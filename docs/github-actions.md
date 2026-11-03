@@ -46,6 +46,8 @@ here. The Securefix caller is part of this repository's PR workflow.
   PR. CI runs the same remote verification. The lock includes transitive
   composite-action dependencies; it does not lock remote reusable workflows,
   whose SHA pins must be reviewed separately.
+- After csm-ci distributes new caller workflows, regenerate the action lock
+  and include it in a follow-up PR. The server does not generate this lock.
 - `mise run fix` updates action pins, checkout settings, and the action lock.
   Review the changes before committing. Keep csm-ci-generated callers managed
   by csm-ci rather than applying repository-specific workflow structure to them.
