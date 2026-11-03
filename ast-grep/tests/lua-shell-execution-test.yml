@@ -1,0 +1,10 @@
+id: lua-shell-execution
+valid:
+  - 'os.execute()'
+  - 'rex.exec({"echo", input})'
+  - 'local text = "io.popen(input)"'
+  - '-- os.execute(input)'
+invalid:
+  - 'os.execute(input)'
+  - 'io.popen(input)'
+  - 'io.popen(input, "r")'

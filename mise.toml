@@ -1,0 +1,40 @@
+[tools]
+"aqua:ast-grep/ast-grep" = "0.51.1"
+"aqua:JohnnyMorganz/StyLua" = "2.6.0"
+"aqua:Kampfkarren/selene" = "0.32.0"
+"aqua:jdx/jactionlint" = "2.4.0"
+"aqua:koalaman/shellcheck" = "0.11.0"
+"aqua:suzuki-shunsuke/disable-checkout-persist-credentials" = "1.0.2"
+"aqua:suzuki-shunsuke/ghalint" = "1.6.0"
+"aqua:suzuki-shunsuke/pinact" = "5.0.2"
+"github:github/gh-actions-lock" = { version = "v0.4.1", bin = "gh-actions-lock" }
+
+[tasks.lint]
+run = [
+  "jactionlint --shellcheck=shellcheck",
+  "pinact run --check --verify-comment",
+  "ghalint run",
+  "gh-actions-lock --verify-local",
+  "git ls-files -z '*.sh' 'mise-tasks/*' | xargs -0 -n 1 sh -c 'for file do shellcheck \"$file\"; done' sh",
+  "git ls-files '*.lua' | while IFS= read -r file; do stylua --check \"$file\" || exit; done",
+  "git ls-files '*.lua' | while IFS= read -r file; do selene \"$file\" || exit; done",
+  "ast-grep scan",
+  "ast-grep test --skip-snapshot-tests",
+]
+
+[tasks.actions-lock]
+run = "gh-actions-lock --no-interactive --no-narrow --no-migrate-local-actions"
+
+[tasks.actions-lock-verify]
+run = "gh-actions-lock --verify"
+
+[tasks.fix]
+run = [
+  "pinact run --verify-comment",
+  "disable-checkout-persist-credentials",
+  "mise run actions-lock",
+  "git ls-files '*.lua' | while IFS= read -r file; do stylua \"$file\" || exit; done",
+]
+
+[tasks.test]
+run = "test -s README.md && test -s LICENSE && ast-grep test --skip-snapshot-tests"
