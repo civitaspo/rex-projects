@@ -1,0 +1,12 @@
+id: lua-shell-execution
+language: Lua
+severity: error
+ignores:
+  - test/hook_test.lua
+  - test/relay_bootstrap.lua
+message: Avoid passing commands to a shell; use an argument-based process API.
+rule:
+  any:
+    - pattern: os.execute($COMMAND)
+    - pattern: io.popen($COMMAND)
+    - pattern: io.popen($COMMAND, $MODE)

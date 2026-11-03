@@ -1,0 +1,27 @@
+name: PR checks (workflow_call)
+on:
+  workflow_call:
+    secrets:
+      CSM_CI_CLIENT_APP_PRIVATE_KEY:
+        required: false
+permissions: {}
+jobs:
+  checks:
+    uses: ./.github/workflows/wc-checks.yml
+    permissions:
+      contents: read
+  tests:
+    uses: ./.github/workflows/wc-tests.yml
+    permissions:
+      contents: read
+  pr-title:
+    uses: ./.github/workflows/wc-pr-title.yml
+    permissions:
+      pull-requests: read
+  securefix:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.author_association == 'OWNER'
+    uses: ./.github/workflows/wc-securefix.yml
+    permissions:
+      contents: read
+    secrets:
+      CSM_CI_CLIENT_APP_PRIVATE_KEY: ${{ secrets.CSM_CI_CLIENT_APP_PRIVATE_KEY }}

@@ -1,0 +1,13 @@
+id: lua-dynamic-code
+valid:
+  - 'json.decode(input)'
+  - 'local text = "load(input)"'
+  - '-- loadstring(input)'
+invalid:
+  - 'load(input)'
+  - 'load(input, "chunk", "t")'
+  - 'loadstring(input)'
+  - 'loadstring(input, "chunk")'
+  - 'loadfile(path)'
+  - 'loadfile(path, "t")'
+  - 'dofile(path)'
