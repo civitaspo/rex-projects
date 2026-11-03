@@ -1,2 +1,2 @@
-local value=1
+local value = 1
 return value
