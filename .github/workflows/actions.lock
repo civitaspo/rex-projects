@@ -3,6 +3,11 @@
 # Docs: https://gh.io/actions-lockfile
 version: 'v0.0.3'
 workflows:
+    '.github/workflows/csm-ci-approve.yml': []
+    '.github/workflows/csm-ci-merge.yml': []
+    '.github/workflows/csm-ci-policy-check.yml': []
+    '.github/workflows/csm-ci-release-pr.yml': []
+    '.github/workflows/csm-ci-release.yml': []
     '.github/workflows/pull_request.yml': []
     '.github/workflows/push.yml': []
     '.github/workflows/wc-checks.yml':
