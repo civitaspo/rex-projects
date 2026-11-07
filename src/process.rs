@@ -312,10 +312,10 @@ fn same_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> boo
         && left.quality == right.quality
 }
 
-/// Signal only a still-running, previously observed group leader. Keeping the
-/// original leader alive prevents its PID/PGID from being recycled between
-/// identity validation and the group signal. A surviving descendant alone is
-/// insufficient proof to signal a reused group number.
+/// Signal a previously observed process group while its verified leader is
+/// alive. If the leader has exited, signal only the exact observed survivors
+/// individually; their kernel birth tokens prevent PID reuse from authorizing
+/// a signal. Never signal a group based only on a surviving descendant.
 pub fn signal_process_group_if_observed(
     process_group_id: u32,
     observed: &[ProcessIdentity],
@@ -327,16 +327,21 @@ pub fn signal_process_group_if_observed(
         .iter()
         .find(|item| item.pid == process_group_id && item.process_group_id == process_group_id)
     else {
-        return if matched
+        let survivors = matched
             .iter()
-            .any(|item| item.process_group_id == process_group_id)
-        {
-            Err(ProcessError::Inspection(
-                "cannot safely signal a group after its verified leader exited".into(),
-            ))
-        } else {
-            Ok(false)
-        };
+            .filter(|item| {
+                observed.iter().any(|known| {
+                    known.process_group_id == process_group_id && same_process_identity(known, item)
+                })
+            })
+            .collect::<Vec<_>>();
+        if survivors.is_empty() {
+            return Ok(false);
+        }
+        for survivor in survivors {
+            signal_process_if_observed(survivor, current, signal)?;
+        }
+        return Ok(true);
     };
     if leader.quality != ProcessIdentityQuality::KernelBirthToken
         || process_group_id > i32::MAX as u32
@@ -1251,14 +1256,27 @@ mod tests {
             !signal_process_group_if_observed(10, &captured, &[], ProcessSignal::Interrupt)
                 .unwrap()
         );
+        let weak_reparented = ProcessIdentity {
+            quality: ProcessIdentityQuality::SecondPrecision,
+            ..reparented.clone()
+        };
         assert!(
             signal_process_group_if_observed(
                 10,
-                std::slice::from_ref(&reparented),
-                std::slice::from_ref(&reparented),
+                std::slice::from_ref(&weak_reparented),
+                std::slice::from_ref(&weak_reparented),
                 ProcessSignal::Terminate
             )
             .is_err()
+        );
+        assert!(
+            !signal_process_group_if_observed(
+                10,
+                std::slice::from_ref(&reparented),
+                &[identity(30, 1, 10, "reused", "shell")],
+                ProcessSignal::Terminate
+            )
+            .unwrap()
         );
     }
 

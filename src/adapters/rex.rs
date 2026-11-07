@@ -93,6 +93,55 @@ pub struct OwnedWindow {
     pub blocks: Vec<OwnedBlock>,
 }
 
+/// Unforgeable in-crate proof for one isolated provider qualification turn.
+/// Production construction is owned by the disposable qualification flow.
+pub(crate) struct RexQualificationFixture {
+    endpoint: String,
+    instance_id: String,
+    session_id: String,
+    window_id: String,
+    block_id: String,
+    operation_id: String,
+}
+
+impl RexQualificationFixture {
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn window_id(&self) -> &str {
+        &self.window_id
+    }
+
+    pub(crate) fn block_id(&self) -> &str {
+        &self.block_id
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_qualification_fixture() -> RexQualificationFixture {
+    RexQualificationFixture {
+        endpoint: "unix:///tmp/rex-test.sock".into(),
+        instance_id: "rex-test-instance".into(),
+        session_id: "session-a".into(),
+        window_id: "rex-test-window".into(),
+        block_id: "block-a".into(),
+        operation_id: "run-a".into(),
+    }
+}
+
 #[derive(Debug)]
 pub enum RexError {
     Invalid(String),
