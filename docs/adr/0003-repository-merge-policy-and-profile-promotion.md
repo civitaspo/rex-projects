@@ -1,0 +1,9 @@
+---
+status: accepted
+---
+
+# Configure repository merge policy and consolidate learned profiles
+
+The user confirmed repository-specific merge conditions and instructions, with automatic merge allowed only under configured eligibility conditions. Each repository can describe its merge mechanism in merge instructions and instruction files. Merge Decision translates them into an ordered typed procedure for PR-body preparation, direct merge or automation request, and required merged-commit verification. The controller validates and executes each step with a stable effect receipt. A merged commit that fails post-merge verification blocks operations and ticket completion without another merge or automatic revert. Bind assessments and approvals to exact change revisions, the prepared body and expected trailers, instruction digests, and resolved policy. Instructions cannot waive required checks or execution-time revision guards.
+
+For learning, generate bounded profile candidates that change guidance while retaining an approved base's execution settings. Human-authorized trials provide efficacy evidence. Periodically propose useful guidance for human-approved consolidation into ordinary profiles under the declarative configuration directory. An inconclusive result stays inconclusive but permits an explicit human uncertain-efficacy promotion decision with rationale and exact limited scope. A regressed revision remains blocked. Neither outcome bypasses configuration approval and apply. Reuse one managed profile slot per Project and role, and retire a promoted candidate only after the complete configuration snapshot applies. This bounds generated profile growth and keeps future behavior reviewable. Existing skills remain profile inputs; automatic skill generation and distribution are deferred.
