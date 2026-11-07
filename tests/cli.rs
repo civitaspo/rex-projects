@@ -1,5 +1,58 @@
 use std::process::Command;
 
+fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rex-projects"));
+    command
+        .args(["--config"])
+        .arg(config)
+        .args(["--state-root"])
+        .arg(state)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"));
+    command
+}
+
+fn fixture(
+    temp: &tempfile::TempDir,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let config = temp.path().join("factory.toml");
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        source.replacen(
+            "schema_version = 1",
+            &format!(
+                "schema_version = 1\nstate_root = \"{}\"",
+                temp.path().join("runtime").display()
+            ),
+            1,
+        ),
+    )
+    .unwrap();
+    let profile_source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/profiles");
+    let profiles = temp.path().join("profiles");
+    for profile in ["judgment_claude", "worker_codex"] {
+        let destination = profiles.join(profile);
+        std::fs::create_dir_all(&destination).unwrap();
+        for file in ["config.toml", "instructions.md"] {
+            std::fs::copy(
+                profile_source.join(profile).join(file),
+                destination.join(file),
+            )
+            .unwrap();
+        }
+    }
+    let state = temp.path().join("runtime");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    (config, state, home)
+}
+
 #[test]
 fn version_reports_the_cargo_package_version() {
     let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
@@ -29,6 +82,32 @@ fn unsupported_invocation_is_reported_as_usage_error() {
             .expect("error output is UTF-8")
             .contains("unrecognized subcommand 'run'")
     );
+}
+
+#[test]
+fn agent_marker_cannot_submit_human_claim_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let output = command(&config, &state, &home)
+        .env("REX_PROJECTS_AGENT", "1")
+        .args([
+            "ticket",
+            "release-claim",
+            "github:org/repo",
+            "PAY-1",
+            "run-1",
+            "1",
+            "0",
+            "--reason",
+            "cancel and re-triage",
+            "--disposition",
+            "cancel",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("human ticket-claim controls"));
+    assert!(!state.join("state.sqlite3").exists());
 }
 
 #[test]
@@ -121,4 +200,178 @@ fn version_metadata_matches_the_created_database_schema() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(metadata["database_schema"].as_i64(), Some(actual_schema));
+}
+
+#[test]
+fn controller_once_publishes_local_project_status_then_releases_ownership() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let apply = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let run = command(&config, &state, &home)
+        .args(["runtime", "run", "--once"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(!state.join("runtime-owner.json").exists());
+
+    let status = command(&config, &state, &home)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["owner"]["active"], false);
+    assert_eq!(report["freshness"], "local_snapshot");
+    assert_eq!(report["projects"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn project_start_queues_only_to_the_active_foreground_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let apply = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(apply.status.success());
+
+    let mut owner = command(&config, &state, &home)
+        .args(["runtime", "run"])
+        .spawn()
+        .unwrap();
+    let mut active = false;
+    for _ in 0..100 {
+        let status = command(&config, &state, &home)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        if status.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&status.stdout)
+                .is_ok_and(|report| report["owner"]["active"] == true)
+        {
+            active = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(active, "foreground controller did not become visible");
+    let start = command(&config, &state, &home)
+        .args([
+            "--json",
+            "project",
+            "start",
+            "goal_project",
+            "--request-id",
+            "start-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&start.stdout).unwrap();
+    assert_eq!(report["state"], "queued");
+
+    let mut updated_config = std::fs::read_to_string(&config).unwrap();
+    updated_config = updated_config.replace(
+        "Deliver the example migration.",
+        "Deliver the revised example migration.",
+    );
+    std::fs::write(&config, updated_config).unwrap();
+    let apply = command(&config, &state, &home)
+        .args(["config", "apply", "--expected-revision", "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stdout)
+    );
+    let apply_report: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(apply_report["state"], "queued");
+    let mut applied = false;
+    for _ in 0..100 {
+        let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
+        let revision: u64 = connection
+            .query_row("SELECT revision FROM config_current", [], |row| row.get(0))
+            .unwrap();
+        let project_revision: u64 = connection
+            .query_row(
+                "SELECT config_revision FROM projects WHERE project_id='goal_project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let owner_projection: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.join("runtime-owner.json")).unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        if revision == 2 && project_revision == 2 && owner_projection["config_revision"] == 2 {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        applied,
+        "active controller did not apply and load the durable config snapshot"
+    );
+
+    let mut stale_config = std::fs::read_to_string(&config).unwrap();
+    stale_config = stale_config.replace(
+        "Deliver the revised example migration.",
+        "Try a stale revision update.",
+    );
+    std::fs::write(&config, stale_config).unwrap();
+    let stale = command(&config, &state, &home)
+        .args(["config", "apply", "--expected-revision", "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        stale.status.success(),
+        "request should queue for owner validation: {}",
+        String::from_utf8_lossy(&stale.stdout)
+    );
+    let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
+    let mut rejected = String::new();
+    for _ in 0..100 {
+        rejected = connection.query_row(
+            "SELECT state FROM controller_commands WHERE kind='config_apply' ORDER BY sequence DESC LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        if rejected == "rejected" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(rejected, "rejected");
+    let owner_projection: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("runtime-owner.json")).unwrap()).unwrap();
+    assert_eq!(
+        owner_projection["config_revision"], 2,
+        "rejected compare-and-swap must retain the loaded snapshot"
+    );
+
+    let stop = command(&config, &state, &home)
+        .args(["runtime", "stop", "--request-id", "stop-1"])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+    let status = owner.wait().unwrap();
+    assert!(status.success());
 }
