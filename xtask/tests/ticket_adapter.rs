@@ -57,6 +57,43 @@ fn adapter(
     }
     adapter
 }
+
+fn adapter_with_timeouts(
+    dir: &TempDir,
+    delay_method: &str,
+    delay_ms: u64,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> TicketCommandAdapter {
+    let command = vec![
+        env!("CARGO_BIN_EXE_xtask").into(),
+        "fixture".into(),
+        "ticket".into(),
+        "--database".into(),
+        dir.path().join("tickets.sqlite").display().to_string(),
+        "--namespace".into(),
+        "fixture/tenant-a".into(),
+        "--delay-method".into(),
+        delay_method.into(),
+        "--delay-ms".into(),
+        delay_ms.to_string(),
+    ];
+    let snapshot = BTreeMap::from([(
+        OsString::from("PATH"),
+        std::env::var_os("PATH").unwrap_or_default(),
+    )]);
+    TicketCommandAdapter::new_discovering_namespace_with_timeouts(
+        &command,
+        &snapshot,
+        &[],
+        dir.path(),
+        read_timeout,
+        write_timeout,
+        Duration::from_millis(100),
+    )
+    .unwrap()
+}
+
 fn req(value: &str) -> RequestId {
     RequestId::new(value).unwrap()
 }
@@ -136,6 +173,46 @@ fn unrelated_native_shapes_normalize_through_the_external_command() {
         assert_eq!(got.ticket.status.value, NormalizedTicketStatus::Ready);
         assert_eq!(got.ticket.revision.as_deref(), Some("rev-1"));
     }
+}
+
+#[test]
+fn ticket_read_and_write_methods_use_their_configured_deadlines() {
+    let read_dir = tempfile::tempdir().unwrap();
+    let read_adapter = adapter_with_timeouts(
+        &read_dir,
+        "adapter.describe",
+        500,
+        Duration::from_millis(250),
+        Duration::from_secs(2),
+    );
+    assert!(matches!(
+        read_adapter.describe(req("delayed-read")),
+        Err(TicketAdapterError::Process {
+            timed_out: true,
+            ..
+        })
+    ));
+
+    let write_dir = tempfile::tempdir().unwrap();
+    let write_adapter = adapter_with_timeouts(
+        &write_dir,
+        "ticket.create",
+        500,
+        Duration::from_millis(250),
+        Duration::from_secs(2),
+    );
+    write_adapter
+        .describe(req("describe-before-write"))
+        .unwrap();
+    let created = write_adapter
+        .create(
+            req("delayed-write"),
+            op("delayed-write"),
+            project(),
+            create(scope("external-project"), "slow-create", "Slow create"),
+        )
+        .unwrap();
+    assert_eq!(created.ticket.title, "Slow create");
 }
 
 #[test]

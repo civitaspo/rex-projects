@@ -374,7 +374,8 @@ pub struct TicketCommandAdapter {
     args: Vec<OsString>,
     environment: BTreeMap<OsString, OsString>,
     cwd: PathBuf,
-    timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
     shutdown_grace: Duration,
     stdout_limit: usize,
     stderr_tail_limit: usize,
@@ -442,18 +443,17 @@ pub fn build_ticket_adapter(
     let adapter = &config.adapters.tickets;
     let shutdown_grace = Duration::from_secs(config.runtime.shutdown_grace_seconds);
     match adapter.kind.as_str() {
-        "command" => Ok(Box::new(TicketCommandAdapter::new_discovering_namespace(
-            &adapter.command,
-            environment_snapshot,
-            &adapter.environment_allow,
-            cwd,
-            Duration::from_secs(
-                adapter
-                    .read_timeout_seconds
-                    .max(adapter.write_timeout_seconds),
-            ),
-            shutdown_grace,
-        )?)),
+        "command" => Ok(Box::new(
+            TicketCommandAdapter::new_discovering_namespace_with_timeouts(
+                &adapter.command,
+                environment_snapshot,
+                &adapter.environment_allow,
+                cwd,
+                Duration::from_secs(adapter.read_timeout_seconds),
+                Duration::from_secs(adapter.write_timeout_seconds),
+                shutdown_grace,
+            )?,
+        )),
         _ => Err(TicketAdapterError::Invalid(
             "unsupported ticket adapter kind".into(),
         )),
@@ -477,6 +477,7 @@ impl TicketCommandAdapter {
             cwd,
             Some(expected_ticket_namespace),
             timeout,
+            timeout,
             shutdown_grace,
         )
     }
@@ -491,13 +492,35 @@ impl TicketCommandAdapter {
         timeout: Duration,
         shutdown_grace: Duration,
     ) -> Result<Self, TicketAdapterError> {
+        Self::new_discovering_namespace_with_timeouts(
+            command,
+            environment_snapshot,
+            environment_allowlist,
+            cwd,
+            timeout,
+            timeout,
+            shutdown_grace,
+        )
+    }
+
+    /// Construct an adapter with separate read and write deadlines.
+    pub fn new_discovering_namespace_with_timeouts(
+        command: &[String],
+        environment_snapshot: &BTreeMap<OsString, OsString>,
+        environment_allowlist: &[String],
+        cwd: &Path,
+        read_timeout: Duration,
+        write_timeout: Duration,
+        shutdown_grace: Duration,
+    ) -> Result<Self, TicketAdapterError> {
         Self::new_inner(
             command,
             environment_snapshot,
             environment_allowlist,
             cwd,
             None,
-            timeout,
+            read_timeout,
+            write_timeout,
             shutdown_grace,
         )
     }
@@ -508,7 +531,8 @@ impl TicketCommandAdapter {
         environment_allowlist: &[String],
         cwd: &Path,
         expected_ticket_namespace: Option<String>,
-        timeout: Duration,
+        read_timeout: Duration,
+        write_timeout: Duration,
         shutdown_grace: Duration,
     ) -> Result<Self, TicketAdapterError> {
         let Some(binary) = command.first() else {
@@ -530,7 +554,8 @@ impl TicketCommandAdapter {
             .canonicalize()
             .map_err(|_| TicketAdapterError::Invalid("working directory is unavailable".into()))?;
         if !cwd.is_dir()
-            || timeout.is_zero()
+            || read_timeout.is_zero()
+            || write_timeout.is_zero()
             || shutdown_grace.is_zero()
             || expected_ticket_namespace.as_ref().is_some_and(|namespace| {
                 namespace.is_empty() || namespace.chars().any(char::is_control)
@@ -554,7 +579,8 @@ impl TicketCommandAdapter {
             args: command.iter().skip(1).map(OsString::from).collect(),
             environment,
             cwd,
-            timeout,
+            read_timeout,
+            write_timeout,
             shutdown_grace,
             stdout_limit: 4 * 1024 * 1024,
             stderr_tail_limit: 64 * 1024,
@@ -1044,7 +1070,17 @@ impl TicketCommandAdapter {
             cwd: Some(self.cwd.clone()),
             clear_environment: true,
             environment: self.environment.clone(),
-            timeout: self.timeout,
+            timeout: match method {
+                TicketMethod::Describe
+                | TicketMethod::List
+                | TicketMethod::Get
+                | TicketMethod::FindOperation => self.read_timeout,
+                TicketMethod::Create
+                | TicketMethod::Update
+                | TicketMethod::Comment
+                | TicketMethod::Triage
+                | TicketMethod::ResolveDuplicate => self.write_timeout,
+            },
             shutdown_grace: self.shutdown_grace,
             stdout_limit: self.stdout_limit,
             stderr_tail_limit: self.stderr_tail_limit,
