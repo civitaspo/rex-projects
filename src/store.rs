@@ -2354,6 +2354,7 @@ impl ConfigStore {
         expected_revision: Revision,
         configuration_digest: &Digest,
         plan: &crate::engine::orchestration::ValidatedPlan,
+        source: &crate::store::agent_results::IngestedAgentResult,
         input: &DurableInput,
         reason: &str,
         evidence_json: &str,
@@ -2363,6 +2364,7 @@ impl ConfigStore {
             ticket_run_id,
             plan,
             configuration_digest,
+            source,
         )?;
         self.commit_ticket_transition_impl(
             owner_generation,
