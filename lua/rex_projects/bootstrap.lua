@@ -131,6 +131,13 @@ local function cache_root(env, exec, started, budget)
     local _, err = run(exec, { "mkdir", root_path }, started, budget)
     if err and not path_exists(root_path, exec, started, budget) then return nil, err end
   end
+  if is_symlink(root_path, exec, started, budget) then
+    return nil, "cache root is a symlink; it was preserved: " .. root_path
+  end
+  local is_directory, directory_error = run(exec, { "/bin/test", "-d", root_path }, started, budget)
+  if not is_directory then
+    return nil, "cache root is not a directory; it was preserved: " .. tostring(directory_error or root_path)
+  end
   local canonical, canonical_error = output(exec, { "realpath", root_path }, started, budget)
   if not canonical then return nil, "cannot resolve cache root: " .. tostring(canonical_error) end
   if not inside(canonical_base, canonical) then
@@ -148,6 +155,13 @@ local function managed_directory(root, path, exec, started, budget)
   if not path_exists(path, exec, started, budget) then
     local _, mkdir_error = run(exec, { "mkdir", path }, started, budget)
     if mkdir_error and not path_exists(path, exec, started, budget) then return nil, mkdir_error end
+  end
+  if is_symlink(path, exec, started, budget) then
+    return nil, "managed cache ancestor is a symlink; it was preserved: " .. path
+  end
+  local is_directory, directory_error = run(exec, { "/bin/test", "-d", path }, started, budget)
+  if not is_directory then
+    return nil, "managed cache ancestor is not a directory; it was preserved: " .. tostring(directory_error or path)
   end
   local canonical, realpath_error = output(exec, { "realpath", path }, started, budget)
   if not canonical then return nil, realpath_error end

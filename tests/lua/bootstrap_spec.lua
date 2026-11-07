@@ -70,6 +70,7 @@ local function fake_world(options)
     if command == "/bin/test" then
       local flag, path = argv[2], argv[3]
       if flag == "-f" then return world.files[path] and success() or failure() end
+      if flag == "-d" then return world.directories[path] and success() or failure() end
       if flag == "-x" then
         return world.files[path] and world.files[path].executable ~= false and success() or failure()
       end
@@ -399,6 +400,43 @@ check(not cache_escape and cache_escape_error:find("symlink", 1, true))
 check(
   not escaped_cache.directories["/outside/rex-projects/dev"],
   "setup must reject a symlinked managed cache root before creating descendants"
+)
+
+local file_cache_root = fake_world()
+file_cache_root.directories["/cache/rex-projects"] = nil
+file_cache_root.files["/cache/rex-projects"] = {
+  digest = "unchanged-cache-root-file",
+  identity = "file:root",
+  binary = false,
+  executable = false,
+  mode = "644",
+}
+local root_file_result, root_file_error = file_cache_root.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(
+  not root_file_result and root_file_error:find("cache root is not a directory", 1, true),
+  "an ordinary file at the cache root must fail with an actionable error"
+)
+check(
+  file_cache_root.files["/cache/rex-projects"].mode == "644",
+  "setup must not chmod an ordinary file where the cache root should be"
+)
+
+local file_managed_ancestor = fake_world()
+file_managed_ancestor.files["/cache/rex-projects/dev"] = {
+  digest = "unchanged-managed-file",
+  identity = "file:dev",
+  binary = false,
+  executable = false,
+  mode = "644",
+}
+local ancestor_file_result, ancestor_file_error = file_managed_ancestor.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(
+  not ancestor_file_result and ancestor_file_error:find("managed cache ancestor is not a directory", 1, true),
+  "an ordinary file at a managed cache ancestor must fail clearly"
+)
+check(
+  file_managed_ancestor.files["/cache/rex-projects/dev"].mode == "644",
+  "setup must not change permissions on an ordinary file at a managed ancestor"
 )
 
 local unreleased = fake_world()
