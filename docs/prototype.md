@@ -41,7 +41,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 
 - [ ] Run `mise install` for pinned tools. Read `docs/github-actions.md` before changing workflow files, CI scripts, or CI configuration.
 - [ ] Run `mise run fix`, inspect its diff, and revert unrelated automatic changes. Run `mise run lint` and `mise run test` before submission.
-- [ ] Preserve existing Lua checks. Add Rust checks to CI when PR1 adds Rust source. Pin the chosen Rust release through `mise`.
+- [ ] Preserve existing Lua checks. The CI-only Rust package and checks are established separately from this implementation plan; PR1 adds runtime source and expands the existing Rust checks as needed. Keep the toolchain pinned through `mise`.
 - [ ] Use signed commits and Conventional Commit PR titles. End commit messages with the contributing Agent's `Co-authored-by` trailer.
 - [ ] Verify trailers before pushing. Open PRs against the default branch, or against their dependency in a deliberate stack.
 - [ ] Follow the repository's approval, required-check, and `/merge` workflow. This plan does not override those gates.
@@ -58,7 +58,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 ### Boot recipe
 
 - [ ] Fetch and check out the exact PR head in an isolated worktree. Record the current default branch SHA as the regression baseline.
-- [ ] For Rust-equipped PRs, build that head, record source revision, dirty flag, and executable digest, and select it through Lua's development `cli` option. Verify the immutable snapshot and running owner's digest before live checks. PR0 has no Rust implementation yet; use disposable lifecycle fixtures and bootstrap stubs rather than claiming to run a future binary.
+- [ ] For Rust-equipped PRs, build that head, record source revision, dirty flag, and executable digest, and select it through Lua's development `cli` option. Verify the immutable snapshot and running owner's digest before live checks. PR0 has no Rust runtime implementation yet; use disposable lifecycle fixtures and bootstrap stubs rather than claiming to run future behavior.
 - [ ] Run `mise install`, `mise run lint`, and `mise run test` using disposable state and cache directories.
 - [ ] Use the Rex skill and installed `rex __internal skill` to drive real Rex. Use normal CLI argv for `rex-projects`. Do not substitute mocks for live acceptance.
 - [ ] Use a temporary local Git remote, a disposable GitHub repository, a fixture ticket CLI, and an explicit test Agent profile. Real credentials stay outside artifacts.

@@ -6,6 +6,10 @@ on:
         required: false
 permissions: {}
 jobs:
+  build:
+    uses: ./.github/workflows/wc-build.yml
+    permissions:
+      contents: read
   checks:
     uses: ./.github/workflows/wc-checks.yml
     permissions:

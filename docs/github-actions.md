@@ -17,7 +17,8 @@ here. The Securefix caller is part of this repository's PR workflow.
   required check. Run lint and tests on both paths.
 - Place reusable jobs in `wc-*.yml`. Keep title validation on PRs and run
   `mise run lint` in the shared checks workflow and `mise run test` in the
-  shared tests workflow. Do not
+  shared tests workflow. Run `mise run build` in a shared build workflow called
+  by both PR and push workflows. Do not
   use workflow-level path filters for required PR checks. If a check needs
   filtering, skip that job inside the reusable workflow instead.
 - Run Securefix only for a PR authored by the repository owner whose head repository is this repository. Check
