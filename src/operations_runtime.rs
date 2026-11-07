@@ -6,16 +6,15 @@
 //! operation identity before any retry can be considered.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppliedConfig;
 use crate::domain::ids::{Digest, OperationId};
 use crate::effects::{
-    AbsentProof, EffectHandler, EffectKind, EffectMode, EffectObservation, EffectRequest,
+    AbsentProof, EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation,
+    EffectRequest,
 };
 use crate::operations::{
     AdapterCall, FindOutcome, FindParams, HumanApprovalReceipt, InvokeOutcome, InvokeResult,
@@ -24,7 +23,7 @@ use crate::operations::{
 };
 use crate::store::{
     EffectIntent,
-    operations::{DurableOperationState, OperationEffectRequest, OperationsStore},
+    operations::{DurableOperationState, OperationEffectRequest},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,12 +73,13 @@ impl EffectHandler for OperationEffectHandler {
         &self,
         mode: EffectMode,
         request: &EffectRequest,
+        context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String> {
         let mode = match mode {
             EffectMode::Submit => OperationExecutionMode::Submit,
             EffectMode::Reconcile => OperationExecutionMode::Reconcile,
         };
-        match self.handle(mode, &request.intent, request.attempt_count)? {
+        match self.handle(mode, &request.intent, request.attempt_count, context)? {
             OperationExecutionOutcome::Applied { receipt_json } => Ok(EffectObservation::Applied {
                 receipt: receipt_json,
             }),
@@ -110,24 +110,17 @@ impl EffectHandler for OperationEffectHandler {
 /// Config snapshots are supplied by the owning controller, indexed by their
 /// immutable digest. The handler never loads agent-provided config or commands.
 pub struct OperationEffectHandler {
-    database_path: PathBuf,
     snapshots: BTreeMap<String, AppliedConfig>,
     process_shutdown_grace: Duration,
-    owner_generation: u64,
 }
 
 impl OperationEffectHandler {
     pub fn new(
-        database_path: impl Into<PathBuf>,
         snapshots: impl IntoIterator<Item = AppliedConfig>,
         process_shutdown_grace: Duration,
-        owner_generation: u64,
     ) -> Result<Self, String> {
         if process_shutdown_grace.is_zero() {
             return Err("process shutdown grace must be non-zero".into());
-        }
-        if owner_generation == 0 {
-            return Err("controller owner generation must be non-zero".into());
         }
         let mut by_digest = BTreeMap::new();
         for snapshot in snapshots {
@@ -140,10 +133,8 @@ impl OperationEffectHandler {
             return Err("at least one applied config snapshot is required".into());
         }
         Ok(Self {
-            database_path: database_path.into(),
             snapshots: by_digest,
             process_shutdown_grace,
-            owner_generation,
         })
     }
 
@@ -152,10 +143,10 @@ impl OperationEffectHandler {
         mode: OperationExecutionMode,
         effect: &EffectIntent,
         attempt_count: u32,
+        context: &mut EffectContext<'_>,
     ) -> Result<OperationExecutionOutcome, String> {
-        let mut connection = open_database(&self.database_path)?;
         let (request, applied, target, permit) = {
-            let store = OperationsStore::new(&mut connection)?;
+            let store = context.store.operations()?;
             let request = store.effect_request(effect)?;
             let record = store
                 .operation(&request.subject.operation_id)?
@@ -246,7 +237,7 @@ impl OperationEffectHandler {
         };
         match mode {
             OperationExecutionMode::Submit => self.submit(
-                &mut connection,
+                context,
                 effect,
                 &request,
                 &applied,
@@ -255,7 +246,7 @@ impl OperationEffectHandler {
                 attempt_count,
             ),
             OperationExecutionMode::Reconcile => self.reconcile(
-                &mut connection,
+                context,
                 effect,
                 &request,
                 &applied,
@@ -269,7 +260,7 @@ impl OperationEffectHandler {
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
-        connection: &mut Connection,
+        context: &mut EffectContext<'_>,
         effect: &EffectIntent,
         request: &OperationEffectRequest,
         applied: &AppliedConfig,
@@ -280,7 +271,7 @@ impl OperationEffectHandler {
         let operation_id = &request.subject.operation_id;
         let now = unix_now()?;
         {
-            let mut store = OperationsStore::new(connection)?;
+            let mut store = context.store.operations()?;
             let record = store
                 .operation(operation_id)?
                 .ok_or_else(|| "durable operation row is missing".to_owned())?;
@@ -296,13 +287,13 @@ impl OperationEffectHandler {
                 return Err("unknown operation requires reconciliation before retry".into());
             }
             store.record_invoking(
-                self.owner_generation,
+                context.owner_generation,
                 operation_id,
                 &request.project_id,
                 &request.ticket_run_id,
                 request.config_revision,
                 &request.config_digest,
-                now,
+                context.now_unix.max(now),
             )?;
         }
 
@@ -317,13 +308,17 @@ impl OperationEffectHandler {
         );
         match call {
             Ok(AdapterCall::Uncertain(reason)) => {
-                let mut store = OperationsStore::new(connection)?;
-                store.record_unknown(self.owner_generation, operation_id, unix_now()?)?;
+                let mut store = context.store.operations()?;
+                store.record_unknown(context.owner_generation, operation_id, unix_now()?)?;
                 Ok(pending_receipt(operation_id, "invoke_uncertain", &reason))
             }
             Err(error) => {
-                let mut store = OperationsStore::new(connection)?;
-                store.record_handler_failure(self.owner_generation, operation_id, unix_now()?)?;
+                let mut store = context.store.operations()?;
+                store.record_handler_failure(
+                    context.owner_generation,
+                    operation_id,
+                    unix_now()?,
+                )?;
                 Ok(pending_receipt(
                     operation_id,
                     "invoke_unknown",
@@ -332,8 +327,8 @@ impl OperationEffectHandler {
             }
             Ok(AdapterCall::Response(response)) => {
                 let Some(value) = response.result else {
-                    let mut store = OperationsStore::new(connection)?;
-                    store.record_unknown(self.owner_generation, operation_id, unix_now()?)?;
+                    let mut store = context.store.operations()?;
+                    store.record_unknown(context.owner_generation, operation_id, unix_now()?)?;
                     return Ok(pending_receipt(
                         operation_id,
                         "invoke_unknown",
@@ -349,22 +344,22 @@ impl OperationEffectHandler {
                             receipt_json: receipt.clone(),
                         };
                         let terminal_receipt = store_terminal_receipt(effect, &outcome)?;
-                        let mut store = OperationsStore::new(connection)?;
+                        let mut store = context.store.operations()?;
                         store.record_observation(
-                            self.owner_generation,
+                            context.owner_generation,
                             operation_id,
                             &receipt,
                             Some(&terminal_receipt),
                             DurableOperationState::Failed,
-                            unix_now()?,
+                            context.now_unix.max(unix_now()?),
                         )?;
                         Ok(outcome)
                     }
                     InvokeOutcome::Accepted | InvokeOutcome::Completed => {
                         let Some(external_reference) = result.external_reference else {
-                            let mut store = OperationsStore::new(connection)?;
+                            let mut store = context.store.operations()?;
                             store.record_unknown(
-                                self.owner_generation,
+                                context.owner_generation,
                                 operation_id,
                                 unix_now()?,
                             )?;
@@ -374,14 +369,14 @@ impl OperationEffectHandler {
                                 "adapter omitted external reference",
                             ));
                         };
-                        OperationsStore::new(connection)?.record_running(
-                            self.owner_generation,
+                        context.store.operations()?.record_running(
+                            context.owner_generation,
                             operation_id,
                             &external_reference,
                             unix_now()?,
                         )?;
                         self.observe(
-                            connection,
+                            context,
                             effect,
                             request,
                             applied,
@@ -399,7 +394,7 @@ impl OperationEffectHandler {
     #[allow(clippy::too_many_arguments)]
     fn reconcile(
         &self,
-        connection: &mut Connection,
+        context: &mut EffectContext<'_>,
         effect: &EffectIntent,
         request: &OperationEffectRequest,
         applied: &AppliedConfig,
@@ -407,12 +402,14 @@ impl OperationEffectHandler {
         permit: &OperationPermit,
         attempt_count: u32,
     ) -> Result<OperationExecutionOutcome, String> {
-        let record = OperationsStore::new(connection)?
+        let record = context
+            .store
+            .operations()?
             .operation(&request.subject.operation_id)?
             .ok_or_else(|| "durable operation row is missing".to_owned())?;
         if let Some(external_reference) = record.external_reference {
             return self.observe(
-                connection,
+                context,
                 effect,
                 request,
                 applied,
@@ -500,14 +497,14 @@ impl OperationEffectHandler {
                 let reference = result
                     .external_reference
                     .ok_or_else(|| "found operation omitted its external reference".to_owned())?;
-                OperationsStore::new(connection)?.record_running(
-                    self.owner_generation,
+                context.store.operations()?.record_running(
+                    context.owner_generation,
                     &request.subject.operation_id,
                     &reference,
                     unix_now()?,
                 )?;
                 self.observe(
-                    connection,
+                    context,
                     effect,
                     request,
                     applied,
@@ -523,7 +520,7 @@ impl OperationEffectHandler {
     #[allow(clippy::too_many_arguments)]
     fn observe(
         &self,
-        connection: &mut Connection,
+        context: &mut EffectContext<'_>,
         effect: &EffectIntent,
         request: &OperationEffectRequest,
         applied: &AppliedConfig,
@@ -629,13 +626,13 @@ impl OperationEffectHandler {
         } else {
             Some(store_terminal_receipt(effect, &outcome)?)
         };
-        OperationsStore::new(connection)?.record_observation(
-            self.owner_generation,
+        context.store.operations()?.record_observation(
+            context.owner_generation,
             &request.subject.operation_id,
             &observation_json,
             terminal_receipt.as_deref(),
             state,
-            unix_now()?,
+            context.now_unix.max(unix_now()?),
         )?;
         Ok(outcome)
     }
@@ -687,17 +684,6 @@ fn request_id(operation_id: &OperationId, stage: &str, attempt: u32) -> String {
     format!("{}-{stage}-{attempt}", operation_id.as_str())
 }
 
-fn open_database(path: &Path) -> Result<Connection, String> {
-    let connection = Connection::open(path).map_err(|error| error.to_string())?;
-    connection
-        .busy_timeout(Duration::from_secs(5))
-        .map_err(|error| error.to_string())?;
-    connection
-        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
-        .map_err(|error| error.to_string())?;
-    Ok(connection)
-}
-
 fn unix_now() -> Result<i64, String> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -708,6 +694,7 @@ fn unix_now() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     use tempfile::tempdir;
 
@@ -716,10 +703,16 @@ mod tests {
         AppliedConfig, Config, OperationActionConfig, OperationTarget, RepositoryOperationsConfig,
         SuccessPredicate,
     };
-    use crate::domain::ids::{ProjectId, RepositoryId, Revision, TicketId, TicketRunId};
+    use crate::domain::ids::{
+        ProjectId, RepositoryId, Revision, TicketId, TicketNamespace, TicketRunId,
+    };
     use crate::domain::types::{ApprovalMode, OperationSource};
+    use crate::effects::{
+        DispatchTick, EffectContext, EffectDispatcher, EffectLimits, EffectMode, EffectRequest,
+    };
     use crate::operations::{DeliveryFacts, validate_recipe};
-    use crate::store::operations::{CompletionGate, migrate_v11};
+    use crate::store::operations::CompletionGate;
+    use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
 
     const SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -734,7 +727,7 @@ mod tests {
             "deploy".into(),
             OperationActionConfig::Command {
                 command: vec![
-                    "python3".into(),
+                    "/usr/bin/python3".into(),
                     fixture.into(),
                     state_path.to_string_lossy().into_owned(),
                     "--drop-first-invoke-reply".into(),
@@ -781,54 +774,53 @@ mod tests {
         }
     }
 
-    fn v10_database(path: &Path) -> Connection {
-        let connection = Connection::open(path).unwrap();
-        connection.execute_batch(
-            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_unix INTEGER NOT NULL);
-             INSERT INTO schema_migrations VALUES (10, 1);
-             CREATE TABLE config_snapshots(source_identity TEXT, revision INTEGER, digest TEXT);
-             CREATE TABLE config_current(source_identity TEXT PRIMARY KEY, revision INTEGER);
-             CREATE TABLE projects(project_id TEXT PRIMARY KEY, config_source TEXT);
-             CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY, project_id TEXT, config_source TEXT, config_revision INTEGER, config_digest TEXT, revision INTEGER);
-             CREATE TABLE controller_owners(singleton INTEGER PRIMARY KEY, generation INTEGER, stopped_at_unix INTEGER);
-             INSERT INTO controller_owners VALUES (1, 1, NULL);
-             CREATE TABLE effects(operation_id TEXT PRIMARY KEY, project_id TEXT, subject_type TEXT, subject_id TEXT, logical_key TEXT, kind TEXT, request_json TEXT, request_digest TEXT, expected_revision INTEGER, status TEXT, attempt_count INTEGER, next_attempt_at_unix INTEGER, owner_generation INTEGER, receipt_json TEXT, last_error TEXT, created_at_unix INTEGER);
-             PRAGMA user_version=10;",
-        ).unwrap();
-        connection
-    }
-
     #[test]
-    fn lost_invoke_reply_reconciles_exact_run_without_duplicate_deploy() {
+    fn durable_operator_effect_reconciles_after_restart_and_checks_current_config() {
         let temp = tempdir().unwrap();
-        let db = temp.path().join("state.sqlite3");
         let remote_state = temp.path().join("fixture-remote.json");
-        let mut connection = v10_database(&db);
-        migrate_v11(&connection).unwrap();
+        let mut store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
 
         let project_id = ProjectId::parse("operations_project").unwrap();
         let ticket_id = TicketId::parse("PAY-12").unwrap();
         let ticket_run_id = TicketRunId::parse("run-1").unwrap();
         let applied = applied_config(&remote_state);
-        connection
-            .execute(
-                "INSERT INTO config_snapshots VALUES ('factory', 1, ?1)",
-                [applied.digest.as_str()],
-            )
+        let applied_revision = store
+            .apply_snapshot("factory", &applied, ExpectedRevision::Bootstrap)
             .unwrap();
-        connection
-            .execute("INSERT INTO config_current VALUES ('factory', 1)", [])
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied_revision.revision,
+                config_digest: applied_revision.digest.clone(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
             .unwrap();
-        connection
-            .execute(
-                "INSERT INTO projects VALUES ('operations_project', 'factory')",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO ticket_runs VALUES ('run-1','operations_project','factory',1,?1,5)",
-                [applied.digest.as_str()],
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: nonce.into(),
+            executable_path: "/tmp/rex-projects-fixture".into(),
+            executable_digest: "b".repeat(64),
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let generation = store.start_owner(&owner("first-owner")).unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &TicketNamespace::parse("github:org/repo").unwrap(),
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "operating",
+                "In Progress",
             )
             .unwrap();
 
@@ -838,15 +830,16 @@ mod tests {
             merge_commits: BTreeMap::from([(target.repository.clone(), SOURCE_SHA.into())]),
             planned_revisions: BTreeMap::new(),
         };
-        let operation_id = OperationsStore::new(&mut connection)
+        let operation_id = store
+            .operations()
             .unwrap()
             .persist_plan(
-                1,
+                generation,
                 &project_id,
                 &ticket_id,
                 &ticket_run_id,
-                Revision(5),
-                Revision(1),
+                Revision(0),
+                applied_revision.revision,
                 &applied,
                 &plan,
                 &delivery,
@@ -854,120 +847,85 @@ mod tests {
             )
             .unwrap()[0]
             .clone();
-        let effect = connection.query_row(
-            "SELECT operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision FROM effects WHERE operation_id=?1",
-            [operation_id.as_str()],
-            |row| Ok(EffectIntent {
-                operation_id: row.get(0)?,
-                project_id: ProjectId::parse(row.get::<_,String>(1)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e))))?,
-                subject_type: row.get(2)?, subject_id: row.get(3)?, logical_key: row.get(4)?, kind: row.get(5)?,
-                request_json: row.get(6)?, request_digest: row.get(7)?, expected_revision: row.get(8)?,
-            }),
-        ).unwrap();
-        let old_handler =
-            OperationEffectHandler::new(&db, [applied.clone()], Duration::from_secs(2), 1).unwrap();
-        connection
-            .execute(
-                "UPDATE controller_owners SET generation=2 WHERE singleton=1",
-                [],
-            )
-            .unwrap();
-        assert!(
-            old_handler
-                .handle(OperationExecutionMode::Submit, &effect, 1)
-                .is_err()
-        );
-        assert!(!remote_state.exists());
         let handler =
-            OperationEffectHandler::new(&db, [applied], Duration::from_secs(2), 2).unwrap();
-
-        connection
-            .execute(
-                "INSERT INTO config_snapshots VALUES ('factory', 2, ?1)",
-                ["f".repeat(64)],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE config_current SET revision=2 WHERE source_identity='factory'",
-                [],
-            )
-            .unwrap();
-        assert!(
-            handler
-                .handle(OperationExecutionMode::Submit, &effect, 1)
-                .is_err()
-        );
-        assert!(!remote_state.exists());
-        connection
-            .execute(
-                "UPDATE config_current SET revision=1 WHERE source_identity='factory'",
-                [],
-            )
-            .unwrap();
-
-        let first = handler
-            .handle(OperationExecutionMode::Submit, &effect, 1)
-            .unwrap();
-        assert!(matches!(first, OperationExecutionOutcome::Pending { .. }));
+            OperationEffectHandler::new([applied.clone()], Duration::from_secs(2)).unwrap();
+        let limits = EffectLimits {
+            max_attempts: 3,
+            max_age: Duration::from_secs(3600),
+            retry_base: Duration::from_secs(1),
+            retry_max: Duration::from_secs(2),
+        };
+        assert!(matches!(
+            EffectDispatcher::tick(&mut store, generation, 100, &[&handler], limits).unwrap(),
+            DispatchTick::WaitingForReconciliation { .. }
+        ));
         let state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
         assert_eq!(state["invoke_calls"], 1);
         assert_eq!(state["duplicate_invoke_calls"], 0);
 
-        // A config change blocks a new submission but must not prevent exact
-        // reconciliation of the already-started historical operation.
-        connection
-            .execute(
-                "UPDATE config_current SET revision=2 WHERE source_identity='factory'",
-                [],
+        // A config change must not prevent exact reconciliation of an already
+        // started historical operation.
+        let mut changed_config = applied.clone();
+        changed_config.digest = Digest::parse("f".repeat(64)).unwrap();
+        let changed_revision = store
+            .apply_snapshot(
+                "factory",
+                &changed_config,
+                ExpectedRevision::Current(applied_revision.revision),
             )
             .unwrap();
-        let historical_reconcile = handler
-            .handle(OperationExecutionMode::Reconcile, &effect, 1)
+        let claimed = store
+            .claim_next_due_effect(generation, 200, &["operation".into()])
+            .unwrap()
             .unwrap();
+        let request = EffectRequest::from(claimed);
+        let historical_reconcile = {
+            let mut context = EffectContext {
+                store: &mut store,
+                owner_generation: generation,
+                now_unix: 200,
+            };
+            EffectHandler::handle(&handler, EffectMode::Reconcile, &request, &mut context).unwrap()
+        };
         assert!(matches!(
             historical_reconcile,
-            OperationExecutionOutcome::Applied { .. }
+            crate::effects::EffectObservation::Applied { .. }
         ));
 
-        // Simulate process death after the handler durably records success but
-        // before the shared dispatcher stores its receipt on the outbox row.
-        let reconciled = handler
-            .handle(OperationExecutionMode::Reconcile, &effect, 1)
-            .unwrap();
-        assert!(matches!(
-            reconciled,
-            OperationExecutionOutcome::Applied { .. }
-        ));
+        // Simulate a crash after operation state was recorded but before the
+        // outbox dispatcher stored the receipt. Restart must replay the exact
+        // terminal receipt without re-invoking the fixture adapter.
+        let restarted_generation = store.start_owner(&owner("second-owner")).unwrap();
         let restarted = OperationEffectHandler::new(
-            &db,
-            [applied_config(&remote_state)],
+            [applied.clone(), changed_config.clone()],
             Duration::from_secs(2),
-            2,
         )
         .unwrap();
-        let replayed = restarted
-            .handle(OperationExecutionMode::Reconcile, &effect, 1)
-            .unwrap();
-        assert_eq!(replayed, reconciled);
+        assert_eq!(restarted_generation, generation + 1);
+        assert!(matches!(
+            EffectDispatcher::tick(&mut store, restarted_generation, 300, &[&restarted], limits)
+                .unwrap(),
+            DispatchTick::Completed { .. }
+        ));
         let state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
         assert_eq!(state["invoke_calls"], 1);
         assert_eq!(state["duplicate_invoke_calls"], 0);
 
         assert_eq!(
-            OperationsStore::new(&mut connection)
+            store
+                .operations()
                 .unwrap()
                 .completion_gate(&project_id, &ticket_run_id)
                 .unwrap(),
             CompletionGate::WaitingForPostmortem
         );
-        // A former controller may still hold this handler after a restart.
-        // Its terminal read is harmless, but every attempted state write must
-        // fail under the replacement owner's generation.
+        // A former controller may still hold request state after a restart,
+        // but stale writes cannot update operation or postmortem state.
         assert!(
-            OperationsStore::new(&mut connection)
+            store
+                .operations()
                 .unwrap()
                 .record_postmortem_receipt(
                     1,
@@ -979,7 +937,8 @@ mod tests {
                 .is_err()
         );
         assert!(
-            OperationsStore::new(&mut connection)
+            store
+                .operations()
                 .unwrap()
                 .record_observation(
                     1,
@@ -992,29 +951,99 @@ mod tests {
                 .is_err()
         );
         assert!(
-            OperationsStore::new(&mut connection)
+            store
+                .operations()
                 .unwrap()
                 .record_unknown(1, &operation_id, 101)
                 .is_err()
         );
         assert_eq!(
-            OperationsStore::new(&mut connection)
+            store
+                .operations()
                 .unwrap()
                 .completion_gate(&project_id, &ticket_run_id)
                 .unwrap(),
             CompletionGate::WaitingForPostmortem
         );
         let receipt = Digest::parse("b".repeat(64)).unwrap();
-        OperationsStore::new(&mut connection)
+        store
+            .operations()
             .unwrap()
             .record_postmortem_receipt(2, &project_id, &ticket_run_id, &receipt, 101)
             .unwrap();
         assert_eq!(
-            OperationsStore::new(&mut connection)
+            store
+                .operations()
                 .unwrap()
                 .completion_gate(&project_id, &ticket_run_id)
                 .unwrap(),
             CompletionGate::Complete
         );
+
+        // A new operation intent created under config v2 cannot invoke after
+        // config v3 is applied. The historical v1 operation above could still
+        // reconcile because it already had a durable external run reference.
+        let second_ticket = TicketId::parse("PAY-13").unwrap();
+        let second_run = TicketRunId::parse("run-2").unwrap();
+        store
+            .create_ticket_run(
+                restarted_generation,
+                &project_id,
+                &TicketNamespace::parse("github:org/repo").unwrap(),
+                &second_ticket,
+                &second_run,
+                1,
+                "operating",
+                "In Progress",
+            )
+            .unwrap();
+        let second_plan = validate_recipe(&changed_config.config, "rollout").unwrap();
+        let second_target = &second_plan.targets()[0];
+        let second_delivery = DeliveryFacts {
+            merge_commits: BTreeMap::from([(second_target.repository.clone(), SOURCE_SHA.into())]),
+            planned_revisions: BTreeMap::new(),
+        };
+        store
+            .operations()
+            .unwrap()
+            .persist_plan(
+                restarted_generation,
+                &project_id,
+                &second_ticket,
+                &second_run,
+                Revision(0),
+                changed_revision.revision,
+                &changed_config,
+                &second_plan,
+                &second_delivery,
+                350,
+            )
+            .unwrap();
+        let mut revoked_config = changed_config.clone();
+        revoked_config.digest = Digest::parse("e".repeat(64)).unwrap();
+        store
+            .apply_snapshot(
+                "factory",
+                &revoked_config,
+                ExpectedRevision::Current(changed_revision.revision),
+            )
+            .unwrap();
+        let revoked_handler =
+            OperationEffectHandler::new([applied, changed_config], Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            EffectDispatcher::tick(
+                &mut store,
+                restarted_generation,
+                400,
+                &[&revoked_handler],
+                limits
+            )
+            .unwrap(),
+            DispatchTick::WaitingForReconciliation { .. }
+        ));
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
+        assert_eq!(state["invoke_calls"], 1);
+        assert_eq!(state["duplicate_invoke_calls"], 0);
     }
 }
