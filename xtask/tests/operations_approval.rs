@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rex_projects::config::{
     AppliedConfig, Config, OperationActionConfig, OperationRecipe, OperationTarget,
@@ -22,6 +22,7 @@ use rex_projects::human_runtime::{
 use rex_projects::launch::{RexView, RexViewKind};
 use rex_projects::operations::{DeliveryFacts, validate_recipe};
 use rex_projects::operations_runtime::{OperationEffectHandler, OperationExecutionMode};
+use rex_projects::store::host_jobs::{HostJobState, OperationMethod};
 use rex_projects::store::operations::DurableOperationState;
 use rex_projects::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
@@ -200,8 +201,29 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
         .unwrap()
         .expect("approval-required operation has a typed human review request");
     let approval_id = HumanRequestId::parse(intent.approval_request_id.unwrap()).unwrap();
-    let operation_handler =
-        OperationEffectHandler::new([applied.clone()], Duration::from_secs(2)).unwrap();
+    let host_jobs = Arc::new(Mutex::new(
+        rex_projects::host_jobs::HostJobPool::new(4, 1).unwrap(),
+    ));
+    let host_environment = [
+        (
+            std::ffi::OsString::from("PATH"),
+            std::env::var_os("PATH").unwrap(),
+        ),
+        (
+            std::ffi::OsString::from("XDG_STATE_HOME"),
+            isolated_xdg.as_os_str().to_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let operation_handler = OperationEffectHandler::with_host_jobs(
+        [applied.clone()],
+        Duration::from_secs(2),
+        Arc::clone(&host_jobs),
+        host_environment,
+        Digest::parse("c".repeat(64)).unwrap(),
+    )
+    .unwrap();
 
     let operation_claim = store
         .claim_next_due_effect(generation, 100, &["operation".into()])
@@ -292,22 +314,42 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
         rex_projects::store::human::HumanDecisionResult::Applied
     ));
 
-    let invoked = {
+    let fixture_receipt = fixture_state.join(format!("{operation_id}.json"));
+    let invoke_job =
+        rex_projects::host_jobs::stable_host_job_id(operation_id.as_str(), "operation.invoke", 1);
+    let invoke_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
         let mut context = EffectContext {
             store: &mut store,
             owner_generation: generation,
             now_unix: 103,
         };
-        EffectHandler::handle(
+        let outcome = EffectHandler::handle(
             &operation_handler,
             EffectMode::Submit,
             &operation_effect,
             &mut context,
         )
-        .unwrap()
-    };
-    assert!(matches!(invoked, EffectObservation::Pending { .. }));
-    let fixture_receipt = fixture_state.join(format!("{operation_id}.json"));
+        .unwrap();
+        assert!(matches!(outcome, EffectObservation::Pending { .. }));
+        if fixture_receipt.exists()
+            && store
+                .operations()
+                .unwrap()
+                .operation(&operation_id)
+                .unwrap()
+                .unwrap()
+                .state
+                == DurableOperationState::Unknown
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < invoke_deadline,
+            "pooled invoke did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         fixture_receipt.exists(),
         "approved operation reached fixture adapter"
@@ -324,28 +366,40 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
         "lost invoke response must remain uncertain until exact reconciliation"
     );
 
-    let reconciled = {
+    let reconcile_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
         let mut context = EffectContext {
             store: &mut store,
             owner_generation: generation,
             now_unix: 104,
         };
-        operation_handler
+        let reconciled = operation_handler
             .handle(
                 OperationExecutionMode::Reconcile,
                 &operation_effect.intent,
                 operation_effect.attempt_count,
                 &mut context,
             )
-            .unwrap()
-    };
-    assert!(
-        matches!(
+            .unwrap();
+        if matches!(
             reconciled,
             rex_projects::operations_runtime::OperationExecutionOutcome::Applied { .. }
-        ),
-        "reconciliation returned: {reconciled:?}"
-    );
+        ) {
+            break;
+        }
+        assert!(
+            matches!(
+                reconciled,
+                rex_projects::operations_runtime::OperationExecutionOutcome::Pending { .. }
+            ),
+            "reconciliation returned: {reconciled:?}"
+        );
+        assert!(
+            Instant::now() < reconcile_deadline,
+            "pooled reconciliation did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
         store
             .operations()
@@ -362,4 +416,30 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
         fixture_json["external_reference"],
         format!("fixture-run:{operation_id}")
     );
+    let operation_jobs = [
+        (invoke_job, OperationMethod::Invoke),
+        (
+            rex_projects::host_jobs::stable_host_job_id(operation_id.as_str(), "operation.find", 1),
+            OperationMethod::Find,
+        ),
+        (
+            rex_projects::host_jobs::stable_host_job_id(
+                operation_id.as_str(),
+                "operation.observe",
+                1,
+            ),
+            OperationMethod::Observe,
+        ),
+    ];
+    for (job_id, method) in operation_jobs {
+        let job = store
+            .host_job(&job_id)
+            .unwrap()
+            .expect("pooled host job persisted");
+        assert_eq!(job.intent.operation_method, Some(method));
+        assert!(matches!(
+            job.state,
+            HostJobState::Succeeded | HostJobState::Failed
+        ));
+    }
 }

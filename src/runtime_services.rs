@@ -193,9 +193,12 @@ impl RuntimeServices {
             ));
         }
         handlers.push(Box::new(
-            crate::operations_runtime::OperationEffectHandler::new(
+            crate::operations_runtime::OperationEffectHandler::with_host_jobs(
                 [applied_config.clone()],
                 Duration::from_secs(applied_config.config.runtime.shutdown_grace_seconds),
+                delivery.host_jobs(),
+                host_environment.clone(),
+                environment.metadata().id.clone(),
             )?,
         ));
         if let Some(knowledge) = &applied_config.config.knowledge {
