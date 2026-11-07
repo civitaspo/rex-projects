@@ -9,6 +9,7 @@
 "aqua:suzuki-shunsuke/pinact" = "5.0.2"
 "github:github/gh-actions-lock" = { version = "v0.4.1", bin = "gh-actions-lock" }
 rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"] }
+lua = "5.1.5"
 
 [tasks.lint]
 run = [
@@ -45,7 +46,12 @@ run = [
   "test -s README.md && test -s LICENSE",
   "ast-grep test --skip-snapshot-tests",
   "python3 -m unittest discover -s tests/fixtures/agents -p 'test_*.py'",
+<<<<<<< HEAD
   "python3 -m unittest discover -s tests -p 'test_release_assets.py'",
+=======
+  "lua tests/lua/bootstrap_version_contract.lua",
+  "lua tests/lua/bootstrap_spec.lua",
+>>>>>>> d0e3345 (feat(lua): bootstrap pinned rex-projects CLI)
   "cargo test --workspace --all-features --locked",
 ]
 
