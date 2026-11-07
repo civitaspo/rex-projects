@@ -26,6 +26,56 @@ fn emit_source_watch_paths() {
     let root = manifest_dir
         .canonicalize()
         .unwrap_or_else(|error| panic!("cannot resolve package directory: {error}"));
+    let target_dir = cargo_target_dir(&root);
+    let git_files = git_raw(&[
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ])
+    .and_then(|files| String::from_utf8(files).ok());
+    if let Some(files) = &git_files {
+        for path in files.split('\0').filter(|path| !path.is_empty()) {
+            emit_changed_path(&root.join(path));
+        }
+    } else if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                emit_changed_path(&entry.path());
+            }
+        }
+    }
+
+    // Cargo recursively watches a directory path. Never emit the package root or
+    // any directory that contains Cargo's output tree; watch its files instead.
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        let inside_git_dir = is_inside(&directory, &root.join(".git"));
+        if inside_git_dir
+            || target_dir
+                .as_deref()
+                .is_some_and(|target| is_inside(&directory, target))
+        {
+            continue;
+        }
+        if directory != root && !overlaps_target(&directory, target_dir.as_deref()) {
+            emit_changed_path(&directory);
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path);
+            }
+        }
+    }
+}
+
+fn cargo_target_dir(root: &Path) -> Option<PathBuf> {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .map(|path| {
@@ -36,35 +86,24 @@ fn emit_source_watch_paths() {
             }
         })
         .or_else(|| {
-            std::env::var_os("OUT_DIR")
-                .map(PathBuf::from)
-                .and_then(|path| path.ancestors().nth(4).map(Path::to_path_buf))
-        })
-        .and_then(|path| path.canonicalize().ok());
-
-    let mut pending = vec![root.clone()];
-    while let Some(directory) = pending.pop() {
-        if is_inside(&directory, &root.join(".git"))
-            || target_dir
-                .as_ref()
-                .is_some_and(|target| is_inside(&directory, target))
-        {
-            continue;
-        }
-        emit_changed_path(&directory);
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                pending.push(path);
-            } else if entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                emit_changed_path(&path);
+            let out_dir = PathBuf::from(std::env::var_os("OUT_DIR")?);
+            let target = std::env::var_os("TARGET")?;
+            let build_dir = out_dir
+                .ancestors()
+                .find(|path| path.file_name().is_some_and(|name| name == "build"))?;
+            let profile_dir = build_dir.parent()?;
+            let platform_dir = profile_dir.parent()?;
+            if platform_dir.file_name() == Some(target.as_os_str()) {
+                platform_dir.parent().map(Path::to_path_buf)
+            } else {
+                Some(platform_dir.to_path_buf())
             }
-        }
-    }
+        })?;
+    target_dir.canonicalize().ok()
+}
+
+fn overlaps_target(path: &Path, target_dir: Option<&Path>) -> bool {
+    target_dir.is_some_and(|target| is_inside(path, target) || is_inside(target, path))
 }
 
 fn emit_git_watch_paths() {
@@ -75,7 +114,10 @@ fn emit_git_watch_paths() {
             "--git-path",
             git_path,
         ]) {
-            emit_changed_path(Path::new(&path));
+            let path = Path::new(&path);
+            if path.exists() {
+                emit_changed_path(path);
+            }
         }
     }
     if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
@@ -85,8 +127,11 @@ fn emit_git_watch_paths() {
             "--git-path",
             &reference,
         ]) {
-            emit_changed_path(Path::new(&path));
-            if let Some(parent) = Path::new(&path).parent() {
+            let reference_path = Path::new(&path);
+            emit_changed_path(reference_path);
+            if !reference_path.exists()
+                && let Some(parent) = reference_path.parent()
+            {
                 emit_changed_path(parent);
             }
         }
@@ -146,11 +191,19 @@ fn valid_revision(value: &str) -> bool {
 }
 
 fn git(arguments: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(arguments).output().ok()?;
+    String::from_utf8(git_raw(arguments)?)
+        .ok()
+        .map(|value| value.trim().to_owned())
+}
+
+fn git_raw(arguments: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .args(arguments)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_owned())
+    Some(output.stdout)
 }
