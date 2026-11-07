@@ -9,7 +9,7 @@ use crate::adapters::tickets::{
     NormalizedTicketStatus, TicketAdapter, TicketListRequest, TicketScope, build_ticket_adapter,
 };
 use crate::config::Config;
-use crate::domain::ids::{AdapterId, TicketId, TicketNamespace};
+use crate::domain::ids::{AdapterId, Digest, TicketId, TicketNamespace};
 use crate::domain::types::TicketStatus;
 use crate::effects::EffectHandler;
 use crate::engine::factory_runtime::{ExternalTicketPage, FactoryRuntimeServices};
@@ -26,6 +26,7 @@ pub struct RuntimeServices {
     namespaces: BTreeMap<AdapterId, TicketNamespace>,
     handlers: Vec<Box<dyn EffectHandler>>,
     config: Config,
+    configuration_digest: Digest,
 }
 
 impl RuntimeServices {
@@ -35,6 +36,7 @@ impl RuntimeServices {
         config_dir: &Path,
         _state_root: &Path,
         _owner_generation: u64,
+        configuration_digest: &Digest,
     ) -> Result<Self, String> {
         let tickets = build_ticket_adapter(config, environment, config_dir)
             .map_err(|error| error.to_string())?;
@@ -43,12 +45,17 @@ impl RuntimeServices {
             namespaces: BTreeMap::new(),
             handlers: Vec::new(),
             config: config.clone(),
+            configuration_digest: configuration_digest.clone(),
         })
     }
 
     fn request_id(&self, purpose: &str) -> Result<RequestId, String> {
         let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         RequestId::new(format!("rex-projects-{purpose}-{sequence}"))
+    }
+
+    pub fn configuration_digest(&self) -> &Digest {
+        &self.configuration_digest
     }
 }
 
