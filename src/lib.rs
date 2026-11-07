@@ -12,6 +12,7 @@ pub mod learning;
 pub mod launch;
 pub mod mailbox;
 pub mod operations;
+pub mod human_runtime;
 pub mod process;
 pub mod protocol;
 pub mod store;

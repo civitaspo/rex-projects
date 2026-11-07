@@ -20,6 +20,8 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
+pub mod human;
+
 pub const SCHEMA_VERSION: i64 = 7;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
