@@ -195,6 +195,22 @@ enum AgentCommand {
         #[arg(long, default_value_t = 5)]
         wait_seconds: u64,
     },
+    ArtifactAdd {
+        #[arg(long, env = "REX_PROJECTS_CONTROL_DIR")]
+        control_dir: PathBuf,
+        #[arg(long = "run", env = "REX_PROJECTS_RUN_ID")]
+        run_id: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long, value_enum)]
+        kind: AgentArtifactKind,
+        #[arg(long, default_value_t = 1)]
+        schema_version: u32,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long, default_value_t = 60)]
+        wait_seconds: u64,
+    },
     Receipt {
         #[arg(long, env = "REX_PROJECTS_CONTROL_DIR")]
         control_dir: PathBuf,
@@ -203,6 +219,37 @@ enum AgentCommand {
         #[arg(long)]
         request_id: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum AgentArtifactKind {
+    Plan,
+    Change,
+    TestReceipt,
+    Review,
+    MergeAssessment,
+    OperationReceipt,
+    Postmortem,
+    Learning,
+    General,
+}
+
+impl AgentArtifactKind {
+    fn role_kind(self) -> crate::engine::orchestration::RoleArtifactKind {
+        use crate::engine::orchestration::RoleArtifactKind as Kind;
+        match self {
+            Self::Plan => Kind::Plan,
+            Self::Change => Kind::Change,
+            Self::TestReceipt => Kind::TestReceipt,
+            Self::Review => Kind::Review,
+            Self::MergeAssessment => Kind::MergeAssessment,
+            Self::OperationReceipt => Kind::OperationReceipt,
+            Self::Postmortem => Kind::Postmortem,
+            Self::Learning => Kind::Learning,
+            Self::General => Kind::General,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1440,6 +1487,24 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 Ok(())
             }
         }
+        AgentCommand::ArtifactAdd {
+            control_dir,
+            run_id,
+            path,
+            kind,
+            schema_version,
+            message_id,
+            wait_seconds,
+        } => agent_artifact_add(
+            control_dir,
+            run_id,
+            path,
+            kind,
+            schema_version,
+            message_id,
+            wait_seconds,
+            json,
+        ),
         AgentCommand::Receipt {
             control_dir,
             run_id,
@@ -1462,6 +1527,124 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 )),
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_artifact_add(
+    control_dir: PathBuf,
+    run_id: String,
+    path: String,
+    kind: AgentArtifactKind,
+    schema_version: u32,
+    message_id: String,
+    wait_seconds: u64,
+    json: bool,
+) -> Result<(), CliError> {
+    use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+    if wait_seconds > 300 {
+        return Err(CliError::usage(
+            "artifact receipt wait is limited to five minutes",
+        ));
+    }
+    if std::env::var("REX_PROJECTS_AGENT").as_deref() != Ok("1") {
+        return Err(CliError::conflict(
+            "agent artifact add can only run in a factory Agent context",
+        ));
+    }
+    let required = |name: &str| {
+        std::env::var(name)
+            .map_err(|_| CliError::usage(format!("required Agent context `{name}` is absent")))
+    };
+    let project_id =
+        ProjectId::parse(required("REX_PROJECTS_PROJECT_ID")?).map_err(CliError::usage)?;
+    let operation_id =
+        crate::domain::ids::OperationId::parse(required("REX_PROJECTS_OPERATION_ID")?)
+            .map_err(CliError::usage)?;
+    let role = serde_json::from_value::<crate::domain::types::Role>(serde_json::Value::String(
+        required("REX_PROJECTS_ROLE")?,
+    ))
+    .map_err(|error| CliError::usage(format!("invalid Agent role context: {error}")))?;
+    let attempt = required("REX_PROJECTS_ATTEMPT")?
+        .parse::<u32>()
+        .map_err(|error| CliError::usage(format!("invalid attempt context: {error}")))?;
+    let run_epoch = required("REX_PROJECTS_RUN_EPOCH")?
+        .parse::<u64>()
+        .map_err(|error| CliError::usage(format!("invalid run epoch context: {error}")))?;
+    let expected_subject_revision = required("REX_PROJECTS_SUBJECT_REVISION")?
+        .parse::<u64>()
+        .map_err(|error| CliError::usage(format!("invalid subject revision context: {error}")))?;
+
+    let request = crate::engine::orchestration::ArtifactAddRequest {
+        schema_version: 1,
+        message_id: message_id.clone(),
+        path,
+        kind: kind.role_kind(),
+        artifact_schema_version: schema_version,
+    };
+    request.validate().map_err(CliError::usage)?;
+    let envelope = RequestEnvelope {
+        schema_version: crate::protocol::SCHEMA_VERSION,
+        request_id: crate::protocol::RequestId::new(message_id.clone()).map_err(CliError::usage)?,
+        operation_id: Some(operation_id),
+        method: crate::protocol::MethodName::new("artifact.add").map_err(CliError::usage)?,
+        project_id: Some(project_id),
+        run_id: Some(run_id.clone()),
+        attempt: Some(attempt),
+        run_epoch: Some(run_epoch),
+        expected_subject_revision: Some(expected_subject_revision),
+        role: Some(role),
+        request_type: Some("artifact_add".into()),
+        params: serde_json::to_value(request)
+            .map_err(|error| CliError::unexpected(error.to_string()))?,
+    };
+    let bytes =
+        serde_json::to_vec(&envelope).map_err(|error| CliError::unexpected(error.to_string()))?;
+    let mailbox =
+        MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
+            .map_err(CliError::unavailable)?;
+    mailbox
+        .queue(
+            &message_id,
+            &bytes,
+            unix_time_now().map_err(CliError::unexpected)?,
+        )
+        .map_err(CliError::conflict)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait_seconds);
+    loop {
+        if let Some(receipt) = mailbox
+            .read_receipt(&message_id, unix_time_now().map_err(CliError::unexpected)?)
+            .map_err(CliError::unexpected)?
+        {
+            let response: ResponseEnvelope<serde_json::Value> =
+                crate::protocol::parse_unique(&receipt).map_err(CliError::unexpected)?;
+            response
+                .validate_for(
+                    &crate::protocol::RequestId::new(message_id.clone())
+                        .map_err(CliError::usage)?,
+                )
+                .map_err(CliError::unexpected)?;
+            if let Some(error) = response.error {
+                return Err(CliError::conflict(format!(
+                    "controller rejected artifact request: {}",
+                    error.message
+                )));
+            }
+            std::io::Write::write_all(&mut std::io::stdout().lock(), &receipt)
+                .map_err(|error| CliError::unexpected(error.to_string()))?;
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pending = serde_json::json!({"state":"queued","request_id":message_id});
+    if json {
+        print_json(&pending)
+    } else {
+        println!("Artifact request {message_id} is queued; controller receipt is pending.");
+        Ok(())
     }
 }
 

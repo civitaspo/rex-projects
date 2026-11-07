@@ -58,6 +58,7 @@ pub struct RuntimeServices {
     runtime_binary_digest: Digest,
     artifacts: ArtifactStore,
     delivery: RuntimeDelivery,
+    mailbox_cursor: Option<String>,
 }
 
 impl RuntimeServices {
@@ -257,6 +258,7 @@ impl RuntimeServices {
             runtime_binary_digest: runtime_binary_digest.clone(),
             artifacts,
             delivery,
+            mailbox_cursor: None,
         })
     }
 
@@ -648,8 +650,13 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             schema_version: 1,
             project_id: reservation.project_id.clone(),
             run_id: reservation.agent_run_id.clone(),
+            operation_id: reservation.operation_id.clone(),
             role: reservation.role,
             ticket_run_id: reservation.ticket_run_id.clone(),
+            expected_subject_revision: reservation
+                .ticket_revision
+                .map(|value| value.0)
+                .unwrap_or(0),
             attempt: reservation.attempt,
             run_epoch: reservation.run_epoch,
             controller_generation: reservation.controller_generation,
@@ -732,6 +739,50 @@ impl RuntimeAgentMaterializer {
 }
 
 impl FactoryRuntimeServices for RuntimeServices {
+    fn process_one_agent_request(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        let mailboxes = store.registered_agent_mailboxes()?;
+        if mailboxes.is_empty() {
+            return Ok(false);
+        }
+        let start = self
+            .mailbox_cursor
+            .as_ref()
+            .and_then(|cursor| {
+                mailboxes
+                    .iter()
+                    .position(|entry| &entry.agent_run_id > cursor)
+            })
+            .unwrap_or(0);
+        let mut first_error = None;
+        for offset in 0..mailboxes.len() {
+            let registration = &mailboxes[(start + offset) % mailboxes.len()];
+            self.mailbox_cursor = Some(registration.agent_run_id.clone());
+            match store.process_one_agent_mailbox_request(
+                owner_generation,
+                &registration.agent_run_id,
+                now_unix,
+                &self.artifacts,
+            ) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        format!("AgentRun {} mailbox: {error}", registration.agent_run_id)
+                    });
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
     fn recover_agents(
         &mut self,
         store: &mut ConfigStore,

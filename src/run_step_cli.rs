@@ -33,8 +33,14 @@ pub fn finalize_and_ack_start(
         || package.descriptor.run_id != reservation.agent_run_id
         || package.project_id != reservation.project_id
         || package.operation_id != reservation.operation_id
+        || package.descriptor.operation_id != reservation.operation_id
         || package.descriptor.role != reservation.role
         || package.descriptor.ticket_run_id != reservation.ticket_run_id
+        || package.descriptor.expected_subject_revision
+            != reservation
+                .ticket_revision
+                .map(|value| value.0)
+                .unwrap_or(0)
         || package.descriptor.attempt != reservation.attempt
         || package.descriptor.run_epoch != reservation.run_epoch
         || package.descriptor.profile_digest != reservation.profile_digest

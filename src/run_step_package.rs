@@ -144,7 +144,14 @@ impl RunStepPackage {
         }
         if self.descriptor.run_id.as_str().is_empty()
             || self.descriptor.project_id != self.project_id
+            || self.descriptor.operation_id != self.operation_id
             || self.descriptor.controller_generation != self.controller_generation
+            || (self.descriptor.role == crate::domain::types::Role::Supervisor
+                && (self.descriptor.ticket_run_id.is_some()
+                    || self.descriptor.expected_subject_revision != 0))
+            || (self.descriptor.role != crate::domain::types::Role::Supervisor
+                && (self.descriptor.ticket_run_id.is_none()
+                    || self.descriptor.expected_subject_revision == 0))
             || self.descriptor.workspace.as_os_str().is_empty()
             || self.descriptor.control_dir.as_os_str().is_empty()
             || !self.descriptor.workspace.is_absolute()
@@ -185,7 +192,7 @@ impl Drop for StagedFile {
 mod tests {
     use super::RunStepPackage;
     use crate::config::Profile;
-    use crate::domain::ids::{AgentRunId, Digest, ProjectId, RexBlockId};
+    use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RexBlockId};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
     use crate::run_step::{ProviderCapabilityEvidence, ProviderQualificationStatus, RunDescriptor};
     use sha2::Digest as _;
@@ -211,8 +218,10 @@ mod tests {
                 schema_version: 1,
                 project_id: ProjectId::parse("project-a").unwrap(),
                 run_id: AgentRunId::parse("run-a").unwrap(),
+                operation_id: OperationId::parse("operation-a").unwrap(),
                 role: Role::Supervisor,
                 ticket_run_id: None,
+                expected_subject_revision: 0,
                 attempt: 1,
                 run_epoch: 1,
                 controller_generation: 1,

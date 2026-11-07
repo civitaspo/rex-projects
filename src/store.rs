@@ -24,6 +24,8 @@ pub mod agent_recovery;
 #[path = "store/dashboard_projection.rs"]
 pub mod dashboard_projection;
 
+#[path = "store/agent_mailbox.rs"]
+pub mod agent_mailbox;
 #[path = "store/agent_results.rs"]
 pub mod agent_results;
 #[path = "store/artifact_registry.rs"]

@@ -110,16 +110,15 @@ impl ArtifactStore {
         let bytes = read_workspace_file(&workspace, path)?;
         validate_contents(kind, schema_version, path, &bytes)?;
         let content_digest = Digest::parse(format!("{:x}", Sha256::digest(&bytes)))?;
-        let identity = serde_json::to_vec(&(
-            "rex-projects-artifact-v1",
-            project_id.as_str(),
-            agent_run_id,
-            kind,
+        let agent_run_id = crate::domain::ids::AgentRunId::parse(agent_run_id.to_owned())?;
+        let artifact_id = crate::domain::ids::ArtifactId::from_registration_identity(
+            project_id,
+            &agent_run_id,
+            kind.as_str(),
             schema_version,
-            content_digest.as_str(),
-        ))
-        .map_err(|error| error.to_string())?;
-        let artifact_id = format!("{:x}", Sha256::digest(identity));
+            &content_digest,
+        )?;
+        let artifact_id = artifact_id.as_str();
         let relative = format!("sha256/{}/{}", &artifact_id[..2], artifact_id);
         let object_path = self.root.join(&relative);
         let parent = object_path
@@ -138,7 +137,7 @@ impl ArtifactStore {
         }
         publish_immutable_object(parent, &object_path, &bytes)?;
         let reference = RoleArtifactReference {
-            artifact_id: crate::domain::ids::ArtifactId::parse(artifact_id.clone())?,
+            artifact_id: crate::domain::ids::ArtifactId::parse(artifact_id.to_owned())?,
             kind,
             schema_version,
             path: relative,
@@ -146,9 +145,9 @@ impl ArtifactStore {
             bytes: bytes.len() as u64,
         };
         Ok(VerifiedArtifact {
-            artifact_id,
+            artifact_id: artifact_id.to_owned(),
             project_id: project_id.clone(),
-            agent_run_id: agent_run_id.to_owned(),
+            agent_run_id: agent_run_id.as_str().to_owned(),
             kind,
             schema_version,
             content_digest,

@@ -90,6 +90,15 @@ pub struct ExternalTicketPage {
 /// Host adapters implement this port with the configured ticket CLI and a
 /// pinned namespace. No authentication state is supplied by rex-projects.
 pub trait FactoryRuntimeServices {
+    /// Process at most one active-run request from the run-local mailbox spool. The host verifies
+    /// the request against the persisted launch authority before acknowledging it.
+    fn process_one_agent_request(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<bool, String>;
+
     fn recover_agents(
         &mut self,
         store: &mut ConfigStore,
@@ -196,6 +205,8 @@ impl FactoryRuntime {
         services: &mut impl FactoryRuntimeServices,
     ) -> Result<FactoryTickReport, String> {
         store.activate_starting_projects(owner_generation)?;
+        let _processed_agent_request =
+            services.process_one_agent_request(store, owner_generation, now_unix)?;
         let agent_result = services.ingest_one_agent_result(store, owner_generation, now_unix)?;
         let ingested_agent_result = if let Some(result) = &agent_result {
             apply_agent_result(store, owner_generation, now_unix, config, services, result)?

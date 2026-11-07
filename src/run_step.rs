@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::adapters::rex::RexQualificationFixture;
 use crate::config::Profile;
-use crate::domain::ids::{AgentRunId, Digest, ProjectId, RexBlockId, TicketRunId};
+use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RexBlockId, TicketRunId};
 use crate::domain::types::{AgentAdapter, CommitMode, Role};
 use crate::process::{self, ProcessError, ProcessIdentity, ProcessIdentityQuality, ProcessSignal};
 use crate::providers;
@@ -102,8 +102,10 @@ pub struct RunDescriptor {
     pub schema_version: u32,
     pub project_id: ProjectId,
     pub run_id: AgentRunId,
+    pub operation_id: OperationId,
     pub role: Role,
     pub ticket_run_id: Option<TicketRunId>,
+    pub expected_subject_revision: u64,
     pub attempt: u32,
     pub run_epoch: u64,
     pub controller_generation: u64,
@@ -1694,9 +1696,29 @@ fn factory_environment(
         ("REX_PROJECTS_PROJECT_ID", descriptor.project_id.as_str()),
         ("REX_PROJECTS_ROLE", role_name(descriptor.role)),
         ("REX_PROJECTS_RUN_ID", descriptor.run_id.as_str()),
+        (
+            "REX_PROJECTS_OPERATION_ID",
+            descriptor.operation_id.as_str(),
+        ),
     ] {
         environment.insert(OsString::from(key), OsString::from(value));
     }
+    environment.insert(
+        OsString::from("REX_PROJECTS_ATTEMPT"),
+        OsString::from(descriptor.attempt.to_string()),
+    );
+    environment.insert(
+        OsString::from("REX_PROJECTS_RUN_EPOCH"),
+        OsString::from(descriptor.run_epoch.to_string()),
+    );
+    environment.insert(
+        OsString::from("REX_PROJECTS_SUBJECT_REVISION"),
+        OsString::from(descriptor.expected_subject_revision.to_string()),
+    );
+    environment.insert(
+        OsString::from("REX_PROJECTS_CONTROL_DIR"),
+        descriptor.control_dir.as_os_str().to_owned(),
+    );
     if let Some(ticket_run_id) = &descriptor.ticket_run_id {
         environment.insert(
             OsString::from("REX_PROJECTS_TICKET_RUN_ID"),
@@ -1820,7 +1842,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::config::{ClaudeCodeOptions, CodexOptions, Profile};
-    use crate::domain::ids::{AgentRunId, Digest, ProjectId, RexBlockId, TicketRunId};
+    use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RexBlockId, TicketRunId};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
     use crate::process::{self, ProcessIdentity};
 
@@ -1905,8 +1927,10 @@ mod tests {
             schema_version: 1,
             project_id: ProjectId::parse("project-a").unwrap(),
             run_id: AgentRunId::parse("run-a").unwrap(),
+            operation_id: OperationId::parse("operation-a").unwrap(),
             role: Role::Worker,
             ticket_run_id: Some(TicketRunId::parse("ticket-run-a").unwrap()),
+            expected_subject_revision: 1,
             attempt: 1,
             run_epoch: 2,
             controller_generation: 3,
