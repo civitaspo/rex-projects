@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use crate::host_commit::{
     ChangeManifest, HostCommitError, HostCommitOptions, HostCommitReceipt, HostCommitter,
     PreparedHostCommit,
 };
+use crate::host_jobs::HostJobPool;
 use crate::process::{self, ProcessOutput, ProcessRequest};
 use crate::worktrees::{
     GitOptions, ManagedRepository, ManagedWorktree, NativeCommitReceipt, TicketKey, WorktreeError,
@@ -483,6 +484,53 @@ impl RepositoryDelivery {
             configuration_digest: configuration_digest.clone(),
             hook_receipts,
         })
+    }
+
+    pub fn run_required_hooks_managed(
+        &self,
+        work: &PreparedRepositoryWork,
+        repository_config: &RepositoryConfig,
+        configuration_digest: &Digest,
+        verified_commit: &VerifiedCommit,
+        store: &mut crate::store::ConfigStore,
+        pool: &mut HostJobPool,
+        effect_operation_id: &str,
+        now_unix: i64,
+        max_attempts: u32,
+    ) -> Result<Option<HookGateReceipt>, DeliveryError> {
+        let accepted_head = verified_commit.head();
+        validate_git_sha(accepted_head)?;
+        let receipts = self
+            .hooks
+            .run_required_managed(
+                &repository_config.rex_projects_hooks,
+                HookRunContext {
+                    repository_id: &work.identity.repository_id,
+                    worktree: &work.worktree.path,
+                    expected_head: accepted_head,
+                    project_id: &work.identity.project_id,
+                    ticket_run_id: &work.identity.ticket_run_id,
+                    configuration_digest,
+                    state_root: &self.state_root,
+                },
+                store,
+                pool,
+                effect_operation_id,
+                max_attempts,
+                now_unix,
+                || {
+                    self.worktrees
+                        .acquire_writer_lease(work.worktree.clone())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .map_err(|error| DeliveryError::Hook(error.to_string()))?;
+        Ok(receipts.map(|hook_receipts| HookGateReceipt {
+            repository_id: work.identity.repository_id.clone(),
+            head: accepted_head.to_owned(),
+            configuration_digest: configuration_digest.clone(),
+            hook_receipts,
+        }))
     }
 
     /// Push the exact owned head as a non-forced, explicit refspec. A remote already at this SHA
@@ -1143,6 +1191,8 @@ pub struct RepositoryDeliveryEffects {
     configuration_digest: Digest,
     repositories: BTreeMap<RepositoryId, RepositoryConfig>,
     project_repositories: BTreeMap<ProjectId, BTreeSet<RepositoryId>>,
+    host_jobs: Mutex<HostJobPool>,
+    max_hook_attempts: u32,
 }
 
 pub struct RepositoryDeliveryEffectConfig {
@@ -1155,10 +1205,16 @@ pub struct RepositoryDeliveryEffectConfig {
     pub configuration_digest: Digest,
     pub repositories: BTreeMap<RepositoryId, RepositoryConfig>,
     pub project_repositories: BTreeMap<ProjectId, BTreeSet<RepositoryId>>,
+    pub max_global_hook_jobs: usize,
+    pub max_hook_attempts: u32,
 }
 
 impl RepositoryDeliveryEffects {
     pub fn new(config: RepositoryDeliveryEffectConfig) -> Result<Arc<Self>, String> {
+        if config.max_hook_attempts == 0 {
+            return Err("maximum hook attempts must be positive".into());
+        }
+        let host_jobs = HostJobPool::new(config.max_global_hook_jobs)?;
         let delivery =
             RepositoryDelivery::new(&config.state_root, config.git, config.inherited_environment)
                 .map_err(|error| error.to_string())?;
@@ -1184,6 +1240,8 @@ impl RepositoryDeliveryEffects {
             configuration_digest: config.configuration_digest,
             repositories: config.repositories,
             project_repositories: config.project_repositories,
+            host_jobs: Mutex::new(host_jobs),
+            max_hook_attempts: config.max_hook_attempts,
         }))
     }
 
@@ -1348,6 +1406,8 @@ impl RepositoryDeliveryEffects {
         &self,
         mode: EffectMode,
         request: &EffectRequest,
+        store: &mut crate::store::ConfigStore,
+        now_unix: i64,
     ) -> Result<EffectObservation, String> {
         let payload: PublishImplementationEffectPayload = decode_effect_payload(request)?;
         self.validate_publish_payload(request, &payload)?;
@@ -1479,15 +1539,36 @@ impl RepositoryDeliveryEffects {
             }
             _ => return Err("commit payload does not match the configured commit mode".into()),
         };
-        let hook_gate = self
+        let mut host_jobs = self
+            .host_jobs
+            .lock()
+            .map_err(|_| "host job pool lock is poisoned".to_owned())?;
+        host_jobs.poll(store, now_unix)?;
+        let Some(hook_gate) = self
             .delivery
-            .run_required_hooks(
+            .run_required_hooks_managed(
                 &work,
                 repository_config,
                 &self.configuration_digest,
                 &commit,
+                store,
+                &mut host_jobs,
+                &request.intent.operation_id,
+                now_unix,
+                self.max_hook_attempts,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(EffectObservation::Pending {
+                receipt: serde_json::json!({
+                    "schema_version": 1,
+                    "state": "repository_hooks_pending",
+                    "effect_operation_id": request.intent.operation_id,
+                    "head": commit.head(),
+                })
+                .to_string(),
+            });
+        };
         if mode == EffectMode::Reconcile {
             let push = self
                 .delivery
@@ -2044,7 +2125,7 @@ impl EffectHandler for PublishImplementationEffectHandler {
         &self,
         mode: EffectMode,
         request: &EffectRequest,
-        _context: &mut EffectContext<'_>,
+        context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String> {
         let payload: PublishImplementationEffectPayload = match decode_effect_payload(request) {
             Ok(payload) => payload,
@@ -2053,7 +2134,8 @@ impl EffectHandler for PublishImplementationEffectHandler {
         if let Err(error) = self.effects.validate_publish_payload(request, &payload) {
             return Ok(rejected_delivery_effect(error));
         }
-        self.effects.publish_implementation(mode, request)
+        self.effects
+            .publish_implementation(mode, request, context.store, context.now_unix)
     }
 }
 
@@ -2459,6 +2541,8 @@ mod tests {
                 project_id.clone(),
                 BTreeSet::from([repository_id.clone()]),
             )]),
+            max_global_hook_jobs: 2,
+            max_hook_attempts: 3,
         })
         .unwrap();
         let payload = PrepareWorktreesEffectPayload {
@@ -2586,6 +2670,8 @@ mod tests {
                 project_id.clone(),
                 BTreeSet::from([repository_id.clone()]),
             )]),
+            max_global_hook_jobs: 2,
+            max_hook_attempts: 3,
         })
         .unwrap();
         let payload = PublishImplementationEffectPayload {

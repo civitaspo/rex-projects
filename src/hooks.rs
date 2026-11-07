@@ -11,8 +11,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::HookConfig;
 use crate::domain::ids::{Digest, ProjectId, RepositoryId, TicketRunId};
+use crate::host_jobs::{HostJobPool, HostJobProgress};
 use crate::process::{self, ProcessError, ProcessRequest};
+use crate::store::ConfigStore;
+use crate::store::host_jobs::HostJobIntent;
 use crate::worktrees::GitOptions;
+use crate::worktrees::WorktreeLease;
 
 const DEFAULT_STDOUT_LIMIT: usize = 1024 * 1024;
 const STDERR_TAIL_LIMIT: usize = 32 * 1024;
@@ -105,6 +109,271 @@ impl HookRunner {
         }
         self.stdout_limit = limit;
         Ok(self)
+    }
+
+    pub fn run_required_managed(
+        &self,
+        hooks: &[HookConfig],
+        context: HookRunContext<'_>,
+        store: &mut ConfigStore,
+        pool: &mut HostJobPool,
+        effect_operation_id: &str,
+        max_attempts: u32,
+        now_unix: i64,
+        mut acquire_worktree_lease: impl FnMut() -> Result<WorktreeLease, String>,
+    ) -> Result<Option<Vec<HookReceipt>>, HookError> {
+        if hooks.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if effect_operation_id.trim().is_empty() || max_attempts == 0 {
+            return Err(HookError::Invalid(
+                "managed hook identity and attempt limit are required".into(),
+            ));
+        }
+        let HookRunContext {
+            repository_id,
+            worktree,
+            expected_head,
+            project_id,
+            ticket_run_id,
+            configuration_digest,
+            state_root,
+        } = context;
+        let root = state_root.canonicalize().map_err(io_error)?;
+        let receipts_root = root
+            .join("hook-receipts")
+            .join(project_id.as_str())
+            .join(repository_id.as_str())
+            .join(ticket_run_id.as_str());
+        create_private_directory(&root)?;
+        create_private_directory(&root.join("hook-receipts"))?;
+        create_private_directory(&root.join("hook-receipts").join(project_id.as_str()))?;
+        create_private_directory(
+            &root
+                .join("hook-receipts")
+                .join(project_id.as_str())
+                .join(repository_id.as_str()),
+        )?;
+        create_private_directory(&receipts_root)?;
+        let repo = worktree.canonicalize().map_err(io_error)?;
+        ensure_real_directory(&repo)?;
+        let managed_worktrees = root.join("worktrees").canonicalize().map_err(io_error)?;
+        if !repo.starts_with(&managed_worktrees) {
+            return Err(HookError::Invalid(
+                "repository checks may run only inside a managed worktree".into(),
+            ));
+        }
+        let actual_head = self.git_text(&repo, ["rev-parse", "--verify", "HEAD"])?;
+        if actual_head.trim() != expected_head {
+            return Err(HookError::Invalid(
+                "repository hook head differs from the expected revision".into(),
+            ));
+        }
+
+        let mut receipts = Vec::with_capacity(hooks.len());
+        for hook in hooks {
+            validate_hook(hook)?;
+            let before = self.source_fingerprint(&repo)?;
+            let executable = self.resolve_command(&hook.command[0]).ok_or_else(|| {
+                HookError::Invalid(format!(
+                    "configured repository check `{}` executable is unavailable",
+                    hook.id
+                ))
+            })?;
+            let timeout = Duration::from_secs(hook.timeout_seconds);
+            if timeout.is_zero() {
+                return Err(HookError::Invalid(format!(
+                    "repository check `{}` timeout must be positive",
+                    hook.id
+                )));
+            }
+            let mut environment = self.inherited_environment.clone();
+            environment.retain(|key, _| {
+                let key = key.to_string_lossy();
+                !key.starts_with("GIT_")
+                    && !matches!(
+                        key.as_ref(),
+                        "REX_PROJECTS_CONTEXT"
+                            | "REX_PROJECTS_AGENT"
+                            | "REX_PROJECTS_PROJECT_ID"
+                            | "REX_PROJECTS_ROLE"
+                            | "REX_PROJECTS_RUN_ID"
+                            | "REX_PROJECTS_TICKET_RUN_ID"
+                    )
+            });
+            environment.insert("REX_PROJECTS_CONTEXT".into(), "rex_projects_hook".into());
+            environment.insert("REX_PROJECTS_AGENT".into(), "1".into());
+            environment.insert("REX_PROJECTS_PROJECT_ID".into(), project_id.as_str().into());
+            environment.insert("REX_PROJECTS_ROLE".into(), "rex_projects_hook".into());
+            environment.insert("REX_PROJECTS_RUN_ID".into(), hook.id.as_str().into());
+            environment.insert(
+                "REX_PROJECTS_TICKET_RUN_ID".into(),
+                ticket_run_id.as_str().into(),
+            );
+            environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+            let request = ProcessRequest {
+                executable,
+                args: hook.command[1..].iter().map(OsString::from).collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.clone()),
+                clear_environment: true,
+                environment,
+                timeout,
+                shutdown_grace: HOOK_SHUTDOWN_GRACE,
+                stdout_limit: self.stdout_limit,
+                stderr_tail_limit: STDERR_TAIL_LIMIT,
+            };
+            let command_digest = digest_process_request(&request);
+            let job_id = digest_bytes(
+                format!(
+                    "rex-hook-v1:{effect_operation_id}:{}:{}:{}:{}",
+                    hook.id, expected_head, configuration_digest, before
+                )
+                .as_bytes(),
+            )
+            .to_string();
+            let intent = HostJobIntent {
+                job_id: job_id.clone(),
+                effect_operation_id: format!("{effect_operation_id}:{}", hook.id),
+                project_id: project_id.as_str().into(),
+                subject_id: hook.id.clone(),
+                worktree_id: repo.to_string_lossy().into_owned(),
+                kind: "repository_hook".into(),
+                request_digest: command_digest.to_string(),
+                configuration_digest: configuration_digest.to_string(),
+                head: expected_head.to_owned(),
+                source_digest: before.to_string(),
+                max_attempts,
+                retry_when_absent: true,
+            };
+            let lease = if pool.holds_worktree_lease_for(&intent.worktree_id) {
+                None
+            } else {
+                Some(acquire_worktree_lease().map_err(HookError::Process)?)
+            };
+            match pool
+                .submit_or_poll(store, &intent, request, lease, now_unix)
+                .map_err(HookError::Process)?
+            {
+                HostJobProgress::Pending | HostJobProgress::Running | HostJobProgress::Unknown => {
+                    return Ok(None);
+                }
+                HostJobProgress::Succeeded(receipt_json)
+                | HostJobProgress::Failed(receipt_json) => {
+                    let receipt: HookReceipt = serde_json::from_str(&receipt_json)
+                        .map_err(|_| HookError::Invalid("stored hook receipt is invalid".into()))?;
+                    validate_hook_receipt(
+                        &receipt,
+                        hook,
+                        project_id,
+                        repository_id,
+                        ticket_run_id,
+                        expected_head,
+                        configuration_digest,
+                    )?;
+                    if !receipt.succeeded {
+                        return Err(HookError::Failed(Box::new(receipt)));
+                    }
+                    receipts.push(receipt);
+                }
+                HostJobProgress::ProcessCompleted(output) => {
+                    let after_head = self.git_text(&repo, ["rev-parse", "--verify", "HEAD"])?;
+                    let after = self.source_fingerprint(&repo)?;
+                    let source_changed = before != after;
+                    let succeeded = output.status_code == Some(0)
+                        && !output.timed_out
+                        && output.cleanup_confirmed
+                        && !output.stdout_truncated
+                        && after_head.trim() == expected_head
+                        && !source_changed;
+                    let receipt = HookReceipt {
+                        schema_version: 1,
+                        hook_id: hook.id.clone(),
+                        project_id: project_id.clone(),
+                        repository_id: repository_id.clone(),
+                        ticket_run_id: ticket_run_id.clone(),
+                        head: expected_head.to_owned(),
+                        configuration_digest: configuration_digest.clone(),
+                        source_before: before,
+                        source_after: after,
+                        exit_code: output.status_code,
+                        timed_out: output.timed_out,
+                        cleanup_confirmed: output.cleanup_confirmed,
+                        stdout_digest: digest_bytes(&output.stdout),
+                        stdout_bytes: output.stdout.len(),
+                        stdout_truncated: output.stdout_truncated,
+                        stderr_tail_digest: digest_bytes(&output.stderr_tail),
+                        stderr_bytes: output.stderr_tail.len(),
+                        stderr_truncated: output.stderr_truncated,
+                        succeeded,
+                        recorded_at_unix: now_unix.max(0) as u64,
+                    };
+                    let receipt_json = serde_json::to_string(&receipt)
+                        .map_err(|error| HookError::Invalid(error.to_string()))?;
+                    write_receipt(
+                        &receipt_path(
+                            &receipts_root,
+                            &hook.id,
+                            expected_head,
+                            configuration_digest,
+                        ),
+                        &receipt,
+                    )?;
+                    pool.finish(store, &job_id, succeeded, &receipt_json, now_unix)
+                        .map_err(HookError::Process)?;
+                    if after_head.trim() != expected_head || source_changed {
+                        return Err(HookError::SourceChanged {
+                            hook_id: hook.id.clone(),
+                        });
+                    }
+                    if !succeeded {
+                        return Err(HookError::Failed(Box::new(receipt)));
+                    }
+                    receipts.push(receipt);
+                }
+                HostJobProgress::ProcessFailed(error) => {
+                    let empty = digest_bytes(&[]);
+                    let receipt = HookReceipt {
+                        schema_version: 1,
+                        hook_id: hook.id.clone(),
+                        project_id: project_id.clone(),
+                        repository_id: repository_id.clone(),
+                        ticket_run_id: ticket_run_id.clone(),
+                        head: expected_head.to_owned(),
+                        configuration_digest: configuration_digest.clone(),
+                        source_before: before.clone(),
+                        source_after: self.source_fingerprint(&repo)?,
+                        exit_code: None,
+                        timed_out: false,
+                        cleanup_confirmed: true,
+                        stdout_digest: empty.clone(),
+                        stdout_bytes: 0,
+                        stdout_truncated: false,
+                        stderr_tail_digest: empty,
+                        stderr_bytes: 0,
+                        stderr_truncated: false,
+                        succeeded: false,
+                        recorded_at_unix: now_unix.max(0) as u64,
+                    };
+                    let receipt_json = serde_json::to_string(&receipt)
+                        .map_err(|e| HookError::Invalid(e.to_string()))?;
+                    write_receipt(
+                        &receipt_path(
+                            &receipts_root,
+                            &hook.id,
+                            expected_head,
+                            configuration_digest,
+                        ),
+                        &receipt,
+                    )?;
+                    pool.finish(store, &job_id, false, &receipt_json, now_unix)
+                        .map_err(HookError::Process)?;
+                    let _ = error;
+                    return Err(HookError::Failed(Box::new(receipt)));
+                }
+            }
+        }
+        Ok(Some(receipts))
     }
 
     pub fn run_required(
@@ -440,6 +709,49 @@ impl HookRunner {
         }
         Ok(digest_bytes(&digest.finalize()))
     }
+}
+
+fn digest_process_request(request: &ProcessRequest) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(request.executable.to_string_lossy().as_bytes());
+    if let Some(cwd) = request.cwd.as_deref() {
+        bytes.extend_from_slice(cwd.to_string_lossy().as_bytes());
+    }
+    for arg in &request.args {
+        bytes.extend_from_slice(arg.to_string_lossy().as_bytes());
+        bytes.push(0);
+    }
+    for (key, value) in &request.environment {
+        bytes.extend_from_slice(key.to_string_lossy().as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(value.to_string_lossy().as_bytes());
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&request.timeout.as_millis().to_le_bytes());
+    digest_bytes(&bytes)
+}
+
+fn validate_hook_receipt(
+    receipt: &HookReceipt,
+    hook: &HookConfig,
+    project_id: &ProjectId,
+    repository_id: &RepositoryId,
+    ticket_run_id: &TicketRunId,
+    head: &str,
+    configuration_digest: &Digest,
+) -> Result<(), HookError> {
+    if receipt.hook_id != hook.id
+        || &receipt.project_id != project_id
+        || &receipt.repository_id != repository_id
+        || &receipt.ticket_run_id != ticket_run_id
+        || receipt.head != head
+        || &receipt.configuration_digest != configuration_digest
+    {
+        return Err(HookError::Invalid(
+            "stored hook receipt does not match its immutable intent".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_hook(hook: &HookConfig) -> Result<(), HookError> {

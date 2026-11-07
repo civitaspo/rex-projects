@@ -12,6 +12,7 @@ pub mod engine;
 pub mod environment;
 pub mod hooks;
 pub mod host_commit;
+pub mod host_jobs;
 pub mod human;
 pub mod human_runtime;
 pub mod knowledge;

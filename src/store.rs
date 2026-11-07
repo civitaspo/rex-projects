@@ -27,6 +27,7 @@ pub const SCHEMA_VERSION: i64 = 11;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
+pub mod host_jobs;
 pub mod human;
 #[path = "store/learning.rs"]
 mod learning_store;
