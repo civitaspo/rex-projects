@@ -10,6 +10,7 @@ pub enum Phase {
     Planning,
     Preparing,
     Implementing,
+    Publishing,
     Reviewing,
     Assessing,
     WaitingHuman,
@@ -50,6 +51,7 @@ pub enum Input {
     PlanAccepted,
     WorktreesPrepared,
     EvidenceSubmitted,
+    ImplementationPublished,
     CorrectionsRemain,
     ReviewConverged,
     RequireHumanReview,
@@ -84,6 +86,7 @@ pub enum EffectKind {
     StartSupervisor,
     StartCoordinator,
     PrepareWorktrees,
+    PublishImplementation,
     StartWorker,
     StartReviewer,
     StartMergeDecision,
@@ -152,6 +155,11 @@ pub fn reduce(
             effects.push(EffectKind::StartWorker);
         }
         Input::EvidenceSubmitted if current.phase == Phase::Implementing => {
+            next.phase = Phase::Publishing;
+            next.activity = Activity::Running;
+            effects.push(EffectKind::PublishImplementation);
+        }
+        Input::ImplementationPublished if current.phase == Phase::Publishing => {
             next.phase = Phase::Reviewing;
             next.activity = Activity::Running;
             effects.push(EffectKind::StartReviewer);
@@ -298,6 +306,7 @@ pub const fn effect_name(kind: &EffectKind) -> &'static str {
         EffectKind::StartSupervisor => "start_supervisor",
         EffectKind::StartCoordinator => "start_coordinator",
         EffectKind::PrepareWorktrees => "prepare_worktrees",
+        EffectKind::PublishImplementation => "publish_implementation",
         EffectKind::StartWorker => "start_worker",
         EffectKind::StartReviewer => "start_reviewer",
         EffectKind::StartMergeDecision => "start_merge_decision",
@@ -338,6 +347,38 @@ mod tests {
             external_status: TicketStatus::Ready,
             required_review_revision: None,
         }
+    }
+
+    #[test]
+    fn implementation_review_cannot_start_before_host_delivery_receipt() {
+        let mut implementing = run();
+        implementing.phase = Phase::Implementing;
+        implementing.activity = Activity::Running;
+        let publish = reduce(
+            &implementing,
+            implementing.revision,
+            Input::EvidenceSubmitted,
+        )
+        .unwrap();
+        assert_eq!(publish.ticket_run.phase, Phase::Publishing);
+        assert_eq!(publish.effects, vec![EffectKind::PublishImplementation]);
+
+        let reviewed = reduce(
+            &publish.ticket_run,
+            publish.ticket_run.revision,
+            Input::ImplementationPublished,
+        )
+        .unwrap();
+        assert_eq!(reviewed.ticket_run.phase, Phase::Reviewing);
+        assert_eq!(reviewed.effects, vec![EffectKind::StartReviewer]);
+        assert!(
+            reduce(
+                &implementing,
+                implementing.revision,
+                Input::ImplementationPublished
+            )
+            .is_err()
+        );
     }
 
     #[test]

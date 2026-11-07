@@ -1,0 +1,2550 @@
+//! Host-owned repository delivery steps for one accepted implementation handoff.
+//!
+//! This module never opens a user's ordinary checkout. Every Git mutation is scoped to the
+//! configured managed clone and the stable worktree returned by `WorktreeManager`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use crate::config::RepositoryConfig;
+use crate::delivery_forge::{
+    PublicationError, PublishedPullRequest, PullRequestPublicationIntent, PullRequestPublisher,
+};
+use crate::domain::ids::{
+    Digest, OperationId, ProjectId, RepositoryId, TicketId, TicketNamespace, TicketRunId,
+};
+use crate::domain::types::CommitMode;
+use crate::effects::{AbsentProof, EffectHandler, EffectMode, EffectObservation, EffectRequest};
+use crate::engine::orchestration::WorkNodeId;
+use crate::engine::reducer::EffectKind;
+use crate::hooks::{HookReceipt, HookRunContext, HookRunner};
+use crate::host_commit::{
+    ChangeManifest, HostCommitError, HostCommitOptions, HostCommitReceipt, HostCommitter,
+    PreparedHostCommit,
+};
+use crate::process::{self, ProcessOutput, ProcessRequest};
+use crate::worktrees::{
+    GitOptions, ManagedRepository, ManagedWorktree, NativeCommitReceipt, TicketKey, WorktreeError,
+    WorktreeManager,
+};
+
+const DELIVERY_OUTPUT_LIMIT: usize = 1024 * 1024;
+const DELIVERY_STDERR_LIMIT: usize = 16 * 1024;
+const DELIVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkNodeIdentity {
+    pub project_id: ProjectId,
+    pub repository_id: RepositoryId,
+    pub ticket_namespace: TicketNamespace,
+    pub ticket_id: TicketId,
+    pub ticket_run_id: TicketRunId,
+    pub work_node_id: String,
+}
+
+impl WorkNodeIdentity {
+    fn ticket_key(&self) -> Result<TicketKey, DeliveryError> {
+        if self.work_node_id.is_empty()
+            || self.work_node_id.len() > 255
+            || !self
+                .work_node_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(DeliveryError::Invalid("work node ID is invalid".into()));
+        }
+        let mut digest = Sha256::new();
+        for value in [
+            self.project_id.as_str(),
+            self.ticket_namespace.as_str(),
+            self.ticket_id.as_str(),
+            self.ticket_run_id.as_str(),
+            self.work_node_id.as_str(),
+        ] {
+            digest.update(value.as_bytes());
+            digest.update([0]);
+        }
+        let composite_ticket_id = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(TicketKey {
+            namespace: self.ticket_namespace.clone(),
+            ticket_id: TicketId::parse(composite_ticket_id).map_err(DeliveryError::Invalid)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedRepositoryWork {
+    pub identity: WorkNodeIdentity,
+    pub repository: ManagedRepository,
+    pub worktree: ManagedWorktree,
+    pub expected_base_sha: String,
+    pub commit_mode: CommitMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerCommitSubmission {
+    Native {
+        previous_accepted_head: String,
+        worker_reported_head: String,
+        required_trailer: String,
+    },
+    HostManifest {
+        operation_id: OperationId,
+        expected_head: String,
+        manifest: ChangeManifest,
+        manifest_root: PathBuf,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VerifiedCommit {
+    Native { receipt: NativeCommitReceipt },
+    Host { receipt: HostCommitReceipt },
+}
+
+impl VerifiedCommit {
+    pub fn head(&self) -> &str {
+        match self {
+            Self::Native { receipt } => &receipt.head,
+            Self::Host { receipt } => &receipt.observed_head,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookGateReceipt {
+    pub repository_id: RepositoryId,
+    pub head: String,
+    pub configuration_digest: Digest,
+    pub hook_receipts: Vec<HookReceipt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushReceipt {
+    pub repository_id: RepositoryId,
+    pub branch: String,
+    pub expected_remote_head: Option<String>,
+    pub observed_remote_head: String,
+    pub pushed_head: String,
+    pub force_with_lease: bool,
+}
+
+/// Inputs captured from an authoritative forge observation before repairing a stacked branch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StackRepairRequest {
+    pub repository_id: RepositoryId,
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub recorded_base_sha: String,
+    pub old_parent_sha: String,
+    pub new_parent_sha: String,
+    pub expected_child_head: String,
+    pub expected_remote_child_head: String,
+    pub default_branch: String,
+    pub observed_protected_branches: Vec<String>,
+    pub protection_observation_complete: bool,
+    pub protection_observed_at_unix: u64,
+    pub protection_observation_digest: Digest,
+    pub required_trailer: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StackRepairReceipt {
+    pub repository_id: RepositoryId,
+    pub branch: String,
+    pub old_parent_sha: String,
+    pub new_parent_sha: String,
+    pub old_child_head: String,
+    pub new_child_head: String,
+    pub verified_commits: Vec<String>,
+    pub hook_gate: HookGateReceipt,
+    pub protection_observation_digest: Digest,
+}
+
+pub struct PullRequestPublication<'a> {
+    pub repository_config: &'a RepositoryConfig,
+    pub configuration_digest: &'a Digest,
+    pub expected_head: &'a str,
+    pub hook_gate: &'a HookGateReceipt,
+    pub intent: &'a PullRequestPublicationIntent,
+}
+
+#[derive(Debug)]
+pub enum DeliveryError {
+    Invalid(String),
+    Conflict(String),
+    Unknown(String),
+    Git(String),
+    Worktree(WorktreeError),
+    HostCommit(HostCommitError),
+    Hook(String),
+}
+
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message)
+            | Self::Conflict(message)
+            | Self::Unknown(message)
+            | Self::Git(message)
+            | Self::Hook(message) => f.write_str(message),
+            Self::Worktree(error) => write!(f, "{error}"),
+            Self::HostCommit(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for DeliveryError {}
+
+pub struct RepositoryDelivery {
+    state_root: PathBuf,
+    git: GitOptions,
+    worktrees: WorktreeManager,
+    commits: HostCommitter,
+    hooks: HookRunner,
+}
+
+impl RepositoryDelivery {
+    pub fn new(
+        state_root: &Path,
+        git: GitOptions,
+        inherited_environment: BTreeMap<OsString, OsString>,
+    ) -> Result<Self, DeliveryError> {
+        let worktrees =
+            WorktreeManager::new(state_root, git.clone()).map_err(DeliveryError::Worktree)?;
+        let commits = HostCommitter::new(HostCommitOptions {
+            git_executable: git.executable.clone(),
+            git_environment: git.environment.clone(),
+            state_root: state_root.to_owned(),
+            timeout: git.timeout,
+        })
+        .map_err(DeliveryError::HostCommit)?;
+        let hooks = HookRunner::new(git.clone(), inherited_environment);
+        Ok(Self {
+            state_root: state_root.to_owned(),
+            git,
+            worktrees,
+            commits,
+            hooks,
+        })
+    }
+
+    /// Initialize/fetch the managed clone and create or reuse the stable TicketRun/work-node branch.
+    pub fn prepare_worktree(
+        &self,
+        identity: WorkNodeIdentity,
+        repository_config: &RepositoryConfig,
+        expected_base_sha: &str,
+        commit_mode: CommitMode,
+    ) -> Result<PreparedRepositoryWork, DeliveryError> {
+        if commit_mode == CommitMode::Auto {
+            return Err(DeliveryError::Invalid(
+                "resolve automatic commit mode to native or host before preparing delivery".into(),
+            ));
+        }
+        validate_git_sha(expected_base_sha)?;
+        let repository = self
+            .worktrees
+            .ensure_repository(&identity.repository_id, &repository_config.clone_url)
+            .map_err(DeliveryError::Worktree)?;
+        let worktree = self
+            .worktrees
+            .prepare_worktree(
+                &repository,
+                &repository_config.base_branch,
+                &identity.ticket_key()?,
+            )
+            .map_err(DeliveryError::Worktree)?;
+        if worktree.base_sha != expected_base_sha {
+            return Err(DeliveryError::Conflict(
+                "fetched base differs from the accepted work plan; refusing to retarget the branch"
+                    .into(),
+            ));
+        }
+        Ok(PreparedRepositoryWork {
+            identity,
+            repository,
+            worktree,
+            expected_base_sha: expected_base_sha.to_owned(),
+            commit_mode,
+        })
+    }
+
+    /// Inspect actual refs and objects for native commits, or execute/reconcile the host manifest.
+    pub fn verify_worker_commit(
+        &self,
+        work: &PreparedRepositoryWork,
+        submission: WorkerCommitSubmission,
+    ) -> Result<VerifiedCommit, DeliveryError> {
+        match submission {
+            WorkerCommitSubmission::Native {
+                previous_accepted_head,
+                worker_reported_head,
+                required_trailer,
+            } => {
+                if work.commit_mode != CommitMode::Native {
+                    return Err(DeliveryError::Invalid(
+                        "native commit submission does not match the selected commit mode".into(),
+                    ));
+                }
+                validate_git_sha(&previous_accepted_head)?;
+                validate_git_sha(&worker_reported_head)?;
+                let mut verification_base = work.worktree.clone();
+                verification_base.base_sha = previous_accepted_head;
+                let _lease = self
+                    .worktrees
+                    .acquire_writer_lease(work.worktree.clone())
+                    .map_err(DeliveryError::Worktree)?;
+                let receipt = self
+                    .worktrees
+                    .verify_native_commits(&verification_base, &required_trailer)
+                    .map_err(DeliveryError::Worktree)?;
+                if receipt.head != worker_reported_head {
+                    return Err(DeliveryError::Conflict(
+                        "Worker-reported HEAD differs from the host-observed branch HEAD".into(),
+                    ));
+                }
+                Ok(VerifiedCommit::Native { receipt })
+            }
+            WorkerCommitSubmission::HostManifest {
+                operation_id,
+                expected_head,
+                manifest,
+                manifest_root,
+                message,
+            } => {
+                if work.commit_mode != CommitMode::Host {
+                    return Err(DeliveryError::Invalid(
+                        "host manifest submission does not match the selected commit mode".into(),
+                    ));
+                }
+                validate_git_sha(&expected_head)?;
+                let actual_head =
+                    self.git_text(&work.worktree.path, ["rev-parse", "--verify", "HEAD"])?;
+                if actual_head.trim() != expected_head {
+                    return Err(DeliveryError::Conflict(
+                        "host manifest expected HEAD differs from the current worktree".into(),
+                    ));
+                }
+                let _lease = self
+                    .worktrees
+                    .acquire_writer_lease(work.worktree.clone())
+                    .map_err(DeliveryError::Worktree)?;
+                let prepared = self
+                    .commits
+                    .prepare(
+                        &work.worktree,
+                        operation_id,
+                        manifest,
+                        &manifest_root,
+                        message,
+                    )
+                    .map_err(DeliveryError::HostCommit)?;
+                if prepared.intent.expected_head != expected_head {
+                    return Err(DeliveryError::Conflict(
+                        "host commit manifest is bound to a different expected HEAD".into(),
+                    ));
+                }
+                let receipt = match self
+                    .commits
+                    .execute(&work.worktree, &prepared)
+                    .map_err(DeliveryError::HostCommit)
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        // Keep the immutable prepared intent for the durable effect's next reconcile.
+                        return Err(error);
+                    }
+                };
+                Ok(VerifiedCommit::Host { receipt })
+            }
+        }
+    }
+
+    /// Durable effect phase: prepare a host commit intent without executing it.
+    pub fn prepare_host_manifest(
+        &self,
+        work: &PreparedRepositoryWork,
+        operation_id: OperationId,
+        expected_head: &str,
+        manifest: ChangeManifest,
+        manifest_root: &Path,
+        message: String,
+    ) -> Result<PreparedHostCommit, DeliveryError> {
+        if work.commit_mode != CommitMode::Host {
+            return Err(DeliveryError::Invalid(
+                "host manifest does not match the selected commit mode".into(),
+            ));
+        }
+        validate_git_sha(expected_head)?;
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(work.worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        let actual_head = self.git_text(&work.worktree.path, ["rev-parse", "--verify", "HEAD"])?;
+        if actual_head.trim() != expected_head {
+            return Err(DeliveryError::Conflict(
+                "host manifest expected HEAD differs from the current worktree".into(),
+            ));
+        }
+        self.commits
+            .prepare(
+                &work.worktree,
+                operation_id,
+                manifest,
+                manifest_root,
+                message,
+            )
+            .map_err(DeliveryError::HostCommit)
+    }
+
+    /// Durable effect phase: execute a previously persisted host commit intent.
+    pub fn execute_host_commit(
+        &self,
+        work: &PreparedRepositoryWork,
+        prepared: &PreparedHostCommit,
+    ) -> Result<HostCommitReceipt, DeliveryError> {
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(work.worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        self.commits
+            .execute(&work.worktree, prepared)
+            .map_err(DeliveryError::HostCommit)
+    }
+
+    /// Durable effect phase: reconcile an interrupted host commit without committing twice.
+    pub fn reconcile_host_commit(
+        &self,
+        work: &PreparedRepositoryWork,
+        prepared: &PreparedHostCommit,
+    ) -> Result<Option<HostCommitReceipt>, DeliveryError> {
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(work.worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        self.commits
+            .reconcile(&work.worktree, prepared)
+            .map_err(DeliveryError::HostCommit)
+    }
+
+    /// Execute repository-declared checks against the immutable accepted commit head.
+    pub fn run_required_hooks(
+        &self,
+        work: &PreparedRepositoryWork,
+        repository_config: &RepositoryConfig,
+        configuration_digest: &Digest,
+        verified_commit: &VerifiedCommit,
+    ) -> Result<HookGateReceipt, DeliveryError> {
+        let accepted_head = verified_commit.head();
+        validate_git_sha(accepted_head)?;
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(work.worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        let hook_receipts = self
+            .hooks
+            .run_required(
+                &repository_config.rex_projects_hooks,
+                HookRunContext {
+                    repository_id: &work.identity.repository_id,
+                    worktree: &work.worktree.path,
+                    expected_head: accepted_head,
+                    project_id: &work.identity.project_id,
+                    ticket_run_id: &work.identity.ticket_run_id,
+                    configuration_digest,
+                    state_root: &self.state_root,
+                },
+            )
+            .map_err(|error| DeliveryError::Hook(error.to_string()))?;
+        Ok(HookGateReceipt {
+            repository_id: work.identity.repository_id.clone(),
+            head: accepted_head.to_owned(),
+            configuration_digest: configuration_digest.clone(),
+            hook_receipts,
+        })
+    }
+
+    /// Push the exact owned head as a non-forced, explicit refspec. A remote already at this SHA
+    /// is an idempotent success; any different observed remote SHA is a reconciliation conflict.
+    pub fn push_owned_branch(
+        &self,
+        work: &PreparedRepositoryWork,
+        repository_config: &RepositoryConfig,
+        configuration_digest: &Digest,
+        expected_head: &str,
+        expected_remote_head: Option<&str>,
+        hook_gate: &HookGateReceipt,
+    ) -> Result<PushReceipt, DeliveryError> {
+        validate_git_sha(expected_head)?;
+        validate_hook_gate(
+            work,
+            repository_config,
+            configuration_digest,
+            expected_head,
+            hook_gate,
+        )?;
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(work.worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        if work.worktree.repository_id != work.identity.repository_id {
+            return Err(DeliveryError::Invalid(
+                "worktree repository does not match its immutable work identity".into(),
+            ));
+        }
+        let local_head = self.git_text(&work.worktree.path, ["rev-parse", "--verify", "HEAD"])?;
+        if local_head.trim() != expected_head {
+            return Err(DeliveryError::Conflict(
+                "local branch HEAD changed before publication".into(),
+            ));
+        }
+        let branch = self.git_text(
+            &work.worktree.path,
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )?;
+        if branch.trim() != work.worktree.branch {
+            return Err(DeliveryError::Conflict(
+                "worktree is no longer on its owned delivery branch".into(),
+            ));
+        }
+        let observed_remote =
+            self.remote_branch_head(&work.worktree.path, &work.worktree.branch)?;
+        if observed_remote.as_deref() == Some(expected_head) {
+            return Ok(PushReceipt {
+                repository_id: work.identity.repository_id.clone(),
+                branch: work.worktree.branch.clone(),
+                expected_remote_head: expected_remote_head.map(str::to_owned),
+                observed_remote_head: expected_head.to_owned(),
+                pushed_head: expected_head.to_owned(),
+                force_with_lease: false,
+            });
+        }
+        if observed_remote.as_deref() != expected_remote_head {
+            return Err(DeliveryError::Conflict(
+                "remote branch differs from the publication intent's expected head".into(),
+            ));
+        }
+        let refspec = format!("{expected_head}:refs/heads/{}", work.worktree.branch);
+        let result = self.git_run(&work.worktree.path, ["push", "origin", &refspec]);
+        match result {
+            Ok(output)
+                if output.status.is_some_and(|status| status.success())
+                    && !output.timed_out
+                    && output.cleanup_confirmed => {}
+            _ => {
+                let observed_after =
+                    self.remote_branch_head(&work.worktree.path, &work.worktree.branch)?;
+                if observed_after.as_deref() == Some(expected_head) {
+                    return Ok(PushReceipt {
+                        repository_id: work.identity.repository_id.clone(),
+                        branch: work.worktree.branch.clone(),
+                        expected_remote_head: expected_remote_head.map(str::to_owned),
+                        observed_remote_head: expected_head.to_owned(),
+                        pushed_head: expected_head.to_owned(),
+                        force_with_lease: false,
+                    });
+                }
+                return Err(DeliveryError::Unknown(
+                    "push outcome is uncertain; inspect the exact remote branch before retrying"
+                        .into(),
+                ));
+            }
+        }
+        let observed_after = self.remote_branch_head(&work.worktree.path, &work.worktree.branch)?;
+        if observed_after.as_deref() != Some(expected_head) {
+            return Err(DeliveryError::Unknown(
+                "push completed without verifying the exact remote head".into(),
+            ));
+        }
+        Ok(PushReceipt {
+            repository_id: work.identity.repository_id.clone(),
+            branch: work.worktree.branch.clone(),
+            expected_remote_head: expected_remote_head.map(str::to_owned),
+            observed_remote_head: expected_head.to_owned(),
+            pushed_head: expected_head.to_owned(),
+            force_with_lease: false,
+        })
+    }
+
+    /// Read-only publication reconciliation; does not update a remote ref.
+    pub fn reconcile_owned_branch(
+        &self,
+        work: &PreparedRepositoryWork,
+        repository_config: &RepositoryConfig,
+        configuration_digest: &Digest,
+        expected_head: &str,
+        expected_prior_remote_head: Option<&str>,
+        hook_gate: &HookGateReceipt,
+    ) -> Result<Option<PushReceipt>, DeliveryError> {
+        validate_git_sha(expected_head)?;
+        validate_hook_gate(
+            work,
+            repository_config,
+            configuration_digest,
+            expected_head,
+            hook_gate,
+        )?;
+        let local_head = self.git_text(&work.worktree.path, ["rev-parse", "--verify", "HEAD"])?;
+        if local_head.trim() != expected_head {
+            return Err(DeliveryError::Conflict(
+                "local branch differs from the persisted publication intent".into(),
+            ));
+        }
+        let observed = self.remote_branch_head(&work.worktree.path, &work.worktree.branch)?;
+        if observed.as_deref() == Some(expected_head) {
+            return Ok(Some(PushReceipt {
+                repository_id: work.identity.repository_id.clone(),
+                branch: work.worktree.branch.clone(),
+                expected_remote_head: expected_prior_remote_head.map(str::to_owned),
+                observed_remote_head: expected_head.to_owned(),
+                pushed_head: expected_head.to_owned(),
+                force_with_lease: false,
+            }));
+        }
+        if observed.as_deref() == expected_prior_remote_head {
+            return Ok(None);
+        }
+        Err(DeliveryError::Conflict(
+            "remote branch matches neither the previous nor intended head".into(),
+        ))
+    }
+
+    pub fn observe_local_head(
+        &self,
+        work: &PreparedRepositoryWork,
+    ) -> Result<String, DeliveryError> {
+        let head = self.git_text(&work.worktree.path, ["rev-parse", "--verify", "HEAD"])?;
+        let head = head.trim().to_owned();
+        validate_git_sha(&head)?;
+        Ok(head)
+    }
+
+    /// Validate publication identity and gate evidence before delegating to the forge adapter.
+    pub fn publish_pull_request(
+        &self,
+        publisher: &impl PullRequestPublisher,
+        work: &PreparedRepositoryWork,
+        publication: PullRequestPublication<'_>,
+    ) -> Result<PublishedPullRequest, DeliveryError> {
+        let PullRequestPublication {
+            repository_config,
+            configuration_digest,
+            expected_head,
+            hook_gate,
+            intent,
+        } = publication;
+        if repository_config.forge != "github"
+            || work.identity.repository_id != intent.repository_id
+            || work.repository.clone_url != intent.clone_url
+            || work.worktree.branch != intent.source_branch
+            || repository_config.base_branch != intent.base_branch
+            || intent.source_head != expected_head
+        {
+            return Err(DeliveryError::Conflict(
+                "pull request intent differs from the configured repository delivery".into(),
+            ));
+        }
+        validate_hook_gate(
+            work,
+            repository_config,
+            configuration_digest,
+            expected_head,
+            hook_gate,
+        )?;
+        let local_head = self.git_text(&work.worktree.path, ["rev-parse", "--verify", "HEAD"])?;
+        if local_head.trim() != expected_head {
+            return Err(DeliveryError::Conflict(
+                "local delivery branch changed before PR publication".into(),
+            ));
+        }
+        publisher
+            .publish(intent)
+            .map_err(|error: PublicationError| DeliveryError::Unknown(error.to_string()))
+    }
+
+    /// Rebase a dependent branch after its parent was squash-merged. Force is limited to an
+    /// explicitly owned, non-default, observed-unprotected branch and carries an exact lease.
+    pub fn repair_stacked_branch(
+        &self,
+        prepared_work: &PreparedRepositoryWork,
+        repository_config: &RepositoryConfig,
+        configuration_digest: &Digest,
+        request: &StackRepairRequest,
+    ) -> Result<StackRepairReceipt, DeliveryError> {
+        for sha in [
+            request.old_parent_sha.as_str(),
+            request.new_parent_sha.as_str(),
+            request.expected_child_head.as_str(),
+            request.expected_remote_child_head.as_str(),
+        ] {
+            validate_git_sha(sha)?;
+        }
+        validate_branch_name(&request.branch)?;
+        validate_branch_name(&request.default_branch)?;
+        validate_git_sha(&request.recorded_base_sha)?;
+        if !request.protection_observation_complete
+            || request.repository_id != prepared_work.identity.repository_id
+            || request.worktree_path != prepared_work.worktree.path
+            || request.branch != prepared_work.worktree.branch
+            || request.recorded_base_sha != prepared_work.worktree.base_sha
+            || request.protection_observation_digest.as_str().len() != 64
+            || request.branch == request.default_branch
+            || request
+                .observed_protected_branches
+                .iter()
+                .any(|branch| branch == &request.branch)
+        {
+            return Err(DeliveryError::Invalid(
+                "stack repair requires a non-default branch with observed unprotected status"
+                    .into(),
+            ));
+        }
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now_unix.saturating_sub(request.protection_observed_at_unix) > 300
+            || request.protection_observed_at_unix > now_unix.saturating_add(30)
+        {
+            return Err(DeliveryError::Conflict(
+                "stack repair branch-protection observation is stale".into(),
+            ));
+        }
+        let worktree = ManagedWorktree {
+            repository_id: request.repository_id.clone(),
+            path: request.worktree_path.clone(),
+            branch: request.branch.clone(),
+            base_sha: request.recorded_base_sha.clone(),
+        };
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        let local_branch = self.git_text(
+            &worktree.path,
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )?;
+        if local_branch.trim() != worktree.branch {
+            return Err(DeliveryError::Conflict(
+                "worktree is no longer on its owned stack child branch".into(),
+            ));
+        }
+        let remote_before = self.remote_branch_head(&worktree.path, &worktree.branch)?;
+        let local_head = self
+            .git_text(&worktree.path, ["rev-parse", "--verify", "HEAD"])?
+            .trim()
+            .to_owned();
+        let is_original_head = local_head == request.expected_child_head;
+        if is_original_head
+            && (request.expected_child_head != request.expected_remote_child_head
+                || remote_before.as_deref() != Some(&request.expected_remote_child_head))
+        {
+            return Err(DeliveryError::Conflict(
+                "remote child branch changed before stack repair".into(),
+            ));
+        }
+        let original_patch = self.git_bytes(
+            &worktree.path,
+            [
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                request.old_parent_sha.as_str(),
+                request.expected_child_head.as_str(),
+            ],
+        )?;
+        let old_patch_digest = Sha256::digest(&original_patch);
+        if is_original_head {
+            self.git_status_ok(
+                &worktree.path,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    request.old_parent_sha.as_str(),
+                    request.expected_child_head.as_str(),
+                ],
+            )?;
+            let merges = self.git_text(
+                &worktree.path,
+                [
+                    "rev-list",
+                    "--merges",
+                    &format!(
+                        "{}..{}",
+                        request.old_parent_sha, request.expected_child_head
+                    ),
+                ],
+            )?;
+            if !merges.trim().is_empty() {
+                return Err(DeliveryError::Conflict(
+                    "stack repair only supports a linear child commit series".into(),
+                ));
+            }
+            self.git_checked(
+                &worktree.path,
+                [
+                    "rebase",
+                    "--onto",
+                    request.new_parent_sha.as_str(),
+                    request.old_parent_sha.as_str(),
+                ],
+            )?;
+        } else {
+            let status = self.git_text(
+                &worktree.path,
+                ["status", "--porcelain=v2", "--untracked-files=all"],
+            )?;
+            if !status.is_empty() {
+                return Err(DeliveryError::Conflict(
+                    "interrupted stack rebase left a dirty worktree; manual reconciliation is required".into(),
+                ));
+            }
+            let current_patch = self.git_bytes(
+                &worktree.path,
+                [
+                    "diff",
+                    "--binary",
+                    "--no-ext-diff",
+                    request.new_parent_sha.as_str(),
+                    local_head.as_str(),
+                ],
+            )?;
+            if Sha256::digest(&current_patch) != old_patch_digest {
+                return Err(DeliveryError::Conflict(
+                    "local child differs from both the original and intended rebased history"
+                        .into(),
+                ));
+            }
+            if remote_before.as_deref() != Some(&request.expected_remote_child_head)
+                && remote_before.as_deref() != Some(&local_head)
+            {
+                return Err(DeliveryError::Conflict(
+                    "remote child branch changed during stack repair".into(),
+                ));
+            }
+        }
+        let rebased_head = self
+            .git_text(&worktree.path, ["rev-parse", "--verify", "HEAD"])?
+            .trim()
+            .to_owned();
+        validate_git_sha(&rebased_head)?;
+        let mut rebased_worktree = worktree.clone();
+        rebased_worktree.base_sha = request.new_parent_sha.clone();
+        let verified = self
+            .worktrees
+            .verify_native_commits(&rebased_worktree, &request.required_trailer)
+            .map_err(DeliveryError::Worktree)?;
+        if verified.head != rebased_head || verified.base_sha != request.new_parent_sha {
+            return Err(DeliveryError::Conflict(
+                "rebased branch did not verify against its new parent".into(),
+            ));
+        }
+        let mut rebased_prepared_work = prepared_work.clone();
+        rebased_prepared_work.worktree = rebased_worktree;
+        rebased_prepared_work.expected_base_sha = request.new_parent_sha.clone();
+        let hook_gate = self.run_required_hooks(
+            &rebased_prepared_work,
+            repository_config,
+            configuration_digest,
+            &VerifiedCommit::Native {
+                receipt: verified.clone(),
+            },
+        )?;
+        let refspec = format!("{rebased_head}:refs/heads/{}", worktree.branch);
+        let lease = format!(
+            "--force-with-lease=refs/heads/{}:{}",
+            worktree.branch, request.expected_remote_child_head
+        );
+        if remote_before.as_deref() != Some(&rebased_head) {
+            let result = self.git_run(&worktree.path, ["push", &lease, "origin", &refspec]);
+            if !matches!(result, Ok(ref output) if output.status.is_some_and(|status| status.success()) && !output.timed_out && output.cleanup_confirmed)
+                && self
+                    .remote_branch_head(&worktree.path, &worktree.branch)?
+                    .as_deref()
+                    != Some(&rebased_head)
+            {
+                return Err(DeliveryError::Unknown(
+                    "stack repair push outcome is uncertain; reconcile the exact remote ref".into(),
+                ));
+            }
+        }
+        let remote_after = self.remote_branch_head(&worktree.path, &worktree.branch)?;
+        if remote_after.as_deref() != Some(&rebased_head) {
+            return Err(DeliveryError::Unknown(
+                "stack repair did not verify the exact remote head".into(),
+            ));
+        }
+        Ok(StackRepairReceipt {
+            repository_id: request.repository_id.clone(),
+            branch: worktree.branch.clone(),
+            old_parent_sha: request.old_parent_sha.clone(),
+            new_parent_sha: request.new_parent_sha.clone(),
+            old_child_head: request.expected_child_head.clone(),
+            new_child_head: rebased_head,
+            verified_commits: verified.commits,
+            hook_gate,
+            protection_observation_digest: request.protection_observation_digest.clone(),
+        })
+    }
+
+    fn remote_branch_head(
+        &self,
+        cwd: &Path,
+        branch: &str,
+    ) -> Result<Option<String>, DeliveryError> {
+        let reference = format!("refs/heads/{branch}");
+        let output = self.git_run(cwd, ["ls-remote", "--heads", "origin", &reference])?;
+        if !output.status.is_some_and(|status| status.success())
+            || output.timed_out
+            || !output.cleanup_confirmed
+            || output.stdout_truncated
+        {
+            return Err(DeliveryError::Unknown(
+                "cannot establish the current remote branch head".into(),
+            ));
+        }
+        let text = String::from_utf8(output.stdout)
+            .map_err(|_| DeliveryError::Unknown("remote branch response is not UTF-8".into()))?;
+        let mut rows = text.lines();
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        if rows.next().is_some() {
+            return Err(DeliveryError::Unknown(
+                "remote returned multiple rows for an exact branch ref".into(),
+            ));
+        }
+        let (sha, refname) = row.split_once('\t').ok_or_else(|| {
+            DeliveryError::Unknown("remote returned an invalid ref observation".into())
+        })?;
+        validate_git_sha(sha)?;
+        if refname != reference {
+            return Err(DeliveryError::Unknown(
+                "remote returned a different branch ref".into(),
+            ));
+        }
+        Ok(Some(sha.to_owned()))
+    }
+
+    fn git_text<const N: usize>(
+        &self,
+        cwd: &Path,
+        args: [&str; N],
+    ) -> Result<String, DeliveryError> {
+        let output = self.git_run(cwd, args)?;
+        if !output.status.is_some_and(|status| status.success())
+            || output.timed_out
+            || !output.cleanup_confirmed
+            || output.stdout_truncated
+        {
+            return Err(DeliveryError::Git(
+                "Git command failed or had an uncertain outcome".into(),
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| DeliveryError::Git("Git output is not UTF-8".into()))
+    }
+
+    fn git_bytes<const N: usize>(
+        &self,
+        cwd: &Path,
+        args: [&str; N],
+    ) -> Result<Vec<u8>, DeliveryError> {
+        let output = self.git_run(cwd, args)?;
+        if !output.status.is_some_and(|status| status.success())
+            || output.timed_out
+            || !output.cleanup_confirmed
+            || output.stdout_truncated
+        {
+            return Err(DeliveryError::Git(
+                "Git command failed or had an uncertain outcome".into(),
+            ));
+        }
+        Ok(output.stdout)
+    }
+
+    fn git_checked<const N: usize>(
+        &self,
+        cwd: &Path,
+        args: [&str; N],
+    ) -> Result<(), DeliveryError> {
+        let output = self.git_run(cwd, args)?;
+        if output.status.is_some_and(|status| status.success())
+            && !output.timed_out
+            && output.cleanup_confirmed
+        {
+            Ok(())
+        } else {
+            Err(DeliveryError::Conflict(
+                "stack rebase failed; inspect the managed worktree before retrying".into(),
+            ))
+        }
+    }
+
+    fn git_status_ok<const N: usize>(
+        &self,
+        cwd: &Path,
+        args: [&str; N],
+    ) -> Result<(), DeliveryError> {
+        let output = self.git_run(cwd, args)?;
+        if output.status.is_some_and(|status| status.success())
+            && !output.timed_out
+            && output.cleanup_confirmed
+        {
+            Ok(())
+        } else {
+            Err(DeliveryError::Conflict(
+                "Git ancestry precondition is not satisfied".into(),
+            ))
+        }
+    }
+
+    fn git_run<const N: usize>(
+        &self,
+        cwd: &Path,
+        args: [&str; N],
+    ) -> Result<ProcessOutput, DeliveryError> {
+        let mut environment = self.git.environment.clone();
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            environment.remove(std::ffi::OsStr::new(key));
+        }
+        environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        process::run(ProcessRequest {
+            executable: self.git.executable.clone(),
+            args: args.into_iter().map(OsString::from).collect(),
+            stdin: Vec::new(),
+            cwd: Some(cwd.to_owned()),
+            clear_environment: true,
+            environment,
+            timeout: self.git.timeout,
+            shutdown_grace: DELIVERY_SHUTDOWN_GRACE,
+            stdout_limit: DELIVERY_OUTPUT_LIMIT,
+            stderr_tail_limit: DELIVERY_STDERR_LIMIT,
+        })
+        .map_err(|_| DeliveryError::Unknown("Git process did not produce a reliable result".into()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareWorktreesEffectPayload {
+    pub schema_version: u32,
+    pub source_revision: u64,
+    pub configuration_digest: Digest,
+    pub ticket_namespace: TicketNamespace,
+    pub ticket_id: TicketId,
+    pub ticket_run_id: TicketRunId,
+    pub work_nodes: Vec<PreparedWorktreeNodeRequest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedWorktreeNodeRequest {
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub expected_base_sha: String,
+    pub commit_mode: CommitMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerDeliveryCommit {
+    Native {
+        previous_accepted_head: String,
+        worker_reported_head: String,
+        required_trailer: String,
+    },
+    HostManifest {
+        expected_head: String,
+        manifest: ChangeManifest,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishImplementationEffectPayload {
+    pub schema_version: u32,
+    pub source_revision: u64,
+    pub configuration_digest: Digest,
+    pub ticket_namespace: TicketNamespace,
+    pub ticket_id: TicketId,
+    pub ticket_run_id: TicketRunId,
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub expected_base_sha: String,
+    pub base_branch: String,
+    pub commit_mode: CommitMode,
+    pub commit: WorkerDeliveryCommit,
+    pub expected_remote_head: Option<String>,
+    pub pull_request: PullRequestContent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestContent {
+    pub title: String,
+    pub body: String,
+    pub update_target: Option<crate::delivery_forge::PullRequestTarget>,
+}
+
+/// Canonical wire encoding for durable delivery effect requests.
+pub fn canonical_delivery_payload<T: Serialize>(payload: &T) -> Result<(String, String), String> {
+    let value = serde_json::to_value(payload).map_err(|error| error.to_string())?;
+    let json = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    let digest = sha256_hex(json.as_bytes());
+    Ok((json, digest))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedWorktreesEffectReceipt {
+    pub schema_version: u32,
+    pub ticket_run_id: TicketRunId,
+    pub work_nodes: Vec<PreparedWorktreeReceiptNode>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedWorktreeReceiptNode {
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub base_sha: String,
+    pub commit_mode: CommitMode,
+}
+
+/// Settings and adapters shared by the two repository-delivery effect handlers.
+pub struct RepositoryDeliveryEffects {
+    delivery: RepositoryDelivery,
+    publisher: crate::delivery_forge::GitHubPullRequestPublisher,
+    configuration_digest: Digest,
+    repositories: BTreeMap<RepositoryId, RepositoryConfig>,
+    project_repositories: BTreeMap<ProjectId, BTreeSet<RepositoryId>>,
+}
+
+pub struct RepositoryDeliveryEffectConfig {
+    pub state_root: PathBuf,
+    pub git: GitOptions,
+    pub inherited_environment: BTreeMap<OsString, OsString>,
+    pub gh_executable: PathBuf,
+    pub gh_environment: BTreeMap<OsString, OsString>,
+    pub timeout: Duration,
+    pub configuration_digest: Digest,
+    pub repositories: BTreeMap<RepositoryId, RepositoryConfig>,
+    pub project_repositories: BTreeMap<ProjectId, BTreeSet<RepositoryId>>,
+}
+
+impl RepositoryDeliveryEffects {
+    pub fn new(config: RepositoryDeliveryEffectConfig) -> Result<Arc<Self>, String> {
+        let delivery =
+            RepositoryDelivery::new(&config.state_root, config.git, config.inherited_environment)
+                .map_err(|error| error.to_string())?;
+        let publisher = crate::delivery_forge::GitHubPullRequestPublisher::new(
+            config.gh_executable,
+            config.gh_environment,
+            config.timeout,
+        )
+        .map_err(|error| error.to_string())?;
+        for (project, repositories) in &config.project_repositories {
+            if repositories
+                .iter()
+                .any(|repository| !config.repositories.contains_key(repository))
+            {
+                return Err(format!(
+                    "Project `{project}` references an unknown repository in delivery registry"
+                ));
+            }
+        }
+        Ok(Arc::new(Self {
+            delivery,
+            publisher,
+            configuration_digest: config.configuration_digest,
+            repositories: config.repositories,
+            project_repositories: config.project_repositories,
+        }))
+    }
+
+    pub fn prepare_worktrees_handler(self: &Arc<Self>) -> PrepareWorktreesEffectHandler {
+        PrepareWorktreesEffectHandler {
+            effects: Arc::clone(self),
+        }
+    }
+
+    pub fn publish_implementation_handler(self: &Arc<Self>) -> PublishImplementationEffectHandler {
+        PublishImplementationEffectHandler {
+            effects: Arc::clone(self),
+        }
+    }
+
+    fn prepare_worktrees(
+        &self,
+        request: &EffectRequest,
+    ) -> Result<PreparedWorktreesEffectReceipt, String> {
+        let payload: PrepareWorktreesEffectPayload = decode_effect_payload(request)?;
+        self.validate_prepare_payload(request, &payload)?;
+        let mut receipts = Vec::with_capacity(payload.work_nodes.len());
+        for node in payload.work_nodes {
+            let identity = WorkNodeIdentity {
+                project_id: request.intent.project_id.clone(),
+                repository_id: node.repository_id.clone(),
+                ticket_namespace: payload.ticket_namespace.clone(),
+                ticket_id: payload.ticket_id.clone(),
+                ticket_run_id: payload.ticket_run_id.clone(),
+                work_node_id: node.work_node_id.to_string(),
+            };
+            let repository_config = self.repository(&node.repository_id)?;
+            let prepared = self
+                .delivery
+                .prepare_worktree(
+                    identity,
+                    repository_config,
+                    &node.expected_base_sha,
+                    node.commit_mode,
+                )
+                .map_err(|error| error.to_string())?;
+            receipts.push(PreparedWorktreeReceiptNode {
+                work_node_id: node.work_node_id,
+                repository_id: node.repository_id,
+                worktree_path: prepared.worktree.path,
+                branch: prepared.worktree.branch,
+                base_sha: prepared.worktree.base_sha,
+                commit_mode: prepared.commit_mode,
+            });
+        }
+        Ok(PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: payload.ticket_run_id,
+            work_nodes: receipts,
+        })
+    }
+
+    fn validate_prepare_payload(
+        &self,
+        request: &EffectRequest,
+        payload: &PrepareWorktreesEffectPayload,
+    ) -> Result<(), String> {
+        self.validate_scope(
+            request,
+            &payload.ticket_run_id,
+            &payload.configuration_digest,
+        )?;
+        validate_effect_kind(request, EffectKind::PrepareWorktrees)?;
+        validate_source_revision(request, payload.source_revision)?;
+        if payload.schema_version != 1 || payload.work_nodes.is_empty() {
+            return Err("prepare_worktrees payload is empty or uses an unsupported schema".into());
+        }
+        let mut previous_id: Option<String> = None;
+        for node in &payload.work_nodes {
+            let node_id = node.work_node_id.to_string();
+            if previous_id
+                .as_ref()
+                .is_some_and(|previous| previous >= &node_id)
+            {
+                return Err("work_nodes must be unique and sorted by work_node_id".into());
+            }
+            previous_id = Some(node_id);
+            self.require_repository(&request.intent.project_id, &node.repository_id)?;
+            if node.commit_mode == CommitMode::Auto {
+                return Err(
+                    "commit_mode must resolve to native or host before worktree prep".into(),
+                );
+            }
+            validate_git_sha(&node.expected_base_sha).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn validate_publish_payload(
+        &self,
+        request: &EffectRequest,
+        payload: &PublishImplementationEffectPayload,
+    ) -> Result<(), String> {
+        self.validate_scope(
+            request,
+            &payload.ticket_run_id,
+            &payload.configuration_digest,
+        )?;
+        validate_effect_kind(request, EffectKind::PublishImplementation)?;
+        validate_source_revision(request, payload.source_revision)?;
+        if payload.schema_version != 1 {
+            return Err("publish_implementation uses an unsupported schema".into());
+        }
+        self.require_repository(&request.intent.project_id, &payload.repository_id)?;
+        if payload.commit_mode == CommitMode::Auto {
+            return Err("commit_mode must resolve to native or host before publishing".into());
+        }
+        validate_git_sha(&payload.expected_base_sha).map_err(|error| error.to_string())?;
+        if let Some(expected) = &payload.expected_remote_head {
+            validate_git_sha(expected).map_err(|error| error.to_string())?;
+        }
+        let repository_config = self.repository(&payload.repository_id)?;
+        if payload.base_branch != repository_config.base_branch {
+            return Err("pull request base branch differs from repository configuration".into());
+        }
+        crate::delivery_forge::validate_github_clone_url(&repository_config.clone_url)
+            .map_err(|error| error.to_string())?;
+        if payload.pull_request.title.trim().is_empty()
+            || payload.pull_request.title.contains(['\n', '\r'])
+        {
+            return Err("pull request title must be one nonempty line".into());
+        }
+        match (&payload.commit, payload.commit_mode) {
+            (
+                WorkerDeliveryCommit::Native {
+                    previous_accepted_head,
+                    worker_reported_head,
+                    required_trailer,
+                },
+                CommitMode::Native,
+            ) => {
+                validate_git_sha(previous_accepted_head).map_err(|error| error.to_string())?;
+                validate_git_sha(worker_reported_head).map_err(|error| error.to_string())?;
+                if required_trailer.trim().is_empty() || required_trailer.contains(['\n', '\r']) {
+                    return Err("required commit trailer must be a nonempty single line".into());
+                }
+            }
+            (
+                WorkerDeliveryCommit::HostManifest {
+                    expected_head,
+                    message,
+                    ..
+                },
+                CommitMode::Host,
+            ) => {
+                validate_git_sha(expected_head).map_err(|error| error.to_string())?;
+                if message.trim().is_empty() {
+                    return Err("host commit message must not be empty".into());
+                }
+            }
+            _ => return Err("commit payload does not match the configured commit mode".into()),
+        }
+        Ok(())
+    }
+
+    fn publish_implementation(
+        &self,
+        mode: EffectMode,
+        request: &EffectRequest,
+    ) -> Result<EffectObservation, String> {
+        let payload: PublishImplementationEffectPayload = decode_effect_payload(request)?;
+        self.validate_publish_payload(request, &payload)?;
+        let repository_config = self.repository(&payload.repository_id)?;
+        let identity = WorkNodeIdentity {
+            project_id: request.intent.project_id.clone(),
+            repository_id: payload.repository_id.clone(),
+            ticket_namespace: payload.ticket_namespace.clone(),
+            ticket_id: payload.ticket_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            work_node_id: payload.work_node_id.to_string(),
+        };
+        let work = self
+            .delivery
+            .prepare_worktree(
+                identity,
+                repository_config,
+                &payload.expected_base_sha,
+                payload.commit_mode,
+            )
+            .map_err(|error| error.to_string())?;
+        let commit = match (&payload.commit, payload.commit_mode, mode) {
+            (
+                WorkerDeliveryCommit::Native {
+                    previous_accepted_head,
+                    worker_reported_head,
+                    required_trailer,
+                },
+                CommitMode::Native,
+                EffectMode::Submit,
+            ) => self
+                .delivery
+                .verify_worker_commit(
+                    &work,
+                    WorkerCommitSubmission::Native {
+                        previous_accepted_head: previous_accepted_head.clone(),
+                        worker_reported_head: worker_reported_head.clone(),
+                        required_trailer: required_trailer.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?,
+            (
+                WorkerDeliveryCommit::Native {
+                    previous_accepted_head,
+                    worker_reported_head,
+                    required_trailer,
+                },
+                CommitMode::Native,
+                EffectMode::Reconcile,
+            ) => {
+                if self
+                    .delivery
+                    .observe_local_head(&work)
+                    .map_err(|error| error.to_string())?
+                    .as_str()
+                    == previous_accepted_head
+                {
+                    return absent_effect(
+                        EffectKind::PublishImplementation,
+                        request,
+                        "managed_git_worktree_head",
+                        format!(
+                            "the owned branch remains at accepted head {previous_accepted_head}"
+                        ),
+                    );
+                }
+                self.delivery
+                    .verify_worker_commit(
+                        &work,
+                        WorkerCommitSubmission::Native {
+                            previous_accepted_head: previous_accepted_head.clone(),
+                            worker_reported_head: worker_reported_head.clone(),
+                            required_trailer: required_trailer.clone(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?
+            }
+            (
+                WorkerDeliveryCommit::HostManifest {
+                    expected_head,
+                    manifest,
+                    message,
+                },
+                CommitMode::Host,
+                _,
+            ) => {
+                let host_operation = derived_operation_id(
+                    &request.intent.operation_id,
+                    &payload.repository_id,
+                    payload.work_node_id.as_str(),
+                    "commit",
+                )?;
+                let prepared = self
+                    .delivery
+                    .prepare_host_manifest(
+                        &work,
+                        host_operation,
+                        expected_head,
+                        manifest.clone(),
+                        &work.worktree.path,
+                        message.clone(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if mode == EffectMode::Reconcile {
+                    match self
+                        .delivery
+                        .reconcile_host_commit(&work, &prepared)
+                        .map_err(|error| error.to_string())?
+                    {
+                        Some(receipt) => VerifiedCommit::Host { receipt },
+                        None => {
+                            return absent_effect(
+                                EffectKind::PublishImplementation,
+                                request,
+                                "managed_git_worktree_head",
+                                format!(
+                                    "the owned branch remains at expected head {expected_head}"
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    let receipt = self
+                        .delivery
+                        .execute_host_commit(&work, &prepared)
+                        .map_err(|error| error.to_string())?;
+                    VerifiedCommit::Host { receipt }
+                }
+            }
+            _ => return Err("commit payload does not match the configured commit mode".into()),
+        };
+        let hook_gate = self
+            .delivery
+            .run_required_hooks(
+                &work,
+                repository_config,
+                &self.configuration_digest,
+                &commit,
+            )
+            .map_err(|error| error.to_string())?;
+        if mode == EffectMode::Reconcile {
+            let push = self
+                .delivery
+                .reconcile_owned_branch(
+                    &work,
+                    repository_config,
+                    &self.configuration_digest,
+                    commit.head(),
+                    payload.expected_remote_head.as_deref(),
+                    &hook_gate,
+                )
+                .map_err(|error| error.to_string())?;
+            let Some(push) = push else {
+                return absent_effect(
+                    EffectKind::PublishImplementation,
+                    request,
+                    "git_remote_ref",
+                    format!(
+                        "{} is still at its prior expected head {:?}",
+                        work.worktree.branch, payload.expected_remote_head
+                    ),
+                );
+            };
+            let pr_operation = derived_operation_id(
+                &request.intent.operation_id,
+                &payload.repository_id,
+                payload.work_node_id.as_str(),
+                "pull-request",
+            )?;
+            let intent = PullRequestPublicationIntent {
+                operation_id: pr_operation,
+                repository_id: payload.repository_id.clone(),
+                clone_url: repository_config.clone_url.clone(),
+                source_branch: work.worktree.branch.clone(),
+                source_head: commit.head().to_owned(),
+                base_branch: repository_config.base_branch.clone(),
+                title: payload.pull_request.title.clone(),
+                body: payload.pull_request.body.clone(),
+                update_target: payload.pull_request.update_target.clone(),
+            };
+            if let Some(pull_request) = self
+                .publisher
+                .reconcile(&intent)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(EffectObservation::Applied {
+                    receipt: serde_json::to_string(&ImplementationPublicationReceipt {
+                        schema_version: 1,
+                        effect_operation_id: request.intent.operation_id.clone(),
+                        source_revision: payload.source_revision,
+                        configuration_digest: payload.configuration_digest.clone(),
+                        ticket_run_id: payload.ticket_run_id.clone(),
+                        repository_id: payload.repository_id,
+                        work_node_id: payload.work_node_id,
+                        commit,
+                        hook_gate,
+                        push,
+                        pull_request,
+                    })
+                    .map_err(|error| error.to_string())?,
+                });
+            }
+            return absent_effect(
+                EffectKind::PublishImplementation,
+                request,
+                "github_pull_request_search",
+                format!(
+                    "no PR with operation marker {} for {}/{}",
+                    intent.operation_id, intent.source_branch, intent.base_branch
+                ),
+            );
+        }
+        let push = self
+            .delivery
+            .push_owned_branch(
+                &work,
+                repository_config,
+                &self.configuration_digest,
+                commit.head(),
+                payload.expected_remote_head.as_deref(),
+                &hook_gate,
+            )
+            .map_err(|error| error.to_string())?;
+        let pr_operation = derived_operation_id(
+            &request.intent.operation_id,
+            &payload.repository_id,
+            payload.work_node_id.as_str(),
+            "pull-request",
+        )?;
+        let intent = PullRequestPublicationIntent {
+            operation_id: pr_operation,
+            repository_id: payload.repository_id.clone(),
+            clone_url: repository_config.clone_url.clone(),
+            source_branch: work.worktree.branch.clone(),
+            source_head: commit.head().to_owned(),
+            base_branch: repository_config.base_branch.clone(),
+            title: payload.pull_request.title.clone(),
+            body: payload.pull_request.body.clone(),
+            update_target: payload.pull_request.update_target.clone(),
+        };
+        let pull_request = self
+            .delivery
+            .publish_pull_request(
+                &self.publisher,
+                &work,
+                PullRequestPublication {
+                    repository_config,
+                    configuration_digest: &self.configuration_digest,
+                    expected_head: commit.head(),
+                    hook_gate: &hook_gate,
+                    intent: &intent,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(EffectObservation::Applied {
+            receipt: serde_json::to_string(&ImplementationPublicationReceipt {
+                schema_version: 1,
+                effect_operation_id: request.intent.operation_id.clone(),
+                source_revision: payload.source_revision,
+                configuration_digest: payload.configuration_digest.clone(),
+                ticket_run_id: payload.ticket_run_id.clone(),
+                repository_id: payload.repository_id,
+                work_node_id: payload.work_node_id,
+                commit,
+                hook_gate,
+                push,
+                pull_request,
+            })
+            .map_err(|error| error.to_string())?,
+        })
+    }
+
+    fn validate_scope(
+        &self,
+        request: &EffectRequest,
+        ticket_run_id: &TicketRunId,
+        configuration_digest: &Digest,
+    ) -> Result<(), String> {
+        if request.intent.subject_type != "ticket_run"
+            || request.intent.subject_id != ticket_run_id.as_str()
+            || request.intent.expected_revision.is_none()
+            || configuration_digest != &self.configuration_digest
+        {
+            return Err("effect scope, revision, or configuration digest does not match".into());
+        }
+        Ok(())
+    }
+
+    fn require_repository(
+        &self,
+        project_id: &ProjectId,
+        repository_id: &RepositoryId,
+    ) -> Result<(), String> {
+        if !self
+            .project_repositories
+            .get(project_id)
+            .is_some_and(|repositories| repositories.contains(repository_id))
+            || !self.repositories.contains_key(repository_id)
+        {
+            return Err("repository is not configured for this Project".into());
+        }
+        Ok(())
+    }
+
+    fn repository(&self, repository_id: &RepositoryId) -> Result<&RepositoryConfig, String> {
+        self.repositories
+            .get(repository_id)
+            .ok_or_else(|| "repository is missing from the active configuration".into())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationPublicationReceipt {
+    pub schema_version: u32,
+    pub effect_operation_id: String,
+    pub source_revision: u64,
+    pub configuration_digest: Digest,
+    pub ticket_run_id: TicketRunId,
+    pub repository_id: RepositoryId,
+    pub work_node_id: WorkNodeId,
+    pub commit: VerifiedCommit,
+    pub hook_gate: HookGateReceipt,
+    pub push: PushReceipt,
+    pub pull_request: PublishedPullRequest,
+}
+
+/// Validate the persisted Applied receipt against the original effect and prepared worktree.
+/// Caller code must invoke this on the durable dispatcher receipt before releasing Reviewer.
+pub fn validate_implementation_publication_receipt(
+    request: &EffectRequest,
+    prepared_worktree: &PreparedWorktreeReceiptNode,
+    receipt_json: &str,
+) -> Result<ImplementationPublicationReceipt, String> {
+    let payload: PublishImplementationEffectPayload = decode_effect_payload(request)?;
+    validate_effect_kind(request, EffectKind::PublishImplementation)?;
+    validate_source_revision(request, payload.source_revision)?;
+    let receipt: ImplementationPublicationReceipt = serde_json::from_str(receipt_json)
+        .map_err(|error| format!("invalid implementation receipt JSON: {error}"))?;
+    if receipt.schema_version != 1
+        || receipt.effect_operation_id != request.intent.operation_id
+        || receipt.source_revision != payload.source_revision
+        || receipt.configuration_digest != payload.configuration_digest
+        || receipt.ticket_run_id != payload.ticket_run_id
+        || receipt.repository_id != payload.repository_id
+        || receipt.work_node_id != payload.work_node_id
+        || prepared_worktree.repository_id != payload.repository_id
+        || prepared_worktree.work_node_id != payload.work_node_id
+        || prepared_worktree.commit_mode != payload.commit_mode
+        || prepared_worktree.base_sha != payload.expected_base_sha
+    {
+        return Err(
+            "implementation receipt does not match its effect and worktree identities".into(),
+        );
+    }
+    let head = receipt.commit.head();
+    match (&receipt.commit, &payload.commit) {
+        (
+            VerifiedCommit::Native { receipt: commit },
+            WorkerDeliveryCommit::Native {
+                previous_accepted_head,
+                worker_reported_head,
+                ..
+            },
+        ) if payload.commit_mode == CommitMode::Native
+            && commit.base_sha == *previous_accepted_head
+            && commit.head == *worker_reported_head
+            && commit.commits.last().is_some_and(|last| last == head) => {}
+        (
+            VerifiedCommit::Host { receipt: commit },
+            WorkerDeliveryCommit::HostManifest {
+                expected_head,
+                manifest,
+                ..
+            },
+        ) if payload.commit_mode == CommitMode::Host
+            && commit.repository_id == payload.repository_id
+            && commit.expected_head == *expected_head
+            && commit.observed_head == *head
+            && commit.signature_verified
+            && commit.hooks_completed
+            && commit.index_synchronized
+            && !commit.index_sync_conflict
+            && digest_json(manifest)? == commit.manifest_digest.as_str() => {}
+        _ => {
+            return Err("implementation receipt commit does not match the requested commit".into());
+        }
+    }
+    if receipt.hook_gate.repository_id != payload.repository_id
+        || receipt.hook_gate.head != head
+        || receipt.hook_gate.configuration_digest != payload.configuration_digest
+        || receipt.hook_gate.hook_receipts.iter().any(|hook| {
+            !hook.succeeded
+                || hook.timed_out
+                || !hook.cleanup_confirmed
+                || hook.source_before != hook.source_after
+                || hook.head != head
+                || hook.repository_id != payload.repository_id
+                || hook.ticket_run_id != payload.ticket_run_id
+                || hook.configuration_digest != payload.configuration_digest
+        })
+    {
+        return Err("implementation receipt hook gate is incomplete or mismatched".into());
+    }
+    if receipt.push.repository_id != payload.repository_id
+        || receipt.push.branch != prepared_worktree.branch
+        || receipt.push.pushed_head != head
+        || receipt.push.observed_remote_head != head
+        || receipt.push.expected_remote_head != payload.expected_remote_head
+        || receipt.push.force_with_lease
+    {
+        return Err("implementation receipt does not prove the exact expected remote head".into());
+    }
+    let expected_pr_operation = derived_operation_id(
+        &request.intent.operation_id,
+        &payload.repository_id,
+        payload.work_node_id.as_str(),
+        "pull-request",
+    )?;
+    let expected_body = format!(
+        "{}\n\n<!-- rex-projects-operation:{} -->",
+        payload.pull_request.body.trim_end(),
+        expected_pr_operation.as_str()
+    );
+    if receipt.pull_request.repository_id != payload.repository_id
+        || receipt.pull_request.operation_id != expected_pr_operation
+        || receipt.pull_request.source_branch != prepared_worktree.branch
+        || receipt.pull_request.source_head != head
+        || receipt.pull_request.base_branch != payload.base_branch
+        || receipt.pull_request.title != payload.pull_request.title
+        || receipt.pull_request.body_digest != sha256_hex(expected_body.as_bytes())
+        || receipt.pull_request.state != "open"
+        || receipt.pull_request.url.is_empty()
+        || receipt.pull_request.node_id.is_empty()
+    {
+        return Err(
+            "implementation receipt pull request does not match the delivery intent".into(),
+        );
+    }
+    Ok(receipt)
+}
+
+fn digest_json<T: Serialize>(value: &T) -> Result<String, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(&bytes))
+}
+
+pub struct PrepareWorktreesEffectHandler {
+    effects: Arc<RepositoryDeliveryEffects>,
+}
+
+impl EffectHandler for PrepareWorktreesEffectHandler {
+    fn kind(&self) -> EffectKind {
+        EffectKind::PrepareWorktrees
+    }
+
+    fn handle(
+        &self,
+        _mode: EffectMode,
+        request: &EffectRequest,
+    ) -> Result<EffectObservation, String> {
+        let payload: PrepareWorktreesEffectPayload = match decode_effect_payload(request) {
+            Ok(payload) => payload,
+            Err(error) => return Ok(rejected_delivery_effect(error)),
+        };
+        if let Err(error) = self.effects.validate_prepare_payload(request, &payload) {
+            return Ok(rejected_delivery_effect(error));
+        }
+        let receipt = self.effects.prepare_worktrees(request)?;
+        Ok(EffectObservation::Applied {
+            receipt: serde_json::to_string(&receipt).map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+pub struct PublishImplementationEffectHandler {
+    effects: Arc<RepositoryDeliveryEffects>,
+}
+
+impl EffectHandler for PublishImplementationEffectHandler {
+    fn kind(&self) -> EffectKind {
+        EffectKind::PublishImplementation
+    }
+
+    fn handle(
+        &self,
+        mode: EffectMode,
+        request: &EffectRequest,
+    ) -> Result<EffectObservation, String> {
+        let payload: PublishImplementationEffectPayload = match decode_effect_payload(request) {
+            Ok(payload) => payload,
+            Err(error) => return Ok(rejected_delivery_effect(error)),
+        };
+        if let Err(error) = self.effects.validate_publish_payload(request, &payload) {
+            return Ok(rejected_delivery_effect(error));
+        }
+        self.effects.publish_implementation(mode, request)
+    }
+}
+
+fn rejected_delivery_effect(error: String) -> EffectObservation {
+    EffectObservation::Rejected {
+        receipt: serde_json::json!({
+            "schema_version": 1,
+            "outcome": "rejected",
+            "reason": error,
+        })
+        .to_string(),
+    }
+}
+
+fn decode_effect_payload<T>(request: &EffectRequest) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let parsed: serde_json::Value = serde_json::from_str(&request.intent.request_json)
+        .map_err(|error| format!("invalid effect JSON: {error}"))?;
+    let canonical = serde_json::to_string(&parsed).map_err(|error| error.to_string())?;
+    if canonical != request.intent.request_json {
+        return Err("effect request JSON is not canonical".into());
+    }
+    if sha256_hex(request.intent.request_json.as_bytes()) != request.intent.request_digest {
+        return Err("effect request digest does not match its payload".into());
+    }
+    serde_json::from_value(parsed).map_err(|error| format!("invalid typed effect payload: {error}"))
+}
+
+fn validate_effect_kind(request: &EffectRequest, expected: EffectKind) -> Result<(), String> {
+    if request.intent.kind != crate::engine::reducer::effect_name(&expected) {
+        return Err("effect kind does not match its typed delivery handler".into());
+    }
+    Ok(())
+}
+
+fn validate_source_revision(request: &EffectRequest, source_revision: u64) -> Result<(), String> {
+    if request.intent.expected_revision != Some(source_revision) {
+        return Err(
+            "effect payload revision does not match the persisted expected revision".into(),
+        );
+    }
+    Ok(())
+}
+
+fn absent_effect(
+    kind: EffectKind,
+    request: &EffectRequest,
+    authority: &str,
+    evidence: String,
+) -> Result<EffectObservation, String> {
+    Ok(EffectObservation::AuthoritativelyAbsent {
+        proof: AbsentProof::from_authoritative_lookup(kind, request, authority, evidence)?,
+    })
+}
+
+fn derived_operation_id(
+    parent: &str,
+    repository_id: &RepositoryId,
+    node_id: &str,
+    stage: &str,
+) -> Result<OperationId, String> {
+    let bytes = [parent, repository_id.as_str(), node_id, stage].join("\0");
+    OperationId::parse(format!("rp-{}", sha256_hex(bytes.as_bytes())))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_git_sha(value: &str) -> Result<(), DeliveryError> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(DeliveryError::Invalid(
+            "Git object ID is not canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_branch_name(value: &str) -> Result<(), DeliveryError> {
+    if value.is_empty()
+        || value.len() > 240
+        || value.starts_with('-')
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+    {
+        return Err(DeliveryError::Invalid(
+            "managed branch name is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hook_gate(
+    work: &PreparedRepositoryWork,
+    repository_config: &RepositoryConfig,
+    expected_configuration_digest: &Digest,
+    expected_head: &str,
+    receipt: &HookGateReceipt,
+) -> Result<(), DeliveryError> {
+    let mut expected_ids = repository_config
+        .rex_projects_hooks
+        .iter()
+        .map(|hook| hook.id.as_str())
+        .collect::<Vec<_>>();
+    expected_ids.sort_unstable();
+    let mut actual_ids = receipt
+        .hook_receipts
+        .iter()
+        .map(|hook| hook.hook_id.as_str())
+        .collect::<Vec<_>>();
+    actual_ids.sort_unstable();
+    if receipt.repository_id != work.identity.repository_id
+        || receipt.head != expected_head
+        || &receipt.configuration_digest != expected_configuration_digest
+        || expected_ids != actual_ids
+        || receipt.hook_receipts.iter().any(|hook| {
+            hook.repository_id != work.identity.repository_id
+                || hook.project_id != work.identity.project_id
+                || hook.ticket_run_id != work.identity.ticket_run_id
+                || hook.head != expected_head
+                || &hook.configuration_digest != expected_configuration_digest
+                || !hook.succeeded
+        })
+    {
+        return Err(DeliveryError::Conflict(
+            "repository hook evidence is missing, failed, or bound to a different subject".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MergeConfig;
+    use crate::process::ProcessRequest;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn git_path() -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("git"))
+            .find(|path| path.is_file())
+            .expect("git is installed for local repository fixtures")
+    }
+
+    fn git(executable: &Path, cwd: &Path, args: &[&str]) {
+        let output = process::run(ProcessRequest {
+            executable: executable.to_owned(),
+            args: args.iter().map(OsString::from).collect(),
+            stdin: Vec::new(),
+            cwd: Some(cwd.to_owned()),
+            clear_environment: true,
+            environment: BTreeMap::new(),
+            timeout: Duration::from_secs(20),
+            shutdown_grace: Duration::from_secs(2),
+            stdout_limit: 1024 * 1024,
+            stderr_tail_limit: 8192,
+        })
+        .unwrap();
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "fixture git command failed: {args:?}"
+        );
+    }
+
+    fn seed_local_remote(root: &Path, executable: &Path) -> (PathBuf, String) {
+        let bare = root.join("origin.git");
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            executable,
+            root,
+            &["init", "--bare", bare.to_str().unwrap()],
+        );
+        git(
+            executable,
+            root,
+            &["init", "-b", "main", seed.to_str().unwrap()],
+        );
+        std::fs::write(seed.join("README.md"), "base\n").unwrap();
+        git(executable, &seed, &["add", "README.md"]);
+        git(
+            executable,
+            &seed,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        git(
+            executable,
+            &seed,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(executable, &seed, &["push", "origin", "main"]);
+        let head = std::process::Command::new(executable)
+            .current_dir(&seed)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        (
+            bare,
+            String::from_utf8(head.stdout).unwrap().trim().to_owned(),
+        )
+    }
+
+    fn fixture_repository_config(clone_url: String) -> RepositoryConfig {
+        RepositoryConfig {
+            clone_url,
+            base_branch: "main".into(),
+            forge: "github".into(),
+            worktree_root: None,
+            instruction_files: Vec::new(),
+            role_instruction_files: BTreeMap::new(),
+            rex_projects_hooks: Vec::new(),
+            merge: MergeConfig::default(),
+            operations: None,
+        }
+    }
+
+    #[test]
+    fn work_node_branch_key_is_stable_but_distinguishes_nodes_and_ticket_runs() {
+        let first = WorkNodeIdentity {
+            project_id: ProjectId::parse("project").unwrap(),
+            repository_id: RepositoryId::parse("repo").unwrap(),
+            ticket_namespace: TicketNamespace::parse("tickets/acme").unwrap(),
+            ticket_id: TicketId::parse("T-42").unwrap(),
+            ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+            work_node_id: "service-change".into(),
+        };
+        assert_eq!(first.ticket_key().unwrap(), first.ticket_key().unwrap());
+        let mut second = first.clone();
+        second.work_node_id = "docs-change".into();
+        assert_ne!(first.ticket_key().unwrap(), second.ticket_key().unwrap());
+    }
+
+    #[test]
+    fn pushes_only_owned_managed_branch_and_reconciles_exact_remote_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let bare = temp.path().join("origin.git");
+        let seed = temp.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            &executable,
+            temp.path(),
+            &["init", "--bare", bare.to_str().unwrap()],
+        );
+        git(
+            &executable,
+            temp.path(),
+            &["init", "-b", "main", seed.to_str().unwrap()],
+        );
+        std::fs::write(seed.join("README.md"), "base\n").unwrap();
+        git(&executable, &seed, &["add", "README.md"]);
+        git(
+            &executable,
+            &seed,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        git(
+            &executable,
+            &seed,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(&executable, &seed, &["push", "origin", "main"]);
+        let base = String::from_utf8(
+            std::process::Command::new(&executable)
+                .current_dir(&seed)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let repo_id = RepositoryId::parse("demo").unwrap();
+        let project_id = ProjectId::parse("project").unwrap();
+        let identity = WorkNodeIdentity {
+            project_id,
+            repository_id: repo_id,
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-10").unwrap(),
+            ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+            work_node_id: "api".into(),
+        };
+        let git_options = GitOptions {
+            executable: executable.clone(),
+            environment: BTreeMap::new(),
+            timeout: Duration::from_secs(20),
+        };
+        let delivery =
+            RepositoryDelivery::new(&temp.path().join("state"), git_options, BTreeMap::new())
+                .unwrap();
+        let config = RepositoryConfig {
+            clone_url: bare.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            forge: "github".into(),
+            worktree_root: None,
+            instruction_files: Vec::new(),
+            role_instruction_files: BTreeMap::new(),
+            rex_projects_hooks: Vec::new(),
+            merge: MergeConfig::default(),
+            operations: None,
+        };
+        let work = delivery
+            .prepare_worktree(identity, &config, &base, CommitMode::Native)
+            .unwrap();
+        std::fs::write(work.worktree.path.join("change.txt"), "feature\n").unwrap();
+        git(&executable, &work.worktree.path, &["add", "change.txt"]);
+        git(
+            &executable,
+            &work.worktree.path,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "feature",
+            ],
+        );
+        let head = std::process::Command::new(&executable)
+            .current_dir(&work.worktree.path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let digest = Digest::parse("a".repeat(64)).unwrap();
+        let gate = HookGateReceipt {
+            repository_id: work.identity.repository_id.clone(),
+            head: head.clone(),
+            configuration_digest: digest.clone(),
+            hook_receipts: Vec::new(),
+        };
+        let first = delivery
+            .push_owned_branch(&work, &config, &digest, &head, None, &gate)
+            .unwrap();
+        let second = delivery
+            .push_owned_branch(&work, &config, &digest, &head, None, &gate)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.pushed_head, head);
+        assert!(!first.force_with_lease);
+    }
+
+    #[test]
+    fn prepare_worktrees_effect_is_canonical_scoped_and_replayable() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let (bare, base_sha) = seed_local_remote(temp.path(), &executable);
+        let repository_id = RepositoryId::parse("demo").unwrap();
+        let project_id = ProjectId::parse("project").unwrap();
+        let repository_config = fixture_repository_config(bare.to_string_lossy().into_owned());
+        let gh_executable = temp.path().join("gh-fixture");
+        std::fs::write(&gh_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&gh_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let configuration_digest = Digest::parse("c".repeat(64)).unwrap();
+        let effects = RepositoryDeliveryEffects::new(RepositoryDeliveryEffectConfig {
+            state_root: temp.path().join("state"),
+            git: GitOptions {
+                executable,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(20),
+            },
+            inherited_environment: BTreeMap::new(),
+            gh_executable,
+            gh_environment: BTreeMap::new(),
+            timeout: Duration::from_secs(5),
+            configuration_digest: configuration_digest.clone(),
+            repositories: BTreeMap::from([(repository_id.clone(), repository_config)]),
+            project_repositories: BTreeMap::from([(
+                project_id.clone(),
+                BTreeSet::from([repository_id.clone()]),
+            )]),
+        })
+        .unwrap();
+        let payload = PrepareWorktreesEffectPayload {
+            schema_version: 1,
+            source_revision: 1,
+            configuration_digest,
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-3").unwrap(),
+            ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+            work_nodes: vec![PreparedWorktreeNodeRequest {
+                work_node_id: WorkNodeId::parse("api").unwrap(),
+                repository_id,
+                expected_base_sha: base_sha.clone(),
+                commit_mode: CommitMode::Native,
+            }],
+        };
+        let mut invalid_payload = payload.clone();
+        invalid_payload
+            .work_nodes
+            .push(PreparedWorktreeNodeRequest {
+                work_node_id: WorkNodeId::parse("zeta").unwrap(),
+                repository_id: RepositoryId::parse("demo").unwrap(),
+                expected_base_sha: base_sha.clone(),
+                commit_mode: CommitMode::Auto,
+            });
+        let (invalid_json, invalid_digest) = canonical_delivery_payload(&invalid_payload).unwrap();
+        let invalid_request = EffectRequest {
+            intent: crate::store::EffectIntent {
+                project_id: ProjectId::parse("project").unwrap(),
+                subject_type: "ticket_run".into(),
+                subject_id: "run-1".into(),
+                operation_id: "prepare-invalid".into(),
+                logical_key: "run-1:revision-1:prepare-invalid".into(),
+                kind: "prepare_worktrees".into(),
+                request_json: invalid_json,
+                request_digest: invalid_digest,
+                expected_revision: Some(1),
+            },
+            attempt_count: 0,
+            created_at_unix: 1,
+        };
+        let handler = effects.prepare_worktrees_handler();
+        assert!(matches!(
+            handler
+                .handle(EffectMode::Submit, &invalid_request)
+                .unwrap(),
+            EffectObservation::Rejected { .. }
+        ));
+        assert!(!temp.path().join("state/worktrees/demo").exists());
+
+        let (request_json, request_digest) = canonical_delivery_payload(&payload).unwrap();
+        let request = EffectRequest {
+            intent: crate::store::EffectIntent {
+                project_id,
+                subject_type: "ticket_run".into(),
+                subject_id: "run-1".into(),
+                operation_id: "prepare-1".into(),
+                logical_key: "run-1:revision-1:prepare_worktrees".into(),
+                kind: "prepare_worktrees".into(),
+                request_json,
+                request_digest,
+                expected_revision: Some(1),
+            },
+            attempt_count: 0,
+            created_at_unix: 1,
+        };
+        let first = handler.handle(EffectMode::Submit, &request).unwrap();
+        let second = handler.handle(EffectMode::Reconcile, &request).unwrap();
+        let (
+            EffectObservation::Applied { receipt: first },
+            EffectObservation::Applied { receipt: second },
+        ) = (first, second)
+        else {
+            panic!("prepare worktrees effect must be replayable");
+        };
+        assert_eq!(first, second);
+        let receipt: PreparedWorktreesEffectReceipt = serde_json::from_str(&first).unwrap();
+        assert_eq!(receipt.work_nodes.len(), 1);
+        assert!(
+            receipt.work_nodes[0]
+                .worktree_path
+                .starts_with(temp.path().join("state/worktrees").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn publish_effect_rejects_invalid_forge_configuration_before_git_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let (bare, base_sha) = seed_local_remote(temp.path(), &executable);
+        let repository_id = RepositoryId::parse("demo").unwrap();
+        let project_id = ProjectId::parse("project").unwrap();
+        let gh_executable = temp.path().join("gh-fixture");
+        std::fs::write(&gh_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&gh_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let configuration_digest = Digest::parse("d".repeat(64)).unwrap();
+        let effects = RepositoryDeliveryEffects::new(RepositoryDeliveryEffectConfig {
+            state_root: temp.path().join("state"),
+            git: GitOptions {
+                executable,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(20),
+            },
+            inherited_environment: BTreeMap::new(),
+            gh_executable,
+            gh_environment: BTreeMap::new(),
+            timeout: Duration::from_secs(5),
+            configuration_digest: configuration_digest.clone(),
+            repositories: BTreeMap::from([(
+                repository_id.clone(),
+                fixture_repository_config(bare.to_string_lossy().into_owned()),
+            )]),
+            project_repositories: BTreeMap::from([(
+                project_id.clone(),
+                BTreeSet::from([repository_id.clone()]),
+            )]),
+        })
+        .unwrap();
+        let payload = PublishImplementationEffectPayload {
+            schema_version: 1,
+            source_revision: 1,
+            configuration_digest,
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-4").unwrap(),
+            ticket_run_id: TicketRunId::parse("run-4").unwrap(),
+            work_node_id: WorkNodeId::parse("api").unwrap(),
+            repository_id,
+            expected_base_sha: base_sha.clone(),
+            base_branch: "main".into(),
+            commit_mode: CommitMode::Native,
+            commit: WorkerDeliveryCommit::Native {
+                previous_accepted_head: base_sha.clone(),
+                worker_reported_head: base_sha,
+                required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+            },
+            expected_remote_head: None,
+            pull_request: PullRequestContent {
+                title: "Ship feature".into(),
+                body: "Implementation details".into(),
+                update_target: None,
+            },
+        };
+        let (request_json, request_digest) = canonical_delivery_payload(&payload).unwrap();
+        let request = EffectRequest {
+            intent: crate::store::EffectIntent {
+                project_id,
+                subject_type: "ticket_run".into(),
+                subject_id: "run-4".into(),
+                operation_id: "publish-4".into(),
+                logical_key: "run-4:revision-1:publish".into(),
+                kind: "publish_implementation".into(),
+                request_json,
+                request_digest,
+                expected_revision: Some(1),
+            },
+            attempt_count: 0,
+            created_at_unix: 1,
+        };
+
+        assert!(matches!(
+            effects
+                .publish_implementation_handler()
+                .handle(EffectMode::Submit, &request)
+                .unwrap(),
+            EffectObservation::Rejected { .. }
+        ));
+        assert!(!temp.path().join("state/worktrees/demo").exists());
+        assert!(!temp.path().join("state/repos/demo").exists());
+    }
+
+    #[test]
+    fn persisted_publication_receipt_must_bind_commit_hooks_push_and_pr() {
+        let project_id = ProjectId::parse("project").unwrap();
+        let repository_id = RepositoryId::parse("demo").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-5").unwrap();
+        let work_node_id = WorkNodeId::parse("api").unwrap();
+        let configuration_digest = Digest::parse("e".repeat(64)).unwrap();
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        let branch = "rex-projects/1234567890abcdef1234567890abcdef".to_owned();
+        let payload = PublishImplementationEffectPayload {
+            schema_version: 1,
+            source_revision: 7,
+            configuration_digest: configuration_digest.clone(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-5").unwrap(),
+            ticket_run_id: ticket_run_id.clone(),
+            work_node_id: work_node_id.clone(),
+            repository_id: repository_id.clone(),
+            expected_base_sha: base.clone(),
+            base_branch: "main".into(),
+            commit_mode: CommitMode::Native,
+            commit: WorkerDeliveryCommit::Native {
+                previous_accepted_head: base.clone(),
+                worker_reported_head: head.clone(),
+                required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+            },
+            expected_remote_head: None,
+            pull_request: PullRequestContent {
+                title: "Ship feature".into(),
+                body: "Details".into(),
+                update_target: None,
+            },
+        };
+        let (request_json, request_digest) = canonical_delivery_payload(&payload).unwrap();
+        let request = EffectRequest {
+            intent: crate::store::EffectIntent {
+                project_id,
+                subject_type: "ticket_run".into(),
+                subject_id: ticket_run_id.to_string(),
+                operation_id: "publish-op".into(),
+                logical_key: "run-5:revision-7:publish".into(),
+                kind: "publish_implementation".into(),
+                request_json,
+                request_digest,
+                expected_revision: Some(7),
+            },
+            attempt_count: 1,
+            created_at_unix: 1,
+        };
+        let prepared = PreparedWorktreeReceiptNode {
+            work_node_id: work_node_id.clone(),
+            repository_id: repository_id.clone(),
+            worktree_path: PathBuf::from("/managed/worktree"),
+            branch: branch.clone(),
+            base_sha: base.clone(),
+            commit_mode: CommitMode::Native,
+        };
+        let pr_operation = derived_operation_id(
+            &request.intent.operation_id,
+            &repository_id,
+            work_node_id.as_str(),
+            "pull-request",
+        )
+        .unwrap();
+        let body = format!(
+            "Details\n\n<!-- rex-projects-operation:{} -->",
+            pr_operation.as_str()
+        );
+        let receipt = ImplementationPublicationReceipt {
+            schema_version: 1,
+            effect_operation_id: "publish-op".into(),
+            source_revision: 7,
+            configuration_digest: configuration_digest.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            repository_id: repository_id.clone(),
+            work_node_id: work_node_id.clone(),
+            commit: VerifiedCommit::Native {
+                receipt: NativeCommitReceipt {
+                    head: head.clone(),
+                    base_sha: base,
+                    commits: vec![head.clone()],
+                },
+            },
+            hook_gate: HookGateReceipt {
+                repository_id: repository_id.clone(),
+                head: head.clone(),
+                configuration_digest,
+                hook_receipts: Vec::new(),
+            },
+            push: PushReceipt {
+                repository_id: repository_id.clone(),
+                branch: branch.clone(),
+                expected_remote_head: None,
+                observed_remote_head: head.clone(),
+                pushed_head: head.clone(),
+                force_with_lease: false,
+            },
+            pull_request: PublishedPullRequest {
+                repository_id,
+                number: 42,
+                node_id: "PR_fixture".into(),
+                url: "https://github.com/acme/demo/pull/42".into(),
+                state: "open".into(),
+                source_branch: branch,
+                source_head: head,
+                base_branch: "main".into(),
+                title: "Ship feature".into(),
+                body_digest: sha256_hex(body.as_bytes()),
+                operation_id: pr_operation,
+            },
+        };
+
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(
+            validate_implementation_publication_receipt(&request, &prepared, &json).unwrap(),
+            receipt
+        );
+        let mut tampered = receipt;
+        tampered.push.pushed_head = "c".repeat(40);
+        assert!(
+            validate_implementation_publication_receipt(
+                &request,
+                &prepared,
+                &serde_json::to_string(&tampered).unwrap()
+            )
+            .is_err()
+        );
+    }
+}
