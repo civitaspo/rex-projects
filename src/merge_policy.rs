@@ -141,6 +141,8 @@ pub struct MergePolicy {
     pub method: MergeMethod,
     pub executor: MergeExecutor,
     pub required_checks: Vec<String>,
+    /// Server-enforced minimum for direct merges; `None` means the repository policy requires none.
+    pub required_approving_reviews: Option<u64>,
     pub risk_weights: RiskWeights,
 }
 
@@ -536,6 +538,7 @@ mod tests {
             method: MergeMethod::Squash,
             executor,
             required_checks: vec!["ci".into()],
+            required_approving_reviews: None,
             risk_weights: RiskWeights::default(),
         }
     }

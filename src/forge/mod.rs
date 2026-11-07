@@ -165,6 +165,8 @@ pub struct IssueComment {
 pub struct BranchProtection {
     pub strict_required_status_checks: bool,
     pub required_check_contexts: Vec<String>,
+    pub required_approving_review_count: Option<u64>,
+    pub dismiss_stale_reviews: Option<bool>,
     pub enforce_admins: bool,
     pub allow_force_pushes: bool,
     pub allow_deletions: bool,
@@ -172,7 +174,14 @@ pub struct BranchProtection {
 }
 
 impl BranchProtection {
-    pub fn supports_execution_base_guard(&self, required_checks: &[String]) -> bool {
+    /// Proves the observed server-side protections needed for unattended direct merge.
+    /// This is not an atomic comparison against an assessed base SHA: GitHub's merge API has no
+    /// expected-base parameter. Callers must preflight the base and verify ancestry afterwards.
+    pub fn supports_execution_base_guard(
+        &self,
+        required_checks: &[String],
+        required_approving_reviews: Option<u64>,
+    ) -> bool {
         self.strict_required_status_checks
             && self.enforce_admins
             && !self.allow_force_pushes
@@ -181,6 +190,13 @@ impl BranchProtection {
             && required_checks
                 .iter()
                 .all(|required| self.required_check_contexts.contains(required))
+            && required_approving_reviews.is_none_or(|required| {
+                required > 0
+                    && self
+                        .required_approving_review_count
+                        .is_some_and(|configured| configured >= required)
+                    && self.dismiss_stale_reviews == Some(true)
+            })
     }
 }
 
@@ -377,6 +393,7 @@ pub struct DirectMergeIntent {
     pub operation_key: String,
     pub method: MergeMethod,
     pub expected_head_sha: String,
+    /// Preflight staleness check only. GitHub cannot atomically condition the merge on this SHA.
     pub expected_base_sha: String,
 }
 
