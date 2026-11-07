@@ -5,15 +5,19 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use crate::adapters::rex::{RexCliTransport, RexIdentity};
+use crate::adapters::rex::{
+    AgentBlockSpec, CreateDisposition, RexCliTransport, RexContextBlock, RexIdentity, RexWindow,
+    owned_agent_block_label, owned_supervisor_window_label, owned_ticket_window_label,
+};
 use crate::adapters::tickets::{
     NormalizedTicketStatus, TicketAdapter, TicketGetRequest, TicketListRequest, TicketScope,
     build_ticket_adapter,
 };
 use crate::artifacts::ArtifactStore;
 use crate::config::{AppliedConfig, Config};
-use crate::domain::ids::{AdapterId, Digest, TicketId, TicketNamespace};
+use crate::domain::ids::{AdapterId, Digest, RexBlockId, TicketId, TicketNamespace};
 use crate::domain::types::{Role, TicketStatus};
 use crate::effects::EffectHandler;
 use crate::engine::factory_runtime::{ExternalTicketPage, FactoryRuntimeServices};
@@ -37,7 +41,9 @@ pub struct RuntimeServices {
     environment: EnvironmentSnapshot,
     host_environment: BTreeMap<OsString, OsString>,
     rex_identity: RexIdentity,
-    rex: RexCliTransport,
+    rex: Arc<RexCliTransport>,
+    rex_cli_path: PathBuf,
+    rex_search_path: Vec<PathBuf>,
     state_root: PathBuf,
     config_dir: PathBuf,
     owner_generation: u64,
@@ -89,15 +95,17 @@ impl RuntimeServices {
             &search_path,
         )
         .ok_or("configured Rex executable is unavailable in the captured environment")?;
-        let rex = RexCliTransport::connect(
-            &rex_binary,
-            &search_path,
-            rex_identity.endpoint.clone(),
-            rex_identity.instance_id.clone(),
-            rex_identity.session_id.clone(),
-            host_environment.clone(),
-        )
-        .map_err(|error| error.to_string())?;
+        let rex = Arc::new(
+            RexCliTransport::connect(
+                &rex_binary,
+                &search_path,
+                rex_identity.endpoint.clone(),
+                rex_identity.instance_id.clone(),
+                rex_identity.session_id.clone(),
+                host_environment.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
         let artifact_root = state_root.join("artifacts");
         let artifacts = ArtifactStore::open(&artifact_root)?;
         let delivery =
@@ -131,6 +139,53 @@ impl RuntimeServices {
             )
             .into_handlers(),
         );
+        handlers.push(Box::new(
+            crate::operations_runtime::OperationEffectHandler::new(
+                [applied_config.clone()],
+                Duration::from_secs(applied_config.config.runtime.shutdown_grace_seconds),
+            )?,
+        ));
+        if let Some(knowledge) = &applied_config.config.knowledge {
+            let root = PathBuf::from(&knowledge.root);
+            let root = if root.is_absolute() {
+                root
+            } else {
+                config_dir.join(root)
+            };
+            handlers.push(Box::new(
+                crate::knowledge_effect::KnowledgeEffectHandler::new(root),
+            ));
+        }
+        let declarative_root = host_environment
+            .get(std::ffi::OsStr::new("XDG_CONFIG_HOME"))
+            .map(PathBuf::from)
+            .or_else(|| {
+                host_environment
+                    .get(std::ffi::OsStr::new("HOME"))
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .ok_or("captured environment has neither XDG_CONFIG_HOME nor HOME")?
+            .join("rex-projects")
+            .join("profiles");
+        handlers.push(Box::new(crate::profile_effect::ProfileEffectHandler::new(
+            declarative_root,
+        )));
+        let materializer = Arc::new(RuntimeAgentMaterializer {
+            applied_config: applied_config.clone(),
+            environment: environment.clone(),
+            state_root: state_root.to_owned(),
+            owner_generation,
+            runtime_binary: runtime_binary.to_owned(),
+            runtime_binary_digest: runtime_binary_digest.clone(),
+            rex_cli_path: rex_binary.clone(),
+            rex_search_path: search_path.clone(),
+            rex_identity: rex_identity.clone(),
+            rex: rex.clone(),
+            tickets: tickets.clone(),
+        });
+        handlers.push(Box::new(
+            crate::start_agent::StartAgentEffectHandler::for_all_roles(materializer),
+        ));
         Ok(Self {
             tickets,
             namespaces: BTreeMap::new(),
@@ -142,6 +197,8 @@ impl RuntimeServices {
             host_environment,
             rex_identity: rex_identity.clone(),
             rex,
+            rex_cli_path: rex_binary,
+            rex_search_path: search_path,
             state_root: state_root.to_owned(),
             config_dir: config_dir.to_owned(),
             owner_generation,
@@ -159,6 +216,415 @@ impl RuntimeServices {
 
     pub fn configuration_digest(&self) -> &Digest {
         &self.configuration_digest
+    }
+}
+
+struct RuntimeAgentMaterializer {
+    applied_config: AppliedConfig,
+    environment: EnvironmentSnapshot,
+    state_root: PathBuf,
+    owner_generation: u64,
+    runtime_binary: PathBuf,
+    runtime_binary_digest: Digest,
+    rex_cli_path: PathBuf,
+    rex_search_path: Vec<PathBuf>,
+    rex_identity: RexIdentity,
+    rex: Arc<RexCliTransport>,
+    tickets: Arc<dyn TicketAdapter>,
+}
+
+impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
+    fn environment_handoff_path(
+        &self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        _now_unix: i64,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<PathBuf, String> {
+        self.validate_reservation(store, owner_generation, reservation)?;
+        let handoff = self
+            .environment
+            .create_handoff_for_operation(&self.state_root, reservation.operation_id.as_str())
+            .map_err(|error| error.to_string())?;
+        if handoff.snapshot_id() != &reservation.environment_snapshot_id {
+            return Err("launch environment snapshot changed after reservation".into());
+        }
+        Ok(handoff.path().to_owned())
+    }
+
+    fn ensure_parked_wrapper(
+        &self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        _now_unix: i64,
+        reservation: &crate::launch::AgentLaunchReservation,
+        package_path: &Path,
+        environment_handoff: &Path,
+    ) -> Result<RexContextBlock, String> {
+        self.validate_reservation(store, owner_generation, reservation)?;
+        if package_path != reservation.descriptor_path
+            || !environment_handoff.is_absolute()
+            || !reservation.workspace_path.is_absolute()
+        {
+            return Err("run-step wrapper paths do not match the immutable reservation".into());
+        }
+        let record = store
+            .rex_view_history(&reservation.project_id)?
+            .into_iter()
+            .find(|record| {
+                record.lifecycle == "active" && record.view.view_id == reservation.rex_view_id
+            })
+            .ok_or("launch reservation has no active Rex view")?;
+        if record.view.rex_server_identity != self.rex_identity.instance_id
+            || record.view.rex_session_id != self.rex_identity.session_id
+        {
+            return Err("launch Rex view is not on the pinned Rex session".into());
+        }
+        let label = match record.view.kind {
+            crate::launch::RexViewKind::Supervisor => {
+                if reservation.role != Role::Supervisor {
+                    return Err("non-Supervisor launch references a Supervisor Rex view".into());
+                }
+                owned_supervisor_window_label(reservation.project_id.as_str())
+            }
+            crate::launch::RexViewKind::Ticket => {
+                let namespace = record
+                    .view
+                    .ticket_namespace
+                    .as_deref()
+                    .ok_or("ticket Rex view is missing its namespace")?;
+                let ticket_id = record
+                    .view
+                    .ticket_id
+                    .as_deref()
+                    .ok_or("ticket Rex view is missing its ticket ID")?;
+                owned_ticket_window_label(namespace, ticket_id)
+                    .map_err(|error| error.to_string())?
+            }
+        };
+        let window = RexWindow {
+            server_instance_id: record.view.rex_server_identity,
+            session_id: record.view.rex_session_id,
+            window_id: record.view.rex_window_id,
+            label: label.clone(),
+            initial_block_id: None,
+            disposition: CreateDisposition::Existing,
+        };
+        let blocks = self
+            .rex
+            .list_window_blocks(&window, &label)
+            .map_err(|error| error.to_string())?;
+        let expected_label = owned_agent_block_label(reservation.agent_run_id.as_str())
+            .map_err(|error| error.to_string())?;
+        let existing = blocks
+            .iter()
+            .filter(|block| block.label == expected_label)
+            .collect::<Vec<_>>();
+        if existing.len() > 1 {
+            return Err("multiple Rex blocks claim the same AgentRun".into());
+        }
+        if let Some(block) = existing.first() {
+            let observed = self
+                .rex
+                .validate_context_block(&block.block_id)
+                .map_err(|error| error.to_string())?;
+            if observed.window_id != window.window_id || observed.label != expected_label {
+                return Err("existing Rex block does not match the AgentRun reservation".into());
+            }
+            return Ok(observed);
+        }
+        let anchor = blocks
+            .first()
+            .ok_or("owned Rex view has no anchor block for a finite Agent turn")?;
+        let spec = AgentBlockSpec {
+            run_id: reservation.agent_run_id.as_str().to_owned(),
+            command: PathBuf::from("/usr/bin/env"),
+            args: vec![
+                "REX_PROJECTS_AGENT=1".into(),
+                "REX_PROJECTS_CONTEXT=agent".into(),
+                format!("REX_PROJECTS_PROJECT_ID={}", reservation.project_id),
+                format!(
+                    "REX_PROJECTS_ROLE={}",
+                    crate::roles::role_name(reservation.role)
+                ),
+                format!("REX_PROJECTS_RUN_ID={}", reservation.agent_run_id),
+                self.runtime_binary.display().to_string(),
+                "agent".into(),
+                "run-step".into(),
+                "--run".into(),
+                reservation.agent_run_id.as_str().to_owned(),
+                "--package".into(),
+                package_path.display().to_string(),
+                "--environment-handoff".into(),
+                environment_handoff.display().to_string(),
+            ],
+            cwd: reservation.workspace_path.clone(),
+            path_prepend: self.rex_search_path.clone(),
+        };
+        let block_id = self
+            .rex
+            .create_agent_block(&window, &anchor.block_id, &spec)
+            .map_err(|error| error.to_string())?;
+        let observed = self
+            .rex
+            .validate_context_block(&block_id)
+            .map_err(|error| error.to_string())?;
+        if observed.window_id != window.window_id || observed.label != expected_label {
+            return Err("new Rex block does not match the AgentRun reservation".into());
+        }
+        Ok(observed)
+    }
+
+    fn build_package(
+        &self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        reservation: &crate::launch::AgentLaunchReservation,
+        observed_block: &RexContextBlock,
+        _environment_handoff: &Path,
+    ) -> Result<crate::run_step_package::RunStepPackage, String> {
+        self.validate_reservation(store, owner_generation, reservation)?;
+        let project = self
+            .applied_config
+            .config
+            .projects
+            .get(&reservation.project_id)
+            .ok_or("Agent reservation references an unconfigured Project")?;
+        let active_run = if let Some(ticket_run_id) = &reservation.ticket_run_id {
+            Some(
+                store
+                    .active_ticket_runs(owner_generation, 256)?
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == *ticket_run_id)
+                    .ok_or("Agent reservation references a missing or terminal TicketRun")?,
+            )
+        } else {
+            None
+        };
+        let ticket = if let Some(active_run) = &active_run {
+            if active_run.project_id != reservation.project_id
+                || Some(active_run.revision) != reservation.ticket_revision.map(|r| r.0)
+            {
+                return Err("TicketRun revision changed after Agent reservation".into());
+            }
+            let scope_values = project
+                .ticket_scope
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_owned()))
+                        .ok_or_else(|| format!("ticket scope `{key}` must be a string"))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let result = self
+                .tickets
+                .get(
+                    RequestId::new(format!("rex-projects-ticket-{}", reservation.agent_run_id))?,
+                    Some(reservation.project_id.clone()),
+                    TicketGetRequest {
+                        scope: TicketScope::new(scope_values).map_err(|e| e.to_string())?,
+                        ticket_id: active_run.ticket_id.as_str().to_owned(),
+                        timeline_limit: Some(20),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            if result.ticket_namespace != active_run.namespace.as_str()
+                || result
+                    .ticket
+                    .revision
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err("ticket adapter returned a stale or unscoped ticket".into());
+            }
+            Some(crate::roles::TicketBrief {
+                ticket_id: active_run.ticket_id.clone(),
+                ticket_revision: active_run.revision,
+                title: result.ticket.title,
+                body: result.ticket.body,
+                acceptance: Vec::new(),
+            })
+        } else {
+            None
+        };
+        if reservation.role == Role::Worker {
+            return Err("Worker package requires the opaque prepared-worktree launch token".into());
+        }
+        let profile = self
+            .applied_config
+            .profiles
+            .get(&reservation.profile_id)
+            .ok_or("Agent profile is missing from the applied configuration")?;
+        let profile_digest = digest_serialized(profile)?;
+        if profile_digest != reservation.profile_digest {
+            return Err("Agent profile changed after launch reservation".into());
+        }
+        let operation_recipe = reservation.operation_recipe_id.clone();
+        let rendered = crate::roles::render_role_prompt(
+            &self.applied_config,
+            &crate::roles::PromptContext {
+                project_id: reservation.project_id.clone(),
+                profile_id: Some(reservation.profile_id.clone()),
+                role: reservation.role,
+                operation_recipe,
+                repositories: project.repositories.clone(),
+                ticket,
+                recovery_summary: None,
+                accepted_plan: active_run
+                    .as_ref()
+                    .and_then(|run| {
+                        store
+                            .latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)
+                            .ok()
+                            .flatten()
+                    })
+                    .map(|plan| serde_json::to_string(&plan.plan).unwrap_or_default()),
+                previous_decisions: Vec::new(),
+                required_evidence: Vec::new(),
+                stop_conditions: Vec::new(),
+                assigned_commit_mode: Some(profile.commit_mode),
+            },
+        )?;
+        if rendered.instruction_digest != reservation.instruction_digest
+            || rendered.result_schema_digest != reservation.result_schema_digest
+        {
+            return Err("rendered role package no longer matches its durable reservation".into());
+        }
+        let runtime_identity = crate::run_step::profile_runtime_identity(profile)
+            .map_err(|error| error.to_string())?;
+        let qualifications = store.verified_provider_qualifications(
+            &reservation.project_id,
+            &reservation.profile_id,
+            &reservation.profile_digest,
+            32,
+        )?;
+        let qualification = qualifications
+            .into_iter()
+            .find(|qualification| {
+                qualification.canonical_digest().ok().as_ref()
+                    == Some(&reservation.qualification_receipt_digest)
+                    && qualification.adapter == runtime_identity.adapter
+                    && qualification.executable_path
+                        == runtime_identity.executable_path.display().to_string()
+                    && qualification.executable_digest == runtime_identity.executable_digest
+                    && qualification.commit_mode == runtime_identity.commit_mode
+                    && qualification.invocation_options_digest
+                        == runtime_identity.invocation_options_digest
+                    && qualification.permission_mode == runtime_identity.effective_permission_mode
+            })
+            .ok_or("launch reservation no longer matches a verified provider qualification")?;
+        qualification.validate_for_unattended_launch()?;
+        let projection = crate::providers::project_result_schema(&rendered.result_schema)?;
+        let rex_block_id = RexBlockId::parse(observed_block.block_id.clone())?;
+        let capability = crate::run_step::ProviderCapabilityEvidence {
+            schema_version: 1,
+            adapter: qualification.adapter,
+            profile_digest: reservation.profile_digest.clone(),
+            version: qualification.provider_version,
+            executable_path: runtime_identity.executable_path,
+            executable_digest: runtime_identity.executable_digest,
+            permission_mode: qualification.permission_mode,
+            invocation_options_digest: runtime_identity.invocation_options_digest,
+            commit_mode: runtime_identity.commit_mode,
+            schema_projection: projection.identity,
+            receipt_digest: reservation.qualification_receipt_digest.clone(),
+            status: crate::run_step::ProviderQualificationStatus::Verified,
+        };
+        let descriptor = crate::run_step::RunDescriptor {
+            schema_version: 1,
+            project_id: reservation.project_id.clone(),
+            run_id: reservation.agent_run_id.clone(),
+            role: reservation.role,
+            ticket_run_id: reservation.ticket_run_id.clone(),
+            attempt: reservation.attempt,
+            run_epoch: reservation.run_epoch,
+            controller_generation: reservation.controller_generation,
+            workspace: reservation.workspace_path.clone(),
+            control_dir: reservation.control_dir.clone(),
+            rex_session_id: observed_block.session_id.clone(),
+            rex_block_id,
+            profile_digest: reservation.profile_digest.clone(),
+            instruction_digest: reservation.instruction_digest.clone(),
+            plan_digest: active_run
+                .as_ref()
+                .and_then(|run| {
+                    store
+                        .latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)
+                        .ok()
+                        .flatten()
+                })
+                .map(|plan| plan.plan_digest),
+            environment_snapshot_id: reservation.environment_snapshot_id.clone(),
+            wake_snapshot_digest: reservation.wake_snapshot.digest.clone(),
+            provider_capability: capability,
+            result_schema: rendered.result_schema,
+        };
+        let window_id = observed_block.window_id.clone();
+        let package = crate::run_step_package::RunStepPackage {
+            schema_version: 1,
+            descriptor,
+            operation_id: reservation.operation_id.clone(),
+            project_id: reservation.project_id.clone(),
+            controller_generation: reservation.controller_generation,
+            runtime_binary_digest: self.runtime_binary_digest.clone(),
+            qualification_receipt_digest: reservation.qualification_receipt_digest.clone(),
+            rex_cli_path: self.rex_cli_path.clone(),
+            rex_search_path: self.rex_search_path.clone(),
+            rex_endpoint: self.rex_identity.endpoint.clone(),
+            rex_server_identity: self.rex_identity.instance_id.clone(),
+            rex_window_id: window_id,
+            profile: profile.clone(),
+            role_contract: crate::roles::builtin_role_contract(reservation.role).to_owned(),
+            prompt: rendered.text,
+            continuation: None,
+            shutdown_grace_seconds: self.applied_config.config.runtime.shutdown_grace_seconds,
+            start_ack_timeout_seconds: 30,
+        };
+        package.validate()?;
+        let _ = now_unix;
+        Ok(package)
+    }
+
+    fn rex_transport(&self) -> &RexCliTransport {
+        &self.rex
+    }
+}
+
+impl RuntimeAgentMaterializer {
+    fn validate_reservation(
+        &self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<(), String> {
+        reservation.validate()?;
+        if owner_generation != self.owner_generation
+            || reservation.controller_generation != owner_generation
+            || reservation.config_digest != self.applied_config.digest
+            || reservation.runtime_binary_digest != self.runtime_binary_digest
+            || reservation.environment_snapshot_id != self.environment.metadata().id
+        {
+            return Err(
+                "Agent launch reservation is stale for the active controller snapshot".into(),
+            );
+        }
+        let project = store
+            .runnable_projects(owner_generation)?
+            .into_iter()
+            .find(|project| project.record.id == reservation.project_id)
+            .ok_or("Agent launch Project is no longer runnable")?;
+        if project.record.config_revision != reservation.config_revision
+            || project.record.config_digest != reservation.config_digest
+            || project.project_epoch != reservation.project_epoch
+            || store.current_revision(&project.record.config_source)?
+                != Some(reservation.config_revision)
+        {
+            return Err("Agent launch Project revision changed after reservation".into());
+        }
+        Ok(())
     }
 }
 

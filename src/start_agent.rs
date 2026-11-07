@@ -18,6 +18,9 @@ pub trait StartAgentMaterializer: Send + Sync {
     /// must return the same path; it must never mint a replacement for a consumed launch.
     fn environment_handoff_path(
         &self,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
         reservation: &AgentLaunchReservation,
     ) -> Result<std::path::PathBuf, String>;
 
@@ -25,6 +28,9 @@ pub trait StartAgentMaterializer: Send + Sync {
     /// locate the existing run-owned block before attempting any create operation.
     fn ensure_parked_wrapper(
         &self,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
         reservation: &AgentLaunchReservation,
         package_path: &std::path::Path,
         environment_handoff: &std::path::Path,
@@ -34,6 +40,9 @@ pub trait StartAgentMaterializer: Send + Sync {
     /// profile, captured environment, and the observed real Rex block.
     fn build_package(
         &self,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
         reservation: &AgentLaunchReservation,
         observed_block: &RexContextBlock,
         environment_handoff: &std::path::Path,
@@ -97,18 +106,31 @@ impl EffectHandler for StartAgentEffectHandler {
             return Err("StartAgent effect does not match the reserved role and operation".into());
         }
 
-        let environment_handoff = self.materializer.environment_handoff_path(&reservation)?;
+        let environment_handoff = self.materializer.environment_handoff_path(
+            context.store,
+            context.owner_generation,
+            context.now_unix,
+            &reservation,
+        )?;
         if !environment_handoff.is_absolute() {
             return Err("environment handoff path must be absolute".into());
         }
         let observed_block = self.materializer.ensure_parked_wrapper(
+            context.store,
+            context.owner_generation,
+            context.now_unix,
             &reservation,
             &reservation.descriptor_path,
             &environment_handoff,
         )?;
-        let package =
-            self.materializer
-                .build_package(&reservation, &observed_block, &environment_handoff)?;
+        let package = self.materializer.build_package(
+            context.store,
+            context.owner_generation,
+            context.now_unix,
+            &reservation,
+            &observed_block,
+            &environment_handoff,
+        )?;
         let authority = finalize_and_ack_start(
             context.store,
             context.owner_generation,

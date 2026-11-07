@@ -1088,13 +1088,13 @@ fn run_controller(
         rex_session_id: Some(rex_identity.session_id.clone()),
         rex_block_id: rex_identity.block_id.clone(),
     };
-    let generation = store.start_owner(&owner).map_err(CliError::unavailable)?;
     let mut environment = crate::environment::capture(&snapshot.config.config.runtime.environment)
         .map_err(|error| CliError::unavailable(error.to_string()))?;
+    let generation = store.start_owner(&owner).map_err(CliError::unavailable)?;
     let config_dir = canonical_source
         .parent()
         .ok_or_else(|| CliError::usage("configuration file has no parent directory"))?;
-    let mut services = crate::runtime_services::RuntimeServices::new(
+    let services = crate::runtime_services::RuntimeServices::new(
         &snapshot.config,
         &environment,
         config_dir,
@@ -1103,8 +1103,14 @@ fn run_controller(
         &rex_identity,
         &executable_path,
         &Digest::parse(executable_digest.clone()).map_err(CliError::usage)?,
-    )
-    .map_err(CliError::unavailable)?;
+    );
+    let mut services = match services {
+        Ok(services) => services,
+        Err(error) => {
+            let _ = store.stop_owner(generation);
+            return Err(CliError::unavailable(error));
+        }
+    };
     let projection = state_root.join("runtime-owner.json");
     publish_owner_projection(
         &projection,
@@ -1139,7 +1145,7 @@ fn run_controller(
                 environment =
                     crate::environment::capture(&snapshot.config.config.runtime.environment)
                         .map_err(|error| CliError::unavailable(error.to_string()))?;
-                services = crate::runtime_services::RuntimeServices::new(
+                let rebuilt = crate::runtime_services::RuntimeServices::new(
                     &snapshot.config,
                     &environment,
                     config_dir,
@@ -1148,8 +1154,14 @@ fn run_controller(
                     &rex_identity,
                     &executable_path,
                     &Digest::parse(executable_digest.clone()).map_err(CliError::usage)?,
-                )
-                .map_err(CliError::unavailable)?;
+                );
+                services = match rebuilt {
+                    Ok(services) => services,
+                    Err(error) => {
+                        let _ = store.stop_owner(generation);
+                        return Err(CliError::unavailable(error));
+                    }
+                };
             }
             if command.kind == "machine_stop" {
                 should_stop = true;
