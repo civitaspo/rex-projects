@@ -229,6 +229,14 @@ impl std::fmt::Display for CliError {
 
 pub fn run() -> Result<i32, CliError> {
     let args = std::env::args_os().collect::<Vec<_>>();
+    if args.len() == 4 && args[1] == "__internal" && args[2] == "env-capture" {
+        let nonce = args[3]
+            .to_str()
+            .ok_or_else(|| CliError::usage("invalid environment capture request"))?;
+        return crate::environment::write_capture_frame(nonce)
+            .map(|()| 0)
+            .map_err(|error| CliError::unexpected(error.to_string()));
+    }
     let json_requested = args.iter().any(|argument| argument == "--json");
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
