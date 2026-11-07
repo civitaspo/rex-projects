@@ -46,21 +46,12 @@ run = [
   "test -s README.md && test -s LICENSE",
   "ast-grep test --skip-snapshot-tests",
   "python3 -m unittest discover -s tests/fixtures/agents -p 'test_*.py'",
-<<<<<<< HEAD
-<<<<<<< HEAD
   "python3 -m unittest discover -s tests -p 'test_release_assets.py'",
-=======
-=======
   "python3 tests/fixtures/rex/bootstrap/verify-link-publication.py",
   "python3 tests/fixtures/rex/bootstrap/verify-mock-override.py",
->>>>>>> 9d083d7 (fix(lua): publish bootstrap cache without shared locks)
   "lua tests/lua/bootstrap_version_contract.lua",
   "lua tests/lua/bootstrap_spec.lua",
-<<<<<<< HEAD
->>>>>>> d0e3345 (feat(lua): bootstrap pinned rex-projects CLI)
-=======
   "lua tests/lua/runtime_details_spec.lua",
->>>>>>> 464e230 (fix(lua): expose bootstrap runtime details)
   "cargo test --workspace --all-features --locked",
 ]
 
