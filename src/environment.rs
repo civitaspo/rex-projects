@@ -21,9 +21,9 @@ const FRAME_MAGIC: &[u8] = b"\0REX-PROJECTS-ENV\0\x01";
 const HANDOFF_MAGIC: &[u8] = b"\0REX-PROJECTS-HANDOFF\0\x01";
 const MAX_ENVIRONMENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STARTUP_OUTPUT_BYTES: usize = 256 * 1024;
-const MAX_SNAPSHOT_BYTES: usize = MAX_ENVIRONMENT_BYTES + MAX_STARTUP_OUTPUT_BYTES + 128;
+const MAX_SNAPSHOT_BYTES: usize = MAX_ENVIRONMENT_BYTES + 128;
 const CAPTURE_MARKER: &str = "environment_capture";
-const CAPTURE_PROGRAM: &str = r#"exec "$1" __internal env-capture "$2""#;
+const CAPTURE_PROGRAM: &str = r#"exec "$1" __internal env-capture "$2" "$3""#;
 const CAPTURE_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,7 +128,8 @@ impl EnvironmentSnapshot {
         let path = directory.join(format!("{}.env", nonce.as_str()));
         let mut file = private_create_new(&path)?;
         use std::io::Write;
-        file.write_all(HANDOFF_MAGIC)
+        let result = file
+            .write_all(HANDOFF_MAGIC)
             .and_then(|()| file.write_all(self.metadata.id.as_str().as_bytes()))
             .and_then(|()| file.write_all(&[0]))
             .and_then(|()| file.write_all(operation_id.as_bytes()))
@@ -136,8 +137,11 @@ impl EnvironmentSnapshot {
             .and_then(|()| file.write_all(nonce.as_str().as_bytes()))
             .and_then(|()| file.write_all(&[0]))
             .and_then(|()| write_variables(&mut file, &self.variables))
-            .and_then(|()| file.sync_all())
-            .map_err(|_| EnvironmentError::Handoff)?;
+            .and_then(|()| file.sync_all());
+        if result.is_err() {
+            let _ = std::fs::remove_file(&path);
+            return Err(EnvironmentError::Handoff);
+        }
         Ok(EnvironmentHandoff {
             path,
             snapshot_id: self.metadata.id.clone(),
@@ -278,6 +282,7 @@ fn capture_login_shell(
     };
     let executable = std::env::current_exe().map_err(|_| EnvironmentError::CaptureFailed)?;
     let nonce = fresh_nonce();
+    let capture_output = CaptureOutput::create(&nonce)?;
     let started = Instant::now();
     let deadline = started
         .checked_add(Duration::from_secs(config.timeout_seconds))
@@ -300,14 +305,19 @@ fn capture_login_shell(
     environment.insert(OsString::from("TERM"), OsString::from("dumb"));
     let request = ProcessRequest {
         executable: shell.clone(),
-        args: shell_kind.arguments(&executable, &nonce, config.interactive),
+        args: shell_kind.arguments(
+            &executable,
+            capture_output.path(),
+            &nonce,
+            config.interactive,
+        ),
         stdin: Vec::new(),
         cwd: None,
         clear_environment: true,
         environment,
         timeout: child_timeout,
         shutdown_grace: grace,
-        stdout_limit: MAX_SNAPSHOT_BYTES,
+        stdout_limit: MAX_STARTUP_OUTPUT_BYTES,
         stderr_tail_limit: MAX_STARTUP_OUTPUT_BYTES,
     };
     let output = run(request).map_err(|_| EnvironmentError::CaptureFailed)?;
@@ -323,8 +333,43 @@ fn capture_login_shell(
     if !output.status.is_some_and(|status| status.success()) {
         return Err(EnvironmentError::CaptureFailed);
     }
-    let variables = parse_frame(&output.stdout, &nonce)?;
+    let variables = capture_output.read(&nonce)?;
     snapshot_from_variables(EnvironmentSource::LoginShell, Some(shell), variables)
+}
+
+struct CaptureOutput {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl CaptureOutput {
+    fn create(nonce: &Digest) -> Result<Self, EnvironmentError> {
+        let directory = std::env::temp_dir().join(format!(
+            "rex-projects-environment-{}-{}",
+            std::process::id(),
+            nonce.as_str()
+        ));
+        create_private_directory(&directory)?;
+        let path = directory.join("capture.bin");
+        private_create_new(&path)?;
+        Ok(Self { directory, path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read(&self, nonce: &Digest) -> Result<BTreeMap<OsString, OsString>, EnvironmentError> {
+        let bytes = read_private_output(&self.path)?;
+        parse_frame(&bytes, nonce)
+    }
+}
+
+impl Drop for CaptureOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.directory);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -334,7 +379,13 @@ enum ShellKind {
 }
 
 impl ShellKind {
-    fn arguments(self, helper: &Path, nonce: &Digest, interactive: bool) -> Vec<OsString> {
+    fn arguments(
+        self,
+        helper: &Path,
+        output: &Path,
+        nonce: &Digest,
+        interactive: bool,
+    ) -> Vec<OsString> {
         let mut args = match self {
             Self::Bash if interactive => vec!["--login", "--interactive", "-c", CAPTURE_PROGRAM],
             Self::Bash => vec!["--login", "-c", CAPTURE_PROGRAM],
@@ -346,6 +397,7 @@ impl ShellKind {
         .collect::<Vec<_>>();
         args.push(OsString::from("rex-projects-environment-capture"));
         args.push(helper.as_os_str().to_os_string());
+        args.push(output.as_os_str().to_os_string());
         args.push(OsString::from(nonce.as_str()));
         args
     }
@@ -353,7 +405,7 @@ impl ShellKind {
 
 /// The private CLI helper called at the end of the login-shell command.
 /// Writes only the framed protocol to stdout; it never prints values to diagnostics.
-pub fn write_capture_frame(nonce: &str) -> Result<(), EnvironmentError> {
+pub fn write_capture_frame(output_path: &Path, nonce: &str) -> Result<(), EnvironmentError> {
     if std::env::var_os("REX_PROJECTS_CONTEXT").as_deref() != Some(OsStr::new(CAPTURE_MARKER))
         || std::env::var_os("REX_PROJECTS_AGENT").is_some()
     {
@@ -363,14 +415,15 @@ pub fn write_capture_frame(nonce: &str) -> Result<(), EnvironmentError> {
     }
     let nonce = Digest::parse(nonce.to_owned()).map_err(|_| EnvironmentError::InvalidFrame)?;
     let variables = current_user_environment();
-    let mut stdout = std::io::stdout().lock();
+    let mut output = open_private_output(output_path)?;
     use std::io::Write;
-    stdout
+    output
         .write_all(FRAME_MAGIC)
-        .and_then(|()| stdout.write_all(nonce.as_str().as_bytes()))
-        .and_then(|()| stdout.write_all(&[0]))
-        .and_then(|()| write_variables(&mut stdout, &variables))
-        .and_then(|()| stdout.flush())
+        .and_then(|()| output.write_all(nonce.as_str().as_bytes()))
+        .and_then(|()| output.write_all(&[0]))
+        .and_then(|()| write_variables(&mut output, &variables))
+        .and_then(|()| output.flush())
+        .and_then(|()| output.sync_all())
         .map_err(|_| EnvironmentError::CaptureFailed)
 }
 
@@ -554,6 +607,7 @@ fn create_private_directory(path: &Path) -> Result<(), EnvironmentError> {
 fn private_create_new(path: &Path) -> Result<std::fs::File, EnvironmentError> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -565,10 +619,85 @@ fn private_create_new(path: &Path) -> Result<std::fs::File, EnvironmentError> {
 #[cfg(not(unix))]
 fn private_create_new(path: &Path) -> Result<std::fs::File, EnvironmentError> {
     std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|_| EnvironmentError::Handoff)
+}
+
+fn open_private_output(path: &Path) -> Result<std::fs::File, EnvironmentError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| EnvironmentError::Handoff)?;
+    let metadata = file.metadata().map_err(|_| EnvironmentError::Handoff)?;
+    if !metadata.is_file() || metadata.len() != 0 || !has_private_parent(path) {
+        return Err(EnvironmentError::Handoff);
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(EnvironmentError::Handoff);
+    }
+    Ok(file)
+}
+
+fn read_private_output(path: &Path) -> Result<Vec<u8>, EnvironmentError> {
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| EnvironmentError::Handoff)?;
+    let metadata = file.metadata().map_err(|_| EnvironmentError::Handoff)?;
+    if !metadata.is_file()
+        || metadata.len() as usize > MAX_SNAPSHOT_BYTES
+        || !has_private_parent(path)
+    {
+        return Err(EnvironmentError::Handoff);
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(EnvironmentError::Handoff);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| EnvironmentError::Handoff)?;
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(EnvironmentError::Handoff);
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn has_private_parent(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    path.parent().is_some_and(|parent| {
+        std::fs::symlink_metadata(parent).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o077 == 0
+        })
+    })
+}
+
+#[cfg(not(unix))]
+fn has_private_parent(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        std::fs::symlink_metadata(parent)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    })
 }
 
 fn read_handoff(
@@ -585,7 +714,7 @@ fn read_handoff(
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path).map_err(|_| EnvironmentError::Handoff)?;
+    let file = options.open(path).map_err(|_| EnvironmentError::Handoff)?;
     let metadata = file.metadata().map_err(|_| EnvironmentError::Handoff)?;
     if !metadata.is_file() || metadata.len() as usize > MAX_ENVIRONMENT_BYTES + 512 {
         return Err(EnvironmentError::Handoff);
@@ -595,8 +724,12 @@ fn read_handoff(
         return Err(EnvironmentError::Handoff);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
+    file.take((MAX_ENVIRONMENT_BYTES + 513) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|_| EnvironmentError::Handoff)?;
+    if bytes.len() > MAX_ENVIRONMENT_BYTES + 512 {
+        return Err(EnvironmentError::Handoff);
+    }
     let mut frame = bytes
         .strip_prefix(HANDOFF_MAGIC)
         .ok_or(EnvironmentError::Handoff)?;
