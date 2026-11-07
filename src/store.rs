@@ -340,6 +340,11 @@ impl ConfigStore {
                 "database schema {existing_version} is newer than supported schema {SCHEMA_VERSION}; refusing to write"
             ));
         }
+        if existing_version == 8 {
+            // Validate the hold layout before WAL/journal PRAGMAs can modify an incompatible
+            // development database that already claims this schema version.
+            Self::validate_human_v8_schema(&connection)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
@@ -381,6 +386,7 @@ impl ConfigStore {
             }
             Self::migrate_human_v8(&mut connection)?;
         }
+        Self::validate_human_v8_schema(&connection)?;
         if existing_version < 9 {
             if existing_version > 0 {
                 backup_before_migration(&connection, state_root)?;
@@ -4045,7 +4051,6 @@ mod tests {
             [1, 1, 1, 1, 2]
         );
     }
-
 
     #[test]
     fn rex_view_history_pin_and_user_blocks_prevent_automatic_cleanup() {

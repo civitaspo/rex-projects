@@ -19,6 +19,8 @@ use super::{ConfigStore, validate_active_generation};
 
 const HUMAN_SCHEMA_VERSION: i64 = 8;
 const MAX_PENDING_DECISIONS: usize = 256;
+type HumanViewIdentityRow = (String, String, Option<String>, Option<String>, String);
+type HumanRequestSummaryRow = (String, String, String, Option<String>, Option<String>);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "detail")]
@@ -39,6 +41,7 @@ pub struct HumanApprovalReceipt {
     policy_digest: Digest,
     choice: HumanDecisionChoice,
     approved: bool,
+    explanation: Option<String>,
     decided_at_unix: u64,
     request_expires_at_unix: u64,
 }
@@ -65,6 +68,9 @@ impl HumanApprovalReceipt {
     pub fn approved(&self) -> bool {
         self.approved
     }
+    pub fn explanation(&self) -> Option<&str> {
+        self.explanation.as_deref()
+    }
     pub fn decided_at_unix(&self) -> u64 {
         self.decided_at_unix
     }
@@ -83,6 +89,7 @@ struct PersistedApprovalReceipt {
     policy_digest: Digest,
     choice: HumanDecisionChoice,
     approved: bool,
+    explanation: Option<String>,
     decided_at_unix: u64,
     request_expires_at_unix: u64,
 }
@@ -121,8 +128,8 @@ pub struct HumanPresentationReceipt {
 }
 
 impl ConfigStore {
-    /// Apply v8 after v7. The controller owns migration ordering and updates the shared schema
-    /// version only after this transaction succeeds.
+    /// Apply v8 after v7. Tests build a v6 fixture, promote only its user_version to 7, and invoke
+    /// this function directly so this branch can be reviewed before PR3d is merged.
     pub fn migrate_human_v8(connection: &mut Connection) -> Result<(), String> {
         let current: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -143,6 +150,7 @@ impl ConfigStore {
                 subject_kind TEXT NOT NULL CHECK(subject_kind IN ('ticket_run','plan','operation','profile','goal','project_configuration','release')),
                 subject_id TEXT NOT NULL,
                 subject_revision INTEGER NOT NULL CHECK(subject_revision >= 0),
+                rex_view_id TEXT NOT NULL REFERENCES rex_views(view_id),
                 subject_digest TEXT NOT NULL,
                 material_digest TEXT NOT NULL,
                 configuration_digest TEXT NOT NULL,
@@ -159,6 +167,7 @@ impl ConfigStore {
             );
             CREATE INDEX human_requests_project_lifecycle ON human_requests(project_id, lifecycle, created_at_unix);
             CREATE INDEX human_requests_subject ON human_requests(project_id, subject_kind, subject_id, subject_revision, subject_digest);
+            CREATE INDEX human_requests_rex_view_lifecycle ON human_requests(rex_view_id,lifecycle);
             CREATE TABLE human_decision_intents (
                 response_id TEXT PRIMARY KEY,
                 request_id TEXT NOT NULL REFERENCES human_requests(request_id),
@@ -201,10 +210,56 @@ impl ConfigStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    pub(crate) fn validate_human_v8_schema(connection: &Connection) -> Result<(), String> {
+        let view_column: Option<(String, u64)> = connection
+            .query_row(
+                "SELECT type,\"notnull\" FROM pragma_table_info('human_requests') WHERE name='rex_view_id'",
+                [],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let view_foreign_key: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('human_requests') WHERE \"table\"='rex_views' AND \"from\"='rex_view_id' AND \"to\"='view_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let has_view_lifecycle_index: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list('human_requests') WHERE name='human_requests_rex_view_lifecycle')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut index_info = connection
+            .prepare("SELECT name FROM pragma_index_info('human_requests_rex_view_lifecycle') ORDER BY seqno")
+            .map_err(|error| error.to_string())?;
+        let index_columns = index_info
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if view_column
+            .as_ref()
+            .is_none_or(|(type_name, not_null)| type_name != "TEXT" || *not_null != 1)
+            || !view_foreign_key
+            || !has_view_lifecycle_index
+            || index_columns != ["rex_view_id", "lifecycle"]
+        {
+            return Err(
+                "database reports schema v8 but is missing the human request Rex view hold layout (human_requests.rex_view_id/index). Preserve and back up this database. This runtime will not alter it; use a binary that supports its layout, or recreate it only if the state is disposable development data from authoritative project configuration and ticket providers.".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn register_human_request(
         &mut self,
         owner_generation: u64,
         request: &HumanRuntimeRequest,
+        rex_view_id: &Digest,
         artifact_path: &Path,
         now: u64,
     ) -> Result<bool, String> {
@@ -217,25 +272,30 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let created = tx.execute(
-            "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending',?14,?15) ON CONFLICT(request_id) DO NOTHING",
-            params![request.request_id.as_str(), request.subject.project_id.as_str(), purpose_name(request.purpose), subject_kind_name(request.subject.kind), request.subject.subject_id, request.subject.revision.0, subject_digest, request.subject.material_digest.as_str(), request.subject.configuration_digest.as_str(), request.subject.policy_digest.as_str(), request.subject.bundle_digest.as_str(), request_json, artifact_path, now, request.expires_at_unix],
-        ).map_err(|error| error.to_string())?;
-        if created == 0 {
-            let previous: (String, String, String, String) = tx.query_row(
-                "SELECT request_json, artifact_path, subject_digest, lifecycle FROM human_requests WHERE request_id=?1",
+        let previous: Option<(String, String, String, String, String)> = tx
+            .query_row(
+                "SELECT request_json, artifact_path, subject_digest, lifecycle, rex_view_id FROM human_requests WHERE request_id=?1",
                 [request.request_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            ).map_err(|error| error.to_string())?;
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(previous) = previous {
             if previous.0 != request_json
                 || previous.1 != artifact_path
                 || previous.2 != subject_digest
+                || previous.4 != rex_view_id.as_str()
             {
                 return Err("human request ID was reused with different content".into());
             }
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(false);
         }
+        validate_active_request_view(&tx, request, rex_view_id)?;
+        tx.execute(
+            "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'pending',?15,?16)",
+            params![request.request_id.as_str(), request.subject.project_id.as_str(), purpose_name(request.purpose), subject_kind_name(request.subject.kind), request.subject.subject_id, request.subject.revision.0, rex_view_id.as_str(), subject_digest, request.subject.material_digest.as_str(), request.subject.configuration_digest.as_str(), request.subject.policy_digest.as_str(), request.subject.bundle_digest.as_str(), request_json, artifact_path, now, request.expires_at_unix],
+        ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }
@@ -417,6 +477,57 @@ impl ConfigStore {
         .collect()
     }
 
+    /// Expire unanswered human requests and release their Rex view holds. The foreground
+    /// controller calls this during each poll; queued responses become terminal in the same tx.
+    pub fn expire_pending_human_requests(
+        &mut self,
+        owner_generation: u64,
+        now: u64,
+    ) -> Result<usize, String> {
+        validate_generation_read(&self.connection, owner_generation)?;
+        let has_expired: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM human_requests WHERE lifecycle IN ('pending','presented','response_queued') AND expires_at_unix<=?1)",
+            [now],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !has_expired {
+            return Ok(0);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let mut statement = tx.prepare(
+            "SELECT request_id FROM human_requests WHERE lifecycle IN ('pending','presented','response_queued') AND expires_at_unix<=?1 ORDER BY expires_at_unix,request_id",
+        ).map_err(|error| error.to_string())?;
+        let request_ids = statement
+            .query_map([now], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        let result_json = serde_json::to_string(&HumanDecisionResult::Expired)
+            .map_err(|error| error.to_string())?;
+        let mut expired = 0;
+        for request_id in request_ids {
+            let changed = tx.execute(
+                "UPDATE human_requests SET lifecycle='expired',decided_at_unix=?2 WHERE request_id=?1 AND lifecycle IN ('pending','presented','response_queued') AND expires_at_unix<=?2",
+                params![request_id,now],
+            ).map_err(|error| error.to_string())?;
+            if changed == 0 {
+                continue;
+            }
+            tx.execute(
+                "UPDATE human_decision_intents SET lifecycle='expired',processed_at_unix=?2,result_json=?3 WHERE request_id=?1 AND lifecycle='queued'",
+                params![request_id,now,result_json],
+            ).map_err(|error| error.to_string())?;
+            expired += changed;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(expired)
+    }
+
     /// Revalidate current subject and ticket revision, then atomically persist the decision and a
     /// role wake. The caller supplies a fresh observation assembled from current provider state.
     pub fn process_human_decision(
@@ -511,6 +622,7 @@ impl ConfigStore {
             policy_digest: request.subject.policy_digest.clone(),
             choice: intent.choice,
             approved,
+            explanation: intent.explanation.clone(),
             decided_at_unix: now,
             request_expires_at_unix: request.expires_at_unix,
         };
@@ -565,6 +677,7 @@ impl ConfigStore {
             policy_digest: receipt.policy_digest,
             choice: receipt.choice,
             approved: receipt.approved,
+            explanation: receipt.explanation,
             decided_at_unix: receipt.decided_at_unix,
             request_expires_at_unix: receipt.request_expires_at_unix,
         }))
@@ -604,6 +717,70 @@ fn validate_current_ticket(
         return Err(TicketValidationError::Stale(
             "ticket is no longer waiting for review of this revision".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_active_request_view(
+    tx: &rusqlite::Transaction<'_>,
+    request: &HumanRuntimeRequest,
+    view_id: &Digest,
+) -> Result<(), String> {
+    let observed: Option<HumanViewIdentityRow> = tx
+        .query_row(
+            "SELECT project_id,view_kind,ticket_namespace,ticket_id,lifecycle FROM rex_views WHERE view_id=?1",
+            [view_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((project_id, view_kind, namespace, ticket_id, lifecycle)) = observed else {
+        return Err("human request Rex view was not found".into());
+    };
+    if lifecycle != "active" {
+        return Err("human request requires an active Rex view".into());
+    }
+    if project_id != request.subject.project_id.as_str() {
+        return Err("human request Rex view belongs to another project".into());
+    }
+    let expected_kind = match request.purpose {
+        HumanPurpose::GoalChange
+        | HumanPurpose::GoalCompletion
+        | HumanPurpose::ProfilePromotion
+        | HumanPurpose::ProjectConfiguration
+        | HumanPurpose::ReleaseDecision => "supervisor",
+        HumanPurpose::PlanDecision
+        | HumanPurpose::TicketReview
+        | HumanPurpose::OperationApproval => "ticket",
+    };
+    if view_kind != expected_kind {
+        return Err(format!("human request requires a {expected_kind} Rex view"));
+    }
+    let ticket_run_id = if request.subject.kind == HumanSubjectKind::TicketRun {
+        Some(TicketRunId::parse(request.subject.subject_id.clone())?)
+    } else {
+        request.subject.ticket_run_id.clone()
+    };
+    if request.purpose == HumanPurpose::OperationApproval && ticket_run_id.is_none() {
+        return Err("operation approval requires a ticket-scoped Rex view".into());
+    }
+    if let Some(ticket_run) = ticket_run_id {
+        let ticket: Option<(String, String)> = tx
+            .query_row(
+                "SELECT namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                params![ticket_run.as_str(), request.subject.project_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((expected_namespace, expected_ticket_id)) = ticket else {
+            return Err("human request ticket run was not found in this project".into());
+        };
+        if namespace.as_deref() != Some(expected_namespace.as_str())
+            || ticket_id.as_deref() != Some(expected_ticket_id.as_str())
+        {
+            return Err("human request Rex view does not match its ticket run".into());
+        }
     }
     Ok(())
 }
@@ -665,11 +842,12 @@ fn load_request(
     connection: &Connection,
     request_id: &HumanRequestId,
 ) -> Result<Option<HumanRequestSummary>, String> {
-    let row: Option<(String, String, Option<String>, Option<String>)> = connection.query_row("SELECT request_json,lifecycle,artifact_path,presentation_reference FROM human_requests WHERE request_id=?1", [request_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|error| error.to_string())?;
-    row.map(|(json, lifecycle, artifact_path, reference)| {
+    let row: Option<HumanRequestSummaryRow> = connection.query_row("SELECT request_json,lifecycle,rex_view_id,artifact_path,presentation_reference FROM human_requests WHERE request_id=?1", [request_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(|error| error.to_string())?;
+    row.map(|(json, lifecycle, rex_view_id, artifact_path, reference)| {
         Ok(HumanRequestSummary {
             request: crate::protocol::parse_unique(json.as_bytes())?,
             lifecycle: parse_lifecycle(&lifecycle)?,
+            rex_view_id: Digest::parse(rex_view_id)?,
             bundle_path: artifact_path
                 .ok_or_else(|| "human review artifact path is missing".to_owned())?,
             presentation_reference: reference,
@@ -787,6 +965,7 @@ mod tests {
         HumanDecisionChoice, HumanDecisionIntent, HumanPurpose, HumanRuntimeRequest,
         HumanSubjectBinding, HumanSubjectKind, write_runtime_review_artifact,
     };
+    use crate::launch::{RexView, RexViewKind};
     use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
     fn runtime_fixture() -> (
@@ -815,6 +994,10 @@ mod tests {
             state_revision: Revision(0),
         };
         store.insert_project(&project).unwrap();
+        store.connection.execute(
+            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision,required_review_revision) VALUES ('run-1','human_project','fixture',1,?1,'github:org/repo','T-1',1,'ready','ready','in_progress','in_progress',1,NULL)",
+            [loaded.digest.as_str()],
+        ).unwrap();
         let generation = store
             .start_owner(&OwnerMetadata {
                 owner_nonce: "human-test-owner".into(),
@@ -828,6 +1011,27 @@ mod tests {
                 rex_block_id: None,
             })
             .unwrap();
+        for (kind, namespace, ticket_id) in [
+            (RexViewKind::Supervisor, None, None),
+            (RexViewKind::Ticket, Some("github:org/repo"), Some("T-1")),
+        ] {
+            let view = RexView {
+                view_id: RexView::derive_id(&project.id, kind, namespace, ticket_id, 1).unwrap(),
+                project_id: project.id.clone(),
+                kind,
+                ticket_namespace: namespace.map(str::to_owned),
+                ticket_id: ticket_id.map(str::to_owned),
+                view_epoch: 1,
+                rex_server_identity: "test-server".into(),
+                rex_session_id: "test-session".into(),
+                rex_window_id: if kind == RexViewKind::Supervisor {
+                    "supervisor-window".into()
+                } else {
+                    "ticket-window".into()
+                },
+            };
+            store.register_rex_view(generation, &view).unwrap();
+        }
         let bundle = ReviewBundle {
             title: "Review operation".into(),
             summary: "Start one staging operation.".into(),
@@ -851,6 +1055,7 @@ mod tests {
             project_id: project.id,
             kind: HumanSubjectKind::Operation,
             subject_id: "deploy-1".into(),
+            ticket_run_id: Some(TicketRunId::parse("run-1").unwrap()),
             revision: Revision(1),
             material_digest: Digest::parse("a".repeat(64)).unwrap(),
             configuration_digest: loaded.digest,
@@ -877,57 +1082,270 @@ mod tests {
         (temp, store, generation, request, artifact)
     }
 
-    #[test]
-    fn v8_migration_accepts_a_v7_fixture_and_refuses_direct_v6_migration() {
-        let temp = tempdir().unwrap();
-        let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        assert_eq!(
+    fn request_view_id(store: &ConfigStore, request: &HumanRuntimeRequest) -> Digest {
+        let view_kind = match request.purpose {
+            HumanPurpose::GoalChange
+            | HumanPurpose::GoalCompletion
+            | HumanPurpose::ProfilePromotion
+            | HumanPurpose::ProjectConfiguration => "supervisor",
+            _ => "ticket",
+        };
+        let row: String = if request.subject.kind == HumanSubjectKind::TicketRun {
             store
                 .connection
-                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            super::super::SCHEMA_VERSION
+                .query_row(
+                    "SELECT v.view_id FROM rex_views v JOIN ticket_runs t ON t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id WHERE t.ticket_run_id=?1 AND v.view_kind=?2 AND v.lifecycle='active'",
+                    params![request.subject.subject_id, view_kind],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        } else {
+            store
+                .connection
+                .query_row(
+                    "SELECT view_id FROM rex_views WHERE project_id=?1 AND view_kind=?2 AND lifecycle='active'",
+                    params![request.subject.project_id.as_str(), view_kind],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        Digest::parse(row).unwrap()
+    }
+
+    fn register_request(
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        request: &HumanRuntimeRequest,
+        artifact: &Path,
+        now: u64,
+    ) -> Result<bool, String> {
+        let view_id = request_view_id(store, request);
+        store.register_human_request(owner_generation, request, &view_id, artifact, now)
+    }
+
+    #[test]
+    fn request_registration_rejects_nonactive_or_wrong_scope_view() {
+        let (_temp, mut store, generation, request, artifact) = runtime_fixture();
+        let wrong_view: String = store
+            .connection
+            .query_row(
+                "SELECT view_id FROM rex_views WHERE project_id=?1 AND view_kind='supervisor'",
+                [request.subject.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            store
+                .register_human_request(
+                    generation,
+                    &request,
+                    &Digest::parse(wrong_view).unwrap(),
+                    &artifact,
+                    10
+                )
+                .is_err()
         );
-        // Start from the real v7 schema produced by the versioned migration chain. Remove only
-        // v8/v9 tables and markers so each upgrade boundary can be exercised independently.
+
+        let view_id = request_view_id(&store, &request);
         store
             .connection
-            .execute_batch(
-                "DROP TABLE goal_ticket_candidates;
-                 DROP TABLE ticket_observations;
-                 DROP TABLE ticket_scan_cursors;
-                 DROP TABLE scheduler_audit;
-                 DROP TABLE ticket_run_context;
-                 DROP TABLE ticket_scan_sequence;
-                 DROP TABLE goal_runtime;
-                 DROP TABLE agent_wake_context;
-                 DROP TABLE goal_ticket_requests;
-                 DROP TABLE human_presentations;
-                 DROP TABLE human_decisions;
-                 DROP TABLE human_decision_intents;
-                 DROP TABLE human_requests;
-                 DELETE FROM schema_migrations WHERE version=8;
-                 DELETE FROM schema_migrations WHERE version=9;
-                 PRAGMA user_version=7;",
+            .execute(
+                "UPDATE rex_views SET lifecycle='close_pending' WHERE view_id=?1",
+                [view_id.as_str()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .register_human_request(generation, &request, &view_id, &artifact, 10)
+                .is_err()
+        );
+        let count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM human_requests WHERE request_id=?1",
+                [request.request_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn plan_approval_requires_its_ticket_view_and_release_uses_project_view() {
+        let (_temp, mut store, generation, request, artifact) = runtime_fixture();
+        let mut plan = request.clone();
+        plan.request_id = HumanRequestId::parse("human-plan-1").unwrap();
+        plan.purpose = HumanPurpose::PlanDecision;
+        plan.subject.kind = HumanSubjectKind::Plan;
+        plan.subject.subject_id = "plan-1".into();
+        plan.subject.ticket_run_id = Some(TicketRunId::parse("run-1").unwrap());
+        plan.choices = vec![HumanDecisionChoice::RevisePlan];
+        let artifact = write_runtime_review_artifact(artifact.parent().unwrap(), &plan).unwrap();
+        let wrong_view = RexView {
+            view_id: RexView::derive_id(
+                &plan.subject.project_id,
+                RexViewKind::Ticket,
+                Some("github:org/repo"),
+                Some("T-2"),
+                1,
+            )
+            .unwrap(),
+            project_id: plan.subject.project_id.clone(),
+            kind: RexViewKind::Ticket,
+            ticket_namespace: Some("github:org/repo".into()),
+            ticket_id: Some("T-2".into()),
+            view_epoch: 1,
+            rex_server_identity: "test-server".into(),
+            rex_session_id: "test-session".into(),
+            rex_window_id: "wrong-ticket-window".into(),
+        };
+        store.register_rex_view(generation, &wrong_view).unwrap();
+        assert!(
+            store
+                .register_human_request(generation, &plan, &wrong_view.view_id, &artifact, 10)
+                .is_err()
+        );
+        assert!(register_request(&mut store, generation, &plan, &artifact, 10).unwrap());
+
+        let mut release = request;
+        release.request_id = HumanRequestId::parse("human-release-1").unwrap();
+        release.purpose = HumanPurpose::ReleaseDecision;
+        release.subject.kind = HumanSubjectKind::Release;
+        release.subject.subject_id = "release-1".into();
+        release.subject.ticket_run_id = None;
+        release.choices = vec![HumanDecisionChoice::Approve, HumanDecisionChoice::Refuse];
+        let artifact = write_runtime_review_artifact(artifact.parent().unwrap(), &release).unwrap();
+        let supervisor_view: String = store
+            .connection
+            .query_row(
+                "SELECT view_id FROM rex_views WHERE project_id=?1 AND view_kind='supervisor'",
+                [release.subject.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            store
+                .register_human_request(
+                    generation,
+                    &release,
+                    &Digest::parse(supervisor_view).unwrap(),
+                    &artifact,
+                    10,
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn unanswered_human_request_holds_view_until_expiry_sweep() {
+        let (_temp, mut store, generation, request, artifact) = runtime_fixture();
+        let view_id = request_view_id(&store, &request);
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES ('hold-run','human_project','fixture',1,?1,'test',1,'hold-op','completed',?2)",
+            params![request.subject.configuration_digest.as_str(),generation],
+        ).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'finished-worker','hold-run','worker','factory','completed',1,1,1)",
+                [view_id.as_str()],
             )
             .unwrap();
         store
             .connection
-            .pragma_update(None, "user_version", 6)
+            .execute(
+                "UPDATE rex_views SET updated_at_unix=0 WHERE view_id=?1",
+                [view_id.as_str()],
+            )
             .unwrap();
-        assert!(ConfigStore::migrate_human_v8(&mut store.connection).is_err());
+
+        let stale_candidate = store.rex_view_cleanup_candidates(1000, 1).unwrap();
+        assert_eq!(stale_candidate.len(), 1);
+        register_request(&mut store, generation, &request, &artifact, 10).unwrap();
+        assert!(
+            store
+                .begin_rex_view_close(generation, &stale_candidate[0], 1000, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .rex_view_cleanup_candidates(1000, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            store.expire_pending_human_requests(generation, 99).unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .expire_pending_human_requests(generation, 100)
+                .unwrap(),
+            1
+        );
+        let candidates = store.rex_view_cleanup_candidates(1000, 1).unwrap();
+        assert_eq!(candidates.len(), 1);
         store
-            .connection
-            .pragma_update(None, "user_version", 7)
+            .begin_rex_view_close(generation, &candidates[0], 1000, 1)
             .unwrap();
-        drop(store);
+    }
+
+    #[test]
+    fn expiry_sweep_terminalizes_a_queued_response_without_waking_a_role() {
+        let (temp, mut store, generation, request, artifact) = runtime_fixture();
+        register_request(&mut store, generation, &request, &artifact, 10).unwrap();
+        let intent = HumanDecisionIntent {
+            request_id: request.request_id.clone(),
+            response_id: "response-expired".into(),
+            expected_subject_digest: request.subject.digest().unwrap(),
+            choice: HumanDecisionChoice::Approve,
+            explanation: Some("Too late to act".into()),
+        };
+        ConfigStore::enqueue_human_decision(temp.path(), &intent, 11).unwrap();
+        assert_eq!(
+            store.pending_human_decisions(generation, 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .expire_pending_human_requests(generation, 100)
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .pending_human_decisions(generation, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store
+                .process_human_decision(generation, &intent.response_id, &request.subject, 101)
+                .unwrap(),
+            HumanDecisionResult::Expired
+        ));
+        let wake_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='human_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wake_count, 0);
+    }
+
+    #[test]
+    fn v8_migration_is_applied_and_includes_the_rex_view_binding() {
+        let temp = tempdir().unwrap();
         let store = ConfigStore::open_test(temp.path()).unwrap();
         assert_eq!(
             store
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            super::super::SCHEMA_VERSION
+            crate::store::SCHEMA_VERSION
         );
         for table in [
             "human_requests",
@@ -945,16 +1363,80 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing {table}");
         }
+        let has_view_binding: bool = store.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('human_requests') WHERE name='rex_view_id')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(has_view_binding);
+    }
+
+    #[test]
+    fn released_v6_database_upgrades_through_v7_v8_and_v9() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        ConfigStore::migrate(&connection, 0, temp.path()).unwrap();
+        crate::store::migrate_v3(&connection).unwrap();
+        crate::store::migrate_v4(&connection).unwrap();
+        crate::store::migrate_v5(&connection).unwrap();
+        crate::store::migrate_v6(&connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        drop(connection);
+
+        let store = ConfigStore::open_test(temp.path()).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            crate::store::SCHEMA_VERSION
+        );
+        ConfigStore::validate_human_v8_schema(&store.connection).unwrap();
+    }
+
+    #[test]
+    fn schema_v8_missing_hold_layout_fails_with_actionable_error_without_repair() {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::open_test(temp.path()).unwrap();
+        drop(store);
+        let database = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("DROP INDEX human_requests_rex_view_lifecycle")
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&database).unwrap();
+
+        let error = match ConfigStore::open_test(temp.path()) {
+            Ok(_) => panic!("incomplete v8 layout must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("schema v8 but is missing the human request Rex view hold layout"));
+        assert_eq!(fs::read(&database).unwrap(), before);
+        let connection = Connection::open(&database).unwrap();
+        let index_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list('human_requests') WHERE name='human_requests_rex_view_lifecycle')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !index_exists,
+            "the failed startup must not alter the database"
+        );
     }
 
     #[test]
     fn response_and_role_wake_commit_together_and_exact_approval_is_queryable() {
         let (temp, mut store, generation, request, artifact) = runtime_fixture();
-        assert!(
-            store
-                .register_human_request(generation, &request, &artifact, 10)
-                .unwrap()
-        );
+        assert!(register_request(&mut store, generation, &request, &artifact, 10).unwrap());
         let listed =
             ConfigStore::list_human_requests(temp.path(), Some(&request.subject.project_id))
                 .unwrap();
@@ -1051,9 +1533,7 @@ mod tests {
     #[test]
     fn stale_subject_is_terminal_and_never_wakes_a_role() {
         let (temp, mut store, generation, request, artifact) = runtime_fixture();
-        store
-            .register_human_request(generation, &request, &artifact, 10)
-            .unwrap();
+        register_request(&mut store, generation, &request, &artifact, 10).unwrap();
         let intent = HumanDecisionIntent {
             request_id: request.request_id.clone(),
             response_id: "response-stale".into(),
@@ -1109,14 +1589,36 @@ mod tests {
             HumanDecisionChoice::Cancel,
         ];
         store.connection.execute(
-            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision,external_revision,required_review_revision) VALUES ('run-1','human_project','fixture',1,?1,'github:org/repo','T-1',1,'waiting_human','blocked','in_progress','in_progress',1,NULL,1)",
-            [request.subject.configuration_digest.as_str()],
+            "UPDATE ticket_runs SET internal_phase='waiting_human',activity='blocked',revision=1,required_review_revision=1 WHERE ticket_run_id='run-1'",
+            [],
         ).unwrap();
         let artifact_root = temp.path().join("human-artifacts");
         let artifact = write_runtime_review_artifact(&artifact_root, &request).unwrap();
-        store
-            .register_human_request(generation, &request, &artifact, 10)
-            .unwrap();
+        let wrong_view = RexView {
+            view_id: RexView::derive_id(
+                &request.subject.project_id,
+                RexViewKind::Ticket,
+                Some("github:org/repo"),
+                Some("T-2"),
+                1,
+            )
+            .unwrap(),
+            project_id: request.subject.project_id.clone(),
+            kind: RexViewKind::Ticket,
+            ticket_namespace: Some("github:org/repo".into()),
+            ticket_id: Some("T-2".into()),
+            view_epoch: 1,
+            rex_server_identity: "test-server".into(),
+            rex_session_id: "test-session".into(),
+            rex_window_id: "wrong-ticket-window".into(),
+        };
+        store.register_rex_view(generation, &wrong_view).unwrap();
+        assert!(
+            store
+                .register_human_request(generation, &request, &wrong_view.view_id, &artifact, 10)
+                .is_err()
+        );
+        register_request(&mut store, generation, &request, &artifact, 10).unwrap();
         let intent = HumanDecisionIntent {
             request_id: request.request_id.clone(),
             response_id: "response-ticket-1".into(),
@@ -1159,9 +1661,7 @@ mod tests {
     #[test]
     fn failed_presentation_keeps_the_request_pending_until_a_successful_open() {
         let (temp, mut store, generation, request, artifact) = runtime_fixture();
-        store
-            .register_human_request(generation, &request, &artifact, 10)
-            .unwrap();
+        register_request(&mut store, generation, &request, &artifact, 10).unwrap();
         store
             .record_human_presentation(
                 generation,
@@ -1250,6 +1750,7 @@ mod tests {
             project_id: ProjectId::parse("p1").unwrap(),
             kind: HumanSubjectKind::Operation,
             subject_id: "op1".into(),
+            ticket_run_id: Some(TicketRunId::parse("run-1").unwrap()),
             revision: Revision(3),
             material_digest: Digest::parse("a".repeat(64)).unwrap(),
             configuration_digest: Digest::parse("b".repeat(64)).unwrap(),

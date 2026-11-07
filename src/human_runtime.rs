@@ -20,6 +20,7 @@ use crate::protocol::{
 };
 
 pub const MAX_HUMAN_REQUEST_BYTES: usize = 1_048_576;
+pub const MAX_HUMAN_RESPONSE_BATCH: usize = 64;
 
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -118,6 +119,9 @@ pub struct HumanSubjectBinding {
     pub kind: HumanSubjectKind,
     /// Stable ID from the typed domain object. Never interpreted as a path or command.
     pub subject_id: String,
+    /// Owning ticket scope for ticket-scoped operations.
+    #[serde(default)]
+    pub ticket_run_id: Option<TicketRunId>,
     pub revision: Revision,
     /// Digest of the complete subject material, including immutable object identity.
     pub material_digest: Digest,
@@ -131,6 +135,7 @@ struct SubjectDigestMaterial<'a> {
     project_id: &'a ProjectId,
     kind: HumanSubjectKind,
     subject_id: &'a str,
+    ticket_run_id: &'a Option<TicketRunId>,
     revision: Revision,
     material_digest: &'a Digest,
     configuration_digest: &'a Digest,
@@ -145,6 +150,7 @@ impl HumanSubjectBinding {
             project_id: &self.project_id,
             kind: self.kind,
             subject_id: &self.subject_id,
+            ticket_run_id: &self.ticket_run_id,
             revision: self.revision,
             material_digest: &self.material_digest,
             configuration_digest: &self.configuration_digest,
@@ -157,12 +163,30 @@ impl HumanSubjectBinding {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.kind == HumanSubjectKind::TicketRun {
-            TicketRunId::parse(self.subject_id.clone())?;
+            let ticket_run = TicketRunId::parse(self.subject_id.clone())?;
+            if self
+                .ticket_run_id
+                .as_ref()
+                .is_some_and(|bound| bound != &ticket_run)
+            {
+                return Err(
+                    "ticket subject's explicit ticket_run_id does not match subject_id".into(),
+                );
+            }
         } else if self.subject_id.is_empty()
             || self.subject_id.len() > 512
             || self.subject_id.chars().any(char::is_control)
         {
             return Err("subject_id must contain 1 to 512 non-control bytes".into());
+        }
+        if matches!(
+            self.kind,
+            HumanSubjectKind::Operation | HumanSubjectKind::Plan
+        ) && self.ticket_run_id.is_none()
+        {
+            return Err(
+                "ticket-scoped human decisions must bind their owning ticket_run_id".into(),
+            );
         }
         Ok(())
     }
@@ -291,8 +315,52 @@ impl HumanRuntimeRequest {
 pub struct HumanRequestSummary {
     pub request: HumanRuntimeRequest,
     pub lifecycle: HumanRequestLifecycle,
+    pub rex_view_id: Digest,
     pub bundle_path: String,
     pub presentation_reference: Option<String>,
+}
+
+/// Result of validating one durably queued response against a fresh host observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessedHumanResponse {
+    pub response_id: String,
+    pub result: crate::store::human::HumanDecisionResult,
+}
+
+/// Drain a bounded response batch. The observer must query authoritative current state (provider,
+/// repository heads, and applicable policy) for each request; a missing observation leaves that
+/// response queued so a transient provider failure cannot accidentally turn into stale approval.
+pub fn process_queued_human_responses<F>(
+    store: &mut crate::store::ConfigStore,
+    owner_generation: u64,
+    limit: usize,
+    now: u64,
+    mut observe: F,
+) -> Result<Vec<ProcessedHumanResponse>, String>
+where
+    F: FnMut(&HumanRuntimeRequest) -> Result<Option<HumanSubjectBinding>, String>,
+{
+    if limit == 0 || limit > MAX_HUMAN_RESPONSE_BATCH {
+        return Err("human response batch limit must be between 1 and 64".into());
+    }
+    let queued = store.pending_human_decisions(owner_generation, limit)?;
+    let mut processed = Vec::with_capacity(queued.len());
+    for item in queued {
+        let Some(current_subject) = observe(&item.request)? else {
+            continue;
+        };
+        let result = store.process_human_decision(
+            owner_generation,
+            &item.intent.response_id,
+            &current_subject,
+            now,
+        )?;
+        processed.push(ProcessedHumanResponse {
+            response_id: item.intent.response_id,
+            result,
+        });
+    }
+    Ok(processed)
 }
 
 /// Versioned command-presenter payload. Presenters may return a display reference, but never a
@@ -831,6 +899,7 @@ mod presenter_tests {
             project_id: ProjectId::parse("p1").unwrap(),
             kind: HumanSubjectKind::Operation,
             subject_id: "deploy-1".into(),
+            ticket_run_id: Some(TicketRunId::parse("run-1").unwrap()),
             revision: Revision(3),
             material_digest: Digest::parse("a".repeat(64)).unwrap(),
             configuration_digest: Digest::parse("b".repeat(64)).unwrap(),
@@ -850,6 +919,17 @@ mod presenter_tests {
             expires_at_unix: 100,
             review_bundle: bundle,
         }
+    }
+
+    #[test]
+    fn operation_subject_digest_binds_its_owning_ticket_run() {
+        let request = sample_request();
+        let first = request.subject.digest().unwrap();
+        let mut changed = request.subject.clone();
+        changed.ticket_run_id = Some(TicketRunId::parse("another-run").unwrap());
+        assert_ne!(first, changed.digest().unwrap());
+        changed.ticket_run_id = None;
+        assert!(changed.validate().is_err());
     }
 
     #[test]
