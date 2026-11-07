@@ -5,6 +5,8 @@
 //! performs it; no network or deployment effects happen inside this module.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -13,7 +15,8 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::config::{
-    Config, OperationActionConfig, OperationRecipe, OperationTarget, SuccessPredicate,
+    AppliedConfig, Config, OperationActionConfig, OperationRecipe, OperationTarget,
+    SuccessPredicate,
 };
 use crate::domain::ids::{
     Digest as ContentDigest, OperationId, ProjectId, RepositoryId, Revision, TicketId, TicketRunId,
@@ -33,14 +36,28 @@ const METHODS: [&str; 4] = [
     "operation.find",
 ];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ValidatedOperationPlan {
-    pub recipe_id: String,
-    pub digest: ContentDigest,
+    recipe_id: String,
+    digest: ContentDigest,
     /// Stable topological order. Independent targets use their configured ID order.
-    pub targets: Vec<OperationTarget>,
-    pub not_required_reason: Option<String>,
+    targets: Vec<OperationTarget>,
+    not_required_reason: Option<String>,
+}
+
+impl ValidatedOperationPlan {
+    pub fn recipe_id(&self) -> &str {
+        &self.recipe_id
+    }
+    pub fn digest(&self) -> &ContentDigest {
+        &self.digest
+    }
+    pub fn targets(&self) -> &[OperationTarget] {
+        &self.targets
+    }
+    pub fn not_required_reason(&self) -> Option<&str> {
+        self.not_required_reason.as_deref()
+    }
 }
 
 /// A ticket resolves to one recipe only when exactly one configured label
@@ -375,6 +392,83 @@ impl std::fmt::Display for AuthorizationError {
 
 impl std::error::Error for AuthorizationError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandExecutionBinding {
+    argv: Vec<String>,
+    executable_digest: ContentDigest,
+    digest: ContentDigest,
+}
+
+fn applied_snapshot_fingerprint(applied: &AppliedConfig) -> Result<ContentDigest, String> {
+    let canonical = serde_json::to_vec(&(
+        &applied.config,
+        &applied.profiles,
+        &applied.source_files,
+        &applied.digest,
+    ))
+    .map_err(|error| error.to_string())?;
+    ContentDigest::parse(format!("{:x}", Sha256::digest(canonical)))
+}
+
+fn bind_command_execution(
+    action: &OperationActionConfig,
+) -> Result<Option<CommandExecutionBinding>, String> {
+    let OperationActionConfig::Command { command } = action else {
+        return Ok(None);
+    };
+    let Some((executable, arguments)) = command.split_first() else {
+        return Err("configured operation command is empty".into());
+    };
+    if executable.is_empty()
+        || command
+            .iter()
+            .any(|argument| argument.is_empty() || argument.contains('\0'))
+    {
+        return Err("configured operation argv contains an empty argument or NUL byte".into());
+    }
+    let search_path = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let executable = crate::process::resolve_executable(Path::new(executable), &search_path)
+        .ok_or_else(|| "configured operation executable is unavailable".to_owned())?;
+    let mut file = File::open(&executable)
+        .map_err(|_| "configured operation executable cannot be read".to_owned())?;
+    let metadata_before = file
+        .metadata()
+        .map_err(|_| "configured operation executable metadata is unavailable".to_owned())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "configured operation executable cannot be hashed".to_owned())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let metadata_after = file
+        .metadata()
+        .map_err(|_| "configured operation executable metadata is unavailable".to_owned())?;
+    if metadata_before.len() != metadata_after.len()
+        || metadata_before.modified().ok() != metadata_after.modified().ok()
+    {
+        return Err("configured operation executable changed while it was being hashed".into());
+    }
+    let executable_digest = ContentDigest::parse(format!("{:x}", hasher.finalize()))?;
+    let mut argv = Vec::with_capacity(command.len());
+    argv.push(executable.display().to_string());
+    argv.extend(arguments.iter().cloned());
+    let canonical =
+        serde_json::to_vec(&(&argv, &executable_digest)).map_err(|error| error.to_string())?;
+    let digest = ContentDigest::parse(format!("{:x}", Sha256::digest(canonical)))?;
+    Ok(Some(CommandExecutionBinding {
+        argv,
+        executable_digest,
+        digest,
+    }))
+}
+
 /// Private fields prevent callers from constructing permits from a free
 /// `approved` boolean. Obtain one only after checking the current repository
 /// policy and exact approval receipt.
@@ -383,6 +477,11 @@ pub struct OperationPermit {
     subject: OperationSubject,
     selector: BTreeMap<String, String>,
     approval_digest: Option<ContentDigest>,
+    command: Option<CommandExecutionBinding>,
+    applied_config_digest: ContentDigest,
+    applied_snapshot_fingerprint: ContentDigest,
+    authority_digest: ContentDigest,
+    timeout_seconds: u64,
 }
 
 impl OperationPermit {
@@ -433,14 +532,30 @@ impl OperationPermit {
 }
 
 pub fn authorize_operation(
-    config: &Config,
-    applied_config_digest: &ContentDigest,
+    applied: &AppliedConfig,
     delivery_facts: &DeliveryFacts,
     plan: &ValidatedOperationPlan,
     target: &OperationTarget,
     subject: OperationSubject,
     approval: Option<&HumanApprovalReceipt>,
 ) -> Result<OperationPermit, AuthorizationError> {
+    let config = &applied.config;
+    let applied_config_digest =
+        ContentDigest::parse(applied.digest.to_string()).map_err(AuthorizationError::Invalid)?;
+    let applied_snapshot_fingerprint =
+        applied_snapshot_fingerprint(applied).map_err(AuthorizationError::Invalid)?;
+    let authoritative_plan = validate_recipe(config, &plan.recipe_id)
+        .map_err(|error| AuthorizationError::Invalid(error.to_string()))?;
+    let same_targets = serde_json::to_value(&plan.targets).ok()
+        == serde_json::to_value(&authoritative_plan.targets).ok();
+    if plan.digest != authoritative_plan.digest
+        || plan.not_required_reason != authoritative_plan.not_required_reason
+        || !same_targets
+    {
+        return Err(AuthorizationError::Invalid(
+            "operation plan does not match the current applied recipe".into(),
+        ));
+    }
     let repository = config
         .repositories
         .get(&target.repository)
@@ -465,7 +580,7 @@ pub fn authorize_operation(
     });
     if subject.recipe_id != plan.recipe_id
         || subject.plan_digest != plan.digest
-        || &subject.config_digest != applied_config_digest
+        || subject.config_digest != applied_config_digest
         || subject.target_id != target.id
         || subject.action_id != target.action
         || subject.repository_id != target.repository
@@ -516,11 +631,61 @@ pub fn authorize_operation(
         }
         None
     };
+    let command = bind_command_execution(action).map_err(AuthorizationError::Invalid)?;
+    let authority_digest = operation_authority_digest(
+        config,
+        &subject.project_id,
+        &plan.recipe_id,
+        &target.repository,
+        &target.action,
+    )
+    .map_err(AuthorizationError::Invalid)?;
     Ok(OperationPermit {
         subject,
         selector: target.selector.clone(),
         approval_digest,
+        command,
+        applied_config_digest,
+        applied_snapshot_fingerprint,
+        authority_digest,
+        timeout_seconds: target.timeout_seconds,
     })
+}
+
+fn operation_authority_digest(
+    config: &Config,
+    project_id: &ProjectId,
+    recipe_id: &str,
+    repository_id: &RepositoryId,
+    action_id: &str,
+) -> Result<ContentDigest, String> {
+    let repository_policy = config
+        .repositories
+        .get(repository_id)
+        .and_then(|repository| repository.operations.as_ref())
+        .ok_or_else(|| "repository operation policy is missing".to_owned())?;
+    let action = config
+        .operation_actions
+        .get(action_id)
+        .ok_or_else(|| "operation action is missing".to_owned())?;
+    let project = config
+        .projects
+        .get(project_id)
+        .ok_or_else(|| "operation project is missing".to_owned())?;
+    let recipe = config
+        .operation_recipes
+        .get(recipe_id)
+        .ok_or_else(|| "operation recipe is missing".to_owned())?;
+    let canonical = serde_json::to_vec(&(
+        recipe_id,
+        recipe,
+        repository_policy,
+        action,
+        &project.repositories,
+        &project.operation_matches,
+    ))
+    .map_err(|error| error.to_string())?;
+    ContentDigest::parse(format!("{:x}", Sha256::digest(canonical)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -785,6 +950,13 @@ pub enum InvokeOutcome {
 #[serde(deny_unknown_fields)]
 pub struct FindResult {
     pub outcome: FindOutcome,
+    pub operation_id: OperationId,
+    pub correlation_key: String,
+    pub action_id: String,
+    pub target_id: String,
+    pub repository_id: RepositoryId,
+    pub environment: String,
+    pub source_sha: String,
     #[serde(default)]
     pub observed_at: Option<String>,
     #[serde(default)]
@@ -805,6 +977,16 @@ pub enum FindOutcome {
 
 impl FindResult {
     pub fn validate(&self) -> Result<(), String> {
+        if self.correlation_key.trim().is_empty()
+            || self.action_id.trim().is_empty()
+            || self.target_id.trim().is_empty()
+            || self.environment.trim().is_empty()
+            || !valid_git_sha(&self.source_sha)
+        {
+            return Err(
+                "operation.find result is missing a valid requested operation identity".into(),
+            );
+        }
         match self.outcome {
             FindOutcome::Found if self.external_reference.as_deref().is_none_or(str::is_empty) => {
                 Err("found operation result must include an external reference".into())
@@ -817,6 +999,23 @@ impl FindResult {
             }
             _ => Ok(()),
         }
+    }
+
+    pub fn validate_for(&self, request: &FindParams) -> Result<(), String> {
+        self.validate()?;
+        if self.operation_id != request.operation_id
+            || self.correlation_key != request.correlation_key
+            || self.action_id != request.action_id
+            || self.target_id != request.target_id
+            || self.repository_id != request.repository_id
+            || self.environment != request.environment
+            || self.source_sha != request.source_sha
+        {
+            return Err(
+                "operation.find result does not match the exact requested operation subject".into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1179,6 +1378,9 @@ pub fn call_command_adapter<R: BoundedCommandRunner, P: Serialize>(
             "operation adapter timeout is outside the supported range".into(),
         ));
     }
+    let params_value = serde_json::to_value(&request.params)
+        .map_err(|error| AdapterError::Invalid(error.to_string()))?;
+    validate_request_for(method, request, &params_value).map_err(AdapterError::Invalid)?;
     let command = match action {
         OperationActionConfig::Command { command } if !command.is_empty() => command,
         OperationActionConfig::Command { .. } => {
@@ -1273,7 +1475,93 @@ pub fn call_command_adapter<R: BoundedCommandRunner, P: Serialize>(
             AdapterError::Invalid(error)
         }
     })?;
+    validate_success_for(
+        method,
+        &params_value,
+        response.result.as_ref().expect("validated response result"),
+    )
+    .map_err(|error| {
+        if method == "operation.invoke" {
+            AdapterError::Uncertain(format!("adapter reply cannot be reconciled: {error}"))
+        } else {
+            AdapterError::Invalid(error)
+        }
+    })?;
     Ok(AdapterCall::Response(response))
+}
+
+fn validate_request_for<P>(
+    method: &str,
+    request: &RequestEnvelope<P>,
+    params: &Value,
+) -> Result<(), String> {
+    match method {
+        "operation.invoke" => {
+            if request.operation_id.is_none() || request.project_id.is_none() {
+                return Err("operation.invoke requires its operation and Project identities in the envelope".into());
+            }
+            let _: InvokeParams = serde_json::from_value(params.clone())
+                .map_err(|error| format!("invalid operation.invoke request params: {error}"))?;
+            Ok(())
+        }
+        "operation.observe" => {
+            let params: ObserveParams = serde_json::from_value(params.clone())
+                .map_err(|error| format!("invalid operation.observe request params: {error}"))?;
+            if request.operation_id.as_ref() != Some(&params.operation_id)
+                || request.project_id.is_none()
+            {
+                return Err(
+                    "operation.observe envelope identity does not match its request params".into(),
+                );
+            }
+            Ok(())
+        }
+        "operation.find" => {
+            let params: FindParams = serde_json::from_value(params.clone())
+                .map_err(|error| format!("invalid operation.find request params: {error}"))?;
+            if request.operation_id.as_ref() != Some(&params.operation_id)
+                || request.project_id.is_none()
+            {
+                return Err(
+                    "operation.find envelope identity does not match its request params".into(),
+                );
+            }
+            Ok(())
+        }
+        "adapter.describe" => Ok(()),
+        _ => Err(format!("unsupported operation method `{method}`")),
+    }
+}
+
+fn validate_success_for(method: &str, params: &Value, result: &Value) -> Result<(), String> {
+    match method {
+        "operation.find" => {
+            let request: FindParams = serde_json::from_value(params.clone())
+                .map_err(|error| format!("invalid operation.find request params: {error}"))?;
+            let response: FindResult = serde_json::from_value(result.clone())
+                .map_err(|error| format!("invalid operation.find result: {error}"))?;
+            response.validate_for(&request)
+        }
+        "operation.observe" => {
+            let request: ObserveParams = serde_json::from_value(params.clone())
+                .map_err(|error| format!("invalid operation.observe request params: {error}"))?;
+            let response: OperationObservation = serde_json::from_value(result.clone())
+                .map_err(|error| format!("invalid operation.observe result: {error}"))?;
+            if response.action_id != request.action_id
+                || response.target_id != request.target_id
+                || response.repository_id != request.repository_id
+                || response.environment != request.environment
+                || response.source_sha != request.source_sha
+            {
+                return Err(
+                    "operation.observe result does not match the exact requested target and source"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Invocation entry point for a write-side command. The command is selected
@@ -1281,19 +1569,80 @@ pub fn call_command_adapter<R: BoundedCommandRunner, P: Serialize>(
 /// pass an agent-authored executable or substitute another target.
 pub fn invoke_authorized_command<R: BoundedCommandRunner>(
     runner: &mut R,
-    config: &Config,
+    applied: &AppliedConfig,
     permit: &OperationPermit,
     request_id: impl Into<String>,
     timeout: Duration,
 ) -> Result<AdapterCall, AdapterError> {
-    let action = config
+    let current_config_digest =
+        ContentDigest::parse(applied.digest.to_string()).map_err(AdapterError::Invalid)?;
+    if current_config_digest != permit.applied_config_digest
+        || current_config_digest != permit.subject.config_digest
+        || applied_snapshot_fingerprint(applied).map_err(AdapterError::Invalid)?
+            != permit.applied_snapshot_fingerprint
+    {
+        return Err(AdapterError::Invalid(
+            "applied configuration changed after operation authorization".into(),
+        ));
+    }
+    let config = &applied.config;
+    let plan = validate_recipe(config, &permit.subject.recipe_id)
+        .map_err(|error| AdapterError::Invalid(error.to_string()))?;
+    if plan.digest != permit.subject.plan_digest {
+        return Err(AdapterError::Invalid(
+            "operation recipe changed after authorization".into(),
+        ));
+    }
+    let target = plan
+        .targets
+        .iter()
+        .find(|target| target.id == permit.subject.target_id)
+        .ok_or_else(|| AdapterError::Invalid("authorized target no longer exists".into()))?;
+    if target.action != permit.subject.action_id
+        || target.repository != permit.subject.repository_id
+        || target.environment != permit.subject.environment
+        || target.selector != permit.selector
+        || target.timeout_seconds != permit.timeout_seconds
+        || timeout.is_zero()
+        || timeout > Duration::from_secs(permit.timeout_seconds)
+    {
+        return Err(AdapterError::Invalid(
+            "authorized target or timeout changed after operation authorization".into(),
+        ));
+    }
+    let authority_digest = operation_authority_digest(
+        config,
+        &permit.subject.project_id,
+        &permit.subject.recipe_id,
+        &permit.subject.repository_id,
+        &permit.subject.action_id,
+    )
+    .map_err(AdapterError::Invalid)?;
+    if authority_digest != permit.authority_digest {
+        return Err(AdapterError::Invalid(
+            "operation authority policy changed after authorization".into(),
+        ));
+    }
+    let current_action = config
         .operation_actions
         .get(&permit.subject.action_id)
         .ok_or_else(|| AdapterError::Invalid("authorized action is no longer configured".into()))?;
+    let current_command = bind_command_execution(current_action).map_err(AdapterError::Invalid)?;
+    if current_command != permit.command {
+        return Err(AdapterError::Invalid(
+            "operation executable or argv changed after authorization".into(),
+        ));
+    }
+    let command = permit.command.as_ref().ok_or_else(|| {
+        AdapterError::Invalid("authorized action is not a command adapter".into())
+    })?;
+    let action = OperationActionConfig::Command {
+        command: command.argv.clone(),
+    };
     let request = permit
         .invoke_request(request_id)
         .map_err(AdapterError::Invalid)?;
-    call_command_adapter(runner, action, &request, timeout)
+    call_command_adapter(runner, &action, &request, timeout)
 }
 
 fn validate_success_payload(method: &str, result: &Value) -> Result<(), String> {
@@ -1372,6 +1721,7 @@ fn _duration_is_representable(_: Duration) {}
 mod tests {
     use super::*;
     use crate::config::{OperationRecipe, RepositoryOperationsConfig};
+    use crate::domain::ids::Digest as AppliedDigest;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -1381,7 +1731,14 @@ mod tests {
         config.operation_actions.insert(
             "deploy".into(),
             OperationActionConfig::Command {
-                command: vec!["adapter".into()],
+                command: vec![
+                    "python3".into(),
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/operations/adapter.py"
+                    )
+                    .into(),
+                ],
             },
         );
         config
@@ -1403,6 +1760,16 @@ mod tests {
             )]),
         );
         config
+    }
+
+    fn applied(config: Config) -> AppliedConfig {
+        AppliedConfig {
+            config,
+            profiles: BTreeMap::new(),
+            source_root: "/fixture".into(),
+            source_files: vec![],
+            digest: AppliedDigest::parse("a".repeat(64)).unwrap(),
+        }
     }
 
     fn target(id: &str, depends_on: Vec<String>, approval: ApprovalMode) -> OperationTarget {
@@ -1492,23 +1859,14 @@ mod tests {
 
     #[test]
     fn repository_environment_strengthens_approval_and_binds_exact_subject() {
-        let config = fixture_config();
-        let plan = validate_recipe(&config, "rollout").unwrap();
+        let applied = applied(fixture_config());
+        let config = &applied.config;
+        let plan = validate_recipe(config, "rollout").unwrap();
         let target = &plan.targets[0];
-        let config_digest = ContentDigest::parse("a".repeat(64)).unwrap();
         let facts = delivery_facts(target);
         let base = subject(&plan, target);
         assert_eq!(
-            authorize_operation(
-                &config,
-                &config_digest,
-                &facts,
-                &plan,
-                target,
-                base.clone(),
-                None
-            )
-            .unwrap_err(),
+            authorize_operation(&applied, &facts, &plan, target, base.clone(), None).unwrap_err(),
             AuthorizationError::ApprovalRequired
         );
         let mut stale = base.clone();
@@ -1522,28 +1880,12 @@ mod tests {
             decided_at: "2026-11-07T00:00:00Z".into(),
         };
         assert_eq!(
-            authorize_operation(
-                &config,
-                &config_digest,
-                &facts,
-                &plan,
-                target,
-                stale,
-                Some(&receipt)
-            )
-            .unwrap_err(),
+            authorize_operation(&applied, &facts, &plan, target, stale, Some(&receipt))
+                .unwrap_err(),
             AuthorizationError::StaleApproval
         );
-        let permit = authorize_operation(
-            &config,
-            &config_digest,
-            &facts,
-            &plan,
-            target,
-            base,
-            Some(&receipt),
-        )
-        .unwrap();
+        let permit =
+            authorize_operation(&applied, &facts, &plan, target, base, Some(&receipt)).unwrap();
         assert_eq!(
             permit.invoke_params().unwrap().approval_digest,
             Some(receipt.subject_digest)
@@ -1552,16 +1894,165 @@ mod tests {
 
     #[test]
     fn changed_config_digest_invalidates_authorization() {
-        let config = fixture_config();
-        let plan = validate_recipe(&config, "rollout").unwrap();
+        let applied = applied(fixture_config());
+        let config = &applied.config;
+        let plan = validate_recipe(config, "rollout").unwrap();
         let target = &plan.targets[0];
         let s = subject(&plan, target);
         let facts = delivery_facts(target);
-        let wrong = ContentDigest::parse("b".repeat(64)).unwrap();
+        let mut wrong = applied.clone();
+        wrong.digest = AppliedDigest::parse("b".repeat(64)).unwrap();
         assert!(matches!(
-            authorize_operation(&config, &wrong, &facts, &plan, target, s, None),
+            authorize_operation(&wrong, &facts, &plan, target, s, None),
             Err(AuthorizationError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn forged_validated_plan_cannot_authorize_a_target_absent_from_config() {
+        let mut config = fixture_config();
+        let deploy = config.operation_actions["deploy"].clone();
+        config
+            .operation_actions
+            .insert("other_allowed_action".into(), deploy);
+        config
+            .repositories
+            .get_mut(&RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .operations
+            .as_mut()
+            .unwrap()
+            .allowed_actions
+            .push("other_allowed_action".into());
+        let applied = applied(config);
+        let plan = validate_recipe(&applied.config, "rollout").unwrap();
+        let mut forged = plan.clone();
+        forged.targets[0].action = "other_allowed_action".into();
+        let target = &forged.targets[0];
+        let facts = delivery_facts(target);
+        let subject = subject(&forged, target);
+        assert!(matches!(
+            authorize_operation(&applied, &facts, &forged, target, subject, None),
+            Err(AuthorizationError::Invalid(reason)) if reason.contains("plan")
+        ));
+    }
+
+    #[test]
+    fn invocation_rejects_changed_command_even_if_caller_reuses_old_config_digest() {
+        let applied = applied(fixture_config());
+        let plan = validate_recipe(&applied.config, "rollout").unwrap();
+        let target = &plan.targets[0];
+        let facts = delivery_facts(target);
+        let subject = subject(&plan, target);
+        let approval = HumanApprovalReceipt {
+            request_id: "human-2".into(),
+            subject_digest: subject.digest().unwrap(),
+            approved: true,
+            decided_at: "2026-11-07T00:00:00Z".into(),
+        };
+        let permit =
+            authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
+        let mut replaced = applied.clone();
+        replaced.config.operation_actions.insert(
+            "deploy".into(),
+            OperationActionConfig::Command {
+                command: vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "print('different command')".into(),
+                ],
+            },
+        );
+        let mut runner = FakeRunner::default();
+        let error = invoke_authorized_command(
+            &mut runner,
+            &replaced,
+            &permit,
+            "req-replaced",
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AdapterError::Invalid(_)));
+        assert!(
+            runner.command.is_empty(),
+            "changed executable must not be run"
+        );
+    }
+
+    #[test]
+    fn invocation_rejects_changed_resolved_executable_contents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("operation-adapter");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let mut configured = fixture_config();
+        configured.operation_actions.insert(
+            "deploy".into(),
+            OperationActionConfig::Command {
+                command: vec![executable.display().to_string()],
+            },
+        );
+        let applied = applied(configured);
+        let plan = validate_recipe(&applied.config, "rollout").unwrap();
+        let target = &plan.targets[0];
+        let facts = delivery_facts(target);
+        let subject = subject(&plan, target);
+        let approval = HumanApprovalReceipt {
+            request_id: "human-3".into(),
+            subject_digest: subject.digest().unwrap(),
+            approved: true,
+            decided_at: "2026-11-07T00:00:00Z".into(),
+        };
+        let permit =
+            authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
+        std::fs::write(&executable, b"#!/bin/sh\nexit 42\n").unwrap();
+        let mut runner = FakeRunner::default();
+        let error = invoke_authorized_command(
+            &mut runner,
+            &applied,
+            &permit,
+            "req-mutated-binary",
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AdapterError::Invalid(_)));
+        assert!(
+            runner.command.is_empty(),
+            "modified executable must not be run"
+        );
+    }
+
+    #[test]
+    fn invocation_cannot_exceed_the_configured_target_deadline() {
+        let applied = applied(fixture_config());
+        let plan = validate_recipe(&applied.config, "rollout").unwrap();
+        let target = &plan.targets[0];
+        let facts = delivery_facts(target);
+        let subject = subject(&plan, target);
+        let approval = HumanApprovalReceipt {
+            request_id: "human-4".into(),
+            subject_digest: subject.digest().unwrap(),
+            approved: true,
+            decided_at: "2026-11-07T00:00:00Z".into(),
+        };
+        let permit =
+            authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
+        let mut runner = FakeRunner::default();
+        assert!(matches!(
+            invoke_authorized_command(
+                &mut runner,
+                &applied,
+                &permit,
+                "req-too-long",
+                Duration::from_secs(61),
+            ),
+            Err(AdapterError::Invalid(_))
+        ));
+        assert!(runner.command.is_empty());
     }
 
     #[test]
@@ -1759,7 +2250,19 @@ mod tests {
             Some(OperationId::parse("op-1").unwrap()),
             Some(ProjectId::parse("operations_project").unwrap()),
             "operation.invoke",
-            serde_json::json!({"action_id":"deploy"}),
+            InvokeParams {
+                action_id: "deploy".into(),
+                target_id: "deploy_prod".into(),
+                repository_id: RepositoryId::parse("example").unwrap(),
+                environment: "production".into(),
+                source_sha: SHA.into(),
+                plan_digest: ContentDigest::parse("d".repeat(64)).unwrap(),
+                correlation_key: "correlation".into(),
+                selector: BTreeMap::new(),
+                parameters: BTreeMap::new(),
+                expected_preconditions: BTreeMap::new(),
+                approval_digest: None,
+            },
         )
         .unwrap();
         let action = OperationActionConfig::Command {
@@ -1787,10 +2290,10 @@ mod tests {
 
     #[test]
     fn authorized_invocation_uses_only_applied_argv_and_bound_request_fields() {
-        let config = fixture_config();
-        let plan = validate_recipe(&config, "rollout").unwrap();
+        let applied = applied(fixture_config());
+        let config = &applied.config;
+        let plan = validate_recipe(config, "rollout").unwrap();
         let target = &plan.targets[0];
-        let config_digest = ContentDigest::parse("a".repeat(64)).unwrap();
         let facts = delivery_facts(target);
         let subject = subject(&plan, target);
         let approval = HumanApprovalReceipt {
@@ -1799,16 +2302,8 @@ mod tests {
             approved: true,
             decided_at: "2026-11-07T00:00:00Z".into(),
         };
-        let permit = authorize_operation(
-            &config,
-            &config_digest,
-            &facts,
-            &plan,
-            target,
-            subject,
-            Some(&approval),
-        )
-        .unwrap();
+        let permit =
+            authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
         let mut runner = FakeRunner {
             command: vec![],
             stdin: vec![],
@@ -1816,13 +2311,15 @@ mod tests {
         };
         let result = invoke_authorized_command(
             &mut runner,
-            &config,
+            &applied,
             &permit,
             "req-1",
             Duration::from_secs(30),
         )
         .unwrap();
-        assert_eq!(runner.command, ["adapter"]);
+        assert_eq!(runner.command.len(), 2);
+        assert!(Path::new(&runner.command[0]).is_absolute());
+        assert!(runner.command[0].contains("python"));
         let request: RequestEnvelope<InvokeParams> = serde_json::from_slice(&runner.stdin).unwrap();
         assert_eq!(request.operation_id.as_ref().unwrap().as_str(), "op-1");
         assert_eq!(request.params.source_sha, SHA);
@@ -1875,11 +2372,127 @@ mod tests {
     fn absent_find_requires_observation_proof() {
         let result = FindResult {
             outcome: FindOutcome::Absent,
+            operation_id: OperationId::parse("op-1").unwrap(),
+            correlation_key: "corr-1".into(),
+            action_id: "deploy".into(),
+            target_id: "deploy_prod".into(),
+            repository_id: RepositoryId::parse("example").unwrap(),
+            environment: "production".into(),
+            source_sha: SHA.into(),
             observed_at: None,
             proof_scope: None,
             external_reference: None,
             receipt: None,
         };
         assert!(result.validate().is_err());
+    }
+
+    #[test]
+    fn found_operation_must_match_the_exact_find_subject() {
+        let request = FindParams {
+            operation_id: OperationId::parse("op-1").unwrap(),
+            correlation_key: "stable-correlation".into(),
+            action_id: "deploy".into(),
+            target_id: "deploy_prod".into(),
+            repository_id: RepositoryId::parse("example").unwrap(),
+            environment: "production".into(),
+            source_sha: SHA.into(),
+        };
+        let result = FindResult {
+            outcome: FindOutcome::Found,
+            operation_id: request.operation_id.clone(),
+            correlation_key: request.correlation_key.clone(),
+            action_id: request.action_id.clone(),
+            target_id: request.target_id.clone(),
+            repository_id: request.repository_id.clone(),
+            environment: request.environment.clone(),
+            source_sha: request.source_sha.clone(),
+            observed_at: None,
+            proof_scope: None,
+            external_reference: Some("external-run".into()),
+            receipt: None,
+        };
+        assert!(result.validate_for(&request).is_ok());
+        let mut unrelated = result;
+        unrelated.operation_id = OperationId::parse("other-operation").unwrap();
+        unrelated.source_sha = "f".repeat(40);
+        assert!(unrelated.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn command_adapter_rejects_found_receipt_for_an_unrelated_operation() {
+        let request = new_request(
+            "find-request",
+            Some(OperationId::parse("op-1").unwrap()),
+            Some(ProjectId::parse("operations_project").unwrap()),
+            "operation.find",
+            FindParams {
+                operation_id: OperationId::parse("op-1").unwrap(),
+                correlation_key: "stable-correlation".into(),
+                action_id: "deploy".into(),
+                target_id: "deploy_prod".into(),
+                repository_id: RepositoryId::parse("example").unwrap(),
+                environment: "production".into(),
+                source_sha: SHA.into(),
+            },
+        )
+        .unwrap();
+        let result = serde_json::json!({
+            "outcome": "found",
+            "operation_id": "different-operation",
+            "correlation_key": "stable-correlation",
+            "action_id": "deploy",
+            "target_id": "deploy_prod",
+            "repository_id": "example",
+            "environment": "production",
+            "source_sha": SHA,
+            "external_reference": "unrelated-run"
+        });
+        let response = serde_json::json!({
+            "schema_version": 1,
+            "request_id": "find-request",
+            "result": result
+        });
+        let mut runner = FakeRunner {
+            command: vec![],
+            stdin: vec![],
+            completion: Some(completed(serde_json::to_vec(&response).unwrap())),
+        };
+        let action = OperationActionConfig::Command {
+            command: vec!["adapter".into()],
+        };
+        assert!(matches!(
+            call_command_adapter(&mut runner, &action, &request, Duration::from_secs(10)),
+            Err(AdapterError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn find_request_rejects_conflicting_envelope_and_parameter_operation_ids() {
+        let request = new_request(
+            "find-request-conflict",
+            Some(OperationId::parse("op-1").unwrap()),
+            Some(ProjectId::parse("operations_project").unwrap()),
+            "operation.find",
+            FindParams {
+                operation_id: OperationId::parse("op-2").unwrap(),
+                correlation_key: "stable-correlation".into(),
+                action_id: "deploy".into(),
+                target_id: "deploy_prod".into(),
+                repository_id: RepositoryId::parse("example").unwrap(),
+                environment: "production".into(),
+                source_sha: SHA.into(),
+            },
+        )
+        .unwrap();
+        let mut runner = FakeRunner::default();
+        let action = OperationActionConfig::Command {
+            command: vec!["adapter".into()],
+        };
+        assert!(matches!(
+            call_command_adapter(&mut runner, &action, &request, Duration::from_secs(10)),
+            Err(AdapterError::Invalid(_))
+        ));
+        assert!(runner.command.is_empty());
     }
 }

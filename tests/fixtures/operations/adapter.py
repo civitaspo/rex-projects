@@ -37,6 +37,13 @@ def main():
     elif method == "operation.find":
         result = {
             "outcome": "absent",
+            "operation_id": params["operation_id"],
+            "correlation_key": params["correlation_key"],
+            "action_id": params["action_id"],
+            "target_id": params["target_id"],
+            "repository_id": params["repository_id"],
+            "environment": params["environment"],
+            "source_sha": params["source_sha"],
             "observed_at": "2026-01-01T00:00:00Z",
             "proof_scope": "fixture-local-deterministic-store",
         }
