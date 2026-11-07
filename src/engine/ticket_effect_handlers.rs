@@ -1766,7 +1766,7 @@ mod tests {
                 &project,
                 &ticket,
                 &run,
-                Revision(1),
+                Revision(0),
                 applied_snapshot.revision,
                 &applied,
                 &plan,
