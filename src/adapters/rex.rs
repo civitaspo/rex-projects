@@ -813,17 +813,145 @@ impl RexCliTransport {
         &self,
         receipt: RexQualificationSessionReceipt,
     ) -> Result<(), RexError> {
-        self.disposable_qualification_fixture(receipt.clone())?;
-        let output = self.command(&["kill".into(), receipt.session_id.clone().into()])?;
-        let _ = output;
         self.verify_identity()?;
-        let output = self.command(&["session".into(), "ls".into(), "--json".into()])?;
-        let sessions: Value = parse(&output.stdout)?;
+        let sessions = self.session_list()?;
+        let listed = sessions
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session list has no sessions array".into()))?;
+        let matches = listed
+            .iter()
+            .filter(|session| {
+                session.get("session_id").and_then(Value::as_str) == Some(&receipt.session_id)
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            self.verify_identity()?;
+            return Ok(());
+        }
+        if matches.len() != 1
+            || matches[0].get("label").and_then(Value::as_str) != Some(&receipt.session_label)
+        {
+            return Err(RexError::Uncertain);
+        }
+        let view = self.session_view()?;
+        let windows = view
+            .get("windows")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if !windows.is_empty() {
+            self.disposable_qualification_fixture(receipt.clone())?;
+        }
+        self.command(&["kill".into(), receipt.session_id.clone().into()])?;
+        let sessions = self.session_list()?;
         if value_contains_exact_string(&sessions, &receipt.session_id) {
             return Err(RexError::Uncertain);
         }
         self.verify_identity()?;
         Ok(())
+    }
+
+    fn session_list(&self) -> Result<Value, RexError> {
+        let output = self.command(&["session".into(), "ls".into(), "--json".into()])?;
+        let sessions: Value = parse(&output.stdout)?;
+        if sessions.get("sessions").and_then(Value::as_array).is_none() {
+            return Err(RexError::Protocol(
+                "session list has no sessions array".into(),
+            ));
+        }
+        Ok(sessions)
+    }
+
+    pub(crate) fn qualification_session_exists(&self, session_id: &str) -> Result<bool, RexError> {
+        if session_id.is_empty() || session_id.chars().any(char::is_control) {
+            return Err(RexError::Invalid(
+                "qualification session ID is malformed".into(),
+            ));
+        }
+        self.verify_identity()?;
+        let sessions = self.session_list()?;
+        let listed = sessions
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session list has no sessions array".into()))?;
+        let matches = listed
+            .iter()
+            .filter(|session| session.get("session_id").and_then(Value::as_str) == Some(session_id))
+            .count();
+        self.verify_identity()?;
+        match matches {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(RexError::Uncertain),
+        }
+    }
+
+    /// Returns true when Rex has removed the exact host-created qualification block. The
+    /// enclosing session must remain unique and contain no foreign windows or blocks.
+    pub(crate) fn qualification_block_finished(
+        &self,
+        receipt: &RexQualificationSessionReceipt,
+    ) -> Result<bool, RexError> {
+        if receipt.endpoint != self.endpoint
+            || receipt.instance_id != self.expected_instance_id
+            || receipt.session_id != self.session_id
+        {
+            return Err(RexError::Invalid(
+                "qualification receipt does not match this Rex transport".into(),
+            ));
+        }
+        self.verify_identity()?;
+        let sessions = self.session_list()?;
+        let listed = sessions
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session list has no sessions array".into()))?;
+        let matches = listed
+            .iter()
+            .filter(|session| {
+                session.get("session_id").and_then(Value::as_str) == Some(&receipt.session_id)
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Ok(true);
+        }
+        if matches.len() != 1
+            || matches[0].get("label").and_then(Value::as_str) != Some(&receipt.session_label)
+        {
+            return Err(RexError::Uncertain);
+        }
+        let view = self.session_view()?;
+        if view.get("session_id").and_then(Value::as_str) != Some(&receipt.session_id)
+            || view.get("label").and_then(Value::as_str) != Some(&receipt.session_label)
+        {
+            return Err(RexError::Uncertain);
+        }
+        let windows = view
+            .get("windows")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if windows.is_empty() {
+            return Ok(true);
+        }
+        if windows.len() != 1
+            || windows[0].get("window_id").and_then(Value::as_str) != Some(&receipt.window_id)
+            || windows[0].get("label").and_then(Value::as_str) != Some(&receipt.window_label)
+        {
+            return Err(RexError::Uncertain);
+        }
+        let blocks = all_blocks_in_window(&view, &receipt.window_id)?;
+        if blocks.is_empty() {
+            return Ok(true);
+        }
+        if blocks.len() == 1
+            && blocks[0].block_id == receipt.block_id
+            && blocks[0].flavor == SHELL_FLAVOR
+        {
+            return Ok(false);
+        }
+        Err(RexError::Uncertain)
     }
 
     pub fn list_owned_windows_and_blocks(&self) -> Result<Vec<OwnedWindow>, RexError> {

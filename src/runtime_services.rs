@@ -536,21 +536,43 @@ impl RuntimeServices {
             Ok(rex) => rex,
             Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
         };
-        let window = RexWindow {
-            server_instance_id: self.rex_identity.instance_id.clone(),
-            session_id: session_id.to_owned(),
-            window_id: window_id.to_owned(),
-            label: package.rex_receipt.window_label().to_owned(),
-            initial_block_id: Some(block_id.to_owned()),
-            disposition: CreateDisposition::Existing,
+        let block_exit_code = if self
+            .rex
+            .qualification_session_exists(session_id)
+            .map_err(|error| error.to_string())?
+        {
+            if rex
+                .qualification_block_finished(&package.rex_receipt)
+                .map_err(|error| error.to_string())?
+            {
+                // Rex removes a finished block (and sometimes its window) automatically. The
+                // run-step spool is only published after the receipt is durable, so the exact
+                // receipt/session shape plus host process cleanup is enough to reconcile it.
+                None
+            } else {
+                let window = RexWindow {
+                    server_instance_id: self.rex_identity.instance_id.clone(),
+                    session_id: session_id.to_owned(),
+                    window_id: window_id.to_owned(),
+                    label: package.rex_receipt.window_label().to_owned(),
+                    initial_block_id: Some(block_id.to_owned()),
+                    disposition: CreateDisposition::Existing,
+                };
+                let observation = match rex.observe_process(&window, &operation_id, block_id) {
+                    Ok(observation) => observation,
+                    Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+                };
+                let Some(exit) = observation.last_exit else {
+                    return Ok(());
+                };
+                Some(exit.exit_code)
+            }
+        } else {
+            // Rex can automatically remove an empty one-block session when the wrapper exits.
+            // The private spool is written only after the turn receipt exists; absence is the
+            // host's terminal observation when that exact session has already disappeared.
+            None
         };
-        let observation = match rex.observe_process(&window, &operation_id, block_id) {
-            Ok(observation) => observation,
-            Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
-        };
-        if observation.last_exit.is_none() {
-            return Ok(());
-        }
         let result_bytes = match read_private_bounded(&result_path, 1024 * 1024) {
             Ok(bytes) => bytes,
             Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
@@ -570,10 +592,7 @@ impl RuntimeServices {
                 != package.descriptor.provider_capability.permission_mode
             || run.receipt.schema_projection
                 != package.descriptor.provider_capability.schema_projection
-            || observation
-                .last_exit
-                .as_ref()
-                .is_none_or(|exit| exit.exit_code != 0)
+            || block_exit_code.is_some_and(|exit_code| exit_code != 0)
         {
             if matches!(
                 run.receipt.cleanup,
@@ -590,6 +609,8 @@ impl RuntimeServices {
                     "request_id": job.request.request_id,
                     "outcome": "failed",
                     "reason": "provider qualification did not produce a valid completed turn",
+                    "provider_result_failure": run.receipt.provider_result_failure,
+                    "provider_process_failure": run.receipt.provider_process_failure,
                 });
                 let failure = serde_json::to_string(&failure).map_err(|error| error.to_string())?;
                 let digest = digest_bytes(failure.as_bytes())?;

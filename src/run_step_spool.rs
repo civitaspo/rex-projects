@@ -494,6 +494,8 @@ mod tests {
                 cleanup_detail: None,
                 processes: vec![],
                 result_digest: None,
+                provider_result_failure: None,
+                provider_process_failure: None,
                 outcome: TurnOutcome::MissingResult,
             },
             structured_result: None,

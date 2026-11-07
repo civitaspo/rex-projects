@@ -227,6 +227,31 @@ pub enum TurnOutcome {
     MissingResult,
 }
 
+/// Bounded non-sensitive reason a provider's structured result was rejected.
+/// Raw provider stdout/stderr is never persisted in the run receipt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderResultFailure {
+    StdoutTruncated,
+    ProviderReportedError,
+    InvalidResponseJson,
+    StructuredOutputMissing,
+    InvalidTransportEnvelope,
+    SourceSchemaRejected,
+    ConversationIdentityMismatch,
+}
+
+/// Non-sensitive category derived from a bounded provider stderr tail.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProcessFailure {
+    Authentication,
+    InvalidInvocation,
+    SchemaRejected,
+    Network,
+    Other,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunReceipt {
@@ -246,6 +271,10 @@ pub struct RunReceipt {
     pub cleanup_detail: Option<String>,
     pub processes: Vec<ObservedProcess>,
     pub result_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_result_failure: Option<ProviderResultFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_process_failure: Option<ProviderProcessFailure>,
     pub outcome: TurnOutcome,
 }
 
@@ -939,7 +968,7 @@ fn run_prepared<O: ProcessObserver>(
             }
         }
     };
-    let _stderr_tail = match join_reader(stderr_reader, Duration::from_millis(500)) {
+    let stderr_tail = match join_reader(stderr_reader, Duration::from_millis(500)) {
         Some(Ok(result)) => result,
         Some(Err(error)) => {
             cleanup_known = false;
@@ -965,10 +994,18 @@ fn run_prepared<O: ProcessObserver>(
     let stdout = stdout.bytes;
     let exit_code = child_status.as_ref().and_then(ExitStatus::code);
     let mut structured_result = None;
+    let mut provider_result_failure = None;
+    let provider_process_failure =
+        if cleanup_known && !timed_out && exit_code.is_some_and(|code| code != 0) {
+            Some(classify_provider_process_failure(&stderr_tail.bytes))
+        } else {
+            None
+        };
     let mut conversation_id = prepared.conversation_id.clone();
     if cleanup_known && !timed_out && cancellation_signal.is_none() && exit_code == Some(0) {
         if stdout_truncated || stdout.len() > MAX_RESULT_BYTES {
             outcome = TurnOutcome::MissingResult;
+            provider_result_failure = Some(ProviderResultFailure::StdoutTruncated);
         } else {
             match providers::parse_result(
                 request.profile.adapter,
@@ -986,13 +1023,18 @@ fn run_prepared<O: ProcessObserver>(
                     };
                     if !conversation_matches {
                         outcome = TurnOutcome::MissingResult;
+                        provider_result_failure =
+                            Some(ProviderResultFailure::ConversationIdentityMismatch);
                     } else {
                         conversation_id = observed_conversation;
                         structured_result = Some(result);
                         outcome = TurnOutcome::Completed;
                     }
                 }
-                Err(_) => outcome = TurnOutcome::MissingResult,
+                Err(error) => {
+                    outcome = TurnOutcome::MissingResult;
+                    provider_result_failure = Some(classify_provider_result_failure(&error));
+                }
             }
         }
     }
@@ -1039,10 +1081,71 @@ fn run_prepared<O: ProcessObserver>(
             cleanup_detail: inspection_error,
             processes: observed.into_iter().map(observed_process).collect(),
             result_digest,
+            provider_result_failure,
+            provider_process_failure,
             outcome,
         },
         structured_result,
     })
+}
+
+fn classify_provider_process_failure(stderr: &[u8]) -> ProviderProcessFailure {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if [
+        "not logged in",
+        "authentication",
+        "unauthorized",
+        "invalid api key",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+    {
+        ProviderProcessFailure::Authentication
+    } else if [
+        "unknown option",
+        "unexpected argument",
+        "unrecognized option",
+        "invalid option",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+    {
+        ProviderProcessFailure::InvalidInvocation
+    } else if ["schema", "structured output", "json schema"]
+        .iter()
+        .any(|needle| stderr.contains(needle))
+    {
+        ProviderProcessFailure::SchemaRejected
+    } else if ["network", "connection", "timed out", "rate limit", "dns"]
+        .iter()
+        .any(|needle| stderr.contains(needle))
+    {
+        ProviderProcessFailure::Network
+    } else {
+        ProviderProcessFailure::Other
+    }
+}
+
+fn classify_provider_result_failure(error: &str) -> ProviderResultFailure {
+    if error.contains("reported an error") || error.contains("reported a failed turn") {
+        ProviderResultFailure::ProviderReportedError
+    } else if error.contains("did not return structured output")
+        || error.contains("did not produce a final agent message")
+    {
+        ProviderResultFailure::StructuredOutputMissing
+    } else if error.contains("projected object envelope")
+        || error.contains("unexpected envelope fields")
+        || error.contains("missing its JSON result string")
+    {
+        ProviderResultFailure::InvalidTransportEnvelope
+    } else if error.contains("JSON response")
+        || error.contains("JSONL")
+        || error.contains("terminal event")
+    {
+        ProviderResultFailure::InvalidResponseJson
+    } else {
+        ProviderResultFailure::SourceSchemaRejected
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1078,6 +1181,8 @@ fn unresolved_receipt(
             cleanup_detail: error,
             processes,
             result_digest: None,
+            provider_result_failure: None,
+            provider_process_failure: None,
             outcome: TurnOutcome::ProviderFailed,
         },
         structured_result: None,
@@ -1848,11 +1953,36 @@ mod tests {
 
     use super::{
         CleanupState, ConversationContinuation, DisposableQualificationContext, ObservedProcess,
-        ProcessObserver, ProcessSignal, ProviderCapabilityEvidence, ProviderQualificationStatus,
-        RunDescriptor, RunReceipt, SystemProcessObserver, TurnOutcome, TurnRequest,
-        factory_environment, issue_qualification_permit, prepare, prepare_with_qualification,
-        run_fixture_turn, run_qualification_turn, run_turn,
+        ProcessObserver, ProcessSignal, ProviderCapabilityEvidence, ProviderProcessFailure,
+        ProviderQualificationStatus, RunDescriptor, RunReceipt, SystemProcessObserver, TurnOutcome,
+        TurnRequest, classify_provider_process_failure, factory_environment,
+        issue_qualification_permit, prepare, prepare_with_qualification, run_fixture_turn,
+        run_qualification_turn, run_turn,
     };
+
+    #[test]
+    fn provider_process_failure_classification_never_preserves_stderr_text() {
+        assert_eq!(
+            classify_provider_process_failure(b"Authentication failed for token: secret"),
+            ProviderProcessFailure::Authentication
+        );
+        assert_eq!(
+            classify_provider_process_failure(b"error: unexpected argument --old"),
+            ProviderProcessFailure::InvalidInvocation
+        );
+        assert_eq!(
+            classify_provider_process_failure(b"provider rejected JSON schema"),
+            ProviderProcessFailure::SchemaRejected
+        );
+        assert_eq!(
+            classify_provider_process_failure(b"connection timed out"),
+            ProviderProcessFailure::Network
+        );
+        assert_eq!(
+            classify_provider_process_failure(b"opaque failure"),
+            ProviderProcessFailure::Other
+        );
+    }
 
     #[test]
     fn run_receipt_spool_round_trips_strictly() {
@@ -1882,6 +2012,8 @@ mod tests {
                 identity_quality: "kernel_birth_token".into(),
             }],
             result_digest: Some(Digest::parse("b".repeat(64)).unwrap()),
+            provider_result_failure: None,
+            provider_process_failure: None,
             outcome: TurnOutcome::Completed,
         };
         let json = serde_json::to_value(&receipt).unwrap();
@@ -1895,6 +2027,20 @@ mod tests {
         let mut extra_process_field = json;
         extra_process_field["processes"][0]["unrecognized"] = json!(true);
         assert!(serde_json::from_value::<RunReceipt>(extra_process_field).is_err());
+    }
+
+    #[test]
+    fn provider_result_failure_is_a_bounded_non_sensitive_category() {
+        assert_eq!(
+            super::classify_provider_result_failure("Claude Code did not return structured output"),
+            super::ProviderResultFailure::StructuredOutputMissing
+        );
+        assert_eq!(
+            super::classify_provider_result_failure(
+                "provider structured output failed source schema validation"
+            ),
+            super::ProviderResultFailure::SourceSchemaRejected
+        );
     }
 
     fn profile(adapter: AgentAdapter, command: &str) -> Profile {

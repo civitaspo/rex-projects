@@ -51,7 +51,6 @@ pub use learning_store::{
     SupervisorCandidateEntry, SupervisorKnowledgeEntry, TrialProgress,
 };
 pub mod operations;
-pub(crate) mod provider_qualification;
 pub mod provider_qualification_runtime;
 pub mod publication_monitor;
 pub mod scheduler;
