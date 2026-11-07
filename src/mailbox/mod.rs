@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -118,6 +119,7 @@ impl MailboxCapability {
         }
         let request_digest = digest(bytes);
         let name = format!("{REQUEST_PREFIX}{}.json", key(request_id));
+        let _guard = self.lock_mailbox()?;
         match self.read_bounded(&name, self.limits.max_request_bytes) {
             Ok(existing) if digest(&existing) == request_digest => {
                 return Ok(QueueResult::Duplicate {
@@ -128,16 +130,7 @@ impl MailboxCapability {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("inspect mailbox request: {error}")),
         }
-        let count = fs::read_dir(&self.directory)
-            .map_err(|error| error.to_string())?
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(REQUEST_PREFIX) && name.ends_with(".json"))
-            })
-            .count();
+        let count = self.unacknowledged_request_names()?.len();
         if count >= self.limits.max_pending_requests {
             return Err("mailbox pending request count reached configured limit".into());
         }
@@ -163,11 +156,9 @@ impl MailboxCapability {
 
     pub fn pending(&self, now: u64) -> Result<Vec<MailboxRequest>, String> {
         self.check_live(now)?;
-        let mut paths = fs::read_dir(&self.directory)
-            .map_err(|error| format!("{}: {error}", self.directory.display()))?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
+        let mut paths = self
+            .directory_file_names()
+            .map_err(|error| format!("{}: {error}", self.directory.display()))?;
         paths.sort();
         let mut requests = Vec::new();
         for file_name in paths {
@@ -175,6 +166,9 @@ impl MailboxCapability {
                 continue;
             };
             if !name.starts_with(REQUEST_PREFIX) || !name.ends_with(".json") {
+                continue;
+            }
+            if self.has_receipt_for_request_file(name)? {
                 continue;
             }
             let bytes = self
@@ -194,6 +188,91 @@ impl MailboxCapability {
         Ok(requests)
     }
 
+    fn unacknowledged_request_names(&self) -> Result<Vec<String>, String> {
+        let entries = self
+            .directory_file_names()
+            .map_err(|error| format!("{}: {error}", self.directory.display()))?;
+        let mut pending = Vec::new();
+        for entry in entries {
+            let Some(name) = entry.to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with(REQUEST_PREFIX)
+                && name.ends_with(".json")
+                && !self.has_receipt_for_request_file(&name)?
+            {
+                pending.push(name);
+            }
+        }
+        Ok(pending)
+    }
+
+    fn has_receipt_for_request_file(&self, request_name: &str) -> Result<bool, String> {
+        let Some(key) = request_name
+            .strip_prefix(REQUEST_PREFIX)
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            return Err("invalid internal request filename".into());
+        };
+        let receipt_name = format!("{RECEIPT_PREFIX}{key}.json");
+        match self.read_bounded(&receipt_name, self.limits.max_request_bytes) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("inspect mailbox receipt: {error}")),
+        }
+    }
+
+    #[cfg(unix)]
+    fn directory_file_names(&self) -> Result<Vec<std::ffi::OsString>, std::io::Error> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStringExt;
+        // Opening "." relative to the pinned directory creates an independent open file
+        // description with its own directory cursor.
+        // SAFETY: the retained descriptor is a verified directory; "." is a fixed basename.
+        let duplicate = unsafe {
+            libc::openat(
+                self.directory_handle.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fdopendir takes ownership of duplicate on success.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed and did not take ownership.
+            unsafe { libc::close(duplicate) };
+            return Err(error);
+        }
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: stream remains live until closedir below; readdir returns an entry owned by it.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: dirent.d_name is a nul-terminated array provided by readdir.
+            let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if bytes != b"." && bytes != b".." {
+                names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+            }
+        }
+        // SAFETY: closes the stream and its owned duplicated descriptor.
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(names)
+    }
+    #[cfg(not(unix))]
+    fn directory_file_names(&self) -> Result<Vec<std::ffi::OsString>, std::io::Error> {
+        fs::read_dir(&self.directory)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect()
+    }
+
     pub fn publish_receipt(&self, request_id: &str, bytes: &[u8], now: u64) -> Result<(), String> {
         self.check_live(now)?;
         if !valid_request_id(request_id) {
@@ -204,6 +283,7 @@ impl MailboxCapability {
         }
         let receipt: ResponseEnvelope<Value> = parse_unique(bytes)?;
         receipt.validate_for(&RequestId::new(request_id)?)?;
+        let _guard = self.lock_mailbox()?;
         let name = format!("{RECEIPT_PREFIX}{}.json", key(request_id));
         match self.read_bounded(&name, self.limits.max_request_bytes) {
             Ok(existing) if existing == bytes => return Ok(()),
@@ -246,6 +326,41 @@ impl MailboxCapability {
     }
 
     #[cfg(unix)]
+    fn lock_mailbox(&self) -> Result<File, String> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // Open a fresh file description for the pinned directory so flock serializes separate
+        // queue/publish calls, including separate processes, without a mutable lock-file path.
+        // SAFETY: the retained descriptor is a verified directory; "\." is a fixed basename.
+        let fd = unsafe {
+            libc::openat(
+                self.directory_handle.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "open mailbox lock handle: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        lock_with_timeout(file)
+    }
+    #[cfg(not(unix))]
+    fn lock_mailbox(&self) -> Result<File, String> {
+        let lock_path = self.directory.join(".mailbox.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(lock_path)
+            .map_err(|e| e.to_string())?;
+        lock_with_timeout(file)
+    }
+
+    #[cfg(unix)]
     fn read_bounded(&self, name: &str, maximum: usize) -> Result<Vec<u8>, std::io::Error> {
         read_bounded_at(&self.directory_handle, name, maximum)
     }
@@ -276,6 +391,22 @@ pub fn unix_time_now() -> Result<u64, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|error| error.to_string())
+}
+
+fn lock_with_timeout(file: File) -> Result<File, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("mailbox is busy; retry shortly".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("lock mailbox: {error}")),
+        }
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -570,5 +701,67 @@ mod tests {
         mailbox.queue("r-1", &request("r-1", "safe"), 1).unwrap();
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
         assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn acknowledged_requests_leave_capacity_available_and_retry_returns_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mailbox = MailboxCapability::create(
+            "agent-run-1",
+            root.path(),
+            100,
+            MailboxLimits {
+                max_request_bytes: 4096,
+                max_pending_requests: 1,
+            },
+        )
+        .unwrap();
+        for index in 0..4 {
+            let request_id = format!("r-{index}");
+            let bytes = request(&request_id, "value");
+            mailbox.queue(&request_id, &bytes, 1).unwrap();
+            assert_eq!(mailbox.pending(1).unwrap().len(), 1);
+            let receipt = format!(
+                r#"{{"schema_version":1,"request_id":"{request_id}","result":{{"accepted":true}}}}"#
+            );
+            mailbox
+                .publish_receipt(&request_id, receipt.as_bytes(), 1)
+                .unwrap();
+            assert!(mailbox.pending(1).unwrap().is_empty());
+            assert!(matches!(
+                mailbox.queue(&request_id, &bytes, 1).unwrap(),
+                QueueResult::Duplicate { .. }
+            ));
+            assert_eq!(
+                mailbox.read_receipt(&request_id, 1).unwrap().unwrap(),
+                receipt.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_queue_calls_cannot_exceed_pending_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let mailbox = MailboxCapability::create(
+            "agent-run-1",
+            root.path(),
+            100,
+            MailboxLimits {
+                max_request_bytes: 4096,
+                max_pending_requests: 1,
+            },
+        )
+        .unwrap();
+        let outcomes = std::thread::scope(|scope| {
+            let first = scope.spawn(|| mailbox.queue("r-1", &request("r-1", "one"), 1));
+            let second = scope.spawn(|| mailbox.queue("r-2", &request("r-2", "two"), 1));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1
+        );
+        assert_eq!(mailbox.pending(1).unwrap().len(), 1);
     }
 }

@@ -16,6 +16,17 @@ use crate::domain::ids::{
 const SCHEMA_VERSION: i64 = 2;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
+type DueEffectRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectRecord {
@@ -37,12 +48,20 @@ pub struct DurableInput {
     pub payload: String,
 }
 
+pub fn durable_input_digest(recipient: &str, payload: &str) -> String {
+    let envelope = serde_json::to_vec(&(recipient, payload)).expect("string tuple serializes");
+    format!("{:x}", Sha256::digest(envelope))
+}
+
 pub struct InputReceipt {
     pub receipt: serde_json::Value,
     pub duplicate: bool,
 }
 
 pub struct EffectIntent {
+    pub project_id: ProjectId,
+    pub subject_type: String,
+    pub subject_id: String,
     pub operation_id: String,
     pub logical_key: String,
     pub kind: String,
@@ -339,19 +358,7 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let inserted = tx.execute("INSERT INTO effects(operation_id, logical_key, kind, request_json, request_digest, expected_revision, status, attempt_count, next_attempt_at_unix, created_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?7) ON CONFLICT(logical_key) DO NOTHING", params![effect.operation_id, effect.logical_key, effect.kind, effect.request_json, effect.request_digest, effect.expected_revision, now_unix()?]).map_err(|e| e.to_string())? != 0;
-        if !inserted {
-            let (operation, digest): (String, String) = tx
-                .query_row(
-                    "SELECT operation_id, request_digest FROM effects WHERE logical_key=?1",
-                    [&effect.logical_key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|e| e.to_string())?;
-            if operation != effect.operation_id || digest != effect.request_digest {
-                return Err("logical effect key was reused with different intent".into());
-            }
-        }
+        let inserted = insert_effect(&tx, effect, now_unix()?)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted)
     }
@@ -376,8 +383,11 @@ impl ConfigStore {
         if active_generation != Some(owner_generation) {
             return Err("controller owner generation is stale".into());
         }
-        let row: Option<(String,String,String,String,String,Option<u64>)> = tx.query_row("SELECT operation_id, logical_key, kind, request_json, request_digest, expected_revision FROM effects WHERE status='pending' AND next_attempt_at_unix<=?1 ORDER BY next_attempt_at_unix, created_at_unix LIMIT 1", [now], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional().map_err(|e| e.to_string())?;
+        let row: Option<DueEffectRow> = tx.query_row("SELECT project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision FROM effects WHERE status='pending' AND next_attempt_at_unix<=?1 ORDER BY next_attempt_at_unix, created_at_unix LIMIT 1", [now], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?))).optional().map_err(|e| e.to_string())?;
         let Some((
+            project_id,
+            subject_type,
+            subject_id,
             operation_id,
             logical_key,
             kind,
@@ -395,6 +405,9 @@ impl ConfigStore {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Some(EffectIntent {
+            project_id: ProjectId::parse(project_id)?,
+            subject_type,
+            subject_id,
             operation_id,
             logical_key,
             kind,
@@ -484,6 +497,36 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
+        let run: Option<(String, String, String)> = tx.query_row(
+            "SELECT c.project_id, r.namespace, r.ticket_id FROM ticket_claims c JOIN ticket_runs r USING(ticket_run_id) WHERE c.namespace=?1 AND c.ticket_id=?2 AND c.ticket_run_id=?3 AND c.generation=?4",
+            params![namespace.as_str(), ticket.as_str(), ticket_run.as_str(), generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some((_, run_namespace, run_ticket)) = &run
+            && (run_namespace != namespace.as_str() || run_ticket != ticket.as_str())
+        {
+            return Err("ticket claim does not match its run identity".into());
+        }
+        if run.is_none() {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        let active_slot: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM execution_slots WHERE ticket_run_id=?1 AND disposition!='released')",
+            [ticket_run.as_str()],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if active_slot {
+            return Err(
+                "ticket claim cannot be released while a run slot is reserved or uncertain".into(),
+            );
+        }
+        let terminal: bool = tx.query_row("SELECT external_status IN ('Done','Canceled') FROM ticket_runs WHERE ticket_run_id=?1", [ticket_run.as_str()], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if !terminal {
+            return Err(
+                "ticket claim can be released only after Done or Canceled is committed".into(),
+            );
+        }
         let removed = tx.execute("DELETE FROM ticket_claims WHERE namespace=?1 AND ticket_id=?2 AND ticket_run_id=?3 AND generation=?4", params![namespace.as_str(), ticket.as_str(), ticket_run.as_str(), generation]).map_err(|e| e.to_string())? == 1;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(removed)
@@ -615,7 +658,7 @@ impl ConfigStore {
             .optional()
             .map_err(|e| e.to_string())?
             .flatten();
-        let mut candidates = tx.prepare("SELECT q.work_key,q.project_id,q.subject_id,q.role,q.pool,rt.project_epoch FROM ready_queue q JOIN project_runtimes rt USING(project_id) JOIN projects p USING(project_id) WHERE q.ready_at_unix<=?1 AND q.expected_generation=rt.project_epoch AND p.desired_lifecycle='running' AND rt.observed_lifecycle IN ('running','starting') ORDER BY CASE WHEN q.project_id>?2 THEN 0 ELSE 1 END, q.project_id, q.priority DESC, q.fair_sequence").map_err(|e| e.to_string())?;
+        let mut candidates = tx.prepare("SELECT q.work_key,q.project_id,q.subject_type,q.subject_id,q.role,q.pool,rt.project_epoch FROM ready_queue q JOIN project_runtimes rt USING(project_id) JOIN projects p USING(project_id) WHERE q.ready_at_unix<=?1 AND q.expected_generation=rt.project_epoch AND p.desired_lifecycle='running' AND rt.observed_lifecycle IN ('running','starting') ORDER BY CASE WHEN q.project_id>?2 THEN 0 ELSE 1 END, q.project_id, q.priority DESC, q.fair_sequence").map_err(|e| e.to_string())?;
         let rows = candidates
             .query_map(params![now, last_project.as_deref().unwrap_or("")], |row| {
                 Ok((
@@ -624,14 +667,15 @@ impl ConfigStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
                 ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         drop(candidates);
-        for (work_key, project, subject_id, role, pool, project_epoch) in rows {
+        for (work_key, project, subject_type, subject_id, role, pool, project_epoch) in rows {
             let global_used: u32 = tx.query_row("SELECT COUNT(*) FROM execution_slots WHERE pool=?1 AND disposition!='released'", [&pool], |row| row.get(0)).map_err(|e| e.to_string())?;
             let project_used: u32 = tx.query_row("SELECT COUNT(*) FROM execution_slots WHERE project_id=?1 AND disposition!='released'", [&project], |row| row.get(0)).map_err(|e| e.to_string())?;
             let pool_limit = if pool == "agent" {
@@ -659,7 +703,8 @@ impl ConfigStore {
             if claimed != 1 {
                 return Err("ready work changed during reservation".into());
             }
-            let reserved = tx.execute("INSERT INTO execution_slots(pool, slot_index, project_id, owner_kind, owner_id, reservation_epoch, controller_generation, disposition) VALUES (?1, ?2, ?3, 'ready_work', ?4, ?5, ?6, 'launch_pending') ON CONFLICT(pool,slot_index) DO UPDATE SET project_id=excluded.project_id,owner_kind=excluded.owner_kind,owner_id=excluded.owner_id,reservation_epoch=excluded.reservation_epoch,controller_generation=excluded.controller_generation,process_identity_json=NULL,disposition='launch_pending' WHERE execution_slots.disposition='released'", params![pool, slot_index, project, work_key, project_epoch, owner_generation]).map_err(|e| e.to_string())?;
+            let ticket_run_id = (subject_type == "ticket_run").then_some(subject_id.as_str());
+            let reserved = tx.execute("INSERT INTO execution_slots(pool, slot_index, project_id, ticket_run_id, owner_kind, owner_id, reservation_epoch, controller_generation, disposition) VALUES (?1, ?2, ?3, ?4, 'ready_work', ?5, ?6, ?7, 'launch_pending') ON CONFLICT(pool,slot_index) DO UPDATE SET project_id=excluded.project_id,ticket_run_id=excluded.ticket_run_id,owner_kind=excluded.owner_kind,owner_id=excluded.owner_id,reservation_epoch=excluded.reservation_epoch,controller_generation=excluded.controller_generation,process_identity_json=NULL,disposition='launch_pending' WHERE execution_slots.disposition='released'", params![pool, slot_index, project, ticket_run_id, work_key, project_epoch, owner_generation]).map_err(|e| e.to_string())?;
             if reserved != 1 {
                 return Err("execution slot was concurrently reserved".into());
             }
@@ -762,6 +807,11 @@ impl ConfigStore {
         .map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO transitions(project_id, entity_type, entity_id, old_revision, new_revision, input_id, decision_reason, evidence_json, created_at_unix) VALUES (?1, 'project', ?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![project_id.as_str(), current, next, input.message_id, reason, serde_json::to_string(&evidence).map_err(|e| e.to_string())?, now]).map_err(|e| e.to_string())?;
         for effect in effects {
+            if effect.project_id != *project_id {
+                return Err(
+                    "effect Project does not match the authorized transition Project".into(),
+                );
+            }
             insert_effect(&tx, effect, now)?;
         }
         let receipt = serde_json::json!({"accepted": true, "message_id": input.message_id, "content_digest": input.content_digest, "project_id": project_id, "revision": next, "effects": effects.iter().map(|effect| effect.operation_id.as_str()).collect::<Vec<_>>()});
@@ -892,7 +942,10 @@ fn migrate_v2(connection: &Connection) -> Result<(), String> {
         );
         CREATE TABLE effects (
             operation_id TEXT PRIMARY KEY,
-            logical_key TEXT NOT NULL UNIQUE,
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            subject_type TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            logical_key TEXT NOT NULL,
             kind TEXT NOT NULL,
             request_json TEXT NOT NULL CHECK(length(request_json) <= 1048576),
             request_digest TEXT NOT NULL,
@@ -903,7 +956,8 @@ fn migrate_v2(connection: &Connection) -> Result<(), String> {
             owner_generation INTEGER,
             receipt_json TEXT,
             last_error TEXT,
-            created_at_unix INTEGER NOT NULL
+            created_at_unix INTEGER NOT NULL,
+            UNIQUE(project_id, subject_type, subject_id, logical_key)
         );
         CREATE INDEX effects_due ON effects(status, next_attempt_at_unix, created_at_unix);
         CREATE TABLE ticket_runs (
@@ -937,6 +991,7 @@ fn migrate_v2(connection: &Connection) -> Result<(), String> {
             pool TEXT NOT NULL CHECK(pool IN ('agent','rex_projects_hook')),
             slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
             project_id TEXT REFERENCES projects(project_id),
+            ticket_run_id TEXT REFERENCES ticket_runs(ticket_run_id),
             owner_kind TEXT NOT NULL,
             owner_id TEXT NOT NULL,
             reservation_epoch INTEGER NOT NULL,
@@ -1228,8 +1283,8 @@ fn validate_input(input: &DurableInput) -> Result<(), String> {
         return Err("invalid inbox identity".into());
     }
     Digest::parse(input.content_digest.clone())?;
-    if input.content_digest != content_digest(&input.payload) {
-        return Err("input digest does not match payload bytes".into());
+    if input.content_digest != durable_input_digest(&input.recipient, &input.payload) {
+        return Err("input digest does not match recipient and payload bytes".into());
     }
     if input.payload.len() > MAX_INPUT_BYTES {
         return Err("input payload exceeds limit".into());
@@ -1247,24 +1302,92 @@ fn insert_effect(
     tx: &rusqlite::Transaction<'_>,
     effect: &EffectIntent,
     now: i64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     validate_effect(effect)?;
-    let inserted = tx.execute("INSERT INTO effects(operation_id, logical_key, kind, request_json, request_digest, expected_revision, status, attempt_count, next_attempt_at_unix, created_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?7) ON CONFLICT(logical_key) DO NOTHING", params![effect.operation_id, effect.logical_key, effect.kind, effect.request_json, effect.request_digest, effect.expected_revision, now]).map_err(|e| e.to_string())?;
-    if inserted == 0 {
-        let (operation_id, digest, request_json): (String, String, String) = tx.query_row("SELECT operation_id, request_digest, request_json FROM effects WHERE logical_key=?1", [&effect.logical_key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(|e| e.to_string())?;
-        if operation_id != effect.operation_id
-            || digest != effect.request_digest
-            || request_json != effect.request_json
-        {
-            return Err("logical effect key was reused with different intent".into());
+    validate_effect_subject(tx, effect)?;
+    let inserted = tx.execute("INSERT INTO effects(operation_id, project_id, subject_type, subject_id, logical_key, kind, request_json, request_digest, expected_revision, status, attempt_count, next_attempt_at_unix, created_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', 0, ?10, ?10) ON CONFLICT DO NOTHING", params![effect.operation_id, effect.project_id.as_str(), effect.subject_type, effect.subject_id, effect.logical_key, effect.kind, effect.request_json, effect.request_digest, effect.expected_revision, now]).map_err(|e| e.to_string())?;
+    if inserted == 1 {
+        return Ok(true);
+    }
+    let existing_by_operation: Option<(String,String,String,String,String,String,String)> = tx.query_row("SELECT project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest FROM effects WHERE operation_id=?1", [&effect.operation_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional().map_err(|e| e.to_string())?;
+    let expected = (
+        effect.project_id.as_str(),
+        effect.subject_type.as_str(),
+        effect.subject_id.as_str(),
+        effect.logical_key.as_str(),
+        effect.kind.as_str(),
+        effect.request_json.as_str(),
+        effect.request_digest.as_str(),
+    );
+    if existing_by_operation.as_ref().is_some_and(|row| {
+        row.0.as_str() == expected.0
+            && row.1 == expected.1
+            && row.2 == expected.2
+            && row.3 == expected.3
+            && row.4 == expected.4
+            && row.5 == expected.5
+            && row.6 == expected.6
+    }) {
+        return Ok(false);
+    }
+    Err("effect operation ID or scoped logical intent was reused with different ownership or content".into())
+}
+
+fn validate_effect_subject(
+    tx: &rusqlite::Transaction<'_>,
+    effect: &EffectIntent,
+) -> Result<(), String> {
+    let subject_revision: Option<u64> = match effect.subject_type.as_str() {
+        "project" if effect.subject_id == effect.project_id.as_str() => tx
+            .query_row(
+                "SELECT state_revision FROM projects WHERE project_id=?1",
+                [effect.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?,
+        "ticket_run" => tx
+            .query_row(
+                "SELECT revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                params![effect.subject_id, effect.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?,
+        "agent_run" => {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent_run_id=?1 AND project_id=?2)",
+                params![effect.subject_id, effect.project_id.as_str()],
+                |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if !exists {
+                return Err("effect subject does not belong to the declared Project".into());
+            }
+            if effect.expected_revision.is_some() {
+                return Err("agent run effects do not accept a subject revision".into());
+            }
+            None
         }
+        _ => return Err("effect subject type is not supported by this store".into()),
+    };
+    if subject_revision.is_none() && effect.subject_type != "agent_run" {
+        return Err("effect subject does not belong to the declared Project".into());
+    }
+    if let (Some(expected), Some(actual)) = (effect.expected_revision, subject_revision)
+        && expected != actual
+    {
+        return Err("effect expected subject revision is stale".into());
     }
     Ok(())
 }
 
 fn validate_effect(effect: &EffectIntent) -> Result<(), String> {
-    if effect.operation_id.is_empty() || effect.logical_key.is_empty() || effect.kind.is_empty() {
-        return Err("effect operation ID, logical key and kind must not be empty".into());
+    if effect.operation_id.is_empty()
+        || effect.logical_key.is_empty()
+        || effect.kind.is_empty()
+        || effect.subject_id.is_empty()
+    {
+        return Err("effect operation, logical key, kind and subject ID must not be empty".into());
     }
     if effect.request_json.len() > MAX_INPUT_BYTES {
         return Err("effect request exceeds limit".into());
@@ -1397,7 +1520,7 @@ mod tests {
 
     use super::{
         ConfigStore, DurableInput, EffectIntent, EffectOutcome, ExpectedRevision, OwnerMetadata,
-        ProjectRecord, content_digest,
+        ProjectRecord, content_digest, durable_input_digest,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
@@ -1589,6 +1712,18 @@ mod tests {
         assert!(
             store
                 .release_ticket_claim(generation, &namespace, &ticket, &ticket_run, 1)
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET external_status='Done' WHERE ticket_run_id=?1",
+                [ticket_run.as_str()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .release_ticket_claim(generation, &namespace, &ticket, &ticket_run, 1)
                 .unwrap()
         );
         assert!(
@@ -1609,8 +1744,8 @@ mod tests {
                     generation,
                     &project.id,
                     "payments:ticket-1:coordinator",
-                    "ticket",
-                    "ticket-1",
+                    "ticket_run",
+                    other_run.as_str(),
                     "coordinator",
                     "agent",
                     10,
@@ -1634,7 +1769,7 @@ mod tests {
         let input = DurableInput {
             producer_id: "agent-run-1".into(),
             message_id: "wake-1".into(),
-            content_digest: content_digest(payload),
+            content_digest: durable_input_digest("coordinator", payload),
             recipient: "coordinator".into(),
             payload: payload.into(),
         };
@@ -1659,6 +1794,9 @@ mod tests {
                 .is_err()
         );
         let effect = EffectIntent {
+            project_id: project.id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run.as_str().to_owned(),
             operation_id: "op-1".into(),
             logical_key: "payments:ticket-1:start-worker".into(),
             kind: "start_worker".into(),
@@ -1678,6 +1816,28 @@ mod tests {
             )
             .unwrap();
         assert!(!first.duplicate);
+        let shared_key_in_other_project = EffectIntent {
+            project_id: other_project.id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: other_run.as_str().to_owned(),
+            operation_id: "op-other-project".into(),
+            logical_key: "payments:ticket-1:start-worker".into(),
+            kind: "start_worker".into(),
+            request_json: r#"{"ticket_id":"ticket-1"}"#.into(),
+            request_digest: content_digest(r#"{"ticket_id":"ticket-1"}"#),
+            expected_revision: Some(0),
+        };
+        assert!(
+            store
+                .enqueue_effect(generation, &shared_key_in_other_project)
+                .unwrap()
+        );
+        let reused_operation = EffectIntent {
+            operation_id: "op-1".into(),
+            logical_key: "different-key".into(),
+            ..shared_key_in_other_project
+        };
+        assert!(store.enqueue_effect(generation, &reused_operation).is_err());
         assert_eq!(
             store.project(&project.id).unwrap().unwrap().state_revision,
             Revision(1)
@@ -1695,6 +1855,26 @@ mod tests {
             .unwrap();
         assert!(retried.duplicate);
         assert_eq!(retried.receipt, first.receipt);
+        let changed_recipient = DurableInput {
+            producer_id: input.producer_id.clone(),
+            message_id: input.message_id.clone(),
+            content_digest: durable_input_digest("supervisor", payload),
+            recipient: "supervisor".into(),
+            payload: payload.into(),
+        };
+        assert!(
+            store
+                .commit_transition(
+                    generation,
+                    &project.id,
+                    Revision(0),
+                    &changed_recipient,
+                    "changed recipient",
+                    "{}",
+                    &[]
+                )
+                .is_err()
+        );
         assert_eq!(
             store.project(&project.id).unwrap().unwrap().state_revision,
             Revision(1)
@@ -1702,7 +1882,7 @@ mod tests {
         let conflict = DurableInput {
             producer_id: "agent-run-2".into(),
             message_id: "wake-2".into(),
-            content_digest: content_digest(r#"{"kind":"reviewed"}"#),
+            content_digest: durable_input_digest("coordinator", r#"{"kind":"reviewed"}"#),
             recipient: "coordinator".into(),
             payload: r#"{"kind":"reviewed"}"#.into(),
         };
@@ -1728,6 +1908,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.operation_id, "op-1");
+        let other_claim = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(other_claim.operation_id, "op-other-project");
+        store
+            .finish_effect(
+                "op-other-project",
+                generation,
+                EffectOutcome::Succeeded,
+                Some("{}"),
+            )
+            .unwrap();
         let new_generation = store
             .start_owner(&OwnerMetadata {
                 owner_nonce: "restarted-owner".into(),
@@ -1742,6 +1935,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(new_generation, generation + 1);
+        assert!(
+            store
+                .release_ticket_claim(new_generation, &namespace, &ticket, &other_run, 1)
+                .is_err()
+        );
         store
             .enqueue_ready(
                 new_generation,
@@ -1770,6 +1968,18 @@ mod tests {
                 &reserved.work_key,
             )
             .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET external_status='Canceled' WHERE ticket_run_id=?1",
+                [other_run.as_str()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .release_ticket_claim(new_generation, &namespace, &ticket, &other_run, 1)
+                .unwrap()
+        );
         assert!(
             store
                 .reserve_next_ready(new_generation, 1, 1, 1, 1)
@@ -1779,7 +1989,7 @@ mod tests {
         let delayed = DurableInput {
             producer_id: "agent-run-1".into(),
             message_id: "late-result".into(),
-            content_digest: content_digest(r#"{"kind":"late"}"#),
+            content_digest: durable_input_digest("coordinator", r#"{"kind":"late"}"#),
             recipient: "coordinator".into(),
             payload: r#"{"kind":"late"}"#.into(),
         };
