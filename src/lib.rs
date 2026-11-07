@@ -20,5 +20,6 @@ pub mod process;
 pub mod protocol;
 pub mod providers;
 pub mod roles;
+pub mod run_step;
 pub mod store;
 pub mod worktrees;
