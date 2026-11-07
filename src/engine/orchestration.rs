@@ -983,7 +983,7 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
     fn require_non_whitespace(value: &mut Value) {
         if let Some(map) = value.as_object_mut() {
             map.insert("minLength".into(), Value::from(1));
-            map.insert("pattern".into(), Value::from(r"^.*\S.*$"));
+            map.insert("pattern".into(), Value::from(r"\S"));
         }
     }
     fn visit(value: &mut Value) {
@@ -3511,6 +3511,20 @@ mod tests {
             .into_iter()
             .find_map(|(kind, value)| (kind == RoleOutputKind::MergeIntent).then_some(value))
             .unwrap();
+        whitespace_step["steps"][0]["rationale"] = json!("merge\naccording to repository policy");
+        assert!(schema_accepts(
+            RoleOutputKind::MergeIntent,
+            &whitespace_step
+        ));
+        whitespace_step["steps"][0]["rationale"] = json!(" \n\t ");
+        assert!(!schema_accepts(
+            RoleOutputKind::MergeIntent,
+            &whitespace_step
+        ));
+        let typed =
+            RoleResultPayload::parse(RoleOutputKind::MergeIntent, whitespace_step.clone()).unwrap();
+        assert!(validate_role_payload(&typed).is_err());
+        whitespace_step["steps"][0]["rationale"] = json!("merge\naccording to repository policy");
         whitespace_step["steps"][0]["instruction_reference"] = json!("   ");
         assert!(!schema_accepts(
             RoleOutputKind::MergeIntent,
