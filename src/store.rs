@@ -3352,11 +3352,11 @@ impl ConfigStore {
                 "AgentRun is not launch-pending under the active controller generation".into(),
             );
         }
-        let stored_ack: Option<(String, String)> = tx
+        let stored_ack: Option<(Option<String>, Option<String>)> = tx
             .query_row(
                 "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
                 [request.agent_run_id.as_str()],
-                |row| Ok((row.get(0)?,row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
@@ -3364,7 +3364,7 @@ impl ConfigStore {
         let request_digest =
             Digest::parse(format!("{:x}", Sha256::digest(request_json.as_bytes())))?;
         let receipt_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
-        if let Some((previous_digest, previous_receipt)) = stored_ack {
+        if let Some((previous_digest, previous_receipt)) = persisted_start_ack(stored_ack)? {
             if previous_digest != request_digest.as_str() || previous_receipt != receipt_json {
                 return Err(
                     "AgentRun already has a different persisted start acknowledgement".into(),
@@ -3581,6 +3581,16 @@ fn insert_effect(
     Err("effect operation ID or scoped logical intent was reused with different ownership or content".into())
 }
 
+fn persisted_start_ack(
+    stored: Option<(Option<String>, Option<String>)>,
+) -> Result<Option<(String, String)>, String> {
+    match stored {
+        None | Some((None, None)) => Ok(None),
+        Some((Some(digest), Some(receipt))) => Ok(Some((digest, receipt))),
+        Some(_) => Err("Agent launch state has a partial persisted start acknowledgement".into()),
+    }
+}
+
 fn validate_effect_subject(
     tx: &rusqlite::Transaction<'_>,
     effect: &EffectIntent,
@@ -3778,8 +3788,9 @@ mod tests {
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
     use crate::engine::reducer::Input;
     use crate::launch::{
-        AgentLaunchAuthority, ProviderQualification, QualificationProof, QualificationStatus,
-        RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind,
+        AgentLaunchAuthority, AgentStartRequest, ObservedWrapperIdentity, ProviderQualification,
+        QualificationProof, QualificationStatus, RexBlockLifecycle, RexBlockOwnership, RexView,
+        RexViewBlock, RexViewKind,
     };
     use sha2::Digest as _;
 
@@ -4369,6 +4380,81 @@ mod tests {
         };
 
         (temp, store, generation, authority, project_a, project_b)
+    }
+
+    #[test]
+    fn authorize_agent_start_accepts_pending_acknowledgement_and_replay() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap();
+        let request = AgentStartRequest {
+            schema_version: 1,
+            operation_id: authority.operation_id.clone(),
+            agent_run_id: authority.agent_run_id.clone(),
+            project_id: authority.project_id.clone(),
+            controller_generation: generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            wrapper_pid: 123,
+            wrapper_start_identity: "wrapper-start".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+        };
+        let observed = ObservedWrapperIdentity {
+            pid: request.wrapper_pid,
+            start_identity: request.wrapper_start_identity.clone(),
+            rex_session_id: request.rex_session_id.clone(),
+            rex_block_id: request.rex_block_id.clone(),
+            runtime_binary_digest: request.runtime_binary_digest.clone(),
+        };
+
+        let receipt = store
+            .authorize_agent_start(generation, &request, &observed)
+            .unwrap();
+        assert_eq!(receipt.decision, crate::launch::LaunchDecision::Accepted);
+        assert_eq!(
+            store
+                .authorize_agent_start(generation, &request, &observed)
+                .unwrap(),
+            receipt
+        );
+
+        let mut changed_request = request.clone();
+        changed_request.wrapper_pid += 1;
+        let changed_observed = ObservedWrapperIdentity {
+            pid: changed_request.wrapper_pid,
+            ..observed.clone()
+        };
+        assert!(
+            store
+                .authorize_agent_start(generation, &changed_request, &changed_observed)
+                .unwrap_err()
+                .contains("different persisted start acknowledgement")
+        );
+
+        let (_temp, mut partial_store, partial_generation, partial_authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        partial_store
+            .register_agent_launch_authority(partial_generation, &partial_authority)
+            .unwrap();
+        partial_store
+            .connection
+            .execute(
+                "UPDATE agent_launch_state SET start_request_digest=?2 WHERE agent_run_id=?1",
+                rusqlite::params![partial_authority.agent_run_id.as_str(), "a".repeat(64)],
+            )
+            .unwrap();
+        assert!(
+            partial_store
+                .authorize_agent_start(partial_generation, &request, &observed)
+                .unwrap_err()
+                .contains("partial persisted start acknowledgement")
+        );
     }
 
     #[test]
