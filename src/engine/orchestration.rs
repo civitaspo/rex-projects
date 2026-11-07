@@ -937,6 +937,10 @@ pub enum RoleRequest {
 pub enum AuthorizedRequest {
     Transition(Input),
     SpawnRole(Role),
+    /// A read-only investigation proposal; the Coordinator decides whether to
+    /// consume one of its bounded child slots and launches it on the Agent's
+    /// behalf. This request is not itself launch authority.
+    RequestCoordinatorInvestigation,
     ReserveGoalTicket,
     QueueHumanRequest,
     RequestDeclaredMerge,
@@ -970,11 +974,15 @@ pub fn authorize_role_request(
         (Role::Coordinator, R::CoordinatorStartPostmortem) => A::SpawnRole(Role::Postmortem),
         (Role::Coordinator, R::CoordinatorHumanRequest) => A::QueueHumanRequest,
         (Role::Planner, R::PlannerSubmitPlan) => A::SubmitPlan,
-        (Role::Planner, R::PlannerRequestReadOnlyInvestigation) => A::SpawnRole(Role::Planner),
+        (Role::Planner, R::PlannerRequestReadOnlyInvestigation) => {
+            A::RequestCoordinatorInvestigation
+        }
         (Role::Worker, R::WorkerSubmitEvidence) => A::SubmitWorkerEvidence,
         (Role::Worker, R::WorkerReportIrregularity) => A::ReportIrregularity,
         (Role::Reviewer, R::ReviewerSubmitFindings) => A::SubmitReview,
-        (Role::Reviewer, R::ReviewerRequestReadOnlyInvestigation) => A::SpawnRole(Role::Reviewer),
+        (Role::Reviewer, R::ReviewerRequestReadOnlyInvestigation) => {
+            A::RequestCoordinatorInvestigation
+        }
         (Role::MergeDecision, R::MergeDecisionSubmitAssessment) => A::SubmitMergeAssessment,
         (Role::MergeDecision, R::MergeDecisionRequestMerge) => A::RequestDeclaredMerge,
         (Role::MergeDecision, R::MergeDecisionRequestHuman) => A::QueueHumanRequest,
@@ -1470,6 +1478,37 @@ mod tests {
         );
         assert!(
             authorize_role_request(Role::Coordinator, RoleRequest::CoordinatorStartWorker).is_ok()
+        );
+    }
+
+    #[test]
+    fn only_coordinator_can_launch_work_and_investigation_requests_are_proposals() {
+        assert_eq!(
+            authorize_role_request(Role::Coordinator, RoleRequest::CoordinatorStartWorker).unwrap(),
+            AuthorizedRequest::SpawnRole(Role::Worker)
+        );
+        assert_eq!(
+            authorize_role_request(Role::Coordinator, RoleRequest::CoordinatorAskPlanner).unwrap(),
+            AuthorizedRequest::SpawnRole(Role::Planner)
+        );
+        assert_eq!(
+            authorize_role_request(
+                Role::Planner,
+                RoleRequest::PlannerRequestReadOnlyInvestigation
+            )
+            .unwrap(),
+            AuthorizedRequest::RequestCoordinatorInvestigation
+        );
+        assert_eq!(
+            authorize_role_request(
+                Role::Reviewer,
+                RoleRequest::ReviewerRequestReadOnlyInvestigation
+            )
+            .unwrap(),
+            AuthorizedRequest::RequestCoordinatorInvestigation
+        );
+        assert!(
+            authorize_role_request(Role::Planner, RoleRequest::CoordinatorStartWorker).is_err()
         );
     }
 
