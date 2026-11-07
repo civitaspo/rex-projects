@@ -29,6 +29,7 @@ const CAPTURE_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildContext {
     Agent,
+    ProfileTrial,
     RexProjectsHook,
     HostOperation,
 }
@@ -37,6 +38,7 @@ impl ChildContext {
     fn marker(self) -> &'static str {
         match self {
             Self::Agent => "agent",
+            Self::ProfileTrial => "profile_trial",
             Self::RexProjectsHook => "rex_projects_hook",
             Self::HostOperation => "host_operation",
         }
@@ -218,6 +220,73 @@ impl EnvironmentSnapshot {
             consumed: false,
             retained: true,
         })
+    }
+
+    /// Create a deterministic one-use handoff for a profile trial. The file remains available
+    /// across controller retries and is removed only by the wrapper when it consumes it.
+    pub(crate) fn create_profile_trial_handoff(
+        &self,
+        state_root: &Path,
+        operation_id: &str,
+    ) -> Result<PathBuf, EnvironmentError> {
+        if operation_id.is_empty() || operation_id.len() > 128 || operation_id.contains('\0') {
+            return Err(EnvironmentError::Invalid(
+                "invalid launch operation identity",
+            ));
+        }
+        let directory = state_root.join("environment-handoffs");
+        create_private_directory(&directory)?;
+        let operation_digest = format!("{:x}", sha2::Sha256::digest(operation_id.as_bytes()));
+        let path = directory.join(format!("profile-trial-{operation_digest}.env"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let bytes = read_handoff_bytes(&path)?;
+                let frame = bytes
+                    .strip_prefix(HANDOFF_MAGIC)
+                    .ok_or(EnvironmentError::Handoff)?;
+                let (snapshot, rest) =
+                    take_nul_terminated(frame).map_err(|_| EnvironmentError::Handoff)?;
+                let (operation, rest) =
+                    take_nul_terminated(rest).map_err(|_| EnvironmentError::Handoff)?;
+                let (nonce, _) =
+                    take_nul_terminated(rest).map_err(|_| EnvironmentError::Handoff)?;
+                if snapshot != self.metadata.id.as_str().as_bytes()
+                    || operation != operation_id.as_bytes()
+                {
+                    return Err(EnvironmentError::Handoff);
+                }
+                let nonce = std::str::from_utf8(nonce).map_err(|_| EnvironmentError::Handoff)?;
+                let nonce =
+                    Digest::parse(nonce.to_owned()).map_err(|_| EnvironmentError::Handoff)?;
+                let _ = read_handoff(&path, &self.metadata.id, operation_id, &nonce)?;
+                return Ok(path);
+            }
+            Ok(_) => return Err(EnvironmentError::Handoff),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(EnvironmentError::Handoff),
+        }
+        let nonce = fresh_nonce();
+        let mut file = private_create_new(&path)?;
+        use std::io::Write;
+        let result = file
+            .write_all(HANDOFF_MAGIC)
+            .and_then(|()| file.write_all(self.metadata.id.as_str().as_bytes()))
+            .and_then(|()| file.write_all(&[0]))
+            .and_then(|()| file.write_all(operation_id.as_bytes()))
+            .and_then(|()| file.write_all(&[0]))
+            .and_then(|()| file.write_all(nonce.as_str().as_bytes()))
+            .and_then(|()| file.write_all(&[0]))
+            .and_then(|()| {
+                let variables =
+                    self.child_environment(ChildContext::ProfileTrial, &BTreeMap::new());
+                write_variables(&mut file, &variables)
+            })
+            .and_then(|()| file.sync_all());
+        if result.is_err() {
+            let _ = std::fs::remove_file(&path);
+            return Err(EnvironmentError::Handoff);
+        }
+        Ok(path)
     }
 }
 

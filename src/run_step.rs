@@ -541,7 +541,15 @@ pub fn run_turn<O: ProcessObserver>(
     request: &TurnRequest,
     observer: &mut O,
 ) -> Result<TurnResult, RunError> {
-    run_turn_with_qualification(request, observer, false)
+    run_turn_with_context(request, observer, RunContext::FactoryAgent)
+}
+
+/// Run one approved profile trial without granting factory Agent environment markers.
+pub fn run_profile_trial_turn<O: ProcessObserver>(
+    request: &TurnRequest,
+    observer: &mut O,
+) -> Result<TurnResult, RunError> {
+    run_turn_with_context(request, observer, RunContext::ProfileTrial)
 }
 
 #[cfg(test)]
@@ -552,6 +560,12 @@ fn run_fixture_turn<O: ProcessObserver>(
     run_turn_with_qualification(request, observer, true)
 }
 
+#[derive(Clone, Copy)]
+enum RunContext {
+    FactoryAgent,
+    ProfileTrial,
+}
+
 fn run_turn_with_qualification<O: ProcessObserver>(
     request: &TurnRequest,
     observer: &mut O,
@@ -559,6 +573,24 @@ fn run_turn_with_qualification<O: ProcessObserver>(
 ) -> Result<TurnResult, RunError> {
     let prepared = prepare_with_qualification(request, allow_fixture_qualification, false)?;
     run_prepared(request, prepared, observer)
+}
+
+fn run_turn_with_context<O: ProcessObserver>(
+    request: &TurnRequest,
+    observer: &mut O,
+    context: RunContext,
+) -> Result<TurnResult, RunError> {
+    let prepared = match context {
+        RunContext::FactoryAgent => prepare_with_qualification(request, false, false)?,
+        RunContext::ProfileTrial => prepare_for_profile_trial(request)?,
+    };
+    run_prepared(request, prepared, observer)
+}
+
+fn prepare_for_profile_trial(request: &TurnRequest) -> Result<PreparedTurn, RunError> {
+    let mut prepared = prepare_with_qualification(request, false, false)?;
+    prepared.environment = profile_trial_environment(&request.environment, &request.descriptor);
+    Ok(prepared)
 }
 
 fn run_prepared<O: ProcessObserver>(
@@ -1630,9 +1662,32 @@ fn factory_environment(
 ) -> Result<BTreeMap<OsString, OsString>, RunError> {
     let mut environment = snapshot
         .iter()
-        .filter(|(key, _)| !key.to_string_lossy().starts_with("REX_PROJECTS_"))
+        .filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            !key.starts_with("REX_PROJECTS_")
+                && !matches!(
+                    key.as_ref(),
+                    "GIT_DIR"
+                        | "GIT_WORK_TREE"
+                        | "GIT_INDEX_FILE"
+                        | "GIT_COMMON_DIR"
+                        | "GIT_OBJECT_DIRECTORY"
+                        | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                        | "GIT_CONFIG_GLOBAL"
+                        | "GIT_CONFIG_SYSTEM"
+                        | "GIT_CONFIG_COUNT"
+                        | "GIT_CONFIG_PARAMETERS"
+                )
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
+    for (key, value) in [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ] {
+        environment.insert(OsString::from(key), OsString::from(value));
+    }
     for (key, value) in [
         ("REX_PROJECTS_CONTEXT", "agent"),
         ("REX_PROJECTS_AGENT", "1"),
@@ -1661,6 +1716,27 @@ fn factory_environment(
         OsString::from(descriptor.rex_block_id.as_str()),
     );
     Ok(environment)
+}
+
+fn profile_trial_environment(
+    snapshot: &BTreeMap<OsString, OsString>,
+    descriptor: &RunDescriptor,
+) -> BTreeMap<OsString, OsString> {
+    let mut environment = snapshot
+        .iter()
+        .filter(|(key, _)| !key.to_string_lossy().starts_with("REX_PROJECTS_"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (key, value) in [
+        ("REX_PROJECTS_CONTEXT", "profile_trial"),
+        ("REX_PROJECTS_AGENT", "0"),
+        ("REX_SESSION", descriptor.rex_session_id.as_str()),
+        ("REX_BLOCK", descriptor.rex_block_id.as_str()),
+        ("REX_BLOCK_ID", descriptor.rex_block_id.as_str()),
+    ] {
+        environment.insert(OsString::from(key), OsString::from(value));
+    }
+    environment
 }
 
 fn role_name(role: Role) -> &'static str {

@@ -93,6 +93,7 @@ pub enum EffectKind {
     PublishProfile,
     CompleteTicket,
     StartAgent,
+    StartProfileTrial,
     StopOwnedRuns,
 }
 
@@ -312,6 +313,7 @@ pub const fn effect_name(kind: &EffectKind) -> &'static str {
         EffectKind::PublishProfile => "publish_profile",
         EffectKind::CompleteTicket => "complete_ticket",
         EffectKind::StartAgent => "start_agent",
+        EffectKind::StartProfileTrial => "start_profile_trial",
         EffectKind::StopOwnedRuns => "stop_owned_runs",
     }
 }

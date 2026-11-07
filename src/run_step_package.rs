@@ -231,6 +231,11 @@ mod tests {
                     profile_digest,
                     version: "fixture-1".into(),
                     executable_path: "/bin/codex".into(),
+                    schema_projection: crate::providers::project_result_schema(
+                        &serde_json::json!({"type":"object"}),
+                    )
+                    .unwrap()
+                    .identity,
                     executable_digest: digest('d'),
                     permission_mode: "workspace_write".into(),
                     invocation_options_digest: digest('e'),

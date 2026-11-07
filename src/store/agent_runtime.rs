@@ -768,7 +768,8 @@ mod tests {
                 "mode":"operations", "ticket_adapter":"tickets",
                 "roles":{"supervisor":"supervisor"}
             }}
-        })).unwrap();
+        }))
+        .unwrap();
         let profile: Profile = serde_json::from_value(serde_json::json!({
             "adapter":"codex", "command":["/usr/bin/codex"], "model":"fixture",
             "commit_mode":"native", "turn_timeout_seconds":60
@@ -930,7 +931,7 @@ mod tests {
                     &project,
                     &qualification.profile_id,
                     &qualification.profile_digest,
-                    MAX_PROFILE_QUALIFICATION_CANDIDATES + 1,
+                    super::MAX_PROFILE_QUALIFICATION_CANDIDATES + 1,
                 )
                 .is_err()
         );

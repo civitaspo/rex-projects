@@ -7,6 +7,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{ConfigStore, validate_active_generation};
 use crate::domain::ids::{Digest, HumanRequestId, OperationId, ProfileId, ProjectId, TicketRunId};
+use crate::human_runtime::HumanRuntimeRequest;
 use crate::knowledge::{
     DEFAULT_MAX_ARTICLE_BYTES, PostmortemInput, PublicationManifest, validate_postmortem_input,
 };
@@ -14,6 +15,10 @@ use crate::learning::{
     CandidateLedger, CandidateRevision, CandidateStatus, ProfilePackage, ProfilePublicationReceipt,
     ProfilePublicationStatus, TrialEvidence, TrialObservation, evaluate_trials,
     validated_promotion_claims,
+};
+use crate::learning_trials::{
+    ProfileTrialAuthorization, ProfileTrialLaunchCapsule, ProfileTrialRunReceipt, TrialSide,
+    accept_profile_trial_approval, bind_profile_trial_human_request,
 };
 
 const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
@@ -294,15 +299,78 @@ pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
+/// Install learning-owned additions in the shared v12 migration transaction.
+/// The caller owns the single schema-version bump and invokes this before commit.
+pub(crate) fn migrate_v12_learning_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS profile_trial_authorizations (
+            authorization_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            candidate_id TEXT NOT NULL,
+            candidate_digest TEXT NOT NULL CHECK(length(candidate_digest)=64),
+            human_request_id TEXT NOT NULL UNIQUE,
+            request_json TEXT NOT NULL CHECK(length(request_json)<=1048576),
+            rex_view_id TEXT NOT NULL CHECK(length(rex_view_id)=64),
+            artifact_path TEXT NOT NULL CHECK(length(artifact_path)<=4096),
+            authorization_digest TEXT NOT NULL CHECK(length(authorization_digest)=64),
+            authorization_json TEXT NOT NULL CHECK(length(authorization_json)<=4194304),
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN ('pending','authorized','refused','expired','completed')),
+            created_at_unix INTEGER NOT NULL,
+            authorized_at_unix INTEGER,
+            updated_at_unix INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS profile_trial_authorizations_pending
+            ON profile_trial_authorizations(project_id,lifecycle,created_at_unix);
+        CREATE TABLE IF NOT EXISTS profile_trial_launches (
+            authorization_id TEXT NOT NULL REFERENCES profile_trial_authorizations(authorization_id) ON DELETE CASCADE,
+            pair_index INTEGER NOT NULL CHECK(pair_index BETWEEN 0 AND 9),
+            side TEXT NOT NULL CHECK(side IN ('baseline','candidate')),
+            operation_id TEXT NOT NULL UNIQUE,
+            run_id TEXT NOT NULL UNIQUE,
+            attempt_id TEXT NOT NULL UNIQUE,
+            capsule_digest TEXT NOT NULL CHECK(length(capsule_digest)=64),
+            capsule_json TEXT NOT NULL CHECK(length(capsule_json)<=2097152),
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN ('prepared','running','uncertain','completed','failed')),
+            created_at_unix INTEGER NOT NULL,
+            completed_at_unix INTEGER,
+            PRIMARY KEY(authorization_id,pair_index,side)
+        );
+        CREATE INDEX IF NOT EXISTS profile_trial_launches_pending
+            ON profile_trial_launches(lifecycle,created_at_unix);
+        CREATE TABLE IF NOT EXISTS profile_trial_run_receipts (
+            authorization_id TEXT NOT NULL,
+            pair_index INTEGER NOT NULL,
+            side TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL CHECK(length(receipt_digest)=64),
+            receipt_json TEXT NOT NULL CHECK(length(receipt_json)<=65536),
+            received_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(authorization_id,pair_index,side),
+            FOREIGN KEY(authorization_id,pair_index,side)
+                REFERENCES profile_trial_launches(authorization_id,pair_index,side) ON DELETE CASCADE,
+            UNIQUE(run_id)
+        );
+        CREATE TABLE IF NOT EXISTS profile_trial_pairs (
+            authorization_id TEXT NOT NULL REFERENCES profile_trial_authorizations(authorization_id) ON DELETE CASCADE,
+            pair_index INTEGER NOT NULL CHECK(pair_index BETWEEN 0 AND 9),
+            input_digest TEXT NOT NULL CHECK(length(input_digest)=64),
+            observation_json TEXT NOT NULL CHECK(length(observation_json)<=16384),
+            created_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(authorization_id,pair_index)
+        );"
+    ).map_err(|e| e.to_string())
+}
+
 /// Refuse databases that claim v10 but do not contain this exact unreleased
 /// learning layout before WAL or other connection PRAGMAs can mutate them.
 pub(crate) fn validate_v10_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|e| e.to_string())?;
-    if version != 10 {
+    if version < 10 {
         return Err(format!(
-            "learning layout validation requires schema v10, found v{version}"
+            "learning layout validation requires schema v10 or later, found v{version}"
         ));
     }
     for (table, expected) in [
@@ -365,12 +433,650 @@ pub(crate) fn validate_v10_schema(connection: &Connection) -> Result<(), String>
 }
 
 impl ConfigStore {
-    /// Resolve the exact immutable profile-trial authorization for a pending human request.
-    /// The table is created by the coordinated v12 learning migration.
+    /// Persist the exact bounded trial batch before making its human request visible.
+    /// A crash between these writes leaves a harmless pending batch that can be retried.
+    pub fn prepare_profile_trial_authorization(
+        &mut self,
+        generation: u64,
+        authorization: &ProfileTrialAuthorization,
+        request: &HumanRuntimeRequest,
+        rex_view_id: &Digest,
+        artifact_path: &std::path::Path,
+        now_unix: u64,
+    ) -> Result<bool, String> {
+        let mut bound = authorization.clone();
+        bind_profile_trial_human_request(&mut bound, request)?;
+        if bound
+            .human_response_receipt_digest
+            .as_str()
+            .bytes()
+            .all(|b| b == b'0')
+        {
+            // Pending requests must not carry an approval receipt supplied by their caller.
+            if authorization
+                .human_response_receipt_digest
+                .as_str()
+                .bytes()
+                .any(|b| b != b'0')
+            {
+                return Err("pending profile trial cannot contain an approval receipt".into());
+            }
+        }
+        let digest = bound.digest()?;
+        let json = super::canonical_json(&bound)?;
+        let request_json = super::canonical_json(request)?;
+        let artifact_path_text = artifact_path.to_string_lossy().into_owned();
+        if json.len() > 4 * 1024 * 1024
+            || request_json.len() > crate::human_runtime::MAX_HUMAN_REQUEST_BYTES
+            || artifact_path_text.len() > 4096
+        {
+            return Err("profile trial authorization exceeds its durable size limit".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let candidate: Option<(String, String, String, String, String)> = tx.query_row(
+            "SELECT role,profile_id,status,package_manifest_digest,package_files_json FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+            params![bound.project_id.as_str(),bound.candidate_id,bound.candidate_digest.as_str()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((role, profile_id, status, manifest_raw, files_json)) = candidate else {
+            return Err(
+                "profile trial candidate is not present in the durable learning ledger".into(),
+            );
+        };
+        let expected_role = serde_json::to_value(bound.role)
+            .map_err(|e| e.to_string())?
+            .as_str()
+            .ok_or("invalid role")?
+            .to_owned();
+        if role != expected_role
+            || profile_id != bound.candidate.profile_id.as_str()
+            || !matches!(status.as_str(), "proposed" | "trialing")
+        {
+            return Err("profile trial candidate scope or lifecycle is stale".into());
+        }
+        let current_config: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [bound.project_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((revision, config_digest)) = current_config else {
+            return Err("profile trial Project no longer exists".into());
+        };
+        if revision != bound.config_revision.0 || config_digest != bound.config_digest.as_str() {
+            return Err("profile trial config snapshot is stale".into());
+        }
+        let candidate_files: std::collections::BTreeMap<String, Vec<u8>> =
+            crate::protocol::parse_unique(files_json.as_bytes())?;
+        let manifest = Digest::parse(manifest_raw)?;
+        if crate::learning::manifest_digest(&candidate_files).map_err(|e| e.to_string())?
+            != manifest
+        {
+            return Err("durable candidate package manifest is invalid".into());
+        }
+        let candidate_config: serde_json::Value =
+            crate::protocol::parse_unique(bound.candidate.profile_config_json.as_bytes())?;
+        let guidance_path = candidate_config
+            .get("learned_guidance")
+            .and_then(|value| value.get("file"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("candidate profile must bind its learned-guidance file")?;
+        let stored_guidance = candidate_files
+            .get(guidance_path)
+            .ok_or("candidate package does not contain its declared learned-guidance file")?;
+        let frozen_guidance = bound
+            .candidate
+            .instruction_files
+            .get(guidance_path)
+            .ok_or("trial snapshot omits the candidate learned-guidance file")?;
+        if stored_guidance != frozen_guidance {
+            return Err(
+                "trial snapshot learned-guidance bytes differ from the immutable candidate package"
+                    .into(),
+            );
+        }
+        let existing: Option<(String,String,String,String,String)> = tx.query_row(
+            "SELECT authorization_digest,authorization_json,request_json,rex_view_id,artifact_path FROM profile_trial_authorizations WHERE authorization_id=?1",
+            [bound.authorization_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let inserted = if let Some((
+            old_digest,
+            old_json,
+            old_request_json,
+            old_view_id,
+            old_artifact_path,
+        )) = existing
+        {
+            if old_digest != digest.as_str()
+                || old_json != json
+                || old_request_json != request_json
+                || old_view_id != rex_view_id.as_str()
+                || old_artifact_path != artifact_path_text
+            {
+                return Err(
+                    "profile trial authorization ID was reused with different content".into(),
+                );
+            }
+            false
+        } else {
+            tx.execute(
+                "INSERT INTO profile_trial_authorizations(authorization_id,project_id,candidate_id,candidate_digest,human_request_id,request_json,rex_view_id,artifact_path,authorization_digest,authorization_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'pending',?11,?11)",
+                params![bound.authorization_id,bound.project_id.as_str(),bound.candidate_id,bound.candidate_digest.as_str(),bound.human_request_id.as_str(),request_json,rex_view_id.as_str(),artifact_path_text,digest.as_str(),json,now_unix],
+            ).map_err(|e| e.to_string())?;
+            set_candidate_revision_status(
+                &tx,
+                &bound.project_id,
+                &bound.candidate_id,
+                &bound.candidate_digest,
+                CandidateStatus::Trialing,
+            )?;
+            true
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        self.register_human_request(generation, request, rex_view_id, artifact_path, now_unix)?;
+        Ok(inserted)
+    }
+
+    /// Turn a pending frozen batch into an authorized batch only from the opaque
+    /// receipt minted by the durable human decision store.
+    pub fn accept_profile_trial_approval(
+        &mut self,
+        generation: u64,
+        authorization_id: &str,
+        now_unix: u64,
+    ) -> Result<bool, String> {
+        let row: Option<(String,String,String)> = self.connection.query_row(
+            "SELECT authorization_json,lifecycle,authorization_digest FROM profile_trial_authorizations WHERE authorization_id=?1",
+            [authorization_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((json, lifecycle, stored_digest)) = row else {
+            return Err("unknown profile trial authorization".into());
+        };
+        let pending_json = json.clone();
+        let mut authorization: ProfileTrialAuthorization =
+            crate::protocol::parse_unique(json.as_bytes())?;
+        if authorization.digest()?.as_str() != stored_digest {
+            return Err("stored profile trial authorization digest is invalid".into());
+        }
+        if lifecycle == "authorized" {
+            return Ok(false);
+        }
+        if lifecycle != "pending" {
+            return Err(format!("profile trial authorization is {lifecycle}"));
+        }
+        let receipt = self
+            .accepted_human_approval(
+                &authorization.human_request_id,
+                &authorization.human_subject_digest,
+                &authorization.human_configuration_digest,
+                &authorization.human_policy_digest,
+                now_unix,
+            )?
+            .ok_or("no current accepted human approval exists for this profile trial")?;
+        authorization = accept_profile_trial_approval(authorization, &receipt, now_unix)?;
+        let json = super::canonical_json(&authorization)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let current: Option<(String,String)> = tx.query_row("SELECT authorization_json,lifecycle FROM profile_trial_authorizations WHERE authorization_id=?1",[authorization_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        if current
+            .as_ref()
+            .is_none_or(|(old_json, state)| old_json != &pending_json || state != "pending")
+        {
+            return Err(
+                "profile trial authorization changed while approval was being checked".into(),
+            );
+        }
+        tx.execute("UPDATE profile_trial_authorizations SET authorization_json=?2,lifecycle='authorized',authorized_at_unix=?3,updated_at_unix=?3 WHERE authorization_id=?1 AND lifecycle='pending'",params![authorization_id,json,now_unix]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// Atomically persist the immutable launch capsule and the Rex start effect.
+    /// Existing capsules are returned verbatim for reconciliation after restart.
+    pub fn next_profile_trial_launch(
+        &mut self,
+        generation: u64,
+        authorization_id: &str,
+        now_unix: u64,
+        max_agent_slots: u32,
+        max_project_slots: u32,
+    ) -> Result<Option<ProfileTrialLaunchCapsule>, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let row: Option<(String,String,String)> = tx.query_row(
+            "SELECT authorization_json,lifecycle,authorization_digest FROM profile_trial_authorizations WHERE authorization_id=?1",
+            [authorization_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((auth_json, lifecycle, auth_digest)) = row else {
+            return Err("unknown profile trial authorization".into());
+        };
+        if lifecycle != "authorized" {
+            return Err("profile trial batch is not human-authorized".into());
+        }
+        let authorization: ProfileTrialAuthorization =
+            crate::protocol::parse_unique(auth_json.as_bytes())?;
+        if authorization.digest()?.as_str() != auth_digest {
+            return Err("stored profile trial authorization digest is invalid".into());
+        }
+        let existing: Option<(String,String)> = tx.query_row(
+            "SELECT capsule_json,capsule_digest FROM profile_trial_launches WHERE authorization_id=?1 AND lifecycle IN ('prepared','running','uncertain') ORDER BY pair_index,CASE side WHEN 'baseline' THEN 0 ELSE 1 END LIMIT 1",
+            [authorization_id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some((json, digest)) = existing {
+            if super::content_digest(&json) != digest {
+                return Err("stored profile trial capsule digest is invalid".into());
+            }
+            let capsule: ProfileTrialLaunchCapsule =
+                crate::protocol::parse_unique(json.as_bytes())?;
+            capsule.validate()?;
+            if capsule.authorization_id != authorization_id
+                || capsule.authorization_digest != authorization.digest()?
+            {
+                return Err("stored trial capsule belongs to a different authorization".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(Some(capsule));
+        }
+        if now_unix >= authorization.expires_at_unix {
+            tx.execute("UPDATE profile_trial_authorizations SET lifecycle='expired',updated_at_unix=?2 WHERE authorization_id=?1 AND lifecycle='authorized'",params![authorization_id,now_unix]).map_err(|e|e.to_string())?;
+            set_candidate_revision_status(
+                &tx,
+                &authorization.project_id,
+                &authorization.candidate_id,
+                &authorization.candidate_digest,
+                CandidateStatus::Expired,
+            )?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(None);
+        }
+        if max_agent_slots == 0 || max_project_slots == 0 {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(None);
+        }
+        for pair in &authorization.pairs {
+            let baseline: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM profile_trial_run_receipts WHERE authorization_id=?1 AND pair_index=?2 AND side='baseline')",
+                params![authorization_id,pair.pair_index], |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            let candidate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM profile_trial_run_receipts WHERE authorization_id=?1 AND pair_index=?2 AND side='candidate')",
+                params![authorization_id,pair.pair_index], |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            let side = if !baseline {
+                TrialSide::Baseline
+            } else if !candidate {
+                TrialSide::Candidate
+            } else {
+                continue;
+            };
+            let capsule = ProfileTrialLaunchCapsule::from_authorized_matrix(
+                &authorization,
+                pair.pair_index,
+                side,
+            )?;
+            let global_used: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM execution_slots WHERE pool='agent' AND disposition!='released'",
+                [], |r| r.get(0),
+            ).map_err(|e|e.to_string())?;
+            let project_used: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM execution_slots WHERE project_id=?1 AND disposition!='released'",
+                [authorization.project_id.as_str()], |r| r.get(0),
+            ).map_err(|e|e.to_string())?;
+            if global_used >= max_agent_slots || project_used >= max_project_slots {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
+            let mut slot_index = None;
+            for slot in 0..max_agent_slots {
+                let occupied: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM execution_slots WHERE pool='agent' AND slot_index=?1 AND disposition!='released')",
+                    [slot], |r| r.get(0),
+                ).map_err(|e|e.to_string())?;
+                if !occupied {
+                    slot_index = Some(slot);
+                    break;
+                }
+            }
+            let Some(slot_index) = slot_index else {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(None);
+            };
+            let project_epoch: u64 = tx
+                .query_row(
+                    "SELECT project_epoch FROM project_runtimes WHERE project_id=?1",
+                    [authorization.project_id.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .ok_or("profile trial Project has no runtime epoch")?;
+            let reserved = tx.execute(
+                "INSERT INTO execution_slots(pool,slot_index,project_id,ticket_run_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',?1,?2,NULL,'profile_trial',?3,?4,?5,'launch_pending') ON CONFLICT(pool,slot_index) DO UPDATE SET project_id=excluded.project_id,ticket_run_id=NULL,owner_kind=excluded.owner_kind,owner_id=excluded.owner_id,reservation_epoch=excluded.reservation_epoch,controller_generation=excluded.controller_generation,process_identity_json=NULL,disposition='launch_pending' WHERE execution_slots.disposition='released'",
+                params![slot_index,authorization.project_id.as_str(),capsule.operation_id().as_str(),project_epoch,generation],
+            ).map_err(|e|e.to_string())?;
+            if reserved != 1 {
+                return Err("profile trial execution slot was concurrently reserved".into());
+            }
+            let capsule_json = super::canonical_json(&capsule)?;
+            let capsule_digest = super::content_digest(&capsule_json);
+            let side_name = if side == TrialSide::Baseline {
+                "baseline"
+            } else {
+                "candidate"
+            };
+            let request_json = super::canonical_json(
+                &serde_json::json!({"authorization_id":authorization_id,"capsule_digest":capsule_digest,"pair_index":pair.pair_index,"run_id":capsule.run_id.as_str(),"side":side_name}),
+            )?;
+            let effect = super::EffectIntent {
+                project_id: authorization.project_id.clone(),
+                subject_type: "project".into(),
+                subject_id: authorization.project_id.to_string(),
+                operation_id: capsule.operation_id.to_string(),
+                logical_key: format!(
+                    "profile-trial-{}-{}-{side_name}",
+                    authorization_id, pair.pair_index
+                ),
+                kind: "start_profile_trial".into(),
+                request_digest: super::content_digest(&request_json),
+                request_json,
+                expected_revision: None,
+            };
+            tx.execute("INSERT INTO profile_trial_launches(authorization_id,pair_index,side,operation_id,run_id,attempt_id,capsule_digest,capsule_json,lifecycle,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'prepared',?9)",params![authorization_id,pair.pair_index,side_name,capsule.operation_id.as_str(),capsule.run_id.as_str(),capsule.attempt_id,capsule_digest,capsule_json,now_unix]).map_err(|e|e.to_string())?;
+            super::insert_effect(&tx, &effect, now_unix as i64)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(Some(capsule));
+        }
+        tx.execute("UPDATE profile_trial_authorizations SET lifecycle='completed',updated_at_unix=?2 WHERE authorization_id=?1",params![authorization_id,now_unix]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(None)
+    }
+
+    /// Accept only host-minted run evidence; pair results become learning evidence
+    /// once both sides have durable terminal receipts.
+    pub(crate) fn acknowledge_profile_trial_start(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+        process: &crate::process::ProcessIdentity,
+        _now_unix: u64,
+    ) -> Result<(), String> {
+        if process.pid == 0
+            || process.start_identity.trim().is_empty()
+            || process.command.trim().is_empty()
+        {
+            return Err("profile trial start requires a pinned host process identity".into());
+        }
+        let identity_json = serde_json::to_string(&serde_json::json!({
+            "pid": process.pid,
+            "parent_pid": process.parent_pid,
+            "process_group_id": process.process_group_id,
+            "start_identity": process.start_identity,
+            "command": process.command,
+        }))
+        .map_err(|e| e.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let launch: Option<(String, String, String)> = tx.query_row(
+            "SELECT l.lifecycle,a.project_id,l.capsule_digest FROM profile_trial_launches l JOIN profile_trial_authorizations a USING(authorization_id) WHERE l.operation_id=?1",
+            [operation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((lifecycle, project_id, _capsule_digest)) = launch else {
+            return Err("profile trial start has no durable launch row".into());
+        };
+        if !matches!(lifecycle.as_str(), "prepared" | "uncertain" | "running") {
+            return Err("profile trial launch is not startable".into());
+        }
+        let slot: Option<(String, String, Option<String>, u64)> = tx.query_row(
+            "SELECT project_id,disposition,process_identity_json,controller_generation FROM execution_slots WHERE pool='agent' AND owner_kind='profile_trial' AND owner_id=?1",
+            [operation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((slot_project, disposition, previous_identity, slot_generation)) = slot else {
+            return Err("profile trial execution slot is missing".into());
+        };
+        if slot_project != project_id || slot_generation > generation {
+            return Err("profile trial execution slot changed ownership".into());
+        }
+        if lifecycle == "running" {
+            if disposition != "running" || previous_identity.as_deref() != Some(&identity_json) {
+                return Err("profile trial start retry has a different process identity".into());
+            }
+            if slot_generation < generation {
+                tx.execute(
+                    "UPDATE execution_slots SET controller_generation=?3 WHERE pool='agent' AND owner_kind='profile_trial' AND owner_id=?1 AND project_id=?2 AND controller_generation=?4 AND disposition='running'",
+                    params![operation_id.as_str(), project_id, generation, slot_generation],
+                ).map_err(|e| e.to_string())?;
+            }
+        } else {
+            let changed = tx.execute(
+                "UPDATE execution_slots SET process_identity_json=?3,disposition='running',controller_generation=?4 WHERE pool='agent' AND owner_kind='profile_trial' AND owner_id=?1 AND project_id=?2 AND controller_generation=?5 AND disposition!='released'",
+                params![operation_id.as_str(), project_id, identity_json, generation, slot_generation],
+            ).map_err(|e| e.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "profile trial execution slot changed before start acknowledgement".into(),
+                );
+            }
+            tx.execute(
+                "UPDATE profile_trial_launches SET lifecycle='running' WHERE operation_id=?1 AND lifecycle IN ('prepared','uncertain')",
+                [operation_id.as_str()],
+            ).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn record_profile_trial_run_receipt(
+        &mut self,
+        generation: u64,
+        receipt: &ProfileTrialRunReceipt,
+        now_unix: u64,
+    ) -> Result<TrialProgress, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let row: Option<(String,String)> = tx.query_row(
+            "SELECT authorization_json,lifecycle FROM profile_trial_authorizations WHERE authorization_id=?1",
+            [receipt.authorization_id()], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((auth_json, lifecycle)) = row else {
+            return Err("trial receipt has no durable authorization".into());
+        };
+        if lifecycle != "authorized" && lifecycle != "completed" {
+            return Err("trial receipt authorization is not active".into());
+        }
+        let authorization: ProfileTrialAuthorization =
+            crate::protocol::parse_unique(auth_json.as_bytes())?;
+        receipt.validate_against(&authorization)?;
+        let side = if receipt.side() == TrialSide::Baseline {
+            "baseline"
+        } else {
+            "candidate"
+        };
+        let capsule_row: Option<(String,String,String,String)> = tx.query_row(
+            "SELECT capsule_json,capsule_digest,run_id,attempt_id FROM profile_trial_launches WHERE authorization_id=?1 AND pair_index=?2 AND side=?3",
+            params![receipt.authorization_id(),receipt.pair_index(),side], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((capsule_json, capsule_digest, run_id, attempt_id)) = capsule_row else {
+            return Err("trial receipt has no prepared durable launch".into());
+        };
+        if run_id != receipt.run_id().as_str()
+            || attempt_id != receipt.attempt_id()
+            || super::content_digest(&capsule_json) != capsule_digest
+        {
+            return Err("trial receipt does not match its persisted launch identity".into());
+        }
+        let capsule: ProfileTrialLaunchCapsule =
+            crate::protocol::parse_unique(capsule_json.as_bytes())?;
+        capsule.validate()?;
+        if capsule.authorization_id != authorization.authorization_id
+            || capsule.authorization_digest != authorization.digest()?
+            || capsule.pair_index != receipt.pair_index()
+            || capsule.side != receipt.side()
+            || capsule.run_id != *receipt.run_id()
+            || capsule.attempt_id != receipt.attempt_id()
+        {
+            return Err("trial receipt differs from the immutable persisted capsule".into());
+        }
+        let receipt_json = super::canonical_json(receipt)?;
+        if receipt_json.len() > 65536 {
+            return Err("profile trial receipt exceeds size limit".into());
+        }
+        let receipt_digest = super::content_digest(&receipt_json);
+        let old: Option<(String,String)> = tx.query_row(
+            "SELECT receipt_digest,receipt_json FROM profile_trial_run_receipts WHERE authorization_id=?1 AND pair_index=?2 AND side=?3",
+            params![receipt.authorization_id(),receipt.pair_index(),side], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        if let Some((digest, json)) = old {
+            if digest != receipt_digest || json != receipt_json {
+                return Err("conflicting terminal trial receipt".into());
+            }
+        } else {
+            tx.execute("INSERT INTO profile_trial_run_receipts(authorization_id,pair_index,side,run_id,attempt_id,receipt_digest,receipt_json,received_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![receipt.authorization_id(),receipt.pair_index(),side,receipt.run_id().as_str(),receipt.attempt_id(),receipt_digest,receipt_json,now_unix]).map_err(|e|e.to_string())?;
+            tx.execute("UPDATE profile_trial_launches SET lifecycle='completed',completed_at_unix=?4 WHERE authorization_id=?1 AND pair_index=?2 AND side=?3",params![receipt.authorization_id(),receipt.pair_index(),side,now_unix]).map_err(|e|e.to_string())?;
+        }
+        let slot: Option<(u32,String)> = tx.query_row(
+            "SELECT slot_index,disposition FROM execution_slots WHERE pool='agent' AND owner_kind='profile_trial' AND owner_id=?1",
+            [capsule.operation_id().as_str()], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((slot_index, disposition)) = slot else {
+            return Err("terminal profile trial receipt has no reserved execution slot".into());
+        };
+        if disposition != "released" {
+            tx.execute("UPDATE execution_slots SET disposition='released',controller_generation=?3 WHERE pool='agent' AND slot_index=?1 AND owner_kind='profile_trial' AND owner_id=?2",params![slot_index,capsule.operation_id().as_str(),generation]).map_err(|e|e.to_string())?;
+        }
+        let baseline_json: Option<String> = tx.query_row("SELECT receipt_json FROM profile_trial_run_receipts WHERE authorization_id=?1 AND pair_index=?2 AND side='baseline'",params![receipt.authorization_id(),receipt.pair_index()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let candidate_json: Option<String> = tx.query_row("SELECT receipt_json FROM profile_trial_run_receipts WHERE authorization_id=?1 AND pair_index=?2 AND side='candidate'",params![receipt.authorization_id(),receipt.pair_index()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if let (Some(baseline_json), Some(candidate_json)) = (baseline_json, candidate_json) {
+            let baseline: ProfileTrialRunReceipt =
+                crate::protocol::parse_unique(baseline_json.as_bytes())?;
+            let candidate: ProfileTrialRunReceipt =
+                crate::protocol::parse_unique(candidate_json.as_bytes())?;
+            let observation = TrialObservation {
+                input_digest: baseline.input_digest().clone(),
+                baseline: baseline.status(),
+                candidate: candidate.status(),
+            };
+            let observation_json = super::canonical_json(&observation)?;
+            tx.execute("INSERT INTO profile_trial_pairs(authorization_id,pair_index,input_digest,observation_json,created_at_unix) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",params![authorization.authorization_id,receipt.pair_index(),observation.input_digest.as_str(),observation_json,now_unix]).map_err(|e|e.to_string())?;
+        }
+        let mut stmt = tx.prepare("SELECT pair_index,observation_json FROM profile_trial_pairs WHERE authorization_id=?1 ORDER BY pair_index").map_err(|e|e.to_string())?;
+        let rows = stmt
+            .query_map([authorization.authorization_id.as_str()], |r| {
+                Ok((r.get::<_, usize>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut trials = Vec::new();
+        for row in rows {
+            let (pair_index, json) = row.map_err(|e| e.to_string())?;
+            trials.push(StoredTrial {
+                pair_index,
+                observation: crate::protocol::parse_unique(json.as_bytes())?,
+            });
+        }
+        drop(stmt);
+        let evidence = evaluate_trials(
+            &trials
+                .iter()
+                .map(|t| t.observation.clone())
+                .collect::<Vec<_>>(),
+            authorization.pairs.len(),
+        )
+        .map_err(|e| e.to_string())?;
+        let evidence_json = super::canonical_json(&evidence)?;
+        let expected = authorization.pairs.len();
+        let new_status = if trials.len() >= expected {
+            "awaiting_approval"
+        } else {
+            "trialing"
+        };
+        tx.execute("UPDATE learning_candidates SET evidence_json=?4 WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",params![authorization.project_id.as_str(),authorization.candidate_id,authorization.candidate_digest.as_str(),evidence_json]).map_err(|e|e.to_string())?;
+        set_candidate_revision_status(
+            &tx,
+            &authorization.project_id,
+            &authorization.candidate_id,
+            &authorization.candidate_digest,
+            if new_status == "awaiting_approval" {
+                CandidateStatus::AwaitingApproval
+            } else {
+                CandidateStatus::Trialing
+            },
+        )?;
+        if trials.len() >= expected {
+            tx.execute("UPDATE profile_trial_authorizations SET lifecycle='completed',updated_at_unix=?2 WHERE authorization_id=?1",params![authorization.authorization_id,now_unix]).map_err(|e|e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(TrialProgress { trials, evidence })
+    }
+
+    pub fn profile_trial_launch_capsule(
+        &self,
+        authorization_id: &str,
+        pair_index: u8,
+        side: TrialSide,
+    ) -> Result<Option<ProfileTrialLaunchCapsule>, String> {
+        let side = if side == TrialSide::Baseline {
+            "baseline"
+        } else {
+            "candidate"
+        };
+        let row: Option<(String,String)> = self.connection.query_row("SELECT capsule_json,capsule_digest FROM profile_trial_launches WHERE authorization_id=?1 AND pair_index=?2 AND side=?3",params![authorization_id,pair_index,side],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        let Some((json, digest)) = row else {
+            return Ok(None);
+        };
+        if super::content_digest(&json) != digest {
+            return Err("stored profile trial capsule digest is invalid".into());
+        }
+        let capsule: ProfileTrialLaunchCapsule = crate::protocol::parse_unique(json.as_bytes())?;
+        capsule.validate()?;
+        Ok(Some(capsule))
+    }
+
+    pub fn profile_trial_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<ProfileTrialAuthorization>, String> {
+        let row: Option<(String,String)> = self.connection.query_row(
+            "SELECT authorization_json,authorization_digest FROM profile_trial_authorizations WHERE authorization_id=?1",
+            [authorization_id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((json, digest)) = row else {
+            return Ok(None);
+        };
+        let authorization: ProfileTrialAuthorization =
+            crate::protocol::parse_unique(json.as_bytes())?;
+        if authorization.digest()?.as_str() != digest {
+            return Err("stored profile trial authorization digest is invalid".into());
+        }
+        authorization.validate()?;
+        Ok(Some(authorization))
+    }
+
+    /// Resolve only a still-pending batch authorization for the persisted
+    /// human request. Host observers use this to reconstitute the exact
+    /// subject before accepting a response; approved or terminal batches are
+    /// not returned by this lookup.
     pub(crate) fn pending_profile_trial_authorization_for_request(
         &self,
         request_id: &HumanRequestId,
-    ) -> Result<Option<crate::learning_trials::ProfileTrialAuthorization>, String> {
+    ) -> Result<Option<ProfileTrialAuthorization>, String> {
         let row: Option<(String, String)> = self
             .connection
             .query_row(
@@ -380,18 +1086,145 @@ impl ConfigStore {
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((json, stored_digest)) = row else {
+        let Some((json, digest)) = row else {
             return Ok(None);
         };
-        let authorization: crate::learning_trials::ProfileTrialAuthorization =
+        let authorization: ProfileTrialAuthorization =
             crate::protocol::parse_unique(json.as_bytes())?;
         if authorization.human_request_id != *request_id
-            || authorization.digest()?.as_str() != stored_digest
+            || authorization.digest()?.as_str() != digest
         {
             return Err("stored pending profile trial authorization is invalid".into());
         }
         authorization.validate()?;
         Ok(Some(authorization))
+    }
+
+    /// A dispatcher retry after the Store commit but before outbox acknowledgement
+    /// must replay this exact host receipt instead of starting the Agent again.
+    pub(crate) fn profile_trial_terminal_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<ProfileTrialRunReceipt>, String> {
+        let row: Option<(String,u8,String,String)> = self.connection.query_row(
+            "SELECT r.receipt_json,r.pair_index,r.side,r.receipt_digest FROM profile_trial_run_receipts r JOIN profile_trial_launches l USING(authorization_id,pair_index,side) WHERE l.operation_id=?1",
+            [operation_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((json, pair_index, side, digest)) = row else {
+            return Ok(None);
+        };
+        if super::content_digest(&json) != digest {
+            return Err("stored profile trial terminal receipt digest is invalid".into());
+        }
+        let receipt: ProfileTrialRunReceipt = crate::protocol::parse_unique(json.as_bytes())?;
+        let authorization = self
+            .profile_trial_authorization(receipt.authorization_id())?
+            .ok_or("trial receipt authorization is missing")?;
+        receipt.validate_against(&authorization)?;
+        let expected_side = if receipt.side() == TrialSide::Baseline {
+            "baseline"
+        } else {
+            "candidate"
+        };
+        if receipt.pair_index() != pair_index || expected_side != side {
+            return Err("stored profile trial receipt has a mismatched launch scope".into());
+        }
+        Ok(Some(receipt))
+    }
+
+    /// Bounded controller cadence: accept at most one newly decided batch and
+    /// materialize at most one next side-effect intent in this tick.
+    pub fn tick_profile_trials(
+        &mut self,
+        generation: u64,
+        now_unix: u64,
+        max_agent_slots: u32,
+        max_project_slots: u32,
+    ) -> Result<Option<ProfileTrialLaunchCapsule>, String> {
+        let pending: Vec<(String, String, String, String, String)> = {
+            let mut stmt = self.connection.prepare(
+                "SELECT authorization_id,authorization_json,request_json,rex_view_id,artifact_path FROM profile_trial_authorizations WHERE lifecycle='pending' ORDER BY created_at_unix,authorization_id LIMIT 32",
+            ).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for (id, json, request_json, rex_view_id, artifact_path) in pending {
+            let auth: ProfileTrialAuthorization = crate::protocol::parse_unique(json.as_bytes())?;
+            if now_unix >= auth.expires_at_unix {
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|e| e.to_string())?;
+                validate_active_generation(&tx, generation)?;
+                tx.execute("UPDATE profile_trial_authorizations SET lifecycle='expired',updated_at_unix=?2 WHERE authorization_id=?1 AND lifecycle='pending'",params![id,now_unix]).map_err(|e|e.to_string())?;
+                set_candidate_revision_status(
+                    &tx,
+                    &auth.project_id,
+                    &auth.candidate_id,
+                    &auth.candidate_digest,
+                    CandidateStatus::Expired,
+                )?;
+                tx.commit().map_err(|e| e.to_string())?;
+                continue;
+            }
+            let request_exists: bool = self
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM human_requests WHERE request_id=?1)",
+                    [auth.human_request_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !request_exists {
+                let request: HumanRuntimeRequest =
+                    crate::protocol::parse_unique(request_json.as_bytes())?;
+                self.register_human_request(
+                    generation,
+                    &request,
+                    &Digest::parse(rex_view_id)?,
+                    std::path::Path::new(&artifact_path),
+                    now_unix,
+                )?;
+            }
+            if self
+                .accepted_human_approval(
+                    &auth.human_request_id,
+                    &auth.human_subject_digest,
+                    &auth.human_configuration_digest,
+                    &auth.human_policy_digest,
+                    now_unix,
+                )?
+                .is_some()
+            {
+                self.accept_profile_trial_approval(generation, &id, now_unix)?;
+                return self.next_profile_trial_launch(
+                    generation,
+                    &id,
+                    now_unix,
+                    max_agent_slots,
+                    max_project_slots,
+                );
+            }
+        }
+        let authorized: Option<String> = self.connection.query_row(
+            "SELECT authorization_id FROM profile_trial_authorizations WHERE lifecycle='authorized' ORDER BY authorized_at_unix,authorization_id LIMIT 1",
+            [], |r| r.get(0),
+        ).optional().map_err(|e|e.to_string())?;
+        match authorized {
+            Some(id) => self.next_profile_trial_launch(
+                generation,
+                &id,
+                now_unix,
+                max_agent_slots,
+                max_project_slots,
+            ),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn ensure_postmortem_published(
@@ -1996,11 +2829,25 @@ mod tests {
         CandidateRevision, CandidateStatus, TrialObservation, TrialOutcome, TrialRunStatus,
     };
     use crate::learning::{ProfilePackage, profile_approval_subject_digest};
+    use crate::learning_trials::{
+        FrozenTrialInput, HostTrialOutcome, HostTrialRunObservation, ProfileTrialAuthorization,
+        TrialPairSpec, TrialProfileSnapshot, TrialSide, profile_trial_human_request,
+        profile_trial_review_bundle,
+    };
     use crate::store::human::HumanDecisionResult;
     use crate::store::{
         ConfigStore, DurableInput, EffectIntent, ExpectedRevision, OwnerMetadata, ProjectRecord,
         content_digest, durable_input_digest,
     };
+
+    fn digest(byte: char) -> Digest {
+        Digest::parse(byte.to_string().repeat(64)).unwrap()
+    }
+
+    fn digest_serialized<T: serde::Serialize>(value: &T) -> Digest {
+        Digest::parse(format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap())).as_str())
+            .unwrap()
+    }
 
     fn v9_fixture() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
@@ -2054,6 +2901,354 @@ mod tests {
     }
 
     #[test]
+    fn v12_learning_trial_tables_install_inside_the_shared_migration_transaction() {
+        let mut fixture = v9_fixture();
+        migrate_v10(&fixture).unwrap();
+        let tx = fixture
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        super::migrate_v12_learning_tables(&tx).unwrap();
+        tx.commit().unwrap();
+        for table in [
+            "profile_trial_authorizations",
+            "profile_trial_launches",
+            "profile_trial_run_receipts",
+            "profile_trial_pairs",
+        ] {
+            let exists: bool = fixture
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing {table}");
+        }
+        let tx = fixture
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        super::migrate_v12_learning_tables(&tx).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn approved_profile_trial_persists_capsule_slot_receipt_and_replays_after_restart() {
+        let (temp, mut store, project, generation, _) = running_store();
+        let project_record = store.project(&project).unwrap().unwrap();
+        let tx = store.connection.transaction().unwrap();
+        super::migrate_v12_learning_tables(&tx).unwrap();
+        tx.commit().unwrap();
+        let candidate_id = "worker-learned-v1";
+        let candidate_digest = digest('d');
+        let profile_id = ProfileId::parse("worker-learned").unwrap();
+        let guidance = b"Keep acceptance checks.".to_vec();
+        let files = BTreeMap::from([("learned.md".to_owned(), guidance.clone())]);
+        let manifest_digest = crate::learning::manifest_digest(&files).unwrap();
+        let manifest_rows: Vec<_> = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path,
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes)).as_str()).unwrap(),
+                )
+            })
+            .collect();
+        let candidate_record = LearningCandidateRecord {
+            revision: CandidateRevision {
+                candidate_id: candidate_id.into(),
+                project_id: project.clone(),
+                role: Role::Worker,
+                digest: candidate_digest.clone(),
+                created_at: "2026-11-07T00:00:00Z".into(),
+                expires_at: "2027-11-07T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            },
+            profile_id: profile_id.clone(),
+            package_manifest_digest: manifest_digest,
+            package_files_json: serde_json::to_string(&files).unwrap(),
+            package_json: serde_json::to_string(&manifest_rows).unwrap(),
+            expected_pairs: 10,
+        };
+        store
+            .register_learning_candidate(generation, &candidate_record)
+            .unwrap();
+
+        let make_snapshot = |learned: bool, description: &str| {
+            let mut config = serde_json::json!({"adapter":"codex","command":["agent"],"description":description,"model":"fixture-model","effort":"low","turn_timeout_seconds":30,"instruction_files":[],"skill_paths":[],"commit_mode":"auto","learned_guidance":null,"options":null});
+            let snapshot_files = if learned {
+                config["learned_guidance"] = serde_json::json!({"file":"learned.md","project_id":project.as_str(),"role":"worker","repository_ids":["repo-a"]});
+                files.clone()
+            } else {
+                BTreeMap::new()
+            };
+            let profile_config_json = serde_json::to_string(&config).unwrap();
+            TrialProfileSnapshot {
+                profile_id: if learned {
+                    profile_id.clone()
+                } else {
+                    ProfileId::parse("worker").unwrap()
+                },
+                profile_digest: Digest::parse(
+                    format!("{:x}", Sha256::digest(profile_config_json.as_bytes())).as_str(),
+                )
+                .unwrap(),
+                instruction_digest: digest_serialized(&snapshot_files),
+                profile_config_json,
+                instruction_files: snapshot_files,
+            }
+        };
+        let baseline = make_snapshot(false, "base");
+        let candidate = make_snapshot(true, "candidate");
+        let inputs: Vec<_> = (0..5)
+            .map(|i| {
+                let input_json = format!("{{\"case\":{i}}}");
+                let evaluator = crate::learning_trials::TrialEvaluator::StructuredAssertionsV1 {
+                    assertions: vec![],
+                };
+                let fixture_seed = crate::learning_trials::InlineFixtureV1::empty();
+                FrozenTrialInput {
+                    input_id: format!("input-{i}"),
+                    input_digest: Digest::parse(
+                        format!("{:x}", Sha256::digest(input_json.as_bytes())).as_str(),
+                    )
+                    .unwrap(),
+                    input_json,
+                    fixture_id: crate::learning_trials::INLINE_FIXTURE_ID.into(),
+                    fixture_revision: Digest::parse(format!(
+                        "{:x}",
+                        Sha256::digest(b"inline_fixture_v1")
+                    ))
+                    .unwrap(),
+                    workspace_seed_digest: fixture_seed.digest().unwrap(),
+                    fixture_seed,
+                    evaluator_id: evaluator.implementation_id().into(),
+                    evaluator_revision: evaluator.digest().unwrap(),
+                    evaluator,
+                }
+            })
+            .collect();
+        let pairs = (0..10)
+            .map(|pair_index| TrialPairSpec {
+                pair_index,
+                input_id: format!("input-{}", pair_index / 2),
+            })
+            .collect();
+        let authorization = ProfileTrialAuthorization {
+            schema_version: 1,
+            authorization_id: "profile-trial-1".into(),
+            project_id: project.clone(),
+            role: Role::Worker,
+            candidate_id: candidate_id.into(),
+            candidate_digest: candidate_digest.clone(),
+            base_profile_id: ProfileId::parse("worker").unwrap(),
+            base_profile_digest: baseline.profile_digest.clone(),
+            config_revision: project_record.config_revision,
+            config_digest: project_record.config_digest.clone(),
+            baseline_qualification_digest: digest('1'),
+            candidate_qualification_digest: digest('2'),
+            trial_policy_digest: digest('3'),
+            baseline,
+            candidate,
+            inputs,
+            pairs,
+            scoped_exception: None,
+            human_request_id: crate::domain::ids::HumanRequestId::parse("human-trial-1").unwrap(),
+            human_subject_digest: digest('4'),
+            human_configuration_digest: project_record.config_digest,
+            human_policy_digest: digest('3'),
+            human_response_receipt_digest: digest('0'),
+            authorized_at_unix: 10,
+            max_attempts_per_side: 1,
+            expires_at_unix: 4_102_444_800,
+        };
+        let bundle = profile_trial_review_bundle(&authorization).unwrap();
+        let request = profile_trial_human_request(
+            authorization.human_request_id.clone(),
+            &authorization,
+            bundle,
+            "Approve this exact bounded fixture batch?".into(),
+            authorization.expires_at_unix,
+        )
+        .unwrap();
+        let view = RexView {
+            view_id: RexView::derive_id(&project, RexViewKind::Supervisor, None, None, 1).unwrap(),
+            project_id: project.clone(),
+            kind: RexViewKind::Supervisor,
+            ticket_namespace: None,
+            ticket_id: None,
+            view_epoch: 1,
+            rex_server_identity: "test-server".into(),
+            rex_session_id: "test-session".into(),
+            rex_window_id: "supervisor-window".into(),
+        };
+        store.register_rex_view(generation, &view).unwrap();
+        let artifact_root = temp.path().join("human-artifacts");
+        fs::create_dir_all(&artifact_root).unwrap();
+        fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let artifact = write_runtime_review_artifact(&artifact_root, &request).unwrap();
+        assert!(
+            store
+                .prepare_profile_trial_authorization(
+                    generation,
+                    &authorization,
+                    &request,
+                    &view.view_id,
+                    &artifact,
+                    100
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .pending_profile_trial_authorization_for_request(&request.request_id)
+                .unwrap()
+                .unwrap()
+                .authorization_id,
+            authorization.authorization_id
+        );
+        // Simulate a crash after the authorization transaction committed but
+        // before the human request was registered. The controller cadence
+        // must reconstruct the request from its durable authorization row.
+        store
+            .connection
+            .execute(
+                "DELETE FROM human_requests WHERE request_id=?1",
+                [request.request_id.as_str()],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM human_requests WHERE request_id=?1)",
+                    [request.request_id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .tick_profile_trials(generation, 100, 2, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ConfigStore::read_human_request(temp.path(), &request.request_id)
+                .unwrap()
+                .is_some()
+        );
+        let now = 101;
+        let response = HumanDecisionIntent {
+            request_id: request.request_id.clone(),
+            response_id: "trial-response-1".into(),
+            expected_subject_digest: request.subject.digest().unwrap(),
+            choice: HumanDecisionChoice::Approve,
+            explanation: Some(
+                "Run only the exact isolated fixture matrix for this candidate.".into(),
+            ),
+        };
+        ConfigStore::enqueue_human_decision(temp.path(), &response, now).unwrap();
+        assert!(matches!(
+            store
+                .process_human_decision(generation, &response.response_id, &request.subject, now)
+                .unwrap(),
+            HumanDecisionResult::Applied
+        ));
+        assert!(
+            store
+                .accept_profile_trial_approval(generation, &authorization.authorization_id, now + 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .pending_profile_trial_authorization_for_request(&request.request_id)
+                .unwrap()
+                .is_none()
+        );
+        let capsule = store
+            .next_profile_trial_launch(generation, &authorization.authorization_id, now + 2, 2, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(capsule.side, TrialSide::Baseline);
+        assert_eq!(
+            store
+                .next_profile_trial_launch(
+                    generation,
+                    &authorization.authorization_id,
+                    now + 3,
+                    2,
+                    1
+                )
+                .unwrap()
+                .unwrap(),
+            capsule
+        );
+        let active_slots:usize=store.connection.query_row("SELECT count(*) FROM execution_slots WHERE owner_kind='profile_trial' AND disposition!='released'",[],|r|r.get(0)).unwrap();
+        assert_eq!(active_slots, 1);
+        let observation = HostTrialRunObservation {
+            run_id: capsule.run_id.clone(),
+            attempt_id: capsule.attempt_id.clone(),
+            qualification_receipt_digest: capsule.provider_qualification_digest.clone(),
+            config_revision: capsule.config_revision,
+            config_digest: capsule.config_digest.clone(),
+            profile_digest: capsule.profile.profile_digest.clone(),
+            instruction_digest: capsule.profile.instruction_digest.clone(),
+            input_digest: capsule.input_digest.clone(),
+            fixture_id: capsule.fixture_id.clone(),
+            fixture_revision: capsule.fixture_revision.clone(),
+            evaluator_id: capsule.evaluator_id.clone(),
+            evaluator_revision: capsule.evaluator_revision.clone(),
+            workspace_seed_digest: capsule.workspace_seed_digest.clone(),
+            no_effects_receipt_digest: digest('e'),
+            outcome: HostTrialOutcome::Equivalent,
+            result_receipt_digest: digest('f'),
+            completed_at_unix: now + 4,
+        };
+        let receipt = capsule.mint_terminal_receipt(observation).unwrap();
+        store
+            .record_profile_trial_run_receipt(generation, &receipt, now + 4)
+            .unwrap();
+        assert_eq!(
+            store
+                .profile_trial_terminal_receipt(capsule.operation_id())
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        store
+            .record_profile_trial_run_receipt(generation, &receipt, now + 5)
+            .unwrap();
+        let active_slots:usize=store.connection.query_row("SELECT count(*) FROM execution_slots WHERE owner_kind='profile_trial' AND disposition!='released'",[],|r|r.get(0)).unwrap();
+        assert_eq!(active_slots, 0);
+        let next = store
+            .tick_profile_trials(generation, now + 6, 2, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.pair_index, capsule.pair_index);
+        assert_eq!(next.side, TrialSide::Candidate);
+        let effect_count: usize = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM effects WHERE kind='start_profile_trial'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(effect_count, 2);
+        drop(store);
+        let restored = ConfigStore::open_test(temp.path()).unwrap();
+        assert_eq!(
+            restored
+                .profile_trial_launch_capsule(
+                    &authorization.authorization_id,
+                    capsule.pair_index,
+                    TrialSide::Baseline
+                )
+                .unwrap(),
+            Some(capsule)
+        );
+    }
+
+    #[test]
     fn startup_refuses_a_v10_database_with_an_incomplete_learning_layout_without_migration() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("state.sqlite3");
@@ -2073,11 +3268,10 @@ mod tests {
         AppliedConfig {
             config: serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
-                "adapters": {"tickets": {"kind":"command","command":["test"],"status_values":{
-                    "triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"
-                }}},
+                "adapters": {"tickets": {"kind":"command","command":["test"]}},
                 "projects": {}
-            })).unwrap(),
+            }))
+            .unwrap(),
             profiles: BTreeMap::new(),
             source_root: "/tmp/rex-projects-test-config".into(),
             source_files: vec![SourceFile {
@@ -2142,7 +3336,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10, "ConfigStore applies the ordered v10 migration");
+        assert_eq!(version, 11, "ConfigStore applies the ordered v11 migration");
         (temp, store, project_id, generation, run)
     }
 
@@ -2345,7 +3539,7 @@ mod tests {
                 )
                 .unwrap();
             if pair_index == 4 {
-                assert_eq!(progress.evidence.outcome, TrialOutcome::Improved);
+                assert_eq!(progress.evidence.outcome, TrialOutcome::Inconclusive);
             }
             assert_eq!(
                 progress.trials.last().unwrap(),
@@ -2388,7 +3582,7 @@ mod tests {
         assert_eq!(supervisor.candidates.len(), 1);
         assert_eq!(
             supervisor.candidates[0].evidence.as_ref().unwrap().outcome,
-            TrialOutcome::Improved
+            TrialOutcome::Inconclusive
         );
         let _ = ProfileId::parse("worker-profile").unwrap();
     }

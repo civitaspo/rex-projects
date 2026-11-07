@@ -299,6 +299,7 @@ impl RexIdentity {
     }
 }
 
+#[derive(Clone)]
 pub struct RexCliTransport {
     executable: PathBuf,
     endpoint: String,

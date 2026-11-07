@@ -6,9 +6,12 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{AgentRunId, Digest, HumanRequestId, ProfileId, ProjectId, Revision};
+use crate::domain::ids::{
+    AgentRunId, Digest, HumanRequestId, OperationId, ProfileId, ProjectId, Revision,
+};
 use crate::domain::types::Role;
 use crate::human_runtime::{
     HumanDecisionChoice, HumanPurpose, HumanRuntimeRequest, HumanSubjectBinding, HumanSubjectKind,
@@ -19,6 +22,69 @@ use crate::store::human::HumanApprovalReceipt;
 pub const MAX_FROZEN_INPUT_BYTES: usize = 256 * 1024;
 pub const MAX_TRIAL_INSTRUCTION_BYTES: usize = 1024 * 1024;
 pub const PROFILE_TRIAL_CAPSULE_SCHEMA_VERSION: u32 = 1;
+pub const MAX_TRIAL_ASSERTIONS: usize = 32;
+pub const MAX_TRIAL_EVALUATOR_BYTES: usize = 64 * 1024;
+pub const INLINE_FIXTURE_MAX_FILES: usize = 64;
+pub const INLINE_FIXTURE_MAX_BYTES: usize = 1024 * 1024;
+pub const INLINE_FIXTURE_MATRIX_MAX_BYTES: usize = 512 * 1024;
+pub const INLINE_FIXTURE_ID: &str = "inline_fixture_v1";
+
+/// Canonical UTF-8 seed for a new disposable trial workspace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InlineFixtureV1 {
+    pub schema_version: u32,
+    pub files: BTreeMap<String, String>,
+}
+
+impl InlineFixtureV1 {
+    pub fn empty() -> Self {
+        Self {
+            schema_version: 1,
+            files: BTreeMap::new(),
+        }
+    }
+
+    pub fn digest(&self) -> Result<Digest, String> {
+        self.validate()?;
+        let canonical = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        content_digest(canonical.as_bytes())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 || self.files.len() > INLINE_FIXTURE_MAX_FILES {
+            return Err("unsupported or oversized inline trial fixture".into());
+        }
+        let mut total = 0usize;
+        let mut paths = std::collections::BTreeSet::new();
+        for (path, contents) in &self.files {
+            if !valid_relative_path(path)
+                || path
+                    .split('/')
+                    .any(|part| part.eq_ignore_ascii_case(".git"))
+                || path
+                    .split('/')
+                    .any(|part| part.eq_ignore_ascii_case("rex-projects-control"))
+            {
+                return Err("inline fixture contains a forbidden or malformed path".into());
+            }
+            if paths.iter().any(|other: &&str| {
+                path.starts_with(&format!("{other}/")) || other.starts_with(&format!("{path}/"))
+            }) {
+                return Err("inline fixture file paths have a file/directory collision".into());
+            }
+            paths.insert(path.as_str());
+            total = total
+                .checked_add(path.len())
+                .and_then(|n| n.checked_add(contents.len()))
+                .ok_or("inline fixture byte count overflow")?;
+            if total > INLINE_FIXTURE_MAX_BYTES {
+                return Err("inline fixture exceeds the 1 MiB limit".into());
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +97,100 @@ pub enum TrialSide {
 #[serde(rename_all = "snake_case")]
 pub enum LaunchPurpose {
     ProfileTrial,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrialEvaluator {
+    StructuredAssertionsV1 { assertions: Vec<TrialAssertion> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialAssertion {
+    pub json_pointer: String,
+    pub expected: Value,
+}
+
+impl TrialEvaluator {
+    pub fn implementation_id(&self) -> &'static str {
+        match self {
+            Self::StructuredAssertionsV1 { .. } => "structured_assertions_v1",
+        }
+    }
+
+    pub fn digest(&self) -> Result<Digest, String> {
+        self.validate()?;
+        let value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        let canonical = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        Digest::parse(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let Self::StructuredAssertionsV1 { assertions } = self;
+        if assertions.len() > MAX_TRIAL_ASSERTIONS {
+            return Err("trial evaluator exceeds the 32 assertion limit".into());
+        }
+        let value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        let canonical = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        if canonical.len() > MAX_TRIAL_EVALUATOR_BYTES {
+            return Err("trial evaluator exceeds the 64 KiB limit".into());
+        }
+        for assertion in assertions {
+            validate_json_pointer(&assertion.json_pointer)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn evaluate(&self, result: Option<&Value>) -> Result<HostTrialOutcome, String> {
+        self.validate()?;
+        let Self::StructuredAssertionsV1 { assertions } = self;
+        if assertions.is_empty() {
+            return Ok(HostTrialOutcome::Equivalent);
+        }
+        let Some(result) = result.filter(|result| !is_empty_result(result)) else {
+            return Ok(HostTrialOutcome::Failed);
+        };
+        if assertions
+            .iter()
+            .any(|assertion| result.pointer(&assertion.json_pointer) != Some(&assertion.expected))
+        {
+            Ok(HostTrialOutcome::Regressed)
+        } else {
+            Ok(HostTrialOutcome::Improved)
+        }
+    }
+}
+
+fn validate_json_pointer(pointer: &str) -> Result<(), String> {
+    if pointer.len() > 4096 || (!pointer.is_empty() && !pointer.starts_with('/')) {
+        return Err("trial evaluator JSON pointer is malformed or too long".into());
+    }
+    let bytes = pointer.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            if !bytes
+                .get(index + 1)
+                .is_some_and(|byte| matches!(byte, b'0' | b'1'))
+            {
+                return Err("trial evaluator JSON pointer has an invalid escape".into());
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn is_empty_result(result: &Value) -> bool {
+    match result {
+        Value::Null => true,
+        Value::String(value) => value.is_empty(),
+        Value::Array(values) => values.is_empty(),
+        Value::Object(values) => values.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,9 +215,11 @@ pub struct FrozenTrialInput {
     pub fixture_id: String,
     pub fixture_revision: Digest,
     pub workspace_seed_digest: Digest,
+    pub fixture_seed: InlineFixtureV1,
     /// Identifies the host-side fixture evaluator and its immutable rubric revision.
     pub evaluator_id: String,
     pub evaluator_revision: Digest,
+    pub evaluator: TrialEvaluator,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,10 +287,13 @@ pub struct ProfileTrialLaunchCapsule {
     pub fixture_id: String,
     pub fixture_revision: Digest,
     pub workspace_seed_digest: Digest,
+    pub fixture_seed: InlineFixtureV1,
     pub evaluator_id: String,
     pub evaluator_revision: Digest,
+    pub evaluator: TrialEvaluator,
     pub side: TrialSide,
     pub run_id: AgentRunId,
+    pub operation_id: OperationId,
     pub attempt_id: String,
     pub profile: TrialProfileSnapshot,
     /// Trial workspaces use registered disposable fixtures and cannot submit factory effects.
@@ -168,7 +333,7 @@ pub(crate) struct HostTrialRunObservation {
 }
 
 /// Opaque run evidence. Fields are private, and there is no public deserializer or constructor.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProfileTrialRunReceipt {
     authorization_id: String,
     authorization_digest: Digest,
@@ -250,6 +415,13 @@ impl ProfileTrialRunReceipt {
                 .as_str()
                 .bytes()
                 .all(|byte| byte == b'0')
+            || self
+                .no_effects_receipt_digest
+                .as_str()
+                .bytes()
+                .all(|byte| byte == b'0')
+            || self.fixture_id != input.fixture_id
+            || self.evaluator_id != input.evaluator_id
             || self.attempt_ordinal == 0
             || self.attempt_ordinal > authorization.max_attempts_per_side
         {
@@ -429,13 +601,50 @@ impl ProfileTrialAuthorization {
         if total_input_bytes > 256 * 1024 {
             return Err("frozen trial input matrix exceeds its aggregate byte limit".into());
         }
+        let total_fixture_bytes = self.inputs.iter().try_fold(0usize, |total, input| {
+            input.fixture_seed.validate()?;
+            let bytes =
+                input
+                    .fixture_seed
+                    .files
+                    .iter()
+                    .try_fold(0usize, |sum, (path, contents)| {
+                        sum.checked_add(path.len())
+                            .and_then(|sum| sum.checked_add(contents.len()))
+                            .ok_or_else(|| "trial fixture matrix byte count overflow".to_owned())
+                    })?;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| "trial fixture matrix byte count overflow".to_owned())
+        })?;
+        if total_fixture_bytes > INLINE_FIXTURE_MATRIX_MAX_BYTES {
+            return Err("frozen trial fixture matrix exceeds the 512 KiB reviewable limit".into());
+        }
+        let total_evaluator_bytes = self.inputs.iter().try_fold(0usize, |total, input| {
+            let encoded =
+                serde_json::to_vec(&input.evaluator).map_err(|error| error.to_string())?;
+            total
+                .checked_add(encoded.len())
+                .ok_or_else(|| "trial grader matrix byte count overflow".to_owned())
+        })?;
+        if total_evaluator_bytes > MAX_TRIAL_EVALUATOR_BYTES {
+            return Err("frozen trial grader matrix exceeds the 64 KiB reviewable limit".into());
+        }
         let mut input_ids = std::collections::BTreeSet::new();
         for input in &self.inputs {
+            input.evaluator.validate()?;
+            let input_value: Value = crate::protocol::parse_unique(input.input_json.as_bytes())?;
             if !valid_token(&input.input_id, 128)
                 || input.input_json.len() > MAX_FROZEN_INPUT_BYTES
+                || serde_json::to_string(&input_value).map_err(|e| e.to_string())?
+                    != input.input_json
                 || content_digest(input.input_json.as_bytes())? != input.input_digest
+                || input.fixture_id != INLINE_FIXTURE_ID
                 || !valid_token(&input.fixture_id, 128)
-                || !valid_token(&input.evaluator_id, 128)
+                || input.fixture_revision != content_digest(b"inline_fixture_v1")?
+                || input.fixture_seed.digest()? != input.workspace_seed_digest
+                || input.evaluator_id != input.evaluator.implementation_id()
+                || input.evaluator_revision != input.evaluator.digest()?
             {
                 return Err("frozen trial input is malformed or exceeds its size limit".into());
             }
@@ -494,13 +703,39 @@ impl ProfileTrialAuthorization {
     }
 }
 
+pub(crate) fn derive_profile_trial_attempt_identity(
+    authorization: &ProfileTrialAuthorization,
+    pair_index: u8,
+    side: TrialSide,
+) -> Result<(AgentRunId, OperationId, String), String> {
+    let authorization_digest = authorization.digest()?;
+    let bytes = serde_json::to_vec(&(
+        "rex-profile-trial-run-v1",
+        &authorization.authorization_id,
+        &authorization_digest,
+        pair_index,
+        side,
+        1u8,
+    ))
+    .map_err(|error| error.to_string())?;
+    let token = format!("{:x}", Sha256::digest(bytes));
+    let run_id = AgentRunId::parse(format!("trial-run-{}", &token[..40]))?;
+    let operation_id = OperationId::parse(format!("trial-op-{}", &token[..40]))?;
+    let attempt_id = format!("trial-attempt-{}", &token[..40]);
+    Ok((run_id, operation_id, attempt_id))
+}
+
 impl ProfileTrialLaunchCapsule {
+    pub(crate) fn digest(&self) -> Result<Digest, String> {
+        let value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        let canonical = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        content_digest(canonical.as_bytes())
+    }
+
     pub(crate) fn from_authorized_matrix(
         authorization: &ProfileTrialAuthorization,
         pair_index: u8,
         side: TrialSide,
-        run_id: AgentRunId,
-        attempt_id: String,
     ) -> Result<Self, String> {
         authorization.validate()?;
         if authorization
@@ -525,6 +760,8 @@ impl ProfileTrialLaunchCapsule {
             TrialSide::Baseline => &authorization.baseline,
             TrialSide::Candidate => &authorization.candidate,
         };
+        let (run_id, operation_id, attempt_id) =
+            derive_profile_trial_attempt_identity(authorization, pair_index, side)?;
         let capsule = Self {
             schema_version: PROFILE_TRIAL_CAPSULE_SCHEMA_VERSION,
             purpose: LaunchPurpose::ProfileTrial,
@@ -552,16 +789,35 @@ impl ProfileTrialLaunchCapsule {
             fixture_id: input.fixture_id.clone(),
             fixture_revision: input.fixture_revision.clone(),
             workspace_seed_digest: input.workspace_seed_digest.clone(),
+            fixture_seed: input.fixture_seed.clone(),
             evaluator_id: input.evaluator_id.clone(),
             evaluator_revision: input.evaluator_revision.clone(),
+            evaluator: input.evaluator.clone(),
             side,
             run_id,
+            operation_id,
             attempt_id,
             profile: profile.clone(),
             effects_disabled: true,
         };
         capsule.validate()?;
         Ok(capsule)
+    }
+
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub(crate) fn evaluate_result(
+        &self,
+        result: Option<&Value>,
+    ) -> Result<HostTrialOutcome, String> {
+        if self.evaluator_id != self.evaluator.implementation_id()
+            || self.evaluator_revision != self.evaluator.digest()?
+        {
+            return Err("trial capsule evaluator identity is inconsistent".into());
+        }
+        self.evaluator.evaluate(result)
     }
 
     pub(crate) fn mint_terminal_receipt(
@@ -576,10 +832,18 @@ impl ProfileTrialLaunchCapsule {
             || observation.profile_digest != self.profile.profile_digest
             || observation.instruction_digest != self.profile.instruction_digest
             || observation.input_digest != self.input_digest
+            || observation.fixture_id != self.fixture_id
             || observation.fixture_revision != self.fixture_revision
+            || observation.evaluator_id != self.evaluator_id
+            || observation.evaluator_revision != self.evaluator_revision
             || observation.workspace_seed_digest != self.workspace_seed_digest
             || observation
                 .result_receipt_digest
+                .as_str()
+                .bytes()
+                .all(|byte| byte == b'0')
+            || observation
+                .no_effects_receipt_digest
                 .as_str()
                 .bytes()
                 .all(|byte| byte == b'0')
@@ -630,6 +894,7 @@ impl ProfileTrialLaunchCapsule {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.evaluator.validate()?;
         if self.schema_version != PROFILE_TRIAL_CAPSULE_SCHEMA_VERSION
             || self.purpose != LaunchPurpose::ProfileTrial
             || !self.effects_disabled
@@ -639,6 +904,11 @@ impl ProfileTrialLaunchCapsule {
             || !valid_token(&self.attempt_id, 255)
             || !valid_token(&self.input_id, 128)
             || self.input_json.len() > MAX_FROZEN_INPUT_BYTES
+            || self.evaluator_id != self.evaluator.implementation_id()
+            || self.evaluator_revision != self.evaluator.digest()?
+            || self.fixture_id != INLINE_FIXTURE_ID
+            || self.fixture_revision != content_digest(b"inline_fixture_v1")?
+            || self.fixture_seed.digest()? != self.workspace_seed_digest
             || content_digest(self.input_json.as_bytes())? != self.input_digest
             || self.profile.profile_config_json.len() > MAX_FROZEN_INPUT_BYTES
             || self
@@ -685,8 +955,11 @@ pub fn profile_trial_review_bundle(
 ) -> Result<crate::human::ReviewBundle, String> {
     authorization.validate()?;
     let input_rows = authorization.inputs.iter().map(|input| {
+        let input_text = serde_json::to_string(&input.input_json)
+            .unwrap_or_default()
+            .replace('`', "\\u0060");
         format!(
-            "- `{}`: fixture `{}` @ `{}`, evaluator `{}` @ `{}`, input digest `{}`, workspace seed `{}`; frozen input: `{}`",
+            "- `{}`: fixture `{}` @ `{}`, evaluator `{}` @ `{}`, input digest `{}`, workspace seed `{}`; canonical frozen input JSON string: `{}`",
             input.input_id,
             input.fixture_id,
             input.fixture_revision,
@@ -694,9 +967,26 @@ pub fn profile_trial_review_bundle(
             input.evaluator_revision,
             input.input_digest,
             input.workspace_seed_digest,
-            input.input_json
+            input_text
         )
     }).collect::<Vec<_>>().join("\n");
+    let fixture_rows = authorization
+        .inputs
+        .iter()
+        .map(|input| {
+            let files = serde_json::to_string(&input.fixture_seed.files)
+                .unwrap_or_default()
+                .replace('`', "\\u0060");
+            let evaluator = serde_json::to_string(&input.evaluator)
+                .unwrap_or_default()
+                .replace('`', "\\u0060");
+            format!(
+                "- Input `{}` fixture manifest `{}` (canonical files JSON): `{}`; host grader: `{}`",
+                input.input_id, input.workspace_seed_digest, files, evaluator
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let pair_rows = authorization
         .pairs
         .iter()
@@ -787,7 +1077,9 @@ pub fn profile_trial_review_bundle(
         evidence: vec![
             crate::human::ReviewEvidence { title: "Scoped matrix exception".into(), body: exception.into(), truncated: false },
             crate::human::ReviewEvidence { title: "Frozen input matrix".into(), body: input_rows, truncated: false },
+            crate::human::ReviewEvidence { title: "Frozen fixture seed files".into(), body: fixture_rows, truncated: false },
             crate::human::ReviewEvidence { title: "Authorized pairs".into(), body: pair_rows, truncated: false },
+            crate::human::ReviewEvidence { title: "Baseline learned guidance".into(), body: baseline_guidance, truncated: false },
             crate::human::ReviewEvidence { title: "Candidate learned guidance".into(), body: candidate_guidance, truncated: false },
             crate::human::ReviewEvidence { title: "Pinned runtime".into(), body: format!("Config revision/digest: {}/{}\nBaseline qualification: {}\nCandidate qualification: {}\nTrial policy: {}\nBaseline profile/instruction: {}/{}\nCandidate profile/instruction: {}/{}", authorization.config_revision.0, authorization.config_digest, authorization.baseline_qualification_digest, authorization.candidate_qualification_digest, authorization.trial_policy_digest, authorization.baseline.profile_digest, authorization.baseline.instruction_digest, authorization.candidate.profile_digest, authorization.candidate.instruction_digest), truncated: false },
         ],
@@ -852,6 +1144,7 @@ pub(crate) fn bind_profile_trial_human_request(
         || request.request_id != authorization.human_request_id
         || request.subject.project_id != authorization.project_id
         || request.subject.subject_id != authorization.authorization_id
+        || request.expires_at_unix != authorization.expires_at_unix
         || request.subject.material_digest != authorization.digest()?
         || request.subject.configuration_digest != authorization.config_digest
         || request.subject.policy_digest != authorization.trial_policy_digest
@@ -935,7 +1228,306 @@ fn valid_token(value: &str, max: usize) -> bool {
 fn valid_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
+        && !(value.len() >= 2
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':')
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
         && value
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FrozenTrialInput, ProfileTrialAuthorization, ProfileTrialLaunchCapsule, TrialPairSpec,
+        TrialProfileSnapshot, TrialSide, bind_profile_trial_human_request, digest_serialized,
+        profile_trial_human_request, profile_trial_review_bundle,
+    };
+    use crate::domain::ids::{Digest, HumanRequestId, ProfileId, ProjectId, Revision};
+    use crate::domain::types::Role;
+    use std::collections::BTreeMap;
+
+    fn digest(byte: char) -> Digest {
+        Digest::parse(byte.to_string().repeat(64)).unwrap()
+    }
+
+    fn snapshot(learned: Option<(&str, &str)>, description: &str) -> TrialProfileSnapshot {
+        let mut config = serde_json::json!({
+            "adapter": "codex",
+            "command": ["agent"],
+            "description": description,
+            "model": "fixture-model",
+            "effort": "low",
+            "turn_timeout_seconds": 30,
+            "instruction_files": [],
+            "skill_paths": [],
+            "commit_mode": "auto",
+            "learned_guidance": null,
+            "options": null
+        });
+        let mut files = BTreeMap::new();
+        if let Some((path, contents)) = learned {
+            config["learned_guidance"] = serde_json::json!({
+                "file": path,
+                "project_id": "project-a",
+                "role": "worker",
+                "repository_ids": ["repo-a"]
+            });
+            files.insert(path.to_owned(), contents.as_bytes().to_vec());
+        }
+        let profile_config_json = serde_json::to_string(&config).unwrap();
+        TrialProfileSnapshot {
+            profile_id: ProfileId::parse("worker").unwrap(),
+            profile_digest: super::content_digest(profile_config_json.as_bytes()).unwrap(),
+            instruction_digest: digest_serialized(&files).unwrap(),
+            profile_config_json,
+            instruction_files: files,
+        }
+    }
+
+    fn authorization() -> ProfileTrialAuthorization {
+        let inputs = (0..5)
+            .map(|index| {
+                let input_json = format!("{{\"case\":{index}}}");
+                let evaluator =
+                    super::TrialEvaluator::StructuredAssertionsV1 { assertions: vec![] };
+                let fixture_seed = super::InlineFixtureV1::empty();
+                FrozenTrialInput {
+                    input_id: format!("input-{index}"),
+                    input_digest: super::content_digest(input_json.as_bytes()).unwrap(),
+                    input_json,
+                    fixture_id: super::INLINE_FIXTURE_ID.into(),
+                    fixture_revision: super::content_digest(b"inline_fixture_v1").unwrap(),
+                    workspace_seed_digest: fixture_seed.digest().unwrap(),
+                    fixture_seed,
+                    evaluator_id: evaluator.implementation_id().into(),
+                    evaluator_revision: evaluator.digest().unwrap(),
+                    evaluator,
+                }
+            })
+            .collect::<Vec<_>>();
+        let pairs = (0..10)
+            .map(|pair_index| TrialPairSpec {
+                pair_index,
+                input_id: format!("input-{}", pair_index / 2),
+            })
+            .collect();
+        let baseline = snapshot(None, "base");
+        ProfileTrialAuthorization {
+            schema_version: super::PROFILE_TRIAL_CAPSULE_SCHEMA_VERSION,
+            authorization_id: "trial-1".into(),
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role: Role::Worker,
+            candidate_id: "candidate-1".into(),
+            candidate_digest: digest('d'),
+            base_profile_id: ProfileId::parse("worker").unwrap(),
+            base_profile_digest: baseline.profile_digest.clone(),
+            config_revision: Revision(1),
+            config_digest: digest('f'),
+            baseline_qualification_digest: digest('1'),
+            candidate_qualification_digest: digest('2'),
+            trial_policy_digest: digest('3'),
+            baseline,
+            candidate: snapshot(Some(("learned.md", "Keep acceptance checks.")), "candidate"),
+            inputs,
+            pairs,
+            scoped_exception: None,
+            human_request_id: HumanRequestId::parse("human-trial-1").unwrap(),
+            human_subject_digest: digest('4'),
+            human_configuration_digest: digest('f'),
+            human_policy_digest: digest('3'),
+            human_response_receipt_digest: digest('0'),
+            authorized_at_unix: 10,
+            max_attempts_per_side: 1,
+            expires_at_unix: 100,
+        }
+    }
+
+    #[test]
+    fn structured_assertions_evaluate_only_host_checked_role_results() {
+        let evaluator = super::TrialEvaluator::StructuredAssertionsV1 {
+            assertions: vec![super::TrialAssertion {
+                json_pointer: "/accepted".into(),
+                expected: serde_json::json!(true),
+            }],
+        };
+        assert_eq!(
+            evaluator
+                .evaluate(Some(&serde_json::json!({"accepted": true})))
+                .unwrap(),
+            super::HostTrialOutcome::Improved
+        );
+        assert_eq!(
+            evaluator
+                .evaluate(Some(&serde_json::json!({"accepted": false})))
+                .unwrap(),
+            super::HostTrialOutcome::Regressed
+        );
+        assert_eq!(
+            evaluator.evaluate(None).unwrap(),
+            super::HostTrialOutcome::Failed
+        );
+        let no_assertions = super::TrialEvaluator::StructuredAssertionsV1 { assertions: vec![] };
+        assert_eq!(
+            no_assertions
+                .evaluate(Some(&serde_json::json!({"accepted": true})))
+                .unwrap(),
+            super::HostTrialOutcome::Equivalent
+        );
+        assert_eq!(
+            no_assertions
+                .evaluate(Some(&serde_json::json!({})))
+                .unwrap(),
+            super::HostTrialOutcome::Equivalent
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_unsupported_or_malformed_contracts() {
+        let too_many = super::TrialEvaluator::StructuredAssertionsV1 {
+            assertions: (0..=super::MAX_TRIAL_ASSERTIONS)
+                .map(|_| super::TrialAssertion {
+                    json_pointer: "/ok".into(),
+                    expected: serde_json::json!(true),
+                })
+                .collect(),
+        };
+        assert!(too_many.validate().is_err());
+        let malformed = super::TrialEvaluator::StructuredAssertionsV1 {
+            assertions: vec![super::TrialAssertion {
+                json_pointer: "/bad~2escape".into(),
+                expected: serde_json::json!(true),
+            }],
+        };
+        assert!(malformed.validate().is_err());
+        let unsupported: Result<super::TrialEvaluator, _> = serde_json::from_value(
+            serde_json::json!({"kind":"future_evaluator_v9","assertions":[]}),
+        );
+        assert!(unsupported.is_err());
+    }
+
+    #[test]
+    fn inline_fixture_manifest_is_bounded_canonical_and_portable() {
+        let mut files = BTreeMap::new();
+        files.insert("src/main.rs".to_owned(), "fn main() {}\n".to_owned());
+        files.insert("cases/input.json".to_owned(), "{}\n".to_owned());
+        let valid = super::InlineFixtureV1 {
+            schema_version: 1,
+            files,
+        };
+        valid.validate().unwrap();
+        assert_eq!(valid.digest().unwrap(), valid.digest().unwrap());
+
+        for path in [
+            "/absolute/file",
+            "C:/absolute/file",
+            "../escape",
+            "src/../escape",
+            "src//empty-component",
+            "src\\windows-path",
+            ".git/config",
+            "nested/.GIT/config",
+            "rex-projects-control/start.request.json",
+        ] {
+            let invalid = super::InlineFixtureV1 {
+                schema_version: 1,
+                files: BTreeMap::from([(path.to_owned(), "blocked".to_owned())]),
+            };
+            assert!(invalid.validate().is_err(), "accepted {path:?}");
+        }
+
+        let collision = super::InlineFixtureV1 {
+            schema_version: 1,
+            files: BTreeMap::from([
+                ("src".to_owned(), "file".to_owned()),
+                ("src/main.rs".to_owned(), "nested file".to_owned()),
+            ]),
+        };
+        assert!(collision.validate().is_err());
+
+        let too_many_files = super::InlineFixtureV1 {
+            schema_version: 1,
+            files: (0..=super::INLINE_FIXTURE_MAX_FILES)
+                .map(|index| (format!("file-{index}.txt"), String::new()))
+                .collect(),
+        };
+        assert!(too_many_files.validate().is_err());
+
+        let oversized = super::InlineFixtureV1 {
+            schema_version: 1,
+            files: BTreeMap::from([(
+                "payload.bin".to_owned(),
+                "x".repeat(super::INLINE_FIXTURE_MAX_BYTES),
+            )]),
+        };
+        assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn full_trial_matrix_rebuilds_one_stable_review_bundle() {
+        let authorization = authorization();
+        authorization.validate().unwrap();
+        assert_eq!(
+            profile_trial_review_bundle(&authorization).unwrap(),
+            profile_trial_review_bundle(&authorization).unwrap()
+        );
+        assert_eq!(authorization.pairs.len() * 2, 20);
+    }
+
+    #[test]
+    fn profile_trial_human_request_binds_exact_authorization_and_bundle() {
+        let mut authorization = authorization();
+        let bundle = profile_trial_review_bundle(&authorization).unwrap();
+        let request = profile_trial_human_request(
+            authorization.human_request_id.clone(),
+            &authorization,
+            bundle,
+            "Approve this bounded fixture trial?".into(),
+            authorization.expires_at_unix,
+        )
+        .unwrap();
+        let before = authorization.digest().unwrap();
+        bind_profile_trial_human_request(&mut authorization, &request).unwrap();
+        assert_eq!(authorization.digest().unwrap(), before);
+        assert_eq!(
+            authorization.human_subject_digest,
+            request.subject.digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn candidate_cannot_change_provider_execution_settings() {
+        let mut authorization = authorization();
+        let mut candidate: serde_json::Value =
+            serde_json::from_str(&authorization.candidate.profile_config_json).unwrap();
+        candidate["command"] = serde_json::json!(["different-agent"]);
+        authorization.candidate.profile_config_json = serde_json::to_string(&candidate).unwrap();
+        authorization.candidate.profile_digest =
+            super::content_digest(authorization.candidate.profile_config_json.as_bytes()).unwrap();
+        assert!(authorization.validate().is_err());
+    }
+
+    #[test]
+    fn restart_reuses_deterministic_run_and_effect_identity() {
+        let mut authorization = authorization();
+        authorization.human_response_receipt_digest = digest('5');
+        let first = ProfileTrialLaunchCapsule::from_authorized_matrix(
+            &authorization,
+            0,
+            TrialSide::Baseline,
+        )
+        .unwrap();
+        let resumed = ProfileTrialLaunchCapsule::from_authorized_matrix(
+            &authorization,
+            0,
+            TrialSide::Baseline,
+        )
+        .unwrap();
+        assert_eq!(first.run_id, resumed.run_id);
+        assert_eq!(first.operation_id, resumed.operation_id);
+        assert_eq!(first.attempt_id, resumed.attempt_id);
+        assert!(first.effects_disabled);
+    }
 }

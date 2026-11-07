@@ -177,6 +177,14 @@ enum AgentCommand {
         #[arg(long)]
         environment_handoff: PathBuf,
     },
+    TrialStep {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long)]
+        environment_handoff: PathBuf,
+    },
     Submit {
         #[arg(long, env = "REX_PROJECTS_CONTROL_DIR")]
         control_dir: PathBuf,
@@ -1348,6 +1356,20 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 }))
             } else {
                 println!("Completed finite Agent turn {}.", result.run_id);
+                Ok(())
+            }
+        }
+        AgentCommand::TrialStep {
+            run,
+            package,
+            environment_handoff,
+        } => {
+            let result = crate::trial_step::run_trial_step(&run, &package, &environment_handoff)
+                .map_err(CliError::unavailable)?;
+            if json {
+                print_json(&serde_json::json!({"run_id": run, "result_digest": result}))
+            } else {
+                println!("Completed profile trial turn {run}.");
                 Ok(())
             }
         }

@@ -117,6 +117,17 @@ pub trait FactoryRuntimeServices {
         role: Role,
     ) -> Result<crate::domain::types::CommitMode, String>;
 
+    /// Accept at most one due profile-trial approval or queue its next run/side.
+    /// Implementations reserve from the same bounded execution-slot pool as Agent launches.
+    fn tick_profile_trials(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        max_agent_slots: u32,
+        max_project_slots: u32,
+    ) -> Result<(), String>;
+
     fn ticket_namespace(
         &mut self,
         adapter: &crate::domain::ids::AdapterId,

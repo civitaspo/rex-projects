@@ -111,6 +111,20 @@ impl RuntimeServices {
         let delivery =
             crate::runtime_delivery::build(applied_config, state_root, &host_environment)?;
         let mut handlers = Vec::new();
+        let profile_trial_handler =
+            crate::profile_trial_runtime::ProfileTrialStartEffectHandler::new(
+                applied_config.clone(),
+                environment.clone(),
+                host_environment.clone(),
+                rex.clone(),
+                rex_binary.clone(),
+                rex_identity.clone(),
+                runtime_binary.to_owned(),
+                runtime_binary_digest.clone(),
+                state_root.to_owned(),
+                owner_generation,
+            )?;
+        handlers.push(Box::new(profile_trial_handler));
         let scopes = applied_config
             .config
             .projects
@@ -718,6 +732,26 @@ impl FactoryRuntimeServices for RuntimeServices {
             .get(profile_id)
             .map(|profile| profile.commit_mode)
             .ok_or_else(|| "configured role profile is missing".into())
+    }
+
+    fn tick_profile_trials(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        max_agent_slots: u32,
+        max_project_slots: u32,
+    ) -> Result<(), String> {
+        if owner_generation != self.owner_generation {
+            return Err("RuntimeServices owner generation changed".into());
+        }
+        let _next = store.tick_profile_trials(
+            owner_generation,
+            u64::try_from(now_unix).map_err(|_| "controller clock is before Unix epoch")?,
+            max_agent_slots,
+            max_project_slots,
+        )?;
+        Ok(())
     }
 
     fn ticket_namespace(&mut self, adapter: &AdapterId) -> Result<TicketNamespace, String> {
