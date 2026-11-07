@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod host_commit;
 pub mod human;
 pub mod knowledge;
+pub mod launch;
 pub mod learning;
 pub mod mailbox;
 pub mod merge_executor;
