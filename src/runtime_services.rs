@@ -37,6 +37,20 @@ struct PreparedWorkerContext {
     token: crate::store::accepted_plans::PreparedWorkerLaunch,
 }
 
+pub(crate) fn worker_publication_identity(
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    node_id: &crate::engine::orchestration::WorkNodeId,
+    evidence_id: &str,
+) -> Result<(String, String), String> {
+    use crate::domain::ids::OperationId;
+
+    let operation_id = OperationId::parse(format!("publish-{evidence_id}"))?
+        .as_str()
+        .to_owned();
+    let logical_key = format!("{}:publish:{}:{evidence_id}", ticket_run_id, node_id);
+    Ok((operation_id, logical_key))
+}
+
 /// Long-lived adapters and effect handlers for a single controller process.
 /// Adapter namespaces are learned once and pinned by their `describe` call.
 pub struct RuntimeServices {
@@ -1514,7 +1528,6 @@ impl FactoryRuntimeServices for RuntimeServices {
             PublishImplementationEffectPayload, PullRequestContent, WorkerDeliveryCommit,
             canonical_delivery_payload,
         };
-        use crate::domain::ids::OperationId;
         use crate::domain::types::CommitMode;
         use crate::engine::orchestration::{RoleArtifactKind, RoleResultPayload};
 
@@ -1725,14 +1738,15 @@ impl FactoryRuntimeServices for RuntimeServices {
             },
         };
         let (request_json, request_digest) = canonical_delivery_payload(&payload)?;
-        let operation_id = OperationId::parse(format!("publish-{}", result.receipt.evidence_id()))?;
+        let (operation_id, logical_key) =
+            worker_publication_identity(ticket_run_id, &node_id, result.receipt.evidence_id())?;
         let _ = now_unix;
         Ok(Some(crate::store::EffectIntent {
             project_id: run.project_id.clone(),
             subject_type: "ticket_run".into(),
             subject_id: run.ticket_run_id.as_str().into(),
-            operation_id: operation_id.as_str().to_owned(),
-            logical_key: format!("{}:publish:{}", run.ticket_run_id, node_id),
+            operation_id,
+            logical_key,
             kind: crate::engine::reducer::effect_name(
                 &crate::engine::reducer::EffectKind::PublishImplementation,
             )

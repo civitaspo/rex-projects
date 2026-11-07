@@ -4514,8 +4514,8 @@ mod tests {
 
     use super::{
         AgentLaunchAuthority, ConfigStore, DurableInput, EffectIntent, EffectOutcome,
-        ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, content_digest,
-        durable_input_digest, persisted_start_ack,
+        ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, canonical_json,
+        content_digest, durable_input_digest, persisted_start_ack,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
@@ -4596,6 +4596,98 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(replayed, original);
+    }
+
+    #[test]
+    fn corrected_worker_publication_can_create_a_new_operation_and_replay_each_round() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("worker-correction-project").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            mode: "goal".into(),
+            goal_revision: 1,
+            desired_lifecycle: "running".into(),
+            state_revision: Revision(0),
+        };
+        assert!(store.insert_project(&project).unwrap());
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "worker-correction-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "worker-correction-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let ticket_run = TicketRunId::parse("worker-correction-run").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project.id,
+                &TicketNamespace::parse("github:org/repo").unwrap(),
+                &TicketId::parse("#12").unwrap(),
+                &ticket_run,
+                1,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+
+        let publication = |round: &str| {
+            let request_json = canonical_json(&serde_json::json!({"commit": round})).unwrap();
+            let evidence_id = format!("evidence-{round}");
+            let (operation_id, logical_key) = crate::runtime_services::worker_publication_identity(
+                &ticket_run,
+                &crate::engine::orchestration::WorkNodeId::parse("worker-a").unwrap(),
+                &evidence_id,
+            )
+            .unwrap();
+            EffectIntent {
+                project_id: project.id.clone(),
+                subject_type: "ticket_run".into(),
+                subject_id: ticket_run.as_str().into(),
+                operation_id,
+                logical_key,
+                kind: "publish_implementation".into(),
+                request_digest: content_digest(&request_json),
+                request_json,
+                expected_revision: Some(0),
+            }
+        };
+        let first_round = publication("first");
+        assert!(store.enqueue_effect(generation, &first_round).unwrap());
+        assert!(!store.enqueue_effect(generation, &first_round).unwrap());
+
+        let corrected_round = publication("corrected");
+        assert_ne!(first_round.logical_key, corrected_round.logical_key);
+        assert!(
+            store.enqueue_effect(generation, &corrected_round).is_ok(),
+            "a new Worker evidence round for the same node must get a distinct durable effect key"
+        );
+        assert!(!store.enqueue_effect(generation, &corrected_round).unwrap());
+        assert_eq!(
+            store
+                .effect_by_logical_key(&first_round.logical_key)
+                .unwrap()
+                .unwrap(),
+            first_round
+        );
     }
 
     fn snapshot(digest: &str) -> AppliedConfig {
