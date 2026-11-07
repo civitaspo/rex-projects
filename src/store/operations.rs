@@ -378,16 +378,38 @@ impl<'a> OperationsStore<'a> {
         &mut self,
         owner_generation: u64,
         operation_id: &OperationId,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        config_revision: Revision,
+        config_digest: &Digest,
         now: i64,
     ) -> Result<(), String> {
-        update_state(
-            self.connection,
-            owner_generation,
-            operation_id,
-            &["ready", "unknown"],
-            "invoking",
-            now,
-        )
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_owner(&tx, owner_generation)?;
+        let config_is_current: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM operation_runs r
+                    JOIN operation_plans op ON op.project_id=r.project_id AND op.ticket_run_id=r.ticket_run_id
+                    JOIN projects p ON p.project_id=op.project_id
+                    JOIN config_current current ON current.source_identity=p.config_source
+                    JOIN config_snapshots snapshot ON snapshot.source_identity=current.source_identity AND snapshot.revision=current.revision
+                    WHERE r.operation_id=?1 AND r.project_id=?2 AND r.ticket_run_id=?3
+                      AND op.config_revision=?4 AND op.config_digest=?5
+                      AND current.revision=?4 AND snapshot.digest=?5
+                )",
+                params![operation_id.as_str(), project_id.as_str(), ticket_run_id.as_str(), config_revision.0, config_digest.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !config_is_current {
+            return Err("operation config is no longer the applied project revision".into());
+        }
+        update_state_in_transaction(&tx, operation_id, &["ready", "unknown"], "invoking", now)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn record_unknown(
@@ -840,6 +862,21 @@ fn update_state(
     to: &str,
     now: i64,
 ) -> Result<(), String> {
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    validate_owner(&tx, owner_generation)?;
+    update_state_in_transaction(&tx, operation_id, from, to, now)?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn update_state_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    operation_id: &OperationId,
+    from: &[&str],
+    to: &str,
+    now: i64,
+) -> Result<(), String> {
     let placeholders = from.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "UPDATE operation_runs SET state=?2,updated_at_unix=?3 WHERE operation_id=?1 AND state IN ({placeholders})"
@@ -853,17 +890,13 @@ fn update_state(
         from.iter()
             .map(|value| rusqlite::types::Value::Text((*value).to_owned())),
     );
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
-    validate_owner(&tx, owner_generation)?;
     let changed = tx
         .execute(&sql, rusqlite::params_from_iter(values))
         .map_err(|error| error.to_string())?;
     if changed != 1 {
         return Err("operation state transition is stale or invalid".into());
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn parse_state(value: &str) -> Result<DurableOperationState, String> {

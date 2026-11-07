@@ -23,7 +23,7 @@ use crate::launch::{
 #[path = "store/dashboard_projection.rs"]
 pub mod dashboard_projection;
 
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 pub mod human;
 #[path = "store/learning.rs"]
 mod learning_store;
@@ -499,6 +499,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             learning_store::migrate_v10(&connection)?;
+        }
+        if existing_version < 11 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            operations::migrate_v11(&connection)?;
         }
         Ok(Self {
             connection,

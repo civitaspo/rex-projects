@@ -295,7 +295,15 @@ impl OperationEffectHandler {
             if record.state == DurableOperationState::Unknown && attempt_count < 2 {
                 return Err("unknown operation requires reconciliation before retry".into());
             }
-            store.record_invoking(self.owner_generation, operation_id, now)?;
+            store.record_invoking(
+                self.owner_generation,
+                operation_id,
+                &request.project_id,
+                &request.ticket_run_id,
+                request.config_revision,
+                &request.config_digest,
+                now,
+            )?;
         }
 
         let mut runner = ProcessCommandRunner::new(self.process_shutdown_grace)?;
@@ -779,6 +787,7 @@ mod tests {
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_unix INTEGER NOT NULL);
              INSERT INTO schema_migrations VALUES (10, 1);
              CREATE TABLE config_snapshots(source_identity TEXT, revision INTEGER, digest TEXT);
+             CREATE TABLE config_current(source_identity TEXT PRIMARY KEY, revision INTEGER);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY, config_source TEXT);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY, project_id TEXT, config_source TEXT, config_revision INTEGER, config_digest TEXT, revision INTEGER);
              CREATE TABLE controller_owners(singleton INTEGER PRIMARY KEY, generation INTEGER, stopped_at_unix INTEGER);
@@ -806,6 +815,9 @@ mod tests {
                 "INSERT INTO config_snapshots VALUES ('factory', 1, ?1)",
                 [applied.digest.as_str()],
             )
+            .unwrap();
+        connection
+            .execute("INSERT INTO config_current VALUES ('factory', 1)", [])
             .unwrap();
         connection
             .execute(
@@ -869,6 +881,31 @@ mod tests {
         let handler =
             OperationEffectHandler::new(&db, [applied], Duration::from_secs(2), 2).unwrap();
 
+        connection
+            .execute(
+                "INSERT INTO config_snapshots VALUES ('factory', 2, ?1)",
+                ["f".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE config_current SET revision=2 WHERE source_identity='factory'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            handler
+                .handle(OperationExecutionMode::Submit, &effect, 1)
+                .is_err()
+        );
+        assert!(!remote_state.exists());
+        connection
+            .execute(
+                "UPDATE config_current SET revision=1 WHERE source_identity='factory'",
+                [],
+            )
+            .unwrap();
+
         let first = handler
             .handle(OperationExecutionMode::Submit, &effect, 1)
             .unwrap();
@@ -877,6 +914,22 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
         assert_eq!(state["invoke_calls"], 1);
         assert_eq!(state["duplicate_invoke_calls"], 0);
+
+        // A config change blocks a new submission but must not prevent exact
+        // reconciliation of the already-started historical operation.
+        connection
+            .execute(
+                "UPDATE config_current SET revision=2 WHERE source_identity='factory'",
+                [],
+            )
+            .unwrap();
+        let historical_reconcile = handler
+            .handle(OperationExecutionMode::Reconcile, &effect, 1)
+            .unwrap();
+        assert!(matches!(
+            historical_reconcile,
+            OperationExecutionOutcome::Applied { .. }
+        ));
 
         // Simulate process death after the handler durably records success but
         // before the shared dispatcher stores its receipt on the outbox row.
