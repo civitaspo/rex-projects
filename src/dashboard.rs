@@ -4,12 +4,17 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
 use serde::{Deserialize, Serialize};
+
+static SHUTDOWN_REQUESTED: LazyLock<Arc<AtomicBool>> =
+    LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 use crate::domain::ids::{HumanRequestId, TicketRunId};
 
@@ -39,7 +44,8 @@ pub struct TicketRow {
     pub activity: String,
     pub external_status: String,
     pub revision: u64,
-    pub pinned: bool,
+    /// Unknown when the active host adapter has no v7 view-history observation.
+    pub pinned: Option<bool>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentRow {
@@ -82,6 +88,7 @@ pub struct FocusTarget {
 pub trait DashboardBackend {
     fn snapshot(&mut self) -> Result<DashboardSnapshot, String>;
     fn focus_and_zoom(&mut self, target: &FocusTarget) -> Result<(), String>;
+    fn focus_ticket(&mut self, ticket_run: &TicketRunId) -> Result<(), String>;
     fn set_pin(
         &mut self,
         ticket_run: &TicketRunId,
@@ -159,13 +166,22 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("dashboard requires a terminal; use --json for a snapshot".into());
     }
+    let _signal_guard = ShutdownSignal::install()?;
     let _terminal_guard =
         TerminalGuard::enter().map_err(|e| format!("cannot initialize dashboard terminal: {e}"))?;
     let mut selected = Selection::Ticket(0);
     loop {
         let snapshot = backend.snapshot()?;
         render(&snapshot, selected)?;
-        if !event::poll(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())? {
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            break;
+        }
+        let has_event = match event::poll(std::time::Duration::from_millis(250)) {
+            Ok(available) => available,
+            Err(_) if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) => break,
+            Err(error) => return Err(error.to_string().into()),
+        };
+        if !has_event {
             continue;
         }
         match event::read().map_err(|e| e.to_string())? {
@@ -176,6 +192,9 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                     Selection::Human(_) => snapshot.human_requests.len(),
                 };
                 match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        break;
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Tab => selected = next_selection(selected, &snapshot),
                     KeyCode::Down | KeyCode::Char('j') if row_count > 0 => {
@@ -193,14 +212,8 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                             }
                         }
                         Selection::Ticket(i) => {
-                            if let Some(ticket) = snapshot.tickets.get(i)
-                                && let Some(agent) = snapshot.agents.iter().find(|a| {
-                                    a.ticket_run_id.as_ref() == Some(&ticket.ticket_run_id)
-                                        && a.rex_block_id.is_some()
-                                })
-                                && let Some(target) = backend.focus_target(&agent.agent_run_id)?
-                            {
-                                backend.focus_and_zoom(&target)?;
+                            if let Some(ticket) = snapshot.tickets.get(i) {
+                                backend.focus_ticket(&ticket.ticket_run_id)?;
                             }
                         }
                         Selection::Human(_) => {}
@@ -210,7 +223,11 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                         if let Selection::Ticket(i) = selected
                             && let Some(t) = snapshot.tickets.get(i)
                         {
-                            backend.set_pin(&t.ticket_run_id, t.revision, !t.pinned)?;
+                            backend.set_pin(
+                                &t.ticket_run_id,
+                                t.revision,
+                                !t.pinned.unwrap_or(false),
+                            )?;
                         }
                     }
                     KeyCode::Char('i') => {
@@ -328,7 +345,11 @@ fn render(snapshot: &DashboardSnapshot, selected: Selection) -> Result<(), Strin
             writeln!(
                 out,
                 "{} {}/{} {} · {} · {}",
-                if t.pinned { "📌" } else { "  " },
+                match t.pinned {
+                    Some(true) => "📌",
+                    Some(false) => "  ",
+                    None => "? ",
+                },
                 terminal_text(&t.namespace),
                 terminal_text(&t.ticket_id),
                 terminal_text(&t.phase),
@@ -418,18 +439,57 @@ fn prompt_line(prompt: &str) -> Result<String, String> {
     }
     Ok(value)
 }
-struct TerminalGuard;
+struct TerminalGuard {
+    raw_mode_enabled: bool,
+}
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
-        Ok(Self)
+        Self::enter_with(terminal::enable_raw_mode, || {
+            execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide).map(|_| ())
+        })
+    }
+    fn enter_with<E, S>(enable_raw: E, enter_screen: S) -> io::Result<Self>
+    where
+        E: FnOnce() -> io::Result<()>,
+        S: FnOnce() -> io::Result<()>,
+    {
+        // Construct the guard before changing terminal state so even a
+        // partially failed setup gets a Drop restoration attempt.
+        let mut guard = Self {
+            raw_mode_enabled: false,
+        };
+        enable_raw()?;
+        guard.raw_mode_enabled = true;
+        enter_screen()?;
+        Ok(guard)
+    }
+}
+
+struct ShutdownSignal(signal_hook::SigId);
+impl ShutdownSignal {
+    fn install() -> Result<Self, DashboardError> {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
+        signal_hook::flag::register(
+            signal_hook::consts::SIGTERM,
+            Arc::clone(&SHUTDOWN_REQUESTED),
+        )
+        .map(Self)
+        .map_err(|error| format!("cannot register dashboard shutdown signal: {error}").into())
+    }
+}
+impl Drop for ShutdownSignal {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.0);
+        SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
+        if self.raw_mode_enabled {
+            let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
+            let _ = terminal::disable_raw_mode();
+            self.raw_mode_enabled = false;
+        }
     }
 }
 
@@ -516,6 +576,10 @@ mod tests {
             ));
             Ok(())
         }
+        fn focus_ticket(&mut self, ticket_run: &TicketRunId) -> Result<(), String> {
+            self.calls.push(format!("focus-ticket:{ticket_run}"));
+            Ok(())
+        }
         fn set_pin(&mut self, id: &TicketRunId, revision: u64, pinned: bool) -> Result<(), String> {
             self.calls.push(format!("pin:{id}:{revision}:{pinned}"));
             Ok(())
@@ -566,7 +630,7 @@ mod tests {
                 activity: "worker_running".into(),
                 external_status: "in_progress".into(),
                 revision: 8,
-                pinned: false,
+                pinned: Some(false),
             }],
             agents: vec![AgentRow {
                 agent_run_id: "run-1".into(),
@@ -601,28 +665,90 @@ mod tests {
         let Ok(log_path) = std::env::var("REX_PROJECTS_DASHBOARD_PTY_LOG") else {
             return;
         };
+        if std::env::var_os("REX_PROJECTS_DASHBOARD_INIT_FAILURE").is_some() {
+            let result = TerminalGuard::enter_with(terminal::enable_raw_mode, || {
+                Err(io::Error::other("fixture alternate-screen failure"))
+            });
+            assert!(result.is_err());
+            std::fs::write(log_path, "restored").unwrap();
+            return;
+        }
         let mut backend = FixtureBackend::default();
         let result = run(&mut backend);
         let payload = serde_json::json!({"exit":result.as_ref().err().map(|e|e.exit_code).unwrap_or(0),"calls":backend.calls});
         std::fs::write(log_path, payload.to_string()).unwrap();
-        if let Err(e) = result {
-            eprintln!("{}", e.message);
-            if e.exit_code != 77 {
-                std::process::exit(e.exit_code);
-            }
+        if let Err(e) = result
+            && e.exit_code != 77
+        {
+            std::process::exit(e.exit_code);
         }
     }
 
     #[test]
     fn pty_keyboard_focuses_and_queues_exact_human_decision() {
-        run_pty_fixture(false);
+        run_pty_fixture(false, false, false);
     }
     #[test]
     fn pty_marked_agent_is_read_only_and_terminal_is_restored() {
-        run_pty_fixture(true);
+        run_pty_fixture(true, false, false);
+    }
+    #[test]
+    fn pty_sigterm_restores_terminal_before_exit() {
+        run_pty_fixture(false, true, false);
+    }
+    #[test]
+    fn pty_ctrl_c_restores_terminal_before_exit() {
+        run_pty_fixture(false, false, true);
+    }
+    #[test]
+    fn pty_failed_alternate_screen_setup_restores_raw_mode() {
+        let mut master_fd = 0;
+        let mut slave_fd = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let _master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let observer = slave.try_clone().unwrap();
+        let mut baseline: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut baseline) },
+            0
+        );
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "dashboard::tests::pty_child", "--nocapture"])
+            .env("REX_PROJECTS_DASHBOARD_PTY_LOG", log.path())
+            .env("REX_PROJECTS_DASHBOARD_INIT_FAILURE", "1")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(log.path()).unwrap(), "restored");
+        let mut after: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut after) },
+            0
+        );
+        assert_eq!(
+            after.c_lflag & (libc::ICANON | libc::ECHO),
+            baseline.c_lflag & (libc::ICANON | libc::ECHO)
+        );
     }
 
-    fn run_pty_fixture(marked: bool) {
+    fn run_pty_fixture(marked: bool, send_sigterm: bool, send_ctrl_c: bool) {
         let mut master_fd = 0;
         let mut slave_fd = 0;
         assert_eq!(
@@ -674,8 +800,19 @@ mod tests {
             Duration::from_secs(5),
             log.path(),
         );
+        if send_sigterm {
+            assert_eq!(
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+        } else if send_ctrl_c {
+            master.write_all(b"\x03").unwrap();
+        }
         // Send individual keys as the app acknowledges each selection change.
-        if marked {
+        if send_sigterm || send_ctrl_c {
+            // SIGTERM is translated into a graceful loop exit by the host;
+            // no provider block or decision action is executed.
+        } else if marked {
             master.write_all(b"\t").unwrap();
             wait_for_pty_text(
                 &mut master,
@@ -707,6 +844,8 @@ mod tests {
             master
                 .write_all(format!("{}\n", instruction.path().display()).as_bytes())
                 .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            master.write_all(b"\r").unwrap();
             std::thread::sleep(Duration::from_millis(100));
             master.write_all(b"\t").unwrap();
             wait_for_pty_text(
@@ -758,11 +897,15 @@ mod tests {
         );
         let out: serde_json::Value =
             serde_json::from_slice(&std::fs::read(log.path()).unwrap()).unwrap();
-        if marked {
+        if send_sigterm || send_ctrl_c {
+            assert_eq!(out["exit"], 0);
+            assert!(out["calls"].as_array().unwrap().is_empty());
+        } else if marked {
             assert_eq!(out["exit"], 77);
             assert!(out["calls"].as_array().unwrap().is_empty());
         } else {
             let calls = out["calls"].as_array().unwrap();
+            assert!(calls.iter().any(|c| c == "focus-ticket:tr-1"));
             assert!(
                 calls
                     .iter()

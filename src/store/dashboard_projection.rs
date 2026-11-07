@@ -1,11 +1,9 @@
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 
-use crate::dashboard::{
-    AgentRow, DashboardSnapshot, HumanInboxRow, ProjectRow, TicketRow, WaitRow,
-};
-use crate::domain::ids::{HumanRequestId, TicketRunId};
+use crate::dashboard::{AgentRow, DashboardSnapshot, ProjectRow, TicketRow, WaitRow};
+use crate::domain::ids::TicketRunId;
 
 /// Read-only, lock-free dashboard projection. Older schemas return the rows
 /// they can represent and an empty human inbox; the human runtime adapter
@@ -45,15 +43,9 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
             projects.push(row.map_err(|e| e.to_string())?);
         }
     }
-    let pin_supported = table_exists(&db, "ticket_view_pins")?;
-    let ticket_sql = if pin_supported {
-        "SELECT t.ticket_run_id,t.project_id,t.namespace,t.ticket_id,t.internal_phase,t.activity,t.external_status,t.revision,COALESCE(v.pinned,0) FROM ticket_runs t LEFT JOIN ticket_view_pins v USING(ticket_run_id) ORDER BY t.project_id,t.ticket_id,t.generation DESC"
-    } else {
-        "SELECT ticket_run_id,project_id,namespace,ticket_id,internal_phase,activity,external_status,revision,0 FROM ticket_runs ORDER BY project_id,ticket_id,generation DESC"
-    };
     let mut tickets = Vec::new();
     {
-        let mut q = db.prepare(ticket_sql).map_err(|e| e.to_string())?;
+        let mut q = db.prepare("SELECT ticket_run_id,project_id,namespace,ticket_id,internal_phase,activity,external_status,revision FROM ticket_runs ORDER BY project_id,ticket_id,generation DESC").map_err(|e| e.to_string())?;
         for row in q
             .query_map([], |r| {
                 let id: String = r.get(0)?;
@@ -66,12 +58,11 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, u64>(7)?,
-                    r.get::<_, bool>(8)?,
                 ))
             })
             .map_err(|e| e.to_string())?
         {
-            let (id, p, n, t, phase, activity, status, revision, pinned) =
+            let (id, p, n, t, phase, activity, status, revision) =
                 row.map_err(|e| e.to_string())?;
             tickets.push(TicketRow {
                 ticket_run_id: TicketRunId::parse(id)?,
@@ -82,7 +73,7 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
                 activity,
                 external_status: status,
                 revision,
-                pinned,
+                pinned: None,
             });
         }
     }
@@ -104,13 +95,10 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
             })
             .map_err(|e| e.to_string())?
         {
-            let (id, p, role_session, owner, state, session, window, block) =
+            let (id, p, _role_session, owner, state, session, window, block) =
                 row.map_err(|e| e.to_string())?;
-            let ticket_run_id = role_session.as_deref().and_then(|s| {
-                s.split_once("ticket_run:")
-                    .and_then(|(_, id)| TicketRunId::parse(id.to_owned()).ok())
-            });
-            let role = owner.rsplit(':').next().unwrap_or(&owner).to_owned();
+            let ticket_run_id = None;
+            let role = owner;
             agents.push(AgentRow {
                 agent_run_id: id,
                 project_id: p,
@@ -144,52 +132,15 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
             waits.push(row.map_err(|e| e.to_string())?);
         }
     }
-    let mut human_requests = Vec::new();
-    if table_exists(&db, "human_requests")? {
-        let mut q=db.prepare("SELECT request_id,project_id,question,choices_json,subject_digest,expires_at_unix FROM human_requests WHERE lifecycle IN ('pending','queued') ORDER BY created_at_unix").map_err(|e|e.to_string())?;
-        for row in q
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-        {
-            let (id, project_id, question, choices, digest, expiry) =
-                row.map_err(|e| e.to_string())?;
-            human_requests.push(HumanInboxRow {
-                request_id: HumanRequestId::parse(id)?,
-                project_id,
-                question,
-                choices: serde_json::from_str(&choices).unwrap_or_default(),
-                subject_digest: digest,
-                expires_at_unix: expiry,
-            });
-        }
-    }
     Ok(DashboardSnapshot {
         observed_at_unix: unix_now(),
         projects,
         tickets,
         agents,
         waits,
-        human_requests,
+        // The host adapter fills this from ConfigStore::list_human_requests.
+        human_requests: Vec::new(),
     })
-}
-fn table_exists(db: &Connection, name: &str) -> Result<bool, String> {
-    db.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-    .map(|v| v.is_some())
-    .map_err(|e| e.to_string())
 }
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
