@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapters::rex::{RexCliTransport, RexIdentity};
@@ -18,6 +19,7 @@ use crate::effects::EffectHandler;
 use crate::engine::factory_runtime::{ExternalTicketPage, FactoryRuntimeServices};
 use crate::environment::{ChildContext, EnvironmentSnapshot};
 use crate::protocol::RequestId;
+use crate::runtime_delivery::RuntimeDelivery;
 use crate::store::ConfigStore;
 use crate::store::scheduler::{ObservedTicket, TicketScanKey};
 
@@ -26,7 +28,7 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Long-lived adapters and effect handlers for a single controller process.
 /// Adapter namespaces are learned once and pinned by their `describe` call.
 pub struct RuntimeServices {
-    tickets: Box<dyn TicketAdapter>,
+    tickets: Arc<dyn TicketAdapter>,
     namespaces: BTreeMap<AdapterId, TicketNamespace>,
     handlers: Vec<Box<dyn EffectHandler>>,
     config: Config,
@@ -42,6 +44,7 @@ pub struct RuntimeServices {
     runtime_binary: PathBuf,
     runtime_binary_digest: Digest,
     artifacts: ArtifactStore,
+    delivery: RuntimeDelivery,
 }
 
 impl RuntimeServices {
@@ -71,8 +74,10 @@ impl RuntimeServices {
         }
         let host_environment =
             environment.child_environment(ChildContext::HostOperation, &active_rex_environment);
-        let tickets = build_ticket_adapter(&applied_config.config, &host_environment, config_dir)
-            .map_err(|error| error.to_string())?;
+        let tickets: Arc<dyn TicketAdapter> = Arc::from(
+            build_ticket_adapter(&applied_config.config, &host_environment, config_dir)
+                .map_err(|error| error.to_string())?,
+        );
         let search_path = host_environment
             .get(std::ffi::OsStr::new("PATH"))
             .map(std::env::split_paths)
@@ -95,10 +100,41 @@ impl RuntimeServices {
         .map_err(|error| error.to_string())?;
         let artifact_root = state_root.join("artifacts");
         let artifacts = ArtifactStore::open(&artifact_root)?;
+        let delivery =
+            crate::runtime_delivery::build(applied_config, state_root, &host_environment)?;
+        let mut handlers = Vec::new();
+        let scopes = applied_config
+            .config
+            .projects
+            .iter()
+            .map(|(project_id, project)| {
+                let values = project
+                    .ticket_scope
+                    .iter()
+                    .map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), value.to_owned()))
+                            .ok_or_else(|| format!("ticket scope `{key}` must be a string"))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                Ok((
+                    project_id.clone(),
+                    TicketScope::new(values).map_err(|e| e.to_string())?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        handlers.extend(
+            crate::engine::ticket_effect_handlers::TicketEffectHandlers::new(
+                tickets.clone(),
+                scopes,
+            )
+            .into_handlers(),
+        );
         Ok(Self {
             tickets,
             namespaces: BTreeMap::new(),
-            handlers: Vec::new(),
+            handlers,
             config: applied_config.config.clone(),
             configuration_digest: applied_config.digest.clone(),
             applied_config: applied_config.clone(),
@@ -112,6 +148,7 @@ impl RuntimeServices {
             runtime_binary: runtime_binary.to_owned(),
             runtime_binary_digest: runtime_binary_digest.clone(),
             artifacts,
+            delivery,
         })
     }
 
@@ -453,7 +490,9 @@ impl FactoryRuntimeServices for RuntimeServices {
     }
 
     fn effect_handlers(&self) -> Vec<&dyn EffectHandler> {
-        self.handlers.iter().map(Box::as_ref).collect()
+        let mut handlers = self.delivery.handlers();
+        handlers.extend(self.handlers.iter().map(Box::as_ref));
+        handlers
     }
 }
 
