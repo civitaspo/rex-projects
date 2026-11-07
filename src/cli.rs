@@ -263,6 +263,14 @@ enum AgentCommand {
         #[arg(long)]
         request_id: String,
     },
+    Inbox {
+        #[arg(long, env = "REX_PROJECTS_CONTROL_DIR")]
+        control_dir: PathBuf,
+        #[arg(long = "run", env = "REX_PROJECTS_RUN_ID")]
+        run_id: String,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1863,6 +1871,35 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 None => Err(CliError::unexpected(
                     "no committed controller receipt exists for this request",
                 )),
+            }
+        }
+        AgentCommand::Inbox {
+            control_dir,
+            run_id,
+            after,
+        } => {
+            if std::env::var("REX_PROJECTS_AGENT").as_deref() != Ok("1") {
+                return Err(CliError::conflict(
+                    "agent inbox can only run in a factory Agent context",
+                ));
+            }
+            let capability = MailboxCapability::open_registered_for_run(&run_id, &control_dir)
+                .map_err(CliError::unavailable)?;
+            let inputs = crate::agent_api::read_inbox(capability.directory(), &run_id, after)
+                .map_err(CliError::unavailable)?;
+            let next_after = inputs
+                .last()
+                .map_or(after, |item| after.max(item.wake_input_id));
+            if json {
+                print_json(&serde_json::json!({
+                    "run_id": run_id,
+                    "after": after,
+                    "next_after": next_after,
+                    "inputs": inputs,
+                }))
+            } else {
+                println!("Agent inbox has {} input(s) after {after}.", inputs.len());
+                Ok(())
             }
         }
     }

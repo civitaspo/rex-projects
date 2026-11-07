@@ -309,7 +309,21 @@ pub fn read_inbox(
     run_id: &str,
     after: u64,
 ) -> Result<Vec<AgentWakeItem>, String> {
-    let path = control_dir.join("inbox").join("snapshot.json");
+    let control_metadata = fs::symlink_metadata(control_dir).map_err(|error| error.to_string())?;
+    if !control_metadata.is_dir() || control_metadata.file_type().is_symlink() {
+        return Err("Agent control directory must be a real directory".into());
+    }
+    let control_dir = fs::canonicalize(control_dir).map_err(|error| error.to_string())?;
+    let inbox_dir = control_dir.join("inbox");
+    let inbox_metadata = fs::symlink_metadata(&inbox_dir).map_err(|error| error.to_string())?;
+    if !inbox_metadata.is_dir() || inbox_metadata.file_type().is_symlink() {
+        return Err("Agent inbox must be a real directory".into());
+    }
+    let inbox_dir = fs::canonicalize(&inbox_dir).map_err(|error| error.to_string())?;
+    if inbox_dir.parent() != Some(control_dir.as_path()) {
+        return Err("Agent inbox directory escaped its control directory".into());
+    }
+    let path = inbox_dir.join("snapshot.json");
     let bytes = read_bounded(&path, MAX_INBOX_BYTES)?;
     let snapshot: AgentWakeSnapshot = crate::protocol::parse_unique(&bytes)?;
     snapshot.validate()?;

@@ -12,6 +12,8 @@ use crate::protocol::{RequestEnvelope, RequestId, ResponseEnvelope, parse_unique
 const REQUEST_PREFIX: &str = "request-";
 const RECEIPT_PREFIX: &str = "receipt-";
 const MAX_ID_BYTES: usize = 255;
+const MAX_REGISTERED_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_REGISTERED_PENDING_REQUESTS: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub struct MailboxLimits {
@@ -150,6 +152,36 @@ impl MailboxCapability {
         {
             return Err("mailbox descriptor does not match its run-scoped capability".into());
         }
+        capability.expires_at = descriptor.expires_at_unix;
+        Ok(capability)
+    }
+
+    /// Opens an existing Agent mailbox using the limits recorded in its run-scoped descriptor.
+    /// This is useful to read Agent-owned control data without SQLite or changing the registered
+    /// limits expected by the host.
+    pub fn open_registered_for_run(
+        run_id: impl Into<String>,
+        directory: &Path,
+    ) -> Result<Self, String> {
+        let mut capability =
+            Self::open_unregistered(run_id, directory, u64::MAX, MailboxLimits::default())?;
+        let bytes = capability
+            .read_bounded("descriptor.json", 4096)
+            .map_err(|error| format!("read mailbox descriptor: {error}"))?;
+        let descriptor: MailboxDescriptor = parse_unique(&bytes)?;
+        if descriptor.schema_version != 1
+            || descriptor.run_id != capability.run_id
+            || descriptor.max_request_bytes == 0
+            || descriptor.max_request_bytes > MAX_REGISTERED_REQUEST_BYTES
+            || descriptor.max_pending_requests == 0
+            || descriptor.max_pending_requests > MAX_REGISTERED_PENDING_REQUESTS
+        {
+            return Err("mailbox descriptor is not a bounded capability for this AgentRun".into());
+        }
+        capability.limits = MailboxLimits {
+            max_request_bytes: descriptor.max_request_bytes,
+            max_pending_requests: descriptor.max_pending_requests,
+        };
         capability.expires_at = descriptor.expires_at_unix;
         Ok(capability)
     }

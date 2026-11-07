@@ -219,6 +219,181 @@ fn version_reports_the_cargo_package_version() {
     assert!(output.stderr.is_empty());
 }
 
+fn inbox_fixture_snapshot(run_id: &str) -> rex_projects::agent_api::AgentWakeSnapshot {
+    let source_id = "3".repeat(64);
+    let artifact_id = "a".repeat(64);
+    let mut snapshot = rex_projects::agent_api::AgentWakeSnapshot {
+        schema_version: 1,
+        project_id: rex_projects::domain::ids::ProjectId::parse("project1").unwrap(),
+        role_session_id: "ticket_run:ticket1:coordinator".into(),
+        agent_run_id: run_id.into(),
+        digest: rex_projects::domain::ids::Digest::parse("0".repeat(64)).unwrap(),
+        inputs: vec![rex_projects::agent_api::AgentWakeItem {
+            wake_input_id: 5,
+            source_type: "agent_result".into(),
+            source_id: source_id.clone(),
+            source_revision: 1,
+            priority: 7,
+            payload_json: serde_json::json!({"structured_result":{"summary":"Planner output"}}),
+            host_artifacts: vec![rex_projects::agent_api::HostArtifactLocator {
+                artifact_id: rex_projects::domain::ids::ArtifactId::parse(artifact_id.clone())
+                    .unwrap(),
+                kind: rex_projects::engine::orchestration::RoleArtifactKind::Plan,
+                schema_version: 1,
+                digest: rex_projects::domain::ids::Digest::parse("b".repeat(64)).unwrap(),
+                bytes: 3,
+                path: format!(".rex-artifacts/sha256/aa/{artifact_id}"),
+                source_run_id: "planner-run".into(),
+                source_evidence_id: source_id,
+                source_authority_digest: rex_projects::domain::ids::Digest::parse("c".repeat(64))
+                    .unwrap(),
+            }],
+        }],
+    };
+    snapshot.digest = snapshot.content_digest().unwrap();
+    snapshot
+}
+
+#[test]
+fn agent_inbox_reads_the_scoped_snapshot_without_opening_state() {
+    use rex_projects::mailbox::{MailboxCapability, MailboxLimits};
+
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let state_root = temp.path().join("unused-state");
+    let run_id = "coordinator-run";
+    MailboxCapability::create(
+        run_id,
+        &control_dir,
+        u64::MAX,
+        MailboxLimits {
+            max_request_bytes: 1_048_576,
+            max_pending_requests: 32,
+        },
+    )
+    .unwrap();
+    let snapshot_path = control_dir.join("inbox/snapshot.json");
+    rex_projects::agent_api::publish_wake_snapshot(&control_dir, inbox_fixture_snapshot(run_id))
+        .unwrap();
+    let descriptor_before = std::fs::read(control_dir.join("descriptor.json")).unwrap();
+    let snapshot_before = std::fs::read(&snapshot_path).unwrap();
+    let run_inbox = |extra: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rex-projects"));
+        command
+            .args(["--state-root"])
+            .arg(&state_root)
+            .args(["agent", "inbox", "--json"])
+            .args(extra)
+            .env("REX_PROJECTS_AGENT", "1")
+            .env("REX_PROJECTS_RUN_ID", run_id)
+            .env("REX_PROJECTS_CONTROL_DIR", &control_dir);
+        command.output().unwrap()
+    };
+
+    let output = run_inbox(&[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["run_id"], run_id);
+    assert_eq!(report["after"], 0);
+    assert_eq!(report["next_after"], 5);
+    assert_eq!(
+        report["inputs"][0]["payload_json"]["structured_result"]["summary"],
+        "Planner output"
+    );
+    assert_eq!(
+        report["inputs"][0]["host_artifacts"][0]["artifact_id"],
+        "a".repeat(64)
+    );
+
+    let output = run_inbox(&["--after", "5"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["after"], 5);
+    assert_eq!(report["next_after"], 5);
+    assert!(report["inputs"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot_before);
+    assert_eq!(
+        std::fs::read(control_dir.join("descriptor.json")).unwrap(),
+        descriptor_before
+    );
+
+    let wrong_run = run_inbox(&["--run", "another-run"]);
+    assert!(!wrong_run.status.success());
+    let wrong_run_snapshot = std::fs::read(&snapshot_path).unwrap();
+    rex_projects::agent_api::publish_wake_snapshot(
+        &control_dir,
+        inbox_fixture_snapshot("another-run"),
+    )
+    .unwrap();
+    let wrong_snapshot_run = run_inbox(&[]);
+    assert!(!wrong_snapshot_run.status.success());
+    let mismatched_snapshot = std::fs::read(&snapshot_path).unwrap();
+    assert_ne!(mismatched_snapshot, wrong_run_snapshot);
+
+    rex_projects::agent_api::publish_wake_snapshot(&control_dir, inbox_fixture_snapshot(run_id))
+        .unwrap();
+    let mut invalid_digest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+    invalid_digest["digest"] = serde_json::Value::String("d".repeat(64));
+    std::fs::write(&snapshot_path, serde_json::to_vec(&invalid_digest).unwrap()).unwrap();
+    let bad_digest = run_inbox(&[]);
+    assert!(!bad_digest.status.success());
+    let invalid_digest_bytes = std::fs::read(&snapshot_path).unwrap();
+    assert!(!invalid_digest_bytes.is_empty());
+
+    let oversized_snapshot = vec![b'x'; 1024 * 1024 + 1];
+    std::fs::write(&snapshot_path, &oversized_snapshot).unwrap();
+    let oversized = run_inbox(&[]);
+    assert!(!oversized.status.success());
+    assert_eq!(std::fs::read(&snapshot_path).unwrap(), oversized_snapshot);
+
+    std::fs::write(control_dir.join("descriptor.json"), b"{").unwrap();
+    let malformed_descriptor = run_inbox(&[]);
+    assert!(!malformed_descriptor.status.success());
+    assert_eq!(
+        std::fs::read(control_dir.join("descriptor.json")).unwrap(),
+        b"{"
+    );
+    std::fs::write(control_dir.join("descriptor.json"), &descriptor_before).unwrap();
+
+    let mut oversized_descriptor: serde_json::Value =
+        serde_json::from_slice(&descriptor_before).unwrap();
+    oversized_descriptor["max_request_bytes"] = serde_json::json!(1024 * 1024 + 1);
+    std::fs::write(
+        control_dir.join("descriptor.json"),
+        serde_json::to_vec(&oversized_descriptor).unwrap(),
+    )
+    .unwrap();
+    let bad_limits = run_inbox(&[]);
+    assert!(!bad_limits.status.success());
+    std::fs::write(control_dir.join("descriptor.json"), &descriptor_before).unwrap();
+
+    #[cfg(unix)]
+    {
+        let inbox_dir = control_dir.join("inbox");
+        let moved_inbox = temp.path().join("original-inbox");
+        std::fs::rename(&inbox_dir, &moved_inbox).unwrap();
+        std::os::unix::fs::symlink(&moved_inbox, &inbox_dir).unwrap();
+        let unsafe_path = run_inbox(&[]);
+        assert!(!unsafe_path.status.success());
+        std::fs::remove_file(&inbox_dir).unwrap();
+        std::fs::rename(&moved_inbox, &inbox_dir).unwrap();
+    }
+
+    assert_eq!(
+        std::fs::read(control_dir.join("descriptor.json")).unwrap(),
+        descriptor_before
+    );
+    assert!(
+        !state_root.exists(),
+        "inbox read must not create a state database"
+    );
+}
+
 #[test]
 #[ignore = "subprocess fixture invoked by the bounded stderr test"]
 fn stderr_exit_fixture() {
