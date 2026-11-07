@@ -223,13 +223,20 @@ pub fn human_present_envelope(
     project_id: ProjectId,
     params: HumanPresentParams,
 ) -> RequestEnvelope<HumanPresentParams> {
-    RequestEnvelope::host(
-        protocol_request_id,
-        None,
-        MethodName::new("human.present").expect("static method is valid"),
-        Some(project_id),
+    RequestEnvelope {
+        schema_version: SCHEMA_VERSION,
+        request_id: protocol_request_id,
+        operation_id: None,
+        method: MethodName::new("human.present").expect("static method is valid"),
+        project_id: Some(project_id),
+        run_id: None,
+        attempt: None,
+        run_epoch: None,
+        expected_subject_revision: None,
+        role: None,
+        request_type: None,
         params,
-    )
+    }
 }
 
 /// Validate a configured presenter's response. It can only acknowledge presentation; it cannot
