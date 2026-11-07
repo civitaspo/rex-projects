@@ -431,6 +431,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 )
                 .map_err(|error| error.to_string())?;
             if result.ticket_namespace != active_run.namespace.as_str()
+                || result.ticket.id != active_run.ticket_id.as_str()
                 || result
                     .ticket
                     .revision

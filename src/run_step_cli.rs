@@ -191,6 +191,140 @@ pub fn finalize_and_ack_start(
     Ok(authority)
 }
 
+/// Recover an uncertain StartAgent effect after the wrapper consumed its one-use environment
+/// handoff. This path only accepts an already persisted host acknowledgement, and revalidates
+/// the immutable authority and the live Rex block before allowing the dispatcher to finish it.
+pub fn reconcile_accepted_start(
+    store: &ConfigStore,
+    owner_generation: u64,
+    reservation: &AgentLaunchReservation,
+    rex: &RexCliTransport,
+) -> Result<Option<AgentLaunchAuthority>, String> {
+    reservation.validate()?;
+    if reservation.controller_generation != owner_generation {
+        return Err("launch reservation belongs to another controller generation".into());
+    }
+    let Some(authority) = store.agent_launch_authority(&reservation.agent_run_id)? else {
+        return Ok(None);
+    };
+    if authority.controller_generation != owner_generation
+        || authority.agent_run_id != reservation.agent_run_id
+        || authority.project_id != reservation.project_id
+        || authority.role != reservation.role
+        || authority.role_session_id != reservation.role_session_id
+        || authority.parent_run_id != reservation.parent_run_id
+        || authority.parent_role != reservation.parent_role
+        || authority.ticket_run_id != reservation.ticket_run_id
+        || authority.ticket_revision != reservation.ticket_revision
+        || authority.config_revision != reservation.config_revision
+        || authority.config_digest != reservation.config_digest
+        || authority.attempt != reservation.attempt
+        || authority.run_epoch != reservation.run_epoch
+        || authority.operation_id != reservation.operation_id
+        || authority.operation_recipe_id != reservation.operation_recipe_id
+        || authority.rex_view_id != reservation.rex_view_id
+        || authority.runtime_binary_digest != reservation.runtime_binary_digest
+        || authority.descriptor_path != reservation.descriptor_path
+        || authority.environment_snapshot_id != reservation.environment_snapshot_id
+        || authority.profile_id != reservation.profile_id
+        || authority.profile_digest != reservation.profile_digest
+        || authority.instruction_digest != reservation.instruction_digest
+        || authority.result_schema_digest != reservation.result_schema_digest
+        || authority.wake_snapshot_digest != reservation.wake_snapshot.digest
+        || authority.qualification_receipt_digest != reservation.qualification_receipt_digest
+        || authority.workspace_path != reservation.workspace_path
+        || authority.control_dir != reservation.control_dir
+        || authority.mailbox_capability_digest != reservation.mailbox_capability_digest
+    {
+        return Err("persisted launch authority does not match the immutable reservation".into());
+    }
+
+    let spool = RunStepSpool::open(&reservation.control_dir)?;
+    let start = spool.read_start_request()?;
+    let request = &start.request;
+    if request.operation_id != authority.operation_id
+        || request.agent_run_id != authority.agent_run_id
+        || request.project_id != authority.project_id
+        || request.controller_generation != owner_generation
+        || request.descriptor_digest != authority.descriptor_digest
+        || request.runtime_binary_digest != authority.runtime_binary_digest
+        || request.environment_snapshot_id != authority.environment_snapshot_id
+        || request.qualification_receipt_digest != authority.qualification_receipt_digest
+        || request.rex_session_id != authority.rex_session_id
+        || request.rex_block_id != authority.rex_block_id
+    {
+        return Err("persisted start request does not match launch authority".into());
+    }
+    let Some(receipt) = store.persisted_start_receipt(request)? else {
+        return Ok(None);
+    };
+    if receipt.decision != LaunchDecision::Accepted {
+        return Err("persisted StartAgent receipt is not accepted".into());
+    }
+    let block = rex
+        .validate_context_block(&authority.rex_block_id)
+        .map_err(|error| format!("revalidate accepted Rex block: {error}"))?;
+    if block.session_id != authority.rex_session_id
+        || block.window_id != authority.rex_window_id
+        || block.server_instance_id != authority.rex_server_identity
+    {
+        return Err("accepted launch Rex block no longer matches its persisted authority".into());
+    }
+    let window = TicketWindow {
+        server_instance_id: authority.rex_server_identity.clone(),
+        session_id: authority.rex_session_id.clone(),
+        window_id: authority.rex_window_id.clone(),
+        label: String::new(),
+        initial_block_id: None,
+        disposition: CreateDisposition::Existing,
+    };
+    let process = rex
+        .observe_process(
+            &window,
+            authority.agent_run_id.as_str(),
+            &authority.rex_block_id,
+        )
+        .map_err(|error| format!("revalidate accepted Rex process: {error}"))?;
+    let rex_reports_wrapper = process
+        .child
+        .iter()
+        .chain(process.foreground.iter())
+        .chain(process.ancestors.iter().flatten())
+        .any(|process| {
+            process.pid == request.wrapper_pid
+                && process.path.as_deref().is_some_and(|path| {
+                    std::fs::canonicalize(path).ok() == std::env::current_exe().ok()
+                })
+        });
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    if digest_file(&executable)? != authority.runtime_binary_digest {
+        return Err("running rex-projects binary differs from launch authority".into());
+    }
+    let expected_command = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let live_process_matches = inspect_process_table()
+        .map_err(|error| format!("reobserve accepted wrapper process: {error}"))?
+        .into_iter()
+        .find(|process| process.pid == request.wrapper_pid)
+        .is_some_and(|process| {
+            process.quality == ProcessIdentityQuality::KernelBirthToken
+                && process.start_identity == request.wrapper_start_identity
+                && process.command == expected_command
+        });
+    if !rex_reports_wrapper || !live_process_matches {
+        // The wrapper may have completed between the original ACK and effect commit. In that
+        // case a validated terminal turn envelope is the durable evidence that makes replay safe.
+        spool.read_turn_result(&start).map_err(|_| {
+            "accepted wrapper is no longer observable and has no validated terminal result"
+                .to_owned()
+        })?;
+    }
+    spool.publish_start_receipt(&start, receipt)?;
+    Ok(Some(authority))
+}
+
 /// Stable identity digest helper shared by the CLI and runtime acceptance tests.
 pub fn digest_bytes(bytes: &[u8]) -> Result<Digest, String> {
     Digest::parse(format!("{:x}", Sha256::digest(bytes)))

@@ -80,7 +80,7 @@ impl EffectHandler for StartAgentEffectHandler {
 
     fn handle(
         &self,
-        _mode: EffectMode,
+        mode: EffectMode,
         request: &EffectRequest,
         context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String> {
@@ -104,6 +104,28 @@ impl EffectHandler for StartAgentEffectHandler {
             || self.role.is_some_and(|role| role != reservation.role)
         {
             return Err("StartAgent effect does not match the reserved role and operation".into());
+        }
+
+        if mode == EffectMode::Reconcile
+            && let Some(authority) = crate::run_step_cli::reconcile_accepted_start(
+                context.store,
+                context.owner_generation,
+                &reservation,
+                self.materializer.rex_transport(),
+            )?
+        {
+            let authority_digest = authority.digest()?;
+            return Ok(EffectObservation::Applied {
+                receipt: serde_json::json!({
+                    "schema_version": 1,
+                    "state": "launch_accepted",
+                    "agent_run_id": authority.agent_run_id,
+                    "operation_id": authority.operation_id,
+                    "authority_digest": authority_digest,
+                    "descriptor_digest": authority.descriptor_digest,
+                })
+                .to_string(),
+            });
         }
 
         let environment_handoff = self.materializer.environment_handoff_path(
