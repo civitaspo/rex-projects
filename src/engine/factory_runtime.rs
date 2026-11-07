@@ -709,34 +709,25 @@ fn apply_agent_result(
         proposal.plan.clone(),
         &observed_bases,
     )?;
-    let mut work_nodes = Vec::new();
-    for node in validated
-        .nodes_in_execution_order
-        .iter()
-        .filter(|node| node.role == Role::Worker)
-    {
-        // A dependent node must be prepared from its predecessor's validated
-        // accepted head. Until that head exists, preparing it from the trunk
-        // would violate the plan's declared Git base, so fail closed here.
-        let WorkBaseSource::ControllerObservedCommit { commit } = &node.base else {
-            return Err(format!(
-                "work node {} depends on a predecessor head that is not available before implementation",
-                node.id
-            ));
-        };
-        if !config.repositories.contains_key(&node.repository) {
-            return Err("validated work node repository is no longer configured".into());
-        }
-        work_nodes.push(crate::delivery_runtime::PreparedWorktreeNodeRequest {
-            work_node_id: node.id.clone(),
-            repository_id: node.repository.clone(),
-            expected_base_sha: commit.clone(),
-            commit_mode: services.profile_commit_mode(&binding.project_id, Role::Worker)?,
-        });
-    }
-    if work_nodes.is_empty() {
+    let Some(node) = validated.nodes_in_execution_order.iter().find(|node| {
+        node.role == Role::Worker
+            && node.depends_on.is_empty()
+            && matches!(node.base, WorkBaseSource::ControllerObservedCommit { .. })
+    }) else {
         return Err("Coordinator plan contains no implementation Worker nodes".into());
+    };
+    if !config.repositories.contains_key(&node.repository) {
+        return Err("validated work node repository is no longer configured".into());
     }
+    let WorkBaseSource::ControllerObservedCommit { commit } = &node.base else {
+        unreachable!("the initial Worker must have a controller-observed base")
+    };
+    let work_nodes = vec![crate::delivery_runtime::PreparedWorktreeNodeRequest {
+        work_node_id: node.id.clone(),
+        repository_id: node.repository.clone(),
+        expected_base_sha: commit.clone(),
+        commit_mode: services.profile_commit_mode(&binding.project_id, Role::Worker)?,
+    }];
     let accepted_revision = source_revision
         .0
         .checked_add(1)
@@ -2391,9 +2382,6 @@ pub fn transition_for_role(
     use ValidatedWorkflowEvent as Event;
     match (role, phase, event) {
         (Role::Coordinator, Phase::Planning, Event::PlanAccepted) => Ok(Input::PlanAccepted),
-        (Role::Coordinator, Phase::Preparing, Event::WorktreesPrepared) => {
-            Ok(Input::WorktreesPrepared)
-        }
         (Role::Worker, Phase::Implementing, Event::ImplementationAccepted) => {
             Ok(Input::EvidenceSubmitted)
         }
@@ -2442,7 +2430,6 @@ pub fn transition_for_observation(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidatedWorkflowEvent {
     PlanAccepted,
-    WorktreesPrepared,
     ImplementationAccepted,
     CorrectionsRequired,
     ReviewConverged,

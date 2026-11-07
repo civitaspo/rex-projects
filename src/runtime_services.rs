@@ -1575,20 +1575,24 @@ impl FactoryRuntimeServices for RuntimeServices {
             run.ticket_run_id.as_str(),
             256,
         )?;
-        let prepared_receipt = succeeded
+        let mut prepared = None;
+        for prepared_receipt in succeeded
             .iter()
-            .find(|receipt| receipt.intent().kind == "prepare_worktrees")
-            .ok_or("Worker has no succeeded PrepareWorktrees receipt")?;
-        let prepared = store
-            .prepared_worker_launch(
+            .filter(|receipt| receipt.intent().kind == "prepare_worktrees")
+        {
+            if let Some(launch) = store.prepared_worker_launch(
                 owner_generation,
                 plan.accepted_revision,
                 &node_id,
                 prepared_receipt,
                 project_config,
                 &self.configuration_digest,
-            )?
-            .ok_or("Worker launch authority is no longer valid")?;
+            )? {
+                prepared = Some(launch);
+                break;
+            }
+        }
+        let prepared = prepared.ok_or("Worker launch authority is no longer valid")?;
         if prepared.project_id() != &run.project_id
             || prepared.ticket_run_id() != ticket_run_id
             || prepared.ticket_revision() != run.revision

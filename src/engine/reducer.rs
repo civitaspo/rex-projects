@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::delivery_runtime::ValidatedImplementationPublication;
+use crate::delivery_runtime::{
+    ValidatedImplementationPublication, ValidatedPreparedWorktrees, ValidatedWorkNodePublication,
+};
 use crate::domain::ids::{OperationId, ProjectId, Revision, TicketRunId};
 use crate::domain::types::{Role, TicketStatus};
 
@@ -49,8 +51,9 @@ pub struct TicketRun {
 pub enum Input {
     Dispatch,
     PlanAccepted,
-    WorktreesPrepared,
+    WorktreesPrepared(ValidatedPreparedWorktrees),
     EvidenceSubmitted,
+    WorkNodePublished(ValidatedWorkNodePublication),
     ImplementationPublished(ValidatedImplementationPublication),
     CorrectionsRemain,
     ReviewConverged,
@@ -147,7 +150,9 @@ pub fn reduce(
             next.activity = Activity::Running;
             effects.push(EffectKind::PrepareWorktrees);
         }
-        Input::WorktreesPrepared if current.phase == Phase::Preparing => {
+        Input::WorktreesPrepared(proof)
+            if current.phase == Phase::Preparing && proof.matches(current) =>
+        {
             next.phase = Phase::Implementing;
             next.activity = Activity::Running;
             wakes.push(WakeTarget::TicketRole(Role::Worker));
@@ -156,6 +161,13 @@ pub fn reduce(
             next.phase = Phase::Publishing;
             next.activity = Activity::Running;
             effects.push(EffectKind::PublishImplementation);
+        }
+        Input::WorkNodePublished(proof)
+            if current.phase == Phase::Publishing && proof.matches(current) =>
+        {
+            next.phase = Phase::Preparing;
+            next.activity = Activity::Running;
+            effects.push(EffectKind::PrepareWorktrees);
         }
         Input::ImplementationPublished(receipt)
             if current.phase == Phase::Publishing && receipt.matches(current) =>
@@ -389,7 +401,11 @@ mod tests {
     fn role_work_is_always_durably_routed_as_a_wake() {
         let cases = [
             (Phase::Queued, Input::Dispatch, Role::Coordinator),
-            (Phase::Preparing, Input::WorktreesPrepared, Role::Worker),
+            (
+                Phase::Implementing,
+                Input::EvidenceSubmitted,
+                Role::Reviewer,
+            ),
             (Phase::Reviewing, Input::CorrectionsRemain, Role::Worker),
             (
                 Phase::Reviewing,

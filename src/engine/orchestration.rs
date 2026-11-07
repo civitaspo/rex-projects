@@ -2338,9 +2338,6 @@ pub fn authorize_role_request(
     let authorized = match (role, request.clone()) {
         (Role::Coordinator, R::CoordinatorPlanAccepted) => A::Transition(Input::PlanAccepted),
         (Role::Coordinator, R::CoordinatorAskPlanner) => A::SpawnRole(Role::Planner),
-        (Role::Coordinator, R::CoordinatorPrepareWorktrees) => {
-            A::Transition(Input::WorktreesPrepared)
-        }
         (Role::Coordinator, R::CoordinatorStartWorker) => A::SpawnRole(Role::Worker),
         (Role::Coordinator, R::CoordinatorStartReviewer) => A::SpawnRole(Role::Reviewer),
         (Role::Coordinator, R::CoordinatorStartMergeDecision) => A::SpawnRole(Role::MergeDecision),

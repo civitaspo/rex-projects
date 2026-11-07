@@ -1294,6 +1294,41 @@ pub struct PreparedWorktreeReceiptNode {
     pub commit_mode: CommitMode,
 }
 
+/// Validate that a persisted worktree receipt covers exactly its request.
+pub fn validate_prepared_receipt(
+    request: &PrepareWorktreesEffectPayload,
+    receipt: &PreparedWorktreesEffectReceipt,
+) -> Result<(), String> {
+    if receipt.schema_version != 1 || receipt.ticket_run_id != request.ticket_run_id {
+        return Err("prepared worktree receipt has a mismatched schema or TicketRun".into());
+    }
+    if request.work_nodes.is_empty() || request.work_nodes.len() > 64 {
+        return Err("prepare worktree request node count is outside limits".into());
+    }
+    if receipt.work_nodes.len() != request.work_nodes.len() {
+        return Err("prepared worktree receipt does not cover the requested nodes".into());
+    }
+    let mut expected = request.work_nodes.iter().collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
+    let mut actual = receipt.work_nodes.iter().collect::<Vec<_>>();
+    actual.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
+    let mut previous: Option<&str> = None;
+    for (wanted, got) in expected.iter().zip(actual) {
+        if previous == Some(wanted.work_node_id.as_str())
+            || wanted.work_node_id != got.work_node_id
+            || wanted.repository_id != got.repository_id
+            || wanted.expected_base_sha != got.base_sha
+            || wanted.commit_mode != got.commit_mode
+            || !got.worktree_path.is_absolute()
+            || got.branch.trim().is_empty()
+        {
+            return Err("prepared worktree node does not match its effect request".into());
+        }
+        previous = Some(wanted.work_node_id.as_str());
+    }
+    Ok(())
+}
+
 /// Settings and adapters shared by the two repository-delivery effect handlers.
 pub struct RepositoryDeliveryEffects {
     delivery: RepositoryDelivery,
@@ -2136,6 +2171,101 @@ pub struct ValidatedImplementationPublication {
     publication_set_digest: String,
 }
 
+/// Opaque proof for one stage of an accepted implementation plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedWorkNodePublication {
+    project_id: ProjectId,
+    ticket_run_id: TicketRunId,
+    source_revision: u64,
+    configuration_digest: Digest,
+    work_node_id: WorkNodeId,
+    head: String,
+    receipt_digest: String,
+}
+
+/// Opaque proof that a persisted preparation receipt covers these exact nodes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedPreparedWorktrees {
+    project_id: ProjectId,
+    ticket_run_id: TicketRunId,
+    source_revision: u64,
+    configuration_digest: Digest,
+    work_node_ids: Vec<WorkNodeId>,
+    receipt_digest: String,
+}
+
+impl ValidatedPreparedWorktrees {
+    pub(crate) fn matches(&self, run: &crate::engine::reducer::TicketRun) -> bool {
+        self.project_id == run.project_id
+            && self.ticket_run_id == run.ticket_run_id
+            && self.source_revision == run.revision.0
+            && !self.work_node_ids.is_empty()
+            && !self.receipt_digest.is_empty()
+    }
+
+    pub(crate) fn work_node_ids(&self) -> &[WorkNodeId] {
+        &self.work_node_ids
+    }
+
+    pub(crate) fn configuration_digest(&self) -> &Digest {
+        &self.configuration_digest
+    }
+}
+
+pub fn validate_prepared_worktree_stage(
+    stored: &crate::store::SucceededEffectReceipt,
+) -> Result<(ValidatedPreparedWorktrees, PreparedWorktreesEffectReceipt), String> {
+    let request = effect_request_from_persisted(stored);
+    validate_effect_kind(&request, EffectKind::PrepareWorktrees)?;
+    let payload: PrepareWorktreesEffectPayload = decode_effect_payload(&request)?;
+    validate_source_revision(&request, payload.source_revision)?;
+    if request.intent.subject_type != "ticket_run"
+        || request.intent.subject_id != payload.ticket_run_id.as_str()
+    {
+        return Err("prepared receipt does not match its TicketRun subject".into());
+    }
+    let receipt: PreparedWorktreesEffectReceipt =
+        serde_json::from_str(stored.receipt_json()).map_err(|error| error.to_string())?;
+    validate_prepared_receipt(&payload, &receipt)?;
+    Ok((
+        ValidatedPreparedWorktrees {
+            project_id: request.intent.project_id,
+            ticket_run_id: payload.ticket_run_id,
+            source_revision: payload.source_revision,
+            configuration_digest: payload.configuration_digest,
+            work_node_ids: payload
+                .work_nodes
+                .into_iter()
+                .map(|node| node.work_node_id)
+                .collect(),
+            receipt_digest: sha256_hex(stored.receipt_json().as_bytes()),
+        },
+        receipt,
+    ))
+}
+
+impl ValidatedWorkNodePublication {
+    pub(crate) fn matches(&self, run: &crate::engine::reducer::TicketRun) -> bool {
+        self.project_id == run.project_id
+            && self.ticket_run_id == run.ticket_run_id
+            && self.source_revision == run.revision.0
+            && !self.head.is_empty()
+            && !self.receipt_digest.is_empty()
+    }
+
+    pub fn work_node_id(&self) -> &WorkNodeId {
+        &self.work_node_id
+    }
+
+    pub fn head(&self) -> &str {
+        &self.head
+    }
+
+    pub(crate) fn configuration_digest(&self) -> &Digest {
+        &self.configuration_digest
+    }
+}
+
 impl ValidatedImplementationPublication {
     pub(crate) fn matches(&self, run: &crate::engine::reducer::TicketRun) -> bool {
         self.project_id == run.project_id
@@ -2232,7 +2362,8 @@ pub fn validate_implementation_publication_receipt(
             "prepared worktree receipt is unsupported or has no ticket-run identity".into(),
         );
     }
-    let mut run_identity: Option<(TicketRunId, u64, Digest)> = None;
+    let mut run_identity: Option<(TicketRunId, Digest)> = None;
+    let mut source_revision = 0;
     for prepared_node in prepared
         .iter()
         .filter(|node| implementation_nodes.contains_key(&node.work_node_id))
@@ -2247,7 +2378,6 @@ pub fn validate_implementation_publication_receipt(
         }
         let identity = (
             payload.ticket_run_id.clone(),
-            payload.source_revision,
             payload.configuration_digest.clone(),
         );
         if run_identity
@@ -2259,6 +2389,7 @@ pub fn validate_implementation_publication_receipt(
             );
         }
         run_identity = Some(identity);
+        source_revision = source_revision.max(payload.source_revision);
         let repository_config = repositories
             .get(&prepared_node.repository_id)
             .ok_or_else(|| "repository config is missing for a planned work node".to_owned())?;
@@ -2270,7 +2401,7 @@ pub fn validate_implementation_publication_receipt(
             stored.receipt_json(),
         )?;
     }
-    let (ticket_run_id, source_revision, _) =
+    let (ticket_run_id, _) =
         run_identity.ok_or_else(|| "publication receipt set is empty".to_owned())?;
     let receipt_bindings = expected_ids
         .iter()
@@ -2292,6 +2423,52 @@ pub fn validate_implementation_publication_receipt(
         work_node_ids: expected_ids,
         receipt_bindings,
         publication_set_digest,
+    })
+}
+
+/// Validate one stage receipt before it can advance the work graph.
+pub fn validate_work_node_publication_receipt(
+    work_plan: &WorkPlan,
+    prepared_worktree: &PreparedWorktreeReceiptNode,
+    project_id: &ProjectId,
+    repositories: &BTreeMap<RepositoryId, RepositoryConfig>,
+    publication: &crate::store::SucceededEffectReceipt,
+    expected_revision: u64,
+) -> Result<ValidatedWorkNodePublication, String> {
+    let request = effect_request_from_persisted(publication);
+    let payload: PublishImplementationEffectPayload = decode_effect_payload(&request)?;
+    let node = work_plan
+        .nodes
+        .iter()
+        .find(|node| node.id == payload.work_node_id)
+        .ok_or("publication receipt names a node outside the accepted plan")?;
+    if node.investigation
+        || node.repository != payload.repository_id
+        || request.intent.expected_revision != Some(expected_revision)
+        || payload.source_revision != expected_revision
+        || prepared_worktree.work_node_id != payload.work_node_id
+        || prepared_worktree.repository_id != payload.repository_id
+    {
+        return Err("publication receipt does not match the current planned stage".into());
+    }
+    let repository = repositories
+        .get(&node.repository)
+        .ok_or("repository config is missing for a planned work node")?;
+    let receipt = validate_one_implementation_publication_receipt(
+        &request,
+        prepared_worktree,
+        project_id,
+        repository,
+        publication.receipt_json(),
+    )?;
+    Ok(ValidatedWorkNodePublication {
+        project_id: project_id.clone(),
+        ticket_run_id: payload.ticket_run_id,
+        source_revision: expected_revision,
+        configuration_digest: payload.configuration_digest,
+        work_node_id: payload.work_node_id,
+        head: receipt.commit.head().to_owned(),
+        receipt_digest: sha256_hex(publication.receipt_json().as_bytes()),
     })
 }
 

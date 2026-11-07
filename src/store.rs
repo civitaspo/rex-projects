@@ -2520,16 +2520,23 @@ impl ConfigStore {
             });
         }
 
-        let stored: Option<(String, String, String, String, u64, Option<u64>)> = tx
+        let stored: Option<(String, String, String, String, String, u64, Option<u64>)> = tx
             .query_row(
-                "SELECT project_id, internal_phase, activity, external_status, revision, required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
+                "SELECT project_id, config_digest, internal_phase, activity, external_status, revision, required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
                 [ticket_run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((project_raw, phase_raw, activity_raw, status_raw, revision, review_revision)) =
-            stored
+        let Some((
+            project_raw,
+            config_digest,
+            phase_raw,
+            activity_raw,
+            status_raw,
+            revision,
+            review_revision,
+        )) = stored
         else {
             return Err("ticket run not found".into());
         };
@@ -2623,9 +2630,28 @@ impl ConfigStore {
         }
         let worker_wake = matches!(
             &transition,
-            Input::WorktreesPrepared | Input::CorrectionsRemain
+            Input::WorktreesPrepared(_) | Input::CorrectionsRemain
         );
-        let initial_worktree_wake = matches!(&transition, Input::WorktreesPrepared);
+        let prepared_node_ids = match &transition {
+            Input::WorktreesPrepared(proof) => {
+                if proof.configuration_digest().as_str() != config_digest {
+                    return Err("prepared worktree proof belongs to a stale configuration".into());
+                }
+                Some(
+                    proof
+                        .work_node_ids()
+                        .iter()
+                        .map(|node| node.as_str().to_owned())
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+            }
+            _ => None,
+        };
+        if let Input::WorkNodePublished(proof) = &transition
+            && proof.configuration_digest().as_str() != config_digest
+        {
+            return Err("published work node proof belongs to a stale configuration".into());
+        }
         let is_plan_accepted = matches!(&transition, Input::PlanAccepted);
         if is_plan_accepted != accepted_plan.is_some() {
             return Err("PlanAccepted requires an atomic validated plan payload".into());
@@ -2808,11 +2834,26 @@ impl ConfigStore {
             if persisted.schema_version != 1 {
                 return Err("accepted work plan is bound to another TicketRun".into());
             }
+            if let Some(ids) = &prepared_node_ids
+                && ids.iter().any(|id| {
+                    !persisted
+                        .proposal
+                        .nodes
+                        .iter()
+                        .any(|node| !node.investigation && node.id.as_str() == id)
+                })
+            {
+                return Err(
+                    "prepared worktree proof names a node outside the accepted plan".into(),
+                );
+            }
             persisted.proposal.nodes
                 .iter()
                 .filter(|node| {
                     !node.investigation
-                        && (!initial_worktree_wake || node.depends_on.is_empty())
+                        && prepared_node_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(node.id.as_str()))
                 })
                 .map(|node| {
                     let role_session_id = format!(
@@ -4516,7 +4557,7 @@ fn now_unix() -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     use super::{
@@ -5102,6 +5143,512 @@ mod tests {
             config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"]}},"projects":{}})).unwrap(),
             profiles: BTreeMap::new(), source_root: "/tmp/config".into(), source_files: vec![SourceFile { kind: SourceKind::File, path: "/tmp/config/config.toml".into(), canonical_path: "/tmp/config/config.toml".into(), sha256: Digest::parse("a".repeat(64)).unwrap(), bytes: 1, contents: "x".into() }], digest: Digest::parse(digest).unwrap(),
         }
+    }
+
+    fn insert_succeeded_test_effect(
+        store: &mut ConfigStore,
+        intent: &EffectIntent,
+        receipt: &impl serde::Serialize,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,status,attempt_count,next_attempt_at_unix,owner_generation,receipt_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'succeeded',1,0,1,?10,?11)",
+                rusqlite::params![
+                    intent.operation_id,
+                    intent.project_id.as_str(),
+                    intent.subject_type,
+                    intent.subject_id,
+                    intent.logical_key,
+                    intent.kind,
+                    intent.request_json,
+                    intent.request_digest,
+                    intent.expected_revision,
+                    serde_json::to_string(receipt).unwrap(),
+                    1_i64,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn staged_plan_effect(
+        project: &crate::domain::ids::ProjectId,
+        run: &TicketRunId,
+        operation_id: &str,
+        kind: &str,
+        revision: u64,
+        request: &impl serde::Serialize,
+    ) -> EffectIntent {
+        let (request_json, request_digest) =
+            crate::delivery_runtime::canonical_delivery_payload(request).unwrap();
+        EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: run.as_str().into(),
+            operation_id: operation_id.into(),
+            logical_key: format!("{run}:{operation_id}"),
+            kind: kind.into(),
+            request_json,
+            request_digest,
+            expected_revision: Some(revision),
+        }
+    }
+
+    #[test]
+    fn dependent_work_node_uses_published_predecessor_head_before_review() {
+        use crate::config::ProjectConfig;
+        use crate::delivery_forge::PublishedPullRequest;
+        use crate::delivery_runtime::{
+            HookGateReceipt, ImplementationPublicationReceipt, PrepareWorktreesEffectPayload,
+            PreparedWorktreeNodeRequest, PreparedWorktreeReceiptNode,
+            PreparedWorktreesEffectReceipt, PublishImplementationEffectPayload, PullRequestContent,
+            PushReceipt, VerifiedCommit, WorkerDeliveryCommit,
+        };
+        use crate::domain::ids::{OperationId, RepositoryId};
+        use crate::domain::types::CommitMode;
+        use crate::engine::orchestration::{
+            PlannedWorkNode, WorkDependency, WorkDependencyKind, WorkPlan,
+        };
+        use crate::engine::reducer::Phase;
+
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut applied = snapshot(&"a".repeat(64));
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let repository_id = RepositoryId::parse("repo-a").unwrap();
+        applied.config.repositories.insert(
+            repository_id.clone(),
+            serde_json::from_value(serde_json::json!({
+                "clone_url": "https://github.com/acme/repo-a.git",
+                "base_branch": "main",
+                "forge": "github"
+            }))
+            .unwrap(),
+        );
+        applied.config.projects.insert(
+            project_id.clone(),
+            serde_json::from_value::<ProjectConfig>(serde_json::json!({
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "repositories": ["repo-a"]
+            }))
+            .unwrap(),
+        );
+        let config_digest = applied.digest.clone();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied_record = store
+            .apply_snapshot("factory", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied_record.revision,
+                config_digest: config_digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let owner_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "staged-plan-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "staged-plan-test".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert_eq!(owner_generation, 1);
+        let ticket_namespace = TicketNamespace::parse("github:acme/repo-a").unwrap();
+        let ticket_id = TicketId::parse("PAY-12").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-staged-1").unwrap();
+        store
+            .create_ticket_run(
+                owner_generation,
+                &project_id,
+                &ticket_namespace,
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "publishing",
+                "in_progress",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,NULL,1,1)",
+                rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=4 WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            )
+            .unwrap();
+
+        let root_id = crate::engine::orchestration::WorkNodeId::parse("root").unwrap();
+        let stacked_id = crate::engine::orchestration::WorkNodeId::parse("stacked").unwrap();
+        let plan = WorkPlan {
+            nodes: vec![
+                PlannedWorkNode {
+                    id: root_id.clone(),
+                    repository: repository_id.clone(),
+                    task: "Implement the foundation".into(),
+                    depends_on: Vec::new(),
+                    required_evidence: vec!["foundation exists".into()],
+                    investigation: false,
+                },
+                PlannedWorkNode {
+                    id: stacked_id.clone(),
+                    repository: repository_id.clone(),
+                    task: "Build on the foundation".into(),
+                    depends_on: vec![WorkDependency {
+                        node: root_id.clone(),
+                        kind: WorkDependencyKind::GitBase,
+                        affected_evidence: BTreeSet::from(["foundation exists".into()]),
+                    }],
+                    required_evidence: vec!["dependent change exists".into()],
+                    investigation: false,
+                },
+            ],
+            requested_investigation_children: 0,
+        };
+        let observed_base = "b".repeat(40);
+        let persisted = crate::store::accepted_plans::PersistedWorkPlan {
+            schema_version: 1,
+            proposal: plan.clone(),
+            observed_base_shas: BTreeMap::from([(repository_id.clone(), observed_base.clone())]),
+        };
+        let plan_json = serde_json::to_string(&serde_json::to_value(&persisted).unwrap()).unwrap();
+        let plan_digest = content_digest(&plan_json);
+        store
+            .connection
+            .execute(
+                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,2,?3,?4,?5,'evidence-1','coordinator-run-1','message-1',?6,'coordinator-run-1',?7,?6,1)",
+                rusqlite::params![
+                    project_id.as_str(),
+                    ticket_run_id.as_str(),
+                    config_digest.as_str(),
+                    plan_digest,
+                    plan_json,
+                    "c".repeat(64),
+                    format!("ticket_run:{}:coordinator", ticket_run_id.as_str()),
+                ],
+            )
+            .unwrap();
+
+        let root_branch = "rex/run-staged-1/root";
+        let root_prepare = PrepareWorktreesEffectPayload {
+            schema_version: 1,
+            source_revision: 2,
+            configuration_digest: config_digest.clone(),
+            ticket_namespace: ticket_namespace.clone(),
+            ticket_id: ticket_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: vec![PreparedWorktreeNodeRequest {
+                work_node_id: root_id.clone(),
+                repository_id: repository_id.clone(),
+                expected_base_sha: observed_base.clone(),
+                commit_mode: CommitMode::Native,
+            }],
+        };
+        let root_prepared = PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: vec![PreparedWorktreeReceiptNode {
+                work_node_id: root_id.clone(),
+                repository_id: repository_id.clone(),
+                worktree_path: std::path::PathBuf::from("/tmp/run-staged-1/root"),
+                branch: root_branch.into(),
+                base_sha: observed_base.clone(),
+                commit_mode: CommitMode::Native,
+            }],
+        };
+        let root_prepare_intent = staged_plan_effect(
+            &project_id,
+            &ticket_run_id,
+            "prepare-root",
+            "prepare_worktrees",
+            2,
+            &root_prepare,
+        );
+        insert_succeeded_test_effect(&mut store, &root_prepare_intent, &root_prepared);
+
+        let publication = |node_id: &crate::engine::orchestration::WorkNodeId,
+                           base: &str,
+                           head: &str,
+                           branch: &str,
+                           revision: u64,
+                           operation_id: &str| {
+            let operation_id = OperationId::parse(operation_id).unwrap();
+            let pr_key = format!(
+                "{}\0{}\0{}\0{}",
+                operation_id.as_str(),
+                repository_id.as_str(),
+                node_id.as_str(),
+                "pull-request"
+            );
+            let pr_operation =
+                OperationId::parse(format!("rp-{}", content_digest(&pr_key))).unwrap();
+            let marked_body = format!(
+                "Details\n\n<!-- rex-projects-operation:{} -->",
+                pr_operation
+            );
+            let payload = PublishImplementationEffectPayload {
+                schema_version: 1,
+                source_revision: revision,
+                configuration_digest: config_digest.clone(),
+                ticket_namespace: ticket_namespace.clone(),
+                ticket_id: ticket_id.clone(),
+                ticket_run_id: ticket_run_id.clone(),
+                work_node_id: node_id.clone(),
+                repository_id: repository_id.clone(),
+                expected_base_sha: base.into(),
+                base_branch: "main".into(),
+                commit_mode: CommitMode::Native,
+                commit: WorkerDeliveryCommit::Native {
+                    previous_accepted_head: base.into(),
+                    worker_reported_head: head.into(),
+                    required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+                },
+                expected_remote_head: None,
+                pull_request: PullRequestContent {
+                    title: "Implement staged work".into(),
+                    body: "Details".into(),
+                    update_target: None,
+                },
+            };
+            let intent = staged_plan_effect(
+                &project_id,
+                &ticket_run_id,
+                operation_id.as_str(),
+                "publish_implementation",
+                revision,
+                &payload,
+            );
+            let receipt = ImplementationPublicationReceipt {
+                schema_version: 1,
+                effect_operation_id: operation_id.as_str().into(),
+                source_revision: revision,
+                configuration_digest: config_digest.clone(),
+                ticket_run_id: ticket_run_id.clone(),
+                repository_id: repository_id.clone(),
+                work_node_id: node_id.clone(),
+                commit: VerifiedCommit::Native {
+                    receipt: crate::worktrees::NativeCommitReceipt {
+                        head: head.into(),
+                        base_sha: base.into(),
+                        commits: vec![head.into()],
+                    },
+                },
+                hook_gate: HookGateReceipt {
+                    repository_id: repository_id.clone(),
+                    head: head.into(),
+                    configuration_digest: config_digest.clone(),
+                    hook_receipts: Vec::new(),
+                },
+                push: PushReceipt {
+                    repository_id: repository_id.clone(),
+                    branch: branch.into(),
+                    expected_remote_head: None,
+                    observed_remote_head: head.into(),
+                    pushed_head: head.into(),
+                    force_with_lease: false,
+                },
+                pull_request: PublishedPullRequest {
+                    repository_id: repository_id.clone(),
+                    number: revision,
+                    node_id: format!("PR_{operation_id}"),
+                    url: format!("https://github.com/acme/repo-a/pull/{revision}"),
+                    state: "open".into(),
+                    source_branch: branch.into(),
+                    source_head: head.into(),
+                    base_branch: "main".into(),
+                    title: "Implement staged work".into(),
+                    body_digest: content_digest(&marked_body),
+                    operation_id: pr_operation,
+                },
+            };
+            (intent, receipt)
+        };
+
+        let first_head = "d".repeat(40);
+        let (first_publish_intent, first_publish_receipt) = publication(
+            &root_id,
+            &observed_base,
+            &first_head,
+            root_branch,
+            4,
+            "publish-root",
+        );
+        insert_succeeded_test_effect(&mut store, &first_publish_intent, &first_publish_receipt);
+        let config = applied.config.clone();
+
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                10,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        let pending = store
+            .connection
+            .query_row(
+                "SELECT request_json,expected_revision FROM effects WHERE kind='prepare_worktrees' AND operation_id<>'prepare-root'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .unwrap();
+        let staged_request: PrepareWorktreesEffectPayload =
+            serde_json::from_str(&pending.0).unwrap();
+        assert_eq!(pending.1, 5);
+        assert_eq!(staged_request.work_nodes[0].work_node_id, stacked_id);
+        assert_eq!(staged_request.work_nodes[0].expected_base_sha, first_head);
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Preparing
+        );
+
+        let staged_branch = "rex/run-staged-1/stacked";
+        let staged_prepared = PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: vec![PreparedWorktreeReceiptNode {
+                work_node_id: stacked_id.clone(),
+                repository_id: repository_id.clone(),
+                worktree_path: std::path::PathBuf::from("/tmp/run-staged-1/stacked"),
+                branch: staged_branch.into(),
+                base_sha: first_head.clone(),
+                commit_mode: CommitMode::Native,
+            }],
+        };
+        let staged_intent = EffectIntent {
+            request_json: pending.0.clone(),
+            request_digest: content_digest(&pending.0),
+            operation_id: store
+                .connection
+                .query_row(
+                    "SELECT operation_id FROM effects WHERE kind='prepare_worktrees' AND operation_id<>'prepare-root'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.as_str().into(),
+            logical_key: "staged-prepare".into(),
+            kind: "prepare_worktrees".into(),
+            expected_revision: Some(5),
+        };
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET status='succeeded',attempt_count=1,receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![
+                    staged_intent.operation_id,
+                    serde_json::to_string(&staged_prepared).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                11,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Implementing
+        );
+
+        let second_head = "e".repeat(40);
+        let (second_publish_intent, second_publish_receipt) = publication(
+            &stacked_id,
+            &first_head,
+            &second_head,
+            staged_branch,
+            7,
+            "publish-stacked",
+        );
+        insert_succeeded_test_effect(&mut store, &second_publish_intent, &second_publish_receipt);
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET internal_phase='publishing',revision=7 WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM effects WHERE operation_id='publish-root'", [])
+            .unwrap();
+        assert!(
+            !crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                12,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Publishing
+        );
+        insert_succeeded_test_effect(&mut store, &first_publish_intent, &first_publish_receipt);
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                13,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Reviewing
+        );
+        assert!(
+            !crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                14,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM effects WHERE kind='prepare_worktrees'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

@@ -628,7 +628,7 @@ impl ConfigStore {
         let intent = succeeded.intent();
         if intent.kind != "prepare_worktrees"
             || intent.subject_type != "ticket_run"
-            || intent.expected_revision != Some(accepted_revision)
+            || intent.expected_revision.is_none()
         {
             return Ok(None);
         }
@@ -647,6 +647,12 @@ impl ConfigStore {
             return Ok(None);
         };
         if current_project != project_id.as_str() || current_phase != "implementing" {
+            return Ok(None);
+        }
+        if intent
+            .expected_revision
+            .is_none_or(|revision| revision > current_revision)
+        {
             return Ok(None);
         }
         let Some(plan) = self.accepted_work_plan(project_id, &ticket_run_id, accepted_revision)?
@@ -692,7 +698,7 @@ impl ConfigStore {
         let payload: PrepareWorktreesEffectPayload = parse_canonical(&intent.request_json)?;
         if digest_json(&intent.request_json).as_str() != intent.request_digest
             || payload.ticket_run_id != ticket_run_id
-            || payload.source_revision != accepted_revision
+            || Some(payload.source_revision) != intent.expected_revision
             || payload.configuration_digest != plan.configuration_digest
         {
             return Err("PrepareWorktrees effect does not match accepted plan".into());

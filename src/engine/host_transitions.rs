@@ -2,7 +2,9 @@
 //! effect handlers. This module never consumes Agent assertions.
 
 use crate::config::Config;
-use crate::delivery_runtime::{PrepareWorktreesEffectPayload, PreparedWorktreesEffectReceipt};
+use crate::delivery_runtime::{
+    PrepareWorktreesEffectPayload, PreparedWorktreeReceiptNode, PreparedWorktreesEffectReceipt,
+};
 use crate::domain::ids::{Digest, OperationId, Revision};
 use crate::effects::EffectKind;
 use crate::engine::reducer::{Input, Phase};
@@ -45,9 +47,19 @@ pub fn consume_one_host_transition(
                 let payload: PrepareWorktreesEffectPayload =
                     decode_canonical(&intent.request_json, &intent.request_digest)?;
                 validate_prepare_binding(&payload, &run, run.revision)?;
-                let receipt: PreparedWorktreesEffectReceipt =
-                    decode_canonical_receipt(stored.receipt_json())?;
-                validate_prepared_receipt(&payload, &receipt)?;
+                let (proof, receipt) =
+                    crate::delivery_runtime::validate_prepared_worktree_stage(stored)?;
+                crate::delivery_runtime::validate_prepared_receipt(&payload, &receipt)?;
+                if !validate_prepared_stage_against_plan(
+                    store,
+                    config,
+                    configuration_digest,
+                    &run,
+                    &receipts,
+                    &payload,
+                )? {
+                    continue;
+                }
 
                 let payload_json = serde_json::json!({
                     "schema_version": 1,
@@ -57,6 +69,7 @@ pub fn consume_one_host_transition(
                     "ticket_run_id": run.ticket_run_id,
                     "source_revision": run.revision,
                     "receipt_digest": sha256_hex(stored.receipt_json().as_bytes()),
+                    "work_node_ids": receipt.work_nodes.iter().map(|node| node.work_node_id.as_str()).collect::<Vec<_>>(),
                 })
                 .to_string();
                 let durable = DurableInput {
@@ -71,7 +84,7 @@ pub fn consume_one_host_transition(
                     &run.ticket_run_id,
                     Revision(run.revision),
                     &durable,
-                    Input::WorktreesPrepared,
+                    Input::WorktreesPrepared(proof),
                     "host-validated worktree preparation receipt",
                     &payload_json,
                     &[],
@@ -81,108 +94,16 @@ pub fn consume_one_host_transition(
         }
 
         if run.phase == Phase::Publishing {
-            let Some(accepted) =
-                store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
-            else {
-                continue;
-            };
-            if accepted.configuration_digest != *configuration_digest {
-                return Err("accepted work plan belongs to a stale configuration snapshot".into());
-            }
-            let project = config
-                .projects
-                .get(&run.project_id)
-                .ok_or("publishing TicketRun Project is no longer configured")?;
-            let _validated = accepted.validate_for(project, configuration_digest)?;
-            let mut prepared_receipt = None;
-            let mut publication_receipts = Vec::new();
-            for stored in &receipts {
-                let intent = stored.intent();
-                if intent.project_id != run.project_id
-                    || intent.subject_type != "ticket_run"
-                    || intent.subject_id != run.ticket_run_id.as_str()
-                {
-                    continue;
-                }
-                if intent.kind == effect_name(EffectKind::PrepareWorktrees) {
-                    if intent.expected_revision != Some(accepted.accepted_revision) {
-                        continue;
-                    }
-                    let payload: PrepareWorktreesEffectPayload =
-                        decode_canonical(&intent.request_json, &intent.request_digest)?;
-                    if payload.ticket_run_id != run.ticket_run_id
-                        || payload.configuration_digest != accepted.configuration_digest
-                    {
-                        return Err("prepared worktree request does not match accepted plan".into());
-                    }
-                    let receipt: PreparedWorktreesEffectReceipt =
-                        decode_canonical_receipt(stored.receipt_json())?;
-                    validate_prepared_receipt(&payload, &receipt)?;
-                    prepared_receipt = Some(receipt);
-                } else if intent.kind == effect_name(EffectKind::PublishImplementation) {
-                    if intent.expected_revision == Some(run.revision) {
-                        publication_receipts.push(stored.clone());
-                    }
-                }
-            }
-            let Some(prepared_receipt) = prepared_receipt else {
-                continue;
-            };
-            let required_publications = accepted
-                .proposal
-                .nodes
-                .iter()
-                .filter(|node| !node.investigation)
-                .count();
-            if publication_receipts.len() < required_publications {
-                continue;
-            }
-            let proof = crate::delivery_runtime::validate_implementation_publication_receipt(
-                &accepted.proposal,
-                &prepared_receipt,
-                &run.project_id,
-                &config.repositories,
-                &publication_receipts,
-            )?;
-            let receipt_digest = sha256_hex(
-                format!(
-                    "{}:{}",
-                    accepted.plan_digest,
-                    publication_receipts
-                        .iter()
-                        .map(|item| item.intent().operation_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-                .as_bytes(),
-            );
-            let payload_json = serde_json::json!({
-                "schema_version": 1,
-                "kind": "implementation_published",
-                "ticket_run_id": run.ticket_run_id,
-                "source_revision": run.revision,
-                "plan_digest": accepted.plan_digest,
-                "publication_set_digest": receipt_digest,
-            })
-            .to_string();
-            let durable = durable_host_input(
-                &format!(
-                    "implementation-published:{}:{}",
-                    run.ticket_run_id, receipt_digest
-                ),
-                &payload_json,
-            );
-            store.commit_ticket_transition(
+            if advance_work_plan_stage(
+                store,
                 owner_generation,
-                &run.ticket_run_id,
-                Revision(run.revision),
-                &durable,
-                Input::ImplementationPublished(proof),
-                "host-validated complete implementation publication receipts",
-                &payload_json,
-                &[],
-            )?;
-            return Ok(true);
+                config,
+                configuration_digest,
+                &run,
+                &receipts,
+            )? {
+                return Ok(true);
+            }
         }
 
         if run.phase == Phase::Operating
@@ -323,6 +244,419 @@ pub fn consume_one_host_transition(
     Ok(false)
 }
 
+fn advance_work_plan_stage(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    config: &Config,
+    configuration_digest: &Digest,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    receipts: &[crate::store::SucceededEffectReceipt],
+) -> Result<bool, String> {
+    use crate::engine::orchestration::{WorkBaseSource, WorkNodeId};
+
+    let Some(accepted) = store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
+    else {
+        return Ok(false);
+    };
+    if accepted.configuration_digest != *configuration_digest {
+        return Err("accepted work plan belongs to a stale configuration snapshot".into());
+    }
+    let project = config
+        .projects
+        .get(&run.project_id)
+        .ok_or("publishing TicketRun Project is no longer configured")?;
+    let validated = accepted.validate_for(project, configuration_digest)?;
+
+    let mut prepared = std::collections::BTreeMap::<WorkNodeId, PreparedWorktreeReceiptNode>::new();
+    let mut publications = std::collections::BTreeMap::<
+        WorkNodeId,
+        (
+            u64,
+            crate::store::SucceededEffectReceipt,
+            crate::delivery_runtime::ValidatedWorkNodePublication,
+        ),
+    >::new();
+    for stored in receipts {
+        let intent = stored.intent();
+        if intent.project_id != run.project_id
+            || intent.subject_type != "ticket_run"
+            || intent.subject_id != run.ticket_run_id.as_str()
+        {
+            continue;
+        }
+        if intent.kind == effect_name(EffectKind::PrepareWorktrees) {
+            let Some(expected_revision) = intent.expected_revision else {
+                continue;
+            };
+            if expected_revision > run.revision {
+                continue;
+            }
+            let payload: PrepareWorktreesEffectPayload =
+                decode_canonical(&intent.request_json, &intent.request_digest)?;
+            if payload.ticket_run_id != run.ticket_run_id
+                || payload.configuration_digest != accepted.configuration_digest
+                || payload.source_revision != expected_revision
+            {
+                return Err("prepared worktree request does not match accepted plan stage".into());
+            }
+            let receipt: PreparedWorktreesEffectReceipt =
+                decode_canonical_receipt(stored.receipt_json())?;
+            crate::delivery_runtime::validate_prepared_receipt(&payload, &receipt)?;
+            for node in receipt.work_nodes {
+                if prepared.insert(node.work_node_id.clone(), node).is_some() {
+                    return Err("accepted work plan has duplicate prepared node receipts".into());
+                }
+            }
+        }
+    }
+    for stored in receipts {
+        let intent = stored.intent();
+        if intent.project_id == run.project_id
+            && intent.subject_type == "ticket_run"
+            && intent.subject_id == run.ticket_run_id.as_str()
+            && intent.kind == effect_name(EffectKind::PublishImplementation)
+        {
+            let Some(expected_revision) = intent.expected_revision else {
+                continue;
+            };
+            if expected_revision > run.revision {
+                continue;
+            }
+            let payload: crate::delivery_runtime::PublishImplementationEffectPayload =
+                decode_canonical(&intent.request_json, &intent.request_digest)?;
+            let Some(prepared_node) = prepared.get(&payload.work_node_id) else {
+                // A missing stage preparation receipt cannot authorize a graph edge.
+                continue;
+            };
+            let proof = crate::delivery_runtime::validate_work_node_publication_receipt(
+                &accepted.proposal,
+                prepared_node,
+                &run.project_id,
+                &config.repositories,
+                stored,
+                expected_revision,
+            )?;
+            match publications.get(&payload.work_node_id) {
+                Some((previous_revision, _, _)) if *previous_revision == expected_revision => {
+                    return Err(
+                        "multiple publication receipts target one node at the same stage".into(),
+                    );
+                }
+                Some((previous_revision, _, _)) if *previous_revision > expected_revision => {}
+                _ => {
+                    publications.insert(
+                        payload.work_node_id,
+                        (expected_revision, stored.clone(), proof),
+                    );
+                }
+            }
+        }
+    }
+
+    let current_publication = publications
+        .values()
+        .find(|(revision, _, _)| *revision == run.revision);
+    let Some((_, current_receipt, current_proof)) = current_publication else {
+        return Ok(false);
+    };
+    let mut prepared_receipt = PreparedWorktreesEffectReceipt {
+        schema_version: 1,
+        ticket_run_id: run.ticket_run_id.clone(),
+        work_nodes: prepared.values().cloned().collect(),
+    };
+    prepared_receipt
+        .work_nodes
+        .sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
+
+    let worker_nodes = validated
+        .nodes_in_execution_order
+        .iter()
+        .filter(|node| node.role == crate::domain::types::Role::Worker)
+        .collect::<Vec<_>>();
+    if publications.len() == worker_nodes.len() {
+        let publication_receipts = publications
+            .values()
+            .map(|(_, receipt, _)| receipt.clone())
+            .collect::<Vec<_>>();
+        let proof = crate::delivery_runtime::validate_implementation_publication_receipt(
+            &accepted.proposal,
+            &prepared_receipt,
+            &run.project_id,
+            &config.repositories,
+            &publication_receipts,
+        )?;
+        let receipt_digest = sha256_hex(
+            format!(
+                "{}:{}",
+                accepted.plan_digest,
+                publication_receipts
+                    .iter()
+                    .map(|item| item.intent().operation_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .as_bytes(),
+        );
+        let payload_json = serde_json::json!({
+            "schema_version": 1,
+            "kind": "implementation_published",
+            "ticket_run_id": run.ticket_run_id,
+            "source_revision": run.revision,
+            "plan_digest": accepted.plan_digest,
+            "publication_set_digest": receipt_digest,
+        })
+        .to_string();
+        let durable = durable_host_input(
+            &format!(
+                "implementation-published:{}:{}",
+                run.ticket_run_id, receipt_digest
+            ),
+            &payload_json,
+        );
+        store.commit_ticket_transition(
+            owner_generation,
+            &run.ticket_run_id,
+            Revision(run.revision),
+            &durable,
+            Input::ImplementationPublished(proof),
+            "host-validated complete implementation publication receipts",
+            &payload_json,
+            &[],
+        )?;
+        return Ok(true);
+    }
+
+    let current_node = validated
+        .nodes_in_execution_order
+        .iter()
+        .find(|node| node.id == *current_proof.work_node_id())
+        .ok_or("publication proof names a node outside the validated plan")?;
+    if current_node
+        .depends_on
+        .iter()
+        .any(|dependency| !publications.contains_key(&dependency.node))
+    {
+        return Ok(false);
+    }
+    if let WorkBaseSource::PredecessorWorkNodeHead { node } = &current_node.base {
+        let (Some((_, _, predecessor)), Some(prepared_node)) =
+            (publications.get(node), prepared.get(&current_node.id))
+        else {
+            return Ok(false);
+        };
+        if prepared_node.base_sha != predecessor.head() {
+            return Ok(false);
+        }
+    }
+
+    let Some(next_node) = worker_nodes.into_iter().find(|node| {
+        !publications.contains_key(&node.id)
+            && node
+                .depends_on
+                .iter()
+                .all(|dependency| publications.contains_key(&dependency.node))
+    }) else {
+        // No ready node means at least one predecessor receipt is absent or stale.
+        return Ok(false);
+    };
+    let expected_base_sha = match &next_node.base {
+        WorkBaseSource::ControllerObservedCommit { commit } => commit.clone(),
+        WorkBaseSource::PredecessorWorkNodeHead { node } => {
+            let Some((_, _, predecessor)) = publications.get(node) else {
+                return Ok(false);
+            };
+            predecessor.head().to_owned()
+        }
+    };
+    let next_revision = run
+        .revision
+        .checked_add(1)
+        .ok_or("TicketRun revision overflow")?;
+    let commit_mode = prepared
+        .values()
+        .next()
+        .map(|node| node.commit_mode)
+        .ok_or("accepted Worker plan has no prepared commit mode")?;
+    let payload = PrepareWorktreesEffectPayload {
+        schema_version: 1,
+        source_revision: next_revision,
+        configuration_digest: configuration_digest.clone(),
+        ticket_namespace: run.namespace.clone(),
+        ticket_id: run.ticket_id.clone(),
+        ticket_run_id: run.ticket_run_id.clone(),
+        work_nodes: vec![crate::delivery_runtime::PreparedWorktreeNodeRequest {
+            work_node_id: next_node.id.clone(),
+            repository_id: next_node.repository.clone(),
+            expected_base_sha,
+            commit_mode,
+        }],
+    };
+    let (request_json, request_digest) =
+        crate::delivery_runtime::canonical_delivery_payload(&payload)?;
+    let operation_id = OperationId::parse(format!(
+        "prepare-{}",
+        sha256_hex(
+            format!(
+                "{}:{}:{}:{}",
+                accepted.plan_digest,
+                next_node.id,
+                current_proof.work_node_id(),
+                sha256_hex(current_receipt.receipt_json().as_bytes()),
+            )
+            .as_bytes()
+        )
+    ))?;
+    let effect = EffectIntent {
+        project_id: run.project_id.clone(),
+        subject_type: "ticket_run".into(),
+        subject_id: run.ticket_run_id.as_str().into(),
+        operation_id: operation_id.as_str().to_owned(),
+        logical_key: format!(
+            "{}:prepare:{}:{}",
+            run.ticket_run_id, accepted.plan_digest, next_node.id
+        ),
+        kind: effect_name(EffectKind::PrepareWorktrees).into(),
+        request_json,
+        request_digest,
+        expected_revision: Some(next_revision),
+    };
+    let payload_json = serde_json::json!({
+        "schema_version": 1,
+        "kind": "work_node_published",
+        "ticket_run_id": run.ticket_run_id,
+        "source_revision": run.revision,
+        "work_node_id": current_proof.work_node_id(),
+        "head": current_proof.head(),
+        "next_work_node_id": next_node.id,
+    })
+    .to_string();
+    let durable = durable_host_input(
+        &format!(
+            "work-node-published:{}:{}",
+            run.ticket_run_id,
+            current_proof.work_node_id()
+        ),
+        &payload_json,
+    );
+    store.commit_ticket_transition(
+        owner_generation,
+        &run.ticket_run_id,
+        Revision(run.revision),
+        &durable,
+        Input::WorkNodePublished(current_proof.clone()),
+        "host-validated node publication and scheduled the next ready work node",
+        &payload_json,
+        &[effect],
+    )?;
+    Ok(true)
+}
+
+fn validate_prepared_stage_against_plan(
+    store: &ConfigStore,
+    config: &Config,
+    configuration_digest: &Digest,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    receipts: &[crate::store::SucceededEffectReceipt],
+    request: &PrepareWorktreesEffectPayload,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::{ValidatedPlan, WorkBaseSource, WorkNodeId};
+
+    let Some(accepted) = store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
+    else {
+        return Ok(false);
+    };
+    if accepted.configuration_digest != *configuration_digest
+        || request.ticket_run_id != run.ticket_run_id
+        || request.configuration_digest != accepted.configuration_digest
+    {
+        return Ok(false);
+    }
+    let project = config
+        .projects
+        .get(&run.project_id)
+        .ok_or("preparing TicketRun Project is no longer configured")?;
+    let validated: ValidatedPlan = accepted.validate_for(project, configuration_digest)?;
+    let mut prepared = std::collections::BTreeMap::<WorkNodeId, PreparedWorktreeReceiptNode>::new();
+    for stored in receipts
+        .iter()
+        .filter(|stored| stored.intent().kind == effect_name(EffectKind::PrepareWorktrees))
+    {
+        let payload: PrepareWorktreesEffectPayload = decode_canonical(
+            &stored.intent().request_json,
+            &stored.intent().request_digest,
+        )?;
+        if payload.ticket_run_id != run.ticket_run_id
+            || payload.configuration_digest != accepted.configuration_digest
+        {
+            continue;
+        }
+        let receipt: PreparedWorktreesEffectReceipt =
+            decode_canonical_receipt(stored.receipt_json())?;
+        crate::delivery_runtime::validate_prepared_receipt(&payload, &receipt)?;
+        for node in receipt.work_nodes {
+            prepared.insert(node.work_node_id.clone(), node);
+        }
+    }
+    let mut published = std::collections::BTreeMap::<
+        WorkNodeId,
+        crate::delivery_runtime::ValidatedWorkNodePublication,
+    >::new();
+    for stored in receipts
+        .iter()
+        .filter(|stored| stored.intent().kind == effect_name(EffectKind::PublishImplementation))
+    {
+        let publication: crate::delivery_runtime::PublishImplementationEffectPayload =
+            decode_canonical(
+                &stored.intent().request_json,
+                &stored.intent().request_digest,
+            )?;
+        let Some(prepared_node) = prepared.get(&publication.work_node_id) else {
+            continue;
+        };
+        let Some(revision) = stored.intent().expected_revision else {
+            continue;
+        };
+        let proof = crate::delivery_runtime::validate_work_node_publication_receipt(
+            &accepted.proposal,
+            prepared_node,
+            &run.project_id,
+            &config.repositories,
+            stored,
+            revision,
+        )?;
+        published.insert(publication.work_node_id, proof);
+    }
+
+    for requested in &request.work_nodes {
+        let Some(node) = validated.nodes_in_execution_order.iter().find(|node| {
+            node.id == requested.work_node_id && node.role == crate::domain::types::Role::Worker
+        }) else {
+            return Ok(false);
+        };
+        if node.repository != requested.repository_id
+            || node
+                .depends_on
+                .iter()
+                .any(|dependency| !published.contains_key(&dependency.node))
+        {
+            return Ok(false);
+        }
+        let expected_base = match &node.base {
+            WorkBaseSource::ControllerObservedCommit { commit } => commit.as_str(),
+            WorkBaseSource::PredecessorWorkNodeHead { node } => {
+                let Some(predecessor) = published.get(node) else {
+                    return Ok(false);
+                };
+                predecessor.head()
+            }
+        };
+        if requested.expected_base_sha != expected_base {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn durable_host_input(message_id: &str, payload: &str) -> DurableInput {
     DurableInput {
         producer_id: "rex-projects-host-transition".into(),
@@ -361,41 +695,6 @@ fn completion_effect_intent(
         request_json,
         expected_revision: Some(effect_revision),
     })
-}
-
-/// Read-only validator for the complete effect request/receipt binding.
-pub fn validate_prepared_receipt(
-    request: &PrepareWorktreesEffectPayload,
-    receipt: &PreparedWorktreesEffectReceipt,
-) -> Result<(), String> {
-    if receipt.schema_version != 1 || receipt.ticket_run_id != request.ticket_run_id {
-        return Err("prepared worktree receipt has a mismatched schema or TicketRun".into());
-    }
-    if request.work_nodes.is_empty() || request.work_nodes.len() > 64 {
-        return Err("prepare worktree request node count is outside limits".into());
-    }
-    if receipt.work_nodes.len() != request.work_nodes.len() {
-        return Err("prepared worktree receipt does not cover the requested nodes".into());
-    }
-    let mut expected = request.work_nodes.iter().collect::<Vec<_>>();
-    expected.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
-    let mut actual = receipt.work_nodes.iter().collect::<Vec<_>>();
-    actual.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
-    let mut previous: Option<&str> = None;
-    for (wanted, got) in expected.iter().zip(actual) {
-        if previous == Some(wanted.work_node_id.as_str())
-            || wanted.work_node_id != got.work_node_id
-            || wanted.repository_id != got.repository_id
-            || wanted.expected_base_sha != got.base_sha
-            || wanted.commit_mode != got.commit_mode
-            || !got.worktree_path.is_absolute()
-            || got.branch.trim().is_empty()
-        {
-            return Err("prepared worktree node does not match its effect request".into());
-        }
-        previous = Some(wanted.work_node_id.as_str());
-    }
-    Ok(())
 }
 
 fn validate_prepare_binding(
@@ -460,7 +759,7 @@ mod tests {
     use crate::domain::types::CommitMode;
     use crate::engine::orchestration::WorkNodeId;
 
-    use super::validate_prepared_receipt;
+    use crate::delivery_runtime::validate_prepared_receipt;
 
     fn request() -> PrepareWorktreesEffectPayload {
         PrepareWorktreesEffectPayload {
