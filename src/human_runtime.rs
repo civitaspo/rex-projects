@@ -16,7 +16,8 @@ use crate::domain::ids::{Digest, HumanRequestId, ProjectId, Revision, TicketRunI
 use crate::effects::{
     EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation, EffectRequest,
 };
-use crate::human::{ReviewBundle, review_bundle_digest};
+use crate::engine::orchestration::{RoleArtifactReference, RoleResultBinding};
+use crate::human::{ReviewBundle, ReviewEvidence, review_bundle_digest};
 use crate::protocol::{
     MethodName, ProtocolError, RequestEnvelope, RequestId as ProtocolRequestId, SCHEMA_VERSION,
     parse_unique,
@@ -653,6 +654,9 @@ impl HumanSubjectObserver for DurableHumanSubjectObserver {
             HumanPurpose::ProfilePromotion => {
                 observe_profile_subject(store, request, &self.declarative_root)
             }
+            HumanPurpose::PlanDecision | HumanPurpose::GoalCompletion => {
+                observe_typed_role_authority(store, request)
+            }
             HumanPurpose::TicketReview => Err(
                 "ticket review freshness requires a configured forge observer; decision remains queued".into(),
             ),
@@ -772,6 +776,101 @@ fn observe_profile_subject(
     Ok(HumanSubjectObservation::Current(binding))
 }
 
+fn observe_typed_role_authority(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+) -> Result<HumanSubjectObservation, String> {
+    let Some(authority) = store.human_request_authority(&request.request_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the typed Planner or goal authority evidence is missing".into(),
+        ));
+    };
+    authority.validate_for(request)?;
+    let source = match &authority {
+        HumanAuthorityMaterial::PlannerClarification { source, .. }
+        | HumanAuthorityMaterial::GoalCompletion { source, .. } => source,
+    };
+    if !store.human_role_result_is_current_source(source)? {
+        return Ok(HumanSubjectObservation::Gone(
+            "the source Agent result is no longer an accepted immutable result".into(),
+        ));
+    }
+    let Some(project) = store.project(&request.subject.project_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project for this human decision no longer exists".into(),
+        ));
+    };
+    let Some(snapshot) = store.load_snapshot(&project.config_source)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if snapshot.revision != project.config_revision
+        || snapshot.config.digest != project.config_digest
+        || snapshot.config.digest != request.subject.configuration_digest
+        || source.binding.config_digest != snapshot.config.digest
+        || source.binding.config_revision != snapshot.revision
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project configuration changed after the human request was prepared".into(),
+        ));
+    }
+    match &authority {
+        HumanAuthorityMaterial::PlannerClarification { source, .. } => {
+            let Some(ticket_run_id) = source.binding.ticket_run_id.as_ref() else {
+                return Ok(HumanSubjectObservation::Gone(
+                    "Planner clarification is missing its TicketRun scope".into(),
+                ));
+            };
+            let Some((project_id, revision, phase, _)) =
+                store.current_ticket_human_scope(ticket_run_id)?
+            else {
+                return Ok(HumanSubjectObservation::Gone(
+                    "the Planner TicketRun no longer exists".into(),
+                ));
+            };
+            if project_id != request.subject.project_id
+                || revision != request.subject.revision.0
+                || source.binding.ticket_revision != Some(request.subject.revision)
+                || phase != "planning"
+            {
+                return Ok(HumanSubjectObservation::Gone(
+                    "the Planner TicketRun phase or revision changed".into(),
+                ));
+            }
+        }
+        HumanAuthorityMaterial::GoalCompletion {
+            goal_revision,
+            acceptance_criteria,
+            evidence,
+            ..
+        } => {
+            let configured_goal = snapshot
+                .config
+                .config
+                .projects
+                .get(&project.id)
+                .and_then(|config| config.goal.as_ref());
+            if project.goal_revision != *goal_revision
+                || configured_goal.is_none_or(|goal| {
+                    goal.revision != *goal_revision || &goal.acceptance != acceptance_criteria
+                })
+                || !evidence.incomplete_ticket_ids.is_empty()
+                || !store.goal_completion_work_is_clear(&project.id)?
+                || evidence
+                    .satisfied_acceptance
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    != acceptance_criteria.iter().cloned().collect::<BTreeSet<_>>()
+            {
+                return Ok(HumanSubjectObservation::Gone(
+                    "goal revision, acceptance criteria, or completion evidence changed".into(),
+                ));
+            }
+        }
+    }
+    Ok(HumanSubjectObservation::Current(request.subject.clone()))
+}
+
 pub fn profile_policy_digest(policy: &crate::config::LearningConfig) -> Result<Digest, String> {
     let bytes = serde_json::to_vec(policy).map_err(|error| error.to_string())?;
     let mut material = b"rex-projects-profile-policy-v1\0".to_vec();
@@ -784,6 +883,276 @@ pub fn profile_policy_digest(policy: &crate::config::LearningConfig) -> Result<D
 pub struct HumanPresentationEffect {
     pub request: HumanRuntimeRequest,
     pub rex_view_id: Digest,
+    #[serde(default)]
+    pub authority: Option<HumanAuthorityMaterial>,
+}
+
+/// Host-built provenance needed to reconstruct a Planner clarification or a
+/// Supervisor goal-completion request after a crash. The source points at an
+/// immutable, already-validated role result; document bytes must come from
+/// the host artifact registry, never from a path supplied to this structure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HumanAuthorityMaterial {
+    PlannerClarification {
+        source: HumanRoleResultSource,
+        documents: Vec<HumanEvidenceDocument>,
+    },
+    GoalCompletion {
+        source: HumanRoleResultSource,
+        goal_revision: u64,
+        acceptance_criteria: Vec<String>,
+        evidence: crate::engine::orchestration::GoalCompletionEvidence,
+        documents: Vec<HumanEvidenceDocument>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanRoleResultSource {
+    pub binding: RoleResultBinding,
+    pub message_id: String,
+    pub result_digest: Digest,
+    pub result_kind: crate::engine::orchestration::RoleOutputKind,
+    pub claimed_artifact_refs: Vec<RoleArtifactReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanEvidenceDocument {
+    pub reference: RoleArtifactReference,
+    /// Bounded verified bytes copied from the artifact registry at request time.
+    pub bytes: Vec<u8>,
+}
+
+impl HumanAuthorityMaterial {
+    pub fn validate_for(&self, request: &HumanRuntimeRequest) -> Result<(), String> {
+        let (source, required_purpose, required_role) = match self {
+            Self::PlannerClarification { source, documents } => {
+                let total = documents.iter().try_fold(0usize, |total, document| {
+                    if document.bytes.len() as u64 != document.reference.bytes
+                        || hex(&Sha256::digest(&document.bytes))
+                            != document.reference.digest.as_str()
+                    {
+                        return Err(
+                            "human evidence document does not match its registered artifact digest"
+                                .to_owned(),
+                        );
+                    }
+                    total
+                        .checked_add(document.bytes.len())
+                        .ok_or_else(|| "human evidence size overflow".to_owned())
+                })?;
+                if total > MAX_HUMAN_REQUEST_BYTES {
+                    return Err(
+                        "human evidence documents exceed the review request size limit".into(),
+                    );
+                }
+                let mut references = documents
+                    .iter()
+                    .map(|document| document.reference.clone())
+                    .collect::<Vec<_>>();
+                references.sort_by(|left, right| left.path.cmp(&right.path));
+                let mut claimed = source.claimed_artifact_refs.clone();
+                claimed.sort_by(|left, right| left.path.cmp(&right.path));
+                if references != claimed
+                    || source.result_kind
+                        != crate::engine::orchestration::RoleOutputKind::HumanRequest
+                {
+                    return Err(
+                        "Planner evidence documents do not match its validated HumanRequest result"
+                            .into(),
+                    );
+                }
+                (
+                    source,
+                    HumanPurpose::PlanDecision,
+                    crate::domain::types::Role::Planner,
+                )
+            }
+            Self::GoalCompletion {
+                source,
+                goal_revision,
+                acceptance_criteria,
+                evidence,
+                documents,
+            } => {
+                let total = documents.iter().try_fold(0usize, |total, document| {
+                    if document.bytes.len() as u64 != document.reference.bytes
+                        || hex(&Sha256::digest(&document.bytes))
+                            != document.reference.digest.as_str()
+                    {
+                        return Err(
+                            "goal evidence document does not match its registered artifact digest"
+                                .to_owned(),
+                        );
+                    }
+                    total
+                        .checked_add(document.bytes.len())
+                        .ok_or_else(|| "goal evidence size overflow".to_owned())
+                })?;
+                if total > MAX_HUMAN_REQUEST_BYTES {
+                    return Err(
+                        "goal evidence documents exceed the review request size limit".into(),
+                    );
+                }
+                if *goal_revision == 0
+                    || request.subject.revision.0 != *goal_revision
+                    || acceptance_criteria.is_empty()
+                    || acceptance_criteria
+                        .iter()
+                        .any(|value| value.trim().is_empty())
+                    || evidence
+                        .satisfied_acceptance
+                        .iter()
+                        .any(|value| value.trim().is_empty())
+                {
+                    return Err("goal-completion evidence or goal revision is invalid".into());
+                }
+                let mut references = documents
+                    .iter()
+                    .map(|document| document.reference.clone())
+                    .collect::<Vec<_>>();
+                references.sort_by(|left, right| left.path.cmp(&right.path));
+                let mut claimed = source.claimed_artifact_refs.clone();
+                claimed.sort_by(|left, right| left.path.cmp(&right.path));
+                if source.result_kind
+                    != crate::engine::orchestration::RoleOutputKind::GoalCompletion
+                    || references != claimed
+                {
+                    return Err(
+                        "goal completion documents do not match its validated typed result".into(),
+                    );
+                }
+                (
+                    source,
+                    HumanPurpose::GoalCompletion,
+                    crate::domain::types::Role::Supervisor,
+                )
+            }
+        };
+        let binding = &source.binding;
+        if request.purpose != required_purpose
+            || binding.role != required_role
+            || binding.project_id != request.subject.project_id
+            || binding.ticket_run_id != request.subject.ticket_run_id
+            || binding.ticket_revision
+                != request
+                    .subject
+                    .ticket_run_id
+                    .as_ref()
+                    .map(|_| request.subject.revision)
+            || binding.config_digest != request.subject.configuration_digest
+            || source.message_id.trim().is_empty()
+            || source.message_id.len() > 255
+            || source.message_id.chars().any(char::is_control)
+        {
+            return Err("human authority source does not match the request scope".into());
+        }
+        let material_digest = self.material_digest()?;
+        if request.subject.material_digest != material_digest {
+            return Err(
+                "human request material digest does not match its canonical authority".into(),
+            );
+        }
+        if request.subject.policy_digest != self.policy_digest()? {
+            return Err("human request policy digest does not match its role authority".into());
+        }
+        if request.review_bundle != self.review_bundle()? {
+            return Err("human review bundle does not match its canonical typed authority".into());
+        }
+        Ok(())
+    }
+
+    pub fn material_digest(&self) -> Result<Digest, String> {
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_HUMAN_REQUEST_BYTES {
+            return Err("human authority material exceeds the request size limit".into());
+        }
+        Digest::parse(hex(&Sha256::digest(bytes)))
+    }
+
+    pub fn policy_digest(&self) -> Result<Digest, String> {
+        let binding = match self {
+            Self::PlannerClarification { source, .. } | Self::GoalCompletion { source, .. } => {
+                &source.binding
+            }
+        };
+        let bytes = serde_json::to_vec(&(
+            &binding.profile_digest,
+            &binding.instruction_digest,
+            &binding.provider_capability_receipt_digest,
+            &binding.result_schema_digest,
+        ))
+        .map_err(|error| error.to_string())?;
+        Digest::parse(hex(&Sha256::digest(bytes)))
+    }
+
+    pub fn review_bundle(&self) -> Result<ReviewBundle, String> {
+        let bundle = match self {
+            Self::PlannerClarification { source, documents } => ReviewBundle {
+                title: "Planner clarification request".into(),
+                summary: format!(
+                    "The Planner requires a human decision for ticket run {} at revision {}.",
+                    source.binding.ticket_run_id.as_ref().map_or("unknown", TicketRunId::as_str),
+                    source.binding.ticket_revision.map_or(0, |revision| revision.0),
+                ),
+                risk: None,
+                repositories: Vec::new(),
+                evidence: documents
+                    .iter()
+                    .map(|document| ReviewEvidence {
+                        title: document.reference.path.clone(),
+                        body: String::from_utf8_lossy(&document.bytes).into_owned(),
+                        truncated: false,
+                    })
+                    .collect(),
+                unknowns: vec![
+                    "Planner-authored evidence is an assertion; review it against the repository and ticket context.".into(),
+                ],
+            },
+            Self::GoalCompletion {
+                source,
+                goal_revision,
+                acceptance_criteria,
+                evidence,
+                documents,
+            } => ReviewBundle {
+                title: format!("Goal completion review: revision {goal_revision}"),
+                summary: format!(
+                    "Supervisor requests confirmation that the goal for project {} is complete.",
+                    source.binding.project_id,
+                ),
+                risk: None,
+                repositories: Vec::new(),
+                evidence: vec![
+                    ReviewEvidence {
+                        title: "Configured acceptance criteria".into(),
+                        body: acceptance_criteria.join("\n"),
+                        truncated: false,
+                    },
+                    ReviewEvidence {
+                        title: "Supervisor completion evidence".into(),
+                        body: serde_json::to_string_pretty(evidence)
+                            .map_err(|error| error.to_string())?,
+                        truncated: false,
+                    },
+                ]
+                .into_iter()
+                .chain(documents.iter().map(|document| ReviewEvidence {
+                    title: document.reference.path.clone(),
+                    body: String::from_utf8_lossy(&document.bytes).into_owned(),
+                    truncated: false,
+                }))
+                .collect(),
+                unknowns: vec![
+                    "Completion evidence is a Supervisor assertion and must be checked against current project state.".into(),
+                ],
+            },
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
 }
 
 /// Configured host-side presenter. Its effect request contains only host-built typed review
@@ -844,15 +1213,36 @@ impl HumanPresenterEffectHandler {
             );
         }
         review.validate(now)?;
+        if effect.authority.is_none()
+            && matches!(
+                review.purpose,
+                HumanPurpose::PlanDecision | HumanPurpose::GoalCompletion
+            )
+        {
+            return Err(
+                "Planner/goal human requests require durable typed authority material".into(),
+            );
+        }
         let html_path = write_runtime_review_artifact(&self.artifact_root, review)
             .map_err(|error| format!("write human review artifact: {error}"))?;
-        let inserted = context.store.register_human_request(
-            context.owner_generation,
-            review,
-            &effect.rex_view_id,
-            &html_path,
-            now,
-        )?;
+        let inserted = if let Some(authority) = &effect.authority {
+            context.store.register_human_request_with_authority(
+                context.owner_generation,
+                review,
+                &effect.rex_view_id,
+                &html_path,
+                authority,
+                now,
+            )?
+        } else {
+            context.store.register_human_request(
+                context.owner_generation,
+                review,
+                &effect.rex_view_id,
+                &html_path,
+                now,
+            )?
+        };
         if !inserted {
             let existing = context
                 .store
@@ -1368,6 +1758,75 @@ mod presenter_tests {
         assert_ne!(first, changed.digest().unwrap());
         changed.ticket_run_id = None;
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn planner_authority_reconstructs_bundle_and_rejects_policy_or_scope_changes() {
+        use crate::domain::ids::{AgentRunId, OperationId};
+        use crate::domain::types::Role;
+        use crate::engine::orchestration::{RoleOutputKind, RoleResultBinding, RoleSessionId};
+
+        let source = HumanRoleResultSource {
+            binding: RoleResultBinding {
+                agent_run_id: AgentRunId::parse("planner-run").unwrap(),
+                operation_id: OperationId::parse("planner-op").unwrap(),
+                project_id: ProjectId::parse("p1").unwrap(),
+                role_session_id: RoleSessionId::parse("planner-session").unwrap(),
+                role: Role::Planner,
+                parent_run_id: Some(AgentRunId::parse("coordinator-run").unwrap()),
+                parent_role: Some(Role::Coordinator),
+                ticket_run_id: Some(TicketRunId::parse("run-1").unwrap()),
+                ticket_revision: Some(Revision(3)),
+                config_revision: Revision(7),
+                config_digest: Digest::parse("b".repeat(64)).unwrap(),
+                profile_digest: Digest::parse("c".repeat(64)).unwrap(),
+                instruction_digest: Digest::parse("d".repeat(64)).unwrap(),
+                provider_capability_receipt_digest: Digest::parse("e".repeat(64)).unwrap(),
+                result_schema_digest: Digest::parse("f".repeat(64)).unwrap(),
+                controller_generation: 2,
+                run_epoch: 1,
+                attempt: 1,
+            },
+            message_id: "planner-result-1".into(),
+            result_digest: Digest::parse("a".repeat(64)).unwrap(),
+            result_kind: RoleOutputKind::HumanRequest,
+            claimed_artifact_refs: Vec::new(),
+        };
+        let authority = HumanAuthorityMaterial::PlannerClarification {
+            source,
+            documents: Vec::new(),
+        };
+        let bundle = authority.review_bundle().unwrap();
+        let request = HumanRuntimeRequest {
+            request_id: HumanRequestId::parse("plan-review-1").unwrap(),
+            purpose: HumanPurpose::PlanDecision,
+            subject: HumanSubjectBinding {
+                project_id: ProjectId::parse("p1").unwrap(),
+                kind: HumanSubjectKind::Plan,
+                subject_id: "plan-1".into(),
+                ticket_run_id: Some(TicketRunId::parse("run-1").unwrap()),
+                revision: Revision(3),
+                material_digest: authority.material_digest().unwrap(),
+                configuration_digest: Digest::parse("b".repeat(64)).unwrap(),
+                policy_digest: authority.policy_digest().unwrap(),
+                bundle_digest: review_bundle_digest(&bundle).unwrap(),
+            },
+            question: "Which architecture should the Planner use?".into(),
+            choices: vec![
+                HumanDecisionChoice::Approve,
+                HumanDecisionChoice::RevisePlan,
+                HumanDecisionChoice::Defer,
+            ],
+            expires_at_unix: 200,
+            review_bundle: bundle,
+        };
+        authority.validate_for(&request).unwrap();
+
+        let mut changed = authority.clone();
+        if let HumanAuthorityMaterial::PlannerClarification { source, .. } = &mut changed {
+            source.binding.instruction_digest = Digest::parse("1".repeat(64)).unwrap();
+        }
+        assert!(changed.validate_for(&request).is_err());
     }
 
     #[test]

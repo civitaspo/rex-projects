@@ -19,8 +19,28 @@ use super::{ConfigStore, validate_active_generation};
 
 const HUMAN_SCHEMA_VERSION: i64 = 8;
 const MAX_PENDING_DECISIONS: usize = 256;
+const MAX_AUTHORITY_JSON_BYTES: usize = 4 * 1_048_576;
 type HumanViewIdentityRow = (String, String, Option<String>, Option<String>, String);
 type HumanRequestSummaryRow = (String, String, String, Option<String>, Option<String>);
+
+/// Additive schema fragment called inside the coordinated v12 migration transaction.
+pub(crate) fn migrate_v12_human_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE human_request_authority (
+            request_id TEXT PRIMARY KEY REFERENCES human_requests(request_id),
+            authority_json TEXT NOT NULL CHECK(length(authority_json) <= 4194304),
+            authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64),
+            created_at_unix INTEGER NOT NULL
+        );
+        CREATE TRIGGER human_request_authority_immutable_update
+        BEFORE UPDATE ON human_request_authority
+        BEGIN SELECT RAISE(ABORT, 'human request authority is immutable'); END;
+        CREATE TRIGGER human_request_authority_immutable_delete
+        BEFORE DELETE ON human_request_authority
+        BEGIN SELECT RAISE(ABORT, 'human request authority is retained'); END;",
+    )
+    .map_err(|error| error.to_string())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "detail")]
@@ -272,9 +292,77 @@ impl ConfigStore {
         artifact_path: &Path,
         now: u64,
     ) -> Result<bool, String> {
+        self.register_human_request_inner(
+            owner_generation,
+            request,
+            rex_view_id,
+            artifact_path,
+            None,
+            now,
+        )
+    }
+
+    pub fn register_human_request_with_authority(
+        &mut self,
+        owner_generation: u64,
+        request: &HumanRuntimeRequest,
+        rex_view_id: &Digest,
+        artifact_path: &Path,
+        authority: &crate::human_runtime::HumanAuthorityMaterial,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.register_human_request_inner(
+            owner_generation,
+            request,
+            rex_view_id,
+            artifact_path,
+            Some(authority),
+            now,
+        )
+    }
+
+    fn register_human_request_inner(
+        &mut self,
+        owner_generation: u64,
+        request: &HumanRuntimeRequest,
+        rex_view_id: &Digest,
+        artifact_path: &Path,
+        authority: Option<&crate::human_runtime::HumanAuthorityMaterial>,
+        now: u64,
+    ) -> Result<bool, String> {
         request.validate(now)?;
+        if let Some(authority) = authority {
+            authority.validate_for(request)?;
+            let source = match authority {
+                crate::human_runtime::HumanAuthorityMaterial::PlannerClarification {
+                    source,
+                    ..
+                }
+                | crate::human_runtime::HumanAuthorityMaterial::GoalCompletion { source, .. } => {
+                    source
+                }
+            };
+            if !self.human_role_result_is_current_source(source)? {
+                return Err(
+                    "human request source does not match a completed validated Agent result".into(),
+                );
+            }
+        }
         let artifact_path = validate_artifact_path(artifact_path)?;
         let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
+        let authority_json = authority
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        if authority_json
+            .as_ref()
+            .is_some_and(|json| json.len() > MAX_AUTHORITY_JSON_BYTES)
+        {
+            return Err("human request authority exceeds its storage size limit".into());
+        }
+        let authority_digest = authority_json
+            .as_ref()
+            .map(|json| format!("{:x}", Sha256::digest(json.as_bytes())));
         let subject_digest = request.subject.digest()?.to_string();
         let tx = self
             .connection
@@ -297,6 +385,25 @@ impl ConfigStore {
             {
                 return Err("human request ID was reused with different content".into());
             }
+            match (&authority_json, &authority_digest) {
+                (Some(json), Some(digest)) => {
+                    let existing: Option<(String, String)> = tx
+                        .query_row(
+                            "SELECT authority_json,authority_digest FROM human_request_authority WHERE request_id=?1",
+                            [request.request_id.as_str()],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?;
+                    if existing.as_ref() != Some(&(json.clone(), digest.clone())) {
+                        return Err(
+                            "human request ID was reused with different authority material".into(),
+                        );
+                    }
+                }
+                (None, None) => {}
+                _ => return Err("invalid human request authority encoding".into()),
+            }
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(false);
         }
@@ -305,8 +412,157 @@ impl ConfigStore {
             "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'pending',?15,?16)",
             params![request.request_id.as_str(), request.subject.project_id.as_str(), purpose_name(request.purpose), subject_kind_name(request.subject.kind), request.subject.subject_id, request.subject.revision.0, rex_view_id.as_str(), subject_digest, request.subject.material_digest.as_str(), request.subject.configuration_digest.as_str(), request.subject.policy_digest.as_str(), request.subject.bundle_digest.as_str(), request_json, artifact_path, now, request.expires_at_unix],
         ).map_err(|error| error.to_string())?;
+        if let (Some(json), Some(digest)) = (authority_json, authority_digest) {
+            tx.execute(
+                "INSERT INTO human_request_authority(request_id,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4)",
+                params![request.request_id.as_str(), json, digest, now],
+            )
+            .map_err(|error| error.to_string())?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    pub fn human_request_authority(
+        &self,
+        request_id: &HumanRequestId,
+    ) -> Result<Option<crate::human_runtime::HumanAuthorityMaterial>, String> {
+        let stored: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT authority_json,authority_digest FROM human_request_authority WHERE request_id=?1",
+                [request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        stored
+            .map(|(json, expected_digest)| {
+                if json.len() > MAX_AUTHORITY_JSON_BYTES
+                    || format!("{:x}", Sha256::digest(json.as_bytes())) != expected_digest
+                {
+                    return Err("stored human authority digest is invalid".into());
+                }
+                let authority: crate::human_runtime::HumanAuthorityMaterial =
+                    crate::protocol::parse_unique(json.as_bytes())?;
+                let canonical =
+                    serde_json::to_string(&authority).map_err(|error| error.to_string())?;
+                if canonical != json {
+                    return Err("stored human authority is not canonical".into());
+                }
+                Ok(authority)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn human_role_result_is_current_source(
+        &self,
+        source: &crate::human_runtime::HumanRoleResultSource,
+    ) -> Result<bool, String> {
+        let binding = &source.binding;
+        let Some(authority) = self.agent_launch_authority(&binding.agent_run_id)? else {
+            return Ok(false);
+        };
+        if authority.project_id != binding.project_id
+            || authority.role != binding.role
+            || authority.ticket_run_id != binding.ticket_run_id
+            || authority.ticket_revision != binding.ticket_revision
+            || authority.config_revision != binding.config_revision
+            || authority.config_digest != binding.config_digest
+            || authority.profile_digest != binding.profile_digest
+            || authority.instruction_digest != binding.instruction_digest
+            || authority.run_epoch != binding.run_epoch
+            || authority.attempt != binding.attempt
+        {
+            return Ok(false);
+        }
+        let row: Option<(String, String, Option<String>, u32, u64, String, Option<String>, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT project_id,role,ticket_run_id,attempt,run_epoch,message_id,result_digest,result_json,artifact_refs_json FROM agent_result_evidence WHERE agent_run_id=?1 AND message_id=?2 AND outcome='completed'",
+                rusqlite::params![binding.agent_run_id.as_str(), source.message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((
+            project_id,
+            role,
+            ticket_run_id,
+            attempt,
+            epoch,
+            message_id,
+            result_digest,
+            result_json,
+            refs_json,
+        )) = row
+        else {
+            return Ok(false);
+        };
+        let expected_role = serde_json::to_value(binding.role)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or("role serialization was not a string")?
+            .to_owned();
+        if project_id != binding.project_id.as_str()
+            || role != expected_role
+            || ticket_run_id.as_deref() != binding.ticket_run_id.as_ref().map(TicketRunId::as_str)
+            || attempt != binding.attempt
+            || epoch != binding.run_epoch
+            || message_id != source.message_id
+            || result_digest.as_deref() != Some(source.result_digest.as_str())
+        {
+            return Ok(false);
+        }
+        let result: serde_json::Value = crate::protocol::parse_unique(result_json.as_bytes())?;
+        let result_bytes = serde_json::to_vec(&result).map_err(|error| error.to_string())?;
+        if format!("{:x}", Sha256::digest(result_bytes)) != source.result_digest.as_str() {
+            return Ok(false);
+        }
+        let stored_refs: Vec<crate::engine::orchestration::RoleArtifactReference> =
+            crate::protocol::parse_unique(refs_json.as_bytes())?;
+        Ok(stored_refs == source.claimed_artifact_refs)
+    }
+
+    pub(crate) fn current_ticket_human_scope(
+        &self,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<Option<(ProjectId, u64, String, Option<u64>)>, String> {
+        self.connection
+            .query_row(
+                "SELECT project_id,revision,internal_phase,required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<u64>>(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|(project, revision, phase, review_revision)| {
+                Ok((ProjectId::parse(project)?, revision, phase, review_revision))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn goal_completion_work_is_clear(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<bool, String> {
+        let unfinished_ticket: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ticket_runs WHERE project_id=?1 AND internal_phase NOT IN ('done','canceled'))",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let unsuccessful_operation: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_runs WHERE project_id=?1 AND state NOT IN ('succeeded','skipped'))",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(!unfinished_ticket && !unsuccessful_operation)
     }
 
     pub fn record_human_presentation(
@@ -1322,6 +1578,7 @@ mod tests {
         let payload = serde_json::to_string(&HumanPresentationEffect {
             request: request.clone(),
             rex_view_id: view_id,
+            authority: None,
         })
         .unwrap();
         let effect = EffectRequest {

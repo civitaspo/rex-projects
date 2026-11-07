@@ -845,6 +845,7 @@ fn enqueue_human_presentation(
     let effect = HumanPresentationEffect {
         request: request.clone(),
         rex_view_id: rex_view_id.clone(),
+        authority: None,
     };
     let request_json = canonical_json(&effect)?;
     let request_digest = digest(&request_json)?;
