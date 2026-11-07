@@ -9,8 +9,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::{AppliedConfig, OperationTarget};
 use crate::domain::ids::{Digest, OperationId, ProjectId, Revision, TicketId, TicketRunId};
+use crate::human_runtime::{
+    HumanDecisionChoice, HumanPresentationEffect, HumanPurpose, HumanRuntimeRequest,
+};
 use crate::operations::{
-    DeliveryFacts, HumanApprovalReceipt, OperationSubject, ValidatedOperationPlan, resolve_source,
+    DeliveryFacts, OperationApprovalCapability, OperationSubject, ValidatedOperationPlan,
+    resolve_source,
 };
 
 pub const OPERATIONS_SCHEMA_VERSION: i64 = 11;
@@ -58,8 +62,6 @@ pub struct OperationEffectRequest {
     pub subject: OperationSubject,
     pub target: OperationTarget,
     pub approval_request_id: Option<String>,
-    #[serde(default)]
-    pub approval: Option<HumanApprovalReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,7 +296,6 @@ impl<'a> OperationsStore<'a> {
                 target: target.clone(),
                 approval_request_id: required_approval
                     .then(|| format!("human-{}", operation_id.as_str())),
-                approval: None,
             };
             let request_json = canonical_json(&payload)?;
             let request_digest = digest(&request_json)?;
@@ -303,23 +304,55 @@ impl<'a> OperationsStore<'a> {
                 "INSERT INTO operation_runs(operation_id,project_id,ticket_run_id,target_id,action_id,repository_id,environment,source_sha,subject_json,subject_digest,request_json,request_digest,state,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![operation_id.as_str(),project_id.as_str(),ticket_run_id.as_str(),target.id,target.action,target.repository.as_str(),target.environment,subject.source_sha,subject_json,subject_digest.as_str(),request_json,request_digest.as_str(),approval_status.as_str(),now],
             ).map_err(|error| error.to_string())?;
-            if !required_approval && target.depends_on.is_empty() {
-                enqueue_effect(&tx, &payload, now)?;
+            if required_approval {
+                let rex_view_id: String = tx.query_row(
+                    "SELECT v.view_id FROM rex_views v JOIN ticket_runs t ON t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id WHERE t.ticket_run_id=?1 AND v.view_kind='ticket' AND v.lifecycle='active' ORDER BY v.view_epoch DESC LIMIT 1",
+                    [ticket_run_id.as_str()],
+                    |row| row.get(0),
+                ).map_err(|_| "operation approval requires an active ticket Rex view".to_owned())?;
+                let bundle = crate::operations::operation_review_bundle(
+                    applied, &subject, target, ticket_id,
+                )?;
+                let binding =
+                    crate::operations::operation_human_subject_binding(applied, &subject, &bundle)?;
+                let request_id = crate::domain::ids::HumanRequestId::parse(
+                    payload
+                        .approval_request_id
+                        .clone()
+                        .ok_or("operation approval request ID is missing")?,
+                )?;
+                let request = HumanRuntimeRequest {
+                    request_id,
+                    purpose: HumanPurpose::OperationApproval,
+                    subject: binding,
+                    question: format!(
+                        "Approve the configured operation `{}` for repository `{}` in environment `{}`?",
+                        target.id, target.repository, target.environment,
+                    ),
+                    choices: vec![HumanDecisionChoice::Approve, HumanDecisionChoice::Refuse],
+                    expires_at_unix: u64::try_from(now)
+                        .unwrap_or(0)
+                        .saturating_add(7 * 24 * 60 * 60),
+                    review_bundle: bundle,
+                };
+                enqueue_human_presentation(&tx, &request, &Digest::parse(rex_view_id)?, now)?;
             }
+            // The operation effect waits durably for dependencies and, when
+            // required, an exact active human approval before invoking anything.
+            enqueue_effect(&tx, &payload, now)?;
             operation_ids.push(operation_id);
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(operation_ids)
     }
 
-    /// A human response is accepted only after the host human subsystem has
-    /// validated freshness and exact subject digest. This method binds it to
-    /// the persisted operation before putting the effect in the outbox.
-    pub fn accept_approval(
+    /// Persist a host-minted approval capability and enqueue the same immutable
+    /// operation intent. The capability itself is never serialized or sent to an Agent.
+    pub(crate) fn accept_approval(
         &mut self,
         owner_generation: u64,
         operation_id: &OperationId,
-        receipt: &HumanApprovalReceipt,
+        capability: &OperationApprovalCapability,
         now: i64,
     ) -> Result<(), String> {
         let tx = self
@@ -335,38 +368,34 @@ impl<'a> OperationsStore<'a> {
         let Some((request_json, subject_digest, state)) = row else {
             return Err("operation approval target was not found".into());
         };
-        if state != "awaiting_approval"
-            || subject_digest != receipt.subject_digest.as_str()
-            || receipt.request_id.trim().is_empty()
-            || receipt.decided_at.trim().is_empty()
+        let payload: OperationEffectRequest =
+            crate::protocol::parse_unique(request_json.as_bytes())?;
+        if canonical_json(&payload)? != request_json
+            || state != "awaiting_approval"
+            || subject_digest != capability.material_digest().as_str()
+            || payload.subject.operation_id != *operation_id
+            || capability.operation_id() != operation_id
+            || payload.subject.digest()? != *capability.material_digest()
+            || payload.config_digest != *capability.configuration_digest()
+            || payload.approval_request_id.as_deref() != Some(capability.request_id().as_str())
+            || capability.decided_at_unix() > now.max(0) as u64
         {
-            return Err("human approval is stale or bound to a different operation".into());
-        }
-        let mut payload: OperationEffectRequest = serde_json::from_str(&request_json)
-            .map_err(|error| format!("stored operation intent is invalid: {error}"))?;
-        if payload.approval_request_id.as_deref() != Some(receipt.request_id.as_str()) {
             return Err(
-                "human approval request ID does not match the persisted operation request".into(),
+                "human approval capability is stale or bound to a different operation".into(),
             );
         }
-        if !receipt.approved {
-            tx.execute(
-                "UPDATE operation_runs SET state='failed',approval_json=?2,updated_at_unix=?3 WHERE operation_id=?1 AND state='awaiting_approval'",
-                params![operation_id.as_str(),canonical_json(receipt)?,now],
-            ).map_err(|error| error.to_string())?;
-            tx.execute(
-                "UPDATE operation_plans SET state='blocked',updated_at_unix=?2 WHERE project_id=(SELECT project_id FROM operation_runs WHERE operation_id=?1) AND ticket_run_id=(SELECT ticket_run_id FROM operation_runs WHERE operation_id=?1)",
-                params![operation_id.as_str(), now],
-            ).map_err(|error| error.to_string())?;
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        payload.approval = Some(receipt.clone());
-        let new_json = canonical_json(&payload)?;
-        let new_digest = digest(&new_json)?;
+        let approval_audit = serde_json::json!({
+            "request_id": capability.request_id().as_str(),
+            "operation_id": capability.operation_id().as_str(),
+            "material_digest": capability.material_digest().as_str(),
+            "binding_digest": capability.binding_digest().as_str(),
+            "configuration_digest": capability.configuration_digest().as_str(),
+            "policy_digest": capability.policy_digest().as_str(),
+            "decided_at_unix": capability.decided_at_unix(),
+        });
         tx.execute(
-            "UPDATE operation_runs SET approval_json=?2,request_json=?3,request_digest=?4,state='ready',updated_at_unix=?5 WHERE operation_id=?1 AND state='awaiting_approval'",
-            params![operation_id.as_str(),canonical_json(receipt)?,new_json,new_digest.as_str(),now],
+            "UPDATE operation_runs SET approval_json=?2,state='ready',updated_at_unix=?3 WHERE operation_id=?1 AND state='awaiting_approval'",
+            params![operation_id.as_str(),canonical_json(&approval_audit)?,now],
         ).map_err(|error| error.to_string())?;
         if dependencies_succeeded(&tx, &payload)? {
             enqueue_effect(&tx, &payload, now)?;
@@ -570,10 +599,24 @@ impl<'a> OperationsStore<'a> {
         if request_json != effect.request_json || request_digest != effect.request_digest {
             return Err("operation effect differs from its durable operation intent".into());
         }
-        if state == "awaiting_approval" {
-            return Err("operation effect is not in a dispatchable state".into());
+        if state == "awaiting_approval" && request.approval_request_id.is_none() {
+            return Err("approval-required operation has no human request identity".into());
         }
         Ok(request)
+    }
+
+    pub fn dependencies_succeeded(&self, request: &OperationEffectRequest) -> Result<bool, String> {
+        for dependency in &request.target.depends_on {
+            let succeeded: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_runs WHERE project_id=?1 AND ticket_run_id=?2 AND target_id=?3 AND state IN ('succeeded','skipped'))",
+                params![request.project_id.as_str(),request.ticket_run_id.as_str(),dependency],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if !succeeded {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn record_handler_failure(
@@ -590,6 +633,33 @@ impl<'a> OperationsStore<'a> {
             "unknown",
             now,
         )
+    }
+
+    pub fn record_approval_rejected(
+        &mut self,
+        owner_generation: u64,
+        operation_id: &OperationId,
+        observation_json: &str,
+        terminal_receipt_json: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_owner(&tx, owner_generation)?;
+        let changed = tx.execute(
+            "UPDATE operation_runs SET state='failed',observation_json=?2,terminal_receipt_json=?3,updated_at_unix=?4 WHERE operation_id=?1 AND state='awaiting_approval'",
+            params![operation_id.as_str(),observation_json,terminal_receipt_json,now],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("operation approval rejection is stale or no longer pending".into());
+        }
+        tx.execute(
+            "UPDATE operation_plans SET state='blocked',updated_at_unix=?2 WHERE project_id=(SELECT project_id FROM operation_runs WHERE operation_id=?1) AND ticket_run_id=(SELECT ticket_run_id FROM operation_runs WHERE operation_id=?1) AND state='required'",
+            params![operation_id.as_str(), now],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn plan_state(
@@ -702,6 +772,35 @@ impl super::ConfigStore {
     pub fn operations(&mut self) -> Result<OperationsStore<'_>, String> {
         OperationsStore::new(&mut self.connection)
     }
+
+    /// Read the immutable operation material behind a pending human approval.
+    /// This is intentionally available through `&ConfigStore` for fresh human
+    /// subject observers; it cannot create or accept an approval.
+    pub fn operation_approval_intent(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<OperationEffectRequest>, String> {
+        let row: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT request_json,state FROM operation_runs WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((json, state)) = row else {
+            return Ok(None);
+        };
+        let request: OperationEffectRequest = crate::protocol::parse_unique(json.as_bytes())?;
+        if state != "awaiting_approval" || request.approval_request_id.is_none() {
+            return Ok(None);
+        }
+        if canonical_json(&request)? != json || &request.subject.operation_id != operation_id {
+            return Err("stored operation approval intent is not canonically bound".into());
+        }
+        Ok(Some(request))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -733,6 +832,46 @@ fn enqueue_effect(
         .map_err(|error| error.to_string())?;
     if persisted.1 != request_digest.as_str() || persisted.0 != canonical_json(payload)? {
         return Err("operation ID is already bound to a different outbox intent".into());
+    }
+    Ok(())
+}
+
+fn enqueue_human_presentation(
+    tx: &rusqlite::Transaction<'_>,
+    request: &HumanRuntimeRequest,
+    rex_view_id: &Digest,
+    now: i64,
+) -> Result<(), String> {
+    let effect = HumanPresentationEffect {
+        request: request.clone(),
+        rex_view_id: rex_view_id.clone(),
+    };
+    let request_json = canonical_json(&effect)?;
+    let request_digest = digest(&request_json)?;
+    let operation_id = format!("present-{}", request.request_id.as_str());
+    let logical_key = format!(
+        "{}:{}:operation-approval:{}",
+        request
+            .subject
+            .ticket_run_id
+            .as_ref()
+            .ok_or("operation approval is missing ticket run")?,
+        request.subject.revision.0,
+        request.subject.subject_id,
+    );
+    tx.execute(
+        "INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,status,attempt_count,next_attempt_at_unix,owner_generation,receipt_json,last_error,created_at_unix) VALUES (?1,?2,'ticket_run',?3,?4,'request_human_review',?5,?6,?7,'pending',0,?8,NULL,NULL,NULL,?8) ON CONFLICT(operation_id) DO NOTHING",
+        params![operation_id,request.subject.project_id.as_str(),request.subject.ticket_run_id.as_ref().unwrap().as_str(),logical_key,request_json,request_digest.as_str(),request.subject.revision.0,now],
+    ).map_err(|error| error.to_string())?;
+    let stored: (String, String) = tx
+        .query_row(
+            "SELECT request_json,request_digest FROM effects WHERE operation_id=?1",
+            [&operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if stored.0 != request_json || stored.1 != request_digest.as_str() {
+        return Err("human operation approval ID is already bound to another request".into());
     }
     Ok(())
 }

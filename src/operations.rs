@@ -22,6 +22,10 @@ use crate::domain::ids::{
     Digest as ContentDigest, OperationId, ProjectId, RepositoryId, Revision, TicketId, TicketRunId,
 };
 use crate::domain::types::{ApprovalMode, OperationOutcome, OperationSource};
+use crate::human::{ReviewBundle, review_bundle_digest};
+use crate::human_runtime::{
+    HumanDecisionChoice, HumanPurpose, HumanRuntimeRequest, HumanSubjectBinding, HumanSubjectKind,
+};
 use crate::protocol::{MethodName, ProtocolError, RequestEnvelope, RequestId, ResponseEnvelope};
 
 pub const OPERATION_PROTOCOL_VERSION: u32 = 1;
@@ -358,15 +362,61 @@ impl OperationSubject {
     }
 }
 
-/// Host-recorded human decision, bound to the complete immutable operation
-/// subject. A boolean without this subject digest is not an authorization.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanApprovalReceipt {
-    pub request_id: String,
-    pub subject_digest: ContentDigest,
-    pub approved: bool,
-    pub decided_at: String,
+/// Host-minted capability for one exact operation approval. This type cannot
+/// cross JSON or mailbox boundaries and has no public constructor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OperationApprovalCapability {
+    operation_id: OperationId,
+    request_id: crate::domain::ids::HumanRequestId,
+    material_digest: ContentDigest,
+    binding_digest: ContentDigest,
+    configuration_digest: ContentDigest,
+    policy_digest: ContentDigest,
+    decided_at_unix: u64,
+}
+
+impl OperationApprovalCapability {
+    fn mint_after_human_store_validation(
+        operation_id: OperationId,
+        request_id: crate::domain::ids::HumanRequestId,
+        material_digest: ContentDigest,
+        binding_digest: ContentDigest,
+        configuration_digest: ContentDigest,
+        policy_digest: ContentDigest,
+        decided_at_unix: u64,
+    ) -> Self {
+        Self {
+            operation_id,
+            request_id,
+            material_digest,
+            binding_digest,
+            configuration_digest,
+            policy_digest,
+            decided_at_unix,
+        }
+    }
+
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    pub(crate) fn request_id(&self) -> &crate::domain::ids::HumanRequestId {
+        &self.request_id
+    }
+    pub(crate) fn material_digest(&self) -> &ContentDigest {
+        &self.material_digest
+    }
+    pub(crate) fn binding_digest(&self) -> &ContentDigest {
+        &self.binding_digest
+    }
+    pub(crate) fn configuration_digest(&self) -> &ContentDigest {
+        &self.configuration_digest
+    }
+    pub(crate) fn policy_digest(&self) -> &ContentDigest {
+        &self.policy_digest
+    }
+    pub(crate) fn decided_at_unix(&self) -> u64 {
+        self.decided_at_unix
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -537,7 +587,7 @@ pub fn authorize_operation(
     plan: &ValidatedOperationPlan,
     target: &OperationTarget,
     subject: OperationSubject,
-    approval: Option<&HumanApprovalReceipt>,
+    approval: Option<&OperationApprovalCapability>,
 ) -> Result<OperationPermit, AuthorizationError> {
     let config = &applied.config;
     let applied_config_digest =
@@ -609,19 +659,26 @@ pub fn authorize_operation(
             .human_approval_environments
             .iter()
             .any(|environment| environment == &target.environment);
+    let authority_digest = operation_authority_digest(
+        config,
+        &subject.project_id,
+        &plan.recipe_id,
+        &target.repository,
+        &target.action,
+    )
+    .map_err(AuthorizationError::Invalid)?;
     let approval_digest = if requires_human {
         let receipt = approval.ok_or(AuthorizationError::ApprovalRequired)?;
         let subject_digest = subject.digest().map_err(AuthorizationError::Invalid)?;
-        if receipt.subject_digest != subject_digest
-            || receipt.request_id.trim().is_empty()
-            || receipt.decided_at.trim().is_empty()
+        if receipt.operation_id != subject.operation_id
+            || receipt.material_digest != subject_digest
+            || receipt.configuration_digest != applied_config_digest
+            || receipt.policy_digest != authority_digest
+            || receipt.decided_at_unix == 0
         {
             return Err(AuthorizationError::StaleApproval);
         }
-        if !receipt.approved {
-            return Err(AuthorizationError::Rejected);
-        }
-        Some(receipt.subject_digest.clone())
+        Some(receipt.binding_digest.clone())
     } else {
         if approval.is_some() {
             return Err(AuthorizationError::Invalid(
@@ -632,14 +689,6 @@ pub fn authorize_operation(
         None
     };
     let command = bind_command_execution(action).map_err(AuthorizationError::Invalid)?;
-    let authority_digest = operation_authority_digest(
-        config,
-        &subject.project_id,
-        &plan.recipe_id,
-        &target.repository,
-        &target.action,
-    )
-    .map_err(AuthorizationError::Invalid)?;
     Ok(OperationPermit {
         subject,
         selector: target.selector.clone(),
@@ -650,6 +699,173 @@ pub fn authorize_operation(
         authority_digest,
         timeout_seconds: target.timeout_seconds,
     })
+}
+
+pub fn operation_policy_digest(
+    config: &Config,
+    subject: &OperationSubject,
+) -> Result<ContentDigest, String> {
+    operation_authority_digest(
+        config,
+        &subject.project_id,
+        &subject.recipe_id,
+        &subject.repository_id,
+        &subject.action_id,
+    )
+}
+
+pub fn operation_review_bundle(
+    applied: &AppliedConfig,
+    subject: &OperationSubject,
+    target: &OperationTarget,
+    ticket_id: &TicketId,
+) -> Result<ReviewBundle, String> {
+    if applied.digest != subject.config_digest
+        || target.id != subject.target_id
+        || target.action != subject.action_id
+        || target.repository != subject.repository_id
+        || target.environment != subject.environment
+    {
+        return Err("operation review subject differs from its applied config".into());
+    }
+    let action = applied
+        .config
+        .operation_actions
+        .get(&subject.action_id)
+        .ok_or_else(|| "operation review action is absent from applied config".to_owned())?;
+    let action_detail = match action {
+        OperationActionConfig::ForgeObservation => "Action kind: forge observation".to_owned(),
+        OperationActionConfig::Command { command } => format!(
+            "Configured argv (direct execution, no shell): {}",
+            serde_json::to_string(command).map_err(|error| error.to_string())?
+        ),
+    };
+    let selector = serde_json::to_string(&target.selector).map_err(|error| error.to_string())?;
+    let predicate =
+        serde_json::to_string(&target.success_predicate).map_err(|error| error.to_string())?;
+    let bundle = ReviewBundle {
+        title: format!("Approve operation {}", subject.target_id),
+        summary: format!(
+            "Operation {} for ticket run {} targets repository {} in environment {}. Its source is the full Git object ID {}. The operation will not be considered successful until its configured success predicate is observed.",
+            subject.operation_id,
+            subject.ticket_run_id,
+            subject.repository_id,
+            subject.environment,
+            subject.source_sha
+        ),
+        risk: None,
+        repositories: Vec::new(),
+        evidence: vec![
+            crate::human::ReviewEvidence {
+                title: "Configured action".into(),
+                body: format!("Action ID: {}\n{action_detail}", subject.action_id),
+                truncated: false,
+            },
+            crate::human::ReviewEvidence {
+                title: "Target and success condition".into(),
+                body: format!(
+                    "Target selector: {selector}\nSuccess predicate: {predicate}\nTimeout: {} seconds",
+                    target.timeout_seconds
+                ),
+                truncated: false,
+            },
+            crate::human::ReviewEvidence {
+                title: "Ticket and delivery identity".into(),
+                body: format!(
+                    "Ticket: {ticket_id}\nTicket run: {}\nTicket revision: {}\nRecipe: {}\nPlan digest: {}\nOperation subject digest: {}",
+                    subject.ticket_run_id,
+                    subject.ticket_revision.0,
+                    subject.recipe_id,
+                    subject.plan_digest,
+                    subject.digest()?
+                ),
+                truncated: false,
+            },
+        ],
+        unknowns: vec![
+            "The operation has not run yet; its external outcome cannot be known at approval time."
+                .into(),
+        ],
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+pub fn operation_human_subject_binding(
+    applied: &AppliedConfig,
+    subject: &OperationSubject,
+    bundle: &ReviewBundle,
+) -> Result<HumanSubjectBinding, String> {
+    if applied.digest != subject.config_digest {
+        return Err("operation subject config digest differs from applied snapshot".into());
+    }
+    Ok(HumanSubjectBinding {
+        project_id: subject.project_id.clone(),
+        kind: HumanSubjectKind::Operation,
+        subject_id: subject.operation_id.to_string(),
+        ticket_run_id: Some(subject.ticket_run_id.clone()),
+        revision: subject.ticket_revision,
+        material_digest: subject.digest()?,
+        configuration_digest: subject.config_digest.clone(),
+        policy_digest: operation_policy_digest(&applied.config, subject)?,
+        bundle_digest: review_bundle_digest(bundle)?,
+    })
+}
+
+/// Mint a non-serializable operation capability only from the opaque receipt
+/// returned by the durable human store and a freshly reconstructed complete
+/// review subject. `receipt` cannot be created from Agent JSON.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_operation_approval(
+    applied: &AppliedConfig,
+    subject: &OperationSubject,
+    target: &OperationTarget,
+    expected_request_id: &crate::domain::ids::HumanRequestId,
+    human_request: &HumanRuntimeRequest,
+    current_bundle: &ReviewBundle,
+    receipt: &crate::store::human::HumanApprovalReceipt,
+    now_unix: u64,
+) -> Result<OperationApprovalCapability, String> {
+    let binding = operation_human_subject_binding(applied, subject, current_bundle)?;
+    let material_digest = binding.material_digest.clone();
+    let policy_digest = binding.policy_digest.clone();
+    let full_binding_digest = binding.digest()?;
+    if applied.digest != subject.config_digest
+        || human_request.request_id != *expected_request_id
+        || human_request.purpose != HumanPurpose::OperationApproval
+        || human_request.subject != binding
+        || human_request.review_bundle != *current_bundle
+        || !human_request
+            .choices
+            .contains(&HumanDecisionChoice::Approve)
+        || human_request.expires_at_unix <= now_unix
+        || target.id != subject.target_id
+        || target.action != subject.action_id
+        || target.repository != subject.repository_id
+        || target.environment != subject.environment
+        || receipt.request_id() != expected_request_id
+        || receipt.subject_digest() != &full_binding_digest
+        || receipt.configuration_digest() != &subject.config_digest
+        || receipt.policy_digest() != &policy_digest
+        || !receipt.approved()
+        || receipt.choice() != HumanDecisionChoice::Approve
+        || receipt.decided_at_unix() > now_unix
+        || receipt.request_expires_at_unix() <= now_unix
+        || receipt.request_expires_at_unix() != human_request.expires_at_unix
+    {
+        return Err("human approval is stale or bound to different operation evidence".into());
+    }
+    Ok(
+        OperationApprovalCapability::mint_after_human_store_validation(
+            subject.operation_id.clone(),
+            expected_request_id.clone(),
+            material_digest,
+            full_binding_digest,
+            subject.config_digest.clone(),
+            policy_digest,
+            receipt.decided_at_unix(),
+        ),
+    )
 }
 
 fn operation_authority_digest(
@@ -1867,6 +2083,29 @@ mod tests {
         }
     }
 
+    fn approval_capability(
+        applied: &AppliedConfig,
+        subject: &OperationSubject,
+        request_id: &str,
+    ) -> OperationApprovalCapability {
+        let material_digest = subject.digest().unwrap();
+        let policy_digest = operation_policy_digest(&applied.config, subject).unwrap();
+        let binding_digest = ContentDigest::parse(format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}", material_digest, request_id).as_bytes())
+        ))
+        .unwrap();
+        OperationApprovalCapability::mint_after_human_store_validation(
+            subject.operation_id.clone(),
+            crate::domain::ids::HumanRequestId::parse(request_id).unwrap(),
+            material_digest,
+            binding_digest,
+            subject.config_digest.clone(),
+            policy_digest,
+            1,
+        )
+    }
+
     fn delivery_facts(target: &OperationTarget) -> DeliveryFacts {
         DeliveryFacts {
             merge_commits: BTreeMap::from([(target.repository.clone(), SHA.into())]),
@@ -1921,12 +2160,7 @@ mod tests {
         stale
             .expected_preconditions
             .insert("branch".into(), Value::String("release".into()));
-        let receipt = HumanApprovalReceipt {
-            request_id: "hr-1".into(),
-            subject_digest: base.digest().unwrap(),
-            approved: true,
-            decided_at: "2026-11-07T00:00:00Z".into(),
-        };
+        let receipt = approval_capability(&applied, &base, "hr-1");
         assert_eq!(
             authorize_operation(&applied, &facts, &plan, target, stale, Some(&receipt))
                 .unwrap_err(),
@@ -1936,7 +2170,7 @@ mod tests {
             authorize_operation(&applied, &facts, &plan, target, base, Some(&receipt)).unwrap();
         assert_eq!(
             permit.invoke_params().unwrap().approval_digest,
-            Some(receipt.subject_digest)
+            Some(receipt.binding_digest().clone())
         );
     }
 
@@ -1992,12 +2226,7 @@ mod tests {
         let target = &plan.targets[0];
         let facts = delivery_facts(target);
         let subject = subject(&plan, target);
-        let approval = HumanApprovalReceipt {
-            request_id: "human-2".into(),
-            subject_digest: subject.digest().unwrap(),
-            approved: true,
-            decided_at: "2026-11-07T00:00:00Z".into(),
-        };
+        let approval = approval_capability(&applied, &subject, "human-2");
         let permit =
             authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
         let mut replaced = applied.clone();
@@ -2049,12 +2278,7 @@ mod tests {
         let target = &plan.targets[0];
         let facts = delivery_facts(target);
         let subject = subject(&plan, target);
-        let approval = HumanApprovalReceipt {
-            request_id: "human-3".into(),
-            subject_digest: subject.digest().unwrap(),
-            approved: true,
-            decided_at: "2026-11-07T00:00:00Z".into(),
-        };
+        let approval = approval_capability(&applied, &subject, "human-3");
         let permit =
             authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
         std::fs::write(&executable, b"#!/bin/sh\nexit 42\n").unwrap();
@@ -2081,12 +2305,7 @@ mod tests {
         let target = &plan.targets[0];
         let facts = delivery_facts(target);
         let subject = subject(&plan, target);
-        let approval = HumanApprovalReceipt {
-            request_id: "human-4".into(),
-            subject_digest: subject.digest().unwrap(),
-            approved: true,
-            decided_at: "2026-11-07T00:00:00Z".into(),
-        };
+        let approval = approval_capability(&applied, &subject, "human-4");
         let permit =
             authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
         let mut runner = FakeRunner::default();
@@ -2469,12 +2688,7 @@ mod tests {
         let target = &plan.targets[0];
         let facts = delivery_facts(target);
         let subject = subject(&plan, target);
-        let approval = HumanApprovalReceipt {
-            request_id: "human-1".into(),
-            subject_digest: subject.digest().unwrap(),
-            approved: true,
-            decided_at: "2026-11-07T00:00:00Z".into(),
-        };
+        let approval = approval_capability(&applied, &subject, "human-1");
         let permit =
             authorize_operation(&applied, &facts, &plan, target, subject, Some(&approval)).unwrap();
         let mut runner = FakeRunner {
@@ -2498,7 +2712,7 @@ mod tests {
         assert_eq!(request.params.source_sha, SHA);
         assert_eq!(
             request.params.approval_digest,
-            Some(approval.subject_digest)
+            Some(approval.binding_digest().clone())
         );
         assert_eq!(classify_invoke(&result), OperationOutcome::Pending);
     }

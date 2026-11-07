@@ -11,20 +11,34 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppliedConfig;
-use crate::domain::ids::{Digest, OperationId};
+use crate::domain::ids::{Digest, HumanRequestId, OperationId};
 use crate::effects::{
     AbsentProof, EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation,
     EffectRequest,
 };
+use crate::human::ReviewBundle;
 use crate::operations::{
-    AdapterCall, FindOutcome, FindParams, HumanApprovalReceipt, InvokeOutcome, InvokeResult,
-    OperationObservation, OperationPermit, PredicateResult, ProcessCommandRunner,
-    authorize_operation, call_command_adapter, new_request, validate_recipe,
+    AdapterCall, FindOutcome, FindParams, InvokeOutcome, InvokeResult, OperationObservation,
+    OperationPermit, PredicateResult, ProcessCommandRunner, authorize_operation,
+    call_command_adapter, new_request, operation_human_subject_binding, validate_recipe,
+    verify_operation_approval,
 };
 use crate::store::{
     EffectIntent,
     operations::{DurableOperationState, OperationEffectRequest},
 };
+
+pub fn operation_review_bundle(
+    applied: &AppliedConfig,
+    request: &OperationEffectRequest,
+) -> Result<ReviewBundle, String> {
+    crate::operations::operation_review_bundle(
+        applied,
+        &request.subject,
+        &request.target,
+        &request.ticket_id,
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationExecutionMode {
@@ -195,6 +209,7 @@ impl OperationEffectHandler {
                 }
                 return Ok(cached.outcome);
             }
+            drop(store);
             let applied = self
                 .snapshots
                 .get(request.config_digest.as_str())
@@ -215,22 +230,103 @@ impl OperationEffectHandler {
             {
                 return Err("operation target differs from the applied recipe".into());
             }
-            let stored_approval = record
-                .approval_json
-                .as_deref()
-                .map(serde_json::from_str::<HumanApprovalReceipt>)
-                .transpose()
-                .map_err(|_| "stored approval receipt is invalid".to_owned())?;
-            if stored_approval != request.approval {
-                return Err("operation approval differs from its accepted durable receipt".into());
+            if !context
+                .store
+                .operations()?
+                .dependencies_succeeded(&request)?
+            {
+                return Ok(pending_receipt(
+                    &request.subject.operation_id,
+                    "waiting_for_dependencies",
+                    "dependent operations have not all succeeded",
+                ));
             }
+            let approval = if let Some(request_id) = &request.approval_request_id {
+                let request_id = HumanRequestId::parse(request_id.clone())?;
+                let Some(human_record) = context.store.current_human_request(&request_id)? else {
+                    return Ok(pending_receipt(
+                        &request.subject.operation_id,
+                        "waiting_for_human_request",
+                        "operation review request has not been presented yet",
+                    ));
+                };
+                let lifecycle = human_record.lifecycle;
+                let human_request = human_record.request;
+                let current_bundle = operation_review_bundle(applied, &request)?;
+                let binding =
+                    operation_human_subject_binding(applied, &request.subject, &current_bundle)?;
+                let now = u64::try_from(context.now_unix)
+                    .map_err(|_| "controller time is invalid".to_owned())?;
+                let receipt = context.store.accepted_human_approval(
+                    &request_id,
+                    &binding.digest()?,
+                    &binding.configuration_digest,
+                    &binding.policy_digest,
+                    now,
+                )?;
+                let Some(receipt) = receipt else {
+                    if matches!(
+                        lifecycle,
+                        crate::human_runtime::HumanRequestLifecycle::Decided
+                            | crate::human_runtime::HumanRequestLifecycle::Stale
+                            | crate::human_runtime::HumanRequestLifecycle::Expired
+                            | crate::human_runtime::HumanRequestLifecycle::Cancelled
+                    ) {
+                        let rejection = serde_json::json!({
+                            "operation_id": request.subject.operation_id,
+                            "state": "human_approval_rejected_or_stale",
+                            "lifecycle": format!("{lifecycle:?}"),
+                        })
+                        .to_string();
+                        let outcome = OperationExecutionOutcome::Rejected {
+                            receipt_json: rejection.clone(),
+                        };
+                        let terminal = store_terminal_receipt(effect, &outcome)?;
+                        context.store.operations()?.record_approval_rejected(
+                            context.owner_generation,
+                            &request.subject.operation_id,
+                            &rejection,
+                            &terminal,
+                            context.now_unix,
+                        )?;
+                        return Ok(outcome);
+                    }
+                    return Ok(pending_receipt(
+                        &request.subject.operation_id,
+                        "waiting_for_human_approval",
+                        "operation requires an exact, unexpired human approval",
+                    ));
+                };
+                let capability = verify_operation_approval(
+                    applied,
+                    &request.subject,
+                    &request.target,
+                    &request_id,
+                    &human_request,
+                    &current_bundle,
+                    &receipt,
+                    now,
+                )?;
+                if record.state == DurableOperationState::AwaitingApproval {
+                    context.store.operations()?.accept_approval(
+                        context.owner_generation,
+                        &request.subject.operation_id,
+                        &capability,
+                        context.now_unix,
+                    )?;
+                }
+                Some(capability)
+            } else {
+                None
+            };
+            let _approval_audit = record.approval_json;
             let permit = authorize_operation(
                 applied,
                 &request.delivery_facts,
                 &plan,
                 target,
                 request.subject.clone(),
-                request.approval.as_ref(),
+                approval.as_ref(),
             )
             .map_err(|error| error.to_string())?;
             (request, applied.clone(), target.clone(), permit)
@@ -710,6 +806,7 @@ mod tests {
     use crate::effects::{
         DispatchTick, EffectContext, EffectDispatcher, EffectLimits, EffectMode, EffectRequest,
     };
+    use crate::human::review_bundle_digest;
     use crate::operations::{DeliveryFacts, validate_recipe};
     use crate::store::operations::CompletionGate;
     use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
@@ -772,6 +869,68 @@ mod tests {
             source_files: vec![],
             digest: Digest::parse("a".repeat(64)).unwrap(),
         }
+    }
+
+    #[test]
+    fn operation_approval_bundle_is_recomputed_from_bound_config_and_subject() {
+        let temp = tempdir().unwrap();
+        let applied = applied_config(&temp.path().join("adapter-state.json"));
+        let plan = validate_recipe(&applied.config, "rollout").unwrap();
+        let target = plan.targets()[0].clone();
+        let project_id = ProjectId::parse("operations_project").unwrap();
+        let ticket_id = TicketId::parse("ticket-1").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-1").unwrap();
+        let operation_id = OperationId::parse("operation-1").unwrap();
+        let delivery_facts = DeliveryFacts {
+            merge_commits: BTreeMap::from([(target.repository.clone(), SOURCE_SHA.into())]),
+            planned_revisions: BTreeMap::new(),
+        };
+        let subject = crate::operations::OperationSubject {
+            project_id: project_id.clone(),
+            ticket_id: ticket_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            ticket_revision: Revision(4),
+            operation_id: operation_id.clone(),
+            recipe_id: plan.recipe_id().to_owned(),
+            plan_digest: plan.digest().clone(),
+            config_digest: applied.digest.clone(),
+            target_id: target.id.clone(),
+            action_id: target.action.clone(),
+            repository_id: target.repository.clone(),
+            environment: target.environment.clone(),
+            source_sha: SOURCE_SHA.into(),
+            expected_preconditions: BTreeMap::new(),
+        };
+        let request = OperationEffectRequest {
+            project_id,
+            ticket_id,
+            ticket_run_id,
+            ticket_revision: Revision(4),
+            config_revision: Revision(3),
+            config_digest: applied.digest.clone(),
+            recipe_id: plan.recipe_id().to_owned(),
+            plan_digest: plan.digest().clone(),
+            delivery_facts,
+            subject,
+            target,
+            approval_request_id: Some("human-operation-1".into()),
+        };
+        let bundle = operation_review_bundle(&applied, &request).unwrap();
+        assert!(bundle.summary.contains(SOURCE_SHA));
+        assert!(bundle.evidence[0].body.contains("lost_reply_adapter.py"));
+        assert!(
+            bundle.evidence[2]
+                .body
+                .contains(&request.subject.digest().unwrap().to_string())
+        );
+        assert_eq!(
+            review_bundle_digest(&bundle).unwrap(),
+            review_bundle_digest(&bundle).unwrap()
+        );
+
+        let mut changed = applied;
+        changed.digest = Digest::parse("f".repeat(64)).unwrap();
+        assert!(operation_review_bundle(&changed, &request).is_err());
     }
 
     #[test]
