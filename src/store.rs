@@ -37,8 +37,6 @@ pub const SCHEMA_VERSION: i64 = 12;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
-#[path = "store/agent_wake_context.rs"]
-pub(crate) mod agent_wake_context;
 pub mod host_jobs;
 pub mod human;
 #[path = "store/learning.rs"]
