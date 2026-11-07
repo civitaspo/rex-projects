@@ -9,7 +9,8 @@ local failure = RuntimeDetails.describe(options, pin, nil, "source executable is
 assert(failure.ready == false, "failed bootstrap must be reported as not ready")
 assert(failure.source_kind == "developer override", "failed details must retain the selected source kind")
 assert(failure.configured_selection == options.cli, "failed details must retain configured CLI selection")
-assert(failure.expected_version == pin.version, "failed details must report expected version")
+assert(failure.pinned_release_version == pin.version, "failed details must report the release pin")
+assert(failure.expected_version == nil, "developer override details must not imply an exact release version")
 assert(failure.expected_cli_protocol == 1, "failed details must report expected CLI protocol")
 assert(failure.cache_state == "not verified", "failed details must describe cache verification state")
 assert(failure.error == "source executable is unavailable", "failed details must retain the setup error")
@@ -29,6 +30,8 @@ local success = RuntimeDetails.describe({}, pin, {
 assert(success.ready == true, "verified bootstrap must be reported as ready")
 assert(success.source_kind == "release", "success details must report resolved source kind")
 assert(success.configured_selection == "embedded release pin", "default pin selection must be explicit")
+assert(success.pinned_release_version == pin.version, "success details must report the release pin")
+assert(success.expected_version == pin.version, "release mode must report its exact expected version")
 assert(
   success.expected_cli_protocol == 1 and success.cli_protocol == 1,
   "success must report expected and observed protocol"
@@ -37,6 +40,21 @@ assert(success.cache_state == "verified", "success details must identify verifie
 assert(success.cli_path ~= nil and success.digest ~= nil, "success details must include resolved binary identity")
 assert(success.database_schema == 4, "success details must report the observed database schema")
 assert(success.error == nil, "successful details must omit stale failure information")
+
+local development = RuntimeDetails.describe(options, pin, {
+  source = "developer",
+  cli_path = "/cache/rex-projects/dev/build-digest/rex-projects",
+  digest = string.rep("b", 64),
+  version = {
+    version = "0.1.0-dev.42",
+    target = "aarch64-apple-darwin",
+    cli_protocol = 1,
+    database_schema = 4,
+  },
+})
+assert(development.version == "0.1.0-dev.42", "developer details must report the actual build version")
+assert(development.pinned_release_version == pin.version, "developer details must keep the release pin visible")
+assert(development.expected_version == nil, "developer mode must not require the pinned release version")
 
 local secret_env = RuntimeDetails.describe({}, pin, nil, "bootstrap failed")
 for _, key in ipairs({ "PATH", "HOME", "TOKEN", "environment" }) do
