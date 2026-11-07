@@ -1810,6 +1810,59 @@ impl ConfigStore {
         }))
     }
 
+    /// List a bounded page of durable, succeeded effects for one exact subject.
+    /// Callers must still validate each typed receipt against its original request
+    /// and the current domain state before producing a transition.
+    pub fn list_succeeded_effect_receipts(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        subject_type: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SucceededEffectReceipt>, String> {
+        if subject_type.is_empty()
+            || subject_type.len() > 128
+            || subject_id.is_empty()
+            || subject_id.len() > 512
+        {
+            return Err("effect subject identity is invalid".into());
+        }
+        if limit == 0 || limit > 256 {
+            return Err("succeeded effect query limit must be between 1 and 256".into());
+        }
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id FROM effects WHERE project_id=?1 AND subject_type=?2 AND subject_id=?3 AND status='succeeded' ORDER BY created_at_unix,operation_id LIMIT ?4",
+        ).map_err(|error| error.to_string())?;
+        let operation_ids = statement
+            .query_map(
+                params![project_id.as_str(), subject_type, subject_id, limit as u64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        operation_ids
+            .iter()
+            .map(|operation_id| {
+                self.succeeded_effect_receipt(operation_id)?
+                    .ok_or_else(|| "succeeded effect disappeared during read".to_owned())
+            })
+            .collect()
+    }
+
     pub fn claim_ticket(
         &mut self,
         owner_generation: u64,
