@@ -371,20 +371,14 @@ pub fn human_runtime_present_envelope(
         expires_at: request.expires_at_unix,
         response_command,
     };
-    let envelope = RequestEnvelope {
-        schema_version: SCHEMA_VERSION,
-        request_id: protocol_request_id,
-        operation_id: None,
-        method: MethodName::new("human.present").expect("static method is valid"),
-        project_id: Some(request.subject.project_id.clone()),
-        run_id: None,
-        attempt: None,
-        run_epoch: None,
-        expected_subject_revision: Some(request.subject.revision.0),
-        role: None,
-        request_type: None,
+    let mut envelope = RequestEnvelope::host(
+        protocol_request_id,
+        None,
+        MethodName::new("human.present").expect("static method is valid"),
+        Some(request.subject.project_id.clone()),
         params,
-    };
+    );
+    envelope.expected_subject_revision = Some(request.subject.revision.0);
     envelope.validate()?;
     let encoded = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
     if encoded.len() > MAX_HUMAN_REQUEST_BYTES {
