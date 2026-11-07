@@ -566,7 +566,7 @@ mod tests {
             ticket_run_id: TicketRunId::parse("ticket/run:1").unwrap(),
             title: "Review result".into(),
             summary: "Recovered after a bounded retry.".into(),
-            findings: vec!["Keep retries bounded".into()],
+            findings: vec![],
             sources: vec![KnowledgeSource {
                 id: "ticket-1".into(),
                 title: "Ticket".into(),
@@ -591,6 +591,7 @@ mod tests {
         assert!(text.contains("status: draft"));
         assert!(text.contains("generated:\n  by: rex-projects/0.1.0"));
         assert!(text.contains("trust: \"untrusted\""));
+        assert!(text.contains("observed issue"));
         assert!(!text.contains("credibility:"));
         let second = publish_postmortem(dir.path(), &i).unwrap();
         assert!(second.already_published);

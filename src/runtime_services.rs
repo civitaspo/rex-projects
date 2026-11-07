@@ -1436,6 +1436,13 @@ impl FactoryRuntimeServices for RuntimeServices {
         store.ingest_next_spooled_agent_result(&self.artifacts, owner_generation, 32)
     }
 
+    fn read_verified_artifact(
+        &self,
+        artifact: &crate::store::artifact_registry::VerifiedArtifact,
+    ) -> Result<Vec<u8>, String> {
+        artifact.read_bytes(&self.artifacts)
+    }
+
     fn observe_base_heads(
         &mut self,
     ) -> Result<BTreeMap<crate::domain::ids::RepositoryId, String>, String> {

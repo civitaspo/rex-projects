@@ -114,6 +114,11 @@ pub trait FactoryRuntimeServices {
         now_unix: i64,
     ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String>;
 
+    fn read_verified_artifact(
+        &self,
+        artifact: &crate::store::artifact_registry::VerifiedArtifact,
+    ) -> Result<Vec<u8>, String>;
+
     fn observe_base_heads(
         &mut self,
     ) -> Result<std::collections::BTreeMap<crate::domain::ids::RepositoryId, String>, String>;
@@ -1581,6 +1586,7 @@ fn apply_postmortem_result(
     services: &impl FactoryRuntimeServices,
     result: &crate::store::agent_results::IngestedAgentResult,
 ) -> Result<bool, String> {
+    use crate::domain::ids::OperationId;
     use crate::engine::orchestration::RoleResultPayload;
 
     let binding = &result.validated.binding;
@@ -1625,6 +1631,21 @@ fn apply_postmortem_result(
         .filter(|value| !value.trim().is_empty())
         .ok_or("Postmortem manifest lacks summary")?
         .clone();
+    let operation_id = OperationId::parse(format!("knowledge-{}", result.receipt.evidence_id()))?;
+    if let Some(intent) = store.knowledge_publication_intent(&operation_id)? {
+        if intent.project_id != run.project_id || intent.ticket_run_id != *ticket_run_id {
+            return Err("stored knowledge request does not match this Postmortem result".into());
+        }
+        store.prepare_knowledge_publication(owner_generation, &intent)?;
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            revision.0,
+            crate::store::agent_results::ResultDisposition::Applied,
+        )?;
+        return Ok(true);
+    }
+    let mut source_bytes = 0usize;
     let sources = payload
         .source_references
         .iter()
@@ -1635,20 +1656,30 @@ fn apply_postmortem_result(
             {
                 return Err("Postmortem source is not the matching registered artifact".to_owned());
             }
+            let artifact_size = usize::try_from(reference.bytes)
+                .map_err(|_| "Postmortem source exceeds the article byte limit")?;
+            source_bytes = source_bytes
+                .checked_add(artifact_size)
+                .ok_or("Postmortem source byte count overflow")?;
+            if source_bytes > crate::knowledge::DEFAULT_MAX_ARTICLE_BYTES {
+                return Err("Postmortem source material exceeds the configured byte limit".into());
+            }
+            let content = services.read_verified_artifact(verified)?;
+            if content.len() != artifact_size {
+                return Err("registered Postmortem source size changed after verification".into());
+            }
+            let content = String::from_utf8(content)
+                .map_err(|_| "registered Postmortem source is not UTF-8")?;
             Ok(crate::knowledge::KnowledgeSource {
                 id: reference.artifact_id.as_str().to_owned(),
                 title: "Registered Postmortem source".into(),
                 resource: format!("rex-artifact://{}", reference.artifact_id),
-                content: format!(
-                    "Registered immutable source artifact {}; curated findings are listed separately.",
-                    reference.artifact_id
-                ),
+                content,
                 digest: reference.digest.clone(),
                 trusted: false,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let operation_id = OperationId::parse(format!("knowledge-{}", result.receipt.evidence_id()))?;
     let input = crate::knowledge::PostmortemInput {
         operation_id: operation_id.clone(),
         project_id: run.project_id.clone(),
