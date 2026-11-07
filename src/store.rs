@@ -37,6 +37,8 @@ pub const SCHEMA_VERSION: i64 = 12;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
+#[path = "store/agent_wake_context.rs"]
+pub(crate) mod agent_wake_context;
 pub mod host_jobs;
 pub mod human;
 #[path = "store/learning.rs"]
@@ -4065,7 +4067,7 @@ impl ConfigStore {
                 "AgentRun is not launch-pending under the active controller generation".into(),
             );
         }
-        let stored_ack: Option<(String, String)> = tx
+        let stored_ack: Option<(Option<String>, Option<String>)> = tx
             .query_row(
                 "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
                 [request.agent_run_id.as_str()],
@@ -4077,7 +4079,7 @@ impl ConfigStore {
         let request_digest =
             Digest::parse(format!("{:x}", Sha256::digest(request_json.as_bytes())))?;
         let receipt_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
-        if let Some((previous_digest, previous_receipt)) = stored_ack {
+        if let Some((previous_digest, previous_receipt)) = persisted_start_ack(stored_ack)? {
             if previous_digest != request_digest.as_str() || previous_receipt != receipt_json {
                 return Err(
                     "AgentRun already has a different persisted start acknowledgement".into(),
@@ -4342,6 +4344,16 @@ fn validate_effect_subject(
     Ok(())
 }
 
+pub(crate) fn persisted_start_ack(
+    stored: Option<(Option<String>, Option<String>)>,
+) -> Result<Option<(String, String)>, String> {
+    match stored {
+        None | Some((None, None)) => Ok(None),
+        Some((Some(digest), Some(receipt))) => Ok(Some((digest, receipt))),
+        Some(_) => Err("Agent launch state has a partial persisted start acknowledgement".into()),
+    }
+}
+
 fn validate_effect(effect: &EffectIntent) -> Result<(), String> {
     if effect.operation_id.is_empty()
         || effect.logical_key.is_empty()
@@ -4482,7 +4494,7 @@ mod tests {
     use super::{
         AgentLaunchAuthority, ConfigStore, DurableInput, EffectIntent, EffectOutcome,
         ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, content_digest,
-        durable_input_digest,
+        durable_input_digest, persisted_start_ack,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
@@ -4490,6 +4502,19 @@ mod tests {
     use crate::launch::{RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind};
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn start_ack_decoder_treats_empty_pair_as_pending_and_rejects_partial_receipts() {
+        assert_eq!(persisted_start_ack(None).unwrap(), None);
+        assert_eq!(persisted_start_ack(Some((None, None))).unwrap(), None);
+        assert_eq!(
+            persisted_start_ack(Some((Some("digest".into()), Some("receipt".into()))))
+                .unwrap(),
+            Some(("digest".into(), "receipt".into()))
+        );
+        assert!(persisted_start_ack(Some((Some("digest".into()), None))).is_err());
+        assert!(persisted_start_ack(Some((None, Some("receipt".into())))).is_err());
+    }
 
     fn snapshot(digest: &str) -> AppliedConfig {
         AppliedConfig {
