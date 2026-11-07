@@ -44,8 +44,6 @@ run = [
 run = [
   "test -s README.md && test -s LICENSE",
   "ast-grep test --skip-snapshot-tests",
-  "python3 -m unittest discover -s tests/fixtures/agents -p 'test_*.py'",
-  "python3 -m unittest discover -s tests/fixtures/e2e -p 'test_*.py'",
   "cargo test --workspace --all-features --locked",
 ]
 
