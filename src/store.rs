@@ -12,8 +12,9 @@ use crate::config::{AppliedConfig, Config, Profile, SourceFile};
 use crate::domain::ids::{
     Digest, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
 };
+use crate::engine::reducer::{Input, TicketRun, WakeTarget, reduce};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 6;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
@@ -26,6 +27,14 @@ type DueEffectRow = (
     String,
     String,
     Option<u64>,
+);
+type PendingControlRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
 );
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +100,71 @@ pub struct OwnerMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectStatus {
+    pub id: ProjectId,
+    pub mode: String,
+    pub desired_lifecycle: String,
+    pub observed_lifecycle: String,
+    pub project_epoch: u64,
+    pub next_due_at_unix: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlCommand {
+    pub request_id: String,
+    pub kind: String,
+    pub project_id: Option<ProjectId>,
+    pub lifecycle: Option<String>,
+    pub created_at_unix: i64,
+    pub applied_config: Option<AppliedRevision>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ConfigApplyPayload {
+    source_identity: String,
+    snapshot: AppliedConfig,
+    expectation: ExpectedRevision,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct HumanClaimRelease {
+    pub namespace: String,
+    pub ticket: String,
+    pub ticket_run_id: String,
+    pub generation: u64,
+    pub expected_revision: u64,
+    pub reason: String,
+    pub disposition: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStatus {
+    pub schema_version: i64,
+    pub owner_generation: Option<u64>,
+    pub owner_pid: Option<u32>,
+    pub owner_process_start_identity: Option<String>,
+    pub owner_started_at_unix: Option<i64>,
+    pub projects: Vec<ProjectStatus>,
+    pub pending_commands: u64,
+    pub rejected_commands: u64,
+    pub pending_effects: u64,
+    pub uncertain_effects: u64,
+    pub occupied_slots: u64,
+    pub observed_at_unix: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentMailboxRegistration {
+    pub agent_run_id: String,
+    pub canonical_directory: String,
+    pub capability_digest: String,
+    pub expires_at_unix: u64,
+    pub max_request_bytes: usize,
+    pub max_pending_requests: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadyWork {
     pub work_key: String,
     pub project_id: ProjectId,
@@ -101,7 +175,7 @@ pub struct ReadyWork {
     pub project_epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 pub enum ExpectedRevision {
     Bootstrap,
     Current(Revision),
@@ -207,8 +281,29 @@ impl ConfigStore {
                 "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
             )
             .map_err(|e| e.to_string())?;
-        if existing_version < SCHEMA_VERSION {
+        if existing_version < 2 {
             Self::migrate(&connection, existing_version, state_root)?;
+        }
+        if existing_version < 3 {
+            migrate_v3(&connection)?;
+        }
+        if existing_version < 4 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            migrate_v4(&connection)?;
+        }
+        if existing_version < 5 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            migrate_v5(&connection)?;
+        }
+        if existing_version < 6 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            migrate_v6(&connection)?;
         }
         Ok(Self {
             connection,
@@ -305,6 +400,121 @@ impl ConfigStore {
         ).optional().map_err(|e| e.to_string())?.map(|(config_source, config_revision, config_digest, mode, goal_revision, desired_lifecycle, state_revision)| {
             Ok(ProjectRecord { id: id.clone(), config_source, config_revision: Revision(config_revision), config_digest: Digest::parse(config_digest)?, mode, goal_revision, desired_lifecycle, state_revision: Revision(state_revision) })
         }).transpose()
+    }
+
+    pub fn register_agent_mailbox(
+        &mut self,
+        owner_generation: u64,
+        agent_run_id: &str,
+        directory: &Path,
+        expires_at_unix: u64,
+        limits: crate::mailbox::MailboxLimits,
+    ) -> Result<AgentMailboxRegistration, String> {
+        let capability = crate::mailbox::MailboxCapability::create(
+            agent_run_id,
+            directory,
+            expires_at_unix,
+            limits,
+        )?;
+        let canonical_directory = capability.directory().display().to_string();
+        let descriptor = crate::mailbox::MailboxDescriptor {
+            schema_version: 1,
+            run_id: agent_run_id.to_owned(),
+            expires_at_unix,
+            max_request_bytes: limits.max_request_bytes,
+            max_pending_requests: limits.max_pending_requests,
+        };
+        let capability_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?)
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let agent_state: Option<(String, u64)> = tx
+            .query_row(
+                "SELECT state,controller_generation FROM agent_runs WHERE agent_run_id=?1",
+                [agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(agent_state, Some((ref state, generation)) if (state == "launch_pending" || state == "running") && generation == owner_generation)
+        {
+            return Err("mailbox can only be registered for a launch-pending or running AgentRun owned by this controller".into());
+        }
+        tx.execute(
+            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(agent_run_id) DO NOTHING",
+            params![agent_run_id, canonical_directory, capability_digest, expires_at_unix, limits.max_request_bytes, limits.max_pending_requests],
+        )
+        .map_err(|error| error.to_string())?;
+        let existing: (String, String, u64, usize, usize) = tx
+            .query_row(
+                "SELECT canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests FROM agent_mailboxes WHERE agent_run_id=?1",
+                [agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let expected = (
+            canonical_directory.clone(),
+            capability_digest.clone(),
+            expires_at_unix,
+            limits.max_request_bytes,
+            limits.max_pending_requests,
+        );
+        if existing != expected {
+            return Err("AgentRun already has a different mailbox capability".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(AgentMailboxRegistration {
+            agent_run_id: agent_run_id.to_owned(),
+            canonical_directory,
+            capability_digest,
+            expires_at_unix,
+            max_request_bytes: limits.max_request_bytes,
+            max_pending_requests: limits.max_pending_requests,
+        })
+    }
+
+    pub fn agent_mailbox_registration(
+        &self,
+        agent_run_id: &str,
+    ) -> Result<Option<AgentMailboxRegistration>, String> {
+        self.connection
+            .query_row(
+                "SELECT canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests FROM agent_mailboxes WHERE agent_run_id=?1",
+                [agent_run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, usize>(3)?, row.get::<_, usize>(4)?)),
+            )
+            .optional()
+            .map(|row| {
+                row.map(|(canonical_directory, capability_digest, expires_at_unix, max_request_bytes, max_pending_requests)| AgentMailboxRegistration {
+                    agent_run_id: agent_run_id.to_owned(), canonical_directory, capability_digest, expires_at_unix, max_request_bytes, max_pending_requests
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn registered_agent_mailboxes(&self) -> Result<Vec<AgentMailboxRegistration>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests FROM agent_mailboxes ORDER BY agent_run_id",
+        ).map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
+                Ok(AgentMailboxRegistration {
+                    agent_run_id: row.get(0)?,
+                    canonical_directory: row.get(1)?,
+                    capability_digest: row.get(2)?,
+                    expires_at_unix: row.get(3)?,
+                    max_request_bytes: row.get(4)?,
+                    max_pending_requests: row.get(5)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     pub fn record_input(
@@ -450,13 +660,55 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
+        let reconcile_state: Option<String> = tx.query_row(
+            "SELECT state FROM ticket_claim_reconciliations WHERE namespace=?1 AND ticket_id=?2",
+            params![namespace.as_str(),ticket.as_str()], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some(state) = reconcile_state.as_deref()
+            && state != "repolled_open"
+        {
+            return Err("ticket was relinquished by a human and must be repolled as open before a new local claim".into());
+        }
         let matching: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2 AND namespace=?3 AND ticket_id=?4 AND generation=?5)", params![ticket_run.as_str(), project.as_str(), namespace.as_str(), ticket.as_str(), generation], |row| row.get(0)).map_err(|e| e.to_string())?;
         if !matching {
             return Err("ticket run does not match claim identity".into());
         }
         let inserted = tx.execute("INSERT INTO ticket_claims(namespace, ticket_id, project_id, ticket_run_id, generation, claimed_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(namespace, ticket_id) DO NOTHING", params![namespace.as_str(), ticket.as_str(), project.as_str(), ticket_run.as_str(), generation, now_unix()?]).map_err(|e| e.to_string())? == 1;
+        if inserted {
+            tx.execute("DELETE FROM ticket_claim_reconciliations WHERE namespace=?1 AND ticket_id=?2 AND state='repolled_open'", params![namespace.as_str(),ticket.as_str()]).map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted)
+    }
+
+    pub fn confirm_ticket_claim_repolled(
+        &mut self,
+        owner_generation: u64,
+        namespace: &TicketNamespace,
+        ticket: &TicketId,
+        eligible_for_claim: bool,
+        observed_status: &str,
+        external_revision: Option<&str>,
+    ) -> Result<bool, String> {
+        if observed_status.is_empty() || observed_status.len() > 255 {
+            return Err("repolled external status is required".into());
+        }
+        let state = if eligible_for_claim {
+            "repolled_open"
+        } else {
+            "repolled_closed"
+        };
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
+            "UPDATE ticket_claim_reconciliations SET state=?3,observed_status=?4,external_revision=?5,repolled_by_generation=?6,repolled_at_unix=?7 WHERE namespace=?1 AND ticket_id=?2",
+            params![namespace.as_str(),ticket.as_str(),state,observed_status,external_revision,owner_generation,now_unix()?],
+        ).map_err(|error| error.to_string())? == 1;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -823,6 +1075,204 @@ impl ConfigStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_ticket_transition(
+        &mut self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+        expected_revision: Revision,
+        input: &DurableInput,
+        transition: Input,
+        reason: &str,
+        evidence_json: &str,
+        effects: &[EffectIntent],
+    ) -> Result<InputReceipt, String> {
+        validate_input(input)?;
+        if reason.is_empty()
+            || reason.len() > 1024
+            || evidence_json.len() > MAX_INPUT_BYTES
+            || effects.len() > 64
+        {
+            return Err("ticket transition exceeds configured limits".into());
+        }
+        let evidence: serde_json::Value =
+            crate::protocol::parse_unique(evidence_json.as_bytes())
+                .map_err(|error| format!("invalid transition evidence: {error}"))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let duplicate: Option<(String, String)> = tx
+            .query_row(
+                "SELECT content_digest, receipt_json FROM inbox WHERE producer_id=?1 AND message_id=?2",
+                params![input.producer_id, input.message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((digest, receipt_json)) = duplicate {
+            if digest != input.content_digest {
+                return Err("message ID was reused with different content".into());
+            }
+            let receipt: serde_json::Value = serde_json::from_str(&receipt_json)
+                .map_err(|error| format!("stored receipt is invalid: {error}"))?;
+            if receipt["ticket_run_id"].as_str() != Some(ticket_run_id.as_str()) {
+                return Err("message ID was already committed for another subject".into());
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(InputReceipt {
+                receipt,
+                duplicate: true,
+            });
+        }
+
+        let stored: Option<(String, String, String, String, u64, Option<u64>)> = tx
+            .query_row(
+                "SELECT project_id, internal_phase, activity, external_status, revision, required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((project_raw, phase_raw, activity_raw, status_raw, revision, review_revision)) =
+            stored
+        else {
+            return Err("ticket run not found".into());
+        };
+        let project_id = ProjectId::parse(project_raw)?;
+        if revision != expected_revision.0 {
+            return Err(
+                "ticket run revision conflict; no transition or effects were written".into(),
+            );
+        }
+        let current = TicketRun {
+            project_id: project_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            revision: Revision(revision),
+            phase: serde_json::from_str(&format!("\"{phase_raw}\""))
+                .map_err(|error| format!("stored ticket phase is invalid: {error}"))?,
+            activity: serde_json::from_str(&format!("\"{activity_raw}\""))
+                .map_err(|error| format!("stored ticket activity is invalid: {error}"))?,
+            external_status: parse_ticket_status(&status_raw)?,
+            required_review_revision: review_revision.map(Revision),
+        };
+        let decision = reduce(&current, expected_revision, transition)?;
+        let expected_kinds = decision
+            .effects
+            .iter()
+            .map(|kind| {
+                serde_json::to_value(kind)
+                    .map_err(|error| error.to_string())?
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "effect kind did not serialize as a string".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut supplied_kinds = effects
+            .iter()
+            .map(|effect| effect.kind.clone())
+            .collect::<Vec<_>>();
+        let mut expected_kinds = expected_kinds;
+        supplied_kinds.sort();
+        expected_kinds.sort();
+        if supplied_kinds != expected_kinds
+            || effects.iter().any(|effect| {
+                effect.project_id != project_id
+                    || effect.subject_type != "ticket_run"
+                    || effect.subject_id != ticket_run_id.as_str()
+                    || effect.expected_revision != Some(decision.ticket_run.revision.0)
+            })
+        {
+            return Err(
+                "effect intents do not match the reducer decision and TicketRun revision".into(),
+            );
+        }
+
+        let decision_run = &decision.ticket_run;
+        tx.execute(
+            "UPDATE ticket_runs SET internal_phase=?2, activity=?3, external_status=?4, required_review_revision=?5, revision=?6 WHERE ticket_run_id=?1 AND revision=?7",
+            params![
+                ticket_run_id.as_str(),
+                enum_string(&decision_run.phase)?,
+                enum_string(&decision_run.activity)?,
+                enum_string(&decision_run.external_status)?,
+                decision_run.required_review_revision.map(|value| value.0),
+                decision_run.revision.0,
+                current.revision.0
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO transitions(project_id, entity_type, entity_id, old_revision, new_revision, input_id, decision_reason, evidence_json, created_at_unix) VALUES (?1, 'ticket_run', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                project_id.as_str(),
+                ticket_run_id.as_str(),
+                current.revision.0,
+                decision_run.revision.0,
+                input.message_id,
+                reason,
+                serde_json::to_string(&evidence).map_err(|error| error.to_string())?,
+                now_unix()?
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let now = now_unix()?;
+        for effect in effects {
+            insert_effect(&tx, effect, now)?;
+        }
+        let wake_records = decision
+            .wakes
+            .iter()
+            .map(|target| {
+                let (role_session_id, target_name) = match target {
+                    WakeTarget::Supervisor => (
+                        format!("project:{}:supervisor", project_id.as_str()),
+                        "supervisor",
+                    ),
+                    WakeTarget::Coordinator => (
+                        format!("ticket_run:{}:coordinator", ticket_run_id.as_str()),
+                        "coordinator",
+                    ),
+                };
+                let payload = serde_json::json!({
+                    "ticket_run_id": ticket_run_id.as_str(),
+                    "target": target_name,
+                    "message_id": input.message_id,
+                    "revision": decision_run.revision.0
+                });
+                let inserted = tx.execute(
+                    "INSERT INTO role_wake_inputs(project_id, role_session_id, source_type, source_id, source_revision, priority, payload_json, lifecycle, created_at_unix) VALUES (?1, ?2, 'ticket_run_transition', ?3, ?4, 0, ?5, 'pending', ?6)",
+                    params![project_id.as_str(), role_session_id, input.message_id, decision_run.revision.0, payload.to_string(), now],
+                ).map_err(|error| error.to_string())?;
+                if inserted != 1 {
+                    return Err("role wake input was not persisted".into());
+                }
+                Ok(serde_json::json!({"role_session_id":role_session_id,"revision":decision_run.revision.0}))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let receipt = serde_json::json!({
+            "accepted": true,
+            "message_id": input.message_id,
+            "content_digest": input.content_digest,
+            "project_id": project_id.as_str(),
+            "ticket_run_id": ticket_run_id.as_str(),
+            "revision": decision_run.revision.0,
+            "effects": effects.iter().map(|effect| effect.operation_id.as_str()).collect::<Vec<_>>(),
+            "wakes": wake_records
+        });
+        tx.execute(
+            "INSERT INTO inbox(producer_id, message_id, content_digest, recipient, payload_json, receipt_json, received_at_unix, processed_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![input.producer_id, input.message_id, input.content_digest, input.recipient, input.payload, serde_json::to_string(&receipt).map_err(|error| error.to_string())?, now],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(InputReceipt {
+            receipt,
+            duplicate: false,
+        })
+    }
+
     pub fn start_owner(&mut self, owner: &OwnerMetadata) -> Result<u64, String> {
         let tx = self
             .connection
@@ -867,6 +1317,436 @@ impl ConfigStore {
 
     pub fn owner_generation(&self) -> Result<Option<u64>, String> {
         self.connection.query_row("SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL", [], |row| row.get(0)).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn process_next_control(
+        &mut self,
+        owner_generation: u64,
+    ) -> Result<Option<ControlCommand>, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let row: Option<PendingControlRow> = tx.query_row(
+            "SELECT request_id, kind, project_id, lifecycle, payload_json, created_at_unix FROM controller_commands WHERE state='pending' ORDER BY sequence LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((request_id, kind, project, lifecycle, payload_json, created_at_unix)) = row
+        else {
+            let human: Option<(String, String, u64, i64)> = tx.query_row(
+                "SELECT request_id,payload_json,expected_generation,created_at_unix FROM human_claim_release_commands WHERE state='pending' ORDER BY sequence LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            if let Some((request_id, payload_json, expected_generation, created_at_unix)) = human {
+                if expected_generation != owner_generation {
+                    tx.execute("UPDATE human_claim_release_commands SET state='rejected',result_json=?2,applied_by_generation=?3,applied_at_unix=?4 WHERE request_id=?1 AND state='pending'", params![request_id, serde_json::json!({"error":"owner generation changed"}).to_string(), owner_generation, now_unix()?]).map_err(|e| e.to_string())?;
+                    tx.commit().map_err(|e| e.to_string())?;
+                    return Ok(Some(ControlCommand {
+                        request_id,
+                        kind: "human_claim_release".into(),
+                        project_id: None,
+                        lifecycle: None,
+                        created_at_unix,
+                        applied_config: None,
+                    }));
+                }
+                let release: HumanClaimRelease =
+                    crate::protocol::parse_unique(payload_json.as_bytes())
+                        .map_err(|error| format!("stored claim release is invalid: {error}"))?;
+                let outcome =
+                    apply_human_claim_release(&tx, owner_generation, &request_id, &release);
+                match outcome {
+                    Ok(receipt) => {
+                        tx.execute("UPDATE human_claim_release_commands SET state='applied',result_json=?2,applied_by_generation=?3,applied_at_unix=?4 WHERE request_id=?1 AND state='pending'", params![request_id, receipt.to_string(), owner_generation, now_unix()?]).map_err(|e| e.to_string())?;
+                    }
+                    Err(error) => {
+                        tx.execute("UPDATE human_claim_release_commands SET state='rejected',result_json=?2,applied_by_generation=?3,applied_at_unix=?4 WHERE request_id=?1 AND state='pending'", params![request_id, serde_json::json!({"error":error}).to_string(), owner_generation, now_unix()?]).map_err(|e| e.to_string())?;
+                    }
+                }
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(Some(ControlCommand {
+                    request_id,
+                    kind: "human_claim_release".into(),
+                    project_id: None,
+                    lifecycle: None,
+                    created_at_unix,
+                    applied_config: None,
+                }));
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(None);
+        };
+        let mut result = serde_json::json!({"accepted":true});
+        let mut applied_config = None;
+        match kind.as_str() {
+            "machine_stop" => {}
+            "config_apply" => {
+                let outcome = payload_json
+                    .as_deref()
+                    .ok_or_else(|| "stored configuration command has no payload".to_owned())
+                    .and_then(|value| {
+                        crate::protocol::parse_unique::<ConfigApplyPayload>(value.as_bytes())
+                            .map_err(|error| {
+                                format!("stored configuration command is invalid: {error}")
+                            })
+                    })
+                    .and_then(|payload| {
+                        persist_snapshot(
+                            &tx,
+                            &payload.source_identity,
+                            &payload.snapshot,
+                            payload.expectation,
+                        )
+                    });
+                match outcome {
+                    Ok(applied) => {
+                        applied_config = Some(applied.clone());
+                        result = serde_json::json!({"accepted":true,"revision":applied.revision.0,"digest":applied.digest,"unchanged":applied.unchanged});
+                    }
+                    Err(error) => {
+                        tx.execute("UPDATE controller_commands SET state='rejected', applied_by_generation=?2, applied_at_unix=?3, result_json=?4 WHERE request_id=?1 AND state='pending'", params![request_id, owner_generation, now_unix()?, serde_json::json!({"error":error}).to_string()]).map_err(|e| e.to_string())?;
+                        tx.commit().map_err(|e| e.to_string())?;
+                        return Ok(Some(ControlCommand {
+                            request_id,
+                            kind,
+                            project_id: None,
+                            lifecycle: None,
+                            created_at_unix,
+                            applied_config: None,
+                        }));
+                    }
+                }
+            }
+            "project_lifecycle" => {
+                let project = project
+                    .as_deref()
+                    .ok_or_else(|| "stored Project command has no Project ID".to_owned())?;
+                let lifecycle = lifecycle
+                    .as_deref()
+                    .ok_or_else(|| "stored Project command has no lifecycle".to_owned())?;
+                if !matches!(lifecycle, "running" | "paused" | "stopped") {
+                    return Err("stored Project command has an invalid lifecycle".into());
+                }
+                let updated = tx
+                    .execute(
+                        "UPDATE projects SET desired_lifecycle=?2 WHERE project_id=?1",
+                        params![project, lifecycle],
+                    )
+                    .map_err(|e| e.to_string())?;
+                if updated != 1 {
+                    tx.execute("UPDATE controller_commands SET state='rejected', result_json=?2 WHERE request_id=?1 AND state='pending'", params![request_id, serde_json::json!({"error":"Project not found"}).to_string()]).map_err(|e| e.to_string())?;
+                    tx.commit().map_err(|e| e.to_string())?;
+                    return Ok(Some(ControlCommand {
+                        request_id,
+                        kind,
+                        project_id: Some(ProjectId::parse(project)?),
+                        lifecycle: Some(lifecycle.to_owned()),
+                        created_at_unix,
+                        applied_config: None,
+                    }));
+                }
+                let next_epoch: u64 = tx
+                    .query_row(
+                        "SELECT project_epoch + 1 FROM project_runtimes WHERE project_id=?1",
+                        [&project],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let observed = if lifecycle == "running" {
+                    "starting"
+                } else if lifecycle == "paused" {
+                    "paused"
+                } else {
+                    "stopped"
+                };
+                tx.execute("UPDATE project_runtimes SET desired_lifecycle=?2, observed_lifecycle=?3, controller_generation=?4, project_epoch=?5 WHERE project_id=?1", params![project, lifecycle, observed, owner_generation, next_epoch]).map_err(|e| e.to_string())?;
+            }
+            _ => return Err("stored controller command has an unsupported kind".into()),
+        }
+        tx.execute("UPDATE controller_commands SET state='applied', applied_by_generation=?2, result_json=?3, applied_at_unix=?4 WHERE request_id=?1 AND state='pending'", params![request_id, owner_generation, result.to_string(), now_unix()?]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(ControlCommand {
+            request_id,
+            kind,
+            project_id: project.map(ProjectId::parse).transpose()?,
+            lifecycle,
+            created_at_unix,
+            applied_config,
+        }))
+    }
+
+    pub fn should_stop(&self, owner_generation: u64) -> Result<bool, String> {
+        let count: u64 = self.connection.query_row("SELECT COUNT(*) FROM controller_commands WHERE kind='machine_stop' AND state='applied' AND applied_by_generation=?1", [owner_generation], |row| row.get(0)).map_err(|e| e.to_string())?;
+        Ok(count > 0)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectRecord>, String> {
+        let mut statement = self.connection.prepare("SELECT project_id, config_source, config_revision, config_digest, mode, goal_revision, desired_lifecycle, state_revision FROM projects ORDER BY project_id").map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, u64>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let (
+                id,
+                config_source,
+                config_revision,
+                config_digest,
+                mode,
+                goal_revision,
+                desired_lifecycle,
+                state_revision,
+            ) = row.map_err(|e| e.to_string())?;
+            Ok(ProjectRecord {
+                id: ProjectId::parse(id)?,
+                config_source,
+                config_revision: Revision(config_revision),
+                config_digest: Digest::parse(config_digest)?,
+                mode,
+                goal_revision,
+                desired_lifecycle,
+                state_revision: Revision(state_revision),
+            })
+        })
+        .collect()
+    }
+
+    pub fn append_control(
+        state_root: &Path,
+        request_id: &str,
+        command: &ControlCommand,
+        owner_generation: u64,
+    ) -> Result<(), String> {
+        if request_id.is_empty()
+            || request_id.len() > 255
+            || request_id.chars().any(char::is_control)
+        {
+            return Err("invalid control request ID".into());
+        }
+        let database = state_root.join("state.sqlite3");
+        let connection = Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("{}: {e}", database.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        let tx = connection
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let project_id = command.project_id.as_ref().map(ProjectId::as_str);
+        tx.execute("INSERT INTO controller_commands(request_id,kind,project_id,lifecycle,state,created_at_unix,expected_generation) VALUES (?1,?2,?3,?4,'pending',?5,?6) ON CONFLICT(request_id) DO NOTHING", params![request_id, command.kind, project_id, command.lifecycle, command.created_at_unix, owner_generation]).map_err(|e| e.to_string())?;
+        let existing: (String, Option<String>, Option<String>, u64) = tx.query_row("SELECT kind,project_id,lifecycle,expected_generation FROM controller_commands WHERE request_id=?1", [request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|e| e.to_string())?;
+        if existing
+            != (
+                command.kind.clone(),
+                project_id.map(str::to_owned),
+                command.lifecycle.clone(),
+                owner_generation,
+            )
+        {
+            return Err("control request ID was reused with different content".into());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn append_config_apply(
+        state_root: &Path,
+        request_id: &str,
+        source_identity: &str,
+        snapshot: &AppliedConfig,
+        expectation: ExpectedRevision,
+        owner_generation: u64,
+    ) -> Result<(), String> {
+        if request_id.is_empty()
+            || request_id.len() > 255
+            || request_id.chars().any(char::is_control)
+            || source_identity.is_empty()
+            || source_identity.len() > 4096
+        {
+            return Err("invalid configuration command identity".into());
+        }
+        let payload = ConfigApplyPayload {
+            source_identity: source_identity.into(),
+            snapshot: snapshot.clone(),
+            expectation,
+        };
+        let payload_json = canonical_json(&payload)?;
+        if payload_json.len() > MAX_INPUT_BYTES {
+            return Err("configuration command exceeds the 1 MiB limit".into());
+        }
+        let database = state_root.join("state.sqlite3");
+        let connection = Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("{}: {error}", database.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        let tx = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        tx.execute(
+            "INSERT INTO controller_commands(request_id,kind,payload_json,state,created_at_unix,expected_generation) VALUES (?1,'config_apply',?2,'pending',?3,?4) ON CONFLICT(request_id) DO NOTHING",
+            params![request_id, payload_json, now_unix()?, owner_generation],
+        )
+        .map_err(|error| error.to_string())?;
+        let existing: (String, Option<String>, u64) = tx
+            .query_row(
+                "SELECT kind,payload_json,expected_generation FROM controller_commands WHERE request_id=?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if existing != ("config_apply".into(), Some(payload_json), owner_generation) {
+            return Err("control request ID was reused with different content".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn append_human_claim_release(
+        state_root: &Path,
+        request_id: &str,
+        release: &HumanClaimRelease,
+        owner_generation: u64,
+    ) -> Result<(), String> {
+        if request_id.is_empty()
+            || request_id.len() > 255
+            || request_id.chars().any(char::is_control)
+        {
+            return Err("invalid claim-release request ID".into());
+        }
+        if release.reason.trim().is_empty()
+            || release.reason.len() > 2048
+            || release.disposition != "cancel"
+        {
+            return Err(
+                "claim release requires a reason and the explicit `cancel` disposition".into(),
+            );
+        }
+        let payload = canonical_json(release)?;
+        let database = state_root.join("state.sqlite3");
+        let connection = Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("{}: {error}", database.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        let tx = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        tx.execute("INSERT INTO human_claim_release_commands(request_id,payload_json,state,created_at_unix,expected_generation) VALUES (?1,?2,'pending',?3,?4) ON CONFLICT(request_id) DO NOTHING", params![request_id,payload,now_unix()?,owner_generation]).map_err(|error| error.to_string())?;
+        let existing: (String,u64) = tx.query_row("SELECT payload_json,expected_generation FROM human_claim_release_commands WHERE request_id=?1", [request_id], |row| Ok((row.get(0)?,row.get(1)?))).map_err(|error| error.to_string())?;
+        if existing != (payload, owner_generation) {
+            return Err("claim-release request ID was reused with different content".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn status(state_root: &Path) -> Result<RuntimeStatus, String> {
+        let database = state_root.join("state.sqlite3");
+        let connection = Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("{}: {e}", database.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(2))
+            .map_err(|e| e.to_string())?;
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if schema_version > SCHEMA_VERSION {
+            return Err(format!(
+                "database schema {schema_version} is newer than supported schema {SCHEMA_VERSION}; status is unavailable without modifying it"
+            ));
+        }
+        if schema_version < 3 {
+            return Err(
+                "runtime state is not initialized; start the Rex-owned `runtime run` block".into(),
+            );
+        }
+        let owner: Option<(u64,u32,String,i64)> = connection.query_row("SELECT generation,pid,process_start_identity,started_at_unix FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|e| e.to_string())?;
+        let mut statement = connection.prepare("SELECT p.project_id,p.mode,p.desired_lifecycle,r.observed_lifecycle,r.project_epoch,r.next_due_at_unix,r.last_error FROM projects p JOIN project_runtimes r USING(project_id) ORDER BY p.project_id").map_err(|e| e.to_string())?;
+        let projects = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .map(|row| {
+                let (
+                    id,
+                    mode,
+                    desired_lifecycle,
+                    observed_lifecycle,
+                    project_epoch,
+                    next_due_at_unix,
+                    last_error,
+                ) = row.map_err(|e| e.to_string())?;
+                Ok(ProjectStatus {
+                    id: ProjectId::parse(id)?,
+                    mode,
+                    desired_lifecycle,
+                    observed_lifecycle,
+                    project_epoch,
+                    next_due_at_unix,
+                    last_error,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let count = |query: &str| {
+            connection
+                .query_row(query, [], |row| row.get::<_, u64>(0))
+                .map_err(|e| e.to_string())
+        };
+        Ok(RuntimeStatus {
+            schema_version,
+            owner_generation: owner.as_ref().map(|v| v.0),
+            owner_pid: owner.as_ref().map(|v| v.1),
+            owner_process_start_identity: owner.as_ref().map(|v| v.2.clone()),
+            owner_started_at_unix: owner.map(|v| v.3),
+            projects,
+            pending_commands: count(
+                "SELECT COUNT(*) FROM controller_commands WHERE state='pending'",
+            )?,
+            rejected_commands: count(
+                "SELECT COUNT(*) FROM controller_commands WHERE state='rejected'",
+            )?,
+            pending_effects: count("SELECT COUNT(*) FROM effects WHERE status='pending'")?,
+            uncertain_effects: count("SELECT COUNT(*) FROM effects WHERE status='uncertain'")?,
+            occupied_slots: count(
+                "SELECT COUNT(*) FROM execution_slots WHERE disposition!='released'",
+            )?,
+            observed_at_unix: now_unix()?,
+        })
     }
 }
 
@@ -1075,6 +1955,340 @@ fn migrate_v2(connection: &Connection) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
+fn persist_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    source_identity: &str,
+    snapshot: &AppliedConfig,
+    expectation: ExpectedRevision,
+) -> Result<AppliedRevision, String> {
+    let effective_config_json = canonical_json(&EffectiveConfig {
+        config: snapshot.config.clone(),
+        profiles: snapshot.profiles.clone(),
+        source_root: snapshot.source_root.clone(),
+    })?;
+    let source_manifest_json = canonical_json(&snapshot.source_files)?;
+    let current: Option<(u64, String)> = tx
+        .query_row(
+            "SELECT current.revision, snapshots.digest FROM config_current current JOIN config_snapshots snapshots USING(source_identity, revision) WHERE current.source_identity = ?1",
+            [source_identity],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((revision, digest)) = &current
+        && digest == snapshot.digest.as_str()
+    {
+        sync_project_configuration(tx, source_identity, Revision(*revision), snapshot)?;
+        return Ok(AppliedRevision {
+            revision: Revision(*revision),
+            digest: snapshot.digest.clone(),
+            unchanged: true,
+        });
+    }
+    let expectation_matches = match (expectation, current.as_ref()) {
+        (ExpectedRevision::Bootstrap, None) => true,
+        (ExpectedRevision::Current(expected), Some((actual, _))) => expected.0 == *actual,
+        _ => false,
+    };
+    if !expectation_matches {
+        return Err("configuration revision conflict; current snapshot was left unchanged".into());
+    }
+    let next_revision = current
+        .as_ref()
+        .map_or(Some(1), |(revision, _)| revision.checked_add(1))
+        .ok_or_else(|| "configuration revision is exhausted".to_owned())?;
+    i64::try_from(next_revision)
+        .map_err(|_| "configuration revision exceeds SQLite's signed integer range".to_owned())?;
+    let applied_at = now_unix()?;
+    tx.execute(
+        "INSERT INTO config_snapshots(revision, source_identity, digest, digest_algorithm, representation, effective_config_json, source_manifest_json, applied_at_unix) VALUES (?1, ?2, ?3, 'sha256', 'canonical_json_utf8_sorted_keys', ?4, ?5, ?6)",
+        params![next_revision, source_identity, snapshot.digest.as_str(), effective_config_json, source_manifest_json, applied_at],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO config_current(source_identity, revision) VALUES (?1, ?2) ON CONFLICT(source_identity) DO UPDATE SET revision=excluded.revision",
+        params![source_identity, next_revision],
+    )
+    .map_err(|error| error.to_string())?;
+    sync_project_configuration(tx, source_identity, Revision(next_revision), snapshot)?;
+    Ok(AppliedRevision {
+        revision: Revision(next_revision),
+        digest: snapshot.digest.clone(),
+        unchanged: false,
+    })
+}
+
+fn sync_project_configuration(
+    tx: &rusqlite::Transaction<'_>,
+    source_identity: &str,
+    revision: Revision,
+    snapshot: &AppliedConfig,
+) -> Result<(), String> {
+    let digest = snapshot.digest.as_str();
+    let configured = snapshot
+        .config
+        .projects
+        .keys()
+        .map(|project| project.as_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut statement = tx
+        .prepare("SELECT project_id FROM projects WHERE config_source=?1")
+        .map_err(|error| error.to_string())?;
+    let existing = statement
+        .query_map([source_identity], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for project_id in existing {
+        if !configured.contains(&project_id) {
+            tx.execute(
+                "UPDATE projects SET desired_lifecycle='stopped' WHERE project_id=?1",
+                [&project_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE project_runtimes SET desired_lifecycle='stopped',observed_lifecycle='stopped',project_epoch=project_epoch+1 WHERE project_id=?1",
+                [&project_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    for (id, project) in &snapshot.config.projects {
+        let mode = enum_string(&project.mode)?;
+        let goal_revision = project.goal.as_ref().map_or(0, |goal| goal.revision);
+        let current_owner: Option<String> = tx
+            .query_row(
+                "SELECT config_source FROM projects WHERE project_id=?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(owner) = current_owner
+            && owner != source_identity
+        {
+            return Err(format!(
+                "Project `{}` is already owned by another configuration source",
+                id.as_str()
+            ));
+        }
+        let inserted = tx.execute(
+            "INSERT INTO projects(project_id,config_source,config_revision,config_digest,mode,goal_revision,desired_lifecycle,state_revision,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,'stopped',0,?7) ON CONFLICT(project_id) DO NOTHING",
+            params![id.as_str(), source_identity, revision.0, digest, mode, goal_revision, now_unix()?],
+        ).map_err(|error| error.to_string())? == 1;
+        if inserted {
+            tx.execute(
+                "INSERT INTO project_runtimes(project_id,desired_lifecycle,observed_lifecycle,controller_generation,project_epoch,next_due_at_unix) VALUES (?1,'stopped','stopped',0,1,0)",
+                [id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+        } else {
+            tx.execute(
+                "UPDATE projects SET config_revision=?2,config_digest=?3,mode=?4,goal_revision=?5 WHERE project_id=?1",
+                params![id.as_str(), revision.0, digest, mode, goal_revision],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v3(connection: &Connection) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE controller_commands (
+            sequence INTEGER PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK(kind IN ('machine_stop','project_lifecycle')),
+            project_id TEXT REFERENCES projects(project_id),
+            lifecycle TEXT CHECK(lifecycle IS NULL OR lifecycle IN ('running','paused','stopped')),
+            state TEXT NOT NULL CHECK(state IN ('pending','applied','rejected')),
+            created_at_unix INTEGER NOT NULL,
+            expected_generation INTEGER NOT NULL,
+            applied_by_generation INTEGER,
+            applied_at_unix INTEGER,
+            result_json TEXT,
+            CHECK((kind = 'machine_stop' AND project_id IS NULL AND lifecycle IS NULL) OR (kind = 'project_lifecycle' AND project_id IS NOT NULL AND lifecycle IS NOT NULL))
+        );
+        CREATE INDEX controller_commands_pending ON controller_commands(state, sequence);
+        INSERT INTO schema_migrations(version, applied_at_unix) VALUES (3, unixepoch());
+        PRAGMA user_version = 3;",
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn migrate_v4(connection: &Connection) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "ALTER TABLE ticket_runs ADD COLUMN required_review_revision INTEGER;
+        INSERT INTO schema_migrations(version, applied_at_unix) VALUES (4, unixepoch());
+        PRAGMA user_version = 4;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_v5(connection: &Connection) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE controller_commands_v5 (
+            sequence INTEGER PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK(kind IN ('machine_stop','project_lifecycle','config_apply')),
+            project_id TEXT REFERENCES projects(project_id),
+            lifecycle TEXT CHECK(lifecycle IS NULL OR lifecycle IN ('running','paused','stopped')),
+            payload_json TEXT CHECK(payload_json IS NULL OR length(payload_json) <= 1048576),
+            state TEXT NOT NULL CHECK(state IN ('pending','applied','rejected')),
+            created_at_unix INTEGER NOT NULL,
+            expected_generation INTEGER NOT NULL,
+            applied_by_generation INTEGER,
+            applied_at_unix INTEGER,
+            result_json TEXT,
+            CHECK((kind='machine_stop' AND project_id IS NULL AND lifecycle IS NULL AND payload_json IS NULL) OR (kind='project_lifecycle' AND project_id IS NOT NULL AND lifecycle IS NOT NULL AND payload_json IS NULL) OR (kind='config_apply' AND project_id IS NULL AND lifecycle IS NULL AND payload_json IS NOT NULL))
+        );
+        INSERT INTO controller_commands_v5(sequence,request_id,kind,project_id,lifecycle,payload_json,state,created_at_unix,expected_generation,applied_by_generation,applied_at_unix,result_json)
+            SELECT sequence,request_id,kind,project_id,lifecycle,NULL,state,created_at_unix,expected_generation,applied_by_generation,applied_at_unix,result_json FROM controller_commands;
+        DROP INDEX controller_commands_pending;
+        DROP TABLE controller_commands;
+        ALTER TABLE controller_commands_v5 RENAME TO controller_commands;
+        CREATE INDEX controller_commands_pending ON controller_commands(state, sequence);
+        INSERT INTO schema_migrations(version, applied_at_unix) VALUES (5, unixepoch());
+        PRAGMA user_version = 5;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_v6(connection: &Connection) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE human_claim_release_commands (
+            sequence INTEGER PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL CHECK(length(payload_json) <= 16384),
+            state TEXT NOT NULL CHECK(state IN ('pending','applied','rejected')),
+            created_at_unix INTEGER NOT NULL,
+            expected_generation INTEGER NOT NULL,
+            applied_by_generation INTEGER,
+            applied_at_unix INTEGER,
+            result_json TEXT
+        );
+        CREATE INDEX human_claim_release_pending ON human_claim_release_commands(state, sequence);
+        CREATE TABLE ticket_claim_reconciliations (
+            namespace TEXT NOT NULL,
+            ticket_id TEXT NOT NULL,
+            release_request_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','repolled_open','repolled_closed')),
+            observed_status TEXT,
+            external_revision TEXT,
+            repolled_by_generation INTEGER,
+            repolled_at_unix INTEGER,
+            created_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(namespace,ticket_id)
+        );
+        INSERT INTO schema_migrations(version, applied_at_unix) VALUES (6, unixepoch());
+        PRAGMA user_version = 6;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn apply_human_claim_release(
+    tx: &rusqlite::Transaction<'_>,
+    owner_generation: u64,
+    request_id: &str,
+    release: &HumanClaimRelease,
+) -> Result<serde_json::Value, String> {
+    if release.reason.trim().is_empty()
+        || release.reason.len() > 2048
+        || release.disposition != "cancel"
+    {
+        return Err("claim release requires a reason and explicit cancel disposition".into());
+    }
+    let namespace = TicketNamespace::parse(release.namespace.clone())?;
+    let ticket = TicketId::parse(release.ticket.clone())?;
+    let ticket_run = TicketRunId::parse(release.ticket_run_id.clone())?;
+    let claim: Option<(String, u64, String, u64, String, String, u64)> = tx.query_row(
+        "SELECT c.project_id,c.generation,r.namespace,r.generation,r.internal_phase,r.activity,r.revision FROM ticket_claims c JOIN ticket_runs r USING(ticket_run_id) WHERE c.namespace=?1 AND c.ticket_id=?2 AND c.ticket_run_id=?3",
+        params![namespace.as_str(), ticket.as_str(), ticket_run.as_str()],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((
+        project_id,
+        claim_generation,
+        run_namespace,
+        run_generation,
+        phase,
+        activity,
+        revision,
+    )) = claim
+    else {
+        return Err("ticket claim no longer matches the requested TicketRun".into());
+    };
+    if claim_generation != release.generation
+        || run_generation != release.generation
+        || run_namespace != namespace.as_str()
+    {
+        return Err(
+            "ticket claim generation or namespace changed; refresh status before releasing".into(),
+        );
+    }
+    if revision != release.expected_revision {
+        return Err("TicketRun revision changed; refresh status before releasing".into());
+    }
+    let active_slot: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM execution_slots WHERE ticket_run_id=?1 AND disposition!='released')",
+        [ticket_run.as_str()], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if active_slot {
+        return Err(
+            "cannot release a claim while its TicketRun has a live or unknown execution slot"
+                .into(),
+        );
+    }
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| "TicketRun revision is exhausted".to_owned())?;
+    if matches!(phase.as_str(), "done" | "canceled") {
+        return Err(
+            "TicketRun is already terminal; reconcile its claim through normal terminal cleanup"
+                .into(),
+        );
+    }
+    tx.execute(
+        "UPDATE ticket_runs SET internal_phase='canceled',activity='failed',revision=?2 WHERE ticket_run_id=?1 AND revision=?3 AND generation=?4",
+        params![ticket_run.as_str(),next_revision,revision,release.generation],
+    ).map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'ticket_run',?2,?3,?4,?5,'Human relinquished ticket claim',?6,?7)",
+        params![project_id,ticket_run.as_str(),revision,next_revision,request_id,serde_json::json!({"actor":"human-cli","reason":release.reason,"disposition":"cancel","prior_phase":phase,"prior_activity":activity,"ticket_run_revision":revision,"owner_generation":owner_generation}).to_string(),now_unix()?],
+    ).map_err(|error| error.to_string())?;
+    let deleted = tx.execute(
+        "DELETE FROM ticket_claims WHERE namespace=?1 AND ticket_id=?2 AND ticket_run_id=?3 AND generation=?4",
+        params![namespace.as_str(),ticket.as_str(),ticket_run.as_str(),release.generation],
+    ).map_err(|error| error.to_string())?;
+    if deleted != 1 {
+        return Err("ticket claim changed during release".into());
+    }
+    tx.execute(
+        "INSERT INTO ticket_claim_reconciliations(namespace,ticket_id,release_request_id,state,created_at_unix) VALUES (?1,?2,?3,'pending',?4) ON CONFLICT(namespace,ticket_id) DO UPDATE SET release_request_id=excluded.release_request_id,state='pending',observed_status=NULL,external_revision=NULL,repolled_by_generation=NULL,repolled_at_unix=NULL,created_at_unix=excluded.created_at_unix",
+        params![namespace.as_str(),ticket.as_str(),request_id,now_unix()?],
+    ).map_err(|error| error.to_string())?;
+    Ok(
+        serde_json::json!({"released":true,"ticket_run_id":ticket_run.as_str(),"revision":next_revision,"disposition":"cancel","external_ticket_repoll_required":true}),
+    )
+}
+
 fn backup_before_migration(connection: &Connection, state_root: &Path) -> Result<(), String> {
     let (busy, _, _) = connection
         .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
@@ -1089,7 +2303,11 @@ fn backup_before_migration(connection: &Connection, state_root: &Path) -> Result
         return Err("database backup postponed because WAL checkpoint is busy".into());
     }
     let source = state_root.join("state.sqlite3");
-    let destination = state_root.join(format!("state.sqlite3.pre-v2-{}.bak", now_unix()?));
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let destination = state_root.join(format!("state.sqlite3.pre-v2-{timestamp}.bak"));
     let mut input = File::open(&source).map_err(|e| format!("{}: {e}", source.display()))?;
     let mut output = private_create_new(&destination)?;
     std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
@@ -1136,63 +2354,13 @@ impl ConfigStore {
         snapshot: &AppliedConfig,
         expectation: ExpectedRevision,
     ) -> Result<AppliedRevision, String> {
-        let effective_config_json = canonical_json(&EffectiveConfig {
-            config: snapshot.config.clone(),
-            profiles: snapshot.profiles.clone(),
-            source_root: snapshot.source_root.clone(),
-        })?;
-        let source_manifest_json = canonical_json(&snapshot.source_files)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        let current: Option<(u64, String)> = tx.query_row(
-            "SELECT current.revision, snapshots.digest FROM config_current current JOIN config_snapshots snapshots USING(source_identity, revision) WHERE current.source_identity = ?1",
-            [source_identity],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional().map_err(|e| e.to_string())?;
-        if let Some((revision, digest)) = &current
-            && digest == snapshot.digest.as_str()
-        {
-            tx.commit().map_err(|e| e.to_string())?;
-            return Ok(AppliedRevision {
-                revision: Revision(*revision),
-                digest: snapshot.digest.clone(),
-                unchanged: true,
-            });
-        }
-        let expectation_matches = match (expectation, current.as_ref()) {
-            (ExpectedRevision::Bootstrap, None) => true,
-            (ExpectedRevision::Current(expected), Some((actual, _))) => expected.0 == *actual,
-            _ => false,
-        };
-        if !expectation_matches {
-            return Err(
-                "configuration revision conflict; current snapshot was left unchanged".into(),
-            );
-        }
-        let next_revision = current
-            .as_ref()
-            .map_or(Some(1), |(revision, _)| revision.checked_add(1))
-            .ok_or_else(|| "configuration revision is exhausted".to_owned())?;
-        i64::try_from(next_revision).map_err(|_| {
-            "configuration revision exceeds SQLite's signed integer range".to_owned()
-        })?;
-        let applied_at = now_unix()?;
-        tx.execute(
-            "INSERT INTO config_snapshots(revision, source_identity, digest, digest_algorithm, representation, effective_config_json, source_manifest_json, applied_at_unix) VALUES (?1, ?2, ?3, 'sha256', 'canonical_json_utf8_sorted_keys', ?4, ?5, ?6)",
-            params![next_revision, source_identity, snapshot.digest.as_str(), effective_config_json, source_manifest_json, applied_at],
-        ).map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO config_current(source_identity, revision) VALUES (?1, ?2) ON CONFLICT(source_identity) DO UPDATE SET revision=excluded.revision",
-            params![source_identity, next_revision],
-        ).map_err(|e| e.to_string())?;
+        let result = persist_snapshot(&tx, source_identity, snapshot, expectation)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(AppliedRevision {
-            revision: Revision(next_revision),
-            digest: snapshot.digest.clone(),
-            unchanged: false,
-        })
+        Ok(result)
     }
 
     pub fn load_snapshot(&self, source_identity: &str) -> Result<Option<StoredSnapshot>, String> {
@@ -1292,6 +2460,29 @@ fn validate_input(input: &DurableInput) -> Result<(), String> {
     crate::protocol::parse_unique::<serde_json::Value>(input.payload.as_bytes())
         .map_err(|e| format!("invalid input JSON: {e}"))?;
     Ok(())
+}
+
+fn enum_string(value: &impl serde::Serialize) -> Result<String, String> {
+    serde_json::to_value(value)
+        .map_err(|error| error.to_string())?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "typed state did not serialize as a string".into())
+}
+
+fn parse_ticket_status(value: &str) -> Result<crate::domain::types::TicketStatus, String> {
+    let name = match value {
+        "Triage" => "triage",
+        "Backlog" => "backlog",
+        "ToDo" | "Ready" => "ready",
+        "In Progress" => "in_progress",
+        "In Review" => "in_review",
+        "Done" => "done",
+        "Canceled" => "canceled",
+        other => other,
+    };
+    serde_json::from_str(&format!("\"{name}\""))
+        .map_err(|error| format!("stored ticket status `{value}` is unsupported: {error}"))
 }
 
 fn content_digest(bytes: &str) -> String {
@@ -1519,11 +2710,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        ConfigStore, DurableInput, EffectIntent, EffectOutcome, ExpectedRevision, OwnerMetadata,
-        ProjectRecord, content_digest, durable_input_digest,
+        ConfigStore, DurableInput, EffectIntent, EffectOutcome, ExpectedRevision,
+        HumanClaimRelease, OwnerMetadata, ProjectRecord, content_digest, durable_input_digest,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
+    use crate::engine::reducer::Input;
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1655,6 +2847,82 @@ mod tests {
                 "ToDo",
             )
             .unwrap();
+        let transition_payload = r#"{"input":"dispatch"}"#;
+        let transition_input = DurableInput {
+            producer_id: "agent-run-coordinator-1".into(),
+            message_id: "dispatch-message-1".into(),
+            content_digest: durable_input_digest("ticket_run", transition_payload),
+            recipient: "ticket_run".into(),
+            payload: transition_payload.into(),
+        };
+        let effect = |operation_id: &str, logical_key: &str, kind: &str| EffectIntent {
+            project_id: project.id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run.as_str().into(),
+            operation_id: operation_id.into(),
+            logical_key: logical_key.into(),
+            kind: kind.into(),
+            request_json: "{}".into(),
+            request_digest: content_digest("{}"),
+            expected_revision: Some(1),
+        };
+        let effects = [
+            effect(
+                "dispatch-coordinator",
+                "dispatch-coordinator-r1",
+                "start_coordinator",
+            ),
+            effect(
+                "publish-in-progress",
+                "publish-in-progress-r1",
+                "publish_ticket_status",
+            ),
+        ];
+        let receipt = store
+            .commit_ticket_transition(
+                generation,
+                &ticket_run,
+                Revision(0),
+                &transition_input,
+                Input::Dispatch,
+                "A ready TicketRun is dispatched.",
+                "{}",
+                &effects,
+            )
+            .unwrap();
+        assert!(!receipt.duplicate);
+        assert_eq!(receipt.receipt["revision"], 1);
+        let retry = store
+            .commit_ticket_transition(
+                generation,
+                &ticket_run,
+                Revision(0),
+                &transition_input,
+                Input::Dispatch,
+                "A ready TicketRun is dispatched.",
+                "{}",
+                &effects,
+            )
+            .unwrap();
+        assert!(retry.duplicate);
+        let ticket_state: (String, u64) = store
+            .connection
+            .query_row(
+                "SELECT internal_phase, revision FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_state, ("planning".into(), 1));
+        let committed: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM effects WHERE subject_id=?1 AND status='pending'",
+                [ticket_run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, 2);
         assert!(
             store
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &ticket_run, 1)
@@ -1802,7 +3070,7 @@ mod tests {
             kind: "start_worker".into(),
             request_json: r#"{"ticket_id":"ticket-1"}"#.into(),
             request_digest: content_digest(r#"{"ticket_id":"ticket-1"}"#),
-            expected_revision: Some(0),
+            expected_revision: Some(1),
         };
         let first = store
             .commit_transition(
@@ -1907,7 +3175,36 @@ mod tests {
             .next_due_effect(generation, i64::MAX)
             .unwrap()
             .unwrap();
-        assert_eq!(claimed.operation_id, "op-1");
+        assert_eq!(claimed.operation_id, "dispatch-coordinator");
+        store
+            .finish_effect(
+                "dispatch-coordinator",
+                generation,
+                EffectOutcome::Succeeded,
+                Some("{}"),
+            )
+            .unwrap();
+        let publish_status = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(publish_status.operation_id, "publish-in-progress");
+        store
+            .finish_effect(
+                "publish-in-progress",
+                generation,
+                EffectOutcome::Succeeded,
+                Some("{}"),
+            )
+            .unwrap();
+        let project_transition_effect = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(project_transition_effect.operation_id, "op-1");
+        store
+            .finish_effect("op-1", generation, EffectOutcome::Succeeded, Some("{}"))
+            .unwrap();
         let other_claim = store
             .next_due_effect(generation, i64::MAX)
             .unwrap()
@@ -2018,6 +3315,131 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn human_claim_release_is_audited_cancels_local_run_and_requires_remote_repoll() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("payments").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            mode: "operations".into(),
+            goal_revision: 0,
+            desired_lifecycle: "running".into(),
+            state_revision: Revision(0),
+        };
+        store.insert_project(&project).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "human-release-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let namespace = TicketNamespace::parse("github:org/repo").unwrap();
+        let ticket = TicketId::parse("#12").unwrap();
+        let run = TicketRunId::parse("payments-12-g1").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project.id,
+                &namespace,
+                &ticket,
+                &run,
+                1,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+        assert!(
+            store
+                .claim_ticket(generation, &namespace, &ticket, &project.id, &run, 1)
+                .unwrap()
+        );
+        let release = HumanClaimRelease {
+            namespace: namespace.as_str().into(),
+            ticket: ticket.as_str().into(),
+            ticket_run_id: run.as_str().into(),
+            generation: 1,
+            expected_revision: 0,
+            reason: "Human requested a clean re-triage".into(),
+            disposition: "cancel".into(),
+        };
+        ConfigStore::append_human_claim_release(
+            temp.path(),
+            "human-release-1",
+            &release,
+            generation,
+        )
+        .unwrap();
+        let command = store.process_next_control(generation).unwrap().unwrap();
+        assert_eq!(command.kind, "human_claim_release");
+        let current: (String, u64) = store
+            .connection
+            .query_row(
+                "SELECT internal_phase,revision FROM ticket_runs WHERE ticket_run_id=?1",
+                [run.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current, ("canceled".into(), 1));
+        assert!(
+            store
+                .claim_ticket(generation, &namespace, &ticket, &project.id, &run, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .confirm_ticket_claim_repolled(
+                    generation,
+                    &namespace,
+                    &ticket,
+                    true,
+                    "In Progress",
+                    Some("remote-7")
+                )
+                .unwrap()
+        );
+        let next_run = TicketRunId::parse("payments-12-g2").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project.id,
+                &namespace,
+                &ticket,
+                &next_run,
+                2,
+                "queued",
+                "In Progress",
+            )
+            .unwrap();
+        assert!(
+            store
+                .claim_ticket(generation, &namespace, &ticket, &project.id, &next_run, 2)
+                .unwrap()
+        );
+        let audit: (String,String) = store.connection.query_row(
+            "SELECT input_id,evidence_json FROM transitions WHERE entity_id=?1 AND new_revision=1",[run.as_str()],|row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(audit.0, "human-release-1");
+        assert!(audit.1.contains("Human requested a clean re-triage"));
     }
 
     #[test]

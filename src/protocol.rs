@@ -5,6 +5,7 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::domain::ids::{OperationId, ProjectId};
+use crate::domain::types::Role;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -76,6 +77,18 @@ pub struct RequestEnvelope<P> {
     pub method: MethodName,
     #[serde(default)]
     pub project_id: Option<ProjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_subject_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub request_type: Option<String>,
     pub params: P,
 }
 
