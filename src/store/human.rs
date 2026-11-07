@@ -1006,6 +1006,7 @@ mod tests {
                 process_start_identity: "test-process-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,

@@ -191,7 +191,8 @@ pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
         ));
     }
     tx.execute_batch(
-        "CREATE TABLE knowledge_publications (
+        "ALTER TABLE controller_owners ADD COLUMN rex_endpoint TEXT;
+        CREATE TABLE knowledge_publications (
             operation_id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL REFERENCES projects(project_id),
             ticket_run_id TEXT NOT NULL UNIQUE REFERENCES ticket_runs(ticket_run_id),
@@ -1602,6 +1603,7 @@ mod tests {
              CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_unix INTEGER NOT NULL);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id));
+             CREATE TABLE controller_owners(singleton INTEGER PRIMARY KEY);
              PRAGMA user_version=9;",
         ).unwrap();
         connection
@@ -1618,6 +1620,14 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 10);
+        let has_rex_endpoint: bool = fixture
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('controller_owners') WHERE name='rex_endpoint')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_rex_endpoint);
         for table in [
             "knowledge_publications",
             "learning_candidates",
@@ -1685,6 +1695,7 @@ mod tests {
                 process_start_identity: "test-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,

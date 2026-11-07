@@ -166,6 +166,7 @@ pub struct OwnerMetadata {
     pub process_start_identity: String,
     pub executable_path: String,
     pub executable_digest: String,
+    pub rex_endpoint: Option<String>,
     pub rex_server_identity: Option<String>,
     pub rex_session_id: Option<String>,
     pub rex_block_id: Option<String>,
@@ -217,6 +218,10 @@ pub struct RuntimeStatus {
     pub owner_pid: Option<u32>,
     pub owner_process_start_identity: Option<String>,
     pub owner_started_at_unix: Option<i64>,
+    pub owner_rex_endpoint: Option<String>,
+    pub owner_rex_server_identity: Option<String>,
+    pub owner_rex_session_id: Option<String>,
+    pub owner_rex_block_id: Option<String>,
     pub projects: Vec<ProjectStatus>,
     pub pending_commands: u64,
     pub rejected_commands: u64,
@@ -2444,7 +2449,7 @@ impl ConfigStore {
         tx.execute("UPDATE effects SET status='uncertain', owner_generation=NULL, last_error='previous controller stopped before recording an outcome' WHERE status='claimed'", []).map_err(|e| e.to_string())?;
         tx.execute("UPDATE execution_slots SET disposition='unknown' WHERE disposition IN ('launch_pending','live')", []).map_err(|e| e.to_string())?;
         tx.execute("UPDATE agent_runs SET state='unknown', controller_generation=?1 WHERE state IN ('launch_pending','running')", [generation]).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO controller_owners(singleton, owner_nonce, generation, state_root, config_source, pid, process_start_identity, executable_path, executable_digest, rex_server_identity, rex_session_id, rex_block_id, started_at_unix, heartbeat_at_unix, stopped_at_unix) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL) ON CONFLICT(singleton) DO UPDATE SET owner_nonce=excluded.owner_nonce, generation=excluded.generation, state_root=excluded.state_root, config_source=excluded.config_source, pid=excluded.pid, process_start_identity=excluded.process_start_identity, executable_path=excluded.executable_path, executable_digest=excluded.executable_digest, rex_server_identity=excluded.rex_server_identity, rex_session_id=excluded.rex_session_id, rex_block_id=excluded.rex_block_id, started_at_unix=excluded.started_at_unix, heartbeat_at_unix=excluded.heartbeat_at_unix, stopped_at_unix=NULL", params![owner.owner_nonce, generation, owner.state_root, owner.config_source, std::process::id(), owner.process_start_identity, owner.executable_path, owner.executable_digest, owner.rex_server_identity, owner.rex_session_id, owner.rex_block_id, now]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO controller_owners(singleton, owner_nonce, generation, state_root, config_source, pid, process_start_identity, executable_path, executable_digest, rex_endpoint, rex_server_identity, rex_session_id, rex_block_id, started_at_unix, heartbeat_at_unix, stopped_at_unix) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, NULL) ON CONFLICT(singleton) DO UPDATE SET owner_nonce=excluded.owner_nonce, generation=excluded.generation, state_root=excluded.state_root, config_source=excluded.config_source, pid=excluded.pid, process_start_identity=excluded.process_start_identity, executable_path=excluded.executable_path, executable_digest=excluded.executable_digest, rex_endpoint=excluded.rex_endpoint, rex_server_identity=excluded.rex_server_identity, rex_session_id=excluded.rex_session_id, rex_block_id=excluded.rex_block_id, started_at_unix=excluded.started_at_unix, heartbeat_at_unix=excluded.heartbeat_at_unix, stopped_at_unix=NULL", params![owner.owner_nonce, generation, owner.state_root, owner.config_source, std::process::id(), owner.process_start_identity, owner.executable_path, owner.executable_digest, owner.rex_endpoint, owner.rex_server_identity, owner.rex_session_id, owner.rex_block_id, now]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(generation)
     }
@@ -2837,6 +2842,19 @@ impl ConfigStore {
             );
         }
         let owner: Option<(u64,u32,String,i64)> = connection.query_row("SELECT generation,pid,process_start_identity,started_at_unix FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|e| e.to_string())?;
+        let owner_rex = if schema_version >= 10 {
+            connection
+                .query_row(
+                    "SELECT rex_endpoint,rex_server_identity,rex_session_id,rex_block_id FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or((None, None, None, None))
+        } else {
+            (None, None, None, None)
+        };
         let mut statement = connection.prepare("SELECT p.project_id,p.mode,p.desired_lifecycle,r.observed_lifecycle,r.project_epoch,r.next_due_at_unix,r.last_error FROM projects p JOIN project_runtimes r USING(project_id) ORDER BY p.project_id").map_err(|e| e.to_string())?;
         let projects = statement
             .query_map([], |row| {
@@ -2883,6 +2901,10 @@ impl ConfigStore {
             owner_pid: owner.as_ref().map(|v| v.1),
             owner_process_start_identity: owner.as_ref().map(|v| v.2.clone()),
             owner_started_at_unix: owner.map(|v| v.3),
+            owner_rex_endpoint: owner_rex.0,
+            owner_rex_server_identity: owner_rex.1,
+            owner_rex_session_id: owner_rex.2,
+            owner_rex_block_id: owner_rex.3,
             projects,
             pending_commands: count(
                 "SELECT COUNT(*) FROM controller_commands WHERE state='pending'",
@@ -4071,6 +4093,7 @@ mod tests {
             process_start_identity: nonce.into(),
             executable_path: "/tmp/rex-projects-test".into(),
             executable_digest: "f".repeat(64),
+            rex_endpoint: None,
             rex_server_identity: None,
             rex_session_id: None,
             rex_block_id: None,
@@ -4338,6 +4361,7 @@ mod tests {
                 process_start_identity: "view-process".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -4504,6 +4528,7 @@ mod tests {
                 process_start_identity: "block-process".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -4694,6 +4719,7 @@ mod tests {
                 process_start_identity: "test-process-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -5096,6 +5122,7 @@ mod tests {
                 process_start_identity: "new-process-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "f".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -5218,6 +5245,7 @@ mod tests {
                 process_start_identity: "test-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,

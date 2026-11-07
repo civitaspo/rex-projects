@@ -130,6 +130,106 @@ pub struct RexCapabilities {
     pub methods: BTreeSet<String>,
 }
 
+/// Authoritative startup identity returned by Rex, pinned for this controller
+/// lifetime. The endpoint is never inferred from environment variable names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RexIdentity {
+    pub endpoint: String,
+    pub instance_id: String,
+    pub session_id: String,
+    pub block_id: Option<String>,
+}
+
+impl RexIdentity {
+    pub fn discover(
+        executable: &Path,
+        search_path: &[PathBuf],
+        environment: &BTreeMap<OsString, OsString>,
+        endpoint_override: Option<&str>,
+    ) -> Result<Self, RexError> {
+        let session_id = environment
+            .get(std::ffi::OsStr::new("REX_SESSION"))
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| RexError::Invalid("REX_SESSION is required inside a Rex block".into()))?
+            .to_owned();
+        if session_id.chars().any(char::is_control) {
+            return Err(RexError::Invalid("REX_SESSION is invalid".into()));
+        }
+        let block_id = environment
+            .get(std::ffi::OsStr::new("REX_BLOCK"))
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if block_id
+            .as_deref()
+            .is_none_or(|block| block.chars().any(char::is_control))
+        {
+            return Err(RexError::Invalid(
+                "REX_BLOCK is required inside a Rex block".into(),
+            ));
+        }
+        if endpoint_override.is_some_and(|endpoint| {
+            !(endpoint.starts_with("unix://")
+                || endpoint.starts_with("http://")
+                || endpoint.starts_with("https://"))
+                || endpoint.chars().any(char::is_control)
+        }) {
+            return Err(RexError::Invalid("Rex server override is invalid".into()));
+        }
+        let executable = resolve_executable(executable, search_path)
+            .ok_or_else(|| RexError::Invalid("Rex CLI executable is unavailable".into()))?;
+        let mut args = Vec::<OsString>::new();
+        if let Some(endpoint) = endpoint_override {
+            args.extend(["--server".into(), endpoint.into()]);
+        }
+        args.extend([
+            "--autostart=false".into(),
+            "--timeout".into(),
+            "10s".into(),
+            "whoami".into(),
+            "--json".into(),
+        ]);
+        let output = run(ProcessRequest {
+            executable,
+            args,
+            stdin: Vec::new(),
+            cwd: None,
+            clear_environment: false,
+            environment: environment.clone(),
+            timeout: Duration::from_secs(12),
+            shutdown_grace: Duration::from_secs(2),
+            stdout_limit: 64 * 1024,
+            stderr_tail_limit: 8 * 1024,
+        })
+        .map_err(|_| RexError::Process)?;
+        if output.timed_out
+            || !output.cleanup_confirmed
+            || !output.status.is_some_and(|status| status.success())
+            || output.stdout_truncated
+        {
+            return Err(RexError::Process);
+        }
+        let who: WhoAmI = parse(&output.stdout)?;
+        if !(who.endpoint.starts_with("unix://")
+            || who.endpoint.starts_with("http://")
+            || who.endpoint.starts_with("https://"))
+            || who.endpoint.chars().any(char::is_control)
+            || who.instance_id.is_empty()
+            || who.instance_id.chars().any(char::is_control)
+            || endpoint_override.is_some_and(|expected| expected != who.endpoint)
+        {
+            return Err(RexError::WrongServer);
+        }
+        Ok(Self {
+            endpoint: who.endpoint,
+            instance_id: who.instance_id,
+            session_id,
+            block_id,
+        })
+    }
+}
+
 pub struct RexCliTransport {
     executable: PathBuf,
     endpoint: String,
@@ -754,8 +854,8 @@ fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, RexError>
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentBlockSpec, CreateDisposition, RexCliTransport, TicketWindow, owned_block_label,
-        ticket_window_label,
+        AgentBlockSpec, CreateDisposition, RexCliTransport, RexIdentity, TicketWindow,
+        owned_block_label, ticket_window_label,
     };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -796,6 +896,34 @@ mod tests {
         .unwrap();
         assert_eq!(observation.last_exit, None);
         assert_eq!(observation.child.unwrap().name, "codex");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_authoritative_rex_endpoint_and_rejects_override_mismatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rex identity fixture");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"endpoint\":\"unix:///tmp/rex-test.sock\",\"instance_id\":\"instance-1\",\"host_id\":\"host-1\",\"rex_version\":\"1.2.3\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = BTreeMap::from([
+            (OsString::from("REX_SESSION"), OsString::from("session-1")),
+            (OsString::from("REX_BLOCK"), OsString::from("block-1")),
+        ]);
+        let identity = RexIdentity::discover(&script, &[], &environment, None).unwrap();
+        assert_eq!(identity.endpoint, "unix:///tmp/rex-test.sock");
+        assert_eq!(identity.instance_id, "instance-1");
+        assert_eq!(identity.session_id, "session-1");
+        assert_eq!(identity.block_id.as_deref(), Some("block-1"));
+        assert!(
+            RexIdentity::discover(&script, &[], &environment, Some("unix:///tmp/other.sock"))
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

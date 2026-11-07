@@ -124,6 +124,8 @@ enum RuntimeCommand {
     Run {
         #[arg(long)]
         once: bool,
+        #[arg(long)]
+        rex_server: Option<String>,
     },
     Stop {
         #[arg(long)]
@@ -580,7 +582,12 @@ fn runtime_command(
     json: bool,
 ) -> Result<(), CliError> {
     match command {
-        RuntimeCommand::Run { once } => run_controller(config_path, explicit_state_root, once),
+        RuntimeCommand::Run { once, rex_server } => run_controller(
+            config_path,
+            explicit_state_root,
+            once,
+            rex_server.as_deref(),
+        ),
         RuntimeCommand::Stop { request_id } => {
             let state_root = selected_state_root(config_path, explicit_state_root)?;
             submit_control(
@@ -800,7 +807,7 @@ fn runtime_status(
         "schema_version":status.schema_version,
         "observed_at_unix":status.observed_at_unix,
         "freshness":"local_snapshot",
-        "owner":{"active":status.owner_is_live(),"generation":status.owner_generation,"pid":status.owner_pid,"started_at_unix":status.owner_started_at_unix},
+        "owner":{"active":status.owner_is_live(),"generation":status.owner_generation,"pid":status.owner_pid,"started_at_unix":status.owner_started_at_unix,"rex_endpoint":status.owner_rex_endpoint,"rex_server_instance":status.owner_rex_server_identity,"rex_session":status.owner_rex_session_id,"rex_block":status.owner_rex_block_id},
         "projects":projects,
         "pending_commands":status.pending_commands,
         "rejected_commands":status.rejected_commands,
@@ -871,6 +878,7 @@ fn run_controller(
     config_path: Option<&Path>,
     explicit_state_root: Option<&Path>,
     once: bool,
+    rex_server_override: Option<&str>,
 ) -> Result<(), CliError> {
     require_human_context()?;
     let (config_path, loaded) = load_config(config_path)?;
@@ -915,6 +923,20 @@ fn run_controller(
         };
         store.insert_project(&record).map_err(CliError::conflict)?;
     }
+    let process_environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    let search_path = process_environment
+        .get(std::ffi::OsStr::new("PATH"))
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let rex_identity = crate::adapters::rex::RexIdentity::discover(
+        Path::new(&snapshot.config.config.runtime.rex_binary),
+        &search_path,
+        &process_environment,
+        rex_server_override,
+    )
+    .map_err(|error| CliError::unavailable(error.to_string()))?;
     let executable_path =
         std::env::current_exe().map_err(|error| CliError::unexpected(error.to_string()))?;
     let executable_bytes =
@@ -928,9 +950,10 @@ fn run_controller(
         process_start_identity: process_start_identity()?,
         executable_path: executable_path.display().to_string(),
         executable_digest: executable_digest.clone(),
-        rex_server_identity: std::env::var("REX_SERVER_INSTANCE").ok(),
-        rex_session_id: std::env::var("REX_SESSION_ID").ok(),
-        rex_block_id: std::env::var("REX_BLOCK_ID").ok(),
+        rex_endpoint: Some(rex_identity.endpoint.clone()),
+        rex_server_identity: Some(rex_identity.instance_id.clone()),
+        rex_session_id: Some(rex_identity.session_id.clone()),
+        rex_block_id: rex_identity.block_id.clone(),
     };
     let generation = store.start_owner(&owner).map_err(CliError::unavailable)?;
     let projection = state_root.join("runtime-owner.json");
@@ -1086,7 +1109,7 @@ fn publish_owner_projection(
     config_digest: &str,
 ) -> Result<(), String> {
     let updated_at_unix = unix_now_i64().map_err(|error| error.to_string())?;
-    let value = serde_json::json!({"schema_version":1,"generation":generation,"pid":std::process::id(),"process_start_identity":owner.process_start_identity,"state_root":owner.state_root,"config_source":owner.config_source,"config_revision":config_revision,"config_digest":config_digest,"executable_path":owner.executable_path,"executable_digest":owner.executable_digest,"rex_server_identity":owner.rex_server_identity,"rex_session_id":owner.rex_session_id,"rex_block_id":owner.rex_block_id,"updated_at_unix":updated_at_unix});
+    let value = serde_json::json!({"schema_version":1,"generation":generation,"pid":std::process::id(),"process_start_identity":owner.process_start_identity,"state_root":owner.state_root,"config_source":owner.config_source,"config_revision":config_revision,"config_digest":config_digest,"executable_path":owner.executable_path,"executable_digest":owner.executable_digest,"rex_endpoint":owner.rex_endpoint,"rex_server_identity":owner.rex_server_identity,"rex_session_id":owner.rex_session_id,"rex_block_id":owner.rex_block_id,"updated_at_unix":updated_at_unix});
     let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
     let temporary = path.with_extension(format!(
         "json.{}.tmp",
