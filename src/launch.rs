@@ -201,7 +201,13 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
     tx.execute_batch(
-        "CREATE TABLE provider_qualifications (
+        "ALTER TABLE agent_runs ADD COLUMN role TEXT
+            CHECK(role IS NULL OR role IN ('supervisor','coordinator','planner','worker','reviewer','merge_decision','operator','postmortem'));
+        CREATE TRIGGER agent_runs_role_immutable
+        BEFORE UPDATE OF role ON agent_runs
+        WHEN OLD.role IS NOT NEW.role
+        BEGIN SELECT RAISE(ABORT, 'AgentRun role reservation is immutable'); END;
+        CREATE TABLE provider_qualifications (
             receipt_digest TEXT PRIMARY KEY CHECK(length(receipt_digest) = 64),
             project_id TEXT NOT NULL REFERENCES projects(project_id),
             profile_id TEXT NOT NULL,
@@ -1182,6 +1188,42 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 7);
+        let agent_role_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agent_runs') WHERE name='role'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_role_column, 1);
+        connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,role) VALUES ('reserved-run','worker')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE agent_runs SET role='coordinator' WHERE agent_run_id='reserved-run'",
+                    [],
+                )
+                .is_err()
+        );
+        connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id) VALUES ('legacy-run')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE agent_runs SET role='worker' WHERE agent_run_id='legacy-run'",
+                    [],
+                )
+                .is_err()
+        );
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('provider_qualifications','agent_launch_authority','agent_launch_state','agent_result_evidence','agent_result_wakes')",

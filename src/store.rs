@@ -34,6 +34,17 @@ type DueEffectRow = (
     String,
     Option<u64>,
 );
+type AgentLaunchRunRow = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
+);
 type ClaimableEffectRow = (
     String,
     String,
@@ -952,10 +963,15 @@ impl ConfigStore {
                 "new launch authority must belong to the active controller generation".into(),
             );
         }
-        let run: Option<(String, String, u64, String, String, u64, String)> = tx.query_row(
-            "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source FROM agent_runs WHERE agent_run_id=?1",
+        let expected_role = serde_json::to_value(authority.role)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or("Agent role did not serialize as a string")?
+            .to_owned();
+        let run: Option<AgentLaunchRunRow> = tx.query_row(
+            "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source,role_session_id,role FROM agent_runs WHERE agent_run_id=?1",
             [authority.agent_run_id.as_str()],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
         ).optional().map_err(|error| error.to_string())?;
         let Some((
             project_id,
@@ -965,6 +981,8 @@ impl ConfigStore {
             config_digest,
             config_revision,
             config_source,
+            role_session_id,
+            role,
         )) = run
         else {
             return Err("launch authority references an unknown AgentRun".into());
@@ -975,6 +993,8 @@ impl ConfigStore {
             || operation_id != authority.operation_id.as_str()
             || config_digest != authority.config_digest.as_str()
             || config_revision != authority.config_revision.0
+            || role_session_id.as_deref() != Some(authority.role_session_id.as_str())
+            || role.as_deref() != Some(expected_role.as_str())
         {
             return Err("AgentRun does not match the proposed launch authority".into());
         }
@@ -985,19 +1005,22 @@ impl ConfigStore {
                 .ticket_run_id
                 .as_ref()
                 .ok_or("ticket AgentRun is missing TicketRun ID")?;
-            let ticket: Option<(String, String, String)> = tx
+            let ticket: Option<(String, String, String, u64)> = tx
                 .query_row(
-                    "SELECT project_id,namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1",
+                    "SELECT project_id,namespace,ticket_id,revision FROM ticket_runs WHERE ticket_run_id=?1",
                     [ticket_run_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
-            let Some((ticket_project, namespace, ticket_id)) = ticket else {
+            let Some((ticket_project, namespace, ticket_id, revision)) = ticket else {
                 return Err("launch TicketRun does not exist".into());
             };
             if ticket_project != authority.project_id.as_str() {
                 return Err("launch TicketRun belongs to another Project".into());
+            }
+            if authority.ticket_revision != Some(Revision(revision)) {
+                return Err("TicketRun revision does not match launch authority".into());
             }
             Some((namespace, ticket_id))
         };
@@ -4158,11 +4181,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn launch_authority_rejects_ticket_run_from_another_project() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
+    fn launch_authority_fixture(
+        ticket_in_project_b: bool,
+        reserved_role: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        ConfigStore,
+        u64,
+        AgentLaunchAuthority,
+        ProjectId,
+        ProjectId,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let project_a = ProjectId::parse("project-a").unwrap();
+        let project_b = ProjectId::parse("project-b").unwrap();
         let mut config_snapshot = snapshot(&"a".repeat(64));
         let profile_id = ProfileId::parse("worker").unwrap();
         let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
@@ -4180,8 +4213,6 @@ mod tests {
         let applied = store
             .apply_snapshot("factory", &config_snapshot, ExpectedRevision::Bootstrap)
             .unwrap();
-        let project_a = ProjectId::parse("project-a").unwrap();
-        let project_b = ProjectId::parse("project-b").unwrap();
         for project_id in [&project_a, &project_b] {
             store
                 .insert_project(&ProjectRecord {
@@ -4214,8 +4245,8 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,'worker-session','test',1,?5,'launch_pending',?6)",
-                rusqlite::params![agent_run_id.as_str(), project_a.as_str(), applied.revision.0, applied.digest.as_str(), operation_id.as_str(), generation],
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,'worker-session',?5,'test',1,?6,'launch_pending',?7)",
+                rusqlite::params![agent_run_id.as_str(), project_a.as_str(), applied.revision.0, applied.digest.as_str(), reserved_role, operation_id.as_str(), generation],
             )
             .unwrap();
         let ticket_run_id = TicketRunId::parse("ticket-run-b").unwrap();
@@ -4223,7 +4254,7 @@ mod tests {
             .connection
             .execute(
                 "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status) VALUES (?1,?2,'factory',?3,?4,'shared','T-1',1,'implementing','working','In Progress','In Progress')",
-                rusqlite::params![ticket_run_id.as_str(), project_b.as_str(), applied.revision.0, applied.digest.as_str()],
+                rusqlite::params![ticket_run_id.as_str(), if ticket_in_project_b { project_b.as_str() } else { project_a.as_str() }, applied.revision.0, applied.digest.as_str()],
             )
             .unwrap();
         let view_id = RexView::derive_id(
@@ -4305,7 +4336,7 @@ mod tests {
 
         let authority = AgentLaunchAuthority {
             agent_run_id,
-            project_id: project_a,
+            project_id: project_a.clone(),
             role: Role::Worker,
             role_session_id: "worker-session".into(),
             parent_run_id: None,
@@ -4337,12 +4368,75 @@ mod tests {
             mailbox_capability_digest: Digest::parse("6".repeat(64)).unwrap(),
         };
 
+        (temp, store, generation, authority, project_a, project_b)
+    }
+
+    #[test]
+    fn launch_authority_rejects_ticket_run_from_another_project() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(true, Some("worker"));
         let error = store
             .register_agent_launch_authority(generation, &authority)
             .unwrap_err();
+        assert!(error.contains("TicketRun belongs to another Project"));
+    }
+
+    #[test]
+    fn launch_authority_rejects_stale_ticket_revision() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, mut authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        authority.ticket_revision = Some(Revision(1));
+        let error = store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap_err();
+        assert!(error.contains("TicketRun revision does not match launch authority"));
+    }
+
+    #[test]
+    fn launch_authority_rejects_unbound_role_session() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, mut authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        authority.role_session_id = "attacker-session".into();
+        let error = store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap_err();
+        assert!(error.contains("AgentRun does not match the proposed launch authority"));
+    }
+
+    #[test]
+    fn launch_authority_rejects_role_not_reserved_by_agent_run() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, mut authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        authority.role = Role::Coordinator;
+        let error = store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap_err();
+        assert!(error.contains("AgentRun does not match the proposed launch authority"));
+    }
+
+    #[test]
+    fn launch_authority_rejects_legacy_agent_run_without_reserved_role() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, authority, _, _) = launch_authority_fixture(false, None);
+        let error = store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap_err();
+        assert!(error.contains("AgentRun does not match the proposed launch authority"));
+    }
+
+    #[test]
+    fn launch_authority_accepts_matching_agent_run_reservation() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
         assert!(
-            error.contains("TicketRun belongs to another Project"),
-            "unexpected launch rejection: {error}"
+            store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
         );
     }
 
