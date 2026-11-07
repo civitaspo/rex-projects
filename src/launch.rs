@@ -378,11 +378,6 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
     tx.execute_batch(
         "ALTER TABLE agent_runs ADD COLUMN role TEXT
             CHECK(role IS NULL OR role IN ('supervisor','coordinator','planner','worker','reviewer','merge_decision','operator','postmortem'));
-        CREATE TRIGGER agent_runs_role_immutable
-        BEFORE UPDATE OF role ON agent_runs
-        WHEN OLD.role IS NOT NEW.role
-        BEGIN SELECT RAISE(ABORT, 'AgentRun role reservation is immutable'); END;
-
         CREATE TABLE provider_qualifications (
             receipt_digest TEXT PRIMARY KEY CHECK(length(receipt_digest) = 64),
             project_id TEXT NOT NULL REFERENCES projects(project_id),
@@ -601,7 +596,8 @@ pub(crate) fn migrate_agent_run_role(tx: &Transaction<'_>) -> Result<(), String>
         .map_err(|error| error.to_string())?;
     }
     tx.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS agent_runs_role_immutable
+        "DROP TRIGGER IF EXISTS agent_runs_role_immutable;
+         CREATE TRIGGER agent_runs_role_immutable
          BEFORE UPDATE OF role ON agent_runs
          WHEN OLD.role IS NOT NEW.role
          BEGIN SELECT RAISE(ABORT, 'AgentRun role reservation is immutable'); END;",
