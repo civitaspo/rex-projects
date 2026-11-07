@@ -108,15 +108,19 @@ impl RuntimeServices {
         );
         let artifact_root = state_root.join("artifacts");
         let artifacts = ArtifactStore::open(&artifact_root)?;
-        let delivery =
-            crate::runtime_delivery::build(applied_config, state_root, &host_environment)?;
-        let mut handlers = Vec::new();
+        let delivery = crate::runtime_delivery::build(
+            applied_config,
+            state_root,
+            &host_environment,
+            &environment.metadata().id,
+        )?;
+        let mut handlers: Vec<Box<dyn EffectHandler>> = Vec::new();
         let profile_trial_handler =
             crate::profile_trial_runtime::ProfileTrialStartEffectHandler::new(
                 applied_config.clone(),
                 environment.clone(),
                 host_environment.clone(),
-                rex.clone(),
+                (*rex).clone(),
                 rex_binary.clone(),
                 rex_identity.clone(),
                 runtime_binary.to_owned(),

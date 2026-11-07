@@ -1,13 +1,104 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
+use crate::domain::ids::Digest as ContentDigest;
 use crate::process::{self, ProcessError, ProcessIdentity, ProcessRequest};
 use crate::store::ConfigStore;
-use crate::store::host_jobs::{HostJobIntent, HostJobRecord, HostJobState};
+use crate::store::host_jobs::{HostJobIntent, HostJobKind, HostJobRecord, HostJobState};
 use crate::worktrees::WorktreeLease;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostJobEnvironmentBinding {
+    pub snapshot_id: ContentDigest,
+    pub policy_digest: ContentDigest,
+}
+
+pub fn environment_policy_digest(
+    policy_version: &str,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Result<ContentDigest, String> {
+    let mut digest = Sha256::new();
+    digest.update(b"rex-host-environment-policy-v1\0");
+    update_field(&mut digest, policy_version.as_bytes());
+    digest.update((environment.len() as u64).to_be_bytes());
+    for key in environment.keys() {
+        update_field(&mut digest, &os_bytes(key));
+    }
+    ContentDigest::parse(format!("{:x}", digest.finalize()))
+}
+
+pub fn stable_host_job_id(operation_id: &str, method: &str, round: u32) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rex-host-job-v1\0");
+    update_field(&mut digest, operation_id.as_bytes());
+    update_field(&mut digest, method.as_bytes());
+    digest.update(round.to_be_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// Hash every immutable child-process input that can change its execution.
+/// The digest can be persisted without storing the command's stdin or secrets.
+pub fn process_request_digest(
+    request: &ProcessRequest,
+    environment: &HostJobEnvironmentBinding,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rex-process-request-v1\0");
+    update_field(&mut digest, &os_bytes(request.executable.as_os_str()));
+    digest.update((request.args.len() as u64).to_be_bytes());
+    for argument in &request.args {
+        update_field(&mut digest, &os_bytes(argument));
+    }
+    update_field(&mut digest, &request.stdin);
+    update_field(&mut digest, environment.snapshot_id.as_str().as_bytes());
+    update_field(&mut digest, environment.policy_digest.as_str().as_bytes());
+    match &request.cwd {
+        Some(cwd) => {
+            digest.update([1]);
+            update_field(&mut digest, &os_bytes(cwd.as_os_str()));
+        }
+        None => {
+            digest.update([0]);
+        }
+    }
+    digest.update([u8::from(request.clear_environment)]);
+    digest.update((request.environment.len() as u64).to_be_bytes());
+    for key in request.environment.keys() {
+        update_field(&mut digest, &os_bytes(key));
+    }
+    digest.update(request.timeout.as_nanos().to_be_bytes());
+    digest.update(request.shutdown_grace.as_nanos().to_be_bytes());
+    digest.update((request.stdout_limit as u64).to_be_bytes());
+    digest.update((request.stderr_tail_limit as u64).to_be_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn update_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+#[cfg(unix)]
+fn os_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn os_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().flat_map(u16::to_be_bytes).collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_bytes(value: &OsStr) -> Vec<u8> {
+    value.to_string_lossy().as_bytes().to_vec()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +117,9 @@ pub enum HostJobProgress {
     Pending,
     Running,
     Unknown,
+    /// A previously launched process identity was checked and confirmed absent;
+    /// the immutable intent forbids another host-side attempt.
+    ProcessAbsentNoRetry,
     ProcessCompleted(HostProcessReceipt),
     ProcessFailed(String),
     Succeeded(String),
@@ -33,7 +127,7 @@ pub enum HostJobProgress {
 }
 
 struct ActiveJob {
-    worktree_id: String,
+    lane_id: String,
     worker: Option<JoinHandle<()>>,
     recovered: bool,
     _worktree_lease: Option<WorktreeLease>,
@@ -59,6 +153,7 @@ enum WorkerEvent {
 /// execute commands and send events; every durable state transition stays here.
 pub struct HostJobPool {
     max_jobs: usize,
+    max_hook_jobs: usize,
     sender: Sender<WorkerEvent>,
     receiver: Receiver<WorkerEvent>,
     active: HashMap<String, ActiveJob>,
@@ -66,13 +161,14 @@ pub struct HostJobPool {
 }
 
 impl HostJobPool {
-    pub fn new(max_jobs: usize) -> Result<Self, String> {
-        if max_jobs == 0 {
-            return Err("host job capacity must be positive".into());
+    pub fn new(max_jobs: usize, max_hook_jobs: usize) -> Result<Self, String> {
+        if max_jobs == 0 || max_hook_jobs == 0 {
+            return Err("host job and repository hook capacities must be positive".into());
         }
         let (sender, receiver) = mpsc::channel();
         Ok(Self {
             max_jobs,
+            max_hook_jobs,
             sender,
             receiver,
             active: HashMap::new(),
@@ -119,7 +215,7 @@ impl HostJobPool {
                             "process absence is established but the immutable retry budget forbids another run",
                             now_unix,
                         )?;
-                        return Ok(HostJobProgress::Unknown);
+                        return Ok(HostJobProgress::ProcessAbsentNoRetry);
                     }
                 }
                 Recovery::NoIdentity => return Ok(HostJobProgress::Unknown),
@@ -135,7 +231,7 @@ impl HostJobPool {
                 self.active.insert(
                     intent.job_id.clone(),
                     ActiveJob {
-                        worktree_id: intent.worktree_id.clone(),
+                        lane_id: intent.lane_id.clone(),
                         worker: None,
                         recovered: true,
                         _worktree_lease: worktree_lease,
@@ -157,7 +253,7 @@ impl HostJobPool {
                         self.active.insert(
                             intent.job_id.clone(),
                             ActiveJob {
-                                worktree_id: intent.worktree_id.clone(),
+                                lane_id: intent.lane_id.clone(),
                                 worker: None,
                                 recovered: true,
                                 _worktree_lease: worktree_lease,
@@ -170,7 +266,7 @@ impl HostJobPool {
                         self.active.insert(
                             intent.job_id.clone(),
                             ActiveJob {
-                                worktree_id: intent.worktree_id.clone(),
+                                lane_id: intent.lane_id.clone(),
                                 worker: None,
                                 recovered: true,
                                 _worktree_lease: worktree_lease,
@@ -190,13 +286,13 @@ impl HostJobPool {
                             self.active.insert(
                                 intent.job_id.clone(),
                                 ActiveJob {
-                                    worktree_id: intent.worktree_id.clone(),
+                                    lane_id: intent.lane_id.clone(),
                                     worker: None,
                                     recovered: true,
                                     _worktree_lease: worktree_lease,
                                 },
                             );
-                            return Ok(HostJobProgress::Unknown);
+                            return Ok(HostJobProgress::ProcessAbsentNoRetry);
                         }
                     }
                     Recovery::NoIdentity => {
@@ -208,7 +304,7 @@ impl HostJobPool {
                         self.active.insert(
                             intent.job_id.clone(),
                             ActiveJob {
-                                worktree_id: intent.worktree_id.clone(),
+                                lane_id: intent.lane_id.clone(),
                                 worker: None,
                                 recovered: true,
                                 _worktree_lease: worktree_lease,
@@ -234,8 +330,13 @@ impl HostJobPool {
             .active
             .remove(&intent.job_id)
             .and_then(|active| active._worktree_lease)
-            .or(worktree_lease)
-            .ok_or_else(|| "host job requires an exclusive worktree lease".to_owned())?;
+            .or(worktree_lease);
+        if intent.kind.requires_worktree_lease() && lease.is_none() {
+            return Err("repository hook jobs require an exclusive worktree lease".into());
+        }
+        if !intent.kind.requires_worktree_lease() && lease.is_some() {
+            return Err("operation adapter jobs must not acquire a Git worktree lease".into());
+        }
         if !store.start_host_job(&intent.job_id, now_unix)? {
             return Ok(HostJobProgress::Pending);
         }
@@ -254,10 +355,10 @@ impl HostJobPool {
             .is_some_and(|active| active._worktree_lease.is_some())
     }
 
-    pub fn holds_worktree_lease_for(&self, worktree_id: &str) -> bool {
+    pub fn holds_worktree_lease_for(&self, lane_id: &str) -> bool {
         self.active
             .values()
-            .any(|active| active.worktree_id == worktree_id && active._worktree_lease.is_some())
+            .any(|active| active.lane_id == lane_id && active._worktree_lease.is_some())
     }
 
     /// Drain worker reports on the controller thread. Call once per controller tick.
@@ -266,9 +367,11 @@ impl HostJobPool {
     }
 
     fn slot_available(&self, store: &ConfigStore, intent: &HostJobIntent) -> Result<bool, String> {
-        if self.active.iter().any(|(job_id, active)| {
-            job_id != &intent.job_id && active.worktree_id == intent.worktree_id
-        }) {
+        if self
+            .active
+            .iter()
+            .any(|(job_id, active)| job_id != &intent.job_id && active.lane_id == intent.lane_id)
+        {
             return Ok(false);
         }
         let occupied = store.host_jobs_in_states(&[
@@ -278,17 +381,22 @@ impl HostJobPool {
                 reason: String::new(),
             },
         ])?;
+        let hook_jobs = occupied
+            .iter()
+            .filter(|job| job.intent.kind == HostJobKind::RepositoryHook)
+            .count();
         Ok(occupied.len() < self.max_jobs
+            && (intent.kind != HostJobKind::RepositoryHook || hook_jobs < self.max_hook_jobs)
             && !occupied
                 .iter()
-                .any(|job| job.intent.worktree_id == intent.worktree_id))
+                .any(|job| job.intent.lane_id == intent.lane_id))
     }
 
     fn start_worker(
         &mut self,
         intent: &HostJobIntent,
         request: ProcessRequest,
-        worktree_lease: WorktreeLease,
+        worktree_lease: Option<WorktreeLease>,
     ) -> Result<(), String> {
         if self.active.contains_key(&intent.job_id) {
             return Err("host job already has a worker".into());
@@ -340,10 +448,10 @@ impl HostJobPool {
         self.active.insert(
             intent.job_id.clone(),
             ActiveJob {
-                worktree_id: intent.worktree_id.clone(),
+                lane_id: intent.lane_id.clone(),
                 worker: Some(worker),
                 recovered: false,
-                _worktree_lease: Some(worktree_lease),
+                _worktree_lease: worktree_lease,
             },
         );
         Ok(())
@@ -486,6 +594,7 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::ProcessIdentityQuality;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -534,6 +643,150 @@ mod tests {
         assert!(began.elapsed() >= Duration::from_millis(200));
         assert!(callback_elapsed.unwrap() < Duration::from_millis(150));
     }
+
+    #[test]
+    fn stable_ids_bind_method_round_and_request_digest_binds_all_process_inputs() {
+        let first_id = stable_host_job_id("operation-1", "operation.observe", 3);
+        assert_eq!(
+            stable_host_job_id("operation-1", "operation.observe", 3),
+            first_id
+        );
+        assert_ne!(
+            stable_host_job_id("operation-1", "operation.find", 3),
+            first_id
+        );
+        assert_ne!(
+            stable_host_job_id("operation-1", "operation.observe", 4),
+            first_id
+        );
+
+        let binding = HostJobEnvironmentBinding {
+            snapshot_id: ContentDigest::parse("a".repeat(64)).unwrap(),
+            policy_digest: ContentDigest::parse("b".repeat(64)).unwrap(),
+        };
+        let mut original = request(PathBuf::from("/usr/bin/true"), &[]);
+        original
+            .environment
+            .insert("TOKEN".into(), "secret-one".into());
+        let digest = process_request_digest(&original, &binding);
+        let mut changed = original.clone();
+        changed.stdin.push(0);
+        assert_ne!(process_request_digest(&changed, &binding), digest);
+        let mut changed = original.clone();
+        changed.clear_environment = !changed.clear_environment;
+        assert_ne!(process_request_digest(&changed, &binding), digest);
+        let mut changed = original.clone();
+        changed
+            .environment
+            .insert("TOKEN".into(), "secret-two".into());
+        assert_eq!(process_request_digest(&changed, &binding), digest);
+        let mut different_environment = binding.clone();
+        different_environment.snapshot_id = ContentDigest::parse("c".repeat(64)).unwrap();
+        assert_ne!(
+            process_request_digest(&original, &different_environment),
+            digest
+        );
+        let mut different_environment = binding.clone();
+        different_environment.policy_digest = ContentDigest::parse("d".repeat(64)).unwrap();
+        assert_ne!(
+            process_request_digest(&original, &different_environment),
+            digest
+        );
+        let policy =
+            environment_policy_digest("operation-adapter-v1", &original.environment).unwrap();
+        assert_eq!(
+            environment_policy_digest("operation-adapter-v1", &changed.environment).unwrap(),
+            policy
+        );
+        let mut changed_selection = original.clone();
+        changed_selection
+            .environment
+            .insert("OTHER".into(), "secret-three".into());
+        assert_ne!(
+            environment_policy_digest("operation-adapter-v1", &changed_selection.environment)
+                .unwrap(),
+            policy
+        );
+        let mut changed = original.clone();
+        changed.shutdown_grace += Duration::from_millis(1);
+        assert_ne!(process_request_digest(&changed, &binding), digest);
+        let mut changed = original;
+        changed.stderr_tail_limit += 1;
+        assert_ne!(process_request_digest(&changed, &binding), digest);
+
+        let intent = crate::store::host_jobs::HostJobIntent {
+            job_id: first_id,
+            effect_operation_id: "operation-1:operation.observe:3".into(),
+            project_id: "project-1".into(),
+            subject_id: "operation-1".into(),
+            lane_id: "operation-1".into(),
+            kind: HostJobKind::OperationAdapter,
+            request_digest: digest,
+            configuration_digest: "configuration-digest".into(),
+            environment_snapshot_id: binding.snapshot_id,
+            environment_policy_digest: binding.policy_digest,
+            head: "source-sha".into(),
+            source_digest: "subject-digest".into(),
+            max_attempts: 2,
+            retry_when_absent: true,
+        };
+        assert!(!serde_json::to_string(&intent).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn confirmed_process_absence_is_typed_when_retries_are_forbidden() {
+        let mut store = crate::store::host_jobs::in_memory_test_store();
+        let job = crate::store::host_jobs::HostJobIntent {
+            job_id: "operation-job".into(),
+            effect_operation_id: "operation-1:operation.invoke:1".into(),
+            project_id: "project-1".into(),
+            subject_id: "operation-1".into(),
+            lane_id: "operation-1".into(),
+            kind: HostJobKind::OperationAdapter,
+            request_digest: "request-digest".into(),
+            configuration_digest: "configuration-digest".into(),
+            environment_snapshot_id: ContentDigest::parse("e".repeat(64)).unwrap(),
+            environment_policy_digest: ContentDigest::parse("f".repeat(64)).unwrap(),
+            head: "source-sha".into(),
+            source_digest: "subject-digest".into(),
+            max_attempts: 1,
+            retry_when_absent: false,
+        };
+        store.enqueue_host_job(&job, 1).unwrap();
+        assert!(store.start_host_job(&job.job_id, 2).unwrap());
+        assert!(
+            store
+                .mark_host_job_running(
+                    &job.job_id,
+                    &ProcessIdentity {
+                        pid: u32::MAX,
+                        parent_pid: 1,
+                        process_group_id: u32::MAX,
+                        start_identity: "nonexistent-kernel-birth-token".into(),
+                        command: "operation-adapter".into(),
+                        quality: ProcessIdentityQuality::KernelBirthToken,
+                    },
+                    3,
+                )
+                .unwrap()
+        );
+        let mut pool = HostJobPool::new(4, 2).unwrap();
+        assert_eq!(
+            pool.submit_or_poll(
+                &mut store,
+                &job,
+                request(std::env::current_exe().unwrap(), &["--version"]),
+                None,
+                4,
+            )
+            .unwrap(),
+            HostJobProgress::ProcessAbsentNoRetry
+        );
+        assert!(matches!(
+            store.host_job(&job.job_id).unwrap().unwrap().state,
+            HostJobState::Unknown { .. }
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -579,10 +832,12 @@ mod pool_tests {
             effect_operation_id: format!("effect:{job_id}"),
             project_id: project.into(),
             subject_id: "hook".into(),
-            worktree_id: worktree.into(),
-            kind: "repository_hook".into(),
+            lane_id: worktree.into(),
+            kind: HostJobKind::RepositoryHook,
             request_digest: format!("request:{job_id}"),
             configuration_digest: "config".into(),
+            environment_snapshot_id: ContentDigest::parse("e".repeat(64)).unwrap(),
+            environment_policy_digest: ContentDigest::parse("f".repeat(64)).unwrap(),
             head: "head".into(),
             source_digest: "source".into(),
             max_attempts: 2,
@@ -638,7 +893,7 @@ mod pool_tests {
         let second = intent("job-2", "project-2", &second_worktree);
         let same_worktree_waiter = intent("job-3", "project-3", &first_worktree);
         let mut store = crate::store::host_jobs::in_memory_test_store();
-        let mut pool = HostJobPool::new(2).unwrap();
+        let mut pool = HostJobPool::new(2, 2).unwrap();
         let began = Instant::now();
         assert_eq!(
             pool.submit_or_poll(
@@ -694,7 +949,10 @@ mod pool_tests {
                             .unwrap();
                         completed.insert(job.job_id.clone(), receipt);
                     }
-                    HostJobProgress::Running | HostJobProgress::Pending => {}
+                    HostJobProgress::Running
+                    | HostJobProgress::Pending
+                    | HostJobProgress::Unknown
+                    | HostJobProgress::ProcessAbsentNoRetry => {}
                     other => panic!("unexpected host job progress: {other:?}"),
                 }
             }
@@ -711,6 +969,72 @@ mod pool_tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn operation_jobs_share_global_capacity_but_not_the_hook_cap_or_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("worktree-state");
+        let manager = WorktreeManager::new(
+            &state_root,
+            GitOptions {
+                executable: PathBuf::from("/run/current-system/sw/bin/git"),
+                environment: Default::default(),
+                timeout: Duration::from_secs(2),
+            },
+        )
+        .unwrap();
+        let state_root = state_root.canonicalize().unwrap();
+        let repository_id = RepositoryId::parse("repo-a").unwrap();
+        let mut store = crate::store::host_jobs::in_memory_test_store();
+        let mut pool = HostJobPool::new(2, 1).unwrap();
+
+        let mut operation = intent("operation-job", "project-1", "operation-1");
+        operation.kind = HostJobKind::OperationAdapter;
+        operation.retry_when_absent = false;
+        assert_eq!(
+            pool.submit_or_poll(&mut store, &operation, request(), None, 1)
+                .unwrap(),
+            HostJobProgress::Running
+        );
+
+        let first_hook_worktree = state_root
+            .join("worktrees/repo-a/00000000000000000000000000000001")
+            .to_string_lossy()
+            .into_owned();
+        let first_hook = intent("hook-1", "project-2", &first_hook_worktree);
+        assert_eq!(
+            pool.submit_or_poll(
+                &mut store,
+                &first_hook,
+                request(),
+                Some(lease_for(&manager, &state_root, &repository_id, 1)),
+                1,
+            )
+            .unwrap(),
+            HostJobProgress::Running
+        );
+
+        let second_hook_worktree = state_root
+            .join("worktrees/repo-a/00000000000000000000000000000002")
+            .to_string_lossy()
+            .into_owned();
+        let second_hook = intent("hook-2", "project-3", &second_hook_worktree);
+        assert_eq!(
+            pool.submit_or_poll(&mut store, &second_hook, request(), None, 1)
+                .unwrap(),
+            HostJobProgress::Pending
+        );
+
+        let second_operation = intent("operation-job-2", "project-4", "operation-2");
+        let mut second_operation = second_operation;
+        second_operation.kind = HostJobKind::OperationAdapter;
+        second_operation.retry_when_absent = false;
+        assert_eq!(
+            pool.submit_or_poll(&mut store, &second_operation, request(), None, 1)
+                .unwrap(),
+            HostJobProgress::Pending
         );
     }
 }

@@ -30,7 +30,7 @@ use crate::host_commit::{
     ChangeManifest, HostCommitError, HostCommitOptions, HostCommitReceipt, HostCommitter,
     PreparedHostCommit,
 };
-use crate::host_jobs::HostJobPool;
+use crate::host_jobs::{HostJobEnvironmentBinding, HostJobPool};
 use crate::process::{self, ProcessOutput, ProcessRequest};
 use crate::worktrees::{
     GitOptions, ManagedRepository, ManagedWorktree, NativeCommitReceipt, TicketKey, WorktreeError,
@@ -253,6 +253,7 @@ impl RepositoryDelivery {
         state_root: &Path,
         git: GitOptions,
         inherited_environment: BTreeMap<OsString, OsString>,
+        environment_binding: HostJobEnvironmentBinding,
     ) -> Result<Self, DeliveryError> {
         let worktrees =
             WorktreeManager::new(state_root, git.clone()).map_err(DeliveryError::Worktree)?;
@@ -263,7 +264,7 @@ impl RepositoryDelivery {
             timeout: git.timeout,
         })
         .map_err(DeliveryError::HostCommit)?;
-        let hooks = HookRunner::new(git.clone(), inherited_environment);
+        let hooks = HookRunner::new(git.clone(), inherited_environment, environment_binding);
         Ok(Self {
             state_root: state_root.to_owned(),
             git,
@@ -1298,7 +1299,7 @@ pub struct RepositoryDeliveryEffects {
     configuration_digest: Digest,
     repositories: BTreeMap<RepositoryId, RepositoryConfig>,
     project_repositories: BTreeMap<ProjectId, BTreeSet<RepositoryId>>,
-    host_jobs: Mutex<HostJobPool>,
+    host_jobs: Arc<Mutex<HostJobPool>>,
     max_hook_attempts: u32,
 }
 
@@ -1306,25 +1307,31 @@ pub struct RepositoryDeliveryEffectConfig {
     pub state_root: PathBuf,
     pub git: GitOptions,
     pub inherited_environment: BTreeMap<OsString, OsString>,
+    pub environment_binding: HostJobEnvironmentBinding,
     pub gh_executable: PathBuf,
     pub gh_environment: BTreeMap<OsString, OsString>,
     pub timeout: Duration,
     pub configuration_digest: Digest,
     pub repositories: BTreeMap<RepositoryId, RepositoryConfig>,
     pub project_repositories: BTreeMap<ProjectId, BTreeSet<RepositoryId>>,
-    pub max_global_hook_jobs: usize,
     pub max_hook_attempts: u32,
 }
 
 impl RepositoryDeliveryEffects {
-    pub fn new(config: RepositoryDeliveryEffectConfig) -> Result<Arc<Self>, String> {
+    pub fn new(
+        config: RepositoryDeliveryEffectConfig,
+        host_jobs: Arc<Mutex<HostJobPool>>,
+    ) -> Result<Arc<Self>, String> {
         if config.max_hook_attempts == 0 {
             return Err("maximum hook attempts must be positive".into());
         }
-        let host_jobs = HostJobPool::new(config.max_global_hook_jobs)?;
-        let delivery =
-            RepositoryDelivery::new(&config.state_root, config.git, config.inherited_environment)
-                .map_err(|error| error.to_string())?;
+        let delivery = RepositoryDelivery::new(
+            &config.state_root,
+            config.git,
+            config.inherited_environment,
+            config.environment_binding,
+        )
+        .map_err(|error| error.to_string())?;
         let publisher = crate::delivery_forge::GitHubPullRequestPublisher::new(
             config.gh_executable,
             config.gh_environment,
@@ -1347,9 +1354,13 @@ impl RepositoryDeliveryEffects {
             configuration_digest: config.configuration_digest,
             repositories: config.repositories,
             project_repositories: config.project_repositories,
-            host_jobs: Mutex::new(host_jobs),
+            host_jobs,
             max_hook_attempts: config.max_hook_attempts,
         }))
+    }
+
+    pub fn host_jobs(&self) -> Arc<Mutex<HostJobPool>> {
+        Arc::clone(&self.host_jobs)
     }
 
     pub fn prepare_worktrees_handler(self: &Arc<Self>) -> PrepareWorktreesEffectHandler {
@@ -2843,9 +2854,16 @@ mod tests {
             environment: BTreeMap::new(),
             timeout: Duration::from_secs(20),
         };
-        let delivery =
-            RepositoryDelivery::new(&temp.path().join("state"), git_options, BTreeMap::new())
-                .unwrap();
+        let delivery = RepositoryDelivery::new(
+            &temp.path().join("state"),
+            git_options,
+            BTreeMap::new(),
+            HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
         let config = RepositoryConfig {
             clone_url: bare.to_string_lossy().into_owned(),
             base_branch: "main".into(),
@@ -2913,26 +2931,33 @@ mod tests {
         std::fs::write(&gh_executable, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&gh_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let configuration_digest = Digest::parse("c".repeat(64)).unwrap();
-        let effects = RepositoryDeliveryEffects::new(RepositoryDeliveryEffectConfig {
-            state_root: temp.path().join("state"),
-            git: GitOptions {
-                executable,
-                environment: BTreeMap::new(),
-                timeout: Duration::from_secs(20),
+        let host_jobs = Arc::new(Mutex::new(HostJobPool::new(2, 2).unwrap()));
+        let effects = RepositoryDeliveryEffects::new(
+            RepositoryDeliveryEffectConfig {
+                state_root: temp.path().join("state"),
+                git: GitOptions {
+                    executable,
+                    environment: BTreeMap::new(),
+                    timeout: Duration::from_secs(20),
+                },
+                inherited_environment: BTreeMap::new(),
+                environment_binding: HostJobEnvironmentBinding {
+                    snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                    policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+                },
+                gh_executable,
+                gh_environment: BTreeMap::new(),
+                timeout: Duration::from_secs(5),
+                configuration_digest: configuration_digest.clone(),
+                repositories: BTreeMap::from([(repository_id.clone(), repository_config)]),
+                project_repositories: BTreeMap::from([(
+                    project_id.clone(),
+                    BTreeSet::from([repository_id.clone()]),
+                )]),
+                max_hook_attempts: 3,
             },
-            inherited_environment: BTreeMap::new(),
-            gh_executable,
-            gh_environment: BTreeMap::new(),
-            timeout: Duration::from_secs(5),
-            configuration_digest: configuration_digest.clone(),
-            repositories: BTreeMap::from([(repository_id.clone(), repository_config)]),
-            project_repositories: BTreeMap::from([(
-                project_id.clone(),
-                BTreeSet::from([repository_id.clone()]),
-            )]),
-            max_global_hook_jobs: 2,
-            max_hook_attempts: 3,
-        })
+            host_jobs,
+        )
         .unwrap();
         let payload = PrepareWorktreesEffectPayload {
             schema_version: 1,
@@ -3039,29 +3064,36 @@ mod tests {
         std::fs::write(&gh_executable, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&gh_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let configuration_digest = Digest::parse("d".repeat(64)).unwrap();
-        let effects = RepositoryDeliveryEffects::new(RepositoryDeliveryEffectConfig {
-            state_root: temp.path().join("state"),
-            git: GitOptions {
-                executable,
-                environment: BTreeMap::new(),
-                timeout: Duration::from_secs(20),
+        let host_jobs = Arc::new(Mutex::new(HostJobPool::new(2, 2).unwrap()));
+        let effects = RepositoryDeliveryEffects::new(
+            RepositoryDeliveryEffectConfig {
+                state_root: temp.path().join("state"),
+                git: GitOptions {
+                    executable,
+                    environment: BTreeMap::new(),
+                    timeout: Duration::from_secs(20),
+                },
+                inherited_environment: BTreeMap::new(),
+                environment_binding: HostJobEnvironmentBinding {
+                    snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                    policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+                },
+                gh_executable,
+                gh_environment: BTreeMap::new(),
+                timeout: Duration::from_secs(5),
+                configuration_digest: configuration_digest.clone(),
+                repositories: BTreeMap::from([(
+                    repository_id.clone(),
+                    fixture_repository_config(bare.to_string_lossy().into_owned()),
+                )]),
+                project_repositories: BTreeMap::from([(
+                    project_id.clone(),
+                    BTreeSet::from([repository_id.clone()]),
+                )]),
+                max_hook_attempts: 3,
             },
-            inherited_environment: BTreeMap::new(),
-            gh_executable,
-            gh_environment: BTreeMap::new(),
-            timeout: Duration::from_secs(5),
-            configuration_digest: configuration_digest.clone(),
-            repositories: BTreeMap::from([(
-                repository_id.clone(),
-                fixture_repository_config(bare.to_string_lossy().into_owned()),
-            )]),
-            project_repositories: BTreeMap::from([(
-                project_id.clone(),
-                BTreeSet::from([repository_id.clone()]),
-            )]),
-            max_global_hook_jobs: 2,
-            max_hook_attempts: 3,
-        })
+            host_jobs,
+        )
         .unwrap();
         let payload = PublishImplementationEffectPayload {
             schema_version: 1,

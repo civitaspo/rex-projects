@@ -56,6 +56,8 @@ pub struct RuntimeConfig {
     pub max_blocks_per_tab: usize,
     #[serde(default = "default_completed_blocks_to_keep")]
     pub completed_blocks_to_keep: usize,
+    #[serde(default = "default_max_host_jobs")]
+    pub max_host_jobs: usize,
     #[serde(default = "default_tab_retention_hours")]
     pub completed_ticket_tab_retention_hours: u64,
     #[serde(default = "default_max_hooks")]
@@ -74,6 +76,7 @@ impl Default for RuntimeConfig {
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
             max_blocks_per_tab: default_max_blocks_per_tab(),
             completed_blocks_to_keep: default_completed_blocks_to_keep(),
+            max_host_jobs: default_max_host_jobs(),
             completed_ticket_tab_retention_hours: default_tab_retention_hours(),
             max_rex_projects_hook_runs: default_max_hooks(),
             environment: EnvironmentConfig::default(),
@@ -98,6 +101,9 @@ fn default_shutdown_grace_seconds() -> u64 {
 }
 fn default_max_blocks_per_tab() -> usize {
     8
+}
+fn default_max_host_jobs() -> usize {
+    4
 }
 fn default_completed_blocks_to_keep() -> usize {
     1
@@ -733,6 +739,7 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
         ),
         ("runtime.max_agent_runs", runtime.max_agent_runs as u64),
         ("runtime.max_ticket_runs", runtime.max_ticket_runs as u64),
+        ("runtime.max_host_jobs", runtime.max_host_jobs as u64),
         (
             "runtime.shutdown_grace_seconds",
             runtime.shutdown_grace_seconds,

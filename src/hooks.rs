@@ -11,10 +11,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::HookConfig;
 use crate::domain::ids::{Digest, ProjectId, RepositoryId, TicketRunId};
-use crate::host_jobs::{HostJobPool, HostJobProgress};
+use crate::host_jobs::{
+    HostJobEnvironmentBinding, HostJobPool, HostJobProgress, process_request_digest,
+};
 use crate::process::{self, ProcessError, ProcessRequest};
 use crate::store::ConfigStore;
-use crate::store::host_jobs::HostJobIntent;
+use crate::store::host_jobs::{HostJobIntent, HostJobKind};
 use crate::worktrees::GitOptions;
 use crate::worktrees::WorktreeLease;
 
@@ -79,6 +81,7 @@ impl std::error::Error for HookError {}
 pub struct HookRunner {
     git: GitOptions,
     inherited_environment: BTreeMap<OsString, OsString>,
+    environment_binding: HostJobEnvironmentBinding,
     stdout_limit: usize,
 }
 
@@ -93,10 +96,15 @@ pub struct HookRunContext<'a> {
 }
 
 impl HookRunner {
-    pub fn new(git: GitOptions, inherited_environment: BTreeMap<OsString, OsString>) -> Self {
+    pub fn new(
+        git: GitOptions,
+        inherited_environment: BTreeMap<OsString, OsString>,
+        environment_binding: HostJobEnvironmentBinding,
+    ) -> Self {
         Self {
             git,
             inherited_environment,
+            environment_binding,
             stdout_limit: DEFAULT_STDOUT_LIMIT,
         }
     }
@@ -223,7 +231,7 @@ impl HookRunner {
                 stdout_limit: self.stdout_limit,
                 stderr_tail_limit: STDERR_TAIL_LIMIT,
             };
-            let command_digest = digest_process_request(&request);
+            let command_digest = process_request_digest(&request, &self.environment_binding);
             let job_id = digest_bytes(
                 format!(
                     "rex-hook-v1:{effect_operation_id}:{}:{}:{}:{}",
@@ -237,16 +245,18 @@ impl HookRunner {
                 effect_operation_id: format!("{effect_operation_id}:{}", hook.id),
                 project_id: project_id.as_str().into(),
                 subject_id: hook.id.clone(),
-                worktree_id: repo.to_string_lossy().into_owned(),
-                kind: "repository_hook".into(),
-                request_digest: command_digest.to_string(),
+                lane_id: repo.to_string_lossy().into_owned(),
+                kind: HostJobKind::RepositoryHook,
+                request_digest: command_digest,
                 configuration_digest: configuration_digest.to_string(),
+                environment_snapshot_id: self.environment_binding.snapshot_id.clone(),
+                environment_policy_digest: self.environment_binding.policy_digest.clone(),
                 head: expected_head.to_owned(),
                 source_digest: before.to_string(),
                 max_attempts,
                 retry_when_absent: true,
             };
-            let lease = if pool.holds_worktree_lease_for(&intent.worktree_id) {
+            let lease = if pool.holds_worktree_lease_for(&intent.lane_id) {
                 None
             } else {
                 Some(acquire_worktree_lease().map_err(HookError::Process)?)
@@ -255,7 +265,10 @@ impl HookRunner {
                 .submit_or_poll(store, &intent, request, lease, now_unix)
                 .map_err(HookError::Process)?
             {
-                HostJobProgress::Pending | HostJobProgress::Running | HostJobProgress::Unknown => {
+                HostJobProgress::Pending
+                | HostJobProgress::Running
+                | HostJobProgress::Unknown
+                | HostJobProgress::ProcessAbsentNoRetry => {
                     return Ok(None);
                 }
                 HostJobProgress::Succeeded(receipt_json)
@@ -711,26 +724,6 @@ impl HookRunner {
     }
 }
 
-fn digest_process_request(request: &ProcessRequest) -> Digest {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(request.executable.to_string_lossy().as_bytes());
-    if let Some(cwd) = request.cwd.as_deref() {
-        bytes.extend_from_slice(cwd.to_string_lossy().as_bytes());
-    }
-    for arg in &request.args {
-        bytes.extend_from_slice(arg.to_string_lossy().as_bytes());
-        bytes.push(0);
-    }
-    for (key, value) in &request.environment {
-        bytes.extend_from_slice(key.to_string_lossy().as_bytes());
-        bytes.push(b'=');
-        bytes.extend_from_slice(value.to_string_lossy().as_bytes());
-        bytes.push(0);
-    }
-    bytes.extend_from_slice(&request.timeout.as_millis().to_le_bytes());
-    digest_bytes(&bytes)
-}
-
 fn validate_hook_receipt(
     receipt: &HookReceipt,
     hook: &HookConfig,
@@ -922,6 +915,13 @@ fn io_error(error: std::io::Error) -> HookError {
 mod tests {
     use super::*;
 
+    fn test_environment_binding() -> HostJobEnvironmentBinding {
+        HostJobEnvironmentBinding {
+            snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+            policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+        }
+    }
+
     fn fixture_git(cwd: &Path, args: &[&str]) {
         let output = process::run(ProcessRequest {
             executable: PathBuf::from("/usr/bin/git"),
@@ -1030,6 +1030,7 @@ mod tests {
                 timeout: Duration::from_secs(10),
             },
             [(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))].into(),
+            test_environment_binding(),
         );
         let receipts = runner
             .run_required(
@@ -1075,6 +1076,278 @@ mod tests {
     }
 
     #[test]
+    fn managed_hook_is_pending_while_other_worktree_progresses_and_same_worktree_waits() {
+        use crate::host_jobs::HostJobPool;
+        use crate::store::host_jobs::{HostJobState, in_memory_test_store};
+        use crate::worktrees::{ManagedWorktree, WorktreeManager};
+        use std::thread;
+        use std::time::Instant;
+
+        let (temp, first_repo, config_digest) = fixture();
+        let second_repo = temp
+            .path()
+            .join("worktrees/second-repo/00000000000000000000000000000002");
+        fs::create_dir_all(second_repo.parent().unwrap()).unwrap();
+        fixture_git(
+            temp.path(),
+            &[
+                "clone",
+                "--shared",
+                "--quiet",
+                first_repo.to_str().unwrap(),
+                second_repo.to_str().unwrap(),
+            ],
+        );
+
+        let git = PathBuf::from("/usr/bin/git");
+        let git_options = GitOptions {
+            executable: git,
+            environment: BTreeMap::new(),
+            timeout: Duration::from_secs(10),
+        };
+        let manager = WorktreeManager::new(temp.path(), git_options.clone()).unwrap();
+        let head = |repo: &Path| {
+            let output = process::run(ProcessRequest {
+                executable: PathBuf::from("/usr/bin/git"),
+                args: ["rev-parse", "HEAD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.to_owned()),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+                shutdown_grace: Duration::from_secs(2),
+                stdout_limit: 1024,
+                stderr_tail_limit: 1024,
+            })
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let first_head = head(&first_repo);
+        let second_head = head(&second_repo);
+        assert_eq!(first_head, second_head);
+
+        let blocked_ready = temp.path().join("blocked.ready");
+        let blocked_release = temp.path().join("blocked.release");
+        let quick_done = temp.path().join("quick.done");
+        let mut environment =
+            BTreeMap::from([(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))]);
+        environment.insert(
+            OsString::from("BLOCKED_READY"),
+            blocked_ready.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("BLOCKED_RELEASE"),
+            blocked_release.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_DONE"),
+            quick_done.clone().into_os_string(),
+        );
+        let runner = HookRunner::new(
+            GitOptions {
+                executable: PathBuf::from("/usr/bin/git"),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+            },
+            environment,
+            test_environment_binding(),
+        );
+        let mut store = in_memory_test_store();
+        let mut pool = HostJobPool::new(2, 2).unwrap();
+        let project = ProjectId::parse("fixture-project").unwrap();
+        let first_repository = RepositoryId::parse("fixture-repo").unwrap();
+        let second_repository = RepositoryId::parse("second-repo").unwrap();
+        let config_digest = config_digest;
+        let blocked = HookConfig {
+            id: "blocked".into(),
+            command: [
+                "/bin/sh",
+                "-c",
+                "printf ready > \"$BLOCKED_READY\"; while [ ! -f \"$BLOCKED_RELEASE\" ]; do sleep 0.01; done",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            timeout_seconds: 10,
+        };
+        let first_ticket = TicketRunId::parse("blocked-run").unwrap();
+        let first_lease = || {
+            manager
+                .acquire_writer_lease(ManagedWorktree {
+                    repository_id: first_repository.clone(),
+                    path: first_repo.canonicalize().unwrap(),
+                    branch: "rex-projects/0123456789abcdef0123456789abcdef".into(),
+                    base_sha: first_head.clone(),
+                })
+                .map_err(|error| error.to_string())
+        };
+        assert!(
+            runner
+                .run_required_managed(
+                    std::slice::from_ref(&blocked),
+                    HookRunContext {
+                        repository_id: &first_repository,
+                        worktree: &first_repo,
+                        expected_head: &first_head,
+                        project_id: &project,
+                        ticket_run_id: &first_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    &mut store,
+                    &mut pool,
+                    "effect-blocked",
+                    1,
+                    10,
+                    first_lease,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !blocked_ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "hook never reached its barrier"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let same_worktree_ticket = TicketRunId::parse("same-worktree-run").unwrap();
+        let same_worktree_hook = hook(&["/bin/sh", "-c", "exit 0"]);
+        assert!(
+            runner
+                .run_required_managed(
+                    std::slice::from_ref(&same_worktree_hook),
+                    HookRunContext {
+                        repository_id: &first_repository,
+                        worktree: &first_repo,
+                        expected_head: &first_head,
+                        project_id: &project,
+                        ticket_run_id: &same_worktree_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    &mut store,
+                    &mut pool,
+                    "effect-same-worktree",
+                    1,
+                    11,
+                    first_lease,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .host_jobs_in_states(&[HostJobState::Pending])
+                .unwrap()
+                .len(),
+            1,
+            "same-worktree work must remain queued while the blocked hook holds its lease"
+        );
+
+        let quick_ticket = TicketRunId::parse("quick-run").unwrap();
+        let quick = HookConfig {
+            id: "quick".into(),
+            command: ["/bin/sh", "-c", "printf done > \"$QUICK_DONE\""]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            timeout_seconds: 10,
+        };
+        let second_lease = || {
+            manager
+                .acquire_writer_lease(ManagedWorktree {
+                    repository_id: second_repository.clone(),
+                    path: second_repo.canonicalize().unwrap(),
+                    branch: "rex-projects/00000000000000000000000000000002".into(),
+                    base_sha: second_head.clone(),
+                })
+                .map_err(|error| error.to_string())
+        };
+        let quick_deadline = Instant::now() + Duration::from_secs(5);
+        let quick_receipts = loop {
+            if let Some(receipts) = runner
+                .run_required_managed(
+                    std::slice::from_ref(&quick),
+                    HookRunContext {
+                        repository_id: &second_repository,
+                        worktree: &second_repo,
+                        expected_head: &second_head,
+                        project_id: &project,
+                        ticket_run_id: &quick_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    &mut store,
+                    &mut pool,
+                    "effect-quick",
+                    1,
+                    12,
+                    second_lease,
+                )
+                .unwrap()
+            {
+                break receipts;
+            }
+            assert!(
+                Instant::now() < quick_deadline,
+                "independent worktree did not complete"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(fs::read_to_string(&quick_done).unwrap(), "done");
+        assert_eq!(quick_receipts.len(), 1);
+        assert!(quick_receipts[0].succeeded);
+        assert!(
+            !blocked_release.exists(),
+            "the quick hook completed before the blocked hook was released"
+        );
+
+        fs::write(&blocked_release, "release").unwrap();
+        let blocked_deadline = Instant::now() + Duration::from_secs(5);
+        let blocked_receipts = loop {
+            if let Some(receipts) = runner
+                .run_required_managed(
+                    std::slice::from_ref(&blocked),
+                    HookRunContext {
+                        repository_id: &first_repository,
+                        worktree: &first_repo,
+                        expected_head: &first_head,
+                        project_id: &project,
+                        ticket_run_id: &first_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    &mut store,
+                    &mut pool,
+                    "effect-blocked",
+                    1,
+                    13,
+                    first_lease,
+                )
+                .unwrap()
+            {
+                break receipts;
+            }
+            assert!(
+                Instant::now() < blocked_deadline,
+                "released hook did not finish"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(blocked_receipts.len(), 1);
+        assert!(blocked_receipts[0].succeeded);
+        assert_eq!(blocked_receipts[0].head, first_head);
+        assert_eq!(blocked_receipts[0].configuration_digest, config_digest);
+    }
+
+    #[test]
     fn keeps_receipts_separate_for_repositories_with_same_project_ticket_and_hook() {
         let (temp, first_repo, config_digest) = fixture();
         let second_repo = temp.path().join("worktrees/second-repo/shared");
@@ -1115,6 +1388,7 @@ mod tests {
                 timeout: Duration::from_secs(10),
             },
             [(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))].into(),
+            test_environment_binding(),
         );
         let project = ProjectId::parse("fixture-project").unwrap();
         let ticket_run = TicketRunId::parse("same-run").unwrap();
@@ -1186,6 +1460,7 @@ mod tests {
                 timeout: Duration::from_secs(10),
             },
             [(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))].into(),
+            test_environment_binding(),
         );
         let result = runner.run_required(
             &[hook(&["sh", "-c", "printf changed > README.md"])],

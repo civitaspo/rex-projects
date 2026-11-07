@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{AppliedConfig, RepositoryConfig};
@@ -10,6 +11,7 @@ use crate::delivery_forge::validate_github_clone_url;
 use crate::delivery_runtime::{RepositoryDeliveryEffectConfig, RepositoryDeliveryEffects};
 use crate::domain::ids::{ProjectId, RepositoryId};
 use crate::effects::EffectHandler;
+use crate::host_jobs::{HostJobEnvironmentBinding, HostJobPool};
 use crate::process::{self, ProcessRequest, resolve_executable};
 use crate::worktrees::GitOptions;
 
@@ -22,6 +24,7 @@ pub struct RuntimeDelivery {
     applied_config: AppliedConfig,
     handlers: Vec<Box<dyn EffectHandler>>,
     effects: std::sync::Arc<RepositoryDeliveryEffects>,
+    host_jobs: Arc<Mutex<HostJobPool>>,
     git_executable: PathBuf,
     git_environment: BTreeMap<OsString, OsString>,
     repositories: BTreeMap<RepositoryId, RepositoryConfig>,
@@ -50,6 +53,10 @@ impl RuntimeDelivery {
 
     pub fn shared_effects(&self) -> std::sync::Arc<RepositoryDeliveryEffects> {
         std::sync::Arc::clone(&self.effects)
+    }
+
+    pub fn host_jobs(&self) -> Arc<Mutex<HostJobPool>> {
+        Arc::clone(&self.host_jobs)
     }
 
     fn observe_snapshot(
@@ -327,6 +334,7 @@ pub fn build(
     applied_config: &AppliedConfig,
     state_root: &Path,
     captured_host_env: &BTreeMap<OsString, OsString>,
+    environment_snapshot_id: &crate::domain::ids::Digest,
 ) -> Result<RuntimeDelivery, String> {
     if !state_root.is_absolute() {
         return Err("repository delivery state root must be absolute".into());
@@ -371,23 +379,37 @@ pub fn build(
         project_repositories.insert(project_id.clone(), selected);
     }
 
-    let effects = RepositoryDeliveryEffects::new(RepositoryDeliveryEffectConfig {
-        state_root: state_root.to_owned(),
-        git: GitOptions {
-            executable: git.clone(),
-            environment: captured_host_env.clone(),
-            timeout: GIT_TIMEOUT,
+    let environment_binding = HostJobEnvironmentBinding {
+        snapshot_id: environment_snapshot_id.clone(),
+        policy_digest: crate::host_jobs::environment_policy_digest(
+            "rex-projects-host-runtime-v1",
+            captured_host_env,
+        )?,
+    };
+    let host_jobs = Arc::new(Mutex::new(HostJobPool::new(
+        applied_config.config.runtime.max_host_jobs,
+        applied_config.config.runtime.max_rex_projects_hook_runs,
+    )?));
+    let effects = RepositoryDeliveryEffects::new(
+        RepositoryDeliveryEffectConfig {
+            state_root: state_root.to_owned(),
+            git: GitOptions {
+                executable: git.clone(),
+                environment: captured_host_env.clone(),
+                timeout: GIT_TIMEOUT,
+            },
+            inherited_environment: captured_host_env.clone(),
+            environment_binding,
+            gh_executable: gh,
+            gh_environment: captured_host_env.clone(),
+            timeout: GH_TIMEOUT,
+            configuration_digest: applied_config.digest.clone(),
+            repositories: repositories.clone(),
+            project_repositories,
+            max_hook_attempts: maximum_project_hook_attempts(&applied_config.config)?,
         },
-        inherited_environment: captured_host_env.clone(),
-        gh_executable: gh,
-        gh_environment: captured_host_env.clone(),
-        timeout: GH_TIMEOUT,
-        configuration_digest: applied_config.digest.clone(),
-        repositories: repositories.clone(),
-        project_repositories,
-        max_global_hook_jobs: applied_config.config.runtime.max_rex_projects_hook_runs,
-        max_hook_attempts: maximum_project_hook_attempts(&applied_config.config)?,
-    })?;
+        Arc::clone(&host_jobs),
+    )?;
     let handlers: Vec<Box<dyn EffectHandler>> = vec![
         Box::new(effects.prepare_worktrees_handler()),
         Box::new(effects.publish_implementation_handler()),
@@ -396,6 +418,7 @@ pub fn build(
         applied_config: applied_config.clone(),
         handlers,
         effects,
+        host_jobs,
         git_executable: git,
         git_environment: captured_host_env.clone(),
         repositories,
@@ -516,6 +539,7 @@ mod tests {
             &applied_config("git@github.com:acme/demo.git", "github"),
             temp.path(),
             &env,
+            &crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
         )
         .unwrap();
         let kinds = delivery
@@ -540,6 +564,7 @@ mod tests {
                 &applied_config("git@github.com:acme/demo.git", "github"),
                 temp.path(),
                 &empty_env,
+                &crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
             )
             .is_err()
         );
@@ -552,6 +577,7 @@ mod tests {
                 &applied_config("ssh://git@example.invalid/acme/demo.git", "forgejo"),
                 temp.path(),
                 &env,
+                &crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
             )
             .is_err()
         );

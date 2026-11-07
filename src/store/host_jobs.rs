@@ -2,7 +2,28 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use super::ConfigStore;
+use crate::domain::ids::Digest;
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostJobKind {
+    RepositoryHook,
+    OperationAdapter,
+}
+
+impl HostJobKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepositoryHook => "repository_hook",
+            Self::OperationAdapter => "operation_adapter",
+        }
+    }
+
+    pub const fn requires_worktree_lease(self) -> bool {
+        matches!(self, Self::RepositoryHook)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,10 +32,13 @@ pub struct HostJobIntent {
     pub effect_operation_id: String,
     pub project_id: String,
     pub subject_id: String,
-    pub worktree_id: String,
-    pub kind: String,
+    /// A repository path for hooks or the operation ID for adapter calls.
+    pub lane_id: String,
+    pub kind: HostJobKind,
     pub request_digest: String,
     pub configuration_digest: String,
+    pub environment_snapshot_id: Digest,
+    pub environment_policy_digest: Digest,
     pub head: String,
     pub source_digest: String,
     pub max_attempts: u32,
@@ -95,7 +119,7 @@ impl ConfigStore {
             .execute(
                 "INSERT INTO host_effect_jobs(job_id, effect_operation_id, project_id, worktree_id, intent_json, state, attempt_count, updated_at_unix)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
-                params![intent.job_id, intent.effect_operation_id, intent.project_id, intent.worktree_id, intent_json, now_unix],
+                params![intent.job_id, intent.effect_operation_id, intent.project_id, intent.lane_id, intent_json, now_unix],
             )
             .map_err(|error| error.to_string())?;
         self.host_job(&intent.job_id)?
@@ -252,7 +276,7 @@ fn validate_intent(intent: &HostJobIntent) -> Result<(), String> {
         ("effect_operation_id", intent.effect_operation_id.as_str()),
         ("project_id", intent.project_id.as_str()),
         ("subject_id", intent.subject_id.as_str()),
-        ("worktree_id", intent.worktree_id.as_str()),
+        ("lane_id", intent.lane_id.as_str()),
         ("kind", intent.kind.as_str()),
         ("request_digest", intent.request_digest.as_str()),
         ("configuration_digest", intent.configuration_digest.as_str()),
@@ -343,10 +367,12 @@ mod tests {
             effect_operation_id: "effect-1:hook-a".into(),
             project_id: "project-a".into(),
             subject_id: "hook-a".into(),
-            worktree_id: "/worktree/a".into(),
-            kind: "repository_hook".into(),
+            lane_id: "/worktree/a".into(),
+            kind: HostJobKind::RepositoryHook,
             request_digest: "request-digest".into(),
             configuration_digest: "config-digest".into(),
+            environment_snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+            environment_policy_digest: Digest::parse("f".repeat(64)).unwrap(),
             head: "head-a".into(),
             source_digest: "source-a".into(),
             max_attempts: 2,
