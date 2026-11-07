@@ -12,7 +12,9 @@ use crate::effects::{DispatchTick, EffectDispatcher, EffectHandler, EffectLimits
 use crate::engine::reducer::{Activity, Input, Phase, TicketRun};
 use crate::store::ConfigStore;
 use crate::store::scheduler::RunnableProject;
-use crate::store::scheduler::{ObservedTicket, TicketObservationClassification, TicketScanKey};
+use crate::store::scheduler::{
+    ObservedTicket, PendingRoleWakeSession, TicketObservationClassification, TicketScanKey,
+};
 
 /// Result of matching a normalized ticket to the configured Project policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +110,20 @@ pub trait FactoryRuntimeServices {
         limit: usize,
     ) -> Result<ExternalTicketPage, String>;
 
+    /// Build and durably prepare at most one finite-turn launch for this exact
+    /// pending role session. The Store implementation must recheck the wake
+    /// set, project epoch, active-run state, and slot capacity atomically.
+    /// Returning `false` means the candidate is no longer launchable; it must
+    /// leave its wake inputs pending.
+    fn prepare_role_launch(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        config: &Config,
+        candidate: &PendingRoleWakeSession,
+        now_unix: i64,
+    ) -> Result<bool, String>;
+
     fn effect_handlers(&self) -> Vec<&dyn EffectHandler>;
 }
 
@@ -115,6 +131,7 @@ pub trait FactoryRuntimeServices {
 pub struct FactoryTickReport {
     pub ingested_agent_result: bool,
     pub effect: DispatchTick,
+    pub role_run_started: bool,
     pub scanned: Option<TicketScanKey>,
     pub ticket_run_started: Option<TicketRunId>,
 }
@@ -143,6 +160,22 @@ impl FactoryRuntime {
         };
         let effect = EffectDispatcher::tick(store, owner_generation, now_unix, &handlers, limits)
             .map_err(|error| error.to_string())?;
+
+        // A result or an already-persisted effect is processed before another
+        // role turn. Launch preparation is bounded to one successful turn and
+        // a finite candidate window so one stale/unlaunchable wake cannot
+        // monopolize the foreground machine controller.
+        let candidates = store.pending_role_wake_sessions(owner_generation, 32)?;
+        let mut role_run_started = false;
+        for candidate in &candidates {
+            if !config.projects.contains_key(&candidate.project_id) {
+                continue;
+            }
+            if services.prepare_role_launch(store, owner_generation, config, candidate, now_unix)? {
+                role_run_started = true;
+                break;
+            }
+        }
 
         let runnable = store.runnable_projects(owner_generation)?;
         let keys = build_scan_keys(config, &runnable, services)?;
@@ -194,6 +227,7 @@ impl FactoryRuntime {
                 return Ok(FactoryTickReport {
                     ingested_agent_result,
                     effect,
+                    role_run_started,
                     scanned: None,
                     ticket_run_started,
                 });
@@ -204,6 +238,7 @@ impl FactoryRuntime {
             return Ok(FactoryTickReport {
                 ingested_agent_result,
                 effect,
+                role_run_started,
                 scanned: None,
                 ticket_run_started: None,
             });
@@ -248,6 +283,7 @@ impl FactoryRuntime {
         Ok(FactoryTickReport {
             ingested_agent_result,
             effect,
+            role_run_started,
             scanned: Some(key),
             ticket_run_started: None,
         })

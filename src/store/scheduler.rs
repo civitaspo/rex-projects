@@ -108,6 +108,18 @@ pub struct AgentWakeSnapshot {
     pub digest: Digest,
 }
 
+/// A role session with at least one unassigned wake input. This is a scheduling
+/// hint only: `prepare_agent_launch` must recheck eligibility and assign the
+/// inputs transactionally before it starts any provider process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRoleWakeSession {
+    pub project_id: ProjectId,
+    pub role_session_id: String,
+    pub highest_priority: i64,
+    pub oldest_created_at_unix: i64,
+    pub pending_count: u64,
+}
+
 /// Receipt for a durable human instruction routed to one exact Coordinator run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoordinatorInstructionReceipt {
@@ -288,6 +300,66 @@ impl TicketScanKey {
 }
 
 impl ConfigStore {
+    /// Return bounded role sessions that can be considered for another finite
+    /// Agent turn. Active or unknown AgentRuns suppress duplicate scheduling;
+    /// a future transactional launch-preparation call still owns the claim.
+    pub fn pending_role_wake_sessions(
+        &self,
+        owner_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<PendingRoleWakeSession>, String> {
+        if limit == 0 || limit > 256 {
+            return Err("pending role wake query limit must be between 1 and 256".into());
+        }
+        let owner_is_active: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM controller_owners WHERE generation=?1 AND stopped_at_unix IS NULL)",
+                [owner_generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !owner_is_active {
+            return Err("controller generation is not active".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT w.project_id,w.role_session_id,MAX(w.priority),MIN(w.created_at_unix),COUNT(*) \
+             FROM role_wake_inputs w \
+             JOIN projects p USING(project_id) \
+             JOIN project_runtimes r USING(project_id) \
+             WHERE w.lifecycle='pending' AND p.desired_lifecycle='running' \
+               AND r.observed_lifecycle='running' AND r.controller_generation=?1 \
+               AND NOT EXISTS(SELECT 1 FROM agent_runs a WHERE a.role_session_id=w.role_session_id \
+                 AND a.state IN ('launch_pending','running','unknown')) \
+             GROUP BY w.project_id,w.role_session_id \
+             ORDER BY MAX(w.priority) DESC,MIN(w.created_at_unix),w.project_id,w.role_session_id \
+             LIMIT ?2",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![owner_generation, limit as u64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (project, role_session_id, highest_priority, oldest_created_at_unix, pending_count) =
+                row.map_err(|error| error.to_string())?;
+            Ok(PendingRoleWakeSession {
+                project_id: ProjectId::parse(project)?,
+                role_session_id,
+                highest_priority,
+                oldest_created_at_unix,
+                pending_count,
+            })
+        })
+        .collect()
+    }
+
     /// Verify a host status publication against the current persisted TicketRun state.
     /// External adapters call this immediately before mutation and again when reconciling.
     pub fn validate_ticket_status_publication(
@@ -1741,7 +1813,7 @@ pub enum TicketObservationClassification {
 mod tests {
     use rusqlite::Connection;
 
-    use super::{TicketScanCursor, TicketScanKey, migrate_v9, status_key};
+    use super::{PendingRoleWakeSession, TicketScanCursor, TicketScanKey, migrate_v9, status_key};
     use crate::domain::types::TicketStatus;
 
     #[test]
@@ -1797,5 +1869,43 @@ mod tests {
             .unwrap();
         assert_eq!(tables, 7);
         assert!(migrate_v9(&connection).is_err());
+    }
+
+    #[test]
+    fn pending_wake_scheduling_orders_priority_and_suppresses_active_runs() {
+        use super::ConfigStore;
+        use crate::store::MachineLock;
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE controller_owners(generation INTEGER PRIMARY KEY, stopped_at_unix INTEGER);
+             CREATE TABLE projects(project_id TEXT PRIMARY KEY, desired_lifecycle TEXT NOT NULL);
+             CREATE TABLE project_runtimes(project_id TEXT PRIMARY KEY, observed_lifecycle TEXT NOT NULL, controller_generation INTEGER NOT NULL);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY, role_session_id TEXT NOT NULL, state TEXT NOT NULL);
+             CREATE TABLE role_wake_inputs(project_id TEXT NOT NULL, role_session_id TEXT NOT NULL, lifecycle TEXT NOT NULL, priority INTEGER NOT NULL, created_at_unix INTEGER NOT NULL);
+             INSERT INTO controller_owners VALUES (7,NULL);
+             INSERT INTO projects VALUES ('p-a','running'),('p-b','running');
+             INSERT INTO project_runtimes VALUES ('p-a','running',7),('p-b','running',7);
+             INSERT INTO role_wake_inputs VALUES ('p-a','ticket_run:r-a:coordinator','pending',2,10),('p-a','ticket_run:r-a:coordinator','pending',8,20),('p-b','project:p-b:supervisor','pending',9,15);
+             INSERT INTO agent_runs VALUES ('run-active','project:p-b:supervisor','running');",
+        ).unwrap();
+        let store = ConfigStore {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        };
+
+        let wakes = store.pending_role_wake_sessions(7, 10).unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(
+            wakes[0],
+            PendingRoleWakeSession {
+                project_id: crate::domain::ids::ProjectId::parse("p-a").unwrap(),
+                role_session_id: "ticket_run:r-a:coordinator".into(),
+                highest_priority: 8,
+                oldest_created_at_unix: 10,
+                pending_count: 2,
+            }
+        );
+        assert!(store.pending_role_wake_sessions(8, 10).is_err());
     }
 }
