@@ -2243,6 +2243,84 @@ mod tests {
     }
 
     #[test]
+    fn observe_adapter_rejects_stale_operation_and_run_receipts() {
+        let operation_id = OperationId::parse("op-current").unwrap();
+        let params = ObserveParams {
+            operation_id: operation_id.clone(),
+            correlation_key: "ticket-run-7:deploy_prod".into(),
+            action_id: "deploy".into(),
+            target_id: "deploy_prod".into(),
+            repository_id: RepositoryId::parse("example").unwrap(),
+            environment: "production".into(),
+            source_sha: SHA.into(),
+            external_reference: Some("run-current".into()),
+            cursor: None,
+        };
+        let request = new_request(
+            "observe-request",
+            Some(operation_id.clone()),
+            Some(ProjectId::parse("operations_project").unwrap()),
+            "operation.observe",
+            params,
+        )
+        .unwrap();
+        let result = serde_json::json!({
+            "provider_instance": "fixture",
+            "external_run_id": "run-current",
+            "operation_id": operation_id,
+            "correlation_key": "ticket-run-7:deploy_prod",
+            "action_id": "deploy",
+            "target_id": "deploy_prod",
+            "repository_id": "example",
+            "environment": "production",
+            "source_sha": SHA,
+            "observed_at": "2026-11-07T00:00:00Z",
+            "status": "succeeded",
+            "evidence": [],
+            "jobs": {}
+        });
+        let action = OperationActionConfig::Command {
+            command: vec!["/opt/adapter".into()],
+        };
+        let response_bytes = |result: Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "request_id": "observe-request",
+                "result": result,
+            }))
+            .unwrap()
+        };
+        let mut runner = FakeRunner {
+            completion: Some(completed(response_bytes(result.clone()))),
+            ..FakeRunner::default()
+        };
+        assert!(
+            call_command_adapter(&mut runner, &action, &request, Duration::from_secs(5)).is_ok()
+        );
+
+        for (field, wrong) in [
+            ("operation_id", serde_json::json!("op-stale")),
+            (
+                "correlation_key",
+                serde_json::json!("ticket-run-6:deploy_prod"),
+            ),
+            ("external_run_id", serde_json::json!("run-stale")),
+        ] {
+            let mut stale = result.clone();
+            stale[field] = wrong;
+            let mut runner = FakeRunner {
+                completion: Some(completed(response_bytes(stale))),
+                ..FakeRunner::default()
+            };
+            assert!(
+                call_command_adapter(&mut runner, &action, &request, Duration::from_secs(5))
+                    .is_err(),
+                "stale {field} must be rejected at the adapter boundary"
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_or_ambiguous_recipe_rules_require_human_resolution() {
         let mut config = fixture_config();
         let project = config
