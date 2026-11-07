@@ -138,6 +138,24 @@ impl RunStepSpool {
         )
     }
 
+    /// Host-side read of an already published start receipt. Existing receipts remain
+    /// immutable; callers compare them with the durable host decision before replaying.
+    pub fn read_start_receipt(
+        &self,
+        request: &StartRequestEnvelope,
+    ) -> Result<Option<AgentLaunchReceipt>, String> {
+        request.validate()?;
+        match read_bounded(&self.directory.join("start.receipt.json"), MAX_START_BYTES) {
+            Ok(bytes) => {
+                let envelope: StartReceiptEnvelope = parse_unique(&bytes)?;
+                envelope.validate_for(request)?;
+                Ok(Some(envelope.receipt))
+            }
+            Err(error) if error == "run-step spool file is not present" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Wrapper-side bounded wait. Timeout is an unresolved start, never permission to proceed.
     pub fn wait_start_receipt(
         &self,
@@ -149,14 +167,8 @@ impl RunStepSpool {
             .checked_add(timeout)
             .ok_or_else(|| "start receipt deadline overflow".to_owned())?;
         loop {
-            match read_bounded(&self.directory.join("start.receipt.json"), MAX_START_BYTES) {
-                Ok(bytes) => {
-                    let envelope: StartReceiptEnvelope = parse_unique(&bytes)?;
-                    envelope.validate_for(request)?;
-                    return Ok(envelope.receipt);
-                }
-                Err(error) if error == "run-step spool file is not present" => {}
-                Err(error) => return Err(error),
+            if let Some(receipt) = self.read_start_receipt(request)? {
+                return Ok(receipt);
             }
             if Instant::now() >= deadline {
                 return Err("timed out waiting for the host start decision".into());

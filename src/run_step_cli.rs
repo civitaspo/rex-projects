@@ -300,10 +300,6 @@ pub fn reconcile_accepted_start(
     if digest_file(&executable)? != authority.runtime_binary_digest {
         return Err("running rex-projects binary differs from launch authority".into());
     }
-    let expected_command = executable
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
     let live_process_matches = inspect_process_table()
         .map_err(|error| format!("reobserve accepted wrapper process: {error}"))?
         .into_iter()
@@ -311,7 +307,6 @@ pub fn reconcile_accepted_start(
         .is_some_and(|process| {
             process.quality == ProcessIdentityQuality::KernelBirthToken
                 && process.start_identity == request.wrapper_start_identity
-                && process.command == expected_command
         });
     if !rex_reports_wrapper || !live_process_matches {
         // The wrapper may have completed between the original ACK and effect commit. In that
@@ -321,7 +316,13 @@ pub fn reconcile_accepted_start(
                 .to_owned()
         })?;
     }
-    spool.publish_start_receipt(&start, receipt)?;
+    match spool.read_start_receipt(&start)? {
+        Some(published) if published == receipt => {}
+        Some(_) => {
+            return Err("published StartAgent receipt differs from durable host authority".into());
+        }
+        None => spool.publish_start_receipt(&start, receipt)?,
+    }
     Ok(Some(authority))
 }
 
