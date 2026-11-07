@@ -390,7 +390,8 @@ pub struct ArtifactAddRequest {
     /// Artifact-add request envelope version.
     pub schema_version: u32,
     pub message_id: String,
-    /// Normalized relative path rooted at the requesting AgentRun output root.
+    /// Normalized relative path (at most 1,024 Unicode scalar values and
+    /// 4,096 UTF-8 bytes), rooted at the requesting AgentRun output root.
     pub path: String,
     pub kind: RoleArtifactKind,
     /// Schema version of the artifact contents, independent of this request.
@@ -459,11 +460,12 @@ pub fn artifact_add_request_schema() -> Value {
         }
         if let Some(path) = properties.get_mut("path").and_then(Value::as_object_mut) {
             path.insert("minLength".into(), Value::from(1));
-            path.insert("maxLength".into(), Value::from(4096));
+            path.insert("maxLength".into(), Value::from(1024));
             path.insert(
                 "pattern".into(),
                 Value::from(ARTIFACT_RELATIVE_PATH_PATTERN),
             );
+            path.insert("not".into(), serde_json::json!({"pattern": r"^[^/]:"}));
         }
     }
     schema
@@ -482,7 +484,8 @@ pub struct RoleArtifactReference {
     pub artifact_id: ArtifactId,
     pub kind: RoleArtifactKind,
     pub schema_version: u32,
-    /// Normalized relative locator in the host-managed artifact store.
+    /// Normalized relative locator in the host-managed artifact store, at most
+    /// 1,024 Unicode scalar values and 4,096 UTF-8 bytes.
     pub path: String,
     pub digest: Digest,
     pub bytes: u64,
@@ -1131,10 +1134,14 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                     if let Some(path) =
                                         properties.get_mut("path").and_then(Value::as_object_mut)
                                     {
-                                        path.insert("maxLength".into(), Value::from(4096));
+                                        path.insert("maxLength".into(), Value::from(1024));
                                         path.insert(
                                             "pattern".into(),
                                             Value::from(ARTIFACT_RELATIVE_PATH_PATTERN),
+                                        );
+                                        path.insert(
+                                            "not".into(),
+                                            serde_json::json!({"pattern": r"^[^/]:"}),
                                         );
                                     }
                                 }
@@ -1325,7 +1332,15 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                     constrain(items, 1, 80, r"^[A-Za-z0-9._-]+$");
                                 }
                             }
-                            "path" => constrain(property, 1, 4096, ARTIFACT_RELATIVE_PATH_PATTERN),
+                            "path" => {
+                                constrain(property, 1, 1024, ARTIFACT_RELATIVE_PATH_PATTERN);
+                                if let Some(map) = property.as_object_mut() {
+                                    map.insert(
+                                        "not".into(),
+                                        serde_json::json!({"pattern": r"^[^/]:"}),
+                                    );
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1476,6 +1491,7 @@ fn validate_artifact_reference(reference: &RoleArtifactReference) -> Result<(), 
 fn validate_artifact_relative_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.len() > 4096
+        || path.chars().count() > 1024
         || path.starts_with('/')
         || path.starts_with('\\')
         || path.contains('\\')
@@ -1486,7 +1502,7 @@ fn validate_artifact_relative_path(path: &str) -> Result<(), String> {
         || path
             .split('/')
             .next()
-            .is_some_and(|part| part.as_bytes().get(1) == Some(&b':'))
+            .is_some_and(|part| part.chars().nth(1) == Some(':'))
     {
         return Err("artifact path must be a bounded normalized relative path".into());
     }
@@ -3542,6 +3558,24 @@ mod tests {
             RoleOutputKind::ImplementationReady,
             &with_artifact
         ));
+        for invalid_path in [
+            "1:/outside",
+            ".:/outside",
+            "-:/outside",
+            "é:/outside",
+            "💥:/outside",
+        ] {
+            with_artifact["irregularity_references"][0]["path"] = json!(invalid_path);
+            assert!(!schema_accepts(
+                RoleOutputKind::ImplementationReady,
+                &with_artifact
+            ));
+        }
+        with_artifact["irregularity_references"][0]["path"] = json!("🍃".repeat(1100));
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
         with_artifact["irregularity_references"][0]["path"] = json!("../outside");
         assert!(!schema_accepts(
             RoleOutputKind::ImplementationReady,
@@ -3743,6 +3777,33 @@ mod tests {
     #[test]
     fn result_artifact_path_must_be_safe_and_role_owned() {
         let binding = worker_result_binding();
+        let oversized_path = "🍃".repeat(1100);
+        for path in [
+            "1:/outside",
+            ".:/outside",
+            "-:/outside",
+            "é:/outside",
+            "💥:/outside",
+            oversized_path.as_str(),
+        ] {
+            let mut invalid_path = worker_result_submission(
+                RoleOutputKind::ImplementationReady,
+                worker_implementation_ready_payload(),
+            );
+            invalid_path.artifact_refs.push(RoleArtifactReference {
+                artifact_id: ArtifactId::parse("f".repeat(64)).unwrap(),
+                kind: RoleArtifactKind::Change,
+                schema_version: 1,
+                path: path.into(),
+                digest: test_digest('f'),
+                bytes: 12,
+            });
+            assert!(
+                validate_role_result(&binding, invalid_path).is_err(),
+                "{path}"
+            );
+        }
+
         let mut submission = worker_result_submission(
             RoleOutputKind::ImplementationReady,
             worker_implementation_ready_payload(),
@@ -3793,7 +3854,18 @@ mod tests {
         let value = serde_json::to_value(&valid).unwrap();
         assert!(validator.is_valid(&value));
 
-        for path in ["../outside", "/outside", "C:/outside", "dir\\file", "a//b"] {
+        for path in [
+            "../outside",
+            "/outside",
+            "C:/outside",
+            "1:/outside",
+            ".:/outside",
+            "-:/outside",
+            "é:/outside",
+            "💥:/outside",
+            "dir\\file",
+            "a//b",
+        ] {
             let invalid = ArtifactAddRequest {
                 path: path.into(),
                 ..valid.clone()
@@ -3804,6 +3876,13 @@ mod tests {
                 "{path}"
             );
         }
+
+        let oversized = ArtifactAddRequest {
+            path: "🍃".repeat(1100),
+            ..valid.clone()
+        };
+        assert!(oversized.validate().is_err());
+        assert!(!validator.is_valid(&serde_json::to_value(oversized).unwrap()));
 
         let mut invalid = serde_json::to_value(&valid).unwrap();
         invalid["schema_version"] = json!(2);
