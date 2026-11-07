@@ -2057,6 +2057,17 @@ mod tests {
             )
             .unwrap();
 
+        // Ticket views become retention candidates only after the durable run is terminal.
+        // The pending request below must then keep that otherwise-clean view alive.
+        store.connection.execute(
+            "UPDATE ticket_runs SET internal_phase='done',activity='done' WHERE ticket_run_id='run-1'",
+            [],
+        ).unwrap();
+        store
+            .archive_rex_view_block(generation, &view_id, "finished-worker", "finished output")
+            .unwrap();
+        assert!(store.mark_rex_view_terminal(generation, &view_id, 0).unwrap());
+
         let stale_candidate = store.rex_view_cleanup_candidates(1000, 1).unwrap();
         assert_eq!(stale_candidate.len(), 1);
         register_request(&mut store, generation, &request, &artifact, 10).unwrap();

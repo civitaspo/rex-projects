@@ -6,6 +6,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, TicketRunId};
 use crate::launch::{AgentLaunchAuthority, ObservedProviderStart, ObservedWrapperIdentity};
+use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 
 use super::{ConfigStore, validate_active_generation};
 
@@ -108,6 +109,38 @@ pub struct StopOwnedRunsIntent {
     pub request: StopOwnedRunsRequest,
     pub targets: Vec<StopOwnedRunTarget>,
     pub created_at_unix: i64,
+}
+
+/// Host-only evidence that a StopOwnedRuns target's immutable process tree was observed absent.
+/// The fields are private, the type is not serializable, and only the runtime observer creates it.
+pub(crate) struct VerifiedStopCancellation {
+    operation_id: OperationId,
+    agent_run_id: AgentRunId,
+    reservation_epoch: u64,
+    authority_digest: Digest,
+    process_tree_digest: Digest,
+    rex_observation_digest: Digest,
+    observed_at_unix: i64,
+}
+
+impl VerifiedStopCancellation {
+    pub(crate) fn after_verified_absence(
+        operation_id: &OperationId,
+        target: &StopOwnedRunTarget,
+        process_tree_digest: &Digest,
+        rex_observation_digest: &Digest,
+        observed_at_unix: i64,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.clone(),
+            agent_run_id: target.agent_run_id.clone(),
+            reservation_epoch: target.reservation_epoch,
+            authority_digest: target.authority_digest.clone(),
+            process_tree_digest: process_tree_digest.clone(),
+            rex_observation_digest: rex_observation_digest.clone(),
+            observed_at_unix,
+        }
+    }
 }
 
 impl StopOwnedRunsEffectPayload {
@@ -331,7 +364,250 @@ pub(crate) fn migrate_v12_recovery_tables(tx: &Transaction<'_>) -> Result<(), St
         .map_err(|error| error.to_string())
 }
 
+fn validate_stop_target_tx(
+    tx: &Transaction<'_>,
+    operation_id: &OperationId,
+    target: &StopOwnedRunTarget,
+) -> Result<(), String> {
+    let raw: String = tx
+        .query_row(
+            "SELECT intent_json FROM agent_stop_owned_runs_intents WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let intent: StopOwnedRunsIntent = crate::protocol::parse_unique(raw.as_bytes())?;
+    intent.validate()?;
+    if intent.operation_id != *operation_id || !intent.targets.contains(target) {
+        return Err("StopOwnedRuns target is outside its immutable intent".into());
+    }
+    let slot: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND reservation_epoch=?2 AND disposition IN ('launch_pending','live','unknown') AND controller_generation=(SELECT controller_generation FROM agent_runs WHERE agent_run_id=?1))",
+        params![target.agent_run_id.as_str(), target.reservation_epoch],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    let authority: Option<String> = tx
+        .query_row(
+            "SELECT authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+            [target.agent_run_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if !slot || authority.as_deref() != Some(target.authority_digest.as_str()) {
+        return Err(
+            "StopOwnedRuns target no longer owns its exact launch authority and slot".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_stop_process_snapshot(
+    target: &StopOwnedRunTarget,
+    processes: &[ProcessIdentity],
+) -> Result<(), String> {
+    if processes.is_empty() || processes.len() > 1024 {
+        return Err("StopOwnedRuns process snapshot is empty or exceeds its bound".into());
+    }
+    let mut last_pid = 0;
+    let group = processes[0].process_group_id;
+    for process in processes {
+        if process.pid <= last_pid
+            || process.quality != ProcessIdentityQuality::KernelBirthToken
+            || process.start_identity.trim().is_empty()
+            || process.command.trim().is_empty()
+            || process.command.chars().any(char::is_control)
+            || process.process_group_id != group
+        {
+            return Err(
+                "StopOwnedRuns process snapshot lacks a complete ordered process group".into(),
+            );
+        }
+        last_pid = process.pid;
+    }
+    let Some(wrapper) = &target.wrapper else {
+        return Err("StopOwnedRuns wrapper identity is missing".into());
+    };
+    let Some(provider) = &target.provider else {
+        return Err("StopOwnedRuns provider identity is missing".into());
+    };
+    if !processes.iter().any(|process| {
+        process.pid == wrapper.pid && process.start_identity == wrapper.start_identity
+    }) || !processes.iter().any(|process| {
+        process.pid == provider.pid && process.start_identity == provider.start_identity
+    }) {
+        return Err("StopOwnedRuns process snapshot omits the pinned wrapper or provider".into());
+    }
+    Ok(())
+}
+
 impl ConfigStore {
+    pub(crate) fn record_stop_process_snapshot(
+        &mut self,
+        owner_generation: u64,
+        operation_id: &OperationId,
+        target: &StopOwnedRunTarget,
+        processes: &[ProcessIdentity],
+        now_unix: i64,
+    ) -> Result<Digest, String> {
+        validate_stop_process_snapshot(target, processes)?;
+        let json = serde_json::to_string(processes).map_err(|error| error.to_string())?;
+        if json.len() > 524_288 {
+            return Err("StopOwnedRuns process snapshot exceeds its limit".into());
+        }
+        let digest = Digest::parse(format!("{:x}", Sha256::digest(json.as_bytes())))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        validate_stop_target_tx(&tx, operation_id, target)?;
+        tx.execute(
+            "INSERT INTO agent_stop_owned_runs_process_snapshots(operation_id,agent_run_id,reservation_epoch,authority_digest,process_tree_digest,process_tree_json,observed_at_unix)
+             VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(operation_id,agent_run_id) DO NOTHING",
+            params![operation_id.as_str(), target.agent_run_id.as_str(), target.reservation_epoch, target.authority_digest.as_str(), digest.as_str(), json, now_unix],
+        ).map_err(|error| error.to_string())?;
+        let stored: (u64, String, String, String) = tx.query_row(
+            "SELECT reservation_epoch,authority_digest,process_tree_digest,process_tree_json FROM agent_stop_owned_runs_process_snapshots WHERE operation_id=?1 AND agent_run_id=?2",
+            params![operation_id.as_str(), target.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored.0 != target.reservation_epoch
+            || stored.1 != target.authority_digest.as_str()
+            || stored.2 != digest.as_str()
+            || stored.3 != json
+        {
+            return Err(
+                "StopOwnedRuns process tree changed after its immutable cancellation snapshot"
+                    .into(),
+            );
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(digest)
+    }
+
+    pub(crate) fn stop_process_snapshot(
+        &self,
+        operation_id: &OperationId,
+        agent_run_id: &AgentRunId,
+    ) -> Result<Option<(Digest, Vec<ProcessIdentity>)>, String> {
+        let row: Option<(String, String)> = self.connection.query_row(
+            "SELECT process_tree_digest,process_tree_json FROM agent_stop_owned_runs_process_snapshots WHERE operation_id=?1 AND agent_run_id=?2",
+            params![operation_id.as_str(), agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((raw_digest, json)) = row else {
+            return Ok(None);
+        };
+        let digest = Digest::parse(raw_digest)?;
+        if Digest::parse(format!("{:x}", Sha256::digest(json.as_bytes())))? != digest {
+            return Err("StopOwnedRuns process snapshot digest does not match its payload".into());
+        }
+        let processes: Vec<ProcessIdentity> = crate::protocol::parse_unique(json.as_bytes())?;
+        Ok(Some((digest, processes)))
+    }
+
+    pub(crate) fn complete_cancelled_agent_run(
+        &mut self,
+        owner_generation: u64,
+        operation_id: &OperationId,
+        target: &StopOwnedRunTarget,
+        proof: &VerifiedStopCancellation,
+    ) -> Result<(), String> {
+        if proof.operation_id != *operation_id
+            || proof.agent_run_id != target.agent_run_id
+            || proof.reservation_epoch != target.reservation_epoch
+            || proof.authority_digest != target.authority_digest
+        {
+            return Err("host cancellation proof does not match the immutable Stop target".into());
+        }
+        let proof_material = serde_json::to_vec(&(
+            operation_id.as_str(),
+            target.agent_run_id.as_str(),
+            target.reservation_epoch,
+            target.authority_digest.as_str(),
+            proof.process_tree_digest.as_str(),
+            proof.rex_observation_digest.as_str(),
+            proof.observed_at_unix,
+        ))
+        .map_err(|error| error.to_string())?;
+        let proof_digest = Digest::parse(format!("{:x}", Sha256::digest(proof_material)))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        validate_stop_target_tx(&tx, operation_id, target)?;
+        let snapshot: Option<(u64, String, String)> = tx.query_row(
+            "SELECT reservation_epoch,authority_digest,process_tree_digest FROM agent_stop_owned_runs_process_snapshots WHERE operation_id=?1 AND agent_run_id=?2",
+            params![operation_id.as_str(), target.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if !matches!(snapshot, Some((epoch, ref authority, ref digest)) if epoch == target.reservation_epoch && authority == target.authority_digest.as_str() && digest == proof.process_tree_digest.as_str())
+        {
+            return Err("cancellation proof has no matching immutable process snapshot".into());
+        }
+        tx.execute(
+            "INSERT INTO agent_stop_owned_runs_completions(operation_id,agent_run_id,reservation_epoch,authority_digest,process_tree_digest,rex_observation_digest,proof_digest,observed_at_unix)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(operation_id,agent_run_id) DO NOTHING",
+            params![operation_id.as_str(), target.agent_run_id.as_str(), target.reservation_epoch, target.authority_digest.as_str(), proof.process_tree_digest.as_str(), proof.rex_observation_digest.as_str(), proof_digest.as_str(), proof.observed_at_unix],
+        ).map_err(|error| error.to_string())?;
+        let stored: (u64, String, String, String, String) = tx.query_row(
+            "SELECT reservation_epoch,authority_digest,process_tree_digest,rex_observation_digest,proof_digest FROM agent_stop_owned_runs_completions WHERE operation_id=?1 AND agent_run_id=?2",
+            params![operation_id.as_str(), target.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored
+            != (
+                target.reservation_epoch,
+                target.authority_digest.to_string(),
+                proof.process_tree_digest.to_string(),
+                proof.rex_observation_digest.to_string(),
+                proof_digest.to_string(),
+            )
+        {
+            return Err(
+                "cancellation completion proof conflicts with its immutable predecessor".into(),
+            );
+        }
+        let run_changed = tx.execute(
+            "UPDATE agent_runs SET state='cancelled',finished_at_unix=COALESCE(finished_at_unix,?3),controller_generation=?4 WHERE agent_run_id=?1 AND project_id=(SELECT project_id FROM agent_launch_authority WHERE agent_run_id=?1 AND authority_digest=?2) AND state IN ('launch_pending','running','parked','unknown') AND controller_generation=?4",
+            params![target.agent_run_id.as_str(), target.authority_digest.as_str(), proof.observed_at_unix, owner_generation],
+        ).map_err(|error| error.to_string())?;
+        if run_changed != 1 {
+            let already_cancelled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent_run_id=?1 AND state='cancelled' AND controller_generation=?2)", params![target.agent_run_id.as_str(), owner_generation], |row| row.get(0)).map_err(|error| error.to_string())?;
+            if !already_cancelled {
+                return Err("AgentRun changed before cancellation completion".into());
+            }
+        }
+        let slot_changed = tx.execute(
+            "UPDATE execution_slots SET disposition='released',controller_generation=?3 WHERE owner_kind='agent_run' AND owner_id=?1 AND project_id=(SELECT project_id FROM agent_launch_authority WHERE agent_run_id=?1 AND authority_digest=?4) AND reservation_epoch=?2 AND disposition='unknown' AND controller_generation=?3",
+            params![target.agent_run_id.as_str(), target.reservation_epoch, owner_generation, target.authority_digest.as_str()],
+        ).map_err(|error| error.to_string())?;
+        if slot_changed != 1 {
+            let already_released: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND reservation_epoch=?2 AND disposition='released' AND controller_generation=?3)", params![target.agent_run_id.as_str(), target.reservation_epoch, owner_generation], |row| row.get(0)).map_err(|error| error.to_string())?;
+            if !already_released {
+                return Err(
+                    "exact AgentRun capacity reservation changed before cancellation release"
+                        .into(),
+                );
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn stop_cancellation_complete(
+        &self,
+        operation_id: &OperationId,
+        agent_run_id: &AgentRunId,
+    ) -> Result<bool, String> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_stop_owned_runs_completions WHERE operation_id=?1 AND agent_run_id=?2)",
+            params![operation_id.as_str(), agent_run_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())
+    }
+
     /// Freeze the exact runs affected by a durable parent Pause/Cancel effect. A caller must
     /// reobserve each target before signaling; the snapshot itself is never proof of liveness.
     pub fn prepare_stop_owned_runs_intent(
@@ -382,6 +658,12 @@ impl ConfigStore {
             if intent.operation_id != *operation_id || intent.request != *request {
                 return Err("StopOwnedRuns operation was reused for a different request".into());
             }
+            tx.execute(
+                "INSERT INTO agent_stop_owned_runs_progress(operation_id,cursor_index,sweep_count,updated_at_unix)
+                 VALUES (?1,0,0,?2) ON CONFLICT(operation_id) DO NOTHING",
+                params![operation_id.as_str(), now_unix],
+            )
+            .map_err(|error| error.to_string())?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(intent);
         }
@@ -515,6 +797,12 @@ impl ConfigStore {
             ],
         )
         .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_stop_owned_runs_progress(operation_id,cursor_index,sweep_count,updated_at_unix)
+             VALUES (?1,0,0,?2)",
+            params![operation_id.as_str(), now_unix],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(intent)
     }
@@ -546,6 +834,125 @@ impl ConfigStore {
             return Err("stored StopOwnedRuns intent operation identity changed".into());
         }
         Ok(Some(intent))
+    }
+
+    pub fn stop_owned_runs_progress(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(u32, u64), String> {
+        self.connection
+            .query_row(
+                "SELECT cursor_index,sweep_count FROM agent_stop_owned_runs_progress WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "StopOwnedRuns progress row is missing".to_owned())
+    }
+
+    pub fn advance_stop_owned_runs_progress(
+        &mut self,
+        owner_generation: u64,
+        operation_id: &OperationId,
+        expected_cursor: u32,
+        target_count: u32,
+        now_unix: i64,
+    ) -> Result<(u32, u64), String> {
+        if target_count == 0 || expected_cursor >= target_count {
+            return Err("StopOwnedRuns progress cursor is outside its target list".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let intent_json: String = tx
+            .query_row(
+                "SELECT intent_json FROM agent_stop_owned_runs_intents WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let intent: StopOwnedRunsIntent = crate::protocol::parse_unique(intent_json.as_bytes())
+            .map_err(|error| format!("stored StopOwnedRuns intent is invalid: {error}"))?;
+        intent.validate()?;
+        if intent.targets.len() != target_count as usize {
+            return Err(
+                "StopOwnedRuns cursor target count differs from its immutable intent".into(),
+            );
+        }
+        let next_cursor = (expected_cursor + 1) % target_count;
+        let changed = tx
+            .execute(
+                "UPDATE agent_stop_owned_runs_progress
+                 SET cursor_index=?2,sweep_count=sweep_count+CASE WHEN ?2=0 THEN 1 ELSE 0 END,updated_at_unix=?3
+                 WHERE operation_id=?1 AND cursor_index=?4",
+                params![operation_id.as_str(), next_cursor, now_unix, expected_cursor],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(
+                "StopOwnedRuns progress changed before this observation was committed".into(),
+            );
+        }
+        let progress = tx
+            .query_row(
+                "SELECT cursor_index,sweep_count FROM agent_stop_owned_runs_progress WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(progress)
+    }
+
+    pub fn agent_terminal_receipt_exists(&self, agent_run_id: &AgentRunId) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1)",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn retain_agent_run_unknown(
+        &mut self,
+        owner_generation: u64,
+        agent_run_id: &AgentRunId,
+        expected_reservation_epoch: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
+            "UPDATE agent_runs SET state='unknown',controller_generation=?2
+             WHERE agent_run_id=?1 AND state IN ('launch_pending','running','unknown')
+               AND EXISTS(SELECT 1 FROM execution_slots s WHERE s.owner_kind='agent_run' AND s.owner_id=agent_runs.agent_run_id
+                 AND s.controller_generation=?2 AND s.reservation_epoch=?3 AND s.disposition IN ('launch_pending','live','unknown'))",
+            params![agent_run_id.as_str(), owner_generation, expected_reservation_epoch],
+        ).map_err(|error| error.to_string())?;
+        let slot_changed = tx
+            .execute(
+                "UPDATE execution_slots SET disposition='unknown',controller_generation=?2
+             WHERE owner_kind='agent_run' AND owner_id=?1 AND reservation_epoch=?3
+               AND disposition IN ('launch_pending','live','unknown')",
+                params![
+                    agent_run_id.as_str(),
+                    owner_generation,
+                    expected_reservation_epoch
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 || slot_changed != 1 {
+            return Err(
+                "AgentRun or execution slot changed before it was retained as unknown".into(),
+            );
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn recoverable_agent_runs(
@@ -921,6 +1328,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        crate::store::artifact_registry::migrate_v12(&store.connection).unwrap();
         let config = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "adapters": {"tickets": {
@@ -1027,6 +1435,319 @@ mod tests {
                 .prepare_stop_owned_runs_intent(generation, &operation_id, &payload, 12)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stop_owned_runs_progress_advances_one_immutable_target_at_a_time() {
+        use crate::store::OwnerMetadata;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        crate::store::artifact_registry::migrate_v12(&store.connection).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "stop-progress-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-start".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-fixture.sock".into()),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let operation_id = OperationId::parse("stop-progress-operation").unwrap();
+        let request = StopOwnedRunsRequest {
+            schema_version: 1,
+            project_id: ProjectId::parse("project-a").unwrap(),
+            ticket_run_id: TicketRunId::parse("ticket-run-a").unwrap(),
+            expected_revision: 1,
+        };
+        let targets = (1..=3)
+            .map(|index| StopOwnedRunTarget {
+                agent_run_id: AgentRunId::parse(format!("agent-run-{index}")).unwrap(),
+                attempt: 1,
+                run_epoch: 1,
+                reservation_epoch: 1,
+                authority_digest: Digest::parse("a".repeat(64)).unwrap(),
+                rex_server_identity: "rex-instance".into(),
+                rex_session_id: "rex-session".into(),
+                rex_window_id: "rex-window".into(),
+                rex_block_id: format!("rex-block-{index}"),
+                wrapper: None,
+                provider: None,
+                lifecycle: StopTargetLifecycle::IdentityUnknown,
+            })
+            .collect::<Vec<_>>();
+        let intent = StopOwnedRunsIntent {
+            schema_version: 1,
+            operation_id: operation_id.clone(),
+            request,
+            targets,
+            created_at_unix: 10,
+        };
+        intent.validate().unwrap();
+        let intent_json = serde_json::to_string(&intent).unwrap();
+        let intent_digest = format!("{:x}", Sha256::digest(intent_json.as_bytes()));
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_stop_owned_runs_intents(operation_id,project_id,ticket_run_id,intent_digest,intent_json,created_at_unix)
+                 VALUES (?1,'project-a','ticket-run-a',?2,?3,10)",
+                params![operation_id.as_str(), intent_digest, intent_json],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_stop_owned_runs_progress(operation_id,cursor_index,sweep_count,updated_at_unix)
+                 VALUES (?1,0,0,10)",
+                [operation_id.as_str()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.stop_owned_runs_progress(&operation_id).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            store
+                .advance_stop_owned_runs_progress(generation, &operation_id, 0, 3, 11)
+                .unwrap(),
+            (1, 0)
+        );
+        assert!(
+            store
+                .advance_stop_owned_runs_progress(generation, &operation_id, 0, 3, 12)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .advance_stop_owned_runs_progress(generation, &operation_id, 1, 3, 13)
+                .unwrap(),
+            (2, 0)
+        );
+        assert_eq!(
+            store
+                .advance_stop_owned_runs_progress(generation, &operation_id, 2, 3, 14)
+                .unwrap(),
+            (0, 1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_kill_without_agent_receipt_releases_only_exact_slot_after_owned_group_absence() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::Duration;
+
+        use crate::store::OwnerMetadata;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        crate::store::artifact_registry::migrate_v12(&store.connection).unwrap();
+        store
+            .connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "stop-hard-kill-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-start".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-fixture.sock".into()),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let root_pid = child.id();
+        let mut tree = Vec::new();
+        for _ in 0..40 {
+            tree = crate::process::capture_process_tree(
+                root_pid,
+                &crate::process::inspect_process_table().unwrap(),
+            );
+            if tree.len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(tree.len() >= 2, "fixture child was not observed");
+        let wrapper = tree
+            .iter()
+            .find(|identity| identity.pid == root_pid)
+            .unwrap();
+        let provider = tree
+            .iter()
+            .find(|identity| identity.pid != root_pid)
+            .unwrap();
+        let agent_run_id = AgentRunId::parse("agent-run-hard-kill").unwrap();
+        let project_id = ProjectId::parse("project-hard-kill").unwrap();
+        let ticket_run_id = TicketRunId::parse("ticket-hard-kill").unwrap();
+        let operation_id = OperationId::parse("stop-hard-kill").unwrap();
+        let authority_digest = Digest::parse("a".repeat(64)).unwrap();
+        let target = StopOwnedRunTarget {
+            agent_run_id: agent_run_id.clone(),
+            attempt: 1,
+            run_epoch: 1,
+            reservation_epoch: 7,
+            authority_digest: authority_digest.clone(),
+            rex_server_identity: "rex-instance".into(),
+            rex_session_id: "rex-session".into(),
+            rex_window_id: "rex-window".into(),
+            rex_block_id: "rex-block".into(),
+            wrapper: Some(StopProcessIdentity {
+                pid: wrapper.pid,
+                start_identity: wrapper.start_identity.clone(),
+            }),
+            provider: Some(StopProcessIdentity {
+                pid: provider.pid,
+                start_identity: provider.start_identity.clone(),
+            }),
+            lifecycle: StopTargetLifecycle::NeedsReconciliation,
+        };
+        let request = StopOwnedRunsRequest {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            expected_revision: 1,
+        };
+        let intent = StopOwnedRunsIntent {
+            schema_version: 1,
+            operation_id: operation_id.clone(),
+            request,
+            targets: vec![target.clone()],
+            created_at_unix: 1,
+        };
+        let intent_json = serde_json::to_string(&intent).unwrap();
+        let digest = format!("{:x}", Sha256::digest(intent_json.as_bytes()));
+
+        store.connection.execute("INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',1,?3,'role-session','role:session',1,'launch-op','unknown',?4)", params![agent_run_id.as_str(), project_id.as_str(), "b".repeat(64), generation]).unwrap();
+        store.connection.execute("INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'worker','role-session',?3,1,1,?4,1,1,?5,'launch-op',?4,?4,?4,'/descriptor',?4,'worker',?4,?4,?4,?4,'rex-instance','rex-session','rex-window','rex-block','/workspace','/control',?4,'{}',?6,1)", params![agent_run_id.as_str(), project_id.as_str(), ticket_run_id.as_str(), "b".repeat(64), generation, authority_digest.as_str()]).unwrap();
+        store.connection.execute("INSERT INTO execution_slots(pool,slot_index,project_id,ticket_run_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',0,?1,?2,'agent_run',?3,7,?4,'unknown'),('agent',1,?1,?2,'agent_run','other-run',8,?4,'unknown')", params![project_id.as_str(), ticket_run_id.as_str(), agent_run_id.as_str(), generation]).unwrap();
+        store.connection.execute("INSERT INTO agent_stop_owned_runs_intents(operation_id,project_id,ticket_run_id,intent_digest,intent_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,1)", params![operation_id.as_str(), project_id.as_str(), ticket_run_id.as_str(), digest, intent_json]).unwrap();
+        store.connection.execute("INSERT INTO agent_stop_owned_runs_progress(operation_id,cursor_index,sweep_count,updated_at_unix) VALUES (?1,0,0,1)", [operation_id.as_str()]).unwrap();
+
+        let snapshot_digest = store
+            .record_stop_process_snapshot(generation, &operation_id, &target, &tree, 2)
+            .unwrap();
+        child.kill().unwrap();
+        let _ = child.wait();
+        let still_owned = crate::process::inspect_process_table().unwrap();
+        assert!(!crate::stop_owned_runs::owned_process_tree_is_absent(
+            &tree,
+            &still_owned
+        ));
+        assert!(
+            !store
+                .stop_cancellation_complete(&operation_id, &agent_run_id)
+                .unwrap()
+        );
+        let disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "unknown");
+        let terminal_exists: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1)",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!terminal_exists);
+
+        let provider_pid = provider.pid.to_string();
+        assert!(
+            Command::new("/bin/kill")
+                .args(["-KILL", &provider_pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut absent = false;
+        for _ in 0..80 {
+            let current = crate::process::inspect_process_table().unwrap();
+            if crate::stop_owned_runs::owned_process_tree_is_absent(&tree, &current) {
+                absent = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(absent, "owned process group remained after hard kill");
+        let proof = VerifiedStopCancellation::after_verified_absence(
+            &operation_id,
+            &target,
+            &snapshot_digest,
+            &Digest::parse("c".repeat(64)).unwrap(),
+            3,
+        );
+        store
+            .complete_cancelled_agent_run(generation, &operation_id, &target, &proof)
+            .unwrap();
+        assert!(
+            store
+                .stop_cancellation_complete(&operation_id, &agent_run_id)
+                .unwrap()
+        );
+        let cancelled: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM agent_runs WHERE agent_run_id=?1",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancelled, "cancelled");
+        let released: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let other: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id='other-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(released, "released");
+        assert_eq!(other, "unknown");
+        let terminal_exists: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1)",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!terminal_exists);
     }
 
     #[test]
