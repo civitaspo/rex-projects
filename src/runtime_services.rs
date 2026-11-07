@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapters::rex::{RexCliTransport, RexIdentity};
 use crate::adapters::tickets::{
-    NormalizedTicketStatus, TicketAdapter, TicketListRequest, TicketScope, build_ticket_adapter,
+    NormalizedTicketStatus, TicketAdapter, TicketGetRequest, TicketListRequest, TicketScope,
+    build_ticket_adapter,
 };
 use crate::artifacts::ArtifactStore;
 use crate::config::{AppliedConfig, Config};
@@ -246,10 +247,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             return Err("RuntimeServices owner generation changed".into());
         }
         if candidate.role != Role::Supervisor {
-            return Err(format!(
-                "{} launch requires its typed TicketRun or prepared-worktree authority",
-                role_name(candidate.role)
-            ));
+            return self.prepare_ticket_role_launch(store, config, candidate, now_unix);
         }
         if candidate.ticket_run_id.is_some()
             || candidate.role_session_id != format!("project:{}:supervisor", candidate.project_id)
@@ -279,8 +277,8 @@ impl FactoryRuntimeServices for RuntimeServices {
             .profiles
             .get(profile_id)
             .ok_or("Supervisor profile is absent from the applied configuration")?;
-        let profile_digest = digest_serialized(profile)?;
-        let runtime_identity = crate::run_step::profile_runtime_identity(profile)
+        let profile_digest = digest_serialized(&profile)?;
+        let runtime_identity = crate::run_step::profile_runtime_identity(&profile)
             .map_err(|error| error.to_string())?;
         let qualifications = store.verified_provider_qualifications(
             &candidate.project_id,
@@ -460,6 +458,373 @@ impl FactoryRuntimeServices for RuntimeServices {
 }
 
 impl RuntimeServices {
+    fn prepare_ticket_role_launch(
+        &mut self,
+        store: &mut ConfigStore,
+        config: &Config,
+        candidate: &crate::store::scheduler::PendingRoleWakeSession,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        if serde_json::to_vec(config).map_err(|error| error.to_string())?
+            != serde_json::to_vec(&self.config).map_err(|error| error.to_string())?
+        {
+            return Err("runtime configuration changed without rebuilding host services".into());
+        }
+        let ticket_run_id = candidate
+            .ticket_run_id
+            .as_ref()
+            .ok_or("ticket role wake lacks TicketRun identity")?;
+        if candidate.role == Role::Worker {
+            if candidate.work_node_id.is_none() {
+                return Err("generic or malformed Worker wake cannot authorize a launch".into());
+            }
+            return Err(
+                "Worker launch requires the dedicated prepared-worktree reservation API".into(),
+            );
+        }
+        if candidate.work_node_id.is_some()
+            || candidate.role_session_id
+                != format!("ticket_run:{ticket_run_id}:{}", role_name(candidate.role))
+        {
+            return Err("ticket role wake scope does not match its TicketRun".into());
+        }
+        let active_run = store
+            .active_ticket_runs(self.owner_generation, 256)?
+            .into_iter()
+            .find(|run| run.ticket_run_id == *ticket_run_id)
+            .ok_or("ticket role refers to a missing or terminal TicketRun")?;
+        if active_run.project_id != candidate.project_id
+            || !role_allowed_in_phase(candidate.role, active_run.phase)
+        {
+            return Err("ticket role does not match the active TicketRun phase".into());
+        }
+        let project = self
+            .applied_config
+            .config
+            .projects
+            .get(&candidate.project_id)
+            .ok_or("pending ticket role references an unconfigured Project")?
+            .clone();
+        let runnable = store
+            .runnable_projects(self.owner_generation)?
+            .into_iter()
+            .find(|project| project.record.id == candidate.project_id)
+            .ok_or("ticket Project is not runnable under this controller")?;
+        if runnable.record.config_digest != self.configuration_digest
+            || runnable.project_epoch != active_run.project_epoch
+            || store.current_revision(&runnable.record.config_source)?
+                != Some(runnable.record.config_revision)
+        {
+            return Err("ticket Project configuration or epoch changed".into());
+        }
+        let mut profile_id = crate::config::effective_project_roles(
+            &candidate.project_id,
+            &self.applied_config.config.projects,
+        )?
+        .get(&candidate.role)
+        .cloned()
+        .ok_or("Project has no profile for this ticket role")?;
+        if let Some(recipe_id) = &active_run.recipe_id {
+            let recipe = self
+                .applied_config
+                .config
+                .operation_recipes
+                .get(recipe_id)
+                .ok_or("TicketRun references an unknown operation recipe")?;
+            if let Some(recipe_profile) = recipe.roles.get(&candidate.role) {
+                profile_id = recipe_profile.clone();
+            }
+        }
+        let profile = self
+            .applied_config
+            .profiles
+            .get(&profile_id)
+            .ok_or("ticket role profile is absent from applied configuration")?
+            .clone();
+        let profile_digest = digest_serialized(&profile)?;
+        let runtime_identity = crate::run_step::profile_runtime_identity(&profile)
+            .map_err(|error| error.to_string())?;
+        let qualification = self.verified_qualification(
+            store,
+            &candidate.project_id,
+            &profile_id,
+            &profile_digest,
+            &runtime_identity,
+        )?;
+        let scope = project
+            .ticket_scope
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| (key.clone(), value.to_owned()))
+                    .ok_or_else(|| format!("ticket scope `{key}` must be a string"))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let scope = TicketScope::new(scope).map_err(|error| error.to_string())?;
+        let namespace = self.ticket_namespace(&project.ticket_adapter)?;
+        if namespace != active_run.namespace {
+            return Err("TicketRun namespace differs from configured ticket adapter".into());
+        }
+        let ticket = self
+            .tickets
+            .get(
+                self.request_id("get")?,
+                None,
+                TicketGetRequest {
+                    scope,
+                    ticket_id: active_run.ticket_id.as_str().to_owned(),
+                    timeline_limit: Some(20),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if ticket.ticket_namespace != namespace.as_str()
+            || ticket.ticket.ticket_namespace != namespace.as_str()
+            || ticket.ticket.id != active_run.ticket_id.as_str()
+        {
+            return Err("ticket adapter returned a mismatched ticket identity".into());
+        }
+        let view = self.ensure_ticket_view(
+            store,
+            &candidate.project_id,
+            &active_run.namespace,
+            &active_run.ticket_id,
+            now_unix,
+        )?;
+        let accepted_plan =
+            store.latest_accepted_work_plan(&candidate.project_id, ticket_run_id)?;
+        let rendered = crate::roles::render_role_prompt(
+            &self.applied_config,
+            &crate::roles::PromptContext {
+                project_id: candidate.project_id.clone(),
+                profile_id: Some(profile_id.clone()),
+                role: candidate.role,
+                operation_recipe: active_run.recipe_id.clone(),
+                repositories: project.repositories.clone(),
+                ticket: Some(crate::roles::TicketBrief {
+                    ticket_id: active_run.ticket_id.clone(),
+                    ticket_revision: active_run.revision,
+                    title: ticket.ticket.title,
+                    body: ticket.ticket.body,
+                    acceptance: Vec::new(),
+                }),
+                recovery_summary: None,
+                accepted_plan: accepted_plan
+                    .as_ref()
+                    .map(|plan| serde_json::to_string(&plan.plan))
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+                previous_decisions: Vec::new(),
+                required_evidence: Vec::new(),
+                stop_conditions: Vec::new(),
+                assigned_commit_mode: None,
+            },
+        )?;
+        let wake_inputs = store.pending_role_wake_inputs(
+            &candidate.project_id,
+            &candidate.role_session_id,
+            256,
+        )?;
+        if wake_inputs.is_empty() {
+            return Ok(false);
+        }
+        let seed = serde_json::to_vec(&(
+            "rex-projects-agent-run-v1",
+            &candidate.project_id,
+            &candidate.role_session_id,
+            wake_inputs
+                .iter()
+                .map(|input| input.wake_input_id)
+                .collect::<Vec<_>>(),
+        ))
+        .map_err(|error| error.to_string())?;
+        let seed_digest = digest_bytes(&seed)?;
+        let suffix = &seed_digest.as_str()[..32];
+        let agent_run_id = crate::domain::ids::AgentRunId::parse(format!("agent-{suffix}"))?;
+        let operation_id = crate::domain::ids::OperationId::parse(format!("start-{suffix}"))?;
+        let workspace = self
+            .state_root
+            .join("projects")
+            .join(candidate.project_id.as_str())
+            .join("role-workspaces")
+            .join(role_name(candidate.role));
+        let run_root = self.state_root.join("agents").join(agent_run_id.as_str());
+        let control_dir = run_root.join("control");
+        create_private_dir(&workspace)?;
+        create_private_dir(&control_dir)?;
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: candidate.project_id.clone(),
+            role_session_id: candidate.role_session_id.clone(),
+            agent_run_id: agent_run_id.as_str().to_owned(),
+            digest: Digest::parse("0".repeat(64))?,
+            inputs: wake_inputs
+                .into_iter()
+                .map(|input| crate::agent_api::AgentWakeItem {
+                    wake_input_id: input.wake_input_id,
+                    source_type: input.source_type,
+                    source_id: input.source_id,
+                    source_revision: input.source_revision,
+                    priority: input.priority,
+                    payload_json: input.payload_json,
+                })
+                .collect(),
+        };
+        wake_snapshot.digest = wake_snapshot.content_digest()?;
+        let capacity = u32::try_from(self.config.runtime.max_agent_runs)
+            .map_err(|_| "runtime.max_agent_runs exceeds the supported slot count")?;
+        if capacity == 0 {
+            return Err("runtime.max_agent_runs must be positive".into());
+        }
+        let Some(slot_index) =
+            store.available_execution_slot(&candidate.project_id, "agent", capacity, capacity)?
+        else {
+            return Ok(false);
+        };
+        let reservation = crate::launch::AgentLaunchReservation {
+            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+            agent_run_id,
+            project_id: candidate.project_id.clone(),
+            role: candidate.role,
+            role_session_id: candidate.role_session_id.clone(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(crate::domain::ids::Revision(active_run.revision)),
+            config_revision: runnable.record.config_revision,
+            config_digest: runnable.record.config_digest,
+            attempt: 1,
+            run_epoch: active_run.revision,
+            controller_generation: self.owner_generation,
+            project_epoch: active_run.project_epoch,
+            operation_id,
+            operation_recipe_id: active_run.recipe_id,
+            rex_view_id: view.view_id,
+            runtime_binary_digest: self.runtime_binary_digest.clone(),
+            environment_snapshot_id: self.environment.metadata().id.clone(),
+            profile_id,
+            profile_digest,
+            instruction_digest: rendered.instruction_digest,
+            result_schema_digest: digest_serialized(&rendered.result_schema)?,
+            wake_snapshot,
+            qualification_receipt_digest: qualification.canonical_digest()?,
+            descriptor_path: run_root.join("run-step.package.json"),
+            workspace_path: workspace,
+            control_dir: control_dir.clone(),
+            mailbox_directory: control_dir,
+            mailbox_capability_digest: digest_bytes(seed_digest.as_str().as_bytes())?,
+            mailbox_expires_at_unix: mailbox_expiration(now_unix, profile.turn_timeout_seconds)?,
+            mailbox_max_request_bytes: 1_048_576,
+            mailbox_max_pending_requests: 32,
+            pool: "agent".into(),
+            slot_index,
+            global_capacity: capacity,
+            project_capacity: capacity,
+        };
+        match store.prepare_role_launch(&reservation)? {
+            crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. } => Ok(true),
+            crate::store::agent_runtime::LaunchPreparationOutcome::CapacityUnavailable => Ok(false),
+        }
+    }
+
+    fn verified_qualification(
+        &self,
+        store: &ConfigStore,
+        project_id: &crate::domain::ids::ProjectId,
+        profile_id: &crate::domain::ids::ProfileId,
+        profile_digest: &Digest,
+        runtime_identity: &crate::run_step::ProfileRuntimeIdentity,
+    ) -> Result<crate::launch::ProviderQualification, String> {
+        store
+            .verified_provider_qualifications(project_id, profile_id, profile_digest, 32)?
+            .into_iter()
+            .find(|qualification| {
+                qualification.adapter == runtime_identity.adapter
+                    && qualification.executable_path
+                        == runtime_identity.executable_path.display().to_string()
+                    && qualification.executable_digest == runtime_identity.executable_digest
+                    && qualification.commit_mode == runtime_identity.commit_mode
+                    && qualification.invocation_options_digest
+                        == runtime_identity.invocation_options_digest
+                    && qualification.permission_mode == runtime_identity.effective_permission_mode
+            })
+            .ok_or_else(|| "profile has no exact verified unattended qualification".into())
+    }
+
+    fn ensure_ticket_view(
+        &self,
+        store: &mut ConfigStore,
+        project_id: &crate::domain::ids::ProjectId,
+        namespace: &TicketNamespace,
+        ticket_id: &TicketId,
+        now_unix: i64,
+    ) -> Result<crate::launch::RexView, String> {
+        for record in store.rex_view_history(project_id)? {
+            if record.lifecycle != "active"
+                || record.view.kind != crate::launch::RexViewKind::Ticket
+                || record.view.ticket_namespace.as_deref() != Some(namespace.as_str())
+                || record.view.ticket_id.as_deref() != Some(ticket_id.as_str())
+            {
+                continue;
+            }
+            if record.view.rex_server_identity == self.rex_identity.instance_id
+                && record.view.rex_session_id == self.rex_identity.session_id
+            {
+                return Ok(record.view);
+            }
+            return Err("TicketRun already has an active Rex view on another session".into());
+        }
+        let epoch = store
+            .rex_view_history(project_id)?
+            .iter()
+            .filter(|record| {
+                record.view.kind == crate::launch::RexViewKind::Ticket
+                    && record.view.ticket_namespace.as_deref() == Some(namespace.as_str())
+                    && record.view.ticket_id.as_deref() == Some(ticket_id.as_str())
+            })
+            .map(|record| record.view.view_epoch)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let spec = crate::adapters::rex::AgentBlockSpec {
+            run_id: format!("ticket-{}-view-{epoch}", ticket_id.as_str()),
+            command: PathBuf::from("/usr/bin/env"),
+            args: vec![
+                self.runtime_binary.display().to_string(),
+                "status".into(),
+                "--json".into(),
+            ],
+            cwd: self.state_root.clone(),
+            path_prepend: self.search_path(),
+        };
+        let window = self
+            .rex
+            .find_or_create_ticket_window(namespace.as_str(), ticket_id.as_str(), &spec)
+            .map_err(|error| error.to_string())?;
+        let view = crate::launch::RexView {
+            view_id: crate::launch::RexView::derive_id(
+                project_id,
+                crate::launch::RexViewKind::Ticket,
+                Some(namespace.as_str()),
+                Some(ticket_id.as_str()),
+                epoch,
+            )?,
+            project_id: project_id.clone(),
+            kind: crate::launch::RexViewKind::Ticket,
+            ticket_namespace: Some(namespace.as_str().to_owned()),
+            ticket_id: Some(ticket_id.as_str().to_owned()),
+            view_epoch: epoch,
+            rex_server_identity: window.server_instance_id,
+            rex_session_id: window.session_id,
+            rex_window_id: window.window_id,
+        };
+        store.register_rex_view(self.owner_generation, &view)?;
+        let _ = now_unix;
+        Ok(view)
+    }
+}
+
+impl RuntimeServices {
     fn ensure_supervisor_view(
         &self,
         store: &mut ConfigStore,
@@ -571,6 +936,32 @@ fn role_name(role: Role) -> &'static str {
         Role::Operator => "operator",
         Role::Postmortem => "postmortem",
     }
+}
+
+fn role_allowed_in_phase(role: Role, phase: crate::engine::reducer::Phase) -> bool {
+    use crate::engine::reducer::Phase;
+    match role {
+        Role::Supervisor => false,
+        Role::Coordinator => !matches!(phase, Phase::Done | Phase::Canceled),
+        Role::Planner => phase == Phase::Planning,
+        Role::Worker => phase == Phase::Implementing,
+        Role::Reviewer => phase == Phase::Reviewing,
+        Role::MergeDecision => matches!(phase, Phase::Assessing | Phase::AwaitingMerge),
+        Role::Operator => phase == Phase::Operating,
+        Role::Postmortem => phase == Phase::Postmortem,
+    }
+}
+
+fn mailbox_expiration(now_unix: i64, turn_timeout_seconds: u64) -> Result<u64, String> {
+    let timeout = i64::try_from(turn_timeout_seconds)
+        .map_err(|_| "Agent turn timeout exceeds supported range")?;
+    u64::try_from(
+        now_unix
+            .checked_add(timeout)
+            .and_then(|value| value.checked_add(86_400))
+            .ok_or("Agent mailbox expiration overflow")?,
+    )
+    .map_err(|_| "Agent mailbox expiration is negative".into())
 }
 
 fn normalized_status(status: TicketStatus) -> NormalizedTicketStatus {
