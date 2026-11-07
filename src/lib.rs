@@ -6,6 +6,7 @@ pub mod engine;
 pub mod human;
 pub mod knowledge;
 pub mod learning;
+pub mod launch;
 pub mod mailbox;
 pub mod process;
 pub mod protocol;
