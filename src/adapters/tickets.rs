@@ -868,11 +868,13 @@ impl TicketCommandAdapter {
         project_id: Option<ProjectId>,
         params: Value,
     ) -> Result<T, TicketAdapterError> {
-        let request = RequestEnvelope {
-            schema_version: crate::protocol::SCHEMA_VERSION,
-            request_id: request_id.clone(),
+        if method != TicketMethod::Describe {
+            self.ensure_namespace_pinned()?;
+        }
+        let request = RequestEnvelope::host(
+            request_id.clone(),
             operation_id,
-            method: MethodName::new(method.as_str()).map_err(TicketAdapterError::Invalid)?,
+            MethodName::new(method.as_str()).map_err(TicketAdapterError::Invalid)?,
             project_id,
             run_id: None,
             attempt: None,
@@ -881,24 +883,10 @@ impl TicketCommandAdapter {
             role: None,
             request_type: None,
             params,
-        };
+        );
         request.validate().map_err(TicketAdapterError::Protocol)?;
-        let has_operation_id = request.operation_id.is_some();
-        let has_project_id = request.project_id.is_some();
-        let mut request_value = serde_json::to_value(&request)
+        let request_value = serde_json::to_value(&request)
             .map_err(|_| TicketAdapterError::Protocol("request encoding failed".into()))?;
-        if !has_operation_id {
-            request_value
-                .as_object_mut()
-                .expect("serialized request envelope is an object")
-                .remove("operation_id");
-        }
-        if !has_project_id {
-            request_value
-                .as_object_mut()
-                .expect("serialized request envelope is an object")
-                .remove("project_id");
-        }
         let stdin = serde_json::to_vec(&request_value)
             .map_err(|_| TicketAdapterError::Protocol("request encoding failed".into()))?;
         let output = run(ProcessRequest {

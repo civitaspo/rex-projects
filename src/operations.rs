@@ -1753,11 +1753,10 @@ pub fn new_request<P>(
     method: &str,
     params: P,
 ) -> Result<RequestEnvelope<P>, String> {
-    Ok(RequestEnvelope {
-        schema_version: crate::protocol::SCHEMA_VERSION,
-        request_id: RequestId::new(request_id)?,
+    Ok(RequestEnvelope::host(
+        RequestId::new(request_id)?,
         operation_id,
-        method: MethodName::new(method)?,
+        MethodName::new(method)?,
         project_id,
         run_id: None,
         attempt: None,
@@ -1766,7 +1765,7 @@ pub fn new_request<P>(
         role: None,
         request_type: None,
         params,
-    })
+    ))
 }
 
 fn _duration_is_representable(_: Duration) {}

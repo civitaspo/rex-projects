@@ -72,10 +72,10 @@ impl<'de> Deserialize<'de> for MethodName {
 pub struct RequestEnvelope<P> {
     pub schema_version: u32,
     pub request_id: RequestId,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<OperationId>,
     pub method: MethodName,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<ProjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -93,6 +93,29 @@ pub struct RequestEnvelope<P> {
 }
 
 impl<P> RequestEnvelope<P> {
+    pub fn host(
+        request_id: RequestId,
+        operation_id: Option<OperationId>,
+        method: MethodName,
+        project_id: Option<ProjectId>,
+        params: P,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            request_id,
+            operation_id,
+            method,
+            project_id,
+            run_id: None,
+            attempt: None,
+            run_epoch: None,
+            expected_subject_revision: None,
+            role: None,
+            request_type: None,
+            params,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(format!(
@@ -303,5 +326,25 @@ mod tests {
             br#"{"schema_version":1,"request_id":"r1","method":"ticket.List","params":{}}"#,
         );
         assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn host_constructor_has_the_exact_host_wire_shape() {
+        let request = RequestEnvelope::host(
+            RequestId::new("r1").unwrap(),
+            None,
+            MethodName::new("ticket.describe").unwrap(),
+            None,
+            serde_json::json!({"schema_version": 1}),
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "schema_version": 1,
+                "request_id": "r1",
+                "method": "ticket.describe",
+                "params": {"schema_version": 1}
+            })
+        );
     }
 }
