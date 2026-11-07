@@ -544,7 +544,7 @@ impl ConfigStore {
         if request.purpose != crate::human_runtime::HumanPurpose::ProfilePromotion
             || request.subject.kind != crate::human_runtime::HumanSubjectKind::Profile
             || request.subject.project_id != intent.project_id
-            || request.subject.subject_id != intent.profile_id.as_str()
+            || request.subject.subject_id != intent.candidate_id
             || request.subject.material_digest != intent.profile_material_digest
             || request.subject.configuration_digest != intent.approval_configuration_digest
             || request.subject.policy_digest != intent.approval_policy_digest
@@ -1362,7 +1362,7 @@ impl ConfigStore {
         if human_request.purpose != crate::human_runtime::HumanPurpose::ProfilePromotion
             || human_request.subject.kind != crate::human_runtime::HumanSubjectKind::Profile
             || human_request.subject.project_id != claims.project_id
-            || human_request.subject.subject_id != claims.profile_id.as_str()
+            || human_request.subject.subject_id != request.candidate_id
             || human_request.subject.material_digest != material_digest
             || human_request.subject.configuration_digest != claims.approval_configuration_digest
             || human_request.subject.policy_digest != claims.approval_policy_digest
@@ -1926,7 +1926,6 @@ mod tests {
         Digest, OperationId, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
     };
     use crate::domain::types::Role;
-    use crate::human::{RepositoryReview, ReviewBundle, ReviewEvidence};
     use crate::human_runtime::{
         HumanDecisionChoice, HumanDecisionIntent, HumanPurpose, HumanRuntimeRequest,
         HumanSubjectBinding, HumanSubjectKind, write_runtime_review_artifact,
@@ -2501,38 +2500,16 @@ mod tests {
             &config_revision,
         )
         .unwrap();
-        let bundle = ReviewBundle {
-            title: "Approve a bounded worker profile trial".into(),
-            summary: "The candidate was inconclusive across five distinct inputs.".into(),
-            risk: None,
-            repositories: vec![RepositoryReview {
-                repository: "sample/repo".into(),
-                pull_request: "candidate profile".into(),
-                url: None,
-                base_ref: "main".into(),
-                base_sha: "a".repeat(40),
-                head_ref: "candidate".into(),
-                head_sha: "b".repeat(40),
-                checks: vec!["five paired trials recorded".into()],
-                review_receipts: vec![],
-                merge_steps: vec![],
-            }],
-            evidence: vec![ReviewEvidence {
-                title: "Trial interpretation".into(),
-                body: "Results are inconclusive; no efficacy claim is made.".into(),
-                truncated: false,
-            }],
-            unknowns: vec!["The candidate may not improve future work.".into()],
-        };
+        let bundle = crate::learning::profile_candidate_review_bundle(&candidate_package).unwrap();
         let request = HumanRuntimeRequest {
             request_id: crate::domain::ids::HumanRequestId::parse("profile-approval-1").unwrap(),
             purpose: HumanPurpose::ProfilePromotion,
             subject: HumanSubjectBinding {
                 project_id: project.clone(),
                 kind: HumanSubjectKind::Profile,
-                subject_id: profile_id.to_string(),
+                subject_id: candidate_id.to_owned(),
                 ticket_run_id: None,
-                revision: Revision(1),
+                revision: crate::learning::profile_candidate_revision(&candidate_digest).unwrap(),
                 material_digest: material_digest.clone(),
                 configuration_digest: config_digest.clone(),
                 policy_digest: policy_digest.clone(),

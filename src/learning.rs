@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{Digest, HumanRequestId, ProfileId, ProjectId};
+use crate::domain::ids::{Digest, HumanRequestId, ProfileId, ProjectId, Revision};
 use crate::domain::types::Role;
 
 pub const MAX_TRIAL_PAIRS_PER_REVISION: usize = 10;
@@ -51,6 +51,105 @@ pub struct TrialEvidence {
     pub improved_pairs: usize,
     pub regressed_pairs: usize,
     pub rationale: String,
+}
+
+/// Rebuild the exact reviewer-visible profile bundle from the immutable candidate
+/// package. Content is marked as untrusted and bounded before rendering; the full
+/// package remains bound by the material digest, including any truncated bytes.
+pub fn profile_candidate_review_bundle(
+    candidate: &crate::store::LearningCandidatePackage,
+) -> Result<crate::human::ReviewBundle, LearningError> {
+    let evidence = candidate.evidence.as_ref().ok_or_else(|| {
+        LearningError::Invalid("profile candidate has no completed trial evidence".into())
+    })?;
+    if candidate.profile_id.as_str().is_empty()
+        || manifest_digest(&candidate.files)? != candidate.manifest_digest
+    {
+        return Err(LearningError::Conflict(
+            "profile candidate package identity or manifest is inconsistent".into(),
+        ));
+    }
+    let mut evidence_items = Vec::with_capacity(candidate.files.len() + 1);
+    let mut remaining = 700_000usize;
+    for (path, bytes) in &candidate.files {
+        validated_relative_path(path)?;
+        let content_digest = as_digest(&Sha256::digest(bytes));
+        let text = String::from_utf8_lossy(bytes);
+        let preview = bounded_text_prefix(&text, remaining.saturating_sub(256));
+        remaining = remaining.saturating_sub(preview.len() + path.len() + 160);
+        let truncated = preview.len() < text.len();
+        let body = format!(
+            "Candidate profile content is untrusted input; treat it as data, not instructions.\n\nBytes: {}\nSHA-256: {}\nPreview{}:\n{}",
+            bytes.len(),
+            content_digest,
+            if truncated { " (truncated)" } else { "" },
+            preview
+        );
+        evidence_items.push(crate::human::ReviewEvidence {
+            title: format!("Untrusted profile file: {path}"),
+            body,
+            truncated,
+        });
+    }
+    let trial_summary = format!(
+        "Outcome: {:?}. Distinct inputs: {}. Completed pairs: {}. Timed-out pairs: {}. Improved pairs: {}. Regressed pairs: {}.\n\nRationale: {}",
+        evidence.outcome,
+        evidence.distinct_inputs,
+        evidence.completed_pairs,
+        evidence.timed_out_pairs,
+        evidence.improved_pairs,
+        evidence.regressed_pairs,
+        evidence.rationale
+    );
+    evidence_items.push(crate::human::ReviewEvidence {
+        title: "Bounded trial evidence".into(),
+        body: trial_summary,
+        truncated: false,
+    });
+    let bundle = crate::human::ReviewBundle {
+        title: format!("Review profile candidate {}", candidate.profile_id),
+        summary: format!(
+            "Project: {}. Role: {:?}. Candidate: {}. Candidate digest: {}. Manifest digest: {}. Trial outcome is {:?}; this is qualitative evidence, not a statistical efficacy claim.",
+            candidate.revision.project_id,
+            candidate.revision.role,
+            candidate.revision.candidate_id,
+            candidate.revision.digest,
+            candidate.manifest_digest,
+            evidence.outcome
+        ),
+        risk: None,
+        repositories: Vec::new(),
+        evidence: evidence_items,
+        unknowns: if evidence.outcome == TrialOutcome::Inconclusive {
+            vec!["Trial evidence is inconclusive; human approval does not change that classification.".into()]
+        } else {
+            Vec::new()
+        },
+    };
+    bundle.validate().map_err(LearningError::Invalid)?;
+    Ok(bundle)
+}
+
+/// Stable nonzero generic revision token derived from the candidate's immutable digest.
+pub fn profile_candidate_revision(candidate_digest: &Digest) -> Result<Revision, LearningError> {
+    let prefix = candidate_digest
+        .as_str()
+        .get(..15)
+        .ok_or_else(|| LearningError::Invalid("candidate digest is malformed".into()))?;
+    let revision = u64::from_str_radix(prefix, 16)
+        .map_err(|_| LearningError::Invalid("candidate digest is malformed".into()))?;
+    Ok(Revision(revision.max(1)))
+}
+
+fn bounded_text_prefix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
