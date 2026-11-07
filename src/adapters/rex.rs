@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -13,6 +13,8 @@ const SHELL_FLAVOR: &str = "com.superlogical.terminal.shell";
 const OWNED_WINDOW_PREFIX: &str = "rex-projects-ticket-";
 const OWNED_SUPERVISOR_WINDOW_PREFIX: &str = "rex-projects-supervisor-";
 const OWNED_BLOCK_PREFIX: &str = "rex-projects-run-";
+const QUALIFICATION_WINDOW_NAMESPACE: &str = "rex-projects-provider-qualification";
+const QUALIFICATION_SESSION_PREFIX: &str = "rex-projects-provider-qualification-";
 
 #[derive(Clone, Debug)]
 pub struct AgentBlockSpec {
@@ -111,6 +113,36 @@ pub struct OwnedWindow {
     pub window_id: String,
     pub label: String,
     pub blocks: Vec<OwnedBlock>,
+}
+
+/// Host-created, exact Rex identity for a disposable provider qualification session.
+/// The wrapper re-observes this session and its sole window/block before it can
+/// construct the opaque `RexQualificationFixture` used by run-step.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RexQualificationSessionReceipt {
+    endpoint: String,
+    instance_id: String,
+    session_id: String,
+    window_id: String,
+    block_id: String,
+    operation_id: String,
+    session_label: String,
+    window_label: String,
+}
+
+impl RexQualificationSessionReceipt {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn window_id(&self) -> &str {
+        &self.window_id
+    }
+
+    pub(crate) fn block_id(&self) -> &str {
+        &self.block_id
+    }
 }
 
 /// Unforgeable in-crate proof for one isolated provider qualification turn.
@@ -548,6 +580,142 @@ impl RexCliTransport {
         }
     }
 
+    /// Creates a uniquely labeled disposable Rex session and verifies the
+    /// exact resources returned by `rex new` against the same configured server.
+    pub(crate) fn create_disposable_qualification_session(
+        &self,
+        operation_id: &str,
+        initial_agent: &AgentBlockSpec,
+    ) -> Result<RexQualificationSessionReceipt, RexError> {
+        if operation_id.is_empty()
+            || operation_id.len() > 180
+            || operation_id.chars().any(char::is_control)
+            || initial_agent.run_id != operation_id
+            || !Path::new(&initial_agent.command).is_absolute()
+            || !initial_agent.path_prepend.is_empty()
+        {
+            return Err(RexError::Invalid(
+                "qualification session requires a matching operation ID, absolute command, and no unsupported Rex PATH injection".into(),
+            ));
+        }
+        terminal_block(initial_agent)?;
+        let session_label = qualification_session_label(operation_id)?;
+        let window_label = ticket_window_label(QUALIFICATION_WINDOW_NAMESPACE, operation_id)?;
+        self.verify_identity()?;
+        let mut args: Vec<OsString> = vec![
+            "new".into(),
+            session_label.clone().into(),
+            "--cwd".into(),
+            initial_agent.cwd.as_os_str().to_owned(),
+            "--window".into(),
+            window_label.clone().into(),
+            "--shell".into(),
+            "none".into(),
+            "--json".into(),
+            "--".into(),
+            initial_agent.command.as_os_str().to_owned(),
+        ];
+        args.extend(initial_agent.args.iter().cloned().map(OsString::from));
+        let output = self.command(&args)?;
+        self.verify_identity()?;
+        let response: Value = parse(&output.stdout)?;
+        let session_id = required_string(&response, "session_id")?.to_owned();
+        if session_id.is_empty()
+            || session_id.len() > 512
+            || session_id.chars().any(char::is_control)
+        {
+            return Err(RexError::Protocol(
+                "created qualification session ID is malformed".into(),
+            ));
+        }
+        let windows = response
+            .get("initial_windows")
+            .and_then(Value::as_array)
+            .filter(|windows| windows.len() == 1)
+            .ok_or_else(|| {
+                RexError::Protocol("rex new returned an unexpected window set".into())
+            })?;
+        let window = &windows[0];
+        let window_id = required_string(window, "window_id")?.to_owned();
+        let blocks = window
+            .get("block_ids")
+            .and_then(Value::as_array)
+            .filter(|blocks| blocks.len() == 1)
+            .ok_or_else(|| RexError::Protocol("rex new returned an unexpected block set".into()))?;
+        let block_id = blocks[0]
+            .as_str()
+            .filter(|id| !id.is_empty() && !id.chars().any(char::is_control))
+            .ok_or_else(|| RexError::Protocol("rex new returned an invalid block ID".into()))?
+            .to_owned();
+        let receipt = RexQualificationSessionReceipt {
+            endpoint: self.endpoint.clone(),
+            instance_id: self.expected_instance_id.clone(),
+            session_id,
+            window_id,
+            block_id,
+            operation_id: operation_id.to_owned(),
+            session_label,
+            window_label,
+        };
+        // Reconnect to the returned session and require an isolated one-window,
+        // one-block view before allowing the receipt to leave the host.
+        let bound = Self::connect(
+            &self.executable,
+            &[],
+            receipt.endpoint.clone(),
+            receipt.instance_id.clone(),
+            receipt.session_id.clone(),
+            self.environment.clone(),
+        )?;
+        bound.disposable_qualification_fixture(receipt.clone())?;
+        Ok(receipt)
+    }
+
+    /// Re-observe a serialized host receipt before producing the opaque token
+    /// accepted by `run_qualification_turn`.
+    pub(crate) fn disposable_qualification_fixture(
+        &self,
+        receipt: RexQualificationSessionReceipt,
+    ) -> Result<RexQualificationFixture, RexError> {
+        if receipt.endpoint != self.endpoint
+            || receipt.instance_id != self.expected_instance_id
+            || receipt.session_id != self.session_id
+            || receipt.session_label != qualification_session_label(&receipt.operation_id)?
+            || receipt.window_label
+                != ticket_window_label(QUALIFICATION_WINDOW_NAMESPACE, &receipt.operation_id)?
+        {
+            return Err(RexError::Invalid(
+                "qualification receipt does not match this Rex transport".into(),
+            ));
+        }
+        self.verify_identity()?;
+        let view = self.session_view()?;
+        let all_windows = view
+            .get("windows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session view has no windows array".into()))?;
+        let matches = windows_with_label(&view, &receipt.window_label)?;
+        let blocks = all_blocks_in_window(&view, &receipt.window_id)?;
+        if all_windows.len() != 1
+            || matches.len() != 1
+            || matches[0].0 != receipt.window_id
+            || blocks.len() != 1
+            || blocks[0].block_id != receipt.block_id
+            || blocks[0].flavor != SHELL_FLAVOR
+        {
+            return Err(RexError::Uncertain);
+        }
+        self.verify_identity()?;
+        Ok(RexQualificationFixture {
+            endpoint: self.endpoint.clone(),
+            instance_id: self.expected_instance_id.clone(),
+            session_id: self.session_id.clone(),
+            window_id: receipt.window_id,
+            block_id: receipt.block_id,
+            operation_id: receipt.operation_id,
+        })
+    }
+
     pub fn list_owned_windows_and_blocks(&self) -> Result<Vec<OwnedWindow>, RexError> {
         let view = self.session_view()?;
         let windows = view
@@ -933,6 +1101,18 @@ fn ticket_window_label(namespace: &str, ticket_id: &str) -> Result<String, RexEr
         "{OWNED_WINDOW_PREFIX}{}",
         hex_prefix(&hasher.finalize(), 24)
     ))
+}
+
+fn qualification_session_label(operation_id: &str) -> Result<String, RexError> {
+    if operation_id.is_empty()
+        || operation_id.len() > 180
+        || operation_id.chars().any(char::is_control)
+    {
+        return Err(RexError::Invalid(
+            "qualification operation ID is invalid".into(),
+        ));
+    }
+    Ok(format!("{QUALIFICATION_SESSION_PREFIX}{operation_id}"))
 }
 
 fn supervisor_window_label(project_id: &str) -> String {

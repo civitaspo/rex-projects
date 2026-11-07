@@ -66,6 +66,10 @@ enum Command {
         #[command(subcommand)]
         command: TicketCommand,
     },
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     Human {
         #[command(subcommand)]
         command: HumanCommand,
@@ -116,6 +120,19 @@ enum TicketCommand {
         reason: String,
         #[arg(long, value_enum)]
         disposition: ClaimDisposition,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    /// Queue an isolated, controller-owned qualification run for the applied role profile.
+    Qualify {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        role: String,
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -403,6 +420,12 @@ pub fn run() -> Result<i32, CliError> {
         }
         Command::Agent { command } => agent_command(command, json),
         Command::Ticket { command } => ticket_command(
+            cli.config.as_deref(),
+            cli.state_root.as_deref(),
+            command,
+            json,
+        ),
+        Command::Provider { command } => provider_command(
             cli.config.as_deref(),
             cli.state_root.as_deref(),
             command,
@@ -795,6 +818,141 @@ fn ticket_command(
                 Ok(())
             }
         }
+    }
+}
+
+fn provider_command(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    command: ProviderCommand,
+    json: bool,
+) -> Result<(), CliError> {
+    require_human_context()?;
+    match command {
+        ProviderCommand::Qualify {
+            project,
+            role,
+            request_id,
+        } => {
+            let project_id = ProjectId::parse(project).map_err(CliError::usage)?;
+            let role = parse_provider_role(&role).ok_or_else(|| {
+                CliError::usage("role must be one of supervisor, coordinator, planner, worker, reviewer, merge_decision, operator, or postmortem")
+            })?;
+            let (source_path, _) = load_config(config_path)?;
+            let source_identity = source_path
+                .canonicalize()
+                .map_err(|error| CliError::usage(format!("{}: {error}", source_path.display())))?
+                .display()
+                .to_string();
+            let state_root = selected_state_root(Some(&source_path), explicit_state_root)?;
+            let status = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
+            let owner_generation = status.owner_generation.ok_or_else(|| {
+                CliError::unavailable("no foreground machine controller is running; start `rex-projects runtime run` first")
+            })?;
+            if !status.owner_is_live() {
+                return Err(CliError::unavailable(
+                    "controller ownership is stale or ambiguous; cannot queue provider qualification",
+                ));
+            }
+            let mut store =
+                ConfigStore::open_control(&state_root).map_err(CliError::unavailable)?;
+            let current_revision = store
+                .current_revision(&source_identity)
+                .map_err(CliError::unavailable)?
+                .ok_or_else(|| CliError::conflict("configuration has not been applied"))?;
+            let snapshot = store
+                .load_snapshot(&source_identity)
+                .map_err(CliError::unavailable)?
+                .ok_or_else(|| CliError::conflict("applied configuration snapshot is missing"))?;
+            if snapshot.revision != current_revision {
+                return Err(CliError::conflict(
+                    "applied configuration revision changed while queuing qualification",
+                ));
+            }
+            let project_config = snapshot
+                .config
+                .config
+                .projects
+                .get(&project_id)
+                .ok_or_else(|| {
+                    CliError::not_found(format!("Project `{project_id}` is not applied"))
+                })?;
+            let roles = crate::config::effective_project_roles(
+                &project_id,
+                &snapshot.config.config.projects,
+            )
+            .map_err(CliError::unexpected)?;
+            let profile_id = roles.get(&role).ok_or_else(|| {
+                CliError::conflict(format!(
+                    "Project `{project_id}` has no effective {role:?} profile"
+                ))
+            })?;
+            let profile = snapshot.config.profiles.get(profile_id).ok_or_else(|| {
+                CliError::conflict("effective role profile is missing from applied config")
+            })?;
+            let profile_json = serde_json::to_vec(profile)
+                .map_err(|error| CliError::unexpected(error.to_string()))?;
+            use sha2::{Digest as _, Sha256};
+            let profile_digest = Digest::parse(format!("{:x}", Sha256::digest(profile_json)))
+                .map_err(CliError::unexpected)?;
+            if project_config.roles.is_empty() && project_config.role_defaults_from.is_none() {
+                return Err(CliError::conflict(
+                    "Project has no configured role profiles",
+                ));
+            }
+            let request =
+                crate::store::provider_qualification_runtime::ProviderQualificationRequest {
+                    request_id: request_id.unwrap_or(generated_request_id()?),
+                    project_id: project_id.clone(),
+                    role,
+                    profile_id: profile_id.clone(),
+                    profile_digest,
+                    config_revision: snapshot.revision.0,
+                    config_digest: snapshot.config.digest.clone(),
+                };
+            let request_digest = store
+                .enqueue_provider_qualification(owner_generation, &request)
+                .map_err(CliError::conflict)?;
+            let report = serde_json::json!({
+                "accepted": true,
+                "request_id": request.request_id,
+                "request_digest": request_digest,
+                "project_id": project_id,
+                "role": role,
+                "profile_id": profile_id,
+                "config_revision": snapshot.revision.0,
+                "config_digest": snapshot.config.digest,
+                "state": "queued",
+                "owner_generation": owner_generation,
+            });
+            if json {
+                print_json(&report)
+            } else {
+                println!(
+                    "Queued provider qualification {} for Project {} ({:?}).",
+                    request.request_id, project_id, role
+                );
+                println!(
+                    "The foreground Rex controller will run and record the bounded qualification."
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+fn parse_provider_role(value: &str) -> Option<crate::domain::types::Role> {
+    use crate::domain::types::Role;
+    match value {
+        "supervisor" => Some(Role::Supervisor),
+        "coordinator" => Some(Role::Coordinator),
+        "planner" => Some(Role::Planner),
+        "worker" => Some(Role::Worker),
+        "reviewer" => Some(Role::Reviewer),
+        "merge_decision" => Some(Role::MergeDecision),
+        "operator" => Some(Role::Operator),
+        "postmortem" => Some(Role::Postmortem),
+        _ => None,
     }
 }
 
