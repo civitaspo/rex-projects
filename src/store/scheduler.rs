@@ -1373,7 +1373,7 @@ impl ConfigStore {
              LEFT JOIN ticket_claims c ON c.namespace=o.namespace AND c.ticket_id=o.ticket_id
              WHERE o.project_id=?1 AND o.adapter_id=?2 AND o.namespace=?3 AND o.scope_digest=?4 AND o.filter_digest=?5
                AND o.status=?6 AND o.dispatch_state='pending' AND c.ticket_run_id IS NULL
-             ORDER BY o.last_seen_at_unix ASC,o.ticket_id ASC LIMIT ?6",
+             ORDER BY o.last_seen_at_unix ASC,o.ticket_id ASC LIMIT ?7",
         ).map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(
@@ -1902,6 +1902,42 @@ mod tests {
             .page_count,
             0
         );
+    }
+
+    #[test]
+    fn pending_ticket_observations_filter_and_bound_in_stable_order() {
+        use super::ConfigStore;
+        use crate::store::MachineLock;
+
+        let path = std::env::temp_dir().join(format!("rex-ticket-observations-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE ticket_observations(project_id TEXT,adapter_id TEXT,namespace TEXT,ticket_id TEXT,scope_digest TEXT,filter_digest TEXT,external_revision TEXT,status TEXT,title TEXT,labels_json TEXT,last_seen_at_unix INTEGER,dispatch_state TEXT);
+             CREATE TABLE ticket_claims(namespace TEXT,ticket_id TEXT,ticket_run_id TEXT);
+             INSERT INTO ticket_observations VALUES
+               ('project-a','tickets','fixture-v1','later','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',NULL,'ready','Later','[]',20,'pending'),
+               ('project-a','tickets','fixture-v1','first-b','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',NULL,'ready','First B','[]',10,'pending'),
+               ('project-a','tickets','fixture-v1','first-a','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',NULL,'ready','First A','[]',10,'pending'),
+               ('project-a','tickets','fixture-v1','wrong-status','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',NULL,'done','Done','[]',1,'pending');",
+        ).unwrap();
+        drop(connection);
+        let store = ConfigStore {
+            connection: Connection::open(&path).unwrap(),
+            _machine_lock: MachineLock { _file: None },
+        };
+        let key = TicketScanKey {
+            project_id: crate::domain::ids::ProjectId::parse("project-a").unwrap(),
+            adapter_id: crate::domain::ids::AdapterId::parse("tickets").unwrap(),
+            namespace: crate::domain::ids::TicketNamespace::parse("fixture-v1").unwrap(),
+            scope_digest: crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
+            filter_digest: crate::domain::ids::Digest::parse("b".repeat(64)).unwrap(),
+            status: TicketStatus::Ready,
+        };
+        let page = store.pending_ticket_observations(&key, 2).unwrap();
+        assert_eq!(page.iter().map(|item| item.ticket_id.as_str()).collect::<Vec<_>>(), ["first-a", "first-b"]);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
