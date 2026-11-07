@@ -83,6 +83,17 @@ impl StoredRoleResultReceipt {
     pub fn wake_input_ids(&self) -> &[i64] {
         &self.wake_input_ids
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_receipt(evidence_id: impl Into<String>) -> Self {
+        Self {
+            evidence_id: evidence_id.into(),
+            message_id: "clarification-message".into(),
+            content_digest: Digest::parse("a".repeat(64)).expect("test digest"),
+            terminal_digest: Digest::parse("b".repeat(64)).expect("test digest"),
+            wake_input_ids: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

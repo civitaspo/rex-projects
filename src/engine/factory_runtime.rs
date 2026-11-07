@@ -606,8 +606,7 @@ fn apply_agent_result(
         presentation
             .request
             .validate(expires_at_unix.saturating_sub(1))?;
-        let request_json =
-            serde_json::to_string(&presentation).map_err(|error| error.to_string())?;
+        let request_json = crate::store::canonical_json(&presentation)?;
         let request_digest = Digest::parse(format!(
             "{:x}",
             sha2::Sha256::digest(request_json.as_bytes())
@@ -3007,5 +3006,281 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn coordinator_clarification_result_creates_durable_presentation_and_acknowledges_claim() {
+        use super::ExternalTicketPage;
+        use super::{FactoryRuntimeServices, apply_agent_result};
+        use crate::agent_recovery::AgentRecoveryReport;
+        use crate::domain::ids::{
+            AdapterId, AgentRunId, Digest, OperationId, ProjectId, Revision, TicketNamespace,
+            TicketRunId,
+        };
+        use crate::domain::types::Role;
+        use crate::effects::EffectHandler;
+        use crate::engine::orchestration::{
+            AgentAssertion, HumanRequestPayload, RoleOutputKind, RoleResultBinding,
+            RoleResultPayload, RoleSessionId, ValidatedRoleResult,
+        };
+        use crate::human_runtime::HumanPresentationEffect;
+        use crate::launch::{RexView, RexViewKind};
+        use crate::runtime_delivery::PublicationMonitorTick;
+        use crate::store::agent_results::{IngestedAgentResult, StoredRoleResultReceipt};
+        use crate::store::scheduler::TicketScanKey;
+        use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
+        use std::path::Path;
+        use tempfile::tempdir;
+
+        struct Services(Digest);
+        impl FactoryRuntimeServices for Services {
+            fn recover_agents(
+                &mut self,
+                _: &mut ConfigStore,
+                _: u64,
+                _: i64,
+            ) -> Result<AgentRecoveryReport, String> {
+                Err("unused".into())
+            }
+            fn ingest_one_agent_result(
+                &mut self,
+                _: &mut ConfigStore,
+                _: u64,
+                _: i64,
+            ) -> Result<Option<IngestedAgentResult>, String> {
+                Err("unused".into())
+            }
+            fn observe_base_heads(
+                &mut self,
+            ) -> Result<std::collections::BTreeMap<crate::domain::ids::RepositoryId, String>, String>
+            {
+                Err("unused".into())
+            }
+            fn configuration_digest(&self) -> &Digest {
+                &self.0
+            }
+            fn profile_commit_mode(
+                &self,
+                _: &ProjectId,
+                _: Role,
+            ) -> Result<crate::domain::types::CommitMode, String> {
+                Err("unused".into())
+            }
+            fn tick_profile_trials(
+                &mut self,
+                _: &mut ConfigStore,
+                _: u64,
+                _: i64,
+                _: u32,
+                _: u32,
+            ) -> Result<(), String> {
+                Err("unused".into())
+            }
+            fn ticket_namespace(&mut self, _: &AdapterId) -> Result<TicketNamespace, String> {
+                Err("unused".into())
+            }
+            fn list_ticket_page(
+                &mut self,
+                _: &TicketScanKey,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<ExternalTicketPage, String> {
+                Err("unused".into())
+            }
+            fn observe_publications(
+                &mut self,
+                _: &mut ConfigStore,
+                _: u64,
+                _: i64,
+            ) -> Result<PublicationMonitorTick, String> {
+                Err("unused".into())
+            }
+            fn prepare_role_launch(
+                &mut self,
+                _: &mut ConfigStore,
+                _: u64,
+                _: &Config,
+                _: &super::PendingRoleWakeSession,
+                _: i64,
+            ) -> Result<bool, String> {
+                Err("unused".into())
+            }
+            fn effect_handlers(&self) -> Vec<&dyn EffectHandler> {
+                Vec::new()
+            }
+        }
+
+        let temp = tempdir().unwrap();
+        let loaded = crate::config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
+        )
+        .unwrap();
+        let config = loaded.config.clone();
+        let project_id = ProjectId::parse("operations_project").unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot("fixture", &loaded, ExpectedRevision::Bootstrap)
+            .unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "fixture".into(),
+                config_revision: applied.revision,
+                config_digest: loaded.digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let ticket_run_id = TicketRunId::parse("clarify-run").unwrap();
+        store.test_connection().execute(
+            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision,required_review_revision) VALUES (?1,?2,'fixture',?3,?4,'github:org/repo','T-42',1,'queued','ready','in_progress','in_progress',1,NULL)",
+            rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), applied.revision.0, loaded.digest.as_str()],
+        ).unwrap();
+        let owner_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "clarification-test-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "fixture".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store.test_connection().execute(
+            "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+            rusqlite::params![project_id.as_str(), owner_generation],
+        ).unwrap();
+        store.test_connection().execute(
+            "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,'docs_only',1,1)",
+            rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+        ).unwrap();
+        let view = RexView {
+            view_id: RexView::derive_id(
+                &project_id,
+                RexViewKind::Ticket,
+                Some("github:org/repo"),
+                Some("T-42"),
+                1,
+            )
+            .unwrap(),
+            project_id: project_id.clone(),
+            kind: RexViewKind::Ticket,
+            ticket_namespace: Some("github:org/repo".into()),
+            ticket_id: Some("T-42".into()),
+            view_epoch: 1,
+            rex_server_identity: "server".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "ticket-window".into(),
+        };
+        store.register_rex_view(owner_generation, &view).unwrap();
+
+        // This test exercises the host consumer boundary; the evidence row is seeded as if the
+        // normal ingestion path had already committed it. The typed result remains immutable.
+        store
+            .test_connection()
+            .execute_batch("PRAGMA foreign_keys=OFF")
+            .unwrap();
+        store.test_connection().execute(
+            "INSERT INTO agent_result_evidence(evidence_id,agent_run_id,project_id,role,ticket_run_id,attempt,run_epoch,message_id,content_digest,outcome,result_digest,result_json,artifact_refs_json,received_at_unix) VALUES ('evidence-clarify','agent-clarify',?1,'coordinator',?2,1,1,'message-clarify',?3,'completed',?4,'{}','[]',1)",
+            rusqlite::params![project_id.as_str(), ticket_run_id.as_str(), "a".repeat(64), "b".repeat(64)],
+        ).unwrap();
+        store
+            .test_connection()
+            .execute_batch("PRAGMA foreign_keys=ON")
+            .unwrap();
+
+        let payload = HumanRequestPayload {
+            kind: "clarification".into(),
+            question: "Which release window should we use?".into(),
+            choices: vec!["weekday".into(), "weekend".into()],
+            evidence_references: Vec::new(),
+            subject_digest: Digest::parse("c".repeat(64)).unwrap(),
+            requested_continuation: Some("continue implementation".into()),
+        };
+        let binding = RoleResultBinding {
+            agent_run_id: AgentRunId::parse("agent-clarify").unwrap(),
+            operation_id: OperationId::parse("op-clarify").unwrap(),
+            project_id: project_id.clone(),
+            role_session_id: RoleSessionId::parse("coordinator-session").unwrap(),
+            role: Role::Coordinator,
+            parent_run_id: Some(AgentRunId::parse("supervisor-run").unwrap()),
+            parent_role: Some(Role::Supervisor),
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(1)),
+            config_revision: applied.revision,
+            config_digest: loaded.digest.clone(),
+            profile_digest: Digest::parse("d".repeat(64)).unwrap(),
+            instruction_digest: Digest::parse("e".repeat(64)).unwrap(),
+            provider_capability_receipt_digest: Digest::parse("f".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("1".repeat(64)).unwrap(),
+            controller_generation: owner_generation,
+            run_epoch: 1,
+            attempt: 1,
+        };
+        let structured_result = serde_json::to_value(&payload).unwrap();
+        let result = IngestedAgentResult {
+            validated: ValidatedRoleResult {
+                binding,
+                message_id: "message-clarify".into(),
+                kind: RoleOutputKind::HumanRequest,
+                assertion: AgentAssertion::Succeeded,
+                structured_result,
+                typed_payload: RoleResultPayload::HumanRequest(payload),
+                result_digest: Digest::parse("b".repeat(64)).unwrap(),
+                claimed_artifact_refs: Vec::new(),
+                wake_recipients: Vec::new(),
+            },
+            receipt: StoredRoleResultReceipt::test_receipt("evidence-clarify"),
+        };
+        let mut services = Services(loaded.digest.clone());
+        assert!(
+            apply_agent_result(
+                &mut store,
+                owner_generation,
+                50,
+                &config,
+                &mut services,
+                &result
+            )
+            .unwrap()
+        );
+        let ack: (u64, String) = store.test_connection().query_row(
+            "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id='evidence-clarify'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(ack, (1, "retained_as_claim".into()));
+        let effect_json: String = store
+            .test_connection()
+            .query_row(
+                "SELECT request_json FROM effects WHERE kind='request_human_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let effect: HumanPresentationEffect = serde_json::from_str(&effect_json).unwrap();
+        assert_eq!(
+            effect.request.purpose,
+            crate::human_runtime::HumanPurpose::CoordinatorClarification
+        );
+        assert_eq!(effect.request.subject.ticket_run_id, Some(ticket_run_id));
+        assert_eq!(
+            effect.request.question,
+            "Which release window should we use?"
+        );
+        let status: String = store
+            .test_connection()
+            .query_row(
+                "SELECT external_status FROM ticket_runs WHERE ticket_run_id='clarify-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "in_progress");
     }
 }

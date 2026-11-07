@@ -444,6 +444,11 @@ impl ConfigStore {
         Self::open_with_lock(state_root, machine_lock)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_connection(&self) -> &Connection {
+        &self.connection
+    }
+
     fn open_with_lock(state_root: &Path, machine_lock: MachineLock) -> Result<Self, String> {
         let database = state_root.join("state.sqlite3");
         ensure_private_database_file(&database)?;
@@ -4497,7 +4502,7 @@ fn restrict_file_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn canonical_json<T: serde::Serialize>(value: &T) -> Result<String, String> {
+pub(crate) fn canonical_json<T: serde::Serialize>(value: &T) -> Result<String, String> {
     let value = serde_json::to_value(value).map_err(|e| e.to_string())?;
     serde_json::to_string(&value).map_err(|e| e.to_string())
 }
