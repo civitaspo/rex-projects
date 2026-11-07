@@ -17,6 +17,7 @@ class TicketCli:
         self.folder = Path(folder)
         self.db = self.folder / "ticket-service.sqlite"
         self.counter = 0
+        self.visibility_delay_seconds = 0.12
 
     def call(self, method, params, *, operation_id=None, scope_project="ext-project", fault=None):
         self.counter += 1
@@ -29,7 +30,8 @@ class TicketCli:
         if operation_id is not None:
             request["operation_id"] = operation_id
         command = [sys.executable, str(ADAPTER), "--database", str(self.db),
-                   "--namespace", "fixture/tenant-a", "--visibility-delay-seconds", "0.12"]
+                   "--namespace", "fixture/tenant-a", "--visibility-delay-seconds",
+                   str(self.visibility_delay_seconds)]
         if fault:
             command += ["--drop-create-response-once", fault]
         run = subprocess.run(command, input=json.dumps(request), text=True, capture_output=True, timeout=5)
@@ -120,6 +122,7 @@ class TicketFixtureTests(unittest.TestCase):
         self.assertEqual(len(listing["result"]["tickets"]), 1)
 
     def test_eventual_index_never_reports_false_absence_and_duplicate_resolution_cancels(self):
+        self.cli.visibility_delay_seconds = 1.0
         _, first = self.cli.create("create-a", "same-key")
         _, second = self.cli.create("create-b", "same-key")
         a, b = self.cli.ticket(first), self.cli.ticket(second)
@@ -128,7 +131,7 @@ class TicketFixtureTests(unittest.TestCase):
                   "subject": {"creation_key": "same-key"}}
         _, early = self.cli.call("operation.find", lookup, operation_id="lookup-early")
         self.assertEqual(early["result"]["outcome"], "unknown")
-        time.sleep(0.14)
+        time.sleep(1.05)
         _, visible = self.cli.call("operation.find", lookup, operation_id="lookup-late")
         self.assertEqual(visible["result"]["outcome"], "found")
         self.assertEqual(len(visible["result"]["matches"]), 2)

@@ -135,20 +135,30 @@ pub fn run(mut request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
 
     let deadline = Instant::now() + request.timeout;
     let mut timed_out = false;
+    let root_pid = child.id();
+    let mut observed_processes = Vec::new();
+    let mut observation_failed = collect_tree(root_pid, &mut observed_processes).is_err();
+    let mut next_process_scan = Instant::now() + Duration::from_millis(20);
     let mut status = loop {
+        if Instant::now() >= next_process_scan {
+            observation_failed |= collect_tree(root_pid, &mut observed_processes).is_err();
+            next_process_scan = Instant::now() + Duration::from_millis(20);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(error) => {
-                // The child PID still belongs to this Child handle. Attempt
-                // bounded cleanup before returning the inspection failure.
-                signal_group(child.id(), "TERM");
-                let stopped = wait_until(&mut child, request.shutdown_grace)?;
-                if stopped.is_none() {
-                    signal_group(child.id(), "KILL");
-                    let _ = wait_until(&mut child, request.shutdown_grace)?;
-                }
-                return Err(ProcessError::Io(error));
+                let cleaned = cleanup_child_tree(
+                    &mut child,
+                    root_pid,
+                    &mut observed_processes,
+                    request.shutdown_grace,
+                );
+                return Err(if cleaned && !observation_failed {
+                    ProcessError::Io(error)
+                } else {
+                    ProcessError::CleanupUnconfirmed
+                });
             }
         }
         if Instant::now() >= deadline {
@@ -159,27 +169,59 @@ pub fn run(mut request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
     };
     let mut cleanup_confirmed = true;
     if timed_out {
-        // The root Child is still unreaped while its process group is signalled,
-        // so this PGID cannot have been recycled for an unrelated process.
-        signal_group(child.id(), "TERM");
-        status = wait_until(&mut child, request.shutdown_grace)?;
-        if status.is_none() {
-            signal_group(child.id(), "KILL");
-            status = wait_until(&mut child, request.shutdown_grace)?;
-        }
-        cleanup_confirmed = status.is_some();
+        cleanup_confirmed = cleanup_child_tree(
+            &mut child,
+            root_pid,
+            &mut observed_processes,
+            request.shutdown_grace,
+        ) && !observation_failed;
+        status = child.try_wait().ok().flatten();
+    } else if status.is_some() {
+        // A command can exit after forking helpers that close all three
+        // standard streams. EOF alone does not prove those helpers stopped.
+        observation_failed |= collect_tree(root_pid, &mut observed_processes).is_err();
+        cleanup_confirmed = !observation_failed
+            && observed_processes.iter().any(|item| item.pid == root_pid)
+            && cleanup_survivors(root_pid, &observed_processes, request.shutdown_grace);
     }
     let io_deadline = Instant::now() + request.shutdown_grace;
     let input_done = input_rx.recv_timeout(remaining(io_deadline)).is_ok();
-    let stdout_result = out_rx.recv_timeout(remaining(io_deadline));
-    let stderr_result = err_rx.recv_timeout(remaining(io_deadline));
-    let (stdout, stdout_truncated) = stdout_result
-        .map_err(|_| ProcessError::CleanupUnconfirmed)?
-        .map_err(ProcessError::Io)?;
-    let (stderr_tail, stderr_truncated) = stderr_result
-        .map_err(|_| ProcessError::CleanupUnconfirmed)?
-        .map_err(ProcessError::Io)?;
-    cleanup_confirmed &= input_done;
+    let mut stdout_result = out_rx.recv_timeout(remaining(io_deadline));
+    let mut stderr_result = err_rx.recv_timeout(remaining(io_deadline));
+    cleanup_confirmed &= input_done && stdout_result.is_ok() && stderr_result.is_ok();
+    if !cleanup_confirmed {
+        cleanup_confirmed =
+            cleanup_survivors(root_pid, &observed_processes, request.shutdown_grace);
+        let retry_deadline = Instant::now() + request.shutdown_grace;
+        if stdout_result.is_err() {
+            stdout_result = out_rx.recv_timeout(remaining(retry_deadline));
+        }
+        if stderr_result.is_err() {
+            stderr_result = err_rx.recv_timeout(remaining(retry_deadline));
+        }
+    }
+    let (stdout, stdout_truncated) = match stdout_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(if cleanup_confirmed {
+                ProcessError::Io(error)
+            } else {
+                ProcessError::CleanupUnconfirmed
+            });
+        }
+        Err(_) => return Err(ProcessError::CleanupUnconfirmed),
+    };
+    let (stderr_tail, stderr_truncated) = match stderr_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(if cleanup_confirmed {
+                ProcessError::Io(error)
+            } else {
+                ProcessError::CleanupUnconfirmed
+            });
+        }
+        Err(_) => return Err(ProcessError::CleanupUnconfirmed),
+    };
     if !cleanup_confirmed {
         return Err(ProcessError::CleanupUnconfirmed);
     }
@@ -252,9 +294,22 @@ pub fn matching_processes(
 ) -> Vec<ProcessIdentity> {
     current
         .iter()
-        .filter(|candidate| observed.iter().any(|known| known == *candidate))
+        .filter(|candidate| {
+            observed
+                .iter()
+                .any(|known| same_process_identity(known, candidate))
+        })
         .cloned()
         .collect()
+}
+
+fn same_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> bool {
+    // Parent PID, process group, and command can change after fork, setpgid,
+    // exec, or reparenting. PID plus kernel birth token remains the stable
+    // identity across those transitions.
+    left.pid == right.pid
+        && left.start_identity == right.start_identity
+        && left.quality == right.quality
 }
 
 /// Signal only a still-running, previously observed group leader. Keeping the
@@ -315,6 +370,53 @@ pub fn signal_process_group_if_observed(
         let _ = (process_group_id, signal);
         Err(ProcessError::Inspection(
             "process-group signalling is unsupported on this platform".into(),
+        ))
+    }
+}
+
+/// Signal one process only when its complete kernel identity still matches.
+/// This is used after the original group leader has exited; callers must never
+/// infer process identity from a PID alone.
+pub fn signal_process_if_observed(
+    observed: &ProcessIdentity,
+    current: &[ProcessIdentity],
+    signal: ProcessSignal,
+) -> Result<bool, ProcessError> {
+    let Some(matched) = matching_processes(std::slice::from_ref(observed), current)
+        .into_iter()
+        .next()
+    else {
+        return Ok(false);
+    };
+    if matched.quality != ProcessIdentityQuality::KernelBirthToken || matched.pid > i32::MAX as u32
+    {
+        return Err(ProcessError::Inspection(
+            "kernel birth-token identity is required for process signalling".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let signal_number = match signal {
+            ProcessSignal::Interrupt => 2,
+            ProcessSignal::Terminate => 15,
+            ProcessSignal::Kill => 9,
+        };
+        let result = unsafe { kill_process_group(matched.pid as i32, signal_number) };
+        if result == 0 {
+            Ok(true)
+        } else if is_process_gone(&std::io::Error::last_os_error()) {
+            Ok(false)
+        } else {
+            Err(ProcessError::Inspection(
+                "operating system rejected the verified process signal".into(),
+            ))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        Err(ProcessError::Inspection(
+            "process signalling is unsupported on this platform".into(),
         ))
     }
 }
@@ -563,6 +665,162 @@ fn read_tail(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, b
     }
 }
 
+fn collect_tree(
+    root_pid: u32,
+    observed: &mut Vec<ProcessIdentity>,
+) -> Result<Vec<ProcessIdentity>, ProcessError> {
+    let current = inspect_process_table()?;
+    if let Some(root) = current.iter().find(|item| item.pid == root_pid) {
+        if root.process_group_id != root_pid
+            || root.quality != ProcessIdentityQuality::KernelBirthToken
+            || observed
+                .iter()
+                .find(|item| item.pid == root_pid)
+                .is_some_and(|known| !same_process_identity(known, root))
+        {
+            return Err(ProcessError::Inspection(
+                "root process identity changed during observation".into(),
+            ));
+        }
+        for item in capture_process_tree(root_pid, &current) {
+            if !observed.iter().any(|known| known == &item) {
+                observed.push(item);
+            }
+        }
+    } else {
+        for member in current
+            .iter()
+            .filter(|item| item.process_group_id == root_pid)
+        {
+            if !observed.iter().any(|known| known == member) {
+                return Err(ProcessError::Inspection(
+                    "unobserved process appeared after its group leader exited".into(),
+                ));
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn wait_child_and_collect(
+    child: &mut std::process::Child,
+    root_pid: u32,
+    observed: &mut Vec<ProcessIdentity>,
+    grace: Duration,
+) -> (Option<ExitStatus>, bool) {
+    let deadline = Instant::now() + grace;
+    let mut complete = true;
+    loop {
+        if collect_tree(root_pid, observed).is_err() {
+            complete = false;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return (Some(status), complete),
+            Ok(None) => {}
+            Err(_) => return (None, false),
+        }
+        if Instant::now() >= deadline {
+            return (None, complete);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn cleanup_survivors(root_pid: u32, observed: &[ProcessIdentity], grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        let Ok(current) = inspect_process_table() else {
+            return false;
+        };
+        let survivors = matching_processes(observed, &current);
+        if current.iter().any(|member| {
+            member.process_group_id == root_pid
+                && !observed
+                    .iter()
+                    .any(|known| same_process_identity(known, member))
+        }) {
+            return false;
+        }
+        if survivors.is_empty() {
+            return true;
+        }
+        for survivor in &survivors {
+            if survivor.pid == root_pid {
+                return false;
+            }
+            if signal_process_if_observed(survivor, &current, ProcessSignal::Kill).is_err() {
+                return false;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn cleanup_child_tree(
+    child: &mut std::process::Child,
+    root_pid: u32,
+    observed: &mut Vec<ProcessIdentity>,
+    grace: Duration,
+) -> bool {
+    let Ok(current) = collect_tree(root_pid, observed) else {
+        let _ = child.kill();
+        let _ = wait_until(child, grace);
+        return false;
+    };
+    let Some(root) = observed.iter().find(|item| item.pid == root_pid) else {
+        let _ = child.kill();
+        let _ = wait_until(child, grace);
+        return false;
+    };
+    if signal_process_group_if_observed(
+        root_pid,
+        std::slice::from_ref(root),
+        &current,
+        ProcessSignal::Terminate,
+    )
+    .is_err()
+    {
+        let _ = child.kill();
+        let (status, _) = wait_child_and_collect(child, root_pid, observed, grace);
+        let _ = status;
+        return false;
+    }
+    let (mut status, mut observation_complete) =
+        wait_child_and_collect(child, root_pid, observed, grace);
+    if status.is_none() {
+        let current = match collect_tree(root_pid, observed) {
+            Ok(current) => current,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = wait_until(child, grace);
+                return false;
+            }
+        };
+        if let Some(root) = observed.iter().find(|item| item.pid == root_pid) {
+            if signal_process_group_if_observed(
+                root_pid,
+                std::slice::from_ref(root),
+                &current,
+                ProcessSignal::Kill,
+            )
+            .is_err()
+            {
+                observation_complete = false;
+            }
+        } else {
+            observation_complete = false;
+        }
+        let waited = wait_child_and_collect(child, root_pid, observed, grace);
+        status = waited.0;
+        observation_complete &= waited.1;
+    }
+    let survivors_stopped = cleanup_survivors(root_pid, observed, grace);
+    status.is_some() && observation_complete && survivors_stopped
+}
+
 fn wait_until(
     child: &mut std::process::Child,
     grace: Duration,
@@ -576,29 +834,6 @@ fn wait_until(
             return Ok(None);
         }
         thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(unix)]
-fn signal_group(pid: u32, signal: &str) {
-    let _ = Command::new("/bin/kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(unix))]
-fn signal_group(pid: u32, signal: &str) {
-    if signal == "KILL" {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status();
-    } else {
-        let _ = pid;
     }
 }
 
@@ -679,7 +914,113 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn returns_bounded_unknown_when_a_setsid_child_keeps_inherited_pipes_open() {
+    fn timeout_does_not_report_success_while_an_observed_child_survives() {
+        use super::{
+            ProcessIdentity, ProcessSignal, inspect_process_table, matching_processes,
+            signal_process_if_observed,
+        };
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Instant;
+
+        struct ChildGuard {
+            release: PathBuf,
+            identity: Arc<Mutex<Option<ProcessIdentity>>>,
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.release, b"release");
+                let Some(identity) = self.identity.lock().ok().and_then(|item| item.clone()) else {
+                    return;
+                };
+                let deadline = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < deadline {
+                    let Ok(current) = inspect_process_table() else {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    if matching_processes(std::slice::from_ref(&identity), &current).is_empty() {
+                        return;
+                    }
+                    let _ = signal_process_if_observed(&identity, &current, ProcessSignal::Kill);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("child-ready");
+        let start = temp.path().join("allow-parent-exit");
+        let release = temp.path().join("release-child");
+        let observed = Arc::new(Mutex::new(None));
+        let _guard = ChildGuard {
+            release: release.clone(),
+            identity: Arc::clone(&observed),
+        };
+        let python = resolve_executable(
+            Path::new("python3"),
+            &std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let program = format!(
+            "import os,signal,time,pathlib; ready=pathlib.Path({:?}); start=pathlib.Path({:?}); release=pathlib.Path({:?}); pid=os.fork();\nif pid:\n deadline=time.monotonic()+3\n while not start.exists() and time.monotonic()<deadline: time.sleep(0.005)\n time.sleep(8)\nelse:\n signal.signal(signal.SIGTERM, signal.SIG_IGN)\n [os.close(fd) for fd in (0,1,2)]\n ready.write_text(str(os.getpid()))\n deadline=time.monotonic()+3\n while not start.exists() and time.monotonic()<deadline: time.sleep(0.005)\n while not release.exists() and time.monotonic()<deadline+5: time.sleep(0.01)",
+            ready, start, release
+        );
+        let mut req = request(python.to_str().unwrap(), &["-c", &program]);
+        req.executable = python;
+        // Leave enough time for a loaded CI host to schedule the observer and
+        // capture the child's kernel start identity before timeout cleanup.
+        req.timeout = Duration::from_secs(1);
+        req.shutdown_grace = Duration::from_secs(1);
+        let child_identity = Arc::clone(&observed);
+        let marker_start = start.clone();
+        let marker_ready = ready.clone();
+        let observer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Ok(pid_text) = std::fs::read_to_string(&marker_ready)
+                    && let Ok(pid) = pid_text.parse::<u32>()
+                    && let Ok(table) = inspect_process_table()
+                    && let Some(identity) = table.into_iter().find(|item| item.pid == pid)
+                {
+                    if let Ok(mut slot) = child_identity.lock() {
+                        *slot = Some(identity);
+                    }
+                    let _ = std::fs::write(&marker_start, b"start");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let output = run(req);
+        observer.join().unwrap();
+        let identity = observed.lock().unwrap().clone();
+        assert!(
+            identity.is_some(),
+            "fixture must capture PID and start identity before allowing the parent to exit"
+        );
+        let identity = identity.unwrap();
+        assert!(
+            output.is_ok(),
+            "verified child should be killed and cleanup confirmed: {output:?}"
+        );
+        let output = output.unwrap();
+        assert!(output.timed_out);
+        assert!(output.cleanup_confirmed);
+        assert!(
+            matching_processes(
+                std::slice::from_ref(&identity),
+                &inspect_process_table().unwrap()
+            )
+            .is_empty(),
+            "the observed child must be gone before cleanup is reported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setsid_child_with_inherited_pipes_is_bounded_and_not_misreported() {
         use super::{
             ProcessIdentity, ProcessSignal, inspect_process_table, matching_processes,
             signal_process_group_if_observed,
@@ -750,7 +1091,7 @@ mod tests {
         )
         .unwrap();
         let program = format!(
-            "import os,time,pathlib; ready=pathlib.Path({:?}); release=pathlib.Path({:?}); pid=os.fork();\nif pid:\n deadline=time.monotonic()+3\n while not ready.exists() and time.monotonic()<deadline: time.sleep(0.005)\n raise SystemExit(0 if ready.exists() else 2)\nos.setsid(); ready.write_text(str(os.getpid())); deadline=time.monotonic()+5\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)",
+            "import os,time,pathlib; ready=pathlib.Path({:?}); release=pathlib.Path({:?}); pid=os.fork();\nif pid:\n deadline=time.monotonic()+3\n while not ready.exists() and time.monotonic()<deadline: time.sleep(0.005)\n time.sleep(0.25)\n raise SystemExit(0 if ready.exists() else 2)\nos.setsid(); ready.write_text(str(os.getpid())); deadline=time.monotonic()+5\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)",
             ready, release,
         );
         let mut req = request(python.to_str().unwrap(), &["-c", &program]);
@@ -768,17 +1109,21 @@ mod tests {
             .iter()
             .find(|process| process.pid == ready_pid)
             .cloned();
-        let observed = child_guard
-            .observed
-            .as_ref()
-            .expect("detached child must be observable after its readiness barrier");
-        assert_eq!(observed.process_group_id, ready_pid);
-        assert!(!observed.start_identity.is_empty());
-        assert!(observed.quality == super::ProcessIdentityQuality::KernelBirthToken);
-        assert!(matches!(
-            result,
-            Err(super::ProcessError::CleanupUnconfirmed)
-        ));
+        if let Some(observed) = child_guard.observed.as_ref() {
+            assert_eq!(observed.process_group_id, ready_pid);
+            assert!(!observed.start_identity.is_empty());
+            assert!(observed.quality == super::ProcessIdentityQuality::KernelBirthToken);
+        }
+        match &result {
+            Err(super::ProcessError::CleanupUnconfirmed) => {}
+            Ok(output) if output.cleanup_confirmed => {
+                assert!(
+                    child_guard.observed.is_none(),
+                    "a surviving escaped process cannot be reported as cleaned"
+                );
+            }
+            _ => panic!("unexpected process result: {result:?}"),
+        }
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(ready.exists());
         assert!(
@@ -822,6 +1167,14 @@ mod tests {
         );
         assert!(
             matching_processes(&captured, &[identity(20, 10, 10, "reused", "tool")]).is_empty()
+        );
+        let reparented_after_term = identity(30, 1, 10, "start-30", "renamed-shell");
+        assert_eq!(
+            matching_processes(
+                std::slice::from_ref(&reparented),
+                std::slice::from_ref(&reparented_after_term)
+            ),
+            vec![reparented_after_term]
         );
         assert!(
             !signal_process_group_if_observed(10, &captured, &[], ProcessSignal::Interrupt)

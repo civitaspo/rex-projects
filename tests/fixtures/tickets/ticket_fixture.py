@@ -443,7 +443,7 @@ def dispatch(db, namespace, delay, request):
         canonical_ticket = namespace_of_ticket(db, namespace, scope, params["canonical_ticket_id"])
         if duplicate["id"] == canonical_ticket["id"]:
             fail("invalid_request", "a ticket cannot be a duplicate of itself")
-        key = "duplicate-of-" + op_id
+        key = params["operation_key"]
         comment = f"Duplicate of {canonical_ticket['ticket_key']}. {params['reason']}"
         created = now()
         db.execute("INSERT OR IGNORE INTO comments VALUES(?,?,?,?,?,?,?)",
@@ -485,7 +485,8 @@ def dispatch(db, namespace, delay, request):
             if invisible:
                 return {"ticket_namespace": namespace, "outcome": "unknown", "reason": "search index has not reached the creation key"}
             matches = [{"operation_id": row["operation_id"], "method": row["method"],
-                        "ticket_id": row["ticket_id"], "receipt": json.loads(row["result_json"])} for row in candidates]
+                        "ticket_id": row["ticket_id"], "stable_external_key": row["external_key"],
+                        "receipt": json.loads(row["result_json"])} for row in candidates]
             return {"ticket_namespace": namespace, "outcome": "found", "matches": matches}
         return {"ticket_namespace": namespace, "outcome": "absent",
                 "proof": {"kind": "fixture-operation-ledger", "scope": json.loads(scope), "observed_at": now()}}
