@@ -128,6 +128,15 @@ pub struct HumanPresentationReceipt {
 }
 
 impl ConfigStore {
+    /// Read a human request through the controller-owned connection. Unlike the CLI helper,
+    /// this does not open a second database connection while the controller holds its lock.
+    pub fn current_human_request(
+        &self,
+        request_id: &HumanRequestId,
+    ) -> Result<Option<HumanRequestSummary>, String> {
+        load_request(&self.connection, request_id)
+    }
+
     /// Apply v8 after v7. Tests build a v6 fixture, promote only its user_version to 7, and invoke
     /// this function directly so this branch can be reviewed before PR3d is merged.
     pub fn migrate_human_v8(connection: &mut Connection) -> Result<(), String> {
@@ -955,6 +964,7 @@ fn validate_generation_read(connection: &Connection, expected: u64) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -962,8 +972,9 @@ mod tests {
     use crate::domain::ids::Revision;
     use crate::human::{RepositoryReview, ReviewBundle};
     use crate::human_runtime::{
-        HumanDecisionChoice, HumanDecisionIntent, HumanPurpose, HumanRuntimeRequest,
-        HumanSubjectBinding, HumanSubjectKind, write_runtime_review_artifact,
+        HumanDecisionChoice, HumanDecisionIntent, HumanPresentationEffect,
+        HumanPresenterEffectHandler, HumanPurpose, HumanRuntimeRequest, HumanSubjectBinding,
+        HumanSubjectKind, HumanSubjectObserver, write_runtime_review_artifact,
     };
     use crate::launch::{RexView, RexViewKind};
     use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
@@ -1122,6 +1133,117 @@ mod tests {
     ) -> Result<bool, String> {
         let view_id = request_view_id(store, request);
         store.register_human_request(owner_generation, request, &view_id, artifact, now)
+    }
+
+    struct FixedSubjectObserver(HumanSubjectBinding);
+
+    impl HumanSubjectObserver for FixedSubjectObserver {
+        fn observe_current_subject(
+            &self,
+            _request: &HumanRuntimeRequest,
+        ) -> Result<Option<HumanSubjectBinding>, String> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn human_effect_registers_presents_then_consumes_only_a_fresh_human_response() {
+        use crate::effects::{
+            EffectContext, EffectHandler, EffectMode, EffectObservation, EffectRequest,
+        };
+        use crate::store::EffectIntent;
+
+        let (temp, mut store, generation, request, artifact) = runtime_fixture();
+        let view_id = request_view_id(&store, &request);
+        let payload = serde_json::to_string(&HumanPresentationEffect {
+            request: request.clone(),
+            rex_view_id: view_id,
+        })
+        .unwrap();
+        let effect = EffectRequest {
+            intent: EffectIntent {
+                project_id: request.subject.project_id.clone(),
+                subject_type: "ticket_run".into(),
+                subject_id: request.subject.subject_id.clone(),
+                operation_id: "human-effect-1".into(),
+                logical_key: "ticket-run-1:1:request_human_review".into(),
+                kind: "request_human_review".into(),
+                request_json: payload,
+                request_digest: "a".repeat(64),
+                expected_revision: Some(request.subject.revision.0),
+            },
+            attempt_count: 1,
+            created_at_unix: 50,
+        };
+        let artifact_root = temp.path().join("human-artifacts");
+        // Remove the fixture's existing page so the handler proves it can create its own private,
+        // deterministic review bundle while preserving identical manifest/summary files.
+        std::fs::remove_file(&artifact).unwrap();
+        let handler = HumanPresenterEffectHandler::new(
+            "local_html",
+            vec!["/usr/bin/true".into()],
+            [(OsString::from("PATH"), OsString::from("/usr/bin"))]
+                .into_iter()
+                .collect(),
+            artifact_root,
+            std::sync::Arc::new(FixedSubjectObserver(request.subject.clone())),
+        )
+        .unwrap();
+        let mut context = EffectContext {
+            store: &mut store,
+            owner_generation: generation,
+            now_unix: 50,
+        };
+        let presented = handler
+            .handle(EffectMode::Submit, &effect, &mut context)
+            .unwrap();
+        assert!(matches!(presented, EffectObservation::Pending { .. }));
+        assert!(
+            context
+                .store
+                .accepted_human_approval(
+                    &request.request_id,
+                    &request.subject.digest().unwrap(),
+                    &request.subject.configuration_digest,
+                    &request.subject.policy_digest,
+                    50,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        ConfigStore::enqueue_human_decision(
+            temp.path(),
+            &HumanDecisionIntent {
+                request_id: request.request_id.clone(),
+                response_id: "human-response-1".into(),
+                expected_subject_digest: request.subject.digest().unwrap(),
+                choice: HumanDecisionChoice::Approve,
+                explanation: Some("Reviewed the exact head and checks.".into()),
+            },
+            51,
+        )
+        .unwrap();
+        let reconciled = handler
+            .handle(EffectMode::Reconcile, &effect, &mut context)
+            .unwrap();
+        assert!(matches!(reconciled, EffectObservation::Applied { .. }));
+        let approval = context
+            .store
+            .accepted_human_approval(
+                &request.request_id,
+                &request.subject.digest().unwrap(),
+                &request.subject.configuration_digest,
+                &request.subject.policy_digest,
+                52,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(approval.approved());
+        assert_eq!(
+            approval.explanation(),
+            Some("Reviewed the exact head and checks.")
+        );
     }
 
     #[test]

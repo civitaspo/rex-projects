@@ -37,7 +37,6 @@
       "type": "string"
     },
     "operation_id": {
-      "default": null,
       "type": [
         "string",
         "null"
@@ -45,7 +44,6 @@
     },
     "params": true,
     "project_id": {
-      "default": null,
       "type": [
         "string",
         "null"

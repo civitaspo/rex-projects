@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{Digest, HumanRequestId, ProjectId, Revision, TicketRunId};
+use crate::effects::{
+    EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation, EffectRequest,
+};
 use crate::human::{ReviewBundle, review_bundle_digest};
 use crate::protocol::{
     MethodName, ProtocolError, RequestEnvelope, RequestId as ProtocolRequestId, SCHEMA_VERSION,
@@ -584,6 +587,261 @@ pub fn open_runtime_review_html(
         return Err("configured local human opener failed".into());
     }
     Ok(())
+}
+
+/// Provider-facing host adapter used to re-observe the complete authority behind a human
+/// decision. Errors leave the response queued for retry; `None` means the current authority is
+/// temporarily unavailable and also leaves it queued.
+pub trait HumanSubjectObserver: Send + Sync {
+    fn observe_current_subject(
+        &self,
+        request: &HumanRuntimeRequest,
+    ) -> Result<Option<HumanSubjectBinding>, String>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanPresentationEffect {
+    pub request: HumanRuntimeRequest,
+    pub rex_view_id: Digest,
+}
+
+/// Configured host-side presenter. Its effect request contains only host-built typed review
+/// material; presenter output may save a location, never a human choice. Decisions enter through
+/// `human respond` and are revalidated in the owning controller.
+pub struct HumanPresenterEffectHandler {
+    kind: EffectKind,
+    command: Vec<String>,
+    local_html: bool,
+    environment: std::collections::BTreeMap<OsString, OsString>,
+    artifact_root: PathBuf,
+    observer: std::sync::Arc<dyn HumanSubjectObserver>,
+}
+
+impl HumanPresenterEffectHandler {
+    pub fn new(
+        presenter_kind: &str,
+        command: Vec<String>,
+        environment: std::collections::BTreeMap<OsString, OsString>,
+        artifact_root: PathBuf,
+        observer: std::sync::Arc<dyn HumanSubjectObserver>,
+    ) -> Result<Self, String> {
+        if !matches!(presenter_kind, "local_html" | "command")
+            || command.is_empty()
+            || command.iter().any(String::is_empty)
+            || !artifact_root.is_absolute()
+        {
+            return Err(
+                "human presenter needs a supported kind, nonempty argv, and absolute artifact root"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            kind: EffectKind::RequestHumanReview,
+            command,
+            local_html: presenter_kind == "local_html",
+            environment,
+            artifact_root,
+            observer,
+        })
+    }
+
+    fn present(
+        &self,
+        request: &EffectRequest,
+        context: &mut EffectContext<'_>,
+    ) -> Result<EffectObservation, String> {
+        let now = u64::try_from(context.now_unix)
+            .map_err(|_| "controller time is before the Unix epoch".to_owned())?;
+        let effect: HumanPresentationEffect = parse_unique(request.intent.request_json.as_bytes())?;
+        let review = &effect.request;
+        if request.intent.project_id != review.subject.project_id
+            || request.intent.subject_id != review.subject.subject_id
+            || request.intent.expected_revision != Some(review.subject.revision.0)
+        {
+            return Err(
+                "human presentation effect identity does not match its typed subject".into(),
+            );
+        }
+        review.validate(now)?;
+        let html_path = write_runtime_review_artifact(&self.artifact_root, review)
+            .map_err(|error| format!("write human review artifact: {error}"))?;
+        let inserted = context.store.register_human_request(
+            context.owner_generation,
+            review,
+            &effect.rex_view_id,
+            &html_path,
+            now,
+        )?;
+        if !inserted {
+            let existing = context
+                .store
+                .current_human_request(&review.request_id)?
+                .ok_or_else(|| "durable human request disappeared".to_owned())?;
+            if existing.lifecycle != HumanRequestLifecycle::Pending {
+                return observation_for_lifecycle(existing.lifecycle, &review.request_id);
+            }
+        }
+
+        let attempted_at_unix = now;
+        let (receipt, observation) = if self.local_html {
+            match open_runtime_review_html(&self.command, &self.environment, &html_path) {
+                Ok(()) => (
+                    crate::store::human::HumanPresentationReceipt {
+                        request_id: review.request_id.clone(),
+                        presenter_kind: "local_html".into(),
+                        reference: Some(html_path.to_string_lossy().into_owned()),
+                        location: None,
+                        outcome: "opened".into(),
+                        detail: None,
+                        attempted_at_unix,
+                    },
+                    EffectObservation::Pending {
+                        receipt: format!("human review opened: {}", review.request_id),
+                    },
+                ),
+                Err(error) => {
+                    let receipt = failed_presentation_receipt(
+                        &review.request_id,
+                        "local_html",
+                        attempted_at_unix,
+                        &error,
+                    );
+                    context
+                        .store
+                        .record_human_presentation(context.owner_generation, &receipt)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            match run_command_presenter(
+                &self.command,
+                &self.environment,
+                ProtocolRequestId::new(format!(
+                    "human-present-{}",
+                    hex(&Sha256::digest(review.request_id.as_str().as_bytes()))
+                ))?,
+                review,
+                html_path.to_string_lossy().into_owned(),
+            ) {
+                Ok(reference) => (
+                    crate::store::human::HumanPresentationReceipt {
+                        request_id: review.request_id.clone(),
+                        presenter_kind: "command".into(),
+                        reference: Some(reference.reference),
+                        location: reference.location,
+                        outcome: "presented".into(),
+                        detail: None,
+                        attempted_at_unix,
+                    },
+                    EffectObservation::Pending {
+                        receipt: format!("human review presented: {}", review.request_id),
+                    },
+                ),
+                Err(error) => {
+                    let receipt = failed_presentation_receipt(
+                        &review.request_id,
+                        "command",
+                        attempted_at_unix,
+                        &error,
+                    );
+                    context
+                        .store
+                        .record_human_presentation(context.owner_generation, &receipt)?;
+                    return Err(error);
+                }
+            }
+        };
+        context
+            .store
+            .record_human_presentation(context.owner_generation, &receipt)?;
+        Ok(observation)
+    }
+
+    fn reconcile(
+        &self,
+        request: &EffectRequest,
+        context: &mut EffectContext<'_>,
+    ) -> Result<EffectObservation, String> {
+        let effect: HumanPresentationEffect = parse_unique(request.intent.request_json.as_bytes())?;
+        // Processing is bounded. Each response is paired with a newly observed full subject;
+        // transient observation errors preserve the durable queue for a later controller tick.
+        let now = u64::try_from(context.now_unix)
+            .map_err(|_| "controller time is before the Unix epoch".to_owned())?;
+        process_queued_human_responses(
+            context.store,
+            context.owner_generation,
+            MAX_HUMAN_RESPONSE_BATCH,
+            now,
+            |human_request| self.observer.observe_current_subject(human_request),
+        )?;
+        let summary = context
+            .store
+            .current_human_request(&effect.request.request_id)?
+            .ok_or_else(|| "durable human request is missing during reconciliation".to_owned())?;
+        if summary.lifecycle == HumanRequestLifecycle::Pending {
+            // A crash or lost presenter reply may leave a durable request without a presentation
+            // receipt. Reuse the stable request ID so command adapters can deduplicate safely.
+            return self.present(request, context);
+        }
+        observation_for_lifecycle(summary.lifecycle, &effect.request.request_id)
+    }
+}
+
+impl EffectHandler for HumanPresenterEffectHandler {
+    fn kind(&self) -> EffectKind {
+        self.kind
+    }
+
+    fn handle(
+        &self,
+        mode: EffectMode,
+        request: &EffectRequest,
+        context: &mut EffectContext<'_>,
+    ) -> Result<EffectObservation, String> {
+        match mode {
+            EffectMode::Submit => self.present(request, context),
+            EffectMode::Reconcile => self.reconcile(request, context),
+        }
+    }
+}
+
+fn observation_for_lifecycle(
+    lifecycle: HumanRequestLifecycle,
+    request_id: &HumanRequestId,
+) -> Result<EffectObservation, String> {
+    match lifecycle {
+        HumanRequestLifecycle::Pending
+        | HumanRequestLifecycle::Presented
+        | HumanRequestLifecycle::ResponseQueued => Ok(EffectObservation::Pending {
+            receipt: format!("awaiting human decision: {request_id}"),
+        }),
+        HumanRequestLifecycle::Decided => Ok(EffectObservation::Applied {
+            receipt: format!("human response validated: {request_id}"),
+        }),
+        HumanRequestLifecycle::Stale
+        | HumanRequestLifecycle::Expired
+        | HumanRequestLifecycle::Cancelled => Ok(EffectObservation::Rejected {
+            receipt: format!("human request is {lifecycle:?}: {request_id}"),
+        }),
+    }
+}
+
+fn failed_presentation_receipt(
+    request_id: &HumanRequestId,
+    kind: &str,
+    attempted_at_unix: u64,
+    error: &str,
+) -> crate::store::human::HumanPresentationReceipt {
+    crate::store::human::HumanPresentationReceipt {
+        request_id: request_id.clone(),
+        presenter_kind: kind.into(),
+        reference: None,
+        location: None,
+        outcome: "failed".into(),
+        detail: Some(error.chars().take(4096).collect()),
+        attempted_at_unix,
+    }
 }
 
 fn resolve_human_child(
