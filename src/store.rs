@@ -20,6 +20,7 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
+pub mod agent_recovery;
 #[path = "store/dashboard_projection.rs"]
 pub mod dashboard_projection;
 

@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod agent_api;
 pub mod agent_recovery;
 pub mod artifacts;
+pub mod agent_recovery;
 pub mod cli;
 pub mod config;
 pub mod dashboard;
