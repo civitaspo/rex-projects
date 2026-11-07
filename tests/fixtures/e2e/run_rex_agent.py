@@ -221,7 +221,7 @@ def main() -> int:
             cleanup_owned_session(rex, session_label, session_id, identity_verified, result)
         except Exception as error:
             result["cleanup_error"] = f"{type(error).__name__}: {error}"
-        sanitize_transcript(transcript)
+        sanitize_transcript(artifacts)
         result["completed_at_epoch_seconds"] = time.time()
         if result.get("cleanup_error"):
             result["outcome"] = "FAILED"

@@ -177,6 +177,10 @@ class E2EFixtureTests(unittest.TestCase):
         self.assertNotIn("principal", output)
         self.assertNotIn("home", output)
         self.assertEqual(output["program"], "$HOME/bin/python")
+        layout = directory / "session-create.json"
+        layout.write_text(json.dumps({"command": [str(Path.home() / "bin" / "python")] }), encoding="utf-8")
+        sanitize_transcript(directory)
+        self.assertEqual(json.loads(layout.read_text(encoding="utf-8"))["command"], ["$HOME/bin/python"])
 
     def test_rex_runner_rejects_payload_digest_claim_without_matching_bytes(self) -> None:
         sys.path.insert(0, str(HERE))
