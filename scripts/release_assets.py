@@ -28,6 +28,8 @@ TARGETS = {
 VERSION_RE = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RELEASE_PREDICATE = "https://github.com/civitaspo/csm-ci-actions/attestation/release/v1"
+RELEASE_SIGNER = "civitaspo/csm-ci-actions/.github/workflows/server.yml"
 
 
 class ReleaseAssetError(Exception):
@@ -69,7 +71,7 @@ def inspect_runtime_minimum(binary: Path, target: str) -> dict[str, str]:
                     minimums.add(match.group(1))
         if len(minimums) != 1:
             raise ReleaseAssetError("otool did not report one unambiguous macOS minimum deployment version")
-        return {"minimum_os": f"macOS {minimums.pop()}"}
+        return {"minimum_os": minimums.pop()}
 
     try:
         output = subprocess.run(["getconf", "GNU_LIBC_VERSION"], check=True, capture_output=True, text=True, timeout=10).stdout.strip()
@@ -81,7 +83,7 @@ def inspect_runtime_minimum(binary: Path, target: str) -> dict[str, str]:
     major, minor = int(match.group(1)), int(match.group(2))
     if (major, minor) < (2, 39):
         raise ReleaseAssetError(f"Linux GNU release assets require a glibc 2.39-or-newer build host; found {output}")
-    return {"minimum_libc": f"glibc >= {major}.{minor}"}
+    return {"minimum_libc": f"glibc {major}.{minor}"}
 
 
 def package_metadata(repository_root: Path) -> tuple[str, str]:
@@ -135,10 +137,10 @@ def validate_runtime_minimum(target: str, runtime_key: str, value: Any) -> str:
     if not isinstance(value, str):
         raise ReleaseAssetError(f"{target} runtime minimum must be a string")
     if runtime_key == "minimum_os":
-        if not re.fullmatch(r"macOS \d+\.\d+(?:\.\d+)?", value):
+        if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", value):
             raise ReleaseAssetError(f"{target} minimum_os must be measured from the executable load commands")
         return value
-    match = re.fullmatch(r"glibc >= (\d+)\.(\d+)", value)
+    match = re.fullmatch(r"glibc (\d+)\.(\d+)", value)
     if not match or (int(match.group(1)), int(match.group(2))) < (2, 39):
         raise ReleaseAssetError(f"{target} minimum_libc must be glibc 2.39 or newer")
     return value
@@ -153,6 +155,17 @@ def validate_release_binary(binary: Path) -> None:
         raise ReleaseAssetError("release executable must be a regular executable file, not a symlink")
     if file_stat.st_size == 0:
         raise ReleaseAssetError("release executable is empty")
+
+
+def runtime_protocol(pin_path: Path) -> int:
+    try:
+        pin_text = pin_path.read_text()
+    except OSError as error:
+        raise ReleaseAssetError(f"cannot read current Lua runtime pin {pin_path}: {error}") from error
+    matches = re.findall(r"^\s*protocol\s*=\s*([1-9][0-9]*)\s*,?\s*$", pin_text, re.MULTILINE)
+    if len(matches) != 1:
+        raise ReleaseAssetError(f"current Lua runtime pin must declare exactly one positive protocol: {pin_path}")
+    return int(matches[0])
 
 
 def make_artifact_manifest(
@@ -211,7 +224,12 @@ def write_artifact_manifest(args: argparse.Namespace) -> None:
     args.output.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
-def read_artifacts(artifact_directory: Path, version: str, protocol: int) -> list[dict[str, str]]:
+def read_artifacts(
+    artifact_directory: Path,
+    version: str,
+    protocol: int,
+    expected_source_revision: str | None = None,
+) -> list[dict[str, str]]:
     entries = list(artifact_directory.iterdir())
     expected_targets = set(TARGETS)
     if {path.name for path in entries} == expected_targets:
@@ -313,6 +331,11 @@ def read_artifacts(artifact_directory: Path, version: str, protocol: int) -> lis
 
     if len(revisions) != 1:
         raise ReleaseAssetError("release assets were not built from the same source revision")
+    if expected_source_revision is not None:
+        if not REVISION_RE.fullmatch(expected_source_revision):
+            raise ReleaseAssetError("expected source revision must be a full lowercase Git SHA")
+        if revisions != {expected_source_revision}:
+            raise ReleaseAssetError("release assets do not match the verified release tag commit")
     if len(schemas) != 1:
         raise ReleaseAssetError("release assets report different database schema versions")
     return results
@@ -346,14 +369,15 @@ def lua_pin(version: str, protocol: int, repository: str, assets: list[dict[str,
 def update_pin(args: argparse.Namespace) -> None:
     repository_root = args.repository_root.resolve()
     version, repository = package_metadata(repository_root)
+    pin_path = args.pin_path.resolve()
+    protocol = args.protocol if args.protocol is not None else runtime_protocol(pin_path)
     artifact_root = args.artifact_root.resolve()
     version_directory = artifact_root / version
     artifact_directory = version_directory if version_directory.is_dir() else artifact_root
     if not artifact_directory.is_dir():
         raise ReleaseAssetError(f"artifact directory does not exist: {artifact_directory}")
-    assets = read_artifacts(artifact_directory, version, args.protocol)
-    generated = lua_pin(version, args.protocol, repository, assets)
-    pin_path = args.pin_path.resolve()
+    assets = read_artifacts(artifact_directory, version, protocol, args.expected_source_revision)
+    generated = lua_pin(version, protocol, repository, assets)
     if args.write:
         if not pin_path.parent.is_dir():
             raise ReleaseAssetError(f"Lua pin directory does not exist: {pin_path.parent}")
@@ -390,6 +414,115 @@ def update_pin(args: argparse.Namespace) -> None:
     raise ReleaseAssetError("Lua runtime pin differs; review the diff and rerun with --write")
 
 
+def run_gh(arguments: list[str], description: str, timeout: int = 60) -> str:
+    try:
+        result = subprocess.run(
+            ["gh", *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ReleaseAssetError(f"{description} failed: {error}") from error
+    return result.stdout
+
+
+def release_assets_for_attestation() -> list[str]:
+    names = ["SHA256SUMS"]
+    for rust_target in TARGETS.values():
+        binary = f"rex-projects-{rust_target}"
+        names.extend([binary, f"{binary}.artifact.json", f"{binary}.sha256"])
+    return names
+
+
+def verify_release_attestation(path: Path, repository: str, tag: str, revision: str) -> None:
+    output = run_gh(
+        [
+            "attestation",
+            "verify",
+            str(path),
+            "--owner",
+            repository.split("/", 1)[0],
+            "--signer-workflow",
+            RELEASE_SIGNER,
+            "--predicate-type",
+            RELEASE_PREDICATE,
+            "--deny-self-hosted-runners",
+            "--format",
+            "json",
+        ],
+        f"attestation verification for {path.name}",
+        timeout=120,
+    )
+    try:
+        attestations = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ReleaseAssetError(f"attestation verification returned invalid JSON for {path.name}") from error
+    if not isinstance(attestations, list) or not attestations:
+        raise ReleaseAssetError(f"no verified release attestation was returned for {path.name}")
+    expected = {"client_repository": repository, "merge_sha": revision, "tag": tag}
+    for item in attestations:
+        try:
+            statement = item["verificationResult"]["statement"]
+            predicate_type = statement["predicateType"]
+            predicate = statement["predicate"]
+        except (KeyError, TypeError) as error:
+            raise ReleaseAssetError(f"attestation statement is incomplete for {path.name}") from error
+        if predicate_type != RELEASE_PREDICATE or not isinstance(predicate, dict):
+            raise ReleaseAssetError(f"attestation type does not match csm-ci release predicate for {path.name}")
+        if any(predicate.get(key) != value for key, value in expected.items()):
+            raise ReleaseAssetError(f"attestation source repository, merge SHA, or tag differs for {path.name}")
+
+
+def refresh_pin(args: argparse.Namespace) -> None:
+    repository_root = args.repository_root.resolve()
+    version, repository_url = package_metadata(repository_root)
+    protocol = runtime_protocol(args.pin_path.resolve())
+    repository = urlparse(repository_url).path.lstrip("/")
+    tag = f"v{version}"
+    try:
+        release = json.loads(
+            run_gh(
+                ["release", "view", tag, "--repo", repository, "--json", "tagName,isDraft,isPrerelease"],
+                f"release lookup for {tag}",
+            )
+        )
+    except json.JSONDecodeError as error:
+        raise ReleaseAssetError(f"GitHub returned invalid release metadata for {tag}") from error
+    if release != {"tagName": tag, "isDraft": False, "isPrerelease": False}:
+        raise ReleaseAssetError(f"{tag} must exist as a published stable release")
+
+    revision = run_gh(
+        ["api", f"repos/{repository}/commits/{tag}", "--jq", ".sha"],
+        f"tag commit lookup for {tag}",
+    ).strip()
+    if not REVISION_RE.fullmatch(revision):
+        raise ReleaseAssetError(f"GitHub returned an invalid source commit for {tag}")
+
+    with tempfile.TemporaryDirectory(prefix="rex-projects-release-pin-") as temporary_directory:
+        artifact_root = Path(temporary_directory)
+        run_gh(
+            ["release", "download", tag, "--repo", repository, "--dir", str(artifact_root)],
+            f"asset download for {tag}",
+        )
+        for asset_name in release_assets_for_attestation():
+            asset_path = artifact_root / asset_name
+            if not asset_path.is_file() or asset_path.is_symlink():
+                raise ReleaseAssetError(f"release asset is missing or not a regular file: {asset_name}")
+            verify_release_attestation(asset_path, repository, tag, revision)
+        update_pin(
+            argparse.Namespace(
+                repository_root=repository_root,
+                artifact_root=artifact_root,
+                pin_path=args.pin_path,
+                protocol=protocol,
+                expected_source_revision=revision,
+                write=args.write,
+            )
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -405,11 +538,23 @@ def main() -> int:
     pin_parser.add_argument("--repository-root", type=Path, default=Path(__file__).resolve().parents[1])
     pin_parser.add_argument("--artifact-root", type=Path, required=True, help="root containing <Cargo-version>/<target>/ artifacts")
     pin_parser.add_argument("--pin-path", type=Path, default=Path(__file__).resolve().parents[1] / "lua/rex_projects/runtime_version.lua")
-    pin_parser.add_argument("--protocol", type=int, required=True, help="expected CLI protocol from the reviewed source")
+    pin_parser.add_argument("--protocol", type=int, help="expected CLI protocol; defaults to the current Lua runtime pin")
+    pin_parser.add_argument("--expected-source-revision", help="require every target manifest to match this source SHA")
     mode = pin_parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="compare generated output with the existing Lua pin (default)")
     mode.add_argument("--write", action="store_true", help="atomically replace the existing Lua pin after validation")
     pin_parser.set_defaults(handler=update_pin)
+
+    refresh_parser = subparsers.add_parser(
+        "refresh",
+        help="download the Cargo-version release, verify csm attestations, and check or write the Lua runtime pin",
+    )
+    refresh_parser.add_argument("--repository-root", type=Path, default=Path(__file__).resolve().parents[1])
+    refresh_parser.add_argument("--pin-path", type=Path, default=Path(__file__).resolve().parents[1] / "lua/rex_projects/runtime_version.lua")
+    refresh_mode = refresh_parser.add_mutually_exclusive_group()
+    refresh_mode.add_argument("--check", action="store_true", help="compare generated output with the existing Lua pin (default)")
+    refresh_mode.add_argument("--write", action="store_true", help="atomically replace the Lua pin after all checks pass")
+    refresh_parser.set_defaults(handler=refresh_pin)
 
     args = parser.parse_args()
     try:
