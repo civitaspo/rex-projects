@@ -525,22 +525,26 @@ impl RuntimeServices {
         {
             return Err("qualification package does not match its durable Rex binding".into());
         }
-        let rex = match RexCliTransport::connect(
-            &self.rex_cli_path,
-            &self.rex_search_path,
-            self.rex_identity.endpoint.clone(),
-            self.rex_identity.instance_id.clone(),
-            session_id.to_owned(),
-            self.host_environment.clone(),
-        ) {
-            Ok(rex) => rex,
+        let session_exists = match self.rex.qualification_session_exists(session_id) {
+            Ok(exists) => exists,
             Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
         };
-        let block_exit_code = if self
-            .rex
-            .qualification_session_exists(session_id)
-            .map_err(|error| error.to_string())?
-        {
+        let rex = if session_exists {
+            match RexCliTransport::connect(
+                &self.rex_cli_path,
+                &self.rex_search_path,
+                self.rex_identity.endpoint.clone(),
+                self.rex_identity.instance_id.clone(),
+                session_id.to_owned(),
+                self.host_environment.clone(),
+            ) {
+                Ok(rex) => Some(rex),
+                Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+            }
+        } else {
+            None
+        };
+        let block_exit_code = if let Some(rex) = rex.as_ref() {
             if rex
                 .qualification_block_finished(&package.rex_receipt)
                 .map_err(|error| error.to_string())?
@@ -599,6 +603,8 @@ impl RuntimeServices {
                 crate::run_step::CleanupState::Confirmed
             ) {
                 if rex
+                    .as_ref()
+                    .unwrap_or(&self.rex)
                     .close_disposable_qualification_session(package.rex_receipt.clone())
                     .is_err()
                 {
@@ -721,6 +727,8 @@ impl RuntimeServices {
         };
         qualification.validate_for_unattended_launch()?;
         if rex
+            .as_ref()
+            .unwrap_or(&self.rex)
             .close_disposable_qualification_session(package.rex_receipt.clone())
             .is_err()
         {
