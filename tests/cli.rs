@@ -88,9 +88,15 @@ fn unsupported_invocation_is_reported_as_usage_error() {
 fn agent_marker_cannot_submit_human_claim_release() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
-    let output = command(&config, &state, &home)
-        .env("REX_PROJECTS_AGENT", "1")
-        .args([
+    let mutations: &[&[&str]] = &[
+        &["config", "apply", "--bootstrap"],
+        &["runtime", "run", "--once"],
+        &["runtime", "stop"],
+        &["project", "start", "goal_project"],
+        &["project", "pause", "goal_project"],
+        &["project", "resume", "goal_project"],
+        &["project", "stop", "goal_project"],
+        &[
             "ticket",
             "release-claim",
             "github:org/repo",
@@ -102,12 +108,23 @@ fn agent_marker_cannot_submit_human_claim_release() {
             "cancel and re-triage",
             "--disposition",
             "cancel",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("human ticket-claim controls"));
-    assert!(!state.join("state.sqlite3").exists());
+        ],
+    ];
+    for marker in ["REX_PROJECTS_AGENT", "REX_PROJECTS_CONTEXT"] {
+        for arguments in mutations {
+            let output = command(&config, &state, &home)
+                .env(marker, "1")
+                .args(arguments.iter().copied())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(77), "{marker}: {arguments:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("human host context"));
+            assert!(
+                !state.join("state.sqlite3").exists(),
+                "{marker}: {arguments:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -193,6 +193,12 @@ impl CliError {
             message: message.into(),
         }
     }
+    fn human_only(message: impl Into<String>) -> Self {
+        Self {
+            code: 77,
+            message: message.into(),
+        }
+    }
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
             code: 5,
@@ -202,6 +208,17 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         i32::from(self.code)
     }
+}
+
+fn require_human_context() -> Result<(), CliError> {
+    if std::env::var_os("REX_PROJECTS_AGENT").is_some()
+        || std::env::var_os("REX_PROJECTS_CONTEXT").is_some()
+    {
+        return Err(CliError::human_only(
+            "this mutation is available only from a human host context; Agent blocks must submit scoped mailbox requests",
+        ));
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for CliError {
@@ -365,6 +382,7 @@ fn apply_config(
     args: ApplyArgs,
     json: bool,
 ) -> Result<(), CliError> {
+    require_human_context()?;
     let (path, loaded) = load_config(config_path)?;
     let canonical_source = path
         .canonicalize()
@@ -585,13 +603,7 @@ fn ticket_command(
     command: TicketCommand,
     json: bool,
 ) -> Result<(), CliError> {
-    if std::env::var_os("REX_PROJECTS_AGENT").is_some()
-        || std::env::var_os("REX_PROJECTS_CONTEXT").is_some()
-    {
-        return Err(CliError::conflict(
-            "human ticket-claim controls cannot be invoked from a rex-projects Agent block",
-        ));
-    }
+    require_human_context()?;
     match command {
         TicketCommand::ReleaseClaim {
             namespace,
@@ -655,6 +667,7 @@ fn submit_project_lifecycle(
     request_id: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
+    require_human_context()?;
     let project_id =
         crate::domain::ids::ProjectId::parse(project.to_owned()).map_err(CliError::usage)?;
     let state_root = selected_state_root(config_path, explicit_state_root)?;
@@ -685,6 +698,7 @@ fn submit_control(
     command: ControlCommand,
     json: bool,
 ) -> Result<(), CliError> {
+    require_human_context()?;
     let status = ConfigStore::status(state_root).map_err(CliError::unavailable)?;
     let Some(generation) = status.owner_generation else {
         return Err(CliError::unavailable(
@@ -810,6 +824,7 @@ fn run_controller(
     explicit_state_root: Option<&Path>,
     once: bool,
 ) -> Result<(), CliError> {
+    require_human_context()?;
     let (config_path, loaded) = load_config(config_path)?;
     let canonical_source = config_path
         .canonicalize()
