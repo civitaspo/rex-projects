@@ -2,6 +2,8 @@
 //!
 //! The controller persists the intent and receipt around these calls. This module never owns a
 //! database transaction, retries an uncertain effect, or executes repository instruction text.
+//! Raw GitHub merge-request comments remain manual because this adapter cannot verify that the
+//! comment handler revalidates the approved revision and policy when it acts.
 
 use std::collections::BTreeMap;
 
@@ -11,9 +13,9 @@ use sha2::Digest as _;
 use crate::domain::ids::Digest;
 use crate::domain::types::MergeMethod;
 use crate::forge::{
-    BodyUpdateIntent, CommentIntent, DirectMergeIntent, EffectAcknowledgement, EffectCertainty,
-    Forge, ForgeError, ForgeObservation, MergeEffectIntent, Observed, PullRequestRef,
-    Reconciliation, canonical_digest,
+    BodyUpdateIntent, DirectMergeIntent, EffectAcknowledgement, EffectCertainty, Forge, ForgeError,
+    ForgeObservation, MergeEffectIntent, Observed, PullRequestRef, Reconciliation,
+    canonical_digest,
 };
 use crate::merge_policy::{
     MergeAssessment, MergeDisposition, MergeEvidenceSnapshot, MergePolicy, MergeProcedure,
@@ -80,12 +82,6 @@ impl ResolvedMergeAuthority {
             }
         }
         Ok(())
-    }
-
-    fn allows_request_comment(&self, exact: &str) -> bool {
-        self.request_comment_proofs
-            .iter()
-            .any(|proof| proof.exact_comment == exact)
     }
 }
 
@@ -285,31 +281,10 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                     .map_err(|error| MergeExecutionError::Forge(error.to_string()))?;
                 Ok(StepOutcome::Effect(ack))
             }
-            MergeProcedureOperation::RequestMerge { exact_comment } => {
-                if !authority.allows_request_comment(exact_comment)
-                    && !approval.is_some_and(|approval| {
-                        approval.exact_request_comment.as_deref() == Some(exact_comment)
-                    })
-                {
-                    return Err(MergeExecutionError::HumanApprovalRequired(
-                        "merge request comment is not an exact literal from trusted repository instructions".into(),
-                    ));
-                }
-                ensure_open_same_revisions(&observed, &approved.subject)?;
-                let effect = CommentIntent {
-                    pull: pull.clone(),
-                    operation_key: intent.operation_key.clone(),
-                    expected_head_sha: approved.subject.head_sha.clone(),
-                    expected_base_sha: approved.subject.base_sha.clone(),
-                    exact_body: exact_comment.clone(),
-                    authenticated_actor: intent.authenticated_actor.clone(),
-                    attempt_started_unix: intent.attempt_started_unix,
-                };
-                let ack = self
-                    .forge
-                    .post_comment(&effect)
-                    .map_err(|error| MergeExecutionError::Forge(error.to_string()))?;
-                Ok(StepOutcome::Effect(ack))
+            MergeProcedureOperation::RequestMerge { .. } => {
+                Err(MergeExecutionError::HumanApprovalRequired(
+                    "plain GitHub merge-request comments have no registered revision-guarded handler; no command was posted".into(),
+                ))
             }
             MergeProcedureOperation::ExecuteMerge {
                 expected_head_sha,
@@ -324,7 +299,10 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                 }
                 ensure_open_same_revisions(&observed, &approved.subject)?;
                 let protection = complete_observation(&observed.branch_protection)?;
-                if !protection.supports_execution_base_guard(&policy.required_checks) {
+                if !protection.supports_execution_base_guard(
+                    &policy.required_checks,
+                    policy.required_approving_reviews,
+                ) {
                     return Err(MergeExecutionError::Blocked(
                         "observed GitHub branch rules do not prove strict execution-time base protection".into(),
                     ));
@@ -762,6 +740,7 @@ mod tests {
             method: MergeMethod::Squash,
             executor: MergeExecutor::Request,
             required_checks: vec!["ci".into()],
+            required_approving_reviews: None,
             risk_weights: RiskWeights::default(),
         };
         assert!(matches!(

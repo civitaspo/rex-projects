@@ -1073,6 +1073,17 @@ fn parse_branch_protection(value: Value) -> Result<BranchProtection, ForgeError>
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
+    let review_policy = value
+        .get("required_pull_request_reviews")
+        .ok_or_else(|| ForgeError("required pull request review state is unknown".into()))?;
+    let (required_approving_review_count, dismiss_stale_reviews) = if review_policy.is_null() {
+        (None, None)
+    } else {
+        (
+            Some(number(review_policy, "required_approving_review_count")?),
+            Some(boolean(review_policy, "dismiss_stale_reviews")?),
+        )
+    };
     let enforce_admins = value
         .get("enforce_admins")
         .and_then(|v| v.get("enabled"))
@@ -1086,6 +1097,14 @@ fn parse_branch_protection(value: Value) -> Result<BranchProtection, ForgeError>
         "required_check_contexts".to_owned(),
         serde_json::to_value(&contexts).expect("strings serialize"),
     );
+    normalized.insert(
+        "required_approving_review_count".to_owned(),
+        serde_json::to_value(required_approving_review_count).expect("option serializes"),
+    );
+    normalized.insert(
+        "dismiss_stale_reviews".to_owned(),
+        serde_json::to_value(dismiss_stale_reviews).expect("option serializes"),
+    );
     normalized.insert("enforce_admins".to_owned(), Value::Bool(enforce_admins));
     normalized.insert(
         "allow_force_pushes".to_owned(),
@@ -1096,6 +1115,8 @@ fn parse_branch_protection(value: Value) -> Result<BranchProtection, ForgeError>
     Ok(BranchProtection {
         strict_required_status_checks: strict,
         required_check_contexts: contexts,
+        required_approving_review_count,
+        dismiss_stale_reviews,
         enforce_admins,
         allow_force_pushes,
         allow_deletions,
@@ -1407,6 +1428,39 @@ mod tests {
     fn missing_protection_fields_are_unknown_not_disabled() {
         let error = parse_branch_protection(serde_json::json!({"required_status_checks": null}));
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn configured_review_requirement_must_be_server_enforced_for_direct_merge() {
+        let protection = parse_branch_protection(serde_json::json!({
+            "required_status_checks": {"strict":true,"contexts":["ci"]},
+            "required_pull_request_reviews": {"required_approving_review_count":1,"dismiss_stale_reviews":true},
+            "enforce_admins": {"enabled":true},
+            "allow_force_pushes": {"enabled":false},
+            "allow_deletions": {"enabled":false}
+        })).unwrap();
+        assert!(protection.supports_execution_base_guard(&["ci".into()], None));
+        assert!(protection.supports_execution_base_guard(&["ci".into()], Some(1)));
+        assert!(!protection.supports_execution_base_guard(&["ci".into()], Some(2)));
+        let without_review_guard = parse_branch_protection(serde_json::json!({
+            "required_status_checks": {"strict":true,"contexts":["ci"]},
+            "required_pull_request_reviews": {"required_approving_review_count":0,"dismiss_stale_reviews":false},
+            "enforce_admins": {"enabled":true},
+            "allow_force_pushes": {"enabled":false},
+            "allow_deletions": {"enabled":false}
+        })).unwrap();
+        assert!(without_review_guard.supports_execution_base_guard(&["ci".into()], None));
+        assert!(!without_review_guard.supports_execution_base_guard(&["ci".into()], Some(1)));
+        let no_review_policy = parse_branch_protection(serde_json::json!({
+            "required_status_checks": {"strict":true,"contexts":["ci"]},
+            "required_pull_request_reviews": null,
+            "enforce_admins": {"enabled":true},
+            "allow_force_pushes": {"enabled":false},
+            "allow_deletions": {"enabled":false}
+        }))
+        .unwrap();
+        assert!(no_review_policy.supports_execution_base_guard(&["ci".into()], None));
+        assert!(!no_review_policy.supports_execution_base_guard(&["ci".into()], Some(1)));
     }
 
     #[test]
