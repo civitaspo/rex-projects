@@ -679,18 +679,25 @@ impl ProfileTrialAuthorization {
             }
         }
         for profile in [&self.baseline, &self.candidate] {
-            if profile.profile_config_json.len() > MAX_FROZEN_INPUT_BYTES
-                || profile
-                    .instruction_files
-                    .values()
-                    .map(Vec::len)
-                    .sum::<usize>()
-                    > MAX_TRIAL_INSTRUCTION_BYTES
+            if profile.profile_config_json.len() > MAX_FROZEN_INPUT_BYTES {
+                return Err(
+                    "frozen profile exceeds size or path limits or has mismatched digests".into(),
+                );
+            }
+            let typed_profile: crate::config::Profile =
+                crate::protocol::parse_unique(profile.profile_config_json.as_bytes())?;
+            if profile
+                .instruction_files
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+                > MAX_TRIAL_INSTRUCTION_BYTES
                 || profile
                     .instruction_files
                     .keys()
                     .any(|path| !valid_relative_path(path))
-                || content_digest(profile.profile_config_json.as_bytes())? != profile.profile_digest
+                || crate::store::canonical_json(&typed_profile)? != profile.profile_config_json
+                || crate::store::agent_profile_digest(&typed_profile)? != profile.profile_digest
                 || digest_serialized(&profile.instruction_files)? != profile.instruction_digest
             {
                 return Err(
@@ -1277,10 +1284,11 @@ mod tests {
             });
             files.insert(path.to_owned(), contents.as_bytes().to_vec());
         }
-        let profile_config_json = serde_json::to_string(&config).unwrap();
+        let profile: crate::config::Profile = serde_json::from_value(config).unwrap();
+        let profile_config_json = crate::store::canonical_json(&profile).unwrap();
         TrialProfileSnapshot {
             profile_id: ProfileId::parse("worker").unwrap(),
-            profile_digest: super::content_digest(profile_config_json.as_bytes()).unwrap(),
+            profile_digest: crate::store::agent_profile_digest(&profile).unwrap(),
             instruction_digest: digest_serialized(&files).unwrap(),
             profile_config_json,
             instruction_files: files,
@@ -1503,9 +1511,11 @@ mod tests {
         let mut candidate: serde_json::Value =
             serde_json::from_str(&authorization.candidate.profile_config_json).unwrap();
         candidate["command"] = serde_json::json!(["different-agent"]);
-        authorization.candidate.profile_config_json = serde_json::to_string(&candidate).unwrap();
+        let profile: crate::config::Profile = serde_json::from_value(candidate).unwrap();
+        authorization.candidate.profile_config_json =
+            crate::store::canonical_json(&profile).unwrap();
         authorization.candidate.profile_digest =
-            super::content_digest(authorization.candidate.profile_config_json.as_bytes()).unwrap();
+            crate::store::agent_profile_digest(&profile).unwrap();
         assert!(authorization.validate().is_err());
     }
 

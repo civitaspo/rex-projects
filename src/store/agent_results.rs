@@ -1985,7 +1985,7 @@ pub(crate) mod tests {
             "commit_mode":"native", "turn_timeout_seconds":60
         }))
         .unwrap();
-        let profile_digest = digest(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
         let schema_projection = crate::providers::project_result_schema(&result_schema)
             .unwrap()
             .identity;
@@ -2981,8 +2981,7 @@ pub(crate) mod host_validation_fixture {
             "adapter":"codex", "command":["/bin/codex"], "model":"fixture", "commit_mode":"native", "turn_timeout_seconds":60
         })).map_err(|error| error.to_string())?;
         authority.profile_id = ProfileId::parse("fixture-profile")?;
-        authority.profile_digest =
-            digest(&serde_json::to_vec(&profile).map_err(|error| error.to_string())?)?;
+        authority.profile_digest = crate::store::agent_profile_digest(&profile)?;
         let schema_name = match role {
             Role::Worker => "worker-v1.json",
             Role::Reviewer => "reviewer-v1.json",

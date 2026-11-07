@@ -1041,11 +1041,8 @@ fn provider_command(
             let profile = snapshot.config.profiles.get(profile_id).ok_or_else(|| {
                 CliError::conflict("effective role profile is missing from applied config")
             })?;
-            let profile_json = serde_json::to_vec(profile)
-                .map_err(|error| CliError::unexpected(error.to_string()))?;
-            use sha2::{Digest as _, Sha256};
-            let profile_digest = Digest::parse(format!("{:x}", Sha256::digest(profile_json)))
-                .map_err(CliError::unexpected)?;
+            let profile_digest =
+                crate::store::agent_profile_digest(profile).map_err(CliError::unexpected)?;
             if project_config.roles.is_empty() && project_config.role_defaults_from.is_none() {
                 return Err(CliError::conflict(
                     "Project has no configured role profiles",

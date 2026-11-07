@@ -167,12 +167,7 @@ impl RunStepPackage {
         {
             return Err("run-step package identity or timeout is invalid".into());
         }
-        let profile_digest = Digest::parse(format!(
-            "{:x}",
-            sha2::Sha256::digest(
-                serde_json::to_vec(&self.profile).map_err(|error| error.to_string())?
-            )
-        ))?;
+        let profile_digest = crate::store::agent_profile_digest(&self.profile)?;
         if profile_digest != self.descriptor.profile_digest {
             return Err("run-step profile does not match the descriptor digest".into());
         }
@@ -207,11 +202,7 @@ mod tests {
             "commit_mode":"native", "turn_timeout_seconds":60
         }))
         .unwrap();
-        let profile_digest = Digest::parse(format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&profile).unwrap())
-        ))
-        .unwrap();
+        let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
         RunStepPackage {
             schema_version: 1,
             descriptor: RunDescriptor {
@@ -271,6 +262,14 @@ mod tests {
             shutdown_grace_seconds: 5,
             start_ack_timeout_seconds: 30,
         }
+    }
+
+    #[test]
+    fn package_rejects_a_profile_changed_after_descriptor_binding() {
+        let mut package = package();
+        package.profile.model = Some("changed".into());
+
+        assert!(package.validate().is_err());
     }
 
     #[test]

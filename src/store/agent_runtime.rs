@@ -797,10 +797,7 @@ impl ConfigStore {
                 "launch profile does not match the Project's effective role profile".into(),
             );
         }
-        let profile_digest = Digest::parse(format!(
-            "{:x}",
-            Sha256::digest(crate::store::canonical_json(profile)?.as_bytes())
-        ))?;
+        let profile_digest = crate::store::agent_profile_digest(profile)?;
         if profile_digest != reservation.profile_digest {
             return Err("launch profile digest does not match the applied profile".into());
         }
@@ -1085,7 +1082,6 @@ fn load_exact_wake_inputs(
 
 #[cfg(test)]
 mod tests {
-    use sha2::Digest as _;
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
@@ -1262,19 +1258,12 @@ mod tests {
             schema_version: 1,
             project_id: ProjectId::parse("project-a").unwrap(),
             profile_id: ProfileId::parse("supervisor").unwrap(),
-            profile_digest: Digest::parse(format!(
-                "{:x}",
-                sha2::Sha256::digest(
-                    crate::store::canonical_json(
-                        applied()
-                            .profiles
-                            .get(&ProfileId::parse("supervisor").unwrap())
-                            .unwrap()
-                    )
-                    .unwrap()
-                    .as_bytes()
-                )
-            ))
+            profile_digest: crate::store::agent_profile_digest(
+                applied()
+                    .profiles
+                    .get(&ProfileId::parse("supervisor").unwrap())
+                    .unwrap(),
+            )
             .unwrap(),
             adapter: AgentAdapter::Codex,
             executable_path: "/usr/bin/codex".into(),
@@ -1415,23 +1404,16 @@ mod tests {
         };
         wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
         let profile_id = ProfileId::parse("supervisor").unwrap();
-        let profile_digest = Digest::parse(format!(
-            "{:x}",
-            sha2::Sha256::digest(
-                crate::store::canonical_json(
-                    store
-                        .load_snapshot("factory")
-                        .unwrap()
-                        .unwrap()
-                        .config
-                        .profiles
-                        .get(&profile_id)
-                        .unwrap()
-                )
+        let profile_digest = crate::store::agent_profile_digest(
+            store
+                .load_snapshot("factory")
                 .unwrap()
-                .as_bytes()
-            )
-        ))
+                .unwrap()
+                .config
+                .profiles
+                .get(&profile_id)
+                .unwrap(),
+        )
         .unwrap();
         let reservation = AgentLaunchReservation {
             schema_version: LAUNCH_SCHEMA_VERSION,

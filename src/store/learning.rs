@@ -2983,17 +2983,15 @@ mod tests {
             } else {
                 BTreeMap::new()
             };
-            let profile_config_json = serde_json::to_string(&config).unwrap();
+            let profile: crate::config::Profile = serde_json::from_value(config).unwrap();
+            let profile_config_json = crate::store::canonical_json(&profile).unwrap();
             TrialProfileSnapshot {
                 profile_id: if learned {
                     profile_id.clone()
                 } else {
                     ProfileId::parse("worker").unwrap()
                 },
-                profile_digest: Digest::parse(
-                    format!("{:x}", Sha256::digest(profile_config_json.as_bytes())).as_str(),
-                )
-                .unwrap(),
+                profile_digest: crate::store::agent_profile_digest(&profile).unwrap(),
                 instruction_digest: digest_serialized(&snapshot_files),
                 profile_config_json,
                 instruction_files: snapshot_files,

@@ -4897,8 +4897,7 @@ mod tests {
     use super::{
         AgentLaunchAuthority, ConfigStore, DurableInput, EffectIntent, EffectOutcome,
         ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, agent_profile_digest,
-        canonical_json,
-        content_digest, durable_input_digest, persisted_start_ack,
+        canonical_json, content_digest, durable_input_digest, persisted_start_ack,
     };
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
@@ -4920,13 +4919,20 @@ mod tests {
         .unwrap();
 
         let canonical = canonical_json(&profile).unwrap();
-        let expected = Digest::parse(format!("{:x}", Sha256::digest(canonical.as_bytes())))
-            .unwrap();
+        let expected =
+            Digest::parse(format!("{:x}", Sha256::digest(canonical.as_bytes()))).unwrap();
         let raw = serde_json::to_vec(&profile).unwrap();
 
         assert_eq!(agent_profile_digest(&profile).unwrap(), expected);
         let raw_digest = Digest::parse(format!("{:x}", Sha256::digest(raw))).unwrap();
         assert_ne!(agent_profile_digest(&profile).unwrap(), raw_digest);
+
+        let mut changed_profile = profile.clone();
+        changed_profile.model = Some("changed".into());
+        assert_ne!(
+            agent_profile_digest(&profile).unwrap(),
+            agent_profile_digest(&changed_profile).unwrap()
+        );
     }
 
     #[test]

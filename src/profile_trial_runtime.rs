@@ -468,12 +468,10 @@ impl ProfileTrialStartEffectHandler {
         let snapshot = &capsule.profile;
         let profile: Profile =
             crate::protocol::parse_unique(snapshot.profile_config_json.as_bytes())?;
-        if serde_json::to_string(&profile).map_err(|e| e.to_string())?
-            != snapshot.profile_config_json
-        {
+        if crate::store::canonical_json(&profile)? != snapshot.profile_config_json {
             return Err("frozen trial profile config is not canonical".into());
         }
-        let profile_digest = digest_bytes(snapshot.profile_config_json.as_bytes())?;
+        let profile_digest = crate::store::agent_profile_digest(&profile)?;
         if profile_digest != snapshot.profile_digest {
             return Err("frozen trial profile digest changed".into());
         }

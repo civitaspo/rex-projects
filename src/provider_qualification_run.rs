@@ -420,7 +420,7 @@ mod marker_probe_tests {
             learned_guidance: None,
             options: None,
         };
-        let profile_digest = digest(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
         let deadline_seconds =
             crate::run_step::qualification_deadline_seconds(profile.turn_timeout_seconds, 30)
                 .unwrap();
@@ -812,8 +812,7 @@ pub(crate) fn validate_package(
     {
         return Err("qualification package identity or bounds are invalid".into());
     }
-    let profile_digest =
-        digest(&serde_json::to_vec(&package.profile).map_err(|error| error.to_string())?)?;
+    let profile_digest = crate::store::agent_profile_digest(&package.profile)?;
     if profile_digest != package.profile_digest {
         return Err("qualification package profile digest mismatch".into());
     }

@@ -395,7 +395,7 @@ impl RuntimeServices {
             .profiles
             .get(&job.request.profile_id)
             .ok_or("provider qualification profile is absent from applied configuration")?;
-        if digest_serialized(profile)? != job.request.profile_digest
+        if crate::store::agent_profile_digest(profile)? != job.request.profile_digest
             || self.applied_config.digest != job.request.config_digest
         {
             return Err("provider qualification profile or config changed after request".into());
@@ -844,7 +844,7 @@ impl RuntimeServices {
                 );
             }
         };
-        if digest_serialized(profile)? != job.request.profile_digest
+        if crate::store::agent_profile_digest(profile)? != job.request.profile_digest
             || identity.executable_digest
                 != package.descriptor.provider_capability.executable_digest
         {
@@ -1413,7 +1413,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             .profiles
             .get(&reservation.profile_id)
             .ok_or("Agent profile is missing from the applied configuration")?;
-        let profile_digest = digest_serialized(profile)?;
+        let profile_digest = crate::store::agent_profile_digest(profile)?;
         if profile_digest != reservation.profile_digest {
             return Err("Agent profile changed after launch reservation".into());
         }
@@ -2246,7 +2246,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             .profiles
             .get(profile_id)
             .ok_or("Supervisor profile is absent from the applied configuration")?;
-        let profile_digest = digest_serialized(&profile)?;
+        let profile_digest = crate::store::agent_profile_digest(&profile)?;
         let runtime_identity = crate::run_step::profile_runtime_identity(profile)
             .map_err(|error| error.to_string())?;
         let qualifications = store.verified_provider_qualifications(
@@ -2625,7 +2625,7 @@ impl RuntimeServices {
             .get(&profile_id)
             .ok_or("ticket role profile is absent from applied configuration")?
             .clone();
-        let profile_digest = digest_serialized(&profile)?;
+        let profile_digest = crate::store::agent_profile_digest(&profile)?;
         let runtime_identity = crate::run_step::profile_runtime_identity(&profile)
             .map_err(|error| error.to_string())?;
         let qualification = self.verified_qualification(

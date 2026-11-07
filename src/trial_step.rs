@@ -482,8 +482,7 @@ impl TrialRunStepPackage {
         {
             return Err("trial run-step package is incomplete or not bound to its capsule".into());
         }
-        let profile_json = serde_json::to_vec(&self.profile).map_err(|e| e.to_string())?;
-        let profile_digest = Digest::parse(format!("{:x}", Sha256::digest(profile_json)))?;
+        let profile_digest = crate::store::agent_profile_digest(&self.profile)?;
         if profile_digest != self.capsule.profile.profile_digest {
             return Err("trial run-step profile does not match the frozen capsule".into());
         }
