@@ -70,6 +70,23 @@ impl ArtifactStore {
         Ok(Self { root })
     }
 
+    pub(crate) fn owns_object_path(
+        &self,
+        reference: &RoleArtifactReference,
+        path: &Path,
+    ) -> Result<bool, String> {
+        validate_relative_path(&reference.path)?;
+        let expected = self.root.join(&reference.path);
+        if expected != path || !expected.starts_with(&self.root) {
+            return Ok(false);
+        }
+        ensure_real_directory_chain(
+            &self.root,
+            expected.parent().ok_or("artifact object has no parent")?,
+        )?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
@@ -140,6 +157,33 @@ impl ArtifactStore {
             reference,
         })
     }
+}
+
+pub(crate) fn validate_relative_path(path: &str) -> Result<(), String> {
+    crate::agent_api::validate_relative_path(path)
+}
+
+fn ensure_real_directory_chain(root: &Path, target: &Path) -> Result<(), String> {
+    let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    if !target.starts_with(&root) {
+        return Err("Artifact object directory escaped the immutable store".into());
+    }
+    let mut current = root.as_path().to_path_buf();
+    for component in target
+        .strip_prefix(&root)
+        .map_err(|error| error.to_string())?
+        .components()
+    {
+        if !matches!(component, Component::Normal(_)) {
+            return Err("Artifact object path is not normalized".into());
+        }
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("Artifact object path contains a non-directory component".into());
+        }
+    }
+    Ok(())
 }
 
 fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, String> {
