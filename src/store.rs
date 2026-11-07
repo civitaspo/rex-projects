@@ -5120,6 +5120,23 @@ mod tests {
         let mut mismatched_role_authority = mismatched_session_authority.clone();
         mismatched_role_authority.role_session_id = "role-session".into();
         mismatched_role_authority.role = crate::domain::types::Role::Coordinator;
+        let ticket_namespace = TicketNamespace::parse("fixture:workspace").unwrap();
+        let ticket_id = TicketId::parse("ticket-block-binding").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-block-binding").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &ticket_namespace,
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "queued",
+                "ready",
+            )
+            .unwrap();
+        mismatched_role_authority.ticket_run_id = Some(ticket_run_id);
+        mismatched_role_authority.ticket_revision = Some(Revision(0));
         let role_error = store
             .register_agent_launch_authority(generation, &mismatched_role_authority)
             .unwrap_err();

@@ -1482,17 +1482,6 @@ mod tests {
             request_digest: hash(&status_json),
             expected_revision: Some(1),
         };
-        let start_intent = EffectIntent {
-            project_id: project.clone(),
-            subject_type: "ticket_run".into(),
-            subject_id: run.as_str().into(),
-            operation_id: "op-start-coordinator".into(),
-            logical_key: "start-coordinator".into(),
-            kind: "start_coordinator".into(),
-            request_json: "{}".into(),
-            request_digest: hash("{}"),
-            expected_revision: Some(1),
-        };
         let transition_payload = "{\"kind\":\"dispatch\"}";
         store
             .commit_ticket_transition(
@@ -1509,7 +1498,7 @@ mod tests {
                 Input::Dispatch,
                 "dispatch",
                 "{}",
-                &[status_intent.clone(), start_intent],
+                &[status_intent.clone()],
             )
             .unwrap();
         let adapter = Arc::new(FakeAdapter::new(
@@ -1645,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_effect_waits_for_operation_and_postmortem_receipts() {
+    fn knowledge_published_transition_requires_a_durable_knowledge_receipt() {
         let (_temp, mut store, project, owner) = test_store();
         let namespace = TicketNamespace::parse("fixture:workspace").unwrap();
         let ticket = TicketId::parse("ticket-completion").unwrap();
@@ -1676,7 +1665,7 @@ mod tests {
             expected_revision: Some(1),
         };
         let transition_payload = "{\"kind\":\"knowledge_published\"}";
-        store
+        let error = store
             .commit_ticket_transition(
                 owner,
                 &run,
@@ -1693,33 +1682,9 @@ mod tests {
                 "{}",
                 &[effect],
             )
-            .unwrap();
-        let mut context = EffectContext {
-            store: &mut store,
-            owner_generation: owner,
-            now_unix: 4,
-        };
-        let request = effect_request(
-            &project,
-            "ticket_run",
-            run.as_str(),
-            "op-complete-ticket",
-            "complete_ticket",
-            payload,
-        );
-        let error = CompleteTicketHandler
-            .handle(EffectMode::Submit, &request, &mut context)
-            .unwrap_err();
-        assert!(
-            error.contains("no such table: operation_plans")
-                || error.contains("completion receipts are not yet available")
-        );
-        assert!(
-            context
-                .store
-                .ticket_run_status_target(owner, &project, &run, 1)
-                .is_ok()
-        );
+            .err()
+            .expect("transition must require a durable knowledge publication");
+        assert!(error.contains("ticket cannot become Done before durable knowledge publication"));
     }
     #[test]
     fn knowledge_publication_then_completion_effect_publishes_external_done() {

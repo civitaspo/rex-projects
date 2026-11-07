@@ -203,10 +203,10 @@ pub(crate) fn test_qualification_fixture() -> RexQualificationFixture {
     RexQualificationFixture {
         endpoint: "unix:///tmp/rex-test.sock".into(),
         instance_id: "rex-test-instance".into(),
-        session_id: "rex-test-session".into(),
+        session_id: "session-a".into(),
         window_id: "rex-test-window".into(),
-        block_id: "rex-test-block".into(),
-        operation_id: "rex-test-operation".into(),
+        block_id: "block-a".into(),
+        operation_id: "run-a".into(),
     }
 }
 

@@ -2460,7 +2460,7 @@ mod tests {
         let root = tempdir().unwrap();
         let executable = fake_claude(
             root.path(),
-            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"ok":true}}"#,
+            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#,
         );
         let executable = executable.to_str().unwrap();
         let mut turn = request(root.path(), AgentAdapter::ClaudeCode, executable);
@@ -2501,7 +2501,7 @@ mod tests {
         let root = tempdir().unwrap();
         let executable = fake_claude(
             root.path(),
-            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"ok":true}}"#,
+            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#,
         );
         let mut turn = request(
             root.path(),
@@ -2514,7 +2514,6 @@ mod tests {
             fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         }
         turn.descriptor.provider_capability.status = ProviderQualificationStatus::Unknown;
-        turn.descriptor.rex_session_id = "rex-projects-doctor-qualification-test".into();
         turn.descriptor.rex_block_id = RexBlockId::parse("block-a").unwrap();
 
         assert!(run_turn(&turn, &mut SystemProcessObserver).is_err());
@@ -2530,7 +2529,11 @@ mod tests {
         };
         let permit = issue_qualification_permit(&turn, context).unwrap();
         let result = run_qualification_turn(&turn, permit, &mut SystemProcessObserver).unwrap();
-        assert!(matches!(result.receipt.outcome, TurnOutcome::Completed));
+        assert!(
+            matches!(result.receipt.outcome, TurnOutcome::Completed),
+            "qualification receipt: {}",
+            serde_json::to_string(&result.receipt).unwrap()
+        );
         assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
         assert_eq!(result.structured_result, Some(json!({"ok":true})));
         assert!(result.receipt.provider_version.is_none());
@@ -2567,7 +2570,7 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let executable = fake_claude(
             root.path(),
-            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"ok":true}}"#,
+            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#,
         );
         let mut turn = request(
             root.path(),
@@ -2575,7 +2578,6 @@ mod tests {
             executable.to_str().unwrap(),
         );
         turn.descriptor.provider_capability.status = ProviderQualificationStatus::Unknown;
-        turn.descriptor.rex_session_id = "rex-projects-doctor-qualification-test".into();
         turn.descriptor.rex_block_id = RexBlockId::parse("block-a").unwrap();
         let original_control_dir = turn.descriptor.control_dir.clone();
         let nested_control_dir = turn.descriptor.workspace.join("nested-control");
@@ -2651,7 +2653,7 @@ mod tests {
         let executable = root.path().join("long-running fake claude");
         fs::write(
             &executable,
-            "#!/bin/sh\nsleep 30\nprintf '%s' '{\"type\":\"result\",\"session_id\":\"session-a\",\"is_error\":false,\"structured_output\":{\"ok\":true}}'\n",
+            "#!/bin/sh\nsleep 30\nprintf '%s' '{\"type\":\"result\",\"session_id\":\"session-a\",\"is_error\":false,\"structured_output\":{\"result\":\"{\\\"ok\\\":true}\"}}'\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2661,7 +2663,6 @@ mod tests {
             executable.to_str().unwrap(),
         );
         turn.descriptor.provider_capability.status = ProviderQualificationStatus::Unknown;
-        turn.descriptor.rex_session_id = "rex-projects-doctor-qualification-test".into();
         turn.descriptor.rex_block_id = RexBlockId::parse("block-a").unwrap();
         turn.profile.turn_timeout_seconds = 1;
         turn.shutdown_grace = Duration::from_millis(1);
@@ -2711,7 +2712,7 @@ mod tests {
         let root = tempdir().unwrap();
         let executable = fake_claude(
             root.path(),
-            r#"{"type":"result","session_id":"session-new","is_error":false,"structured_output":{"ok":true}}"#,
+            r#"{"type":"result","session_id":"session-new","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#,
         );
         let executable = executable.to_str().unwrap();
         let mut turn = request(root.path(), AgentAdapter::ClaudeCode, executable);
@@ -2746,7 +2747,7 @@ mod tests {
         let root = tempdir().unwrap();
         let executable = fake_claude(
             root.path(),
-            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"ok":true}}"#,
+            r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#,
         );
         let make_turn = || {
             request(
@@ -2825,7 +2826,7 @@ mod tests {
             format!(
                 "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nprintf '%s' '{}'\n",
                 kill_marker.display(),
-                r#"{"type":"result","session_id":"cancelled","is_error":false,"structured_output":{"ok":true}}"#
+                r#"{"type":"result","session_id":"cancelled","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#
             ),
         )
         .unwrap();

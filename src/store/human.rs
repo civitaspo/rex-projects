@@ -1753,7 +1753,17 @@ mod tests {
             intent: EffectIntent {
                 project_id: request.subject.project_id.clone(),
                 subject_type: "ticket_run".into(),
-                subject_id: request.subject.subject_id.clone(),
+                subject_id: if request.purpose == HumanPurpose::OperationApproval {
+                    request
+                        .subject
+                        .ticket_run_id
+                        .as_ref()
+                        .expect("operation approval fixture binds a TicketRun")
+                        .as_str()
+                        .to_owned()
+                } else {
+                    request.subject.subject_id.clone()
+                },
                 operation_id: "human-effect-1".into(),
                 logical_key: "ticket-run-1:1:request_human_review".into(),
                 kind: "request_human_review".into(),
