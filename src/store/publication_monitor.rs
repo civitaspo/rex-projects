@@ -16,6 +16,7 @@ pub fn migrate_v12_publication_baselines(tx: &Transaction<'_>) -> Result<(), Str
             repository_id TEXT NOT NULL,
             branch TEXT NOT NULL,
             base_branch TEXT NOT NULL,
+            configuration_digest TEXT NOT NULL,
             initial_snapshot_json TEXT NOT NULL,
             initial_digest TEXT NOT NULL,
             current_snapshot_json TEXT NOT NULL,

@@ -32,6 +32,7 @@ pub mod host_jobs;
 pub mod human;
 #[path = "store/learning.rs"]
 mod learning_store;
+pub mod merge_work;
 pub use learning_store::{
     CandidateRegistration, KnowledgePublicationIntent, KnowledgePublicationReceipt,
     LearningCandidatePackage, LearningCandidateRecord, ProfilePromotionIntent,

@@ -86,6 +86,30 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
     let tx = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
+    migrate_v12_artifact_tables(&tx)?;
+    crate::store::agent_results::migrate_v12_tables(&tx)?;
+    crate::store::accepted_plans::migrate_v12_worker_plan_tables(&tx)?;
+    crate::store::agent_recovery::migrate_v12_recovery_tables(&tx)?;
+    crate::store::rex_view_tables::migrate_v12_view_tables(&tx)?;
+    crate::store::provider_qualification::migrate_v12_provider_qualification_jobs(&tx)?;
+    crate::store::host_jobs::migrate_v12_host_jobs_tables(&tx)?;
+    crate::store::human::migrate_v12_human_tables(&tx)?;
+    crate::store::learning_store::migrate_v12_learning_tables(&tx)?;
+    crate::store::publication_monitor::migrate_v12_publication_baselines(&tx)?;
+    crate::store::merge_work::migrate_v12_merge_work_items(&tx)?;
+    let now = crate::store::now_unix()?;
+    tx.execute(
+        "INSERT INTO schema_migrations(version,applied_at_unix) VALUES (12,?1)",
+        [now],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.pragma_update(None, "user_version", 12)
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    validate_v12_schema(connection)
+}
+
+fn migrate_v12_artifact_tables(tx: &Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "CREATE TABLE registered_artifacts (
             artifact_id TEXT PRIMARY KEY CHECK(length(artifact_id)=64),
@@ -130,7 +154,155 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
             BEGIN SELECT RAISE(ABORT, 'registered artifacts are immutable'); END;
         CREATE TRIGGER registered_artifacts_immutable_delete BEFORE DELETE ON registered_artifacts
             BEGIN SELECT RAISE(ABORT, 'registered artifacts are retained'); END;"
-    ).map_err(|error| error.to_string())?;
+    ).map_err(|error| error.to_string())
+}
+
+const V12_TABLES: &[&str] = &[
+    "registered_artifacts",
+    "registered_artifact_messages",
+    "agent_result_wakes",
+    "agent_terminal_receipts",
+    "agent_result_reducer_ack",
+    "accepted_work_plans",
+    "agent_run_adoptions",
+    "agent_run_recovery_observations",
+    "agent_stop_owned_runs_intents",
+    "rex_block_archives",
+    "provider_qualification_jobs",
+    "host_effect_jobs",
+    "human_request_authority",
+    "profile_trial_authorizations",
+    "profile_trial_launches",
+    "profile_trial_run_receipts",
+    "profile_trial_pairs",
+    "publication_baselines",
+    "merge_work_items",
+];
+
+#[derive(Debug, Eq, PartialEq)]
+struct ColumnLayout {
+    name: String,
+    data_type: String,
+    not_null: i64,
+    default_value: Option<String>,
+    primary_key_position: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ForeignKeyLayout {
+    id: i64,
+    sequence: i64,
+    table: String,
+    from: String,
+    to: Option<String>,
+    on_update: String,
+    on_delete: String,
+    match_kind: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct IndexColumnLayout {
+    sequence: i64,
+    column_id: i64,
+    name: Option<String>,
+    descending: i64,
+    collation: String,
+    is_key: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct IndexLayout {
+    name: String,
+    unique: i64,
+    origin: String,
+    partial: i64,
+    columns: Vec<IndexColumnLayout>,
+    sql: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TriggerLayout {
+    name: String,
+    sql: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TableLayout {
+    sql: String,
+    columns: Vec<ColumnLayout>,
+    foreign_keys: Vec<ForeignKeyLayout>,
+    indexes: Vec<IndexLayout>,
+    triggers: Vec<TriggerLayout>,
+}
+
+pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version != 12 {
+        return Err(format!(
+            "artifact registry schema version mismatch: {version}"
+        ));
+    }
+    let migration_recorded: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=12)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !migration_recorded {
+        return Err("schema 12 migration record is missing".into());
+    }
+    let canonical = canonical_v12_schema()?;
+    for table in V12_TABLES {
+        let actual = read_table_layout(connection, table)?;
+        let expected = read_table_layout(&canonical, table)?;
+        if actual != expected {
+            return Err(format!(
+                "schema 12 table {table} has an incompatible v12 layout"
+            ));
+        }
+    }
+    for (table, column) in [("rex_views", "terminal_at_unix")] {
+        let actual = read_column_layout(connection, table, column)?;
+        let expected = read_column_layout(&canonical, table, column)?;
+        if actual != expected {
+            return Err(format!(
+                "schema 12 column {table}.{column} has an incompatible layout"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the expected v12 layout by replaying the same migration helpers into an isolated
+/// in-memory database. This keeps startup validation tied to the DDL that creates the schema.
+fn canonical_v12_schema() -> Result<Connection, String> {
+    let mut canonical = Connection::open_in_memory().map_err(|error| error.to_string())?;
+    canonical
+        .execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
+             CREATE TABLE projects(project_id TEXT PRIMARY KEY);
+             CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY,project_id TEXT);
+             CREATE TABLE agent_launch_authority(agent_run_id TEXT PRIMARY KEY);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
+             CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
+             CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
+             CREATE TABLE controller_owners(singleton INTEGER PRIMARY KEY);
+             CREATE TABLE agent_result_evidence(evidence_id TEXT PRIMARY KEY);
+             CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY);
+             CREATE TABLE agent_result_wakes(
+                 evidence_id TEXT PRIMARY KEY,
+                 recipient_type TEXT NOT NULL,
+                 recipient_id TEXT NOT NULL,
+                 wake_input_id INTEGER,
+                 queued_at_unix INTEGER NOT NULL
+             );",
+        )
+        .map_err(|error| error.to_string())?;
+    let tx = canonical.transaction().map_err(|error| error.to_string())?;
+    migrate_v12_artifact_tables(&tx)?;
     crate::store::agent_results::migrate_v12_tables(&tx)?;
     crate::store::accepted_plans::migrate_v12_worker_plan_tables(&tx)?;
     crate::store::agent_recovery::migrate_v12_recovery_tables(&tx)?;
@@ -140,73 +312,147 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
     crate::store::human::migrate_v12_human_tables(&tx)?;
     crate::store::learning_store::migrate_v12_learning_tables(&tx)?;
     crate::store::publication_monitor::migrate_v12_publication_baselines(&tx)?;
-    let now = crate::store::now_unix()?;
-    tx.execute(
-        "INSERT INTO schema_migrations(version,applied_at_unix) VALUES (12,?1)",
-        [now],
-    )
-    .map_err(|error| error.to_string())?;
-    tx.pragma_update(None, "user_version", 12)
-        .map_err(|error| error.to_string())?;
+    crate::store::merge_work::migrate_v12_merge_work_items(&tx)?;
     tx.commit().map_err(|error| error.to_string())?;
-    validate_v12_schema(connection)
+    Ok(canonical)
 }
 
-pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String> {
-    for table in [
-        "registered_artifacts",
-        "registered_artifact_messages",
-        "agent_terminal_receipts",
-        "agent_result_reducer_ack",
-        "accepted_work_plans",
-        "agent_run_adoptions",
-        "agent_run_recovery_observations",
-        "agent_stop_owned_runs_intents",
-        "rex_block_archives",
-        "provider_qualification_jobs",
-        "host_effect_jobs",
-        "human_request_authority",
-        "profile_trial_authorizations",
-        "profile_trial_launches",
-        "profile_trial_run_receipts",
-        "profile_trial_pairs",
-        "publication_baselines",
-    ] {
-        let found: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                [table],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if !found {
-            return Err(format!("schema 12 is missing {table}"));
-        }
-    }
-    for (table, column) in [
-        ("rex_views", "terminal_at_unix"),
-        ("agent_result_wakes", "wake_input_id"),
-    ] {
-        let found: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
-                rusqlite::params![table, column],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if !found {
-            return Err(format!("schema 12 is missing {table}.{column}"));
-        }
-    }
-    let version: i64 = connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
+fn read_column_layout(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<Option<ColumnLayout>, String> {
+    Ok(read_table_layout(connection, table)?
+        .columns
+        .into_iter()
+        .find(|layout| layout.name == column))
+}
+
+fn read_table_layout(connection: &Connection, table: &str) -> Result<TableLayout, String> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
         .map_err(|error| error.to_string())?;
-    if version != 12 {
-        return Err(format!(
-            "artifact registry schema version mismatch: {version}"
-        ));
+    let sql = sql.ok_or_else(|| format!("schema 12 is missing table {table}"))?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT name,type,\"notnull\",dflt_value,pk FROM pragma_table_info(?1) ORDER BY cid",
+        )
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([table], |row| {
+            Ok(ColumnLayout {
+                name: row.get(0)?,
+                data_type: row.get(1)?,
+                not_null: row.get(2)?,
+                default_value: row.get(3)?,
+                primary_key_position: row.get(4)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let mut statement = connection
+        .prepare("SELECT id,seq,\"table\",\"from\",\"to\",on_update,on_delete,\"match\" FROM pragma_foreign_key_list(?1) ORDER BY id,seq")
+        .map_err(|error| error.to_string())?;
+    let foreign_keys = statement
+        .query_map([table], |row| {
+            Ok(ForeignKeyLayout {
+                id: row.get(0)?,
+                sequence: row.get(1)?,
+                table: row.get(2)?,
+                from: row.get(3)?,
+                to: row.get(4)?,
+                on_update: row.get(5)?,
+                on_delete: row.get(6)?,
+                match_kind: row.get(7)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let mut statement = connection
+        .prepare("SELECT name,\"unique\",origin,partial FROM pragma_index_list(?1) ORDER BY name")
+        .map_err(|error| error.to_string())?;
+    let index_rows = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut indexes = Vec::with_capacity(index_rows.len());
+    for (name, unique, origin, partial) in index_rows {
+        let mut index_statement = connection
+            .prepare("SELECT seqno,cid,name,\"desc\",coll,\"key\" FROM pragma_index_xinfo(?1) ORDER BY seqno")
+            .map_err(|error| error.to_string())?;
+        let columns = index_statement
+            .query_map([&name], |row| {
+                Ok(IndexColumnLayout {
+                    sequence: row.get(0)?,
+                    column_id: row.get(1)?,
+                    name: row.get(2)?,
+                    descending: row.get(3)?,
+                    collation: row.get(4)?,
+                    is_key: row.get(5)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let index_sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [&name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        indexes.push(IndexLayout {
+            name,
+            unique,
+            origin,
+            partial,
+            columns,
+            sql: index_sql,
+        });
     }
-    Ok(())
+
+    let mut statement = connection
+        .prepare(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?1 ORDER BY name",
+        )
+        .map_err(|error| error.to_string())?;
+    let triggers = statement
+        .query_map([table], |row| {
+            Ok(TriggerLayout {
+                name: row.get(0)?,
+                sql: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(TableLayout {
+        sql,
+        columns,
+        foreign_keys,
+        indexes,
+        triggers,
+    })
 }
 
 #[cfg(test)]
@@ -267,6 +513,7 @@ mod tests {
             "profile_trial_run_receipts",
             "profile_trial_pairs",
             "publication_baselines",
+            "merge_work_items",
         ] {
             let found: bool = connection
                 .query_row(
@@ -396,6 +643,7 @@ mod tests {
             "human_request_authority",
             "profile_trial_authorizations",
             "publication_baselines",
+            "merge_work_items",
         ] {
             let found: bool = store
                 .connection
@@ -438,6 +686,70 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 12);
+    }
+
+    #[test]
+    fn malformed_same_name_v12_table_is_rejected_before_wal() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
+        drop(store);
+
+        let path = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 PRAGMA journal_mode=DELETE;
+                 DROP TABLE publication_baselines;
+                 CREATE TABLE publication_baselines(project_id TEXT);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = crate::store::ConfigStore::open_test(temp.path())
+            .err()
+            .expect("malformed schema must be rejected");
+        assert!(error.contains("publication_baselines"), "{error}");
+        let connection = Connection::open(path).unwrap();
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+    }
+
+    #[test]
+    fn valid_v10_database_migrates_to_v12_and_reopens() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::store::ConfigStore::migrate(&connection, 0, temp.path()).unwrap();
+        crate::store::migrate_v3(&connection).unwrap();
+        crate::store::migrate_v4(&connection).unwrap();
+        crate::store::migrate_v5(&connection).unwrap();
+        crate::store::migrate_v6(&connection).unwrap();
+        crate::launch::migrate_v7(&mut connection).unwrap();
+        crate::store::ConfigStore::migrate_human_v8(&mut connection).unwrap();
+        crate::store::scheduler::migrate_v9(&connection).unwrap();
+        crate::store::learning_store::migrate_v10(&connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        crate::store::learning_store::validate_v10_schema(&connection).unwrap();
+        drop(connection);
+
+        let store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        super::validate_v12_schema(&store.connection).unwrap();
     }
 
     fn test_authority() -> AgentLaunchAuthority {
