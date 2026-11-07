@@ -810,25 +810,10 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
     {
         return Err("runtime.environment.shell must not be empty".into());
     }
-    if !matches!(
-        config.adapters.tickets.kind.as_str(),
-        "command" | "linear_cli"
-    ) {
-        return Err("adapters.tickets.kind must be `command` or `linear_cli`".into());
+    if !matches!(config.adapters.tickets.kind.as_str(), "command") {
+        return Err("adapters.tickets.kind must be `command`".into());
     }
     validate_argv("adapters.tickets.command", &config.adapters.tickets.command)?;
-    if config.adapters.tickets.kind == "linear_cli"
-        && ["HOME", "PATH", "XDG_CONFIG_HOME"].iter().any(|required| {
-            !config
-                .adapters
-                .tickets
-                .environment_allow
-                .iter()
-                .any(|name| name == required)
-        })
-    {
-        return Err("adapters.tickets.environment_allow must include `HOME`, `PATH`, and `XDG_CONFIG_HOME` for linear_cli".into());
-    }
     if config.adapters.tickets.read_timeout_seconds == 0
         || config.adapters.tickets.write_timeout_seconds == 0
     {
@@ -1680,22 +1665,16 @@ mod tests {
     }
 
     #[test]
-    fn linear_cli_kind_requires_cli_configuration_environment() {
+    fn tracker_specific_adapter_kinds_are_rejected() {
         let config_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
-        let mut loaded = super::load(&config_path).unwrap();
-        {
-            let ticket = &mut loaded.config.adapters.tickets;
-            ticket.kind = "linear_cli".into();
-            ticket.command = vec!["linear".into()];
-            ticket.environment_allow = vec!["HOME".into(), "PATH".into(), "XDG_CONFIG_HOME".into()];
-        }
-        assert!(super::validate_config(&loaded.config, &loaded.profiles).is_ok());
-        loaded.config.adapters.tickets.environment_allow.pop();
+        let loaded = super::load(&config_path).unwrap();
+        let mut config = loaded.config;
+        config.adapters.tickets.kind = "tracker_native".into();
         assert!(
-            super::validate_config(&loaded.config, &loaded.profiles)
+            super::validate_config(&config, &loaded.profiles)
                 .unwrap_err()
-                .contains("HOME`, `PATH`, and `XDG_CONFIG_HOME")
+                .contains("adapters.tickets.kind must be `command`")
         );
     }
 

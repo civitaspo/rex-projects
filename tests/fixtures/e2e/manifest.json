@@ -28,7 +28,7 @@
     "knowledge publication and ticket completion"
   ],
   "fixtures": {
-    "tickets": "../tickets/ticket_fixture.py",
+    "tickets": "cargo run --package rex-projects-xtask -- fixture ticket",
     "forge": "forge_fixture.py",
     "operations": "operations_fixture.py",
     "agent": "deterministic_agent.py",

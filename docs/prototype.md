@@ -1208,7 +1208,7 @@ Validate at the boundary. Internal domain logic works with parsed types.
 
 `result` and `error` are mutually exclusive. `error` contains `code`, `message`, `retryable`, optional `retry_after_seconds`, and optional structured details.
 Use normalized codes `not_found`, `unauthorized`, `forbidden`, `conflict`, `rate_limited`, `unavailable`, `unsupported`, and `invalid_request`.
-Keep provider details under `extensions` or error details. Do not branch the engine on Linear-specific labels or status IDs.
+Keep provider details under `extensions` or error details. Do not branch the engine on tracker-specific labels or status IDs.
 `revision` is opaque and may be unavailable if the provider has no stable revision. `adapter.describe` states whether conditional writes are supported. Without compare-and-set, re-read immediately before mutation and record that a race remains.
 The normalized external status is exactly `triage`, `backlog`, `ready`, `in_progress`, `in_review`, `done`, or `canceled`, as defined in Appendix E. In `[adapters.tickets.status_values]`, normalized semantic keys map to the native status strings to use when reading and writing tickets. The adapter response returns the normalized key plus the observed native value and display label. Reject unmapped statuses; never guess that an unknown status is `ready`.
 A Project's adapter scope filters every list and mutation. Out-of-scope tickets are rejected even if a model requests them. Adapters declare supported scoped filters and optional operations; core logic never sends opaque provider requests.

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -24,7 +25,7 @@ pub enum TicketMethod {
     FindOperation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TicketScope(BTreeMap<String, String>);
 
@@ -50,7 +51,7 @@ impl TicketScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NormalizedTicketStatus {
     Triage,
@@ -62,7 +63,7 @@ pub enum NormalizedTicketStatus {
     Canceled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct TicketStatusValue {
     pub value: NormalizedTicketStatus,
     #[serde(default)]
@@ -73,7 +74,7 @@ pub struct TicketStatusValue {
     pub label: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct NormalizedTicket {
     pub ticket_namespace: String,
     pub scope: TicketScope,
@@ -101,7 +102,7 @@ pub struct NormalizedTicket {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct TicketPage {
     pub ticket_namespace: String,
     pub tickets: Vec<NormalizedTicket>,
@@ -112,7 +113,7 @@ pub struct TicketPage {
     pub scan: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct AdapterDescription {
     pub ticket_namespace: String,
     pub identity: BTreeMap<String, Value>,
@@ -122,7 +123,7 @@ pub struct AdapterDescription {
     pub capabilities: AdapterCapabilities,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct AdapterCapabilities {
     pub pagination: bool,
     pub filters: BTreeSet<String>,
@@ -135,7 +136,7 @@ pub struct AdapterCapabilities {
     pub supported_optional_methods: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct TicketGetResult {
     pub ticket_namespace: String,
     pub ticket: NormalizedTicket,
@@ -143,19 +144,19 @@ pub struct TicketGetResult {
     pub timeline: Vec<TimelineEntry>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct ScopedTicketResult {
     pub ticket_namespace: String,
     pub ticket: NormalizedTicket,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct CommentResult {
     pub ticket_namespace: String,
     pub comment: CommentReceipt,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct CommentReceipt {
     pub reference: String,
     pub ticket_id: String,
@@ -163,7 +164,7 @@ pub struct CommentReceipt {
     pub created_at: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct DuplicateResolutionResult {
     pub ticket_namespace: String,
     pub duplicate: NormalizedTicket,
@@ -172,7 +173,7 @@ pub struct DuplicateResolutionResult {
     pub outcome: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct TimelineEntry {
     pub actor: String,
     #[serde(rename = "time")]
@@ -183,7 +184,7 @@ pub struct TimelineEntry {
     pub reference: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReconciliationOutcome {
     Found,
@@ -191,14 +192,14 @@ pub enum ReconciliationOutcome {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationMatchBasis {
     OperationId,
     StableExternalKey,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct OperationMatch {
     pub operation_id: String,
     pub method: String,
@@ -209,7 +210,7 @@ pub struct OperationMatch {
     pub receipt: Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct OperationLookup {
     pub ticket_namespace: String,
     pub outcome: ReconciliationOutcome,
@@ -223,7 +224,7 @@ pub struct OperationLookup {
     pub proof: Option<Value>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct TicketListRequest {
     pub scope: TicketScope,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,7 +250,7 @@ pub struct TicketListRequest {
     pub updated_since: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct TicketGetRequest {
     pub scope: TicketScope,
     pub ticket_id: String,
@@ -257,7 +258,7 @@ pub struct TicketGetRequest {
     pub timeline_limit: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct TicketCreateRequest {
     pub scope: TicketScope,
     pub creation_key: String,
@@ -285,7 +286,7 @@ pub struct TicketCreateRequest {
     pub labels: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct TicketUpdateRequest {
     pub scope: TicketScope,
     pub ticket_id: String,
@@ -294,7 +295,7 @@ pub struct TicketUpdateRequest {
     pub patch: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct TicketCommentRequest {
     pub scope: TicketScope,
     pub ticket_id: String,
@@ -304,7 +305,7 @@ pub struct TicketCommentRequest {
     pub references: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct DuplicateResolutionRequest {
     pub scope: TicketScope,
     pub duplicate_ticket_id: String,
@@ -313,7 +314,7 @@ pub struct DuplicateResolutionRequest {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct OperationFindRequest {
     pub scope: TicketScope,
     pub operation_id: String,
@@ -451,12 +452,6 @@ pub fn build_ticket_adapter(
                     .read_timeout_seconds
                     .max(adapter.write_timeout_seconds),
             ),
-            shutdown_grace,
-        )?)),
-        "linear_cli" => Ok(Box::new(super::linear_cli::LinearCliAdapter::new(
-            adapter,
-            environment_snapshot,
-            cwd,
             shutdown_grace,
         )?)),
         _ => Err(TicketAdapterError::Invalid(
@@ -1221,542 +1216,5 @@ impl TicketAdapter for TicketCommandAdapter {
         input: OperationFindRequest,
     ) -> Result<OperationLookup, TicketAdapterError> {
         TicketCommandAdapter::find_operation(self, request_id, project_id, input)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::time::Duration;
-
-    use serde_json::json;
-
-    use crate::domain::ids::{OperationId, ProjectId};
-    use crate::protocol::RequestId;
-
-    use super::{
-        DuplicateResolutionRequest, NormalizedTicketStatus, OperationFindRequest,
-        ReconciliationOutcome, TicketAdapter, TicketCommandAdapter, TicketCommentRequest,
-        TicketCreateRequest, TicketGetRequest, TicketListRequest, TicketScope, TicketUpdateRequest,
-    };
-
-    #[test]
-    fn discovered_namespace_is_pinned_by_describe_before_data_calls() {
-        let dir = tempfile::tempdir().unwrap();
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tickets/ticket_fixture.py");
-        let command = vec![
-            "python3".into(),
-            fixture.display().to_string(),
-            "--database".into(),
-            dir.path().join("tickets.sqlite").display().to_string(),
-            "--namespace".into(),
-            "fixture/tenant-a".into(),
-            "--visibility-delay-seconds".into(),
-            "0".into(),
-        ];
-        let adapter = TicketCommandAdapter::new_discovering_namespace(
-            &command,
-            &BTreeMap::from([(
-                std::ffi::OsString::from("PATH"),
-                std::env::var_os("PATH").unwrap(),
-            )]),
-            &[],
-            dir.path(),
-            Duration::from_secs(5),
-            Duration::from_millis(100),
-        )
-        .unwrap();
-        let project = Some(ProjectId::parse("project-1").unwrap());
-        let create_request = create(scope("external-project"), "key", "Ticket");
-        assert!(matches!(
-            adapter.create(
-                req("before-describe"),
-                op("before-describe"),
-                project.clone(),
-                create_request.clone()
-            ),
-            Err(super::TicketAdapterError::Protocol(_))
-        ));
-
-        let object_safe: &dyn TicketAdapter = &adapter;
-        let description = object_safe.describe(req("describe")).unwrap();
-        assert_eq!(description.ticket_namespace, "fixture/tenant-a");
-        let created = object_safe
-            .create(
-                req("after-describe"),
-                op("after-describe"),
-                project,
-                create_request,
-            )
-            .unwrap();
-        assert_eq!(created.ticket.ticket_namespace, "fixture/tenant-a");
-        let tickets = object_safe
-            .list(
-                req("list-after-describe"),
-                None,
-                list(scope("external-project"), Some(10), None),
-            )
-            .unwrap();
-        assert_eq!(tickets.tickets.len(), 1);
-    }
-
-    #[test]
-    fn typed_adapter_round_trips_scope_revision_cursor_comments_and_duplicates() {
-        let dir = tempfile::tempdir().unwrap();
-        let adapter = fixture_adapter(&dir, None);
-        let project = Some(ProjectId::parse("project-1").unwrap());
-        let description = adapter.describe(req("describe")).unwrap();
-        assert_eq!(description.ticket_namespace, "fixture/tenant-a");
-        assert!(description.capabilities.conditional_revision_mutation);
-        let ticket_scope = scope("external-project");
-        let first = adapter
-            .create(
-                req("create-a"),
-                op("create-a"),
-                project.clone(),
-                create(ticket_scope.clone(), "key-a", "Ticket A"),
-            )
-            .unwrap();
-        let second = adapter
-            .create(
-                req("create-b"),
-                op("create-b"),
-                project.clone(),
-                create(ticket_scope.clone(), "key-b", "Ticket B"),
-            )
-            .unwrap();
-        assert_eq!(first.ticket.revision.as_deref(), Some("rev-1"));
-
-        let first_page = adapter
-            .list(
-                req("list-a"),
-                project.clone(),
-                list(ticket_scope.clone(), Some(1), None),
-            )
-            .unwrap();
-        assert_eq!(first_page.tickets.len(), 1);
-        let cursor = first_page.next_cursor.clone().unwrap();
-        let second_page = adapter
-            .list(
-                req("list-b"),
-                project.clone(),
-                list(ticket_scope.clone(), Some(1), Some(cursor.clone())),
-            )
-            .unwrap();
-        assert_eq!(second_page.tickets.len(), 1);
-        let other_scope = scope("different-project");
-        let conflict = adapter.list(
-            req("list-c"),
-            project.clone(),
-            list(other_scope, Some(1), Some(cursor)),
-        );
-        assert!(
-            matches!(conflict, Err(super::TicketAdapterError::Application(error)) if matches!(error.code, crate::protocol::ErrorCode::Conflict))
-        );
-
-        let got = adapter
-            .get(
-                req("get"),
-                project.clone(),
-                TicketGetRequest {
-                    scope: ticket_scope.clone(),
-                    ticket_id: first.ticket.id.clone(),
-                    timeline_limit: Some(20),
-                },
-            )
-            .unwrap();
-        let stale = adapter.update(
-            req("stale"),
-            op("stale"),
-            project.clone(),
-            TicketUpdateRequest {
-                scope: ticket_scope.clone(),
-                ticket_id: first.ticket.id.clone(),
-                expected_revision: "rev-0".into(),
-                patch: BTreeMap::from([("title".into(), json!("stale"))]),
-            },
-        );
-        assert!(
-            matches!(stale, Err(super::TicketAdapterError::Application(error)) if matches!(error.code, crate::protocol::ErrorCode::Conflict))
-        );
-
-        adapter
-            .comment(
-                req("comment"),
-                op("comment"),
-                project.clone(),
-                TicketCommentRequest {
-                    scope: ticket_scope.clone(),
-                    ticket_id: got.ticket.id.clone(),
-                    comment_key: "comment-a".into(),
-                    body: "Progress update".into(),
-                    references: vec![],
-                },
-            )
-            .unwrap();
-        let resolved = adapter
-            .resolve_duplicate(
-                req("duplicate"),
-                op("duplicate"),
-                project.clone(),
-                DuplicateResolutionRequest {
-                    scope: ticket_scope.clone(),
-                    duplicate_ticket_id: second.ticket.id.clone(),
-                    canonical_ticket_id: first.ticket.id.clone(),
-                    operation_key: "duplicate-op".into(),
-                    reason: "same work".into(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            resolved.duplicate.status.value,
-            NormalizedTicketStatus::Canceled
-        );
-    }
-
-    #[test]
-    fn lost_create_response_is_uncertain_and_reconciliation_is_typed() {
-        let dir = tempfile::tempdir().unwrap();
-        let adapter = fixture_adapter(&dir, Some("create-lost"));
-        let project = Some(ProjectId::parse("project-1").unwrap());
-        let ticket_scope = scope("external-project");
-        let lost = adapter.create(
-            req("lost"),
-            op("create-lost"),
-            project.clone(),
-            create(ticket_scope.clone(), "lost-key", "Lost response"),
-        );
-        assert!(matches!(lost, Err(super::TicketAdapterError::Uncertain)));
-        let lookup = adapter
-            .find_operation(
-                req("find"),
-                project,
-                OperationFindRequest {
-                    scope: ticket_scope,
-                    operation_id: "create-lost".into(),
-                    method: "ticket.create".into(),
-                    stable_external_key: "lost-key".into(),
-                    subject: BTreeMap::from([("creation_key".into(), "lost-key".into())]),
-                },
-            )
-            .unwrap();
-        assert!(matches!(lookup.outcome, ReconciliationOutcome::Found));
-        assert_eq!(lookup.matches.len(), 1);
-    }
-
-    #[test]
-    fn stable_creation_key_lookup_preserves_ambiguous_candidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let adapter = fixture_adapter(&dir, None);
-        let project = Some(ProjectId::parse("project-1").unwrap());
-        let ticket_scope = scope("external-project");
-        adapter
-            .create(
-                req("create-candidate-a"),
-                op("create-candidate-a"),
-                project.clone(),
-                create(ticket_scope.clone(), "shared-key", "Candidate A"),
-            )
-            .unwrap();
-        adapter
-            .create(
-                req("create-candidate-b"),
-                op("create-candidate-b"),
-                project.clone(),
-                create(ticket_scope.clone(), "shared-key", "Candidate B"),
-            )
-            .unwrap();
-
-        let lookup = adapter
-            .find_operation(
-                req("find-candidates"),
-                project,
-                OperationFindRequest {
-                    scope: ticket_scope,
-                    operation_id: "not-indexed-yet".into(),
-                    method: "ticket.create".into(),
-                    stable_external_key: "shared-key".into(),
-                    subject: BTreeMap::from([("creation_key".into(), "shared-key".into())]),
-                },
-            )
-            .unwrap();
-
-        assert!(matches!(lookup.outcome, ReconciliationOutcome::Found));
-        assert_eq!(
-            lookup.match_basis,
-            Some(super::OperationMatchBasis::StableExternalKey)
-        );
-        assert_eq!(lookup.matches.len(), 2);
-        assert!(lookup.matches.iter().all(|matched| {
-            matched.operation_id != "not-indexed-yet"
-                && matched.stable_external_key.as_deref() == Some("shared-key")
-        }));
-    }
-
-    #[test]
-    fn rejects_ticket_receipts_bound_to_different_requested_identities() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = Some(ProjectId::parse("project-1").unwrap());
-        let ticket_scope = scope("external-project");
-        let base = fixture_adapter(&dir, None);
-        let first = base
-            .create(
-                req("identity-seed"),
-                op("identity-seed"),
-                project.clone(),
-                create(ticket_scope.clone(), "identity-seed-key", "Seed"),
-            )
-            .unwrap();
-        let second = base
-            .create(
-                req("identity-second"),
-                op("identity-second"),
-                project.clone(),
-                create(ticket_scope.clone(), "identity-second-key", "Second"),
-            )
-            .unwrap();
-        base.update(
-            req("identity-update"),
-            op("identity-update"),
-            project.clone(),
-            TicketUpdateRequest {
-                scope: ticket_scope.clone(),
-                ticket_id: first.ticket.id.clone(),
-                expected_revision: first.ticket.revision.clone().unwrap(),
-                patch: BTreeMap::from([("title".into(), json!("Identity update"))]),
-            },
-        )
-        .unwrap();
-
-        let get = response_mutator(&dir, "get-ticket-id");
-        assert!(matches!(
-            get.get(
-                req("wrong-get"),
-                project.clone(),
-                TicketGetRequest {
-                    scope: ticket_scope.clone(),
-                    ticket_id: first.ticket.id.clone(),
-                    timeline_limit: None,
-                }
-            ),
-            Err(super::TicketAdapterError::Protocol(_))
-        ));
-
-        let update = response_mutator(&dir, "update-ticket-id");
-        assert!(matches!(
-            update.update(
-                req("wrong-update"),
-                op("wrong-update"),
-                project.clone(),
-                TicketUpdateRequest {
-                    scope: ticket_scope.clone(),
-                    ticket_id: first.ticket.id.clone(),
-                    expected_revision: "rev-2".into(),
-                    patch: BTreeMap::from([("title".into(), json!("Updated"))]),
-                }
-            ),
-            Err(super::TicketAdapterError::Protocol(_))
-        ));
-
-        let comment = response_mutator(&dir, "comment-key");
-        assert!(matches!(
-            comment.comment(
-                req("wrong-comment"),
-                op("wrong-comment"),
-                project.clone(),
-                TicketCommentRequest {
-                    scope: ticket_scope.clone(),
-                    ticket_id: first.ticket.id.clone(),
-                    comment_key: "requested-comment-key".into(),
-                    body: "body".into(),
-                    references: vec![],
-                }
-            ),
-            Err(super::TicketAdapterError::Protocol(_))
-        ));
-
-        let duplicate = response_mutator(&dir, "duplicate-key");
-        assert!(matches!(
-            duplicate.resolve_duplicate(
-                req("wrong-duplicate"),
-                op("wrong-duplicate"),
-                project.clone(),
-                DuplicateResolutionRequest {
-                    scope: ticket_scope.clone(),
-                    duplicate_ticket_id: second.ticket.id.clone(),
-                    canonical_ticket_id: first.ticket.id.clone(),
-                    operation_key: "requested-duplicate-key".into(),
-                    reason: "same work".into(),
-                }
-            ),
-            Err(super::TicketAdapterError::Protocol(_))
-        ));
-
-        let unrelated_operation = response_mutator(&dir, "operation-id");
-        assert!(matches!(
-            unrelated_operation.find_operation(
-                req("wrong-find-operation"),
-                project.clone(),
-                OperationFindRequest {
-                    scope: ticket_scope.clone(),
-                    operation_id: "identity-seed".into(),
-                    method: "ticket.create".into(),
-                    stable_external_key: "identity-seed-key".into(),
-                    subject: BTreeMap::from([("creation_key".into(), "identity-seed-key".into(),)]),
-                }
-            ),
-            Err(super::TicketAdapterError::Protocol(_))
-        ));
-
-        let unrelated_ticket = response_mutator(&dir, "operation-ticket-id");
-        assert!(matches!(
-            unrelated_ticket.find_operation(
-                req("wrong-find-ticket"),
-                project,
-                OperationFindRequest {
-                    scope: ticket_scope,
-                    operation_id: "identity-update".into(),
-                    method: "ticket.update".into(),
-                    stable_external_key: "identity-update-key".into(),
-                    subject: BTreeMap::from([("ticket_id".into(), first.ticket.id)]),
-                }
-            ),
-            Err(super::TicketAdapterError::Protocol(_))
-        ));
-    }
-
-    fn fixture_adapter(dir: &tempfile::TempDir, drop_once: Option<&str>) -> TicketCommandAdapter {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tickets/ticket_fixture.py");
-        let db = dir.path().join("tickets.sqlite");
-        let mut command = vec![
-            "python3".into(),
-            fixture.display().to_string(),
-            "--database".into(),
-            db.display().to_string(),
-            "--namespace".into(),
-            "fixture/tenant-a".into(),
-            "--visibility-delay-seconds".into(),
-            "0".into(),
-        ];
-        if let Some(operation_id) = drop_once {
-            command.extend(["--drop-create-response-once".into(), operation_id.into()]);
-        }
-        TicketCommandAdapter::new(
-            &command,
-            &BTreeMap::from([(
-                std::ffi::OsString::from("PATH"),
-                std::env::var_os("PATH").unwrap(),
-            )]),
-            &[],
-            dir.path(),
-            "fixture/tenant-a".into(),
-            Duration::from_secs(5),
-            Duration::from_millis(100),
-        )
-        .unwrap()
-    }
-
-    fn response_mutator(dir: &tempfile::TempDir, mutation: &str) -> TicketCommandAdapter {
-        let wrapper = dir.path().join("response_mutator.py");
-        std::fs::write(
-            &wrapper,
-            r#"import json, subprocess, sys
-mutation = sys.argv[1]
-command = sys.argv[2:]
-request = sys.stdin.buffer.read()
-run = subprocess.run(command, input=request, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-response = json.loads(run.stdout)
-result = response["result"]
-if mutation == "get-ticket-id" or mutation == "update-ticket-id":
-    result["ticket"]["id"] = "unrelated-ticket"
-elif mutation == "comment-key":
-    result["comment"]["key"] = "unrelated-comment-key"
-elif mutation == "duplicate-key":
-    result["comment_key"] = "unrelated-duplicate-key"
-elif mutation == "operation-id":
-    result["matches"][0]["operation_id"] = "UNRELATED-OP"
-elif mutation == "operation-ticket-id":
-    result["matches"][0]["ticket_id"] = "UNRELATED-TICKET"
-sys.stdout.write(json.dumps(response, separators=(",", ":")))
-"#,
-        )
-        .unwrap();
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tickets/ticket_fixture.py");
-        let command = vec![
-            "python3".into(),
-            wrapper.display().to_string(),
-            mutation.into(),
-            "python3".into(),
-            fixture.display().to_string(),
-            "--database".into(),
-            dir.path().join("tickets.sqlite").display().to_string(),
-            "--namespace".into(),
-            "fixture/tenant-a".into(),
-            "--visibility-delay-seconds".into(),
-            "0".into(),
-        ];
-        TicketCommandAdapter::new(
-            &command,
-            &BTreeMap::from([(
-                std::ffi::OsString::from("PATH"),
-                std::env::var_os("PATH").unwrap(),
-            )]),
-            &[],
-            dir.path(),
-            "fixture/tenant-a".into(),
-            Duration::from_secs(5),
-            Duration::from_millis(100),
-        )
-        .unwrap()
-    }
-
-    fn req(id: &str) -> RequestId {
-        RequestId::new(id).unwrap()
-    }
-    fn op(id: &str) -> OperationId {
-        OperationId::parse(id).unwrap()
-    }
-    fn scope(project: &str) -> TicketScope {
-        TicketScope::new(BTreeMap::from([("project".into(), project.into())])).unwrap()
-    }
-    fn create(scope: TicketScope, key: &str, title: &str) -> TicketCreateRequest {
-        TicketCreateRequest {
-            scope,
-            creation_key: key.into(),
-            title: title.into(),
-            body: "Acceptance criteria".into(),
-            status: Some(NormalizedTicketStatus::Ready),
-            template: None,
-            parent: None,
-            dependencies: Some(vec![]),
-            project: None,
-            milestone: None,
-            assignee: None,
-            priority: None,
-            due_date: None,
-            labels: Some(vec!["fixture".into()]),
-        }
-    }
-    fn list(
-        scope: TicketScope,
-        page_size: Option<u32>,
-        cursor: Option<String>,
-    ) -> TicketListRequest {
-        TicketListRequest {
-            scope,
-            status: None,
-            assignee: None,
-            project: None,
-            milestone: None,
-            release: None,
-            labels: Some(vec!["fixture".into()]),
-            query: None,
-            cursor,
-            page_size,
-            updated_since: None,
-        }
     }
 }

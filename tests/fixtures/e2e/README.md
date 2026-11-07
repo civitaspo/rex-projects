@@ -4,7 +4,7 @@ This directory supplies disposable local dependencies for the Appendix M user-pa
 
 The scripts use only Python's standard library and Git. Adapter database and worktree paths are caller-supplied, so acceptance runs must pass paths beneath a fresh temporary fixture root. The unit tests create and remove their own temporary roots. No script starts an HTTP service or opens a network connection.
 
-The fixtures reuse `../tickets/ticket_fixture.py` for the durable ticket protocol and lost-create-reply injection. `create_local_git.py` creates an isolated clone and bare remote below a caller-selected new root. `forge_fixture.py` and `operations_fixture.py` are local, durable command adapter fixtures. `deterministic_agent.py` is a finite Rex block payload that writes a fixed change and a result receipt in a caller-selected worktree; it contains no provider invocation and does not establish that the product launches or reconciles it correctly.
+The ticket command fixture is the development-only Rust command `cargo run --package rex-projects-xtask -- fixture ticket`; it supports durable state and lost-create-reply injection. `create_local_git.py` creates an isolated clone and bare remote below a caller-selected new root. `forge_fixture.py` and `operations_fixture.py` are local, durable command adapter fixtures. `deterministic_agent.py` is a finite Rex block payload that writes a fixed change and a result receipt in a caller-selected worktree; it contains no provider invocation and does not establish that the product launches or reconciles it correctly.
 
 ## Create local Git resources
 
