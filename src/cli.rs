@@ -202,6 +202,12 @@ enum AgentCommand {
         #[arg(long)]
         package: PathBuf,
     },
+    /// Internal tool-shell marker probe for provider qualification.
+    #[command(hide = true)]
+    QualificationProbe {
+        #[arg(long)]
+        package: PathBuf,
+    },
     RunStep {
         #[arg(long)]
         run: String,
@@ -1647,6 +1653,16 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 print_json(&serde_json::json!({"result_digest": result_digest}))
             } else {
                 println!("Provider qualification turn finished.");
+                Ok(())
+            }
+        }
+        AgentCommand::QualificationProbe { package } => {
+            crate::provider_qualification_run::run_marker_probe(&package)
+                .map_err(CliError::unavailable)?;
+            if json {
+                print_json(&serde_json::json!({"marker_probe": "complete"}))
+            } else {
+                println!("Qualification marker probe completed.");
                 Ok(())
             }
         }

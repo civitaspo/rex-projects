@@ -242,6 +242,7 @@ fn agent_marker_cannot_submit_human_claim_release() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
     let mutations: &[&[&str]] = &[
+        &["human", "list"],
         &["config", "apply", "--bootstrap"],
         &["runtime", "run", "--once"],
         &["runtime", "stop"],

@@ -625,6 +625,7 @@ impl RexCliTransport {
             initial_agent.cwd.as_os_str().to_owned(),
             "--window".into(),
             window_label.clone().into(),
+            "--keep-open".into(),
             "--shell".into(),
             "none".into(),
             "--json".into(),
@@ -805,6 +806,32 @@ impl RexCliTransport {
             block_id: receipt.block_id,
             operation_id: receipt.operation_id,
         })
+    }
+
+    /// Observe the initial `rex new --shell none` block by its exact host-issued qualification
+    /// receipt. This bootstrap block uses Rex's default shell label, so ordinary Agent-label
+    /// matching cannot establish its process identity.
+    pub(crate) fn observe_qualification_process(
+        &self,
+        receipt: &RexQualificationSessionReceipt,
+    ) -> Result<RexProcessObservation, RexError> {
+        self.disposable_qualification_fixture(receipt.clone())?;
+        self.verify_identity()?;
+        let encoded = serde_json::to_string(&json!({
+            "session_id": receipt.session_id,
+            "block_id": receipt.block_id
+        }))
+        .map_err(|_| RexError::Protocol("request encoding failed".into()))?;
+        let output = self.command(&[
+            "api".into(),
+            "call".into(),
+            "com.superlogical.terminal.process".into(),
+            encoded.into(),
+        ])?;
+        let observation: RexProcessObservation =
+            parse(&output.stdout).map_err(|_| RexError::Uncertain)?;
+        self.verify_identity().map_err(|_| RexError::Uncertain)?;
+        Ok(observation)
     }
 
     /// Close only the exact isolated session minted by `rex new`, then verify it is absent

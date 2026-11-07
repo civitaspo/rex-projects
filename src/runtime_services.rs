@@ -1,6 +1,6 @@
 //! Concrete host adapters assembled for one foreground controller.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -380,16 +380,18 @@ impl RuntimeServices {
             .create_handoff_for_operation(&self.state_root, &operation_id)
             .map_err(|error| error.to_string())?;
         let role_contract = crate::roles::builtin_role_contract(job.request.role).to_owned();
+        let descriptor_path = root.join("package.json");
         let prompt = format!(
-            "This is a disposable provider qualification turn for role {:?}. Produce exactly one minimal, valid structured result permitted by the attached role schema. Use only synthetic data; do not access external systems, modify files, or perform delivery actions.",
-            job.request.role
+            "This is a disposable provider qualification turn for role {:?}. First invoke the available shell tool to run `{} agent qualification-probe --package {}` exactly as written. Wait for it to succeed. Then produce exactly one minimal, valid structured result permitted by the attached role schema. Use only synthetic data; do not access external systems or perform delivery actions.",
+            job.request.role,
+            shell_quote(&self.runtime_binary)?,
+            shell_quote(&descriptor_path)?,
         );
         let result_schema = crate::roles::result_schema(job.request.role);
         let projection = crate::providers::project_result_schema(&result_schema)?;
         let profile_digest = job.request.profile_digest.clone();
         let instruction_digest = digest_bytes(role_contract.as_bytes())?;
         let wake_digest = digest_bytes(prompt.as_bytes())?;
-        let descriptor_path = root.join("package.json");
         let bootstrap_spec = AgentBlockSpec {
             run_id: operation_id.clone(),
             command: PathBuf::from("/usr/bin/env"),
@@ -399,7 +401,7 @@ impl RuntimeServices {
                 format!("REX_PROJECTS_PROJECT_ID={}", job.request.project_id),
                 format!(
                     "REX_PROJECTS_ROLE={}",
-                    qualification_role_name(job.request.role)
+                    crate::provider_qualification_run::qualification_role_name(job.request.role)
                 ),
                 format!("REX_PROJECTS_RUN_ID={run_id}"),
                 self.runtime_binary.display().to_string(),
@@ -433,7 +435,7 @@ impl RuntimeServices {
             attempt: 1,
             run_epoch: 1,
             controller_generation: self.owner_generation,
-            workspace,
+            workspace: workspace.clone(),
             control_dir,
             rex_session_id: rex_receipt.session_id().to_owned(),
             rex_block_id: crate::domain::ids::RexBlockId::parse(rex_receipt.block_id().to_owned())?,
@@ -461,6 +463,9 @@ impl RuntimeServices {
         let package = crate::provider_qualification_run::QualificationRunPackage {
             schema_version: 1,
             request_id: job.request.request_id.clone(),
+            request_digest: job.request_digest.clone(),
+            config_revision: job.request.config_revision,
+            config_digest: job.request.config_digest.clone(),
             project_id: job.request.project_id.clone(),
             role: job.request.role,
             profile_id: job.request.profile_id.clone(),
@@ -474,6 +479,11 @@ impl RuntimeServices {
             environment_handoff: handoff.path().to_owned(),
             environment_operation_id: operation_id,
             result_path,
+            marker_probe_path: workspace.join("marker-probe.json"),
+            marker_probe_challenge: crate::provider_qualification_run::new_marker_probe_challenge(
+            )?,
+            runtime_binary_path: self.runtime_binary.clone(),
+            runtime_binary_digest: self.runtime_binary_digest.clone(),
             rex_cli_path: self.rex_cli_path.clone(),
             rex_search_path: self.rex_search_path.clone(),
             rex_receipt,
@@ -546,7 +556,23 @@ impl RuntimeServices {
                 Ok(package) => package,
                 Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
             };
+        if crate::provider_qualification_run::validate_package(&package, &package_path).is_err()
+            || package.workspace_root != root
+            || package.descriptor.workspace != root.join("workspace")
+            || package.descriptor.control_dir != root.join("control")
+            || package.result_path != result_path
+            || package.marker_probe_path != root.join("workspace/marker-probe.json")
+        {
+            return mark_qualification_unknown(store, self.owner_generation, job);
+        }
         if package.request_id != job.request.request_id
+            || package.request_digest != job.request_digest
+            || package.config_revision != job.request.config_revision
+            || package.config_digest != job.request.config_digest
+            || package.profile_id != job.request.profile_id
+            || package.profile_digest != job.request.profile_digest
+            || package.runtime_binary_path != self.runtime_binary
+            || package.runtime_binary_digest != self.runtime_binary_digest
             || package.rex_receipt.operation_id() != operation_id
             || package.rex_receipt.session_id() != session_id
             || package.rex_receipt.window_id() != window_id
@@ -583,15 +609,7 @@ impl RuntimeServices {
                 // receipt/session shape plus host process cleanup is enough to reconcile it.
                 None
             } else {
-                let window = RexWindow {
-                    server_instance_id: self.rex_identity.instance_id.clone(),
-                    session_id: session_id.to_owned(),
-                    window_id: window_id.to_owned(),
-                    label: package.rex_receipt.window_label().to_owned(),
-                    initial_block_id: Some(block_id.to_owned()),
-                    disposition: CreateDisposition::Existing,
-                };
-                let observation = match rex.observe_process(&window, &operation_id, block_id) {
+                let observation = match rex.observe_qualification_process(&package.rex_receipt) {
                     Ok(observation) => observation,
                     Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
                 };
@@ -615,66 +633,28 @@ impl RuntimeServices {
                 Ok(run) => run,
                 Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
             };
-        if run.request_id != job.request.request_id {
-            return mark_qualification_unknown(store, self.owner_generation, job);
-        }
-        if !crate::provider_qualification_run::receipt_outcome_succeeded(&run.receipt)
+        if run.request_id != job.request.request_id
             || run.receipt.run_id != package.descriptor.run_id
             || run.receipt.provider != package.profile.adapter
             || run.receipt.effective_permission_mode
                 != package.descriptor.provider_capability.permission_mode
             || run.receipt.schema_projection
                 != package.descriptor.provider_capability.schema_projection
-            || block_exit_code.is_some_and(|exit_code| exit_code != 0)
         {
-            if matches!(
-                run.receipt.cleanup,
-                crate::run_step::CleanupState::Confirmed
-            ) {
-                if rex
-                    .as_ref()
-                    .unwrap_or(&self.rex)
-                    .close_disposable_qualification_session(package.rex_receipt.clone())
-                    .is_err()
-                {
-                    return mark_qualification_unknown(store, self.owner_generation, job);
-                }
-                let failure = serde_json::json!({
-                    "schema_version": 1,
-                    "request_id": job.request.request_id,
-                    "outcome": "failed",
-                    "reason": "provider qualification did not produce a valid completed turn",
-                    "provider_result_failure": run.receipt.provider_result_failure,
-                    "provider_process_failure": run.receipt.provider_process_failure,
-                });
-                let failure = serde_json::to_string(&failure).map_err(|error| error.to_string())?;
-                let digest = digest_bytes(failure.as_bytes())?;
-                store.finish_provider_qualification_job(
-                    self.owner_generation,
-                    &job.request.request_id,
-                    Status::Failed,
-                    &failure,
-                    &digest,
-                    true,
-                )?;
-                return Ok(());
-            }
             return mark_qualification_unknown(store, self.owner_generation, job);
         }
-        let Some(structured_result) = run.structured_result.as_ref() else {
-            return mark_qualification_unknown(store, self.owner_generation, job);
-        };
-        let actual_result_digest = digest_bytes(
-            &serde_json::to_vec(&Some(structured_result)).map_err(|error| error.to_string())?,
-        )?;
-        if actual_result_digest != run.result_digest {
-            return mark_qualification_unknown(store, self.owner_generation, job);
-        }
+        // A terminal but unusable qualification may release its slot only after the
+        // receipt records confirmed cleanup and a fresh host snapshot proves every
+        // captured kernel identity absent. Keep this check ahead of marker/result
+        // validation so a safely failed probe can be recorded as Failed.
         let current = match crate::process::inspect_process_table() {
             Ok(current) => current,
             Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
         };
-        let process_tree_absent = !run.receipt.processes.is_empty()
+        let process_tree_absent = matches!(
+            run.receipt.cleanup,
+            crate::run_step::CleanupState::Confirmed
+        ) && !run.receipt.processes.is_empty()
             && run.receipt.processes.iter().all(|observed| {
                 observed.identity_quality == "kernel_birth_token"
                     && current.iter().all(|process| {
@@ -685,35 +665,174 @@ impl RuntimeServices {
         if !process_tree_absent {
             return mark_qualification_unknown(store, self.owner_generation, job);
         }
-        let profile = self
-            .applied_config
-            .profiles
-            .get(&job.request.profile_id)
-            .ok_or("qualified profile disappeared from applied configuration")?;
-        let identity = crate::run_step::profile_runtime_identity(profile)
-            .map_err(|error| error.to_string())?;
+        let probe_bytes = match read_private_bounded(&package.marker_probe_path, 16 * 1024) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return finish_qualification_failed(
+                    store,
+                    self.owner_generation,
+                    job,
+                    &package,
+                    &run,
+                    rex.as_ref().unwrap_or(&self.rex),
+                    "provider marker report is missing",
+                );
+            }
+        };
+        let probe: crate::provider_qualification_run::MarkerProbeReport =
+            match crate::protocol::parse_unique(&probe_bytes) {
+                Ok(probe) => probe,
+                Err(_) => {
+                    return finish_qualification_failed(
+                        store,
+                        self.owner_generation,
+                        job,
+                        &package,
+                        &run,
+                        rex.as_ref().unwrap_or(&self.rex),
+                        "provider marker report is invalid",
+                    );
+                }
+            };
+        let verified_markers =
+            match crate::provider_qualification_run::verify_marker_probe(&package, &probe) {
+                Ok(verified) => verified,
+                Err(_) => {
+                    return finish_qualification_failed(
+                        store,
+                        self.owner_generation,
+                        job,
+                        &package,
+                        &run,
+                        rex.as_ref().unwrap_or(&self.rex),
+                        "provider marker proof did not verify",
+                    );
+                }
+            };
+        let probe_process = run.receipt.processes.iter().find(|process| {
+            process.pid == probe.tool_pid && process.identity_quality == "kernel_birth_token"
+        });
+        let descendant_process = run.receipt.processes.iter().find(|process| {
+            process.pid == probe.descendant_pid && process.identity_quality == "kernel_birth_token"
+        });
+        if probe_process.is_none_or(|process| process.parent_pid != probe.tool_parent_pid)
+            || descendant_process.is_none_or(|process| process.parent_pid != probe.tool_pid)
+            || !run.receipt.processes.iter().any(|process| {
+                process.pid == probe.tool_parent_pid
+                    && process.identity_quality == "kernel_birth_token"
+            })
+        {
+            return finish_qualification_failed(
+                store,
+                self.owner_generation,
+                job,
+                &package,
+                &run,
+                rex.as_ref().unwrap_or(&self.rex),
+                "provider marker process identities did not verify",
+            );
+        }
+        if !crate::provider_qualification_run::receipt_outcome_succeeded(&run.receipt)
+            || run.receipt.run_id != package.descriptor.run_id
+            || run.receipt.provider != package.profile.adapter
+            || run.receipt.effective_permission_mode
+                != package.descriptor.provider_capability.permission_mode
+            || run.receipt.schema_projection
+                != package.descriptor.provider_capability.schema_projection
+            || block_exit_code.is_some_and(|exit_code| exit_code != 0)
+        {
+            return finish_qualification_failed(
+                store,
+                self.owner_generation,
+                job,
+                &package,
+                &run,
+                rex.as_ref().unwrap_or(&self.rex),
+                "provider qualification did not produce a valid completed turn",
+            );
+        }
+        let Some(structured_result) = run.structured_result.as_ref() else {
+            return finish_qualification_failed(
+                store,
+                self.owner_generation,
+                job,
+                &package,
+                &run,
+                rex.as_ref().unwrap_or(&self.rex),
+                "provider structured result is missing",
+            );
+        };
+        let actual_result_digest = digest_bytes(
+            &serde_json::to_vec(&Some(structured_result)).map_err(|error| error.to_string())?,
+        )?;
+        if actual_result_digest != run.result_digest {
+            return finish_qualification_failed(
+                store,
+                self.owner_generation,
+                job,
+                &package,
+                &run,
+                rex.as_ref().unwrap_or(&self.rex),
+                "provider structured result digest is invalid",
+            );
+        }
+        let Some(profile) = self.applied_config.profiles.get(&job.request.profile_id) else {
+            return finish_qualification_failed(
+                store,
+                self.owner_generation,
+                job,
+                &package,
+                &run,
+                rex.as_ref().unwrap_or(&self.rex),
+                "provider profile changed during qualification",
+            );
+        };
+        let identity = match crate::run_step::profile_runtime_identity(profile) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return finish_qualification_failed(
+                    store,
+                    self.owner_generation,
+                    job,
+                    &package,
+                    &run,
+                    rex.as_ref().unwrap_or(&self.rex),
+                    "provider profile identity is invalid",
+                );
+            }
+        };
         if digest_serialized(profile)? != job.request.profile_digest
             || identity.executable_digest
                 != package.descriptor.provider_capability.executable_digest
         {
-            return Err("provider profile changed while qualification was running".into());
+            return finish_qualification_failed(
+                store,
+                self.owner_generation,
+                job,
+                &package,
+                &run,
+                rex.as_ref().unwrap_or(&self.rex),
+                "provider profile changed during qualification",
+            );
         }
-        let version = probe_provider_version(
+        let version = match probe_provider_version(
             profile,
             &self.host_environment,
             &package.descriptor.workspace,
-        )?;
-        let marker_names = [
-            "REX_PROJECTS_AGENT",
-            "REX_PROJECTS_CONTEXT",
-            "REX_PROJECTS_PROJECT_ID",
-            "REX_PROJECTS_ROLE",
-            "REX_PROJECTS_RUN_ID",
-        ];
-        let markers: BTreeSet<String> = marker_names
-            .iter()
-            .map(|marker| (*marker).to_owned())
-            .collect();
+        ) {
+            Ok(version) => version,
+            Err(_) => {
+                return finish_qualification_failed(
+                    store,
+                    self.owner_generation,
+                    job,
+                    &package,
+                    &run,
+                    rex.as_ref().unwrap_or(&self.rex),
+                    "provider version probe failed",
+                );
+            }
+        };
         let receipt_json = serde_json::to_vec(&run.receipt).map_err(|error| error.to_string())?;
         let fixture_json =
             serde_json::to_vec(&package.rex_receipt).map_err(|error| error.to_string())?;
@@ -722,14 +841,10 @@ impl RuntimeServices {
             probe_id: job.request.request_id.clone(),
             fixture_digest: digest_bytes(&fixture_json)?,
             rex_instance_id: self.rex_identity.instance_id.clone(),
-            tool_shell_marker_digest: digest_bytes(
-                &serde_json::to_vec(&markers).map_err(|e| e.to_string())?,
-            )?,
-            tool_shell_markers_present: markers.clone(),
-            descendant_marker_digest: digest_bytes(
-                &serde_json::to_vec(&markers).map_err(|e| e.to_string())?,
-            )?,
-            descendant_markers_present: markers,
+            tool_shell_marker_digest: verified_markers.tool_shell_marker_digest,
+            tool_shell_markers_present: verified_markers.tool_shell_markers_present,
+            descendant_marker_digest: verified_markers.descendant_marker_digest,
+            descendant_markers_present: verified_markers.descendant_markers_present,
             automatic_turn_result_digest: run.result_digest.clone(),
             automatic_turn_completed: true,
             structured_result_valid: true,
@@ -754,7 +869,17 @@ impl RuntimeServices {
             proof,
             status: crate::launch::QualificationStatus::Verified,
         };
-        qualification.validate_for_unattended_launch()?;
+        if qualification.validate_for_unattended_launch().is_err() {
+            return finish_qualification_failed(
+                store,
+                self.owner_generation,
+                job,
+                &package,
+                &run,
+                rex.as_ref().unwrap_or(&self.rex),
+                "provider qualification proof is incomplete",
+            );
+        }
         if rex
             .as_ref()
             .unwrap_or(&self.rex)
@@ -776,19 +901,6 @@ impl RuntimeServices {
             true,
         )?;
         Ok(())
-    }
-}
-
-fn qualification_role_name(role: Role) -> &'static str {
-    match role {
-        Role::Supervisor => "supervisor",
-        Role::Coordinator => "coordinator",
-        Role::Planner => "planner",
-        Role::Worker => "worker",
-        Role::Reviewer => "reviewer",
-        Role::MergeDecision => "merge_decision",
-        Role::Operator => "operator",
-        Role::Postmortem => "postmortem",
     }
 }
 
@@ -818,6 +930,13 @@ fn create_private_qualification_tree(root: &Path) -> Result<(), String> {
         return Err("qualification paths changed during creation".into());
     }
     Ok(())
+}
+
+fn shell_quote(path: &Path) -> Result<String, String> {
+    let path = path
+        .to_str()
+        .ok_or("provider qualification command path is not valid UTF-8")?;
+    Ok(format!("'{}'", path.replace('\'', "'\\''")))
 }
 
 fn set_private_directory(path: &Path) -> Result<(), String> {
@@ -912,6 +1031,72 @@ fn mark_qualification_unknown(
         store.mark_provider_qualification_unknown(generation, &job.request.request_id)?;
     }
     Ok(())
+}
+
+fn finish_qualification_failed(
+    store: &mut ConfigStore,
+    generation: u64,
+    job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
+    package: &crate::provider_qualification_run::QualificationRunPackage,
+    run: &crate::provider_qualification_run::QualificationRunResult,
+    rex: &RexCliTransport,
+    reason: &str,
+) -> Result<(), String> {
+    use crate::store::provider_qualification_runtime::ProviderQualificationJobStatus as Status;
+    if !matches!(
+        run.receipt.cleanup,
+        crate::run_step::CleanupState::Confirmed
+    ) || run.receipt.processes.is_empty()
+        || !matches!(
+            reason,
+            "provider marker report is missing"
+                | "provider marker report is invalid"
+                | "provider marker proof did not verify"
+                | "provider marker process identities did not verify"
+                | "provider qualification did not produce a valid completed turn"
+                | "provider structured result is missing"
+                | "provider structured result digest is invalid"
+                | "provider profile changed during qualification"
+                | "provider profile identity is invalid"
+                | "provider version probe failed"
+                | "provider qualification proof is incomplete"
+        )
+    {
+        return mark_qualification_unknown(store, generation, job);
+    }
+    let current = match crate::process::inspect_process_table() {
+        Ok(current) => current,
+        Err(_) => return mark_qualification_unknown(store, generation, job),
+    };
+    let identities_absent = run.receipt.processes.iter().all(|observed| {
+        observed.identity_quality == "kernel_birth_token"
+            && current.iter().all(|process| {
+                process.pid != observed.pid || process.start_identity != observed.start_identity
+            })
+    });
+    if !identities_absent
+        || rex
+            .close_disposable_qualification_session(package.rex_receipt.clone())
+            .is_err()
+    {
+        return mark_qualification_unknown(store, generation, job);
+    }
+    let failure = serde_json::json!({
+        "schema_version": 1,
+        "request_id": job.request.request_id,
+        "outcome": "failed",
+        "reason": reason,
+    });
+    let failure = serde_json::to_string(&failure).map_err(|error| error.to_string())?;
+    let digest = digest_bytes(failure.as_bytes())?;
+    store.finish_provider_qualification_job(
+        generation,
+        &job.request.request_id,
+        Status::Failed,
+        &failure,
+        &digest,
+        true,
+    )
 }
 
 struct RuntimeAgentMaterializer {
