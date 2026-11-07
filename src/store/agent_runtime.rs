@@ -481,7 +481,7 @@ impl ConfigStore {
             "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
             [agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let expected_json = serde_json::to_string(authority).map_err(|error| error.to_string())?;
+        let expected_json = authority.storage_json()?;
         let expected_digest = authority.digest()?;
         if persisted.as_ref().is_none_or(|(json, digest)| {
             json != &expected_json || digest != expected_digest.as_str()
@@ -604,7 +604,7 @@ mod tests {
         let config = serde_json::from_value(serde_json::json!({
             "schema_version":1,
             "adapters":{"tickets":{"kind":"command","command":["ticket-cli"]}},
-            "projects":{"project-a":{"mode":"operations","ticket_adapter":"tickets","roles":{"supervisor":"supervisor"}}}
+            "projects":{"project-a":{"mode":"operations","ticket_adapter":"tickets","roles":{"supervisor":"supervisor","reviewer":"reviewer"}}}
         })).unwrap();
         let profile = serde_json::from_value::<Profile>(serde_json::json!({
             "adapter":"codex","command":["/usr/bin/codex"],"model":"fixture",
@@ -613,7 +613,10 @@ mod tests {
         .unwrap();
         AppliedConfig {
             config,
-            profiles: BTreeMap::from([(ProfileId::parse("supervisor").unwrap(), profile)]),
+            profiles: BTreeMap::from([
+                (ProfileId::parse("supervisor").unwrap(), profile.clone()),
+                (ProfileId::parse("reviewer").unwrap(), profile),
+            ]),
             source_root: "/tmp/config".into(),
             source_files: vec![SourceFile {
                 kind: SourceKind::File,
@@ -799,6 +802,130 @@ mod tests {
             global_capacity: 1,
             project_capacity: 1,
         };
+
+        // A real reservation with a database-backed Planner parent must not accept the
+        // impossible Reviewer -> Planner edge or leave any durable launch side effects.
+        let child_ticket_run_id = crate::domain::ids::TicketRunId::parse("ticket-child").unwrap();
+        store.connection.execute(
+            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status) VALUES (?1,?2,'factory',?3,?4,'shared','T-2',1,'queued','working','In Progress','In Progress')",
+            rusqlite::params![child_ticket_run_id.as_str(), project.as_str(), applied.revision.0, digest('b').as_str()],
+        ).unwrap();
+        let child_view = RexView {
+            view_id: RexView::derive_id(
+                &project,
+                RexViewKind::Ticket,
+                Some("shared"),
+                Some("T-2"),
+                1,
+            )
+            .unwrap(),
+            project_id: project.clone(),
+            kind: RexViewKind::Ticket,
+            ticket_namespace: Some("shared".into()),
+            ticket_id: Some("T-2".into()),
+            view_epoch: 1,
+            rex_server_identity: "rex-fixture".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+        };
+        store.register_rex_view(generation, &child_view).unwrap();
+        let reviewer_profile_id = ProfileId::parse("reviewer").unwrap();
+        let mut reviewer_qualification = qualification.clone();
+        reviewer_qualification.profile_id = reviewer_profile_id.clone();
+        let reviewer_qualification_digest = store
+            .store_provider_qualification(generation, &reviewer_qualification)
+            .unwrap();
+        let parent_id = AgentRunId::parse("planner-parent").unwrap();
+        let parent_operation = OperationId::parse("op-planner-parent").unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,'planner-parent-session','factory',1,?5,'running',?6)",
+            rusqlite::params![parent_id.as_str(), project.as_str(), applied.revision.0, digest('b').as_str(), parent_operation.as_str(), generation],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'planner','planner-parent-session',?3,0,?4,?5,1,1,?6,?7,?8,?9,?10,'/state/parent.json',?11,'reviewer',?12,?13,?14,?15,'rex-fixture','session','window','parent-block','/state/workspace','/state/control',?16,'{}',?17,0)",
+            rusqlite::params![parent_id.as_str(), project.as_str(), child_ticket_run_id.as_str(), applied.revision.0, digest('b').as_str(), generation, parent_operation.as_str(), child_view.view_id.as_str(), digest('a').as_str(), digest('4').as_str(), digest('5').as_str(), digest('6').as_str(), digest('7').as_str(), digest('8').as_str(), reviewer_qualification_digest.as_str(), digest('9').as_str(), digest('0').as_str()],
+        ).unwrap();
+        let child_run_id = AgentRunId::parse("reviewer-child").unwrap();
+        let child_operation = OperationId::parse("op-reviewer-child").unwrap();
+        let child_session_id = "ticket:project-a:T-2:reviewer";
+        store.connection.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'human','wake-child',1,10,'{}','pending',0)",
+            rusqlite::params![project.as_str(), child_session_id],
+        ).unwrap();
+        let mut impossible_child = reservation.clone();
+        impossible_child.agent_run_id = child_run_id.clone();
+        impossible_child.role = Role::Reviewer;
+        impossible_child.role_session_id = child_session_id.into();
+        impossible_child.parent_run_id = Some(parent_id.clone());
+        impossible_child.parent_role = Some(Role::Planner);
+        impossible_child.ticket_run_id = Some(child_ticket_run_id);
+        impossible_child.ticket_revision = Some(Revision(0));
+        impossible_child.operation_id = child_operation;
+        impossible_child.profile_id = reviewer_profile_id;
+        impossible_child.qualification_receipt_digest = reviewer_qualification_digest;
+        impossible_child.rex_view_id = child_view.view_id;
+        impossible_child.slot_index = 0;
+        impossible_child.wake_snapshot.role_session_id = child_session_id.into();
+        impossible_child.wake_snapshot.agent_run_id = child_run_id.as_str().into();
+        impossible_child.wake_snapshot.inputs = vec![crate::agent_api::AgentWakeItem {
+            wake_input_id: store
+                .connection
+                .query_row(
+                    "SELECT wake_input_id FROM role_wake_inputs WHERE source_id='wake-child'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            source_type: "human".into(),
+            source_id: "wake-child".into(),
+            source_revision: 1,
+            priority: 10,
+            payload_json: serde_json::json!({}),
+            host_artifacts: vec![],
+        }];
+        impossible_child.wake_snapshot.digest =
+            impossible_child.wake_snapshot.content_digest().unwrap();
+        let before = store
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM agent_runs),(SELECT COUNT(*) FROM execution_slots),(SELECT COUNT(*) FROM effects WHERE kind='start_agent'),(SELECT COUNT(*) FROM agent_launch_reservations),(SELECT COUNT(*) FROM agent_mailboxes)",
+                [],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?, row.get::<_, u64>(4)?)),
+            )
+            .unwrap();
+        let wake_before: (String, Option<String>, String) = store
+            .connection
+            .query_row(
+                "SELECT lifecycle,consuming_agent_run_id,payload_json FROM role_wake_inputs WHERE source_id='wake-child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            store
+                .prepare_role_launch(&impossible_child)
+                .unwrap_err()
+                .contains("parent role")
+        );
+        let after = store
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM agent_runs),(SELECT COUNT(*) FROM execution_slots),(SELECT COUNT(*) FROM effects WHERE kind='start_agent'),(SELECT COUNT(*) FROM agent_launch_reservations),(SELECT COUNT(*) FROM agent_mailboxes)",
+                [],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?, row.get::<_, u64>(4)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let wake_after: (String, Option<String>, String) = store
+            .connection
+            .query_row(
+                "SELECT lifecycle,consuming_agent_run_id,payload_json FROM role_wake_inputs WHERE source_id='wake-child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(wake_after, wake_before);
+
         let reservation_digest = reservation.digest().unwrap();
         let mut unsupported_worker = reservation.clone();
         unsupported_worker.role = Role::Worker;

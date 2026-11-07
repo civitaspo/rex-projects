@@ -959,7 +959,7 @@ impl ConfigStore {
         authority: &AgentLaunchAuthority,
     ) -> Result<bool, String> {
         authority.validate()?;
-        let authority_json = serde_json::to_string(authority).map_err(|error| error.to_string())?;
+        let authority_json = authority.storage_json()?;
         let authority_digest = authority.digest()?;
         let tx = self
             .connection
@@ -4600,6 +4600,121 @@ mod tests {
             store
                 .register_agent_launch_authority(generation, &authority)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn populated_v7_authority_and_start_receipt_survive_v8_migration() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        assert!(
+            store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
+        );
+        let request = AgentStartRequest {
+            schema_version: 1,
+            operation_id: authority.operation_id.clone(),
+            agent_run_id: authority.agent_run_id.clone(),
+            project_id: authority.project_id.clone(),
+            controller_generation: generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            wrapper_pid: 456,
+            wrapper_start_identity: "v7-wrapper".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+        };
+        let observed = ObservedWrapperIdentity {
+            pid: request.wrapper_pid,
+            start_identity: request.wrapper_start_identity.clone(),
+            rex_session_id: request.rex_session_id.clone(),
+            rex_block_id: request.rex_block_id.clone(),
+            runtime_binary_digest: request.runtime_binary_digest.clone(),
+        };
+        let receipt = store
+            .authorize_agent_start(generation, &request, &observed)
+            .unwrap();
+
+        // Recreate the serialized authority format written by schema v7, before either field
+        // existed. Keep the struct's original field order so its historical digest is exact.
+        let legacy_json = serde_json::to_string(&authority)
+            .unwrap()
+            .replacen(",\"operation_recipe_id\":null", "", 1)
+            .replacen(
+                &format!(
+                    ",\"wake_snapshot_digest\":\"{}\"",
+                    authority.wake_snapshot_digest
+                ),
+                "",
+                1,
+            );
+        assert!(!legacy_json.contains("operation_recipe_id"));
+        assert!(!legacy_json.contains("wake_snapshot_digest"));
+        let legacy_digest = format!("{:x}", sha2::Sha256::digest(legacy_json.as_bytes()));
+        store
+            .connection
+            .execute_batch(
+                "DROP TRIGGER agent_launch_authority_immutable_update;
+             DROP TRIGGER agent_launch_authority_immutable_delete;",
+            )
+            .unwrap();
+        store.connection.execute(
+            "UPDATE agent_launch_authority SET authority_json=?2,authority_digest=?3 WHERE agent_run_id=?1",
+            rusqlite::params![authority.agent_run_id.as_str(), legacy_json, legacy_digest],
+        ).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX agent_launch_reservations_project;
+             DROP TRIGGER agent_launch_reservation_identity_guard;
+             DROP TRIGGER agent_launch_reservation_no_delete;
+             DROP TRIGGER agent_wake_context_immutable_update;
+             DROP TRIGGER agent_wake_context_immutable_delete;
+             DROP TABLE agent_launch_reservations;
+             DROP TABLE agent_wake_context;
+             ALTER TABLE agent_launch_authority DROP COLUMN operation_recipe_id;
+             ALTER TABLE agent_launch_authority DROP COLUMN wake_snapshot_digest;
+             DELETE FROM schema_migrations WHERE version=8;
+             PRAGMA user_version=7;",
+            )
+            .unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let mut expected_legacy_authority = authority.clone();
+        expected_legacy_authority.wake_snapshot_digest = Digest::parse("0".repeat(64)).unwrap();
+        assert_eq!(
+            store
+                .agent_launch_authority(&authority.agent_run_id)
+                .unwrap(),
+            Some(expected_legacy_authority.clone())
+        );
+        assert!(
+            !store
+                .register_agent_launch_authority(generation, &expected_legacy_authority)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .authorize_agent_start(generation, &request, &observed)
+                .unwrap(),
+            receipt
+        );
+        let mut changed_request = request.clone();
+        changed_request.wrapper_pid += 1;
+        let changed_observation = ObservedWrapperIdentity {
+            pid: changed_request.wrapper_pid,
+            ..observed
+        };
+        assert!(
+            store
+                .authorize_agent_start(generation, &changed_request, &changed_observation)
+                .unwrap_err()
+                .contains("different persisted start acknowledgement")
         );
     }
 

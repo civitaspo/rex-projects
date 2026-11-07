@@ -150,6 +150,7 @@ impl AgentLaunchReservation {
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("reservation parent AgentRun ID and role must be present together".into());
         }
+        validate_launch_parent_role(self.role, self.parent_role)?;
         match (self.role, self.worker_assignment.as_ref()) {
             (Role::Worker, Some(assignment)) => assignment.validate()?,
             (Role::Worker, None) => {
@@ -868,6 +869,7 @@ impl AgentLaunchAuthority {
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("parent AgentRun ID and role must be present together".into());
         }
+        validate_launch_parent_role(self.role, self.parent_role)?;
         if self.role == Role::Supervisor {
             if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {
                 return Err("Project Supervisor launch authority cannot have a TicketRun".into());
@@ -901,8 +903,35 @@ impl AgentLaunchAuthority {
     }
 
     pub fn digest(&self) -> Result<ContentDigest, String> {
-        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        ContentDigest::parse(format!("{:x}", Sha256::digest(bytes)))
+        let json = self.storage_json()?;
+        ContentDigest::parse(format!("{:x}", Sha256::digest(json.as_bytes())))
+    }
+
+    /// Serialize the immutable authority as stored. Schema-v7 records predate both optional
+    /// fields and were digested without them; preserve those bytes only when both fields have
+    /// their v7 defaults. Non-default schema-v8 authorities keep the current serialization.
+    pub(crate) fn storage_json(&self) -> Result<String, String> {
+        let mut json = serde_json::to_string(self).map_err(|error| error.to_string())?;
+        if self.operation_recipe_id.is_none()
+            && self.wake_snapshot_digest == empty_wake_snapshot_digest()
+        {
+            let fields = [
+                String::from(",\"operation_recipe_id\":null"),
+                format!(
+                    ",\"wake_snapshot_digest\":\"{}\"",
+                    self.wake_snapshot_digest
+                ),
+            ];
+            for field in fields {
+                if !json.contains(&field) {
+                    return Err(
+                        "Agent launch authority JSON omitted an expected default field".into(),
+                    );
+                }
+                json = json.replacen(&field, "", 1);
+            }
+        }
+        Ok(json)
     }
 
     pub fn expectation(&self, qualification: &ProviderQualification) -> LaunchExpectation {
@@ -935,6 +964,30 @@ impl AgentLaunchAuthority {
 
 fn empty_wake_snapshot_digest() -> ContentDigest {
     ContentDigest::parse("0".repeat(64)).expect("fixed digest is valid")
+}
+
+fn validate_launch_parent_role(child_role: Role, parent_role: Option<Role>) -> Result<(), String> {
+    let Some(parent_role) = parent_role else {
+        return Ok(());
+    };
+    let expected = match child_role {
+        Role::Supervisor => {
+            return Err("Project Supervisor cannot have a parent AgentRun".into());
+        }
+        Role::Coordinator => Role::Supervisor,
+        Role::Planner
+        | Role::Worker
+        | Role::Reviewer
+        | Role::MergeDecision
+        | Role::Operator
+        | Role::Postmortem => Role::Coordinator,
+    };
+    if parent_role != expected {
+        return Err(format!(
+            "{child_role:?} launch parent role must be {expected:?}, got {parent_role:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// The process wrapper's start observation. It contains identity facts only, never environment
@@ -1155,6 +1208,7 @@ mod tests {
         AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, LaunchDecision,
         LaunchExpectation, ObservedProviderStart, ProviderQualification, QualificationIdentity,
         QualificationProof, QualificationStatus, authorize_start, migrate_v7,
+        validate_launch_parent_role,
     };
     use crate::domain::ids::{
         AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketRunId,
@@ -1163,6 +1217,26 @@ mod tests {
 
     fn digest(byte: char) -> Digest {
         Digest::parse(byte.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn parent_role_topology_is_closed_when_a_parent_is_declared() {
+        assert!(validate_launch_parent_role(Role::Supervisor, None).is_ok());
+        assert!(validate_launch_parent_role(Role::Coordinator, Some(Role::Supervisor)).is_ok());
+        for child in [
+            Role::Planner,
+            Role::Worker,
+            Role::Reviewer,
+            Role::MergeDecision,
+            Role::Operator,
+            Role::Postmortem,
+        ] {
+            assert!(validate_launch_parent_role(child, Some(Role::Coordinator)).is_ok());
+            assert!(validate_launch_parent_role(child, None).is_ok());
+            assert!(validate_launch_parent_role(child, Some(Role::Planner)).is_err());
+        }
+        assert!(validate_launch_parent_role(Role::Supervisor, Some(Role::Coordinator)).is_err());
+        assert!(validate_launch_parent_role(Role::Coordinator, Some(Role::Planner)).is_err());
     }
 
     fn qualification(status: QualificationStatus) -> ProviderQualification {
