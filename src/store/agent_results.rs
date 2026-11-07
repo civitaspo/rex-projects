@@ -2524,12 +2524,19 @@ pub(crate) mod host_validation_fixture {
         pub ingested: IngestedAgentResult,
     }
 
+    pub(crate) struct InPlaceValidatedResultFixture {
+        pub artifacts: crate::artifacts::ArtifactStore,
+        pub start: StartRequestEnvelope,
+        pub terminal: VerifiedAgentTerminal,
+        pub ingested: IngestedAgentResult,
+    }
+
     /// Builds real host terminal and result evidence around test-seeded running launch records.
     /// Qualification, published package, process absence, terminal, and result validators are
     /// production paths; only the earlier controller/Rex prerecords are seeded in the test DB.
     pub(crate) fn host_validated_result(
         role: Role,
-        mut message: RoleResultMessage,
+        message: RoleResultMessage,
     ) -> Result<TestValidatedResultFixture, String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = std::fs::canonicalize(temp.path()).map_err(|error| error.to_string())?;
@@ -2585,6 +2592,51 @@ pub(crate) mod host_validation_fixture {
             "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,?3,1,1)",
             rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), recipe_id],
         ).map_err(|error| error.to_string())?;
+        let evidence = host_validated_result_in(
+            &mut store,
+            &root,
+            owner_generation,
+            project_id,
+            ticket_run_id,
+            role,
+            message,
+        )?;
+        Ok(TestValidatedResultFixture {
+            _temp: temp,
+            store,
+            artifacts: evidence.artifacts,
+            owner_generation,
+            start: evidence.start,
+            terminal: evidence.terminal,
+            ingested: evidence.ingested,
+        })
+    }
+
+    /// Adds a real host-validated result to an existing publication/Reviewing database.
+    /// Project configuration, owner, and TicketRun state are read from that database so the
+    /// launch authority is bound to its current revision and configuration.
+    pub(crate) fn host_validated_result_in(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        role: Role,
+        mut message: RoleResultMessage,
+    ) -> Result<InPlaceValidatedResultFixture, String> {
+        let project = store
+            .project(&project_id)?
+            .ok_or("fixture Project is missing")?;
+        let config_source = project.config_source.clone();
+        let config_revision = project.config_revision;
+        let config_digest = project.config_digest.as_str().to_owned();
+        let (ticket_revision, namespace, ticket_id): (u64, String, String) = store.connection
+            .query_row(
+                "SELECT revision,namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| error.to_string())?;
         let agent_run_id = AgentRunId::parse("fixture-agent-run")?;
         let mut authority = crate::store::agent_results::tests::test_authority();
         authority.agent_run_id = agent_run_id.clone();
@@ -2600,7 +2652,7 @@ pub(crate) mod host_validation_fixture {
         authority.parent_role = Some(Role::Coordinator);
         authority.ticket_run_id = Some(ticket_run_id.clone());
         authority.ticket_revision = Some(Revision(ticket_revision));
-        authority.config_revision = applied.revision;
+        authority.config_revision = config_revision;
         authority.config_digest = Digest::parse(config_digest.clone())?;
         authority.controller_generation = owner_generation;
         authority.rex_server_identity = "fixture-rex".into();
@@ -2649,19 +2701,19 @@ pub(crate) mod host_validation_fixture {
             .to_owned();
         let now = 1_i64;
         store.connection.execute(
-            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,state,controller_generation) VALUES (?1,?2,'fixture',?3,?4,?5,'fixture-owner',1,?6,?7,?8,?9,'running',?10)",
-            rusqlite::params![run_id_str, project_id.as_str(), applied.revision.0, config_digest, authority.role_session_id, authority.operation_id.as_str(), authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, owner_generation],
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,?6,'fixture-owner',1,?7,?8,?9,?10,'running',?11)",
+            rusqlite::params![run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, authority.role_session_id, authority.operation_id.as_str(), authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, owner_generation],
         ).map_err(|error| error.to_string())?;
         let view_id = crate::launch::RexView::derive_id(
             &project_id,
             crate::launch::RexViewKind::Ticket,
-            Some("fixture"),
-            Some("T-1"),
+            Some(&namespace),
+            Some(&ticket_id),
             1,
         )?;
         store.connection.execute(
-            "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'ticket','fixture','T-1',1,'fixture-rex','fixture-session','fixture-window',0,'active',?3,?3)",
-            rusqlite::params![view_id.as_str(), project_id.as_str(), now],
+            "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'ticket',?3,?4,1,'fixture-rex','fixture-session','fixture-window',0,'active',?5,?5)",
+            rusqlite::params![view_id.as_str(), project_id.as_str(), namespace, ticket_id, now],
         ).map_err(|error| error.to_string())?;
         authority.rex_view_id = view_id;
         authority.descriptor_path = root.join("run-step-package-final.json");
@@ -2672,13 +2724,13 @@ pub(crate) mod host_validation_fixture {
         authority.descriptor_digest = package.publish_once(&authority.descriptor_path)?;
         let parent_run_id_str = parent_run_id.as_str();
         store.connection.execute(
-            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'fixture',?3,?4,'fixture-coordinator','fixture-owner',1,'fixture-parent-operation','running',?5)",
-            rusqlite::params![parent_run_id_str, project_id.as_str(), applied.revision.0, config_digest, owner_generation],
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,'fixture-coordinator','fixture-owner',1,'fixture-parent-operation','running',?6)",
+            rusqlite::params![parent_run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, owner_generation],
         ).map_err(|error| error.to_string())?;
         let parent_authority_digest = "c".repeat(64);
         store.connection.execute(
             "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'coordinator','fixture-coordinator',?3,1,?4,?5,1,1,?6,'fixture-parent-operation',?7,?8,?8,'/fixture/parent-package',?8,'fixture-profile',?8,?8,?8,?9,'fixture-rex','fixture-session','fixture-window','fixture-parent-block','/fixture/workspace','/fixture/control',?8,'{}',?10,?11)",
-            rusqlite::params![parent_run_id_str, project_id.as_str(), ticket_run_id.as_str(), applied.revision.0, config_digest, owner_generation, authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.qualification_receipt_digest.as_str(), parent_authority_digest, now],
+            rusqlite::params![parent_run_id_str, project_id.as_str(), ticket_run_id.as_str(), config_revision.0, config_digest, owner_generation, authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.qualification_receipt_digest.as_str(), parent_authority_digest, now],
         ).map_err(|error| error.to_string())?;
         store.connection.execute(
             "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,'coordinator',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)",
@@ -2861,11 +2913,8 @@ pub(crate) mod host_validation_fixture {
         let artifacts = crate::artifacts::ArtifactStore::open(&root.join("artifacts"))?;
         let ingested =
             store.store_validated_agent_result(&artifacts, owner_generation, &terminal, message)?;
-        Ok(TestValidatedResultFixture {
-            _temp: temp,
-            store,
+        Ok(InPlaceValidatedResultFixture {
             artifacts,
-            owner_generation,
             start,
             terminal,
             ingested,

@@ -729,25 +729,33 @@ fn apply_agent_result(
         proposal.plan.clone(),
         &observed_bases,
     )?;
-    let Some(node) = validated.nodes_in_execution_order.iter().find(|node| {
-        node.role == Role::Worker
-            && node.depends_on.is_empty()
-            && matches!(node.base, WorkBaseSource::ControllerObservedCommit { .. })
-    }) else {
-        return Err("Coordinator plan contains no implementation Worker nodes".into());
-    };
-    if !config.repositories.contains_key(&node.repository) {
-        return Err("validated work node repository is no longer configured".into());
+    let mut work_nodes = Vec::new();
+    for node in validated
+        .nodes_in_execution_order
+        .iter()
+        .filter(|node| node.role == Role::Worker)
+    {
+        // A dependent node must be prepared from its predecessor's validated
+        // accepted head; preparing it from trunk would violate the declared Git base.
+        let WorkBaseSource::ControllerObservedCommit { commit } = &node.base else {
+            return Err(format!(
+                "work node {} depends on a predecessor head that is not available before implementation",
+                node.id
+            ));
+        };
+        if !config.repositories.contains_key(&node.repository) {
+            return Err("validated work node repository is no longer configured".into());
+        }
+        work_nodes.push(crate::delivery_runtime::PreparedWorktreeNodeRequest {
+            work_node_id: node.id.clone(),
+            repository_id: node.repository.clone(),
+            expected_base_sha: commit.clone(),
+            commit_mode: services.profile_commit_mode(&binding.project_id, Role::Worker)?,
+        });
     }
-    let WorkBaseSource::ControllerObservedCommit { commit } = &node.base else {
-        unreachable!("the initial Worker must have a controller-observed base")
-    };
-    let work_nodes = vec![crate::delivery_runtime::PreparedWorktreeNodeRequest {
-        work_node_id: node.id.clone(),
-        repository_id: node.repository.clone(),
-        expected_base_sha: commit.clone(),
-        commit_mode: services.profile_commit_mode(&binding.project_id, Role::Worker)?,
-    }];
+    if work_nodes.is_empty() {
+        return Err("Coordinator plan contains no implementation Worker nodes".into());
+    }
     let accepted_revision = source_revision
         .0
         .checked_add(1)
@@ -2880,6 +2888,28 @@ pub(crate) mod tests {
         fn effect_handlers(&self) -> Vec<&dyn crate::effects::EffectHandler> {
             Vec::new()
         }
+    }
+
+    pub(crate) fn apply_agent_result_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<bool, String> {
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+        };
+        super::apply_agent_result(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            &mut services,
+            result,
+        )
     }
 
     #[test]

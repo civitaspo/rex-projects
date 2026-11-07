@@ -5463,7 +5463,7 @@ mod tests {
     }
 
     #[test]
-    fn dependent_work_node_uses_published_predecessor_head_before_review() {
+    fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
         use crate::delivery_runtime::{
@@ -5478,6 +5478,7 @@ mod tests {
             PlannedWorkNode, WorkDependency, WorkDependencyKind, WorkPlan,
         };
         use crate::engine::reducer::Phase;
+        use sha2::Digest as _;
 
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -6098,33 +6099,115 @@ mod tests {
                 .any(|receipt| receipt.intent().operation_id == corrected_intent.operation_id)
         );
 
-        let review_payload = serde_json::json!({
-            "schema_version": 1,
-            "kind": "review_assessment",
-            "source_revision": corrected_review.revision,
-            "accepted_revision": corrected_review.revision + 1,
-            "transition": "review_converged",
-        })
-        .to_string();
-        let review_input = DurableInput {
-            producer_id: "reviewer-test".into(),
-            message_id: "review-converged-for-snapshot-test".into(),
-            content_digest: durable_input_digest("ticket_run", &review_payload),
-            recipient: "ticket_run".into(),
-            payload: review_payload.clone(),
+        let accepted = corrected_snapshot.accepted_plan();
+        let mut publication_facts = corrected_snapshot
+            .publication_receipts()
+            .iter()
+            .map(|receipt| {
+                let publication: ImplementationPublicationReceipt =
+                    serde_json::from_str(receipt.receipt_json()).unwrap();
+                serde_json::json!({
+                    "work_node_id": publication.work_node_id,
+                    "repository_id": publication.repository_id,
+                    "pull_request_number": publication.pull_request.number,
+                    "pull_request_node_id": publication.pull_request.node_id,
+                    "pull_request_head": publication.pull_request.source_head,
+                    "published_head": publication.push.pushed_head,
+                    "receipt_digest": format!("{:x}", sha2::Sha256::digest(receipt.receipt_json().as_bytes())),
+                })
+            })
+            .collect::<Vec<_>>();
+        publication_facts
+            .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
+        let publication_subject = serde_json::json!({
+            "ticket_run_id": ticket_run_id,
+            "accepted_plan_digest": accepted.plan_digest,
+            "publications": publication_facts,
+        });
+        let subject_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&publication_subject).unwrap())
+        );
+        let evidence_coverage = accepted
+            .proposal
+            .nodes
+            .iter()
+            .filter(|node| !node.investigation)
+            .map(|node| node.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let structured_result = serde_json::json!({
+            "subject_kind": "implementation_publication_set",
+            "subject_digest": subject_digest,
+            "findings": [],
+            "evidence_coverage": evidence_coverage,
+            "disposition": "approved",
+            "unknowns": [],
+        });
+        let reviewer_message = crate::roles::RoleResultMessage {
+            schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "reviewer-published-snapshot".into(),
+            kind: crate::engine::orchestration::RoleOutputKind::ReviewReady,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            result_digest: Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+            ))
+            .unwrap(),
+            structured_result,
+            artifact_refs: Vec::new(),
         };
-        store
-            .commit_ticket_transition(
+        let reviewer_evidence =
+            crate::store::agent_results::host_validation_fixture::host_validated_result_in(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
                 owner_generation,
-                &ticket_run_id,
-                Revision(corrected_review.revision),
-                &review_input,
-                Input::ReviewConverged,
-                "test accepted Reviewer transition for snapshot lookup",
-                &review_payload,
-                &[],
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::Reviewer,
+                reviewer_message,
             )
             .unwrap();
+        let mut tampered = reviewer_evidence.ingested.clone();
+        let crate::engine::orchestration::RoleResultPayload::ReviewReady(assessment) =
+            &mut tampered.validated.typed_payload
+        else {
+            panic!("validated reviewer evidence has the wrong payload type");
+        };
+        assessment.subject_digest = Digest::parse("f".repeat(64)).unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &tampered,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                17,
+                &config,
+                config_digest.clone(),
+                &reviewer_evidence.ingested,
+            )
+            .unwrap()
+        );
+        let result_ack: (u64, String) = store
+            .connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [reviewer_evidence.ingested.receipt.evidence_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            result_ack,
+            (corrected_review.revision + 1, "applied".into())
+        );
         let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
         let merge_snapshot = store
             .accepted_implementation_publication_snapshot(
@@ -6159,6 +6242,29 @@ mod tests {
                 )
                 .unwrap(),
             2
+        );
+        assert!(
+            store
+                .pending_validated_agent_results(&reviewer_evidence.artifacts, owner_generation, 10)
+                .unwrap()
+                .is_empty()
+        );
+        drop(reviewer_evidence);
+        drop(store);
+        let mut reopened = ConfigStore::open_test(temp.path()).unwrap();
+        assert_eq!(
+            reopened.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Assessing
+        );
+        assert!(
+            reopened
+                .pending_validated_agent_results(
+                    &crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap(),
+                    owner_generation,
+                    10,
+                )
+                .unwrap()
+                .is_empty()
         );
     }
 
