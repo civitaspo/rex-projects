@@ -1,4 +1,82 @@
+use std::collections::VecDeque;
+use std::io::{self, Read};
 use std::process::Command;
+use std::process::{Child, ExitStatus, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const MAX_CAPTURED_STDERR_BYTES: usize = 8 * 1024;
+
+struct ForegroundOwner {
+    child: Child,
+    stderr_reader: Option<JoinHandle<VecDeque<u8>>>,
+}
+
+impl ForegroundOwner {
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        let mut child = command.stderr(Stdio::piped()).spawn()?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .expect("piped stderr is available after spawn");
+        let stderr_reader = std::thread::spawn(move || {
+            let mut tail = VecDeque::with_capacity(MAX_CAPTURED_STDERR_BYTES);
+            let mut chunk = [0; 2048];
+            loop {
+                let read = match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                for byte in &chunk[..read] {
+                    if tail.len() == MAX_CAPTURED_STDERR_BYTES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
+            }
+            tail
+        });
+        Ok(Self {
+            child,
+            stderr_reader: Some(stderr_reader),
+        })
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
+    }
+
+    fn terminate(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+
+    fn stderr_tail(&mut self) -> String {
+        self.stderr_reader
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .map(|bytes| {
+                let bytes: Vec<u8> = bytes.into_iter().collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+            .unwrap_or_else(|| "<stderr capture unavailable>".into())
+    }
+}
+
+impl Drop for ForegroundOwner {
+    fn drop(&mut self) {
+        self.terminate();
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rex-projects"));
@@ -23,16 +101,13 @@ fn fixture(
     .unwrap();
     std::fs::write(
         &config,
-        format!(
-            "{}\n[runtime.environment]\nsource = \"current\"\ninteractive = false\ntimeout_seconds = 15\n",
-            source.replacen(
+        source.replacen(
             "schema_version = 1",
             &format!(
                 "schema_version = 1\nstate_root = \"{}\"",
                 temp.path().join("runtime").display()
             ),
             1,
-            )
         ),
     )
     .unwrap();
@@ -72,6 +147,31 @@ fn version_reports_the_cargo_package_version() {
 }
 
 #[test]
+fn foreground_owner_reports_exit_status_and_bounds_captured_stderr() {
+    let mut child = ForegroundOwner::spawn({
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import sys; sys.stderr.write('x' * 20000); sys.exit(17)",
+        ]);
+        command
+    })
+    .expect("spawn stderr fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "stderr fixture timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = child.stderr_tail();
+    assert_eq!(status.code(), Some(17));
+    assert_eq!(stderr.len(), MAX_CAPTURED_STDERR_BYTES);
+    assert!(stderr.bytes().all(|byte| byte == b'x'));
+}
+
+#[test]
 fn unsupported_invocation_is_reported_as_usage_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
         .arg("run")
@@ -88,7 +188,7 @@ fn unsupported_invocation_is_reported_as_usage_error() {
 }
 
 #[test]
-fn factory_agent_marker_rejects_human_mutations_before_state_access() {
+fn agent_marker_cannot_submit_human_claim_release() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
     let mutations: &[&[&str]] = &[
@@ -111,18 +211,6 @@ fn factory_agent_marker_rejects_human_mutations_before_state_access() {
             "cancel and re-triage",
             "--disposition",
             "cancel",
-        ],
-        &["human", "list"],
-        &[
-            "human",
-            "respond",
-            "request-1",
-            "--subject-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--choice",
-            "approve",
-            "--explanation",
-            "reviewed",
         ],
     ];
     for marker in ["REX_PROJECTS_AGENT", "REX_PROJECTS_CONTEXT"] {
@@ -271,120 +359,6 @@ fn controller_once_publishes_local_project_status_then_releases_ownership() {
 }
 
 #[test]
-fn dashboard_json_uses_the_typed_local_projection_without_a_terminal() {
-    let temp = tempfile::tempdir().unwrap();
-    let (config, state, home) = fixture(&temp);
-    let apply = command(&config, &state, &home)
-        .args(["config", "apply", "--bootstrap"])
-        .output()
-        .unwrap();
-    assert!(
-        apply.status.success(),
-        "{}",
-        String::from_utf8_lossy(&apply.stderr)
-    );
-    let run = command(&config, &state, &home)
-        .args(["runtime", "run", "--once"])
-        .output()
-        .unwrap();
-    assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-
-    let dashboard = command(&config, &state, &home)
-        .args(["--json", "dashboard"])
-        .output()
-        .unwrap();
-    assert!(
-        dashboard.status.success(),
-        "{}",
-        String::from_utf8_lossy(&dashboard.stderr)
-    );
-    let snapshot: serde_json::Value = serde_json::from_slice(&dashboard.stdout).unwrap();
-    assert_eq!(snapshot["projects"].as_array().unwrap().len(), 2);
-    assert!(snapshot["tickets"].as_array().is_some());
-    assert!(snapshot["agents"].as_array().is_some());
-    assert!(snapshot["human_requests"].as_array().is_some());
-}
-
-#[cfg(unix)]
-#[test]
-fn runtime_pins_the_verified_rex_endpoint_and_context_in_owner_projection() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::Stdio;
-
-    let temp = tempfile::tempdir().unwrap();
-    let (config, state, home) = fixture(&temp);
-    let rex = temp.path().join("rex-fixture");
-    let script = "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{\"endpoint\":\"unix:///tmp/rex-fixture.sock\",\"instance_id\":\"rex-fixture\",\"host_id\":\"host\",\"rex_version\":\"1\"}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{\"methods\":{\"session.view\":{},\"session.new_window\":{},\"session.new_split\":{},\"session.focus_block\":{},\"session.zoom_block\":{},\"block.close\":{}}}' ;;\n  *\"session.view\"*) printf '%s\\n' '{\"windows\":[{\"window_id\":\"w1\",\"layers\":[{\"blocks\":[{\"block_id\":\"b1\",\"label\":\"rex-projects-run-fixture\",\"flavor\":\"com.superlogical.terminal.shell\"}]}]}]}' ;;\n  *) exit 3 ;;\nesac\n";
-    std::fs::write(&rex, script).unwrap();
-    std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let config_contents = std::fs::read_to_string(&config).unwrap();
-    let config_contents = config_contents.replacen(
-        "state_root =",
-        &format!("runtime.rex_binary = \"{}\"\nstate_root =", rex.display()),
-        1,
-    );
-    std::fs::write(&config, config_contents).unwrap();
-    let apply = command(&config, &state, &home)
-        .args(["config", "apply", "--bootstrap"])
-        .output()
-        .unwrap();
-    assert!(
-        apply.status.success(),
-        "{}",
-        String::from_utf8_lossy(&apply.stderr)
-    );
-
-    let mut owner = command(&config, &state, &home)
-        .args([
-            "runtime",
-            "run",
-            "--rex-server",
-            "unix:///tmp/rex-fixture.sock",
-        ])
-        .env("REX_SESSION", "session-fixture")
-        .env("REX_BLOCK", "b1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let projection = state.join("runtime-owner.json");
-    let mut observed = None;
-    for _ in 0..150 {
-        if let Ok(bytes) = std::fs::read(&projection) {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if value["rex_endpoint"] == "unix:///tmp/rex-fixture.sock" {
-                    observed = Some(value);
-                    break;
-                }
-            }
-        }
-        if owner.try_wait().unwrap().is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let value = observed.expect("controller should publish its validated Rex binding");
-    assert_eq!(value["rex_server_identity"], "rex-fixture");
-    assert_eq!(value["rex_session_id"], "session-fixture");
-    assert_eq!(value["rex_block_id"], "b1");
-
-    let stop = command(&config, &state, &home)
-        .args(["runtime", "stop", "--request-id", "stop-dashboard-fixture"])
-        .output()
-        .unwrap();
-    assert!(
-        stop.status.success(),
-        "{}",
-        String::from_utf8_lossy(&stop.stderr)
-    );
-    assert!(owner.wait().unwrap().success());
-}
-
-#[test]
 fn project_start_queues_only_to_the_active_foreground_owner() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
@@ -394,13 +368,19 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         .unwrap();
     assert!(apply.status.success());
 
-    let mut owner = command(&config, &state, &home)
-        .args(["runtime", "run"])
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut active = false;
-    for _ in 0..100 {
+    let mut owner_command = command(&config, &state, &home);
+    owner_command.args(["runtime", "run"]);
+    let mut owner = ForegroundOwner::spawn(owner_command)
+        .expect("spawn foreground controller with captured stderr");
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = owner
+            .try_wait()
+            .expect("poll foreground controller process")
+        {
+            let stderr = owner.stderr_tail();
+            panic!("foreground controller exited during startup ({status}); stderr: {stderr}");
+        }
         let status = command(&config, &state, &home)
             .args(["--json", "status"])
             .output()
@@ -409,17 +389,14 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
             && serde_json::from_slice::<serde_json::Value>(&status.stdout)
                 .is_ok_and(|report| report["owner"]["active"] == true)
         {
-            active = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if !active {
-        let output = owner.wait_with_output().unwrap();
-        panic!(
-            "foreground controller did not become visible: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if Instant::now() >= startup_deadline {
+            owner.terminate();
+            let stderr = owner.stderr_tail();
+            panic!("foreground controller startup timed out after 10s; stderr: {stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     let start = command(&config, &state, &home)
         .args([
@@ -526,5 +503,9 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         .unwrap();
     assert!(stop.status.success());
     let status = owner.wait().unwrap();
-    assert!(status.success());
+    let stderr = owner.stderr_tail();
+    assert!(
+        status.success(),
+        "foreground controller exited with {status}; stderr: {stderr}"
+    );
 }

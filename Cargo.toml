@@ -20,6 +20,7 @@ sha2 = "0.10"
 toml = "0.9"
 
 [dev-dependencies]
+jsonschema = { version = "0.60.2", default-features = false }
 tempfile = "3"
 
 [profile.release]

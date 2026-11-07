@@ -33,9 +33,10 @@ with tempfile.TemporaryDirectory(prefix="rex-projects bootstrap ") as directory:
         "probe_exit_code": result.returncode,
         "probe_succeeded": result.returncode == 0,
         "version_matches_fixture": metadata.get("version") == "0.1.0-dev.fixture",
-        "target_matches_fixture": metadata.get("target") == "darwin-aarch64",
-        "protocol_matches_fixture": metadata.get("protocol_version") == 1,
-        "bootstrap_schema_matches_fixture": metadata.get("bootstrap_schema") == 1,
+        "target_matches_fixture": metadata.get("target") == "aarch64-apple-darwin",
+        "protocol_matches_fixture": metadata.get("cli_protocol") == 1,
+        "database_schema_matches_fixture": metadata.get("database_schema") == 1,
+        "dirty_type_matches_fixture": metadata.get("dirty") is False,
     }
     print(json.dumps(checks, indent=2, sort_keys=True))
     if not all(value is True for key, value in checks.items() if isinstance(value, bool)):

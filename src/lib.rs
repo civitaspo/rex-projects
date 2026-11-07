@@ -1,12 +1,13 @@
 pub mod adapters;
 pub mod cli;
 pub mod config;
+pub mod dashboard;
 pub mod delivery_forge;
 pub mod delivery_runtime;
-pub mod dashboard;
 pub mod domain;
 pub mod effects;
 pub mod engine;
+pub mod environment;
 pub mod hooks;
 pub mod host_commit;
 pub mod human;
