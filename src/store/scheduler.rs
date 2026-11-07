@@ -1359,12 +1359,13 @@ impl ConfigStore {
             return Err("goal ticket proposal must be canonical and match its digest".into());
         }
         ticket_request.validate()?;
+        let ticket_proposal = serde_json::to_value(&ticket_request.proposal)
+            .map_err(|error| error.to_string())?;
         if ticket_request.project_id != *project_id
             || ticket_request.namespace != *namespace
             || ticket_request.request_key != request_key
             || ticket_request.request_digest.as_str() != request_digest
-            || serde_json::to_string(&ticket_request.proposal).map_err(|error| error.to_string())?
-                != proposal_json
+            || ticket_proposal != proposal
         {
             return Err("goal ticket effect does not match its reserved proposal".into());
         }
