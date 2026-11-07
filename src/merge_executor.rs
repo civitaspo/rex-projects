@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::ids::{Digest, HumanRequestId};
 use crate::domain::types::MergeMethod;
@@ -131,7 +132,6 @@ impl HumanMergeApproval {
         policy: &MergePolicy,
         assessment: &MergeAssessment,
         procedure: &MergeProcedure,
-        now_unix: u64,
     ) -> Result<Self, MergeExecutionError> {
         let configuration_digest = assessment.subject.config_digest.clone();
         let policy_digest = canonical_digest(policy).map_err(forge_error)?;
@@ -151,7 +151,7 @@ impl HumanMergeApproval {
             || !receipt.is_explicit_approval()
             || receipt.response_id().trim().is_empty()
             || receipt.decided_at_unix() >= receipt.expires_at_unix()
-            || now_unix >= receipt.expires_at_unix()
+            || current_unix_time()? >= receipt.expires_at_unix()
         {
             return Err(MergeExecutionError::HumanApprovalRequired(
                 "host approval receipt is stale, unapproved, or bound to a different request"
@@ -183,7 +183,6 @@ pub struct MergeStepReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StepIntent {
     pub operation_key: String,
-    pub attempt_started_unix: u64,
     pub authenticated_actor: String,
     /// Exact bytes included in the approved procedure's prepared body digest.
     pub exact_prepared_body: Option<String>,
@@ -286,7 +285,7 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             approval,
             &procedure_digest,
             &policy_digest,
-            intent.attempt_started_unix,
+            current_unix_time()?,
         )?;
         if approved.disposition == MergeDisposition::HumanRequired && !human_approved {
             return Err(MergeExecutionError::HumanApprovalRequired(
@@ -358,6 +357,13 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                     exact_body: body.clone(),
                     approved_body_digest: approved_body_digest.clone(),
                 };
+                validate_approval(
+                    approved,
+                    approval,
+                    &procedure_digest,
+                    &policy_digest,
+                    current_unix_time()?,
+                )?;
                 let ack = self
                     .forge
                     .update_body(&effect)
@@ -397,6 +403,13 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                     expected_head_sha: expected_head_sha.clone(),
                     expected_base_sha: approved.subject.base_sha.clone(),
                 };
+                validate_approval(
+                    approved,
+                    approval,
+                    &procedure_digest,
+                    &policy_digest,
+                    current_unix_time()?,
+                )?;
                 let ack = self
                     .forge
                     .execute_merge(&effect)
@@ -540,6 +553,13 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             expected_trailers: expected_trailers.to_vec(),
         }))
     }
+}
+
+fn current_unix_time() -> Result<u64, MergeExecutionError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| MergeExecutionError::Invalid("system clock is before Unix epoch".into()))
 }
 
 fn validate_procedure_policy(
@@ -767,6 +787,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct AcceptedReceipt {
         request_id: HumanRequestId,
         response_id: String,
@@ -865,7 +886,7 @@ mod tests {
             policy_digest,
             approved: true,
             decided_at_unix: 100,
-            expires_at_unix: 200,
+            expires_at_unix: u64::MAX,
         };
         (
             receipt,
@@ -888,7 +909,6 @@ mod tests {
             &policy,
             &assessment,
             &procedure,
-            150,
         )
         .unwrap();
         let procedure_digest = canonical_digest(&procedure).unwrap();
@@ -903,6 +923,18 @@ mod tests {
             )
             .unwrap()
         );
+        let mut cached_after_expiry = approval.clone();
+        cached_after_expiry.expires_at_unix = 1;
+        assert!(
+            validate_approval(
+                &assessment,
+                Some(&cached_after_expiry),
+                &procedure_digest,
+                &policy_digest,
+                current_unix_time().unwrap(),
+            )
+            .is_err()
+        );
         assert!(
             HumanMergeApproval::from_host_validated_receipt(
                 &receipt,
@@ -911,7 +943,6 @@ mod tests {
                 &policy,
                 &assessment,
                 &procedure,
-                150,
             )
             .is_err()
         );
@@ -923,19 +954,19 @@ mod tests {
                 &policy,
                 &assessment,
                 &procedure,
-                150,
             )
             .is_err()
         );
+        let mut expired = receipt.clone();
+        expired.expires_at_unix = 1;
         assert!(
             HumanMergeApproval::from_host_validated_receipt(
-                &receipt,
+                &expired,
                 &request_id,
                 &subject_digest,
                 &policy,
                 &assessment,
                 &procedure,
-                200,
             )
             .is_err()
         );
@@ -949,7 +980,6 @@ mod tests {
                 &policy,
                 &assessment,
                 &procedure,
-                150,
             )
             .is_err()
         );
