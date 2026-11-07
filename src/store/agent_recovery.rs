@@ -286,7 +286,47 @@ pub(crate) fn migrate_v12_recovery_tables(tx: &Transaction<'_>) -> Result<(), St
             BEGIN SELECT RAISE(ABORT, 'StopOwnedRuns intent is immutable'); END;
             CREATE TRIGGER agent_stop_owned_runs_intents_immutable_delete
             BEFORE DELETE ON agent_stop_owned_runs_intents
-            BEGIN SELECT RAISE(ABORT, 'StopOwnedRuns intent is retained'); END;",
+            BEGIN SELECT RAISE(ABORT, 'StopOwnedRuns intent is retained'); END;
+
+            CREATE TABLE agent_stop_owned_runs_progress (
+                operation_id TEXT PRIMARY KEY REFERENCES agent_stop_owned_runs_intents(operation_id),
+                cursor_index INTEGER NOT NULL CHECK(cursor_index >= 0),
+                sweep_count INTEGER NOT NULL CHECK(sweep_count >= 0),
+                updated_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE agent_stop_owned_runs_process_snapshots (
+                operation_id TEXT NOT NULL REFERENCES agent_stop_owned_runs_intents(operation_id),
+                agent_run_id TEXT NOT NULL REFERENCES agent_runs(agent_run_id),
+                reservation_epoch INTEGER NOT NULL CHECK(reservation_epoch > 0),
+                authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64),
+                process_tree_digest TEXT NOT NULL CHECK(length(process_tree_digest) = 64),
+                process_tree_json TEXT NOT NULL CHECK(length(process_tree_json) <= 524288),
+                observed_at_unix INTEGER NOT NULL,
+                PRIMARY KEY(operation_id,agent_run_id)
+            );
+            CREATE TRIGGER agent_stop_owned_runs_process_snapshots_immutable_update
+            BEFORE UPDATE ON agent_stop_owned_runs_process_snapshots
+            BEGIN SELECT RAISE(ABORT, 'StopOwnedRuns process snapshots are immutable'); END;
+            CREATE TRIGGER agent_stop_owned_runs_process_snapshots_immutable_delete
+            BEFORE DELETE ON agent_stop_owned_runs_process_snapshots
+            BEGIN SELECT RAISE(ABORT, 'StopOwnedRuns process snapshots are retained'); END;
+            CREATE TABLE agent_stop_owned_runs_completions (
+                operation_id TEXT NOT NULL REFERENCES agent_stop_owned_runs_intents(operation_id),
+                agent_run_id TEXT NOT NULL REFERENCES agent_runs(agent_run_id),
+                reservation_epoch INTEGER NOT NULL CHECK(reservation_epoch > 0),
+                authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64),
+                process_tree_digest TEXT NOT NULL CHECK(length(process_tree_digest) = 64),
+                rex_observation_digest TEXT NOT NULL CHECK(length(rex_observation_digest) = 64),
+                proof_digest TEXT NOT NULL CHECK(length(proof_digest) = 64),
+                observed_at_unix INTEGER NOT NULL,
+                PRIMARY KEY(operation_id,agent_run_id)
+            );
+            CREATE TRIGGER agent_stop_owned_runs_completions_immutable_update
+            BEFORE UPDATE ON agent_stop_owned_runs_completions
+            BEGIN SELECT RAISE(ABORT, 'StopOwnedRuns completion proofs are immutable'); END;
+            CREATE TRIGGER agent_stop_owned_runs_completions_immutable_delete
+            BEFORE DELETE ON agent_stop_owned_runs_completions
+            BEGIN SELECT RAISE(ABORT, 'StopOwnedRuns completion proofs are retained'); END;",
         )
         .map_err(|error| error.to_string())
 }

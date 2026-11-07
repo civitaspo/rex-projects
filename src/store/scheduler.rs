@@ -114,25 +114,6 @@ pub struct ActiveTicketRun {
     pub recipe_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AgentWakeInput {
-    pub wake_input_id: u64,
-    pub source_type: String,
-    pub source_id: String,
-    pub source_revision: u64,
-    pub priority: i64,
-    pub payload_json: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AgentWakeSnapshot {
-    pub project_id: ProjectId,
-    pub role_session_id: String,
-    pub agent_run_id: crate::domain::ids::AgentRunId,
-    pub inputs: Vec<AgentWakeInput>,
-    pub digest: Digest,
-}
-
 /// A role session with at least one unassigned wake input. This is a scheduling
 /// hint only: `prepare_agent_launch` must recheck eligibility and assign the
 /// inputs transactionally before it starts any provider process.
@@ -246,7 +227,7 @@ pub(super) fn migrate_v9(connection: &Connection) -> Result<(), String> {
             completion_subject_digest TEXT,
             updated_at_unix INTEGER NOT NULL
         );
-        CREATE TABLE agent_wake_context (
+        CREATE TABLE IF NOT EXISTS agent_wake_context (
             agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
             context_json TEXT NOT NULL CHECK(length(context_json) <= 1048576),
             context_digest TEXT NOT NULL CHECK(length(context_digest)=64),
@@ -912,122 +893,6 @@ impl ConfigStore {
             return Err("ticket scan changed before error backoff could be committed".into());
         }
         tx.commit().map_err(|error| error.to_string())
-    }
-
-    /// Atomically snapshot the highest-priority pending wake inputs for a
-    /// launch-pending AgentRun. The immutable receipt is reused if descriptor
-    /// creation is retried after a crash.
-    pub fn assign_pending_wakes(
-        &mut self,
-        owner_generation: u64,
-        agent_run_id: &crate::domain::ids::AgentRunId,
-        limit: usize,
-        now_unix: i64,
-    ) -> Result<AgentWakeSnapshot, String> {
-        if limit == 0 || limit > 256 {
-            return Err("Agent wake snapshot limit must be between 1 and 256".into());
-        }
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        validate_active_generation(&tx, owner_generation)?;
-        if let Some((context_json, context_digest)) = tx
-            .query_row(
-                "SELECT context_json,context_digest FROM agent_wake_context WHERE agent_run_id=?1",
-                [agent_run_id.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-        {
-            let snapshot: AgentWakeSnapshot =
-                crate::protocol::parse_unique(context_json.as_bytes())
-                    .map_err(|error| format!("stored wake snapshot is invalid: {error}"))?;
-            if snapshot.agent_run_id != *agent_run_id
-                || snapshot.digest.as_str()
-                    != agent_wake_snapshot_digest(
-                        &snapshot.project_id,
-                        &snapshot.role_session_id,
-                        &snapshot.agent_run_id,
-                        &snapshot.inputs,
-                    )?
-                || content_digest(&context_json) != context_digest
-            {
-                return Err("stored Agent wake snapshot digest or owner does not match".into());
-            }
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok(snapshot);
-        }
-        let (project_id, role_session_id, state): (String,String,String) = tx.query_row(
-            "SELECT project_id,role_session_id,state FROM agent_runs WHERE agent_run_id=?1 AND controller_generation=?2",
-            params![agent_run_id.as_str(),owner_generation],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-        ).map_err(|error| error.to_string())?;
-        if state != "launch_pending" || role_session_id.is_empty() {
-            return Err(
-                "AgentRun must be launch-pending and have a role session before wake assignment"
-                    .into(),
-            );
-        }
-        let already_active: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE role_session_id=?1 AND agent_run_id!=?2 AND state IN ('launch_pending','running','unknown'))",
-            params![role_session_id,agent_run_id.as_str()],
-            |row| row.get(0),
-        ).map_err(|error| error.to_string())?;
-        if already_active {
-            return Err("another active AgentRun already owns this role session".into());
-        }
-        let mut statement = tx.prepare(
-            "SELECT wake_input_id,source_type,source_id,source_revision,priority,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND lifecycle='pending' ORDER BY priority DESC,created_at_unix ASC,wake_input_id ASC LIMIT ?3",
-        ).map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(params![project_id, role_session_id, limit as u64], |row| {
-                Ok(AgentWakeInput {
-                    wake_input_id: row.get(0)?,
-                    source_type: row.get(1)?,
-                    source_id: row.get(2)?,
-                    source_revision: row.get(3)?,
-                    priority: row.get(4)?,
-                    payload_json: row.get(5)?,
-                })
-            })
-            .map_err(|error| error.to_string())?;
-        let inputs = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        drop(statement);
-        let project_id = ProjectId::parse(project_id)?;
-        let digest = Digest::parse(agent_wake_snapshot_digest(
-            &project_id,
-            &role_session_id,
-            agent_run_id,
-            &inputs,
-        )?)?;
-        let snapshot = AgentWakeSnapshot {
-            project_id,
-            role_session_id,
-            agent_run_id: agent_run_id.clone(),
-            inputs,
-            digest,
-        };
-        let context_json = serde_json::to_string(&snapshot).map_err(|error| error.to_string())?;
-        let context_digest = content_digest(&context_json);
-        for input in &snapshot.inputs {
-            let changed = tx.execute(
-                "UPDATE role_wake_inputs SET lifecycle='assigned',consuming_agent_run_id=?1 WHERE wake_input_id=?2 AND project_id=?3 AND role_session_id=?4 AND lifecycle='pending'",
-                params![agent_run_id.as_str(),input.wake_input_id,snapshot.project_id.as_str(),snapshot.role_session_id],
-            ).map_err(|error| error.to_string())?;
-            if changed != 1 {
-                return Err("role wake input changed during assignment".into());
-            }
-        }
-        tx.execute(
-            "INSERT INTO agent_wake_context(agent_run_id,context_json,context_digest,assigned_at_unix) VALUES (?1,?2,?3,?4)",
-            params![agent_run_id.as_str(),context_json,context_digest,now_unix],
-        ).map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(snapshot)
     }
 
     /// Mark a snapshotted wake set consumed only after validated result
@@ -1970,22 +1835,6 @@ fn stable_duplicate_operation_id(
     );
     let digest = format!("{:x}", sha2::Sha256::digest(identity.as_bytes()));
     OperationId::parse(format!("op-{}", &digest[..48]))
-}
-
-fn agent_wake_snapshot_digest(
-    project_id: &ProjectId,
-    role_session_id: &str,
-    agent_run_id: &crate::domain::ids::AgentRunId,
-    inputs: &[AgentWakeInput],
-) -> Result<String, String> {
-    let base = serde_json::json!({
-        "project_id": project_id.as_str(),
-        "role_session_id": role_session_id,
-        "agent_run_id": agent_run_id.as_str(),
-        "inputs": inputs,
-    });
-    let canonical = serde_json::to_string(&base).map_err(|error| error.to_string())?;
-    Ok(content_digest(&canonical))
 }
 
 fn status_key(status: TicketStatus) -> &'static str {

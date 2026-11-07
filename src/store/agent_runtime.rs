@@ -1,6 +1,6 @@
 //! Host-side queries and state transitions for finite role Agent turns.
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -10,7 +10,245 @@ use crate::launch::{AgentLaunchReservation, StartAgentEffectPayload};
 use crate::store::{EffectIntent, insert_effect, now_unix, validate_active_generation};
 
 const MAX_WAKE_SNAPSHOT_ITEMS: usize = 256;
+const MAX_WAKE_SNAPSHOT_JSON_BYTES: usize = 1_048_576;
+const MAX_WAKE_CONTEXT_MIGRATION_ROWS: usize = 65_536;
+const MAX_WAKE_CONTEXT_MIGRATION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROFILE_QUALIFICATION_CANDIDATES: usize = 32;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyWakeSnapshot {
+    project_id: ProjectId,
+    role_session_id: String,
+    agent_run_id: String,
+    inputs: Vec<LegacyWakeInput>,
+    digest: Digest,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyWakeInput {
+    wake_input_id: u64,
+    source_type: String,
+    source_id: String,
+    source_revision: u64,
+    priority: i64,
+    payload_json: String,
+}
+
+/// Reconcile the v9 scheduler wake table with the canonical PR3 launch projection.
+/// Legacy rows are strictly verified and converted in a bounded buffer before the old
+/// table is replaced, so malformed data leaves the transaction's original table intact.
+pub(crate) fn migrate_v12_agent_wake_context(tx: &Transaction<'_>) -> Result<(), String> {
+    let table_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_wake_context')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !table_exists {
+        create_agent_wake_context_table(tx, "agent_wake_context")?;
+        create_agent_wake_context_triggers(tx)?;
+        return Ok(());
+    }
+    let mut statement = tx
+        .prepare("SELECT name FROM pragma_table_info('agent_wake_context') ORDER BY cid")
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    if columns
+        == [
+            "agent_run_id",
+            "snapshot_digest",
+            "snapshot_json",
+            "created_at_unix",
+        ]
+    {
+        return Ok(());
+    }
+    if columns
+        != [
+            "agent_run_id",
+            "context_json",
+            "context_digest",
+            "assigned_at_unix",
+        ]
+    {
+        return Err(format!(
+            "agent_wake_context has an unsupported v12 migration layout: {columns:?}"
+        ));
+    }
+
+    let rows = read_legacy_wake_context_rows(tx)?;
+    tx.execute_batch("DROP TABLE agent_wake_context;")
+        .map_err(|error| error.to_string())?;
+    create_agent_wake_context_table(tx, "agent_wake_context")?;
+    for (agent_run_id, snapshot_digest, snapshot_json, created_at_unix) in rows {
+        tx.execute(
+            "INSERT INTO agent_wake_context(agent_run_id,snapshot_digest,snapshot_json,created_at_unix) VALUES (?1,?2,?3,?4)",
+            params![agent_run_id,snapshot_digest,snapshot_json,created_at_unix],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    create_agent_wake_context_triggers(tx)
+}
+
+fn create_agent_wake_context_table(tx: &Transaction<'_>, table_name: &str) -> Result<(), String> {
+    if table_name != "agent_wake_context" {
+        return Err("invalid internal wake context table name".into());
+    }
+    tx.execute_batch(&format!(
+        "CREATE TABLE {table_name} (
+            agent_run_id TEXT PRIMARY KEY REFERENCES agent_launch_authority(agent_run_id),
+            snapshot_digest TEXT NOT NULL CHECK(length(snapshot_digest) = 64),
+            snapshot_json TEXT NOT NULL CHECK(length(snapshot_json) <= 1048576),
+            created_at_unix INTEGER NOT NULL
+        );"
+    ))
+    .map_err(|error| error.to_string())
+}
+
+fn create_agent_wake_context_triggers(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TRIGGER agent_wake_context_immutable_update
+         BEFORE UPDATE ON agent_wake_context
+         BEGIN SELECT RAISE(ABORT, 'Agent wake context is immutable'); END;
+         CREATE TRIGGER agent_wake_context_immutable_delete
+         BEFORE DELETE ON agent_wake_context
+         BEGIN SELECT RAISE(ABORT, 'Agent wake context is retained'); END;",
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn read_legacy_wake_context_rows(
+    tx: &Transaction<'_>,
+) -> Result<Vec<(String, String, String, i64)>, String> {
+    let mut statement = tx
+        .prepare(
+            "SELECT agent_run_id,context_json,context_digest,assigned_at_unix FROM agent_wake_context ORDER BY agent_run_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+    let mut converted = Vec::new();
+    let mut total_bytes = 0usize;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let agent_run_id: String = row.get(0).map_err(|error| error.to_string())?;
+        let context_json: String = row.get(1).map_err(|error| error.to_string())?;
+        let context_digest: String = row.get(2).map_err(|error| error.to_string())?;
+        let assigned_at_unix: i64 = row.get(3).map_err(|error| error.to_string())?;
+        if context_json.len() > MAX_WAKE_SNAPSHOT_JSON_BYTES {
+            return Err("legacy Agent wake context exceeds its 1 MiB bound".into());
+        }
+        total_bytes = total_bytes.saturating_add(context_json.len());
+        if converted.len() >= MAX_WAKE_CONTEXT_MIGRATION_ROWS
+            || total_bytes > MAX_WAKE_CONTEXT_MIGRATION_BYTES
+        {
+            return Err("legacy Agent wake contexts exceed the bounded migration limit".into());
+        }
+        let legacy: LegacyWakeSnapshot = crate::protocol::parse_unique(context_json.as_bytes())
+            .map_err(|error| format!("legacy Agent wake snapshot is invalid: {error}"))?;
+        if legacy.agent_run_id != agent_run_id
+            || legacy.inputs.len() > MAX_WAKE_SNAPSHOT_ITEMS
+            || legacy.digest.as_str()
+                != legacy_wake_snapshot_digest(
+                    &legacy.project_id,
+                    &legacy.role_session_id,
+                    &legacy.agent_run_id,
+                    &legacy.inputs,
+                )?
+            || crate::store::content_digest(&context_json) != context_digest
+        {
+            return Err("legacy Agent wake snapshot identity or digest is invalid".into());
+        }
+        let run_scope: Option<(String, String)> = tx
+            .query_row(
+                "SELECT project_id,role_session_id FROM agent_runs WHERE agent_run_id=?1",
+                [&agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if run_scope
+            .as_ref()
+            .is_none_or(|(project_id, role_session_id)| {
+                project_id != legacy.project_id.as_str()
+                    || role_session_id != &legacy.role_session_id
+            })
+        {
+            return Err("legacy Agent wake snapshot does not match its AgentRun scope".into());
+        }
+        let has_authority: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launch_authority WHERE agent_run_id=?1)",
+                [&agent_run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_authority {
+            return Err("legacy Agent wake snapshot has no persisted launch authority".into());
+        }
+        let inputs = legacy
+            .inputs
+            .into_iter()
+            .map(|input| {
+                let priority = i32::try_from(input.priority)
+                    .map_err(|_| "legacy Agent wake priority is outside the i32 range")?;
+                let payload_json = crate::protocol::parse_unique(input.payload_json.as_bytes())
+                    .map_err(|error| format!("legacy Agent wake payload is invalid: {error}"))?;
+                Ok(crate::agent_api::AgentWakeItem {
+                    wake_input_id: input.wake_input_id,
+                    source_type: input.source_type,
+                    source_id: input.source_id,
+                    source_revision: input.source_revision,
+                    priority,
+                    payload_json,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: legacy.project_id,
+            role_session_id: legacy.role_session_id,
+            agent_run_id: legacy.agent_run_id,
+            digest: Digest::parse("0".repeat(64))?,
+            inputs,
+        };
+        snapshot.digest = snapshot.content_digest()?;
+        snapshot.validate()?;
+        let snapshot_json = crate::store::canonical_json(&snapshot)?;
+        if snapshot_json.len() > MAX_WAKE_SNAPSHOT_JSON_BYTES {
+            return Err("converted Agent wake snapshot exceeds its 1 MiB bound".into());
+        }
+        converted.push((
+            agent_run_id,
+            snapshot.digest.as_str().to_owned(),
+            snapshot_json,
+            assigned_at_unix,
+        ));
+    }
+    Ok(converted)
+}
+
+fn legacy_wake_snapshot_digest(
+    project_id: &ProjectId,
+    role_session_id: &str,
+    agent_run_id: &str,
+    inputs: &[LegacyWakeInput],
+) -> Result<String, String> {
+    let base = serde_json::json!({
+        "project_id": project_id.as_str(),
+        "role_session_id": role_session_id,
+        "agent_run_id": agent_run_id,
+        "inputs": inputs,
+    });
+    let canonical = serde_json::to_string(&base).map_err(|error| error.to_string())?;
+    Ok(crate::store::content_digest(&canonical))
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -743,7 +981,11 @@ mod tests {
     use sha2::Digest as _;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{ConfigStore, LaunchPreparationOutcome, MAX_PROFILE_QUALIFICATION_CANDIDATES};
+    use super::{
+        ConfigStore, LaunchPreparationOutcome, LegacyWakeInput, LegacyWakeSnapshot,
+        MAX_PROFILE_QUALIFICATION_CANDIDATES, legacy_wake_snapshot_digest,
+        migrate_v12_agent_wake_context,
+    };
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
@@ -755,6 +997,79 @@ mod tests {
 
     fn digest(ch: char) -> Digest {
         Digest::parse(ch.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn legacy_wake_context_conversion_rejects_unrepresentable_rows_before_replacement() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,project_id TEXT,role_session_id TEXT);
+                 CREATE TABLE agent_launch_authority(agent_run_id TEXT PRIMARY KEY);
+                 INSERT INTO agent_runs VALUES ('run1','project1','session1');
+                 INSERT INTO agent_launch_authority VALUES ('run1');
+                 CREATE TABLE agent_wake_context(
+                    agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
+                    context_json TEXT NOT NULL,
+                    context_digest TEXT NOT NULL,
+                    assigned_at_unix INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("project1").unwrap();
+        let input = LegacyWakeInput {
+            wake_input_id: 1,
+            source_type: "test".into(),
+            source_id: "event1".into(),
+            source_revision: 1,
+            priority: i64::from(i32::MAX) + 1,
+            payload_json: "{}".into(),
+        };
+        let snapshot_digest = legacy_wake_snapshot_digest(
+            &project_id,
+            "session1",
+            "run1",
+            std::slice::from_ref(&input),
+        )
+        .unwrap();
+        let context_json = serde_json::to_string(&LegacyWakeSnapshot {
+            project_id,
+            role_session_id: "session1".into(),
+            agent_run_id: "run1".into(),
+            inputs: vec![input],
+            digest: Digest::parse(snapshot_digest).unwrap(),
+        })
+        .unwrap();
+        let context_digest = crate::store::content_digest(&context_json);
+        connection
+            .execute(
+                "INSERT INTO agent_wake_context VALUES ('run1',?1,?2,1)",
+                rusqlite::params![context_json, context_digest],
+            )
+            .unwrap();
+
+        let tx = connection.transaction().unwrap();
+        let error = migrate_v12_agent_wake_context(&tx).unwrap_err();
+        assert!(error.contains("i32 range"), "{error}");
+        drop(tx);
+
+        let legacy_column_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_wake_context') WHERE name='context_json')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            legacy_column_exists,
+            "failed conversion leaves the legacy schema intact"
+        );
+        let row_count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM agent_wake_context", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 1, "failed conversion preserves the source row");
     }
 
     fn applied() -> AppliedConfig {

@@ -94,6 +94,7 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
         crate::launch::migrate_launch_reservation_tables(&tx)?;
+        crate::store::agent_runtime::migrate_v12_agent_wake_context(&tx)?;
         migrate_v12_artifact_tables(&tx)?;
         crate::store::agent_results::migrate_v12_tables(&tx)?;
         crate::store::accepted_plans::migrate_v12_worker_plan_tables(&tx)?;
@@ -119,6 +120,7 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
         tx.pragma_update(None, "user_version", 12)
             .map_err(|error| error.to_string())?;
+        validate_v12_schema(&tx)?;
         tx.commit().map_err(|error| error.to_string())
     })();
     let restore_result = connection
@@ -200,6 +202,7 @@ const V12_TABLES: &[&str] = &[
     "registered_artifacts",
     "registered_artifact_messages",
     "agent_launch_reservations",
+    "agent_wake_context",
     "agent_result_wakes",
     "agent_terminal_receipts",
     "agent_result_reducer_ack",
@@ -207,6 +210,9 @@ const V12_TABLES: &[&str] = &[
     "agent_run_adoptions",
     "agent_run_recovery_observations",
     "agent_stop_owned_runs_intents",
+    "agent_stop_owned_runs_progress",
+    "agent_stop_owned_runs_process_snapshots",
+    "agent_stop_owned_runs_completions",
     "rex_block_archives",
     "provider_qualification_jobs",
     "host_effect_jobs",
@@ -327,7 +333,7 @@ fn canonical_v12_schema() -> Result<Connection, String> {
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY,project_id TEXT);
              CREATE TABLE agent_launch_authority(agent_run_id TEXT PRIMARY KEY);
-             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,project_id TEXT,role_session_id TEXT);
              CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
              CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
              CREATE TABLE controller_owners(singleton INTEGER PRIMARY KEY);
@@ -345,6 +351,7 @@ fn canonical_v12_schema() -> Result<Connection, String> {
     {
         let tx = canonical.transaction().map_err(|error| error.to_string())?;
         crate::launch::migrate_launch_reservation_tables(&tx)?;
+        crate::store::agent_runtime::migrate_v12_agent_wake_context(&tx)?;
         tx.commit().map_err(|error| error.to_string())?;
     }
     crate::store::human::create_human_requests_table(&canonical, "human_requests", false)?;
@@ -528,7 +535,7 @@ mod tests {
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY);
-             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,project_id TEXT,role_session_id TEXT);
              CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
              CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
              CREATE TABLE agent_launch_authority(agent_run_id TEXT PRIMARY KEY);
@@ -549,6 +556,8 @@ mod tests {
              );
              INSERT INTO projects(project_id) VALUES ('project1');
              INSERT INTO rex_views(view_id) VALUES ('view1');
+             INSERT INTO agent_runs(agent_run_id,project_id,role_session_id) VALUES ('run1','project1','worker-session');
+             INSERT INTO agent_launch_authority(agent_run_id) VALUES ('run1');
              INSERT INTO human_requests(
                 request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,
                 subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,
@@ -560,6 +569,48 @@ mod tests {
                 'pending',1,2,NULL
              );
              INSERT INTO human_request_history(request_id) VALUES ('request1');",
+            )
+            .unwrap();
+        let legacy_payload = r#"{"kind":"start"}"#;
+        let legacy_inputs = serde_json::json!([{
+            "wake_input_id": 1,
+            "source_type": "test",
+            "source_id": "event1",
+            "source_revision": 1,
+            "priority": 9,
+            "payload_json": legacy_payload,
+        }]);
+        let legacy_digest_material = serde_json::to_string(&serde_json::json!({
+            "project_id": "project1",
+            "role_session_id": "worker-session",
+            "agent_run_id": "run1",
+            "inputs": legacy_inputs,
+        }))
+        .unwrap();
+        let legacy_digest = crate::store::content_digest(&legacy_digest_material);
+        let legacy_context = serde_json::to_string(&serde_json::json!({
+            "project_id": "project1",
+            "role_session_id": "worker-session",
+            "agent_run_id": "run1",
+            "inputs": legacy_inputs,
+            "digest": legacy_digest,
+        }))
+        .unwrap();
+        let legacy_context_digest = crate::store::content_digest(&legacy_context);
+        connection
+            .execute_batch(
+                "CREATE TABLE agent_wake_context(
+                    agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
+                    context_json TEXT NOT NULL CHECK(length(context_json) <= 1048576),
+                    context_digest TEXT NOT NULL CHECK(length(context_digest)=64),
+                    assigned_at_unix INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_wake_context(agent_run_id,context_json,context_digest,assigned_at_unix) VALUES ('run1',?1,?2,123)",
+                rusqlite::params![legacy_context, legacy_context_digest],
             )
             .unwrap();
         migrate_v12(&connection).unwrap();
@@ -625,6 +676,23 @@ mod tests {
             )
             .unwrap();
         assert!(index_preserved, "human request index is recreated");
+        let (wake_digest, wake_json, created_at): (String, String, i64) = connection
+            .query_row(
+                "SELECT snapshot_digest,snapshot_json,created_at_unix FROM agent_wake_context WHERE agent_run_id='run1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let wake: crate::agent_api::AgentWakeSnapshot =
+            crate::protocol::parse_unique(wake_json.as_bytes()).unwrap();
+        wake.validate().unwrap();
+        assert_eq!(wake.digest.as_str(), wake_digest);
+        assert_eq!(wake.inputs[0].priority, 9);
+        assert_eq!(
+            wake.inputs[0].payload_json,
+            serde_json::json!({"kind":"start"})
+        );
+        assert_eq!(created_at, 123, "legacy wake assignment time is preserved");
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -632,6 +700,7 @@ mod tests {
         for table in [
             "registered_artifacts",
             "agent_launch_reservations",
+            "agent_wake_context",
             "registered_artifact_messages",
             "agent_terminal_receipts",
             "agent_result_reducer_ack",
@@ -639,6 +708,9 @@ mod tests {
             "agent_run_adoptions",
             "agent_run_recovery_observations",
             "agent_stop_owned_runs_intents",
+            "agent_stop_owned_runs_progress",
+            "agent_stop_owned_runs_process_snapshots",
+            "agent_stop_owned_runs_completions",
             "rex_block_archives",
             "provider_qualification_jobs",
             "host_effect_jobs",
@@ -677,12 +749,6 @@ mod tests {
             connection.query_row("SELECT 1 FROM pragma_table_info('agent_result_wakes') WHERE name='wake_input_id'", [], |_| Ok(())).is_ok(),
             "result wake input column is missing"
         );
-        connection
-            .execute(
-                "INSERT INTO agent_launch_authority(agent_run_id) VALUES ('run1')",
-                [],
-            )
-            .unwrap();
         let digest = "a".repeat(64);
         connection
             .execute(
