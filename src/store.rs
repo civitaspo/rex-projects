@@ -13,7 +13,7 @@ use crate::domain::ids::{
     AgentRunId, Digest, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
 };
 use crate::domain::types::Role;
-use crate::engine::reducer::{Input, TicketRun, WakeTarget, reduce};
+use crate::engine::reducer::{Input, Phase, TicketRun, WakeTarget, reduce};
 use crate::launch::{
     AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, ObservedProviderStart,
     ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle, RexFocusTarget, RexView,
@@ -25,6 +25,8 @@ pub mod dashboard_projection;
 
 pub const SCHEMA_VERSION: i64 = 11;
 pub mod agent_runtime;
+#[path = "store/accepted_plans.rs"]
+pub mod accepted_plans;
 pub mod human;
 #[path = "store/learning.rs"]
 mod learning_store;
@@ -2315,6 +2317,41 @@ impl ConfigStore {
             evidence_json,
             effects,
             None,
+            None,
+        )
+    }
+
+    /// Persist a validated plan and its PlanAccepted transition/effect in one
+    /// owner-fenced SQLite transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_validated_work_plan(
+        &mut self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+        expected_revision: Revision,
+        configuration_digest: &Digest,
+        plan: &crate::engine::orchestration::ValidatedPlan,
+        input: &DurableInput,
+        reason: &str,
+        evidence_json: &str,
+        effects: &[EffectIntent],
+    ) -> Result<InputReceipt, String> {
+        let write = crate::store::accepted_plans::prepare_accepted_plan_write(
+            ticket_run_id,
+            plan,
+            configuration_digest,
+        )?;
+        self.commit_ticket_transition_impl(
+            owner_generation,
+            ticket_run_id,
+            expected_revision,
+            input,
+            Input::PlanAccepted,
+            reason,
+            evidence_json,
+            effects,
+            None,
+            Some(write),
         )
     }
 
@@ -2342,6 +2379,7 @@ impl ConfigStore {
             evidence_json,
             effects,
             Some(proof),
+            None,
         )
     }
 
@@ -2357,6 +2395,7 @@ impl ConfigStore {
         evidence_json: &str,
         effects: &[EffectIntent],
         completion_proof: Option<&crate::engine::ticket_effects::TicketCompletionProof>,
+        accepted_plan: Option<crate::store::accepted_plans::AcceptedPlanWrite>,
     ) -> Result<InputReceipt, String> {
         validate_input(input)?;
         if matches!(transition, Input::KnowledgePublished) {
@@ -2476,14 +2515,15 @@ impl ConfigStore {
                         |row| row.get(0),
                     )
                     .map_err(|error| error.to_string())?;
-                let manifest: serde_json::Value =
+                let manifest: crate::knowledge::PublicationManifest =
                     crate::protocol::parse_unique(manifest_json.as_bytes()).map_err(|error| {
                         format!("stored Postmortem manifest is invalid: {error}")
                     })?;
-                if manifest["operation_id"].as_str() != Some(proof.knowledge_operation_id())
-                    || manifest["project_id"].as_str() != Some(project_id.as_str())
-                    || manifest["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
-                    || canonical_json(&manifest)? != manifest_json
+                if manifest.operation_id.as_str() != proof.knowledge_operation_id()
+                    || manifest.project_id.as_str() != project_id.as_str()
+                    || manifest.ticket_run_id.as_str() != ticket_run_id.as_str()
+                    || serde_json::to_string(&manifest).map_err(|error| error.to_string())?
+                        != manifest_json
                     || content_digest(&manifest_json) != proof.knowledge_manifest_digest().as_str()
                 {
                     return Err(
@@ -2500,6 +2540,15 @@ impl ConfigStore {
                 return Err("completion proof cannot authorize a different transition".into());
             }
             (_, None) => {}
+        }
+        let worker_wake = matches!(
+            &transition,
+            Input::WorktreesPrepared | Input::CorrectionsRemain
+        );
+        let initial_worktree_wake = matches!(&transition, Input::WorktreesPrepared);
+        let is_plan_accepted = matches!(&transition, Input::PlanAccepted);
+        if is_plan_accepted != accepted_plan.is_some() {
+            return Err("PlanAccepted requires an atomic validated plan payload".into());
         }
         let decision = reduce(&current, expected_revision, transition)?;
         let expected_kinds = decision
@@ -2534,6 +2583,19 @@ impl ConfigStore {
         }
 
         let decision_run = &decision.ticket_run;
+        if let Some(plan) = accepted_plan {
+            if decision_run.phase != Phase::Preparing
+                || plan.plan_digest.as_str() != content_digest(&plan.plan_json)
+            {
+                return Err(
+                    "validated work plan is not bound to the PlanAccepted transition".into(),
+                );
+            }
+            tx.execute(
+                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![project_id.as_str(),ticket_run_id.as_str(),decision_run.revision.0,plan.configuration_digest.as_str(),plan.plan_digest.as_str(),plan.plan_json,now_unix()?],
+            ).map_err(|error| error.to_string())?;
+        }
         tx.execute(
             "UPDATE ticket_runs SET internal_phase=?2, activity=?3, external_status=?4, required_review_revision=?5, revision=?6 WHERE ticket_run_id=?1 AND revision=?7",
             params![
@@ -2565,10 +2627,61 @@ impl ConfigStore {
         for effect in effects {
             insert_effect(&tx, effect, now)?;
         }
-        let wake_records = decision
-            .wakes
-            .iter()
-            .map(|target| {
+        let wake_records = if worker_wake {
+            let accepted: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT plan_digest,plan_json FROM accepted_work_plans WHERE project_id=?1 AND ticket_run_id=?2 ORDER BY accepted_revision DESC LIMIT 1",
+                    params![project_id.as_str(), ticket_run_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((plan_digest, plan_json)) = accepted else {
+                return Err("Worker wake requires a persisted accepted work plan".into());
+            };
+            if content_digest(&plan_json) != plan_digest {
+                return Err("accepted work plan digest is invalid".into());
+            }
+            let plan: crate::engine::orchestration::ValidatedPlan =
+                serde_json::from_str(&plan_json)
+                    .map_err(|error| format!("accepted work plan is invalid: {error}"))?;
+            if plan.ticket_run_id != *ticket_run_id {
+                return Err("accepted work plan is bound to another TicketRun".into());
+            }
+            plan.nodes_in_execution_order
+                .iter()
+                .filter(|node| {
+                    node.role == Role::Worker
+                        && (!initial_worktree_wake || node.depends_on.is_empty())
+                })
+                .map(|node| {
+                    let role_session_id = format!(
+                        "ticket:{}:worker:{}",
+                        ticket_run_id.as_str(),
+                        node.id.as_str()
+                    );
+                    let payload = serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "work_node_ready",
+                        "ticket_run_id": ticket_run_id.as_str(),
+                        "work_node_id": node.id.as_str(),
+                        "accepted_plan_digest": plan_digest,
+                        "source_message_id": input.message_id,
+                        "revision": decision_run.revision.0
+                    });
+                    let inserted = tx.execute(
+                        "INSERT INTO role_wake_inputs(project_id, role_session_id, source_type, source_id, source_revision, priority, payload_json, lifecycle, created_at_unix) VALUES (?1, ?2, 'work_node_ready', ?3, ?4, 0, ?5, 'pending', ?6)",
+                        params![project_id.as_str(), role_session_id, input.message_id, decision_run.revision.0, payload.to_string(), now],
+                    ).map_err(|error| error.to_string())?;
+                    if inserted != 1 { return Err("Worker wake input was not persisted".into()); }
+                    Ok(serde_json::json!({"role_session_id":role_session_id,"work_node_id":node.id.as_str(),"revision":decision_run.revision.0}))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        } else {
+            decision
+                .wakes
+                .iter()
+                .map(|target| {
                 let (role_session_id, target_name) = match target {
                     WakeTarget::Supervisor => (
                         format!("project:{}:supervisor", project_id.as_str()),
@@ -2598,7 +2711,8 @@ impl ConfigStore {
                 }
                 Ok(serde_json::json!({"role_session_id":role_session_id,"revision":decision_run.revision.0}))
             })
-            .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, String>>()?
+        };
         let receipt = serde_json::json!({
             "accepted": true,
             "message_id": input.message_id,

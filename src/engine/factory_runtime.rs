@@ -135,6 +135,9 @@ pub struct FactoryTickReport {
     pub supervisor_learning_project: Option<ProjectId>,
     pub scanned: Option<TicketScanKey>,
     pub ticket_run_started: Option<TicketRunId>,
+    /// Recoverable external CLI failures observed this tick. These are
+    /// reported to the controller while unrelated Projects continue.
+    pub external_errors: Vec<String>,
 }
 
 /// One bounded foreground controller iteration. Results and one outbox effect
@@ -161,6 +164,14 @@ impl FactoryRuntime {
         };
         let effect = EffectDispatcher::tick(store, owner_generation, now_unix, &handlers, limits)
             .map_err(|error| error.to_string())?;
+        // Handler return values are not workflow proof. Consume only persisted
+        // succeeded receipts and commit their typed transition before choosing
+        // the next role wake.
+        let _host_transition_applied = super::host_transitions::consume_one_host_transition(
+            store,
+            owner_generation,
+            now_unix,
+        )?;
 
         // A result or an already-persisted effect is processed before another
         // role turn. Launch preparation is bounded to one successful turn and
@@ -192,7 +203,7 @@ impl FactoryRuntime {
             learning_interval,
             12,
         )?;
-        let keys = build_scan_keys(config, &runnable, services)?;
+        let (keys, mut external_errors) = build_scan_keys(config, &runnable, services);
         if let Some(key) = next_pending_candidate_key(store, &runnable, config, &keys)? {
             if let Some((project_run, disposition)) =
                 next_disposition(store, config, &runnable, &key)?
@@ -245,6 +256,7 @@ impl FactoryRuntime {
                     supervisor_learning_project,
                     scanned: None,
                     ticket_run_started,
+                    external_errors,
                 });
             }
         }
@@ -257,6 +269,7 @@ impl FactoryRuntime {
                 supervisor_learning_project,
                 scanned: None,
                 ticket_run_started: None,
+                external_errors,
             });
         };
         let page = match services.list_ticket_page(&key, cursor.cursor.as_deref(), 100) {
@@ -271,7 +284,16 @@ impl FactoryRuntime {
                     now_unix,
                     config.runtime.external_poll_seconds.clamp(2, 3600),
                 )?;
-                return Err(error);
+                external_errors.push(error);
+                return Ok(FactoryTickReport {
+                    ingested_agent_result,
+                    effect,
+                    role_run_started,
+                    supervisor_learning_project,
+                    scanned: None,
+                    ticket_run_started: None,
+                    external_errors,
+                });
             }
         };
         if page.tickets.len() > 100
@@ -303,6 +325,7 @@ impl FactoryRuntime {
             supervisor_learning_project,
             scanned: Some(key),
             ticket_run_started: None,
+            external_errors,
         })
     }
 }
@@ -311,8 +334,9 @@ fn build_scan_keys(
     config: &Config,
     projects: &[RunnableProject],
     services: &mut impl FactoryRuntimeServices,
-) -> Result<Vec<TicketScanKey>, String> {
+) -> (Vec<TicketScanKey>, Vec<String>) {
     let mut keys = Vec::new();
+    let mut errors = Vec::new();
     let mut namespaces = HashMap::<crate::domain::ids::AdapterId, TicketNamespace>::new();
     for runtime_project in projects {
         let Some(project) = config.projects.get(&runtime_project.record.id) else {
@@ -321,21 +345,30 @@ fn build_scan_keys(
         let namespace = if let Some(namespace) = namespaces.get(&project.ticket_adapter) {
             namespace.clone()
         } else {
-            let namespace = services.ticket_namespace(&project.ticket_adapter)?;
+            let namespace = match services.ticket_namespace(&project.ticket_adapter) {
+                Ok(namespace) => namespace,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
             namespaces.insert(project.ticket_adapter.clone(), namespace.clone());
             namespace
         };
         for status in &project.dispatch_states {
-            keys.push(TicketScanKey::for_project(
+            match TicketScanKey::for_project(
                 &runtime_project.record.id,
                 &project.ticket_adapter,
                 &namespace,
                 project,
                 *status,
-            )?);
+            ) {
+                Ok(key) => keys.push(key),
+                Err(error) => errors.push(error),
+            }
         }
     }
-    Ok(keys)
+    (keys, errors)
 }
 
 struct PendingCandidate {

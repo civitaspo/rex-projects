@@ -15,6 +15,7 @@ use crate::domain::ids::{
     AdapterId, Digest, OperationId, ProjectId, TicketId, TicketNamespace, TicketRunId,
 };
 use crate::domain::types::{Role, TicketStatus};
+use crate::engine::orchestration::WorkNodeId;
 use crate::engine::reducer::{Activity, Input, Phase, TicketRun, bind_effects, reduce};
 
 /// Cursor and timing information for one Project/status scan.
@@ -97,6 +98,20 @@ pub struct TicketRunStatusTarget {
     pub external_revision: Option<String>,
 }
 
+/// One nonterminal TicketRun snapshot for bounded host transition processing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveTicketRun {
+    pub project_id: ProjectId,
+    pub ticket_run_id: TicketRunId,
+    pub namespace: TicketNamespace,
+    pub ticket_id: TicketId,
+    pub revision: u64,
+    pub phase: Phase,
+    pub activity: Activity,
+    pub project_epoch: u64,
+    pub recipe_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentWakeInput {
     pub wake_input_id: u64,
@@ -125,6 +140,8 @@ pub struct PendingRoleWakeSession {
     pub role_session_id: String,
     pub role: Role,
     pub ticket_run_id: Option<TicketRunId>,
+    /// Set only for the canonical per-node Worker session.
+    pub work_node_id: Option<WorkNodeId>,
     pub highest_priority: i64,
     pub oldest_created_at_unix: i64,
     pub pending_count: u64,
@@ -310,6 +327,76 @@ impl TicketScanKey {
 }
 
 impl ConfigStore {
+    /// Read a bounded, stable page of nonterminal TicketRuns for host-side
+    /// receipt consumption. This is a hint; transition commits still CAS the
+    /// exact revision and validate the owner generation.
+    pub fn active_ticket_runs(
+        &self,
+        owner_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<ActiveTicketRun>, String> {
+        if limit == 0 || limit > 256 {
+            return Err("active TicketRun query limit must be between 1 and 256".into());
+        }
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT t.project_id,t.ticket_run_id,t.namespace,t.ticket_id,t.revision,t.internal_phase,t.activity,c.project_epoch,c.recipe_id FROM ticket_runs t LEFT JOIN ticket_run_context c USING(ticket_run_id) WHERE t.internal_phase NOT IN ('done','canceled') ORDER BY t.project_id,t.ticket_run_id LIMIT ?1",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([limit as u64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (
+                project,
+                run,
+                namespace,
+                ticket,
+                revision,
+                phase,
+                activity,
+                project_epoch,
+                recipe_id,
+            ) = row.map_err(|error| error.to_string())?;
+            Ok(ActiveTicketRun {
+                project_id: ProjectId::parse(project)?,
+                ticket_run_id: TicketRunId::parse(run)?,
+                namespace: TicketNamespace::parse(namespace)?,
+                ticket_id: TicketId::parse(ticket)?,
+                revision,
+                phase: serde_json::from_str(&format!("\"{phase}\""))
+                    .map_err(|error| format!("stored TicketRun phase is invalid: {error}"))?,
+                activity: serde_json::from_str(&format!("\"{activity}\""))
+                    .map_err(|error| format!("stored TicketRun activity is invalid: {error}"))?,
+                project_epoch,
+                recipe_id,
+            })
+        })
+        .collect()
+    }
+
     /// Return bounded role sessions that can be considered for another finite
     /// Agent turn. Active or unknown AgentRuns suppress duplicate scheduling;
     /// a future transactional launch-preparation call still owns the claim.
@@ -359,12 +446,13 @@ impl ConfigStore {
         rows.map(|row| {
             let (project, role_session_id, highest_priority, oldest_created_at_unix, pending_count) =
                 row.map_err(|error| error.to_string())?;
-            let (role, ticket_run_id) = parse_role_session_id(&role_session_id)?;
+            let (role, ticket_run_id, work_node_id) = parse_role_session_id(&role_session_id)?;
             Ok(PendingRoleWakeSession {
                 project_id: ProjectId::parse(project)?,
                 role_session_id,
                 role,
                 ticket_run_id,
+                work_node_id,
                 highest_priority,
                 oldest_created_at_unix,
                 pending_count,
@@ -505,13 +593,13 @@ impl ConfigStore {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         };
-        let manifest: serde_json::Value =
+        let manifest: crate::knowledge::PublicationManifest =
             crate::protocol::parse_unique(manifest_json.as_bytes())
                 .map_err(|error| format!("stored Postmortem manifest is invalid: {error}"))?;
-        if manifest["operation_id"].as_str() != Some(knowledge_operation_id.as_str())
-            || manifest["project_id"].as_str() != Some(project_id.as_str())
-            || manifest["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
-            || super::canonical_json(&manifest)? != manifest_json
+        if manifest.operation_id.as_str() != knowledge_operation_id
+            || manifest.project_id.as_str() != project_id.as_str()
+            || manifest.ticket_run_id.as_str() != ticket_run_id.as_str()
+            || serde_json::to_string(&manifest).map_err(|error| error.to_string())? != manifest_json
         {
             return Err("stored Postmortem manifest identity or encoding is invalid".into());
         }
@@ -1776,11 +1864,23 @@ impl ConfigStore {
     }
 }
 
-fn parse_role_session_id(value: &str) -> Result<(Role, Option<TicketRunId>), String> {
+fn parse_role_session_id(
+    value: &str,
+) -> Result<(Role, Option<TicketRunId>, Option<WorkNodeId>), String> {
     if let Some(project) = value.strip_prefix("project:")
         && project.ends_with(":supervisor")
     {
-        return Ok((Role::Supervisor, None));
+        return Ok((Role::Supervisor, None, None));
+    }
+    if let Some(worker) = value.strip_prefix("ticket:") {
+        if let Some((ticket_run, node)) = worker.split_once(":worker:") {
+            return Ok((
+                Role::Worker,
+                Some(TicketRunId::parse(ticket_run.to_owned())?),
+                Some(WorkNodeId::parse(node.to_owned())?),
+            ));
+        }
+        return Err("per-node Worker session is malformed".into());
     }
     let ticket = value
         .strip_prefix("ticket_run:")
@@ -1796,7 +1896,14 @@ fn parse_role_session_id(value: &str) -> Result<(Role, Option<TicketRunId>), Str
     ];
     for (role, name) in ROLES {
         if let Some(ticket_run_id) = ticket.strip_suffix(&format!(":{name}")) {
-            return Ok((role, Some(TicketRunId::parse(ticket_run_id.to_owned())?)));
+            // Legacy/generic Worker wakes may exist in an upgraded database.
+            // They remain visible for dashboard repair but have no node token,
+            // so the launch service must reject them.
+            return Ok((
+                role,
+                Some(TicketRunId::parse(ticket_run_id.to_owned())?),
+                None,
+            ));
         }
     }
     Err("pending wake session has an unknown ticket role".into())
@@ -1997,6 +2104,7 @@ mod tests {
                 role_session_id: "ticket_run:r-a:coordinator".into(),
                 role: Role::Coordinator,
                 ticket_run_id: Some(crate::domain::ids::TicketRunId::parse("r-a").unwrap()),
+                work_node_id: None,
                 highest_priority: 8,
                 oldest_created_at_unix: 10,
                 pending_count: 2,
@@ -2012,13 +2120,30 @@ mod tests {
 
         assert_eq!(
             parse_role_session_id("project:p-a:supervisor").unwrap(),
-            (Role::Supervisor, None)
+            (Role::Supervisor, None, None)
         );
         assert_eq!(
             parse_role_session_id("ticket_run:run:with:colon:merge_decision").unwrap(),
             (
                 Role::MergeDecision,
-                Some(crate::domain::ids::TicketRunId::parse("run:with:colon").unwrap())
+                Some(crate::domain::ids::TicketRunId::parse("run:with:colon").unwrap()),
+                None,
+            )
+        );
+        assert_eq!(
+            parse_role_session_id("ticket:run-1:worker:node-a").unwrap(),
+            (
+                Role::Worker,
+                Some(crate::domain::ids::TicketRunId::parse("run-1").unwrap()),
+                Some(WorkNodeId::parse("node-a").unwrap()),
+            )
+        );
+        assert_eq!(
+            parse_role_session_id("ticket_run:run:worker").unwrap(),
+            (
+                Role::Worker,
+                Some(crate::domain::ids::TicketRunId::parse("run").unwrap()),
+                None,
             )
         );
         assert!(parse_role_session_id("project:p-a:worker").is_err());

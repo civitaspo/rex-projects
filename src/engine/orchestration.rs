@@ -340,6 +340,7 @@ pub enum RoleOutputKind {
     LearningDecision,
     ProfileTrialResult,
     ProfilePromotionProposal,
+    GoalCompletion,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -662,6 +663,10 @@ role_payload!(ProfilePromotionProposalPayload {
     expected_target_digests: BTreeMap<String, Digest>,
     uncertain_efficacy_exception: Option<BTreeMap<String, String>>,
 });
+role_payload!(GoalCompletionProposalPayload {
+    evidence: GoalCompletionEvidence,
+    evidence_references: Vec<RoleArtifactReference>,
+});
 
 /// Closed role payloads that can cross the durable evidence boundary. These
 /// represent Agent assertions only; host observations and effects are stored
@@ -688,6 +693,7 @@ pub enum RoleResultPayload {
     LearningDecision(LearningDecisionPayload),
     ProfileTrialResult(ProfileTrialResultPayload),
     ProfilePromotionProposal(ProfilePromotionProposalPayload),
+    GoalCompletion(GoalCompletionProposalPayload),
 }
 
 impl RoleResultPayload {
@@ -742,6 +748,9 @@ impl RoleResultPayload {
             RoleOutputKind::ProfilePromotionProposal => {
                 parse_variant!(ProfilePromotionProposalPayload, ProfilePromotionProposal)
             }
+            RoleOutputKind::GoalCompletion => {
+                parse_variant!(GoalCompletionProposalPayload, GoalCompletion)
+            }
         }
     }
 
@@ -767,6 +776,7 @@ impl RoleResultPayload {
             Self::LearningDecision(_) => RoleOutputKind::LearningDecision,
             Self::ProfileTrialResult(_) => RoleOutputKind::ProfileTrialResult,
             Self::ProfilePromotionProposal(_) => RoleOutputKind::ProfilePromotionProposal,
+            Self::GoalCompletion(_) => RoleOutputKind::GoalCompletion,
         }
     }
 }
@@ -870,6 +880,23 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
                 );
             }
         }
+        RoleResultPayload::GoalCompletion(result)
+            if result.evidence.satisfied_acceptance.is_empty()
+                || result.evidence.satisfied_acceptance.len() > 256
+                || result.evidence.incomplete_ticket_ids.len() > 256
+                || result.evidence.deferred_risks.len() > 128
+                || result.evidence.operation_results.len() > 128
+                || result
+                    .evidence
+                    .satisfied_acceptance
+                    .iter()
+                    .chain(&result.evidence.deferred_risks)
+                    .chain(&result.evidence.operation_results)
+                    .any(|value| value.trim().is_empty() || value.len() > 4_096)
+                || result.evidence_references.len() > 128 =>
+        {
+            return Err("goal completion proposal has empty or oversized evidence".into());
+        }
         _ => {}
     }
     Ok(())
@@ -905,6 +932,7 @@ fn validate_payload_artifacts(
         RoleResultPayload::ProfilePromotionProposal(value) => {
             references.extend(&value.evidence_references)
         }
+        RoleResultPayload::GoalCompletion(value) => references.extend(&value.evidence_references),
         RoleResultPayload::TicketProposal(_)
         | RoleResultPayload::DispatchRequest(_)
         | RoleResultPayload::Intervention(_)
@@ -964,6 +992,7 @@ pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
         RoleOutputKind::ProfilePromotionProposal => {
             schema_for_kind!(ProfilePromotionProposalPayload)
         }
+        RoleOutputKind::GoalCompletion => schema_for_kind!(GoalCompletionProposalPayload),
     };
     constrain_payload_string_schemas(&mut schema);
     schema
@@ -1397,6 +1426,7 @@ pub fn allowed_role_output_kinds(role: Role) -> Vec<RoleOutputKind> {
             K::LearningDecision,
             K::ProfileTrialResult,
             K::ProfilePromotionProposal,
+            K::GoalCompletion,
         ],
         Role::Coordinator => vec![K::SpawnRequest, K::PrepareWorktrees, K::PlanReady],
         Role::Planner => vec![K::PlanReady, K::InvestigationRequest],
@@ -1692,7 +1722,8 @@ pub struct WorkPlan {
     pub requested_investigation_children: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatedWorkNode {
     pub id: WorkNodeId,
     pub repository: RepositoryId,
@@ -1703,7 +1734,8 @@ pub struct ValidatedWorkNode {
     pub role: Role,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkBaseSource {
     ControllerObservedCommit {
         commit: String,
@@ -1715,7 +1747,8 @@ pub enum WorkBaseSource {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatedPlan {
     pub ticket_run_id: TicketRunId,
     pub nodes_in_execution_order: Vec<ValidatedWorkNode>,
@@ -1965,7 +1998,8 @@ pub fn select_planner(project: &ProjectConfig, complexity: PlanComplexity) -> Pl
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoalCompletionEvidence {
     pub satisfied_acceptance: Vec<String>,
     pub incomplete_ticket_ids: Vec<TicketId>,
@@ -2405,6 +2439,10 @@ mod tests {
             (
                 RoleOutputKind::HumanRequest,
                 json!({"kind":"clarification", "question":"Which option?", "choices":["a"], "evidence_references":[], "subject_digest":digest, "requested_continuation":null}),
+            ),
+            (
+                RoleOutputKind::GoalCompletion,
+                json!({"evidence":{"satisfied_acceptance":["api"],"incomplete_ticket_ids":[],"deferred_risks":[],"operation_results":["checks passed"],"subject_digest":digest},"evidence_references":[]}),
             ),
             (
                 RoleOutputKind::TicketProposal,
@@ -3309,6 +3347,7 @@ mod tests {
             RoleOutputKind::LearningDecision,
             RoleOutputKind::ProfileTrialResult,
             RoleOutputKind::ProfilePromotionProposal,
+            RoleOutputKind::GoalCompletion,
         ];
         for kind in kinds {
             let schema = role_result_payload_schema(kind);
