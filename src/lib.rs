@@ -14,5 +14,6 @@ pub mod mailbox;
 pub mod operations;
 pub mod process;
 pub mod protocol;
+pub mod roles;
 pub mod store;
 pub mod worktrees;
