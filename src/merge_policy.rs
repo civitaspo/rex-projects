@@ -178,6 +178,15 @@ pub fn evaluate_merge_policy(
     let mut reasons = Vec::new();
     let mut blocked = false;
     let mut human = false;
+    for required in &policy.required_checks {
+        let key = format!("check:{required}");
+        if !evidence.gates.iter().any(|gate| gate.key == key) {
+            human = true;
+            reasons.push(format!(
+                "required check `{required}` has no revision-bound evidence"
+            ));
+        }
+    }
     if evidence.subject != evidence.current_subject {
         blocked = true;
         reasons.push("assessment subject is stale".into());
@@ -449,9 +458,24 @@ pub fn build_merge_procedure(
                 merge_seen = true;
                 merge_key = Some(step.key.as_str());
             }
-            MergeProcedureOperation::VerifyMergeCommit { .. } => {
+            MergeProcedureOperation::VerifyMergeCommit { expected_trailers } => {
                 if !merge_seen || verify_seen || index + 1 != steps.len() {
                     return Err("merge commit verification must occur once and be last".into());
+                }
+                if expected_trailers.is_empty()
+                    || expected_trailers
+                        .iter()
+                        .any(|line| !line.starts_with("Co-authored-by: "))
+                {
+                    return Err(
+                        "merge verification requires a non-empty, supported trailer block".into(),
+                    );
+                }
+                let mut unique = expected_trailers.clone();
+                unique.sort();
+                unique.dedup();
+                if unique.len() != expected_trailers.len() {
+                    return Err("merge verification trailer lines must be unique".into());
                 }
                 if !merge_key.is_some_and(|key| step.prerequisites.iter().any(|item| item == key)) {
                     return Err("merge commit verification must depend on the merge step".into());
@@ -520,7 +544,7 @@ mod tests {
             subject: subject(),
             current_subject: subject(),
             gates: vec![GateEvidence {
-                key: "checks".into(),
+                key: "check:ci".into(),
                 state: EvidenceState::Pass,
                 required: true,
                 detail: "all pass".into(),
@@ -572,6 +596,20 @@ mod tests {
         let result = evaluate_merge_policy(&policy(MergeExecutor::Direct), &input).unwrap();
         assert_eq!(result.reliability_score, Some(100));
         assert_eq!(result.disposition, MergeDisposition::Blocked);
+    }
+
+    #[test]
+    fn configured_required_check_without_exact_evidence_requires_human() {
+        let mut input = evidence();
+        input.gates.clear();
+        let result = evaluate_merge_policy(&policy(MergeExecutor::Direct), &input).unwrap();
+        assert_eq!(result.disposition, MergeDisposition::HumanRequired);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("check `ci`"))
+        );
     }
     #[test]
     fn unknown_and_stale_evidence_never_pass() {
@@ -666,7 +704,7 @@ mod tests {
                 "verify",
                 vec!["request"],
                 MergeProcedureOperation::VerifyMergeCommit {
-                    expected_trailers: vec![],
+                    expected_trailers: vec!["Co-authored-by: Agent <agent@example.com>".into()],
                 },
             ),
         ];
@@ -693,7 +731,7 @@ mod tests {
                 "verify",
                 vec!["request"],
                 MergeProcedureOperation::VerifyMergeCommit {
-                    expected_trailers: vec![],
+                    expected_trailers: vec!["Co-authored-by: Agent <agent@example.com>".into()],
                 },
             ),
         ];

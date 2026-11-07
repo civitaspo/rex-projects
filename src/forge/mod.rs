@@ -395,6 +395,8 @@ pub struct DirectMergeIntent {
     pub expected_head_sha: String,
     /// Preflight staleness check only. GitHub cannot atomically condition the merge on this SHA.
     pub expected_base_sha: String,
+    /// Exact final trailer block required by the reviewed procedure. Empty means no trailer is required.
+    pub expected_trailers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

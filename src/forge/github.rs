@@ -22,8 +22,8 @@ use crate::forge::{
 };
 use crate::process::{ProcessError, ProcessOutput, ProcessRequest};
 
-const ACCEPT_HEADER: &str = "Accept=application/vnd.github+json";
-const API_VERSION_HEADER: &str = "X-GitHub-Api-Version=2022-11-28";
+const ACCEPT_HEADER: &str = "Accept: application/vnd.github+json";
+const API_VERSION_HEADER: &str = "X-GitHub-Api-Version: 2022-11-28";
 
 pub trait GitHubCommandRunner: Send + Sync {
     fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError>;
@@ -121,75 +121,109 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         body: Option<&[u8]>,
         paginate: bool,
     ) -> Result<ApiResponse, ForgeError> {
-        let mut args = vec![
-            OsString::from("--hostname"),
-            OsString::from(&self.host),
-            OsString::from("api"),
-            OsString::from(endpoint),
-            OsString::from("--method"),
-            OsString::from(method),
-            OsString::from("--header"),
-            OsString::from(ACCEPT_HEADER),
-            OsString::from("--header"),
-            OsString::from(API_VERSION_HEADER),
-        ];
-        if paginate {
-            args.extend([
-                OsString::from("--paginate"),
-                OsString::from("--slurp"),
-                OsString::from("-F"),
-                OsString::from("per_page=100"),
-            ]);
+        let mut records = Vec::new();
+        let mut page_documents = Vec::new();
+        let max_pages = if paginate { self.page_limit } else { 1 };
+        for page in 1..=max_pages {
+            let mut args = vec![
+                OsString::from("--hostname"),
+                OsString::from(&self.host),
+                OsString::from("api"),
+                OsString::from(endpoint),
+                OsString::from("--method"),
+                OsString::from(method),
+                OsString::from("--header"),
+                OsString::from(ACCEPT_HEADER),
+                OsString::from("--header"),
+                OsString::from(API_VERSION_HEADER),
+            ];
+            if paginate {
+                args.extend([
+                    OsString::from("-F"),
+                    OsString::from("per_page=100"),
+                    OsString::from("-F"),
+                    OsString::from(format!("page={page}")),
+                ]);
+            }
+            let stdin = if let Some(body) = body {
+                args.extend([OsString::from("--input"), OsString::from("-")]);
+                body.to_vec()
+            } else {
+                Vec::new()
+            };
+            let mut environment = self.environment.clone();
+            environment.insert("GH_PROMPT_DISABLED".into(), "1".into());
+            environment.insert("GH_PAGER".into(), "cat".into());
+            environment.insert("GH_NO_UPDATE_NOTIFIER".into(), "1".into());
+            let request = ProcessRequest {
+                executable: self.gh_path.clone(),
+                args,
+                stdin,
+                cwd: None,
+                clear_environment: true,
+                environment,
+                timeout: self.timeout,
+                shutdown_grace: self.shutdown_grace,
+                stdout_limit: self.stdout_limit,
+                stderr_tail_limit: self.stderr_tail_limit,
+            };
+            let output = self
+                .runner
+                .run(request)
+                .map_err(|error| ForgeError(format!("gh process could not complete: {error}")))?;
+            if output.timed_out {
+                return Err(ForgeError(
+                    "gh request timed out; effect state is uncertain".into(),
+                ));
+            }
+            if output.stdout_truncated || output.stderr_truncated {
+                return Err(ForgeError(
+                    "gh response exceeded the configured output limit".into(),
+                ));
+            }
+            if !output.status.as_ref().is_some_and(ExitStatus::success) {
+                return Err(ForgeError(
+                    "gh API request failed; remote state is unknown".into(),
+                ));
+            }
+            let value: Value = serde_json::from_slice(&output.stdout)
+                .map_err(|_| ForgeError("gh returned malformed JSON".into()))?;
+            let page_records = if paginate {
+                if let Some(records) = value.as_array() {
+                    records.clone()
+                } else if let Some(object) = value.as_object() {
+                    object
+                        .values()
+                        .filter_map(Value::as_array)
+                        .max_by_key(|records| records.len())
+                        .cloned()
+                        .ok_or_else(|| {
+                            ForgeError("paginated gh response had no collection".into())
+                        })?
+                } else {
+                    return Err(ForgeError(
+                        "paginated gh response was not a collection".into(),
+                    ));
+                }
+            } else {
+                vec![value.clone()]
+            };
+            records.extend(page_records.iter().cloned());
+            page_documents.push(value);
+            if !paginate || page_records.len() < 100 {
+                break;
+            }
+            if page == max_pages {
+                return Err(ForgeError(
+                    "GitHub pagination reached the configured page limit with more results possible".into(),
+                ));
+            }
         }
-        let stdin = if let Some(body) = body {
-            args.extend([OsString::from("--input"), OsString::from("-")]);
-            body.to_vec()
-        } else {
-            Vec::new()
-        };
-        let mut environment = self.environment.clone();
-        environment.insert("GH_PROMPT_DISABLED".into(), "1".into());
-        environment.insert("GH_PAGER".into(), "cat".into());
-        environment.insert("GH_NO_UPDATE_NOTIFIER".into(), "1".into());
-        let request = ProcessRequest {
-            executable: self.gh_path.clone(),
-            args,
-            stdin,
-            cwd: None,
-            clear_environment: true,
-            environment,
-            timeout: self.timeout,
-            shutdown_grace: self.shutdown_grace,
-            stdout_limit: self.stdout_limit,
-            stderr_tail_limit: self.stderr_tail_limit,
-        };
-        let output = self
-            .runner
-            .run(request)
-            .map_err(|error| ForgeError(format!("gh process could not complete: {error}")))?;
-        if output.timed_out {
-            return Err(ForgeError(
-                "gh request timed out; effect state is uncertain".into(),
-            ));
-        }
-        if output.stdout_truncated || output.stderr_truncated {
-            return Err(ForgeError(
-                "gh response exceeded the configured output limit".into(),
-            ));
-        }
-        if !output.status.as_ref().is_some_and(ExitStatus::success) {
-            return Err(ForgeError(
-                "gh API request failed; remote state is unknown".into(),
-            ));
-        }
-        let value: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|_| ForgeError("gh returned malformed JSON".into()))?;
-        let (records, pages) = if paginate {
-            flatten_pages(value, self.page_limit)?
-        } else {
-            (vec![value], 1)
-        };
-        Ok(ApiResponse { records, pages })
+        Ok(ApiResponse {
+            records,
+            pages: page_documents.len() as u16,
+            page_documents,
+        })
     }
 
     fn read_value(&self, repository: &RepositoryRef, suffix: &str) -> Result<Value, ForgeError> {
@@ -210,7 +244,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         let response = self.run_api("GET", &self.endpoint(repository, suffix)?, None, true)?;
         let records = if let Some(field) = collection_field {
             let mut collected = Vec::new();
-            for page in response.records {
+            for page in response.page_documents {
                 let values = page
                     .get(field)
                     .and_then(Value::as_array)
@@ -433,7 +467,11 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
     ) -> Result<CommitComparison, ForgeError> {
         let base = path_component(base)?;
         let head = path_component(head)?;
-        parse_comparison(self.read_value(repository, &format!("compare/{base}...{head}"))?)
+        parse_comparison(
+            self.read_value(repository, &format!("compare/{base}...{head}"))?,
+            &base,
+            &head,
+        )
     }
 
     fn current_actor(&self, repository: &RepositoryRef) -> Result<String, ForgeError> {
@@ -463,13 +501,14 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         endpoint: &str,
         body: Value,
         operation_key: &str,
+        request_digest: &Digest,
     ) -> Result<EffectAcknowledgement, ForgeError> {
         if operation_key.is_empty() {
             return Err(ForgeError("effect operation key must be non-empty".into()));
         }
         let body_bytes =
             serde_json::to_vec(&body).map_err(|error| ForgeError(error.to_string()))?;
-        let request_digest = Digest::parse(hex_digest(&body_bytes)).map_err(ForgeError)?;
+        let request_digest = request_digest.clone();
         let output = self.run_api(method, endpoint, Some(&body_bytes), false);
         match output {
             Ok(response) => Ok(EffectAcknowledgement {
@@ -537,6 +576,12 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             None,
             parse_file,
         );
+        let files = match files {
+            Observed::Complete { value, .. } if value.len() >= 3_000 => Self::unknown(ForgeError(
+                "GitHub file listing reached its 3,000-file cap; complete diff is unknown".into(),
+            )),
+            other => other,
+        };
         let check_runs = match pr {
             Some(pr) => self.observe_list(
                 &pull.repository,
@@ -551,7 +596,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 &pull.repository,
                 &format!("commits/{}/statuses", pr.head_sha),
                 None,
-                parse_status,
+                |value| parse_status(value, &pr.head_sha),
             ),
             None => Self::unknown(ForgeError("pull request head is unknown".into())),
         };
@@ -653,71 +698,10 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         }
     }
 
-    fn update_body(&self, intent: &BodyUpdateIntent) -> Result<EffectAcknowledgement, ForgeError> {
-        intent.pull.validate().map_err(ForgeError)?;
-        let expected =
-            Digest::parse(hex_digest(intent.exact_body.as_bytes())).map_err(ForgeError)?;
-        if expected != intent.approved_body_digest {
-            return Err(ForgeError(
-                "prepared PR body differs from approved body digest".into(),
-            ));
-        }
-        let before = self.observe_pull_for_effect(&intent.pull)?;
-        let prior = Digest::parse(hex_digest(
-            before.body.as_deref().unwrap_or_default().as_bytes(),
+    fn update_body(&self, _intent: &BodyUpdateIntent) -> Result<EffectAcknowledgement, ForgeError> {
+        Err(ForgeError(
+            "GitHub does not support atomic conditional PR-body updates; this effect requires human execution".into(),
         ))
-        .map_err(ForgeError)?;
-        if before.head_sha != intent.expected_head_sha || prior != intent.expected_prior_body_digest
-        {
-            return Ok(EffectAcknowledgement {
-                operation_key: intent.operation_key.clone(),
-                request_digest: canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
-                certainty: EffectCertainty::DefinitelyAbsent,
-                external_id: None,
-                external_url: None,
-                resulting_head_sha: Some(before.head_sha),
-                resulting_merge_sha: None,
-                reason: Some("PR body or head changed before update".into()),
-            });
-        }
-        let endpoint = self.endpoint(
-            &intent.pull.repository,
-            &format!("pulls/{}", intent.pull.number),
-        )?;
-        let mut body = Map::new();
-        body.insert("body".into(), Value::String(intent.exact_body.clone()));
-        let mut result = self.mutate(
-            "PATCH",
-            &endpoint,
-            Value::Object(body),
-            &intent.operation_key,
-        )?;
-        if result.certainty == EffectCertainty::Unknown {
-            return Ok(result);
-        }
-        match self.observe_pull_for_effect(&intent.pull) {
-            Ok(after)
-                if after.head_sha == intent.expected_head_sha
-                    && after.body.as_deref().unwrap_or_default() == intent.exact_body =>
-            {
-                result.resulting_head_sha = Some(after.head_sha);
-                Ok(result)
-            }
-            Ok(after) => {
-                result.certainty = EffectCertainty::Unknown;
-                result.resulting_head_sha = Some(after.head_sha);
-                result.reason =
-                    Some("PR body or head changed during update; reconciliation required".into());
-                Ok(result)
-            }
-            Err(error) => {
-                result.certainty = EffectCertainty::Unknown;
-                result.reason = Some(format!(
-                    "body update succeeded but re-observation failed: {error}"
-                ));
-                Ok(result)
-            }
-        }
     }
 
     fn post_comment(&self, intent: &CommentIntent) -> Result<EffectAcknowledgement, ForgeError> {
@@ -760,6 +744,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             &endpoint,
             serde_json::json!({"body": intent.exact_body}),
             &intent.operation_key,
+            &canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
         )
     }
 
@@ -810,9 +795,35 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 .into(),
             ),
         );
+        if !intent.expected_trailers.is_empty() {
+            if intent.method != MergeMethod::Squash {
+                return Err(ForgeError(
+                    "GitHub only accepts a custom commit message for squash merges; required trailers cannot be guaranteed for this merge method".into(),
+                ));
+            }
+            if intent
+                .expected_trailers
+                .iter()
+                .any(|line| !line.starts_with("Co-authored-by: ") || line.contains(['\n', '\r']))
+            {
+                return Err(ForgeError("required merge trailer block is invalid".into()));
+            }
+            let mut commit_message = before.body.unwrap_or_default().trim_end().to_owned();
+            if !commit_message.is_empty() {
+                commit_message.push_str("\n\n");
+            }
+            commit_message.push_str(&intent.expected_trailers.join("\n"));
+            body.insert("commit_message".into(), Value::String(commit_message));
+        }
         // GitHub accepts an expected head SHA but no expected base SHA. The separate base SHA is
         // retained in the durable request digest and must be re-observed by the executor.
-        self.mutate("PUT", &endpoint, Value::Object(body), &intent.operation_key)
+        self.mutate(
+            "PUT",
+            &endpoint,
+            Value::Object(body),
+            &intent.operation_key,
+            &canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
+        )
     }
 
     fn reconcile(&self, intent: &MergeEffectIntent) -> Result<Reconciliation, ForgeError> {
@@ -828,16 +839,14 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                         "PR head changed while body update outcome is uncertain".into(),
                     ));
                 }
-                let actual_digest = pull.body.as_deref().map(|body| hex_digest(body.as_bytes()));
-                if actual_digest.as_deref() == Some(body_intent.approved_body_digest.as_str()) {
+                let actual_digest = hex_digest(pull.body.as_deref().unwrap_or_default().as_bytes());
+                if actual_digest == body_intent.approved_body_digest.as_str() {
                     Ok(Reconciliation::Recovered(ack_for(
                         intent,
                         EffectCertainty::Recovered,
                         None,
                     )))
-                } else if actual_digest.as_deref()
-                    == Some(body_intent.expected_prior_body_digest.as_str())
-                {
+                } else if actual_digest == body_intent.expected_prior_body_digest.as_str() {
                     Ok(Reconciliation::DefinitelyAbsent)
                 } else {
                     Ok(Reconciliation::Unknown(
@@ -894,20 +903,13 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                         }
                         Err(error) => return Ok(Reconciliation::Unknown(error.0)),
                     };
-                    let head = match self.observe_commit_inner(
-                        &intent.pull.repository,
-                        &merge_intent.expected_head_sha,
-                    ) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Reconciliation::Unknown(error.0)),
-                    };
                     let includes_head = match merge_intent.method {
                         MergeMethod::Merge => {
                             merge.parents.contains(&merge_intent.expected_head_sha)
                         }
-                        MergeMethod::Squash | MergeMethod::Rebase => {
-                            merge.tree_sha == head.tree_sha
-                        }
+                        // A merged PR is associated with its exact reported head SHA. Equality
+                        // with the PR head tree is too strict when the target has unrelated edits.
+                        MergeMethod::Squash | MergeMethod::Rebase => true,
                     };
                     let Some(base_parent) = merge.parents.first() else {
                         return Ok(Reconciliation::Unknown(
@@ -954,6 +956,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
 struct ApiResponse {
     records: Vec<Value>,
     pages: u16,
+    page_documents: Vec<Value>,
 }
 
 fn parse_repository(value: Value) -> Result<RepositoryIdentity, ForgeError> {
@@ -1015,11 +1018,21 @@ fn parse_check_run(value: Value) -> Result<CheckRun, ForgeError> {
     })
 }
 
-fn parse_status(value: Value) -> Result<CommitStatus, ForgeError> {
+fn parse_status(value: Value, requested_sha: &str) -> Result<CommitStatus, ForgeError> {
+    let sha = value
+        .get("sha")
+        .and_then(Value::as_str)
+        .unwrap_or(requested_sha)
+        .to_owned();
+    if sha != requested_sha {
+        return Err(ForgeError(
+            "commit status belongs to a different SHA".into(),
+        ));
+    }
     Ok(CommitStatus {
         context: string(&value, "context")?,
         state: string(&value, "state")?,
-        sha: string(&value, "sha")?,
+        sha,
         creator: value
             .get("creator")
             .and_then(|v| v.get("login"))
@@ -1140,16 +1153,34 @@ fn parse_commit(value: Value) -> Result<crate::forge::CommitObservation, ForgeEr
     })
 }
 
-fn parse_comparison(value: Value) -> Result<CommitComparison, ForgeError> {
+fn parse_comparison(
+    value: Value,
+    requested_base: &str,
+    requested_head: &str,
+) -> Result<CommitComparison, ForgeError> {
+    let base_sha = value
+        .pointer("/base_commit/sha")
+        .and_then(Value::as_str)
+        .unwrap_or(requested_base);
+    let head_sha = value
+        .pointer("/head_commit/sha")
+        .and_then(Value::as_str)
+        .unwrap_or(requested_head);
+    if base_sha != requested_base || head_sha != requested_head {
+        return Err(ForgeError(
+            "comparison response revisions differ from the requested pair".into(),
+        ));
+    }
     Ok(CommitComparison {
-        base_sha: string_path(&value, &["base_commit", "sha"])?,
-        head_sha: string_path(&value, &["head_commit", "sha"])?,
+        base_sha: base_sha.to_owned(),
+        head_sha: head_sha.to_owned(),
         status: string(&value, "status")?,
         ahead_by: number(&value, "ahead_by")?,
         behind_by: number(&value, "behind_by")?,
     })
 }
 
+#[cfg(test)]
 fn flatten_pages(value: Value, limit: u16) -> Result<(Vec<Value>, u16), ForgeError> {
     let pages = value
         .as_array()
@@ -1422,6 +1453,35 @@ mod tests {
         assert_eq!(pages, 2);
         assert_eq!(records.len(), 2);
         assert!(flatten_pages(serde_json::json!([[{"id":1}], [{"id":2}]]), 1).is_err());
+    }
+
+    #[test]
+    fn status_without_sha_is_bound_to_requested_head_and_mismatch_is_unknown() {
+        let status = parse_status(
+            serde_json::json!({"context":"ci","state":"success"}),
+            "abc123",
+        )
+        .unwrap();
+        assert_eq!(status.sha, "abc123");
+        assert!(
+            parse_status(
+                serde_json::json!({"context":"ci","state":"success","sha":"other"}),
+                "abc123",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn comparison_without_head_commit_still_binds_requested_pair() {
+        let comparison = parse_comparison(
+            serde_json::json!({"status":"ahead","ahead_by":1,"behind_by":0}),
+            "base123",
+            "head456",
+        )
+        .unwrap();
+        assert_eq!(comparison.base_sha, "base123");
+        assert_eq!(comparison.head_sha, "head456");
     }
 
     #[test]

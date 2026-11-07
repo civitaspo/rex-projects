@@ -14,9 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::domain::ids::{Digest, HumanRequestId};
 use crate::domain::types::MergeMethod;
 use crate::forge::{
-    BodyUpdateIntent, DirectMergeIntent, EffectAcknowledgement, EffectCertainty, Forge, ForgeError,
-    ForgeObservation, MergeEffectIntent, Observed, PullRequestRef, Reconciliation,
-    canonical_digest,
+    DirectMergeIntent, EffectAcknowledgement, EffectCertainty, Forge, ForgeError, ForgeObservation,
+    MergeEffectIntent, Observed, PullRequestRef, Reconciliation, canonical_digest,
 };
 use crate::merge_policy::{
     MergeAssessment, MergeDisposition, MergeEvidenceSnapshot, MergePolicy, MergeProcedure,
@@ -328,51 +327,15 @@ impl<F: Forge> MergeProcedureExecutor<F> {
 
         match &step.operation {
             MergeProcedureOperation::UpdatePullRequestBody {
-                expected_prior_body_digest,
-                approved_body_digest,
+                ..
             } => {
-                let body = intent.exact_prepared_body.as_ref().ok_or_else(|| {
-                    MergeExecutionError::Invalid("approved PR body bytes are missing".into())
-                })?;
-                if digest_bytes(body.as_bytes())? != *approved_body_digest
-                    || approved.subject.prepared_body_digest.as_ref() != Some(approved_body_digest)
-                {
-                    return Err(MergeExecutionError::Stale(
-                        "prepared body bytes do not match the reviewed body digest".into(),
-                    ));
-                }
-                let live = complete_pull(&observed)?;
-                if body_digest(live.body.as_deref().unwrap_or_default())?
-                    != *expected_prior_body_digest
-                {
-                    return Err(MergeExecutionError::Stale(
-                        "PR body differs from the procedure's expected prior body".into(),
-                    ));
-                }
-                let effect = BodyUpdateIntent {
-                    pull: pull.clone(),
-                    operation_key: intent.operation_key.clone(),
-                    expected_head_sha: approved.subject.head_sha.clone(),
-                    expected_prior_body_digest: expected_prior_body_digest.clone(),
-                    exact_body: body.clone(),
-                    approved_body_digest: approved_body_digest.clone(),
-                };
-                validate_approval(
-                    approved,
-                    approval,
-                    &procedure_digest,
-                    &policy_digest,
-                    current_unix_time()?,
-                )?;
-                let ack = self
-                    .forge
-                    .update_body(&effect)
-                    .map_err(|error| MergeExecutionError::Forge(error.to_string()))?;
-                Ok(StepOutcome::Effect(ack))
+                Err(MergeExecutionError::Blocked(
+                    "GitHub does not support atomic conditional PR-body updates; perform this step manually, re-observe, and create a new assessment".into(),
+                ))
             }
             MergeProcedureOperation::RequestMerge { .. } => {
-                Err(MergeExecutionError::HumanApprovalRequired(
-                    "plain GitHub merge-request comments have no registered revision-guarded handler; no command was posted".into(),
+                Err(MergeExecutionError::Blocked(
+                    "plain GitHub merge-request comments have no registered revision-guarded handler; hand off to a human without posting a command".into(),
                 ))
             }
             MergeProcedureOperation::ExecuteMerge {
@@ -387,6 +350,35 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                     ));
                 }
                 ensure_open_same_revisions(&observed, &approved.subject)?;
+                let expected_body_digest = procedure.steps.iter().find_map(|step| {
+                    if let MergeProcedureOperation::UpdatePullRequestBody {
+                        approved_body_digest,
+                        ..
+                    } = &step.operation
+                    {
+                        Some(approved_body_digest)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(expected_body_digest) = expected_body_digest {
+                    let prepared_body = intent.exact_prepared_body.as_ref().ok_or_else(|| {
+                        MergeExecutionError::Invalid(
+                            "prepared PR body is missing for the approved procedure".into(),
+                        )
+                    })?;
+                    let live = complete_pull(&observed)?;
+                    if digest_bytes(prepared_body.as_bytes())? != *expected_body_digest
+                        || approved.subject.prepared_body_digest.as_ref()
+                            != Some(expected_body_digest)
+                        || body_digest(live.body.as_deref().unwrap_or_default())?
+                            != digest_bytes(prepared_body.as_bytes())?
+                    {
+                        return Err(MergeExecutionError::Stale(
+                            "PR body changed after its reviewed update; refusing merge".into(),
+                        ));
+                    }
+                }
                 let protection = complete_observation(&observed.branch_protection)?;
                 if !protection.supports_execution_base_guard(
                     &policy.required_checks,
@@ -402,6 +394,13 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                     method: procedure.method,
                     expected_head_sha: expected_head_sha.clone(),
                     expected_base_sha: approved.subject.base_sha.clone(),
+                    expected_trailers: procedure.steps.iter().find_map(|step| {
+                        if let MergeProcedureOperation::VerifyMergeCommit { expected_trailers } = &step.operation {
+                            Some(expected_trailers.clone())
+                        } else {
+                            None
+                        }
+                    }).unwrap_or_default(),
                 };
                 validate_approval(
                     approved,
@@ -488,27 +487,10 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                 "merge commit identity or required trailers do not match".into(),
             ));
         }
-        let head_commit = match self
-            .forge
-            .observe_commit(&pull.repository, &subject.head_sha)
-            .map_err(|error| MergeExecutionError::Forge(error.to_string()))?
-        {
-            Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => {
-                return Err(MergeExecutionError::VerificationFailed(reason));
-            }
-        };
         match method {
             MergeMethod::Merge if !merge_commit.parents.contains(&subject.head_sha) => {
                 return Err(MergeExecutionError::VerificationFailed(
                     "merge commit does not have the approved PR head as a parent".into(),
-                ));
-            }
-            MergeMethod::Squash | MergeMethod::Rebase
-                if merge_commit.tree_sha != head_commit.tree_sha =>
-            {
-                return Err(MergeExecutionError::VerificationFailed(
-                    "squash/rebase merge tree differs from approved PR head tree".into(),
                 ));
             }
             _ => (),
