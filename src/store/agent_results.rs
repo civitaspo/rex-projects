@@ -1345,6 +1345,11 @@ mod tests {
                 run_id: authority.agent_run_id.clone(),
                 role: authority.role,
                 ticket_run_id: authority.ticket_run_id.clone(),
+                operation_id: authority.operation_id.clone(),
+                expected_subject_revision: authority
+                    .ticket_revision
+                    .expect("ticket-scoped result fixture")
+                    .0,
                 attempt: authority.attempt,
                 run_epoch: authority.run_epoch,
                 controller_generation: authority.controller_generation,
@@ -1550,6 +1555,8 @@ mod tests {
                 effective_permission_mode: "workspace_write".into(),
                 conversation_id: None,
                 provider_version: Some("fixture-1".into()),
+                provider_process_failure: None,
+                provider_result_failure: None,
                 capability_receipt_digest: Some(authority.qualification_receipt_digest.clone()),
                 schema_projection: projection,
                 launch_pid_hint: None,
