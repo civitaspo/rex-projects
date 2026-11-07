@@ -1,0 +1,1077 @@
+{
+  "$defs": {
+    "AdaptersConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "tickets": {
+          "$ref": "#/$defs/TicketAdapterConfig"
+        }
+      },
+      "required": [
+        "tickets"
+      ],
+      "type": "object"
+    },
+    "ApprovalMode": {
+      "enum": [
+        "repository_policy",
+        "always",
+        "not_required"
+      ],
+      "type": "string"
+    },
+    "CommitConclusion": {
+      "enum": [
+        "success",
+        "failure",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "EnvironmentConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "interactive": {
+          "default": false,
+          "type": "boolean"
+        },
+        "shell": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/EnvironmentSource",
+          "default": "current"
+        },
+        "timeout_seconds": {
+          "default": 15,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "EnvironmentSource": {
+      "enum": [
+        "current",
+        "login_shell"
+      ],
+      "type": "string"
+    },
+    "GoalConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptance": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "statement",
+        "acceptance"
+      ],
+      "type": "object"
+    },
+    "HookConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 900,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "command"
+      ],
+      "type": "object"
+    },
+    "HumanConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "command"
+      ],
+      "type": "object"
+    },
+    "KnowledgeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "type": "string"
+        },
+        "max_source_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "format",
+        "root",
+        "max_source_bytes"
+      ],
+      "type": "object"
+    },
+    "LearningConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_candidates_per_project": {
+          "default": 5,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_trial_pairs_per_revision": {
+          "default": 10,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_distinct_trial_inputs": {
+          "default": 5,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "review_interval_hours": {
+          "default": 24,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "MergeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_check_conclusions": {
+          "default": [
+            "success"
+          ],
+          "items": {
+            "$ref": "#/$defs/CommitConclusion"
+          },
+          "type": "array"
+        },
+        "auto_merge": {
+          "default": false,
+          "type": "boolean"
+        },
+        "executor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeExecutor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "instruction_files": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "instructions": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeMethod"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "minimum_reliability_score": {
+          "default": 0,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "required_approvals": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "required_checks": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "MergeExecutor": {
+      "enum": [
+        "direct",
+        "request"
+      ],
+      "type": "string"
+    },
+    "MergeMethod": {
+      "enum": [
+        "merge",
+        "squash",
+        "rebase"
+      ],
+      "type": "string"
+    },
+    "OperationActionConfig": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "forge_observation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "command",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OperationMatch": {
+      "additionalProperties": false,
+      "properties": {
+        "labels_all": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recipe": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "recipe"
+      ],
+      "type": "object"
+    },
+    "OperationRecipe": {
+      "additionalProperties": false,
+      "properties": {
+        "not_required_reason": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required_evidence": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "required_stages": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RecipeStage"
+          },
+          "type": "array"
+        },
+        "roles": {
+          "additionalProperties": false,
+          "default": {},
+          "properties": {
+            "coordinator": {
+              "type": "string"
+            },
+            "merge_decision": {
+              "type": "string"
+            },
+            "operator": {
+              "type": "string"
+            },
+            "planner": {
+              "type": "string"
+            },
+            "postmortem": {
+              "type": "string"
+            },
+            "reviewer": {
+              "type": "string"
+            },
+            "supervisor": {
+              "type": "string"
+            },
+            "worker": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "targets": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/OperationTarget"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "OperationTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "approval": {
+          "$ref": "#/$defs/ApprovalMode"
+        },
+        "depends_on": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "selector": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "source": {
+          "type": "string"
+        },
+        "success_predicate": {
+          "$ref": "#/$defs/SuccessPredicate"
+        },
+        "timeout_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "repository",
+        "environment",
+        "action",
+        "source",
+        "success_predicate",
+        "timeout_seconds",
+        "approval"
+      ],
+      "type": "object"
+    },
+    "ProjectConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "auto_merge": {
+          "default": false,
+          "type": "boolean"
+        },
+        "dispatch_states": {
+          "default": [
+            "ready"
+          ],
+          "items": {
+            "$ref": "#/$defs/TicketStatus"
+          },
+          "type": "array"
+        },
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GoalConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_active_tickets": {
+          "default": 1,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_created_tickets_per_goal_revision": {
+          "default": 20,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_effect_retries": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_investigation_children": {
+          "default": 2,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_review_rounds": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/ProjectMode"
+        },
+        "operation_matches": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/OperationMatch"
+          },
+          "type": "array"
+        },
+        "repositories": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "role_defaults_from": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "roles": {
+          "additionalProperties": false,
+          "default": {},
+          "properties": {
+            "coordinator": {
+              "type": "string"
+            },
+            "merge_decision": {
+              "type": "string"
+            },
+            "operator": {
+              "type": "string"
+            },
+            "planner": {
+              "type": "string"
+            },
+            "postmortem": {
+              "type": "string"
+            },
+            "reviewer": {
+              "type": "string"
+            },
+            "supervisor": {
+              "type": "string"
+            },
+            "worker": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "ticket_adapter": {
+          "type": "string"
+        },
+        "ticket_scope": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "mode",
+        "ticket_adapter"
+      ],
+      "type": "object"
+    },
+    "ProjectMode": {
+      "enum": [
+        "goal",
+        "operations"
+      ],
+      "type": "string"
+    },
+    "RecipeStage": {
+      "enum": [
+        "planning",
+        "implementation",
+        "review",
+        "merge",
+        "operations",
+        "postmortem"
+      ],
+      "type": "string"
+    },
+    "RepositoryConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "base_branch": {
+          "type": "string"
+        },
+        "clone_url": {
+          "type": "string"
+        },
+        "forge": {
+          "type": "string"
+        },
+        "instruction_files": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "merge": {
+          "$ref": "#/$defs/MergeConfig",
+          "default": {
+            "allowed_check_conclusions": [
+              "success"
+            ],
+            "auto_merge": false,
+            "executor": null,
+            "instruction_files": [],
+            "instructions": null,
+            "method": null,
+            "minimum_reliability_score": 85,
+            "required_approvals": 0,
+            "required_checks": []
+          }
+        },
+        "operations": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RepositoryOperationsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "rex_projects_hooks": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/HookConfig"
+          },
+          "type": "array"
+        },
+        "role_instruction_files": {
+          "additionalProperties": false,
+          "default": {},
+          "properties": {
+            "coordinator": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "merge_decision": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "operator": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "planner": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "postmortem": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reviewer": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "supervisor": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "worker": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "worktree_root": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "clone_url",
+        "base_branch",
+        "forge"
+      ],
+      "type": "object"
+    },
+    "RepositoryOperationsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_actions": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "human_approval_environments": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "instruction_files": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recipe": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "recipe"
+      ],
+      "type": "object"
+    },
+    "RuntimeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "completed_blocks_to_keep": {
+          "default": 1,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "completed_ticket_tab_retention_hours": {
+          "default": 24,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "environment": {
+          "$ref": "#/$defs/EnvironmentConfig",
+          "default": {
+            "interactive": false,
+            "shell": null,
+            "source": "current",
+            "timeout_seconds": 15
+          }
+        },
+        "external_poll_seconds": {
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_agent_runs": {
+          "default": 8,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_blocks_per_tab": {
+          "default": 8,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_rex_projects_hook_runs": {
+          "default": 2,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_ticket_runs": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rex_binary": {
+          "default": "rex",
+          "type": "string"
+        },
+        "shutdown_grace_seconds": {
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "StatusValues": {
+      "additionalProperties": false,
+      "properties": {
+        "backlog": {
+          "type": "string"
+        },
+        "canceled": {
+          "type": "string"
+        },
+        "done": {
+          "type": "string"
+        },
+        "in_progress": {
+          "type": "string"
+        },
+        "in_review": {
+          "type": "string"
+        },
+        "ready": {
+          "type": "string"
+        },
+        "triage": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "triage",
+        "backlog",
+        "ready",
+        "in_progress",
+        "in_review",
+        "done",
+        "canceled"
+      ],
+      "type": "object"
+    },
+    "SuccessPredicate": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "target_succeeded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "jobs": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "all_named_jobs_succeeded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "jobs"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "explicit_not_required",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "evidence"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TicketAdapterConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "environment_allow": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "read_timeout_seconds": {
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status_values": {
+          "$ref": "#/$defs/StatusValues"
+        },
+        "write_timeout_seconds": {
+          "default": 120,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "command",
+        "status_values"
+      ],
+      "type": "object"
+    },
+    "TicketStatus": {
+      "enum": [
+        "triage",
+        "backlog",
+        "ready",
+        "in_progress",
+        "in_review",
+        "done",
+        "canceled"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "adapters": {
+      "$ref": "#/$defs/AdaptersConfig"
+    },
+    "human": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HumanConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "knowledge": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KnowledgeConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "learning": {
+      "$ref": "#/$defs/LearningConfig",
+      "default": {
+        "max_candidates_per_project": 5,
+        "max_trial_pairs_per_revision": 10,
+        "min_distinct_trial_inputs": 5,
+        "review_interval_hours": 24
+      }
+    },
+    "operation_actions": {
+      "additionalProperties": {
+        "$ref": "#/$defs/OperationActionConfig"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "operation_recipes": {
+      "additionalProperties": {
+        "$ref": "#/$defs/OperationRecipe"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "projects": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProjectConfig"
+      },
+      "type": "object"
+    },
+    "repositories": {
+      "additionalProperties": {
+        "$ref": "#/$defs/RepositoryConfig"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeConfig",
+      "default": {
+        "completed_blocks_to_keep": 1,
+        "completed_ticket_tab_retention_hours": 24,
+        "environment": {
+          "interactive": false,
+          "shell": null,
+          "source": "current",
+          "timeout_seconds": 15
+        },
+        "external_poll_seconds": 30,
+        "max_agent_runs": 8,
+        "max_blocks_per_tab": 8,
+        "max_rex_projects_hook_runs": 2,
+        "max_ticket_runs": 3,
+        "rex_binary": "rex",
+        "shutdown_grace_seconds": 30
+      }
+    },
+    "schema_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "state_root": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "adapters",
+    "projects"
+  ],
+  "title": "Config",
+  "type": "object"
+}

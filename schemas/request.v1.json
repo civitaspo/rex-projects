@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "method": {
+      "type": "string"
+    },
+    "operation_id": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "params": true,
+    "project_id": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "request_id",
+    "method",
+    "params"
+  ],
+  "title": "RequestEnvelope",
+  "type": "object"
+}

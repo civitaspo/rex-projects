@@ -1,11 +1,29 @@
 # rex-projects
 
-A Rex plugin with a Lua integration layer and a Rust core.
+A Rex plugin with a Lua integration layer and a Rust core. Rust owns typed
+configuration, protocol and state boundaries; Lua is the Rex integration layer.
 
-The Rust package currently provides only a CI/build scaffold. Its executable
-supports `--version` and reports the Cargo package version for release checks.
-Other invocations print that the runtime is not implemented yet and exit with
-an error; no rex-projects runtime behavior is available yet.
+The current Rust slice provides strict configuration/profile validation,
+generated JSON Schemas, read-only dependency discovery, protocol envelope
+validation, build metadata, and transactional configuration snapshots. The
+Agent runtime and ticket-processing controller are implemented in later slices.
+
+The default configuration path is `${XDG_CONFIG_HOME:-$HOME/.config}/rex-projects/config.toml`.
+Agent profiles live in sibling `profiles/<profile-id>/` directories. Validate
+the checked-in public example with:
+
+```sh
+cargo run -- --config examples/fixture/config.toml config validate
+```
+
+`config apply --bootstrap` creates the first snapshot in
+`${XDG_STATE_HOME:-$HOME/.local/state}/rex-projects/`; subsequent applies use
+`--expected-revision`. Run `rex-projects schema config` for the authoritative
+configuration schema and `rex-projects doctor --json` for read-only executable
+resolution. `rex-projects --version` and `rex-projects <Cargo version>` support
+release probes.
+
+See [Release assets](docs/release-assets.md) for versioned target builds.
 
 ## Development
 

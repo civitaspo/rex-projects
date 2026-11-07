@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cli_protocol": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "database_schema": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dirty": {
+      "type": "boolean"
+    },
+    "name": {
+      "type": "string"
+    },
+    "source_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "version",
+    "target",
+    "cli_protocol",
+    "database_schema",
+    "dirty"
+  ],
+  "title": "VersionInfo",
+  "type": "object"
+}
