@@ -1298,7 +1298,19 @@ fn insert_derived_wakes(
     if envelope_bytes.len() > 512 * 1024 {
         return Err("validated Agent result wake exceeds its 512 KiB snapshot limit".into());
     }
+    let coordinator_waiting_for_human = authority.role == Role::Coordinator
+        && matches!(
+            &result.typed_payload,
+            crate::engine::orchestration::RoleResultPayload::HumanRequest(request)
+                if request.kind == "clarification"
+        );
     for recipient in &result.wake_recipients {
+        if coordinator_waiting_for_human && recipient.role == Role::Supervisor {
+            // A Coordinator clarification is surfaced through the durable human request. The
+            // Supervisor must not consume the result as if the ticket could proceed before the
+            // human answer arrives; the answer itself wakes this Coordinator session.
+            continue;
+        }
         let session = resolve_recipient_session(tx, authority, recipient)?;
         let payload = serde_json::to_string(&result_envelope).map_err(|error| error.to_string())?;
         tx.execute("INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'agent_result',?3,?4,0,?5,'pending',?6) ON CONFLICT(role_session_id,source_type,source_id,source_revision) DO NOTHING", params![authority.project_id.as_str(),session,evidence_id,authority.run_epoch,payload,now]).map_err(|error| error.to_string())?;

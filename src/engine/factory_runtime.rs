@@ -5,6 +5,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use sha2::Digest as _;
+
 use crate::agent_recovery::AgentRecoveryReport;
 use crate::config::{Config, ProjectConfig};
 use crate::domain::ids::{Digest, OperationId, ProjectId, Revision, TicketNamespace, TicketRunId};
@@ -531,6 +533,111 @@ fn apply_agent_result(
         && result.validated.kind == RoleOutputKind::OperationResult
     {
         return apply_operator_result(store, owner_generation, now_unix, services, result);
+    }
+    if binding.role == Role::Coordinator
+        && result.validated.kind == RoleOutputKind::HumanRequest
+        && let RoleResultPayload::HumanRequest(payload) = &result.validated.typed_payload
+        && payload.kind == "clarification"
+    {
+        let Some(ticket_run_id) = binding.ticket_run_id.as_ref() else {
+            return Err("Coordinator clarification result lacks TicketRun scope".into());
+        };
+        let revision = binding
+            .ticket_revision
+            .ok_or("Coordinator clarification result lacks TicketRun revision")?;
+        if !config.projects.contains_key(&binding.project_id) {
+            return Err("Coordinator clarification Project is no longer configured".into());
+        }
+        let record = store
+            .project(&binding.project_id)?
+            .ok_or("Coordinator clarification Project has no durable configuration")?;
+        if record.config_digest != services.configuration_digest().clone()
+            || record.config_digest != binding.config_digest
+            || record.config_revision != binding.config_revision
+        {
+            return Err(
+                "Coordinator clarification belongs to a stale Project configuration".into(),
+            );
+        }
+        let current = store
+            .active_ticket_runs(owner_generation, 128)?
+            .into_iter()
+            .find(|run| run.ticket_run_id == *ticket_run_id)
+            .ok_or("Coordinator clarification references no active TicketRun")?;
+        if current.project_id != binding.project_id
+            || current.revision != revision.0
+            || matches!(
+                current.phase,
+                Phase::WaitingHuman | Phase::Done | Phase::Canceled
+            )
+        {
+            return Err(
+                "Coordinator clarification is stale or conflicts with human code review".into(),
+            );
+        }
+        let documents = services.human_evidence_documents(store, result)?;
+        let request_id = crate::domain::ids::HumanRequestId::parse(format!(
+            "clarify-{}",
+            result.receipt.evidence_id()
+        ))?;
+        let rex_view_id = store
+            .active_ticket_view_id(owner_generation, &binding.project_id, ticket_run_id)?
+            .ok_or("Coordinator clarification has no active ticket Rex view")?;
+        let source = crate::human_runtime::HumanRoleResultSource {
+            binding: binding.clone(),
+            message_id: result.validated.message_id.clone(),
+            result_digest: result.validated.result_digest.clone(),
+            result_kind: result.validated.kind,
+            assertion: result.validated.assertion.clone(),
+            human_request: payload.clone(),
+            claimed_artifact_refs: result.validated.claimed_artifact_refs.clone(),
+        };
+        let expires_at_unix = u64::try_from(now_unix)
+            .map_err(|_| "controller time is before the Unix epoch")?
+            .saturating_add(7 * 24 * 60 * 60);
+        let presentation =
+            crate::human_runtime::HumanAuthorityMaterial::coordinator_clarification_effect(
+                request_id.clone(),
+                rex_view_id,
+                source,
+                documents,
+                expires_at_unix,
+            )?;
+        presentation
+            .request
+            .validate(expires_at_unix.saturating_sub(1))?;
+        let request_json =
+            serde_json::to_string(&presentation).map_err(|error| error.to_string())?;
+        let request_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(request_json.as_bytes())
+        ))?;
+        let operation_id = OperationId::parse(format!("present-{}", request_id.as_str()))?;
+        let _inserted = store.enqueue_effect(
+            owner_generation,
+            &EffectIntent {
+                project_id: binding.project_id.clone(),
+                subject_type: "ticket_run".into(),
+                subject_id: ticket_run_id.as_str().into(),
+                operation_id: operation_id.as_str().into(),
+                logical_key: format!(
+                    "{}:{}:coordinator-clarification:{}",
+                    ticket_run_id, revision.0, request_id
+                ),
+                kind: "request_human_review".into(),
+                request_json,
+                request_digest: request_digest.to_string(),
+                expected_revision: Some(revision.0),
+            },
+        )?;
+        let ack_revision = revision.0.max(1);
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            ack_revision,
+            crate::store::agent_results::ResultDisposition::RetainedAsClaim,
+        )?;
+        return Ok(true);
     }
     if result.validated.kind != RoleOutputKind::PlanReady
         || binding.role != Role::Coordinator

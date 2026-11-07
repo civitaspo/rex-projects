@@ -56,9 +56,9 @@ pub(crate) fn create_human_requests_table(
         return Err("invalid internal human request table name".into());
     }
     let purposes = if allow_publication_adoption {
-        "'plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision','publication_adoption'"
+        "'plan_decision','coordinator_clarification','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision','publication_adoption','merge_preparation'"
     } else {
-        "'plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision'"
+        "'plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision','merge_preparation'"
     };
     let subjects = if allow_publication_adoption {
         "'ticket_run','plan','operation','profile','goal','project_configuration','release','publication'"
@@ -122,7 +122,64 @@ fn migrate_human_requests_publication_adoption(
          ALTER TABLE human_requests_v12 RENAME TO human_requests;"
     ))
     .map_err(|error| error.to_string())?;
-    create_human_request_indexes(tx)
+    create_human_request_indexes(tx)?;
+
+    // v12's centralized rebuild is the only schema-version bump for these unreleased purposes.
+    // Rebuild the decision table too: older v8 databases have a narrower CHECK constraint.
+    let decisions_exist: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='human_decisions')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !decisions_exist {
+        // Canonical schema validation builds only the tables needed to validate the layout.
+        // The production v8 migration creates this table; the validator fixture does not.
+        create_human_decisions_table(tx, "human_decisions")?;
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE human_decisions_v12 (
+            response_id TEXT PRIMARY KEY REFERENCES human_decision_intents(response_id),
+            request_id TEXT NOT NULL REFERENCES human_requests(request_id),
+            subject_digest TEXT NOT NULL,
+            configuration_digest TEXT NOT NULL,
+            policy_digest TEXT NOT NULL,
+            choice TEXT NOT NULL CHECK(choice IN ('approve','answer','request_changes','revise_plan','defer','cancel','refuse','completed')),
+            approved INTEGER NOT NULL CHECK(approved IN (0,1)),
+            explanation TEXT,
+            decided_at_unix INTEGER NOT NULL,
+            receipt_json TEXT NOT NULL CHECK(length(receipt_json) <= 65536),
+            UNIQUE(request_id)
+        );
+        INSERT INTO human_decisions_v12(response_id,request_id,subject_digest,configuration_digest,policy_digest,choice,approved,explanation,decided_at_unix,receipt_json)
+            SELECT response_id,request_id,subject_digest,configuration_digest,policy_digest,choice,approved,explanation,decided_at_unix,receipt_json FROM human_decisions;
+        DROP TABLE human_decisions;
+        ALTER TABLE human_decisions_v12 RENAME TO human_decisions;"
+    )
+    .map_err(|error| format!("could not upgrade human decision choices without data loss: {error}"))
+}
+
+fn create_human_decisions_table(connection: &Connection, table_name: &str) -> Result<(), String> {
+    if !matches!(table_name, "human_decisions" | "human_decisions_v12") {
+        return Err("invalid internal human decisions table name".into());
+    }
+    connection.execute_batch(&format!(
+        "CREATE TABLE {table_name} (
+            response_id TEXT PRIMARY KEY REFERENCES human_decision_intents(response_id),
+            request_id TEXT NOT NULL REFERENCES human_requests(request_id),
+            subject_digest TEXT NOT NULL,
+            configuration_digest TEXT NOT NULL,
+            policy_digest TEXT NOT NULL,
+            choice TEXT NOT NULL CHECK(choice IN ('approve','answer','request_changes','revise_plan','defer','cancel','refuse','completed')),
+            approved INTEGER NOT NULL CHECK(approved IN (0,1)),
+            explanation TEXT,
+            decided_at_unix INTEGER NOT NULL,
+            receipt_json TEXT NOT NULL CHECK(length(receipt_json) <= 65536),
+            UNIQUE(request_id)
+        );"
+    )).map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -316,7 +373,7 @@ impl ConfigStore {
                 subject_digest TEXT NOT NULL,
                 configuration_digest TEXT NOT NULL,
                 policy_digest TEXT NOT NULL,
-                choice TEXT NOT NULL CHECK(choice IN ('approve','request_changes','revise_plan','defer','cancel','refuse')),
+                choice TEXT NOT NULL CHECK(choice IN ('approve','answer','request_changes','revise_plan','defer','cancel','refuse','completed')),
                 approved INTEGER NOT NULL CHECK(approved IN (0,1)),
                 explanation TEXT,
                 decided_at_unix INTEGER NOT NULL,
@@ -437,6 +494,10 @@ impl ConfigStore {
             authority.validate_for(request)?;
             let source = match authority {
                 crate::human_runtime::HumanAuthorityMaterial::PlannerClarification {
+                    source,
+                    ..
+                }
+                | crate::human_runtime::HumanAuthorityMaterial::CoordinatorClarification {
                     source,
                     ..
                 }
@@ -796,6 +857,16 @@ impl ConfigStore {
         }
         if !request.choices.contains(&intent.choice) || !request.purpose.allows(intent.choice) {
             return Err("choice is not offered for this human request".into());
+        }
+        if intent.choice == HumanDecisionChoice::Answer
+            && intent
+                .explanation
+                .as_deref()
+                .is_none_or(|answer| answer.trim().is_empty())
+        {
+            return Err(
+                "Coordinator clarification answer must include nonempty answer text".into(),
+            );
         }
         if now >= request.expires_at_unix {
             return Err("human request has expired".into());
@@ -1284,6 +1355,7 @@ fn validate_active_request_view(
         | HumanPurpose::ProjectConfiguration
         | HumanPurpose::ReleaseDecision => "supervisor",
         HumanPurpose::PlanDecision
+        | HumanPurpose::CoordinatorClarification
         | HumanPurpose::TicketReview
         | HumanPurpose::OperationApproval
         | HumanPurpose::PublicationAdoption => "ticket",
@@ -1364,6 +1436,7 @@ fn insert_role_wake(
         "configuration_digest": receipt.configuration_digest,
         "policy_digest": receipt.policy_digest,
         "revision": request.subject.revision.0,
+        "explanation": receipt.explanation,
         "target": role_name,
     });
     tx.execute("INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'human_decision',?3,?4,10,?5,'pending',?6)", params![request.subject.project_id.as_str(),role_session_id,receipt.response_id,request.subject.revision.0,payload.to_string(),now]).map_err(|error| error.to_string())?;
@@ -1463,6 +1536,7 @@ fn parse_lifecycle(value: &str) -> Result<HumanRequestLifecycle, String> {
 fn purpose_name(value: HumanPurpose) -> &'static str {
     match value {
         HumanPurpose::PlanDecision => "plan_decision",
+        HumanPurpose::CoordinatorClarification => "coordinator_clarification",
         HumanPurpose::TicketReview => "ticket_review",
         HumanPurpose::OperationApproval => "operation_approval",
         HumanPurpose::ProfilePromotion => "profile_promotion",
@@ -1491,6 +1565,7 @@ fn subject_kind_name(value: HumanSubjectKind) -> &'static str {
 fn choice_name(value: HumanDecisionChoice) -> &'static str {
     match value {
         HumanDecisionChoice::Approve => "approve",
+        HumanDecisionChoice::Answer => "answer",
         HumanDecisionChoice::RequestChanges => "request_changes",
         HumanDecisionChoice::RevisePlan => "revise_plan",
         HumanDecisionChoice::Defer => "defer",
@@ -2252,6 +2327,144 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn coordinator_answer_requires_text_and_wakes_its_ticket_coordinator_atomically() {
+        let (temp, mut store, generation, base_request, artifact) = runtime_fixture();
+        let bundle = base_request.review_bundle.clone();
+        let request = HumanRuntimeRequest {
+            request_id: HumanRequestId::parse("clarify-1").unwrap(),
+            purpose: HumanPurpose::CoordinatorClarification,
+            subject: HumanSubjectBinding {
+                project_id: ProjectId::parse("human_project").unwrap(),
+                kind: HumanSubjectKind::TicketRun,
+                subject_id: "run-1".into(),
+                ticket_run_id: Some(TicketRunId::parse("run-1").unwrap()),
+                revision: Revision(1),
+                material_digest: Digest::parse("a".repeat(64)).unwrap(),
+                configuration_digest: base_request.subject.configuration_digest.clone(),
+                policy_digest: Digest::parse("b".repeat(64)).unwrap(),
+                bundle_digest: crate::human::review_bundle_digest(&bundle).unwrap(),
+            },
+            question: "Which option should we use?".into(),
+            choices: vec![
+                HumanDecisionChoice::Answer,
+                HumanDecisionChoice::Defer,
+                HumanDecisionChoice::Cancel,
+            ],
+            expires_at_unix: 100,
+            review_bundle: bundle,
+        };
+        assert!(register_request(&mut store, generation, &request, &artifact, 10).unwrap());
+        let mut intent = HumanDecisionIntent {
+            request_id: request.request_id.clone(),
+            response_id: "answer-1".into(),
+            expected_subject_digest: request.subject.digest().unwrap(),
+            choice: HumanDecisionChoice::Answer,
+            explanation: None,
+        };
+        assert!(ConfigStore::enqueue_human_decision(temp.path(), &intent, 11).is_err());
+        intent.explanation =
+            Some("Use region west-2; it matches the existing deployment target.".into());
+        ConfigStore::enqueue_human_decision(temp.path(), &intent, 11).unwrap();
+        assert!(matches!(
+            store
+                .process_human_decision(generation, &intent.response_id, &request.subject, 12)
+                .unwrap(),
+            HumanDecisionResult::Applied
+        ));
+        let wake: (String, String) = store.connection.query_row(
+            "SELECT role_session_id,payload_json FROM role_wake_inputs WHERE source_type='human_decision' AND source_id='answer-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(wake.0, "ticket_run:run-1:coordinator");
+        let payload: serde_json::Value = serde_json::from_str(&wake.1).unwrap();
+        assert_eq!(payload["choice"], "answer");
+        assert_eq!(
+            payload["explanation"],
+            "Use region west-2; it matches the existing deployment target."
+        );
+    }
+
+    #[test]
+    fn v12_human_rebuild_preserves_rows_and_adds_coordinator_answer_constraints() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_unix INTEGER NOT NULL);
+             CREATE TABLE projects(project_id TEXT PRIMARY KEY);
+             CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
+             PRAGMA foreign_keys=OFF;",
+        ).unwrap();
+        connection
+            .execute("INSERT INTO projects VALUES ('p')", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO rex_views VALUES ('v')", [])
+            .unwrap();
+        create_human_requests_table(&connection, "human_requests", false).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE human_decision_intents (
+                response_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL REFERENCES human_requests(request_id),
+                content_digest TEXT NOT NULL,
+                intent_json TEXT NOT NULL,
+                lifecycle TEXT NOT NULL,
+                result_json TEXT,
+                created_at_unix INTEGER NOT NULL,
+                processed_at_unix INTEGER
+             );
+             CREATE TABLE human_decisions (
+                response_id TEXT PRIMARY KEY REFERENCES human_decision_intents(response_id),
+                request_id TEXT NOT NULL REFERENCES human_requests(request_id),
+                subject_digest TEXT NOT NULL,
+                configuration_digest TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                choice TEXT NOT NULL CHECK(choice IN ('approve','request_changes','revise_plan','defer','cancel','refuse')),
+                approved INTEGER NOT NULL CHECK(approved IN (0,1)),
+                explanation TEXT,
+                decided_at_unix INTEGER NOT NULL,
+                receipt_json TEXT NOT NULL,
+                UNIQUE(request_id)
+             );
+             INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix)
+             VALUES ('old','p','release_decision','release','r',1,'v','s','m','c','p','b','{}','a','decided',1,2);
+             INSERT INTO human_decision_intents(response_id,request_id,content_digest,intent_json,lifecycle,created_at_unix) VALUES ('resp-old','old','d','{}','applied',1);
+             INSERT INTO human_decisions(response_id,request_id,subject_digest,configuration_digest,policy_digest,choice,approved,decided_at_unix,receipt_json)
+             VALUES ('resp-old','old','s','c','p','approve',1,2,'{}');"
+        ).unwrap();
+        let tx = connection.transaction().unwrap();
+        migrate_v12_human_tables(&tx).unwrap();
+        tx.commit().unwrap();
+
+        let preserved: (String, String) = connection
+            .query_row(
+                "SELECT request_id,purpose FROM human_requests WHERE request_id='old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, ("old".into(), "release_decision".into()));
+        let preserved_choice: String = connection
+            .query_row(
+                "SELECT choice FROM human_decisions WHERE response_id='resp-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_choice, "approve");
+        connection.execute(
+            "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix)
+             VALUES ('clarify','p','coordinator_clarification','ticket_run','run',1,'v','s2','m2','c','p','b2','{}','a2','decided',3,4)", [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO human_decision_intents(response_id,request_id,content_digest,intent_json,lifecycle,created_at_unix) VALUES ('resp-answer','clarify','d2','{}','applied',3)", [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO human_decisions(response_id,request_id,subject_digest,configuration_digest,policy_digest,choice,approved,explanation,decided_at_unix,receipt_json)
+             VALUES ('resp-answer','clarify','s2','c','p','answer',0,'use option B',4,'{}')", [],
+        ).expect("v12 decision constraint accepts Coordinator freeform answers");
     }
 
     #[test]

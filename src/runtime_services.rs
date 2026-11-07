@@ -1472,17 +1472,24 @@ impl FactoryRuntimeServices for RuntimeServices {
         store: &mut ConfigStore,
         result: &crate::store::agent_results::IngestedAgentResult,
     ) -> Result<Vec<crate::human_runtime::HumanEvidenceDocument>, String> {
+        let references = &result.validated.claimed_artifact_refs;
+        let total = references.iter().try_fold(0u64, |total, reference| {
+            total
+                .checked_add(reference.bytes)
+                .ok_or_else(|| "human evidence byte count overflow".to_owned())
+        })?;
+        if total > crate::human_runtime::MAX_HUMAN_REQUEST_BYTES as u64 {
+            return Err("Coordinator human evidence exceeds the review request size limit".into());
+        }
         let authority = store
             .agent_launch_authority(&result.validated.binding.agent_run_id)?
-            .ok_or("Supervisor result has no launch authority for its evidence")?;
-        result
-            .validated
-            .claimed_artifact_refs
+            .ok_or("human evidence source Agent launch authority is missing")?;
+        references
             .iter()
             .map(|reference| {
                 let verified = store
                     .lookup_verified_artifact(&self.artifacts, &authority, reference)?
-                    .ok_or("Supervisor goal evidence is no longer registered")?;
+                    .ok_or_else(|| "human evidence artifact is no longer registered".to_owned())?;
                 let bytes = verified.read_bytes(&self.artifacts)?;
                 Ok(crate::human_runtime::HumanEvidenceDocument {
                     reference: reference.clone(),

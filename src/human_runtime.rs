@@ -49,6 +49,7 @@ pub enum HumanSubjectKind {
 #[serde(rename_all = "snake_case")]
 pub enum HumanPurpose {
     PlanDecision,
+    CoordinatorClarification,
     TicketReview,
     OperationApproval,
     ProfilePromotion,
@@ -66,6 +67,8 @@ pub enum HumanPurpose {
 #[serde(rename_all = "snake_case")]
 pub enum HumanDecisionChoice {
     Approve,
+    /// A freeform answer to a Coordinator question. Storage requires a nonempty explanation.
+    Answer,
     RequestChanges,
     RevisePlan,
     Defer,
@@ -76,6 +79,7 @@ pub enum HumanDecisionChoice {
 impl HumanPurpose {
     pub fn subject_kind(self) -> HumanSubjectKind {
         match self {
+            Self::CoordinatorClarification => HumanSubjectKind::TicketRun,
             Self::PlanDecision => HumanSubjectKind::Plan,
             Self::TicketReview => HumanSubjectKind::TicketRun,
             Self::OperationApproval => HumanSubjectKind::Operation,
@@ -89,6 +93,12 @@ impl HumanPurpose {
 
     pub fn allows(self, choice: HumanDecisionChoice) -> bool {
         match self {
+            Self::CoordinatorClarification => matches!(
+                choice,
+                HumanDecisionChoice::Answer
+                    | HumanDecisionChoice::Defer
+                    | HumanDecisionChoice::Cancel
+            ),
             Self::PlanDecision => matches!(
                 choice,
                 HumanDecisionChoice::Approve
@@ -318,7 +328,9 @@ impl HumanRuntimeRequest {
             HumanPurpose::OperationApproval | HumanPurpose::ReleaseDecision => {
                 HumanWakeTarget::Operator
             }
-            HumanPurpose::PublicationAdoption => HumanWakeTarget::Coordinator,
+            HumanPurpose::PublicationAdoption | HumanPurpose::CoordinatorClarification => {
+                HumanWakeTarget::Coordinator
+            }
             _ => HumanWakeTarget::Coordinator,
         }
     }
@@ -711,9 +723,9 @@ impl HumanSubjectObserver for DurableHumanSubjectObserver {
                 observe_profile_subject(store, request, &self.declarative_root)
             }
             HumanPurpose::ProfileTrial => observe_profile_trial_subject(store, request),
-            HumanPurpose::PlanDecision | HumanPurpose::GoalCompletion => {
-                observe_typed_role_authority(store, request)
-            }
+            HumanPurpose::PlanDecision
+            | HumanPurpose::CoordinatorClarification
+            | HumanPurpose::GoalCompletion => observe_typed_role_authority(store, request),
             HumanPurpose::PublicationAdoption => {
                 match (&self.publication_source, self.owner_generation) {
                     (Some(source), Some(generation)) => observe_publication_adoption_subject(
@@ -966,6 +978,7 @@ fn observe_typed_role_authority(
     authority.validate_for(request)?;
     let source = match &authority {
         HumanAuthorityMaterial::PlannerClarification { source, .. }
+        | HumanAuthorityMaterial::CoordinatorClarification { source, .. }
         | HumanAuthorityMaterial::GoalCompletion { source, .. } => source,
         HumanAuthorityMaterial::PublicationAdoption { .. } => {
             return Ok(HumanSubjectObservation::Gone(
@@ -1017,6 +1030,29 @@ fn observe_typed_role_authority(
             {
                 return Ok(HumanSubjectObservation::Gone(
                     "the Planner TicketRun phase or revision changed".into(),
+                ));
+            }
+        }
+        HumanAuthorityMaterial::CoordinatorClarification { source, .. } => {
+            let Some(ticket_run_id) = source.binding.ticket_run_id.as_ref() else {
+                return Ok(HumanSubjectObservation::Gone(
+                    "Coordinator clarification is missing its TicketRun scope".into(),
+                ));
+            };
+            let Some((project_id, revision, phase, _)) =
+                store.current_ticket_human_scope(ticket_run_id)?
+            else {
+                return Ok(HumanSubjectObservation::Gone(
+                    "the Coordinator TicketRun no longer exists".into(),
+                ));
+            };
+            if project_id != request.subject.project_id
+                || revision != request.subject.revision.0
+                || source.binding.ticket_revision != Some(request.subject.revision)
+                || matches!(phase.as_str(), "done" | "canceled" | "waiting_human")
+            {
+                return Ok(HumanSubjectObservation::Gone(
+                    "the Coordinator TicketRun phase or revision changed".into(),
                 ));
             }
         }
@@ -1079,6 +1115,10 @@ pub struct HumanPresentationEffect {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanAuthorityMaterial {
     PlannerClarification {
+        source: HumanRoleResultSource,
+        documents: Vec<HumanEvidenceDocument>,
+    },
+    CoordinatorClarification {
         source: HumanRoleResultSource,
         documents: Vec<HumanEvidenceDocument>,
     },
@@ -1346,6 +1386,73 @@ pub fn publication_adoption_policy_digest(
 }
 
 impl HumanAuthorityMaterial {
+    /// Build the exact human interaction requested by a validated Coordinator result. The only
+    /// accepted answer shape is an explicit freeform Answer; the Agent cannot choose approval or
+    /// alter the ticket scope.
+    pub fn coordinator_clarification_request(
+        request_id: HumanRequestId,
+        material: Self,
+        expires_at_unix: u64,
+    ) -> Result<HumanRuntimeRequest, String> {
+        let Self::CoordinatorClarification { source, .. } = &material else {
+            return Err("Coordinator clarification requires Coordinator authority material".into());
+        };
+        let ticket_run_id = source
+            .binding
+            .ticket_run_id
+            .as_ref()
+            .ok_or_else(|| "Coordinator clarification is missing TicketRun scope".to_owned())?;
+        let binding = HumanSubjectBinding {
+            project_id: source.binding.project_id.clone(),
+            kind: HumanSubjectKind::TicketRun,
+            subject_id: ticket_run_id.as_str().to_owned(),
+            ticket_run_id: Some(ticket_run_id.clone()),
+            revision: source.binding.ticket_revision.ok_or_else(|| {
+                "Coordinator clarification is missing its ticket revision".to_owned()
+            })?,
+            material_digest: material.material_digest()?,
+            configuration_digest: source.binding.config_digest.clone(),
+            policy_digest: material.policy_digest()?,
+            bundle_digest: review_bundle_digest(&material.review_bundle()?)?,
+        };
+        let request = HumanRuntimeRequest {
+            request_id,
+            purpose: HumanPurpose::CoordinatorClarification,
+            subject: binding,
+            question: source.human_request.question.clone(),
+            choices: vec![
+                HumanDecisionChoice::Answer,
+                HumanDecisionChoice::Defer,
+                HumanDecisionChoice::Cancel,
+            ],
+            expires_at_unix,
+            review_bundle: material.review_bundle()?,
+        };
+        material.validate_for(&request)?;
+        request.validate(expires_at_unix.saturating_sub(1))?;
+        Ok(request)
+    }
+
+    pub fn coordinator_clarification_effect(
+        request_id: HumanRequestId,
+        rex_view_id: Digest,
+        source: HumanRoleResultSource,
+        documents: Vec<HumanEvidenceDocument>,
+        expires_at_unix: u64,
+    ) -> Result<HumanPresentationEffect, String> {
+        let authority = Self::CoordinatorClarification { source, documents };
+        let request = Self::coordinator_clarification_request(
+            request_id,
+            authority.clone(),
+            expires_at_unix,
+        )?;
+        Ok(HumanPresentationEffect {
+            request,
+            rex_view_id,
+            authority: Some(authority),
+        })
+    }
+
     pub fn validate_for(&self, request: &HumanRuntimeRequest) -> Result<(), String> {
         if let Self::PublicationAdoption { material } = self {
             if publication_adoption_request(request.request_id.clone(), material.clone())?
@@ -1358,7 +1465,8 @@ impl HumanAuthorityMaterial {
             return Ok(());
         }
         let (source, required_purpose, required_role) = match self {
-            Self::PlannerClarification { source, documents } => {
+            Self::PlannerClarification { source, documents }
+            | Self::CoordinatorClarification { source, documents } => {
                 let total = documents.iter().try_fold(0usize, |total, document| {
                     if document.bytes.len() as u64 != document.reference.bytes
                         || hex(&Sha256::digest(&document.bytes))
@@ -1385,22 +1493,30 @@ impl HumanAuthorityMaterial {
                 references.sort_by(|left, right| left.path.cmp(&right.path));
                 let mut claimed = source.claimed_artifact_refs.clone();
                 claimed.sort_by(|left, right| left.path.cmp(&right.path));
+                let is_coordinator = matches!(self, Self::CoordinatorClarification { .. });
+                let expected_role = if is_coordinator {
+                    crate::domain::types::Role::Coordinator
+                } else {
+                    crate::domain::types::Role::Planner
+                };
+                let expected_purpose = if is_coordinator {
+                    HumanPurpose::CoordinatorClarification
+                } else {
+                    HumanPurpose::PlanDecision
+                };
                 if references != claimed
                     || source.result_kind
                         != crate::engine::orchestration::RoleOutputKind::HumanRequest
                     || source.human_request.kind != "clarification"
                     || source.human_request.evidence_references != source.claimed_artifact_refs
+                    || source.binding.role != expected_role
                 {
                     return Err(
-                        "Planner evidence documents do not match its validated HumanRequest result"
+                        "role clarification evidence does not match its validated HumanRequest result"
                             .into(),
                     );
                 }
-                (
-                    source,
-                    HumanPurpose::PlanDecision,
-                    crate::domain::types::Role::Planner,
-                )
+                (source, expected_purpose, expected_role)
             }
             Self::GoalCompletion {
                 source,
@@ -1485,6 +1601,24 @@ impl HumanAuthorityMaterial {
         {
             return Err("human authority source does not match the request scope".into());
         }
+        if let Self::CoordinatorClarification { source, .. } = self {
+            let ticket_run_id = source.binding.ticket_run_id.as_ref().ok_or_else(|| {
+                "Coordinator clarification is missing its TicketRun scope".to_owned()
+            })?;
+            if request.subject.subject_id != ticket_run_id.as_str()
+                || request.question != source.human_request.question
+                || request.choices
+                    != [
+                        HumanDecisionChoice::Answer,
+                        HumanDecisionChoice::Defer,
+                        HumanDecisionChoice::Cancel,
+                    ]
+            {
+                return Err(
+                    "Coordinator clarification request differs from its validated source".into(),
+                );
+            }
+        }
         let material_digest = self.material_digest()?;
         if request.subject.material_digest != material_digest {
             return Err(
@@ -1510,9 +1644,9 @@ impl HumanAuthorityMaterial {
 
     pub fn policy_digest(&self) -> Result<Digest, String> {
         let binding = match self {
-            Self::PlannerClarification { source, .. } | Self::GoalCompletion { source, .. } => {
-                &source.binding
-            }
+            Self::PlannerClarification { source, .. }
+            | Self::CoordinatorClarification { source, .. }
+            | Self::GoalCompletion { source, .. } => &source.binding,
             Self::PublicationAdoption { material } => return Ok(material.policy_digest.clone()),
         };
         let bytes = serde_json::to_vec(&(
@@ -1527,8 +1661,14 @@ impl HumanAuthorityMaterial {
 
     pub fn review_bundle(&self) -> Result<ReviewBundle, String> {
         let bundle = match self {
-            Self::PlannerClarification { source, documents } => ReviewBundle {
-                title: "Planner clarification request".into(),
+            Self::PlannerClarification { source, documents }
+            | Self::CoordinatorClarification { source, documents } => ReviewBundle {
+                title: if matches!(self, Self::CoordinatorClarification { .. }) {
+                    "Coordinator clarification request"
+                } else {
+                    "Planner clarification request"
+                }
+                .into(),
                 summary: format!(
                     "The Planner requires a human decision for ticket run {} at revision {}.",
                     source.binding.ticket_run_id.as_ref().map_or("unknown", TicketRunId::as_str),
@@ -1544,9 +1684,7 @@ impl HumanAuthorityMaterial {
                         truncated: false,
                     })
                     .collect(),
-                unknowns: vec![
-                    "Planner-authored evidence is an assertion; review it against the repository and ticket context.".into(),
-                ],
+                unknowns: vec!["Agent-authored evidence is an assertion; review it against the repository and ticket context.".into()],
             },
             Self::GoalCompletion {
                 source,
@@ -1659,11 +1797,14 @@ impl HumanPresenterEffectHandler {
         if effect.authority.is_none()
             && matches!(
                 review.purpose,
-                HumanPurpose::PlanDecision | HumanPurpose::GoalCompletion
+                HumanPurpose::PlanDecision
+                    | HumanPurpose::CoordinatorClarification
+                    | HumanPurpose::GoalCompletion
             )
         {
             return Err(
-                "Planner/goal human requests require durable typed authority material".into(),
+                "Planner, Coordinator, and goal requests require durable typed authority material"
+                    .into(),
             );
         }
         let html_path = write_runtime_review_artifact(&self.artifact_root, review)

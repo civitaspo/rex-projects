@@ -567,6 +567,37 @@ impl ConfigStore {
         .collect()
     }
 
+    /// Return the active Rex view currently bound to a TicketRun.
+    pub fn active_ticket_view_id(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<Option<Digest>, String> {
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let view_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT v.view_id FROM rex_views v JOIN ticket_runs t ON t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id WHERE t.project_id=?1 AND t.ticket_run_id=?2 AND v.view_kind='ticket' AND v.lifecycle='active' ORDER BY v.view_epoch DESC LIMIT 1",
+                params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        view_id.map(Digest::parse).transpose()
+    }
+
     /// Return bounded role sessions that can be considered for another finite
     /// Agent turn. Active or unknown AgentRuns suppress duplicate scheduling;
     /// a future transactional launch-preparation call still owns the claim.
