@@ -7,6 +7,7 @@ pub mod human;
 pub mod knowledge;
 pub mod learning;
 pub mod mailbox;
+pub mod operations;
 pub mod process;
 pub mod protocol;
 pub mod store;
