@@ -26,6 +26,10 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+class IdentityMismatch(Exception):
+    pass
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=5)
@@ -91,11 +95,22 @@ def dispatch(db: sqlite3.Connection, request: dict) -> dict:
             result = {"outcome": "absent", "operation_id": operation_id,
                       "correlation_key": correlation, "proof_scope": "fixture-local-sqlite",
                       "observed_at_epoch_seconds": time.time()}
-        elif method == "operation.find":
+        else:
+            identities = {
+                "operation_id": row["operation_id"], "correlation_key": row["correlation_key"],
+                "action_id": row["action_id"], "target_id": row["target_id"],
+                "repository_id": row["repository_id"], "environment": row["environment"],
+                "source_sha": row["source_sha"],
+            }
+            mismatches = [key for key, expected in identities.items()
+                          if key in params and params[key] != expected]
+            if mismatches:
+                raise IdentityMismatch("operation identity mismatch: " + ", ".join(sorted(mismatches)))
+        if row is not None and method == "operation.find":
             result = {"outcome": "found", "operation_id": row["operation_id"],
                       "correlation_key": row["correlation_key"], "action_id": row["action_id"],
                       "external_reference": row["external_run_id"], "status": row["status"]}
-        else:
+        elif row is not None:
             db.execute("UPDATE operations SET status='succeeded',updated_at=? WHERE operation_id=?",
                        (time.time(), row["operation_id"]))
             row = db.execute("SELECT * FROM operations WHERE operation_id=?", (row["operation_id"],)).fetchone()
@@ -136,9 +151,10 @@ def main() -> int:
         return 0
     except Exception as error:
         db.rollback()
+        code = "conflict" if isinstance(error, IdentityMismatch) else (
+            "unsupported" if isinstance(error, NotImplementedError) else "invalid_request")
         print(json.dumps(fail(locals().get("request", {}).get("request_id", "invalid"),
-                              "unsupported" if isinstance(error, NotImplementedError) else "invalid_request",
-                              str(error)), sort_keys=True, separators=(",", ":")))
+                              code, str(error)), sort_keys=True, separators=(",", ":")))
         return 0
     finally:
         db.close()

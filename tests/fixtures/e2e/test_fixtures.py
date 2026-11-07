@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -135,6 +136,11 @@ class E2EFixtureTests(unittest.TestCase):
                         "params": {"operation_id": "op-release-1", "correlation_key": params["correlation_key"]}}
         found = invoke(argv, find_request)
         self.assertEqual(json.loads(found.stdout)["result"]["outcome"], "found")
+        wrong_identity = {"schema_version": 1, "request_id": "observe-wrong", "method": "operation.observe",
+                          "params": {"operation_id": "op-release-1", "correlation_key": params["correlation_key"],
+                                     "source_sha": "b" * 40}}
+        mismatch = invoke(argv, wrong_identity)
+        self.assertEqual(json.loads(mismatch.stdout)["error"]["code"], "conflict")
         observe_request = {"schema_version": 1, "request_id": "observe-1", "method": "operation.observe",
                            "params": {"operation_id": "op-release-1", "correlation_key": params["correlation_key"]}}
         observed = invoke(argv, observe_request)
@@ -171,6 +177,38 @@ class E2EFixtureTests(unittest.TestCase):
         self.assertNotIn("principal", output)
         self.assertNotIn("home", output)
         self.assertEqual(output["program"], "$HOME/bin/python")
+
+    def test_rex_runner_rejects_payload_digest_claim_without_matching_bytes(self) -> None:
+        sys.path.insert(0, str(HERE))
+        from deterministic_agent import CHANGE
+        from run_rex_agent import ProbeError, verify_worker_output
+
+        target = self.seed / "src/acceptance-fixture.txt"
+        target.parent.mkdir()
+        target.write_text(CHANGE, encoding="utf-8")
+        receipt = {"ticket_id": "fixture-42", "outcome": "completed",
+                   "content_sha256": hashlib.sha256(CHANGE.encode("utf-8")).hexdigest()}
+        self.assertEqual(verify_worker_output(self.seed, "fixture-42", receipt), receipt["content_sha256"])
+        target.write_text("different bytes\n", encoding="utf-8")
+        with self.assertRaises(ProbeError):
+            verify_worker_output(self.seed, "fixture-42", receipt)
+
+    def test_rex_runner_skips_cleanup_before_identity_is_verified(self) -> None:
+        sys.path.insert(0, str(HERE))
+        from run_rex_agent import cleanup_owned_session
+
+        class NoCallRex:
+            calls = 0
+
+            def call(self, *_args, **_kwargs):
+                self.calls += 1
+                raise AssertionError("must not query or mutate an unverified Rex server")
+
+        rex = NoCallRex()
+        result: dict[str, object] = {}
+        cleanup_owned_session(rex, "unique-test-label", None, False, result)
+        self.assertEqual(rex.calls, 0)
+        self.assertIn("cleanup_skipped", result)
 
 if __name__ == "__main__":
     unittest.main()

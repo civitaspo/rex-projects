@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -25,6 +26,7 @@ from run_lifecycle import (  # noqa: E402
 )
 
 FIXTURE_DIR = Path(__file__).resolve().parent
+from deterministic_agent import CHANGE  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -68,6 +70,45 @@ def sanitize_transcript(directory: Path) -> None:
                 entry[field] = json.dumps(redact_user_metadata(parsed), sort_keys=True)
         path.write_text(json.dumps(redact_user_metadata(entry), indent=2) + "\n", encoding="utf-8")
         os.chmod(path, 0o600)
+
+
+def verify_worker_output(worktree: Path, ticket_id: str, receipt: dict) -> str:
+    require(receipt.get("ticket_id") == ticket_id,
+            "Worker receipt is not bound to the requested fixture ticket")
+    require(receipt.get("outcome") == "completed", "Worker did not complete")
+    content = (worktree / "src/acceptance-fixture.txt").read_bytes()
+    actual_digest = hashlib.sha256(content).hexdigest()
+    expected_digest = hashlib.sha256(CHANGE.encode("utf-8")).hexdigest()
+    require(actual_digest == expected_digest,
+            "worktree file bytes differ from the deterministic fixture payload")
+    require(receipt.get("content_sha256") == actual_digest,
+            "Worker receipt digest does not match independently hashed file bytes")
+    return actual_digest
+
+
+def cleanup_owned_session(rex: Rex, session_label: str, session_id: str | None,
+                          identity_verified: bool, result: dict[str, object]) -> None:
+    if not identity_verified:
+        result["cleanup_skipped"] = "Rex endpoint and instance identity were not verified"
+        result["cleanup_error"] = "no cleanup request was sent to an unverified Rex server"
+        return
+    sessions = json.loads(rex.call("ls", "--json").stdout)
+    sessions = sessions.get("sessions", []) if isinstance(sessions, dict) else sessions
+    matches = [item for item in sessions if item.get("label") == session_label]
+    if session_id is None and len(matches) == 1:
+        session_id = matches[0].get("session_id")
+        result["reconciled_session_after_create_reply_loss"] = True
+    if session_id:
+        rex.call("kill", session_id, check=False)
+        result["cleanup_session_id"] = session_id
+        after_kill = json.loads(rex.call("ls", "--json").stdout)
+        after_sessions = after_kill.get("sessions", []) if isinstance(after_kill, dict) else after_kill
+        if any(item.get("session_id") == session_id for item in after_sessions):
+            result["cleanup_error"] = "owned fixture session remains after rex kill"
+    elif matches:
+        result["cleanup_error"] = "ambiguous fixture session label; left sessions untouched"
+    else:
+        result["cleanup_session_absent"] = True
 
 
 def main() -> int:
@@ -114,6 +155,7 @@ def main() -> int:
     rex = Rex(args.server, args.timeout_seconds, transcript)
     session_label = f"rex-projects-e2e-worker-{secrets.token_hex(8)}"
     session_id: str | None = None
+    identity_verified = False
     result: dict[str, object] = {
         "schema_version": 1,
         "source_sha": args.source_sha,
@@ -129,6 +171,7 @@ def main() -> int:
         require(whoami.get("endpoint") == args.server, "Rex endpoint differs from the explicit test server")
         require(whoami.get("instance_id") == args.expected_instance_id,
                 "Rex instance differs from --expected-instance-id")
+        identity_verified = True
         create_layout = {
             "label": session_label,
             "initial_windows": [{
@@ -157,11 +200,7 @@ def main() -> int:
                 f"Rex did not report a successful Worker process exit: {process!r}")
         process_summary = {"last_exit": {"exit_code": process["last_exit"]["exit_code"]}}
         worker_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        require(worker_receipt.get("ticket_id") == args.ticket_id,
-                "Worker receipt is not bound to the requested fixture ticket")
-        require(worker_receipt.get("outcome") == "completed", "Worker did not complete")
-        require((worktree / "src/acceptance-fixture.txt").is_file(),
-                "the Worker did not write the expected worktree change")
+        actual_digest = verify_worker_output(worktree, args.ticket_id, worker_receipt)
         observed_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree,
                                        capture_output=True, text=True, timeout=10, check=False)
         require(observed_head.returncode == 0, "cannot observe fixture worktree HEAD")
@@ -170,6 +209,7 @@ def main() -> int:
         require(resulting_status.returncode == 0, "cannot observe fixture worktree changes")
         result.update({"outcome": "PASS", "session_id": session_id, "window_id": window_id,
                        "block_id": block_id, "process": process_summary,
+                       "observed_content_sha256": actual_digest,
                        "worker_receipt": worker_receipt, "worktree_head": observed_head.stdout.strip(),
                        "worktree_status": resulting_status.stdout,
                        "terminal_capture": read_probe_output(rex, session_id, block_id),
@@ -178,23 +218,7 @@ def main() -> int:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:
         try:
-            sessions = json.loads(rex.call("ls", "--json").stdout)
-            sessions = sessions.get("sessions", []) if isinstance(sessions, dict) else sessions
-            matches = [item for item in sessions if item.get("label") == session_label]
-            if session_id is None and len(matches) == 1:
-                session_id = matches[0].get("session_id")
-                result["reconciled_session_after_create_reply_loss"] = True
-            if session_id:
-                rex.call("kill", session_id, check=False)
-                result["cleanup_session_id"] = session_id
-                after_kill = json.loads(rex.call("ls", "--json").stdout)
-                after_sessions = after_kill.get("sessions", []) if isinstance(after_kill, dict) else after_kill
-                if any(item.get("session_id") == session_id for item in after_sessions):
-                    result["cleanup_error"] = "owned fixture session remains after rex kill"
-            elif matches:
-                result["cleanup_error"] = "ambiguous fixture session label; left sessions untouched"
-            else:
-                result["cleanup_session_absent"] = True
+            cleanup_owned_session(rex, session_label, session_id, identity_verified, result)
         except Exception as error:
             result["cleanup_error"] = f"{type(error).__name__}: {error}"
         sanitize_transcript(transcript)
