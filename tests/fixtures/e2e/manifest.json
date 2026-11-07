@@ -37,7 +37,7 @@
       "command": "cargo xtask fixture ticket",
       "integration_test": "cargo test --locked -p rex-projects-xtask --test ticket_adapter",
       "state": "caller-selected SQLite database",
-      "controls": ["--drop-create-response-once", "--index-delay-ms", "--native-shape", "--mutate-response"]
+      "controls": ["--drop-create-response-once", "--index-delay-ms", "--delay-method with --delay-ms", "--native-shape", "--mutate-response"]
     },
     "operations": {
       "command": "cargo xtask fixture operations",
@@ -54,6 +54,7 @@
   "implemented_fault_controls": {
     "ticket_create_reply": "--drop-create-response-once OPERATION_ID",
     "ticket_index_visibility": "--index-delay-ms MILLISECONDS",
+    "ticket_method_timeout": "--delay-method METHOD --delay-ms MILLISECONDS",
     "ticket_response_mutation": "--mutate-response MODE",
     "operation_reply": "fixture_lost_reply invocation followed by operation.find"
   },

@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
@@ -14,6 +14,7 @@ pub fn run(
     drop_create_response_once: Option<&str>,
     mutate_response: Option<&str>,
     index_delay_ms: u64,
+    method_delay: Option<(&str, u64)>,
     native_shape: &str,
 ) -> Result<(), String> {
     let mut input = Vec::new();
@@ -21,6 +22,12 @@ pub fn run(
         .read_to_end(&mut input)
         .map_err(|error| error.to_string())?;
     let request: Value = serde_json::from_slice(&input).map_err(|error| error.to_string())?;
+    if let Some((delay_method, delay_ms)) = method_delay
+        && delay_ms > 0
+        && request["method"].as_str() == Some(delay_method)
+    {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
     let connection = Connection::open(database).map_err(|error| error.to_string())?;
     connection
         .execute_batch(

@@ -20,6 +20,6 @@ cargo xtask fixture operations \
   --state-dir /tmp/rex-projects-operation-fixture
 ```
 
-The ticket fixture can emulate two unrelated native response shapes (`record` and `edges`), lose one create response, delay stable-key index visibility, or mutate selected responses for rejection tests. The operations fixture persists invocation state so a lost reply can be reconciled by a later lookup.
+The ticket fixture can emulate two unrelated native response shapes (`record` and `edges`), lose one create response, delay stable-key index visibility, delay a selected protocol method with `--delay-method` and `--delay-ms`, or mutate selected responses for rejection tests. The operations fixture persists invocation state so a lost reply can be reconciled by a later lookup.
 
 The JSON manifest retains the intended goal and operations Project acceptance story and required runtime capabilities. There is not yet a Rust driver that runs that complete story through the public CLI, Rex, Git, merge, deployment, knowledge publication, and restart recovery. Do not treat the protocol fixture tests as end-to-end acceptance or report a full-flow pass. Add that driver once every production runtime transition is callable, then record the actual verification boundary in its results.

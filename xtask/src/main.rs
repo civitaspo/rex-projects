@@ -69,6 +69,10 @@ enum FixtureCommand {
         mutate_response: Option<String>,
         #[arg(long, default_value_t = 0)]
         index_delay_ms: u64,
+        #[arg(long)]
+        delay_method: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        delay_ms: u64,
         #[arg(long, default_value = "record", value_parser = ["record", "edges"])]
         native_shape: String,
     },
@@ -119,6 +123,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 drop_create_response_once,
                 mutate_response,
                 index_delay_ms,
+                delay_method,
+                delay_ms,
                 native_shape,
             } => fixtures::ticket::run(
                 &database,
@@ -126,6 +132,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 drop_create_response_once.as_deref(),
                 mutate_response.as_deref(),
                 index_delay_ms,
+                delay_method.as_deref().map(|method| (method, delay_ms)),
                 &native_shape,
             ),
         },
