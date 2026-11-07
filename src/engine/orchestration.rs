@@ -303,9 +303,10 @@ impl RoleSessionId {
         let value = value.into();
         if value.is_empty()
             || value.len() > 255
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || value.split(':').any(str::is_empty)
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+            })
         {
             return Err("invalid role session ID".into());
         }
@@ -1119,7 +1120,12 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                             "GitCommitId" => {
                                 constrain(definition, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
                             }
-                            "RoleSessionId" => constrain(definition, 1, 255, r"^[A-Za-z0-9._-]+$"),
+                            "RoleSessionId" => constrain(
+                                definition,
+                                1,
+                                255,
+                                r"^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$",
+                            ),
                             "RoleArtifactReference" => {
                                 if let Some(properties) = definition
                                     .get_mut("properties")
@@ -1311,7 +1317,7 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                 constrain(property, 1, 255, r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
                             }
                             "coordinator_role_session_id" => {
-                                constrain(property, 1, 255, r"^[A-Za-z0-9._-]+$")
+                                constrain(property, 1, 255, r"^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$")
                             }
                             "parent" | "ticket_reference" | "ticket_id" | "ticket_namespace"
                             | "ticket_run_id" | "agent_run_id" | "parent_run_id"
@@ -3897,8 +3903,50 @@ mod tests {
 
     #[test]
     fn role_session_id_deserialization_uses_constructor_validation() {
-        for invalid in ["../outside", "folder/session", "bad id"] {
+        assert!(RoleSessionId::parse("ticket_run:run-a:coordinator").is_ok());
+        for invalid in [
+            "../outside",
+            "folder/session",
+            "bad id",
+            "ticket_run::coordinator",
+        ] {
             assert!(serde_json::from_str::<RoleSessionId>(&format!("{invalid:?}")).is_err());
         }
+    }
+
+    #[test]
+    fn intervention_schema_accepts_canonical_coordinator_session() {
+        let payload = json!({
+            "coordinator_role_session_id": "ticket_run:run-a:coordinator",
+            "ticket_run_revision": 1,
+            "reason": "Coordinator requests a plan adjustment.",
+            "evidence": [],
+            "proposed_plan_change": "Split the implementation into smaller nodes."
+        });
+        let schema = role_result_payload_schema(RoleOutputKind::Intervention);
+        let validator = jsonschema::options()
+            .offline()
+            .build(&schema)
+            .expect("Intervention schema is valid");
+        assert!(
+            validator.is_valid(&payload),
+            "{}",
+            validator
+                .iter_errors(&payload)
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        assert!(RoleResultPayload::parse(RoleOutputKind::Intervention, payload).is_ok());
+
+        let invalid = json!({
+            "coordinator_role_session_id": "ticket_run::coordinator",
+            "ticket_run_revision": 1,
+            "reason": "Coordinator requests a plan adjustment.",
+            "evidence": [],
+            "proposed_plan_change": "Split the implementation into smaller nodes."
+        });
+        assert!(!validator.is_valid(&invalid));
+        assert!(RoleResultPayload::parse(RoleOutputKind::Intervention, invalid).is_err());
     }
 }

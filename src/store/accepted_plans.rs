@@ -14,6 +14,15 @@ use crate::store::{ConfigStore, SucceededEffectReceipt};
 
 const MAX_PLAN_BYTES: usize = 1_048_576;
 
+pub(crate) fn coordinator_role_session_id(
+    ticket_run_id: &TicketRunId,
+) -> Result<crate::engine::orchestration::RoleSessionId, String> {
+    crate::engine::orchestration::RoleSessionId::parse(format!(
+        "ticket_run:{}:coordinator",
+        ticket_run_id.as_str()
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AcceptedPlanWrite {
     pub configuration_digest: Digest,
@@ -44,8 +53,7 @@ pub(crate) fn prepare_accepted_plan_write(
         || binding.role != crate::domain::types::Role::Coordinator
         || binding.ticket_run_id.as_ref() != Some(ticket_run_id)
         || binding.config_digest != *configuration_digest
-        || binding.role_session_id.as_str()
-            != format!("ticket_run:{}:coordinator", ticket_run_id.as_str())
+        || binding.role_session_id != coordinator_role_session_id(ticket_run_id)?
         || !matches!(
             source.validated.typed_payload,
             crate::engine::orchestration::RoleResultPayload::PlanReady(_)

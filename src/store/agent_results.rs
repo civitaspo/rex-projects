@@ -93,6 +93,27 @@ pub struct IngestedAgentResult {
     pub verified_artifacts: Vec<crate::store::artifact_registry::VerifiedArtifact>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_ingested_agent_result(
+    submission: RoleResultSubmission,
+    evidence_id: String,
+) -> IngestedAgentResult {
+    let binding = submission.binding.clone();
+    let validated =
+        crate::engine::orchestration::validate_role_result(&binding, submission).unwrap();
+    IngestedAgentResult {
+        receipt: StoredRoleResultReceipt {
+            evidence_id,
+            message_id: validated.message_id.clone(),
+            content_digest: Digest::parse("b".repeat(64)).unwrap(),
+            terminal_digest: Digest::parse("c".repeat(64)).unwrap(),
+            wake_input_ids: Vec::new(),
+        },
+        validated,
+        verified_artifacts: Vec::new(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultDisposition {
     Applied,

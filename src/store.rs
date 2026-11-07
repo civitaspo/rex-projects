@@ -2715,7 +2715,9 @@ impl ConfigStore {
                 || source_ticket_revision != Some(current.revision.0)
                 || source_session != plan.coordinator_role_session_id
                 || source_config != plan.configuration_digest.as_str()
-                || source_session != format!("ticket:{}:coordinator", ticket_run_id.as_str())
+                || source_session
+                    != crate::store::accepted_plans::coordinator_role_session_id(ticket_run_id)?
+                        .as_str()
             {
                 return Err("accepted plan Coordinator provenance is stale or out of scope".into());
             }
@@ -2745,8 +2747,8 @@ impl ConfigStore {
                 );
             }
             tx.execute(
-                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![project_id.as_str(),ticket_run_id.as_str(),decision_run.revision.0,plan.configuration_digest.as_str(),plan.plan_digest.as_str(),plan.plan_json,now_unix()?],
+                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![project_id.as_str(),ticket_run_id.as_str(),decision_run.revision.0,plan.configuration_digest.as_str(),plan.plan_digest.as_str(),plan.plan_json,plan.source_evidence_id,plan.source_agent_run_id.as_str(),plan.source_message_id,plan.source_result_digest.as_str(),plan.coordinator_agent_run_id.as_str(),plan.coordinator_role_session_id,authority_digest,now_unix()?],
             ).map_err(|error| error.to_string())?;
         }
         tx.execute(
@@ -4529,8 +4531,7 @@ mod tests {
         assert_eq!(persisted_start_ack(None).unwrap(), None);
         assert_eq!(persisted_start_ack(Some((None, None))).unwrap(), None);
         assert_eq!(
-            persisted_start_ack(Some((Some("digest".into()), Some("receipt".into()))))
-                .unwrap(),
+            persisted_start_ack(Some((Some("digest".into()), Some("receipt".into())))).unwrap(),
             Some(("digest".into(), "receipt".into()))
         );
         assert!(persisted_start_ack(Some((Some("digest".into()), None))).is_err());
@@ -4676,10 +4677,7 @@ mod tests {
 
         let corrected_round = publication("corrected");
         assert_ne!(first_round.logical_key, corrected_round.logical_key);
-        assert!(
-            store.enqueue_effect(generation, &corrected_round).is_ok(),
-            "a new Worker evidence round for the same node must get a distinct durable effect key"
-        );
+        assert!(store.enqueue_effect(generation, &corrected_round).is_ok());
         assert!(!store.enqueue_effect(generation, &corrected_round).unwrap());
         assert_eq!(
             store
@@ -4687,6 +4685,410 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             first_round
+        );
+    }
+
+    #[test]
+    fn validated_plan_transition_persists_provenance_and_replays_atomically() {
+        use crate::domain::ids::{AgentRunId, OperationId, RepositoryId};
+        use crate::domain::types::Role;
+        use crate::engine::orchestration::{
+            AgentAssertion, PlannedWorkNode, RoleOutputKind, RoleResultBinding,
+            RoleResultSubmission, RoleSessionId, ValidatedPlan, ValidatedWorkNode, WorkBaseSource,
+            WorkPlan,
+        };
+        use sha2::Digest as _;
+
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("plan-persistence").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: applied.digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "plan-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "plan-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store
+            .set_project_lifecycle(generation, &project_id, "running")
+            .unwrap();
+        let namespace = TicketNamespace::parse("github:org/repo").unwrap();
+        let ticket_id = TicketId::parse("#14").unwrap();
+        let ticket_run_id = TicketRunId::parse("plan-persistence-14-g1").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &namespace,
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "queued",
+                "ToDo",
+            )
+            .unwrap();
+        let dispatch_payload = r#"{"input":"dispatch"}"#;
+        let dispatch_effect = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.as_str().into(),
+            operation_id: "publish-plan-in-progress".into(),
+            logical_key: "publish-plan-in-progress".into(),
+            kind: "publish_ticket_status".into(),
+            request_json: "{}".into(),
+            request_digest: content_digest("{}"),
+            expected_revision: Some(1),
+        };
+        store
+            .commit_ticket_transition(
+                generation,
+                &ticket_run_id,
+                Revision(0),
+                &DurableInput {
+                    producer_id: "test".into(),
+                    message_id: "dispatch-plan".into(),
+                    content_digest: durable_input_digest("ticket_run", dispatch_payload),
+                    recipient: "ticket_run".into(),
+                    payload: dispatch_payload.into(),
+                },
+                Input::Dispatch,
+                "Dispatch for plan test.",
+                "{}",
+                &[dispatch_effect],
+            )
+            .unwrap();
+
+        let coordinator_run_id = AgentRunId::parse("plan-coordinator-run").unwrap();
+        let role_session_id =
+            crate::store::accepted_plans::coordinator_role_session_id(&ticket_run_id).unwrap();
+        let structured_result = serde_json::json!({
+            "plan": {
+                "nodes": [{
+                    "id": "implement",
+                    "repository": "repo-a",
+                    "task": "Implement the requested change",
+                    "depends_on": [],
+                    "required_evidence": ["tests pass"],
+                    "investigation": false
+                }],
+                "requested_investigation_children": 0
+            },
+            "unresolved_questions": []
+        });
+        let structured_bytes = serde_json::to_vec(&structured_result).unwrap();
+        let result_digest =
+            Digest::parse(format!("{:x}", sha2::Sha256::digest(&structured_bytes))).unwrap();
+        let binding = RoleResultBinding {
+            agent_run_id: coordinator_run_id.clone(),
+            operation_id: OperationId::parse("plan-operation").unwrap(),
+            project_id: project_id.clone(),
+            role_session_id: RoleSessionId::parse(role_session_id.as_str()).unwrap(),
+            role: Role::Coordinator,
+            parent_run_id: Some(AgentRunId::parse("plan-supervisor-run").unwrap()),
+            parent_role: Some(Role::Supervisor),
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(1)),
+            config_revision: applied.revision,
+            config_digest: applied.digest.clone(),
+            profile_digest: Digest::parse("1".repeat(64)).unwrap(),
+            instruction_digest: Digest::parse("2".repeat(64)).unwrap(),
+            provider_capability_receipt_digest: Digest::parse("3".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("4".repeat(64)).unwrap(),
+            controller_generation: generation,
+            run_epoch: 1,
+            attempt: 1,
+        };
+        let source_authority = AgentLaunchAuthority {
+            agent_run_id: coordinator_run_id.clone(),
+            project_id: project_id.clone(),
+            role: Role::Coordinator,
+            role_session_id: role_session_id.as_str().into(),
+            parent_run_id: binding.parent_run_id.clone(),
+            parent_role: binding.parent_role,
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(1)),
+            config_revision: applied.revision,
+            config_digest: applied.digest.clone(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: generation,
+            operation_id: binding.operation_id.clone(),
+            operation_recipe_id: None,
+            rex_view_id: Digest::parse("5".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("5".repeat(64)).unwrap(),
+            runtime_binary_digest: Digest::parse("5".repeat(64)).unwrap(),
+            descriptor_path: "/tmp/descriptor".into(),
+            environment_snapshot_id: Digest::parse("5".repeat(64)).unwrap(),
+            profile_id: crate::domain::ids::ProfileId::parse("test-profile").unwrap(),
+            profile_digest: binding.profile_digest.clone(),
+            instruction_digest: binding.instruction_digest.clone(),
+            result_schema_digest: binding.result_schema_digest.clone(),
+            wake_snapshot_digest: Digest::parse("5".repeat(64)).unwrap(),
+            qualification_receipt_digest: binding.provider_capability_receipt_digest.clone(),
+            rex_server_identity: "test".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+            rex_block_id: "block".into(),
+            workspace_path: "/tmp/workspace".into(),
+            control_dir: "/tmp/control".into(),
+            mailbox_capability_digest: Digest::parse("5".repeat(64)).unwrap(),
+        };
+        source_authority.validate().unwrap();
+        let authority_digest = source_authority.digest().unwrap();
+        let authority_json = serde_json::to_string(&source_authority).unwrap();
+        let submission = RoleResultSubmission {
+            schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "coordinator-plan-result".into(),
+            binding: binding.clone(),
+            kind: RoleOutputKind::PlanReady,
+            assertion: AgentAssertion::Succeeded,
+            structured_result,
+            result_digest: result_digest.clone(),
+            artifact_refs: Vec::new(),
+        };
+        let persisted_submission = serde_json::to_string(&submission).unwrap();
+        let evidence_id = "plan-source-evidence";
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'coordinator',?3,'plan-supervisor-run','supervisor',?4,1,?5,?6,1,1,?7,'plan-operation',?8,?8,?8,'/tmp/descriptor',?8,'test-profile',?9,?10,?11,?12,'test','session','window','block','/tmp/workspace','/tmp/control',?8,?13,?14,1)",
+            rusqlite::params![coordinator_run_id.as_str(),project_id.as_str(),role_session_id.as_str(),ticket_run_id.as_str(),applied.revision.0,applied.digest.as_str(),generation,"5".repeat(64),binding.profile_digest.as_str(),binding.instruction_digest.as_str(),binding.result_schema_digest.as_str(),binding.provider_capability_receipt_digest.as_str(),authority_json,authority_digest.as_str()],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_result_evidence(evidence_id,agent_run_id,project_id,role,ticket_run_id,attempt,run_epoch,message_id,content_digest,outcome,result_digest,result_json,artifact_refs_json,received_at_unix) VALUES (?1,?2,?3,'coordinator',?4,1,1,?5,?6,'completed',?7,?8,'[]',1)",
+            rusqlite::params![evidence_id,coordinator_run_id.as_str(),project_id.as_str(),ticket_run_id.as_str(),submission.message_id,"6".repeat(64),result_digest.as_str(),persisted_submission],
+        ).unwrap();
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .unwrap();
+
+        let source = crate::store::agent_results::test_ingested_agent_result(
+            submission.clone(),
+            evidence_id.into(),
+        );
+        let repository = RepositoryId::parse("repo-a").unwrap();
+        let node_id = crate::engine::orchestration::WorkNodeId::parse("implement").unwrap();
+        let claim = WorkPlan {
+            nodes: vec![PlannedWorkNode {
+                id: node_id.clone(),
+                repository: repository.clone(),
+                task: "Implement the requested change".into(),
+                depends_on: Vec::new(),
+                required_evidence: vec!["tests pass".into()],
+                investigation: false,
+            }],
+            requested_investigation_children: 0,
+        };
+        let plan = ValidatedPlan {
+            ticket_run_id: ticket_run_id.clone(),
+            nodes_in_execution_order: vec![ValidatedWorkNode {
+                id: node_id,
+                repository,
+                base: WorkBaseSource::ControllerObservedCommit {
+                    commit: "a".repeat(40),
+                },
+                task: "Implement the requested change".into(),
+                depends_on: Vec::new(),
+                required_evidence: vec!["tests pass".into()],
+                role: Role::Worker,
+            }],
+            spawned_investigation_children: 0,
+        };
+        let transition_payload = r#"{"input":"plan_accepted"}"#;
+        let input = DurableInput {
+            producer_id: "test".into(),
+            message_id: "accept-plan".into(),
+            content_digest: durable_input_digest("ticket_run", transition_payload),
+            recipient: "ticket_run".into(),
+            payload: transition_payload.into(),
+        };
+        let effect_request = "{}";
+        let effect = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.as_str().into(),
+            operation_id: "prepare-plan-worktrees".into(),
+            logical_key: "prepare-plan-worktrees".into(),
+            kind: "prepare_worktrees".into(),
+            request_json: effect_request.into(),
+            request_digest: content_digest(effect_request),
+            expected_revision: Some(2),
+        };
+        let mut wrong_session_source = source.clone();
+        wrong_session_source.validated.binding.role_session_id =
+            RoleSessionId::parse("ticket_run:another-ticket:coordinator").unwrap();
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(1),
+                    &applied.digest,
+                    &plan,
+                    &wrong_session_source,
+                    &input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(1),
+                    &Digest::parse("f".repeat(64)).unwrap(),
+                    &plan,
+                    &source,
+                    &input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        let missing_evidence = crate::store::agent_results::test_ingested_agent_result(
+            submission.clone(),
+            "missing-plan-evidence".into(),
+        );
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(1),
+                    &applied.digest,
+                    &plan,
+                    &missing_evidence,
+                    &input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        let stale_input = DurableInput {
+            producer_id: "test".into(),
+            message_id: "stale-plan-attempt".into(),
+            content_digest: durable_input_digest("ticket_run", transition_payload),
+            recipient: "ticket_run".into(),
+            payload: transition_payload.into(),
+        };
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(0),
+                    &applied.digest,
+                    &plan,
+                    &source,
+                    &stale_input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        let committed = store
+            .commit_validated_work_plan(
+                generation,
+                &ticket_run_id,
+                Revision(1),
+                &applied.digest,
+                &plan,
+                &source,
+                &input,
+                "Coordinator plan accepted.",
+                transition_payload,
+                std::slice::from_ref(&effect),
+            )
+            .unwrap();
+        assert!(!committed.duplicate);
+        let loaded = store
+            .latest_accepted_work_plan(&project_id, &ticket_run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.accepted_revision, 2);
+        assert_eq!(loaded.proposal, claim);
+        assert_eq!(loaded.source_evidence_id, evidence_id);
+        assert_eq!(loaded.source_agent_run_id, coordinator_run_id);
+        assert_eq!(loaded.source_message_id, "coordinator-plan-result");
+        assert_eq!(loaded.source_result_digest, result_digest);
+        assert_eq!(loaded.coordinator_role_session_id, role_session_id.as_str());
+        assert_eq!(
+            loaded.coordinator_authority_digest.as_str(),
+            authority_digest.as_str()
+        );
+        assert_eq!(
+            store.effect_by_logical_key(&effect.logical_key).unwrap(),
+            Some(effect)
+        );
+        let replay = store
+            .commit_validated_work_plan(
+                generation,
+                &ticket_run_id,
+                Revision(1),
+                &applied.digest,
+                &plan,
+                &source,
+                &input,
+                "Coordinator plan accepted.",
+                transition_payload,
+                &[EffectIntent {
+                    project_id: project_id.clone(),
+                    subject_type: "ticket_run".into(),
+                    subject_id: ticket_run_id.as_str().into(),
+                    operation_id: "prepare-plan-worktrees".into(),
+                    logical_key: "prepare-plan-worktrees".into(),
+                    kind: "prepare_worktrees".into(),
+                    request_json: effect_request.into(),
+                    request_digest: content_digest(effect_request),
+                    expected_revision: Some(2),
+                }],
+            )
+            .unwrap();
+        assert!(replay.duplicate);
+        let (revision, phase, transition_count): (u64, String, u64) = store.connection.query_row(
+            "SELECT t.revision,t.internal_phase,(SELECT COUNT(*) FROM transitions WHERE entity_id=t.ticket_run_id) FROM ticket_runs t WHERE ticket_run_id=?1",
+            [ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            (revision, phase.as_str(), transition_count),
+            (2, "preparing", 2)
         );
     }
 
