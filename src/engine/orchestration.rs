@@ -342,7 +342,7 @@ pub enum RoleOutputKind {
     ProfilePromotionProposal,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "assertion", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentAssertion {
     Succeeded,
@@ -1368,7 +1368,7 @@ fn validate_artifact_reference(reference: &RoleArtifactReference) -> Result<(), 
     Ok(())
 }
 
-fn role_may_submit_artifact(role: Role, kind: RoleArtifactKind) -> bool {
+pub(crate) fn role_may_submit_artifact(role: Role, kind: RoleArtifactKind) -> bool {
     use RoleArtifactKind as K;
     match kind {
         K::Plan => matches!(role, Role::Coordinator | Role::Planner),

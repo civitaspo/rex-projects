@@ -24,6 +24,7 @@ use crate::launch::{
 pub mod dashboard_projection;
 
 pub const SCHEMA_VERSION: i64 = 11;
+pub mod agent_runtime;
 pub mod human;
 #[path = "store/learning.rs"]
 mod learning_store;

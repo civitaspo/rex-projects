@@ -1,0 +1,433 @@
+//! Run-local Agent-facing files and typed mailbox payloads.
+//!
+//! These helpers never open SQLite. Every value is still an Agent claim until the foreground
+//! controller validates it against the immutable launch authority and records host evidence.
+
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Component, Path};
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use crate::domain::ids::{Digest, ProjectId};
+use crate::engine::orchestration::{RoleArtifactKind, RoleArtifactReference};
+
+const MAX_INBOX_BYTES: usize = 1024 * 1024;
+const MAX_WAKE_ITEMS: usize = 256;
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWakeSnapshot {
+    pub schema_version: u32,
+    pub project_id: ProjectId,
+    pub role_session_id: String,
+    pub agent_run_id: String,
+    pub digest: Digest,
+    pub inputs: Vec<AgentWakeItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWakeItem {
+    pub wake_input_id: u64,
+    pub source_type: String,
+    pub source_id: String,
+    pub source_revision: u64,
+    pub priority: i32,
+    pub payload_json: serde_json::Value,
+}
+
+impl AgentWakeSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.role_session_id.trim().is_empty()
+            || self.agent_run_id.trim().is_empty()
+        {
+            return Err("unsupported or incomplete Agent inbox snapshot".into());
+        }
+        if self.inputs.len() > MAX_WAKE_ITEMS {
+            return Err("Agent inbox snapshot exceeds the 256 item limit".into());
+        }
+        let mut previous = 0;
+        for item in &self.inputs {
+            if item.wake_input_id == 0
+                || item.wake_input_id <= previous
+                || item.source_revision == 0
+                || item.source_type.is_empty()
+                || item.source_id.is_empty()
+                || item.source_type.chars().any(char::is_control)
+                || item.source_id.chars().any(char::is_control)
+            {
+                return Err(
+                    "Agent inbox entries must have ordered IDs and complete source identity".into(),
+                );
+            }
+            previous = item.wake_input_id;
+        }
+        if self.digest != self.content_digest()? {
+            return Err("Agent inbox digest does not match its content".into());
+        }
+        Ok(())
+    }
+
+    pub fn content_digest(&self) -> Result<Digest, String> {
+        let bytes = serde_json::to_vec(&(
+            self.schema_version,
+            &self.project_id,
+            &self.role_session_id,
+            &self.agent_run_id,
+            &self.inputs,
+        ))
+        .map_err(|error| error.to_string())?;
+        Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactAddRequest {
+    pub schema_version: u32,
+    pub message_id: String,
+    /// Normalized relative path under the immutable AgentRun workspace.
+    pub path: String,
+    pub kind: RoleArtifactKind,
+    pub artifact_schema_version: u32,
+}
+
+impl ArtifactAddRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_message_id(&self.message_id)?;
+        if self.schema_version != 1 || self.artifact_schema_version == 0 {
+            return Err("unsupported artifact request schema".into());
+        }
+        validate_relative_path(&self.path)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactAddReceipt {
+    pub schema_version: u32,
+    pub message_id: String,
+    pub artifact: RoleArtifactReference,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryManifestRequest {
+    pub schema_version: u32,
+    pub worktree_id: String,
+    pub entries: Vec<ManifestPath>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestPath {
+    pub path: String,
+    pub operation: ManifestOperation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestOperation {
+    Capture,
+    Delete,
+}
+
+impl RepositoryManifestRequest {
+    pub fn from_paths_file(worktree_id: String, path: &Path) -> Result<Self, String> {
+        if worktree_id.trim().is_empty() || worktree_id.chars().any(char::is_control) {
+            return Err("invalid worktree ID".into());
+        }
+        let bytes = read_bounded(path, 1024 * 1024)?;
+        let parsed: Self = crate::protocol::parse_unique(&bytes)?;
+        if parsed.schema_version != 1 || parsed.worktree_id != worktree_id {
+            return Err("manifest file does not match requested worktree".into());
+        }
+        if parsed.entries.len() > 10_000 {
+            return Err("manifest exceeds 10,000 paths".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &parsed.entries {
+            validate_relative_path(&item.path)?;
+            if !seen.insert(item.path.clone()) {
+                return Err("manifest contains a duplicate path".into());
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// Derive a Git manifest from the current Rex block worktree. No Git metadata is touched.
+    pub fn build(&self, root: &Path) -> Result<crate::host_commit::ChangeManifest, String> {
+        let root =
+            fs::canonicalize(root).map_err(|error| format!("canonicalize worktree: {error}"))?;
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for item in &self.entries {
+            let relative = Path::new(&item.path);
+            let full = root.join(relative);
+            match item.operation {
+                ManifestOperation::Delete => {
+                    entries.push(crate::host_commit::ManifestEntry::Delete {
+                        path: item.path.clone(),
+                    })
+                }
+                ManifestOperation::Capture => {
+                    let metadata = fs::symlink_metadata(&full)
+                        .map_err(|error| format!("inspect {}: {error}", item.path))?;
+                    if metadata.file_type().is_symlink() {
+                        let parent = full.parent().ok_or("manifest symlink has no parent")?;
+                        let resolved_parent = fs::canonicalize(parent)
+                            .map_err(|error| format!("resolve manifest parent: {error}"))?;
+                        if !resolved_parent.starts_with(&root) {
+                            return Err(
+                                "manifest path escapes its worktree through a parent symlink"
+                                    .into(),
+                            );
+                        }
+                        let target = fs::read_link(&full).map_err(|error| error.to_string())?;
+                        let target = target.to_str().ok_or("symlink target is not UTF-8")?;
+                        if target.contains('\0') || target.len() > 4096 {
+                            return Err("unsupported symlink target".into());
+                        }
+                        let digest = sha256(target.as_bytes())?;
+                        entries.push(crate::host_commit::ManifestEntry::Symlink {
+                            path: item.path.clone(),
+                            target_sha256: digest,
+                            target_byte_count: target.len() as u64,
+                        });
+                    } else if metadata.is_file() {
+                        let resolved = fs::canonicalize(&full)
+                            .map_err(|error| format!("resolve {}: {error}", item.path))?;
+                        if !resolved.starts_with(&root) {
+                            return Err("manifest file escapes its worktree".into());
+                        }
+                        if metadata.len() > 64 * 1024 * 1024 {
+                            return Err("manifest file exceeds 64 MiB".into());
+                        }
+                        let bytes = read_bounded(&full, 64 * 1024 * 1024)?;
+                        let mode = executable_mode(&metadata)?;
+                        entries.push(crate::host_commit::ManifestEntry::Write {
+                            path: item.path.clone(),
+                            mode,
+                            sha256: sha256(&bytes)?,
+                            byte_count: bytes.len() as u64,
+                        });
+                    } else {
+                        return Err(format!("unsupported manifest entry type: {}", item.path));
+                    }
+                }
+            }
+        }
+        Ok(crate::host_commit::ChangeManifest {
+            schema_version: 1,
+            entries,
+        })
+    }
+}
+
+pub fn read_inbox(
+    control_dir: &Path,
+    run_id: &str,
+    after: u64,
+) -> Result<Vec<AgentWakeItem>, String> {
+    let path = control_dir.join("inbox").join("snapshot.json");
+    let bytes = read_bounded(&path, MAX_INBOX_BYTES)?;
+    let snapshot: AgentWakeSnapshot = crate::protocol::parse_unique(&bytes)?;
+    snapshot.validate()?;
+    if snapshot.agent_run_id != run_id {
+        return Err("inbox snapshot belongs to another AgentRun".into());
+    }
+    Ok(snapshot
+        .inputs
+        .into_iter()
+        .filter(|item| item.wake_input_id > after)
+        .collect())
+}
+
+/// Host-side publication after a durable wake claim. Replaying the same snapshot is idempotent;
+/// replacing it with different content is permitted only for a later AgentRun and must be fenced
+/// by the host authority before this function is called.
+pub fn publish_wake_snapshot(
+    control_dir: &Path,
+    mut snapshot: AgentWakeSnapshot,
+) -> Result<(), String> {
+    let directory = control_dir.join("inbox");
+    ensure_real_directory(&directory)?;
+    snapshot.digest = snapshot.content_digest()?;
+    snapshot.validate()?;
+    let bytes = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_INBOX_BYTES {
+        return Err("Agent inbox snapshot exceeds 1 MiB".into());
+    }
+    let path = directory.join("snapshot.json");
+    let temporary = directory.join(format!(".snapshot-{}.tmp", std::process::id()));
+    write_new_file(&temporary, &bytes)?;
+    match fs::rename(&temporary, &path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(format!("publish Agent inbox snapshot: {error}"))
+        }
+    }
+}
+
+pub fn write_heartbeat(control_dir: &Path, run_id: &str) -> Result<(), String> {
+    validate_message_id(run_id)?;
+    let directory = control_dir.join("heartbeat");
+    ensure_real_directory(&directory)?;
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    let body = serde_json::json!({"schema_version":1,"run_id":run_id,"observed_at_unix":epoch});
+    atomic_replace(
+        &directory.join("heartbeat.json"),
+        &serde_json::to_vec(&body).map_err(|error| error.to_string())?,
+    )
+}
+
+pub fn validate_message_id(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
+        Err("message ID must contain 1 to 255 non-control bytes".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_relative_path(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return Err("path must be a normalized relative path".into());
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("path must not contain absolute, dot, or parent components".into());
+    }
+    if value.starts_with(".git/") || value == ".git" || value.starts_with(".rex-projects-control/")
+    {
+        return Err("path targets reserved repository control data".into());
+    }
+    Ok(())
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Err(format!("{} is not a bounded regular file", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::take(&mut file, limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Err(format!("{} exceeds its byte limit", path.display()));
+    }
+    Ok(bytes)
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), String> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("control child must be a real directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("heartbeat path has no parent")?;
+    let temporary = parent.join(format!(".heartbeat-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn sha256(bytes: &[u8]) -> Result<Digest, String> {
+    Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(unix)]
+fn executable_mode(metadata: &fs::Metadata) -> Result<crate::host_commit::FileMode, String> {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        Ok(crate::host_commit::FileMode::Executable0755)
+    } else {
+        Ok(crate::host_commit::FileMode::Regular0644)
+    }
+}
+#[cfg(not(unix))]
+fn executable_mode(_: &fs::Metadata) -> Result<crate::host_commit::FileMode, String> {
+    Ok(crate::host_commit::FileMode::Regular0644)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn path_validation_rejects_escape_and_control_paths() {
+        for invalid in [
+            "../secret",
+            "/tmp/file",
+            "a\\b",
+            ".git/config",
+            ".rex-projects-control/x",
+        ] {
+            assert!(validate_relative_path(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_relative_path("src/main.rs").is_ok());
+    }
+}

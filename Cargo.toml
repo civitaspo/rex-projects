@@ -8,6 +8,7 @@ repository = "https://github.com/civitaspo/rex-projects"
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29.0"
+jsonschema = { version = "0.60.2", default-features = false }
 libc = "0.2"
 fs2 = "0.4.3"
 rusqlite = { version = "0.37", features = ["bundled"] }

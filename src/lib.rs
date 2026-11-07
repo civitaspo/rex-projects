@@ -1,4 +1,6 @@
 pub mod adapters;
+pub mod agent_api;
+pub mod artifacts;
 pub mod cli;
 pub mod config;
 pub mod dashboard;
@@ -22,6 +24,11 @@ pub mod operations_runtime;
 pub mod process;
 pub mod profile_effect;
 pub mod protocol;
+pub mod providers;
+pub mod roles;
+pub mod run_step;
+pub mod run_step_package;
+pub mod run_step_spool;
 pub mod runtime_services;
 pub mod store;
 pub mod worktrees;
