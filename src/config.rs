@@ -807,10 +807,25 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
     {
         return Err("runtime.environment.shell is required when source is `login_shell`".into());
     }
-    if config.adapters.tickets.kind != "command" {
-        return Err("adapters.tickets.kind: only `command` is supported".into());
+    if !matches!(
+        config.adapters.tickets.kind.as_str(),
+        "command" | "linear_cli"
+    ) {
+        return Err("adapters.tickets.kind must be `command` or `linear_cli`".into());
     }
     validate_argv("adapters.tickets.command", &config.adapters.tickets.command)?;
+    if config.adapters.tickets.kind == "linear_cli"
+        && ["HOME", "PATH", "XDG_CONFIG_HOME"].iter().any(|required| {
+            !config
+                .adapters
+                .tickets
+                .environment_allow
+                .iter()
+                .any(|name| name == required)
+        })
+    {
+        return Err("adapters.tickets.environment_allow must include `HOME`, `PATH`, and `XDG_CONFIG_HOME` for linear_cli".into());
+    }
     if config.adapters.tickets.read_timeout_seconds == 0
         || config.adapters.tickets.write_timeout_seconds == 0
     {
@@ -1651,6 +1666,26 @@ mod tests {
         assert_eq!(loaded.config.projects.len(), 2);
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.source_files.len(), 7);
+    }
+
+    #[test]
+    fn linear_cli_kind_requires_cli_configuration_environment() {
+        let config_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let mut loaded = super::load(&config_path).unwrap();
+        {
+            let ticket = &mut loaded.config.adapters.tickets;
+            ticket.kind = "linear_cli".into();
+            ticket.command = vec!["linear".into()];
+            ticket.environment_allow = vec!["HOME".into(), "PATH".into(), "XDG_CONFIG_HOME".into()];
+        }
+        assert!(super::validate_config(&loaded.config, &loaded.profiles).is_ok());
+        loaded.config.adapters.tickets.environment_allow.pop();
+        assert!(
+            super::validate_config(&loaded.config, &loaded.profiles)
+                .unwrap_err()
+                .contains("HOME`, `PATH`, and `XDG_CONFIG_HOME")
+        );
     }
 
     #[test]
