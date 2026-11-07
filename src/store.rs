@@ -10,11 +10,17 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::{AppliedConfig, Config, Profile, SourceFile};
 use crate::domain::ids::{
-    Digest, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
+    AgentRunId, Digest, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
 };
+use crate::domain::types::Role;
 use crate::engine::reducer::{Input, TicketRun, WakeTarget, reduce};
+use crate::launch::{
+    AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, ObservedProviderStart,
+    ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle, RexFocusTarget, RexView,
+    RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
+};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
@@ -47,6 +53,25 @@ type PendingControlRow = (
     Option<String>,
     Option<String>,
     i64,
+);
+type RexViewIdentityRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    u64,
+    String,
+    String,
+    String,
+);
+type LaunchRexViewRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
 );
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,7 +314,7 @@ impl ConfigStore {
     fn open_with_lock(state_root: &Path, machine_lock: MachineLock) -> Result<Self, String> {
         let database = state_root.join("state.sqlite3");
         ensure_private_database_file(&database)?;
-        let connection =
+        let mut connection =
             Connection::open(&database).map_err(|e| format!("{}: {e}", database.display()))?;
         restrict_file_permissions(&database)?;
         connection
@@ -331,6 +356,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             migrate_v6(&connection)?;
+        }
+        if existing_version < 7 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            crate::launch::migrate_v7(&mut connection)?;
         }
         Ok(Self {
             connection,
@@ -427,6 +458,643 @@ impl ConfigStore {
         ).optional().map_err(|e| e.to_string())?.map(|(config_source, config_revision, config_digest, mode, goal_revision, desired_lifecycle, state_revision)| {
             Ok(ProjectRecord { id: id.clone(), config_source, config_revision: Revision(config_revision), config_digest: Digest::parse(config_digest)?, mode, goal_revision, desired_lifecycle, state_revision: Revision(state_revision) })
         }).transpose()
+    }
+
+    pub fn register_rex_view(
+        &mut self,
+        owner_generation: u64,
+        view: &RexView,
+    ) -> Result<bool, String> {
+        view.validate()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let inserted = tx.execute(
+            "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'active',?10,?10) ON CONFLICT(view_id) DO NOTHING",
+            params![view.view_id.as_str(),view.project_id.as_str(),serde_json::to_value(view.kind).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),view.ticket_namespace,view.ticket_id,view.view_epoch,view.rex_server_identity,view.rex_session_id,view.rex_window_id,now_unix()?],
+        ).map_err(|error| error.to_string())? == 1;
+        let stored: Option<RexViewIdentityRow> = tx.query_row(
+            "SELECT project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id FROM rex_views WHERE view_id=?1",
+            [view.view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let expected_kind = serde_json::to_value(view.kind)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let expected = (
+            view.project_id.as_str().to_owned(),
+            expected_kind,
+            view.ticket_namespace.clone(),
+            view.ticket_id.clone(),
+            view.view_epoch,
+            view.rex_server_identity.clone(),
+            view.rex_session_id.clone(),
+            view.rex_window_id.clone(),
+        );
+        if stored.as_ref() != Some(&expected) {
+            return Err("Rex view ID already exists with different identity".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
+    }
+
+    pub fn observe_rex_view_block(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+        lifecycle: RexBlockLifecycle,
+        process_absent_confirmed: bool,
+        retained_until_unix: Option<u64>,
+    ) -> Result<(), String> {
+        if block_id.trim().is_empty() || block_id.chars().any(char::is_control) {
+            return Err("Rex block identity is malformed".into());
+        }
+        if lifecycle == RexBlockLifecycle::Unknown && process_absent_confirmed {
+            return Err("unknown Rex block cannot be marked process-absent confirmed".into());
+        }
+        if lifecycle == RexBlockLifecycle::Active && process_absent_confirmed {
+            return Err("active Rex block cannot be marked process-absent confirmed".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let status = serde_json::to_value(lifecycle).map_err(|error| error.to_string())?;
+        let status = status.as_str().ok_or("Rex block lifecycle is invalid")?;
+        let changed = tx.execute(
+            "UPDATE rex_view_blocks SET lifecycle=?3,process_absent_confirmed=?4,last_observed_at_unix=?5,retained_until_unix=COALESCE(?6,retained_until_unix) WHERE view_id=?1 AND block_id=?2 AND lifecycle!='closed' AND (lifecycle='unknown' OR ?3='unknown' OR (?3='closed' AND process_absent_confirmed=1) OR lifecycle='active')",
+            params![view_id.as_str(),block_id,status,process_absent_confirmed,now_unix()?,retained_until_unix],
+        ).map_err(|error|error.to_string())?;
+        if changed != 1 {
+            return Err(
+                "Rex view block not found or observation would regress a terminal state".into(),
+            );
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn rex_view_history(&self, project_id: &ProjectId) -> Result<Vec<RexViewRecord>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix,closed_at_unix FROM rex_views WHERE project_id=?1 ORDER BY created_at_unix DESC,view_epoch DESC",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([project_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, bool>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, u64>(11)?,
+                    row.get::<_, u64>(12)?,
+                    row.get::<_, Option<u64>>(13)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (
+                id,
+                project,
+                kind,
+                namespace,
+                ticket,
+                epoch,
+                server,
+                session,
+                window,
+                pinned,
+                lifecycle,
+                created,
+                updated,
+                closed,
+            ) = row.map_err(|error| error.to_string())?;
+            let kind = match kind.as_str() {
+                "supervisor" => RexViewKind::Supervisor,
+                "ticket" => RexViewKind::Ticket,
+                _ => return Err("stored Rex view kind is invalid".into()),
+            };
+            let view = RexView {
+                view_id: Digest::parse(id)?,
+                project_id: ProjectId::parse(project)?,
+                kind,
+                ticket_namespace: namespace,
+                ticket_id: ticket,
+                view_epoch: epoch,
+                rex_server_identity: server,
+                rex_session_id: session,
+                rex_window_id: window,
+            };
+            view.validate()?;
+            Ok(RexViewRecord {
+                view,
+                pinned,
+                lifecycle,
+                created_at_unix: created,
+                updated_at_unix: updated,
+                closed_at_unix: closed,
+            })
+        })
+        .collect()
+    }
+
+    pub fn rex_focus_target(
+        &self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+    ) -> Result<RexFocusTarget, String> {
+        let active_generation: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|error|error.to_string())?;
+        if active_generation != Some(owner_generation) {
+            return Err("Rex focus request is fenced to a stale controller generation".into());
+        }
+        let target: Option<(String,String,String)> = self.connection.query_row(
+            "SELECT v.rex_server_identity,v.rex_session_id,v.rex_window_id FROM rex_views v JOIN rex_view_blocks b USING(view_id) WHERE v.view_id=?1 AND b.block_id=?2 AND v.lifecycle='active' AND b.lifecycle!='closed'",
+            params![view_id.as_str(),block_id], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error|error.to_string())?;
+        let Some((server, session, window)) = target else {
+            return Err("active Rex focus target not found".into());
+        };
+        Ok(RexFocusTarget {
+            view_id: view_id.clone(),
+            rex_server_identity: server,
+            rex_session_id: session,
+            rex_window_id: window,
+            rex_block_id: block_id.to_owned(),
+        })
+    }
+
+    pub fn set_rex_view_pin(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        pinned: bool,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute("UPDATE rex_views SET pinned=?2,updated_at_unix=?3 WHERE view_id=?1 AND lifecycle='active'", params![view_id.as_str(),pinned,now_unix()?]).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("active Rex view not found".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn rex_view_cleanup_candidates(
+        &self,
+        now_unix: u64,
+        retention_seconds: u64,
+    ) -> Result<Vec<RexViewCleanupCandidate>, String> {
+        let cutoff = now_unix.saturating_sub(retention_seconds);
+        let mut statement=self.connection.prepare(
+            "SELECT v.view_id,v.project_id,v.view_kind,v.ticket_namespace,v.ticket_id,v.view_epoch,v.rex_server_identity,v.rex_session_id,v.rex_window_id,v.updated_at_unix FROM rex_views v WHERE v.lifecycle='active' AND v.pinned=0 AND v.updated_at_unix<=?1 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2))) ORDER BY v.updated_at_unix",
+        ).map_err(|error|error.to_string())?;
+        let rows = statement
+            .query_map(params![cutoff, now_unix], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, u64>(9)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (id, project, kind, namespace, ticket, epoch, server, session, window, updated) =
+                row.map_err(|error| error.to_string())?;
+            let kind = match kind.as_str() {
+                "supervisor" => RexViewKind::Supervisor,
+                "ticket" => RexViewKind::Ticket,
+                _ => return Err("stored Rex view kind is invalid".into()),
+            };
+            let view = RexView {
+                view_id: Digest::parse(id)?,
+                project_id: ProjectId::parse(project)?,
+                kind,
+                ticket_namespace: namespace,
+                ticket_id: ticket,
+                view_epoch: epoch,
+                rex_server_identity: server,
+                rex_session_id: session,
+                rex_window_id: window,
+            };
+            view.validate()?;
+            Ok(RexViewCleanupCandidate {
+                view,
+                close_after_unix: updated.saturating_add(retention_seconds),
+            })
+        })
+        .collect()
+    }
+
+    pub fn begin_rex_view_close(
+        &mut self,
+        owner_generation: u64,
+        candidate: &RexViewCleanupCandidate,
+        now_unix: u64,
+        retention_seconds: u64,
+    ) -> Result<(), String> {
+        candidate.view.validate()?;
+        if candidate.close_after_unix > now_unix {
+            return Err("Rex view retention period has not elapsed".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let cutoff = now_unix.saturating_sub(retention_seconds);
+        let changed=tx.execute(
+            "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND updated_at_unix<=?3 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2)))",
+            params![candidate.view.view_id.as_str(),now_unix,cutoff],
+        ).map_err(|error|error.to_string())?;
+        if changed != 1 {
+            return Err("Rex view is no longer safe to close".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn finish_rex_view_close(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        observed_closed: bool,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let now = now_unix()?;
+        let lifecycle = if observed_closed { "closed" } else { "unknown" };
+        let changed=tx.execute("UPDATE rex_views SET lifecycle=?2,updated_at_unix=?3,closed_at_unix=CASE WHEN ?2='closed' THEN ?3 ELSE NULL END WHERE view_id=?1 AND lifecycle='close_pending'",params![view_id.as_str(),lifecycle,now]).map_err(|error|error.to_string())?;
+        if changed != 1 {
+            return Err("Rex view has no matching pending close".into());
+        }
+        if observed_closed {
+            tx.execute("UPDATE rex_view_blocks SET lifecycle='closed',process_absent_confirmed=1,last_observed_at_unix=?2 WHERE view_id=?1",params![view_id.as_str(),now]).map_err(|error|error.to_string())?;
+        } else {
+            tx.execute("UPDATE rex_view_blocks SET lifecycle='unknown',process_absent_confirmed=0,last_observed_at_unix=?2 WHERE view_id=?1 AND lifecycle!='closed'",params![view_id.as_str(),now]).map_err(|error|error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn register_rex_view_block(
+        &mut self,
+        owner_generation: u64,
+        block: &RexViewBlock,
+    ) -> Result<bool, String> {
+        block.validate()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let view_state: Option<String> = tx
+            .query_row(
+                "SELECT lifecycle FROM rex_views WHERE view_id=?1",
+                [block.view_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if view_state.as_deref() != Some("active") {
+            return Err("Rex block can only be recorded in an active view".into());
+        }
+        if block.ownership == crate::launch::RexBlockOwnership::Factory {
+            let run_id = block
+                .agent_run_id
+                .as_ref()
+                .ok_or("factory block requires AgentRun")?;
+            let (view, role): (String, String) = tx
+                .query_row(
+                    "SELECT rex_view_id,role FROM agent_launch_authority WHERE agent_run_id=?1",
+                    [run_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or("factory block requires persisted launch authority")?;
+            let role_raw = serde_json::to_value(block.role)
+                .map_err(|error| error.to_string())?
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if view != block.view_id.as_str() || role != role_raw {
+                return Err("Rex block identity does not match launch authority".into());
+            }
+        }
+        let ownership = serde_json::to_value(block.ownership).map_err(|error| error.to_string())?;
+        let lifecycle = serde_json::to_value(block.lifecycle).map_err(|error| error.to_string())?;
+        let role = block.role.map(|role| {
+            serde_json::to_value(role)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
+        let inserted=tx.execute("INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix,retained_until_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9) ON CONFLICT(view_id,block_id) DO NOTHING",params![block.view_id.as_str(),block.block_id,block.agent_run_id.as_ref().map(AgentRunId::as_str),role.flatten(),ownership.as_str().unwrap_or_default(),lifecycle.as_str().unwrap_or_default(),block.process_absent_confirmed,now_unix()?,block.retained_until_unix]).map_err(|error|error.to_string())?==1;
+        let requested_role = block.role.map(|role| {
+            serde_json::to_value(role)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
+        let existing: Option<(Option<String>,Option<String>,String)>=tx.query_row(
+            "SELECT agent_run_id,role,ownership FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2",
+            params![block.view_id.as_str(),block.block_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error|error.to_string())?;
+        if existing.as_ref().is_none_or(|row| {
+            row.0.as_deref() != block.agent_run_id.as_ref().map(AgentRunId::as_str)
+                || row.1 != requested_role.flatten()
+                || row.2 != ownership.as_str().unwrap_or_default()
+        }) {
+            return Err("Rex block already exists with different identity".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
+    }
+
+    /// Persist immutable provider qualification evidence. A caller-supplied digest is never
+    /// accepted; the key is recomputed from the full receipt and verified on every read.
+    pub fn store_provider_qualification(
+        &mut self,
+        owner_generation: u64,
+        qualification: &ProviderQualification,
+    ) -> Result<Digest, String> {
+        qualification.validate_for_storage()?;
+        let receipt_digest = qualification.canonical_digest()?;
+        let receipt_json =
+            serde_json::to_string(qualification).map_err(|error| error.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        tx.execute(
+            "INSERT INTO provider_qualifications(receipt_digest,project_id,profile_id,profile_digest,adapter,executable_path,executable_digest,provider_version,permission_mode,invocation_options_digest,commit_mode,status,receipt_json,created_by_generation,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(receipt_digest) DO NOTHING",
+            params![receipt_digest.as_str(), qualification.project_id.as_str(), qualification.profile_id.as_str(), qualification.profile_digest.as_str(), serde_json::to_value(qualification.adapter).map_err(|error| error.to_string())?.as_str().unwrap_or_default(), qualification.executable_path, qualification.executable_digest.as_str(), qualification.provider_version, qualification.permission_mode, qualification.invocation_options_digest.as_str(), serde_json::to_value(qualification.commit_mode).map_err(|error| error.to_string())?.as_str().unwrap_or_default(), serde_json::to_value(qualification.status).map_err(|error| error.to_string())?.as_str().unwrap_or_default(), receipt_json, owner_generation, now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        let stored: String = tx
+            .query_row(
+                "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
+                [receipt_digest.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if stored != serde_json::to_string(qualification).map_err(|error| error.to_string())? {
+            return Err("qualification digest collides with different stored evidence".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(receipt_digest)
+    }
+
+    pub fn provider_qualification(
+        &self,
+        receipt_digest: &Digest,
+    ) -> Result<Option<ProviderQualification>, String> {
+        let receipt: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
+                [receipt_digest.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        receipt
+            .map(|json| {
+                let qualification: ProviderQualification =
+                    crate::protocol::parse_unique(json.as_bytes()).map_err(|error| {
+                        format!("stored provider qualification is invalid: {error}")
+                    })?;
+                if qualification.canonical_digest()? != *receipt_digest {
+                    return Err("stored provider qualification digest mismatch".into());
+                }
+                Ok(qualification)
+            })
+            .transpose()
+    }
+
+    /// Register the exact immutable run authority only after the Rex block, descriptor,
+    /// workspace, and mailbox capability have been prepared by the host.
+    pub fn register_agent_launch_authority(
+        &mut self,
+        owner_generation: u64,
+        authority: &AgentLaunchAuthority,
+    ) -> Result<bool, String> {
+        authority.validate()?;
+        let authority_json = serde_json::to_string(authority).map_err(|error| error.to_string())?;
+        let authority_digest = authority.digest()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        if authority.controller_generation != owner_generation {
+            return Err(
+                "new launch authority must belong to the active controller generation".into(),
+            );
+        }
+        let run: Option<(String, String, u64, String, String, String, String)> = tx.query_row(
+            "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source FROM agent_runs WHERE agent_run_id=?1",
+            [authority.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((
+            project_id,
+            state,
+            generation,
+            operation_id,
+            config_digest,
+            config_revision,
+            config_source,
+        )) = run
+        else {
+            return Err("launch authority references an unknown AgentRun".into());
+        };
+        if project_id != authority.project_id.as_str()
+            || state != "launch_pending"
+            || generation != owner_generation
+            || operation_id != authority.operation_id.as_str()
+            || config_digest != authority.config_digest.as_str()
+            || config_revision != authority.config_revision.0.to_string()
+        {
+            return Err("AgentRun does not match the proposed launch authority".into());
+        }
+        let snapshot: Option<(String, String)> = tx.query_row(
+            "SELECT snapshots.digest,snapshots.effective_config_json FROM config_current current JOIN config_snapshots snapshots USING(source_identity,revision) WHERE current.source_identity=?1 AND current.revision=?2",
+            params![config_source,authority.config_revision.0],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((snapshot_digest, effective_json)) = snapshot else {
+            return Err(
+                "launch authority config revision is no longer the applied snapshot".into(),
+            );
+        };
+        if snapshot_digest != authority.config_digest.as_str() {
+            return Err(
+                "launch authority config digest does not match the applied snapshot".into(),
+            );
+        }
+        let effective: EffectiveConfig =
+            crate::protocol::parse_unique(effective_json.as_bytes())
+                .map_err(|error| format!("applied config snapshot is invalid: {error}"))?;
+        let profile = effective
+            .profiles
+            .get(&authority.profile_id)
+            .ok_or("launch profile is missing from the applied config snapshot")?;
+        let profile_json = canonical_json(profile)?;
+        let profile_digest =
+            Digest::parse(format!("{:x}", Sha256::digest(profile_json.as_bytes())))?;
+        if profile_digest != authority.profile_digest {
+            return Err("launch profile digest does not match the applied config snapshot".into());
+        }
+        let mailbox: Option<String> = tx
+            .query_row(
+                "SELECT capability_digest FROM agent_mailboxes WHERE agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if mailbox.as_deref() != Some(authority.mailbox_capability_digest.as_str()) {
+            return Err("launch authority has no matching registered mailbox capability".into());
+        }
+        let view: Option<LaunchRexViewRow> = tx.query_row(
+            "SELECT project_id,rex_server_identity,rex_session_id,rex_window_id,view_kind,ticket_namespace,ticket_id FROM rex_views WHERE view_id=?1 AND lifecycle='active'",
+            [authority.rex_view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let ticket_scope = if authority.role == Role::Supervisor {
+            None
+        } else {
+            Some(
+                tx.query_row(
+                    "SELECT namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1",
+                    [authority
+                        .ticket_run_id
+                        .as_ref()
+                        .ok_or("ticket AgentRun is missing TicketRun ID")?
+                        .as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or("launch TicketRun does not exist")?,
+            )
+        };
+        let view_ticket_scope_matches =
+            view.as_ref()
+                .is_some_and(|(_, _, _, _, kind, namespace, ticket)| {
+                    if authority.role == Role::Supervisor {
+                        kind == "supervisor" && namespace.is_none() && ticket.is_none()
+                    } else {
+                        kind == "ticket"
+                            && ticket_scope.as_ref().is_some_and(
+                                |(expected_namespace, expected_ticket)| {
+                                    namespace.as_deref() == Some(expected_namespace.as_str())
+                                        && ticket.as_deref() == Some(expected_ticket.as_str())
+                                },
+                            )
+                    }
+                });
+        if !view_ticket_scope_matches
+            || view.as_ref().is_none_or(|row| {
+                row.0 != authority.project_id.as_str()
+                    || row.1 != authority.rex_server_identity
+                    || row.2 != authority.rex_session_id
+                    || row.3 != authority.rex_window_id
+            })
+        {
+            return Err("launch authority does not match an active registered Rex view".into());
+        }
+        let qualification_json: Option<String> = tx
+            .query_row(
+                "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
+                [authority.qualification_receipt_digest.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let qualification: ProviderQualification = crate::protocol::parse_unique(
+            qualification_json
+                .ok_or("launch authority references an unregistered qualification")?
+                .as_bytes(),
+        )
+        .map_err(|error| format!("stored provider qualification is invalid: {error}"))?;
+        if qualification.canonical_digest()? != authority.qualification_receipt_digest
+            || qualification.project_id != authority.project_id
+            || qualification.profile_id != authority.profile_id
+            || qualification.profile_digest != authority.profile_digest
+        {
+            return Err("qualification receipt does not match the immutable launch profile".into());
+        }
+        qualification.validate_for_unattended_launch()?;
+        let authority_inserted = tx.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34) ON CONFLICT(agent_run_id) DO NOTHING",
+            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        let existing: Option<(String,String)> = tx
+            .query_row(
+                "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if existing.as_ref().is_none_or(|(json, digest)| {
+            json != &authority_json || digest != authority_digest.as_str()
+        }) {
+            return Err("AgentRun already has a different immutable launch authority".into());
+        }
+        tx.execute("INSERT INTO agent_launch_state(agent_run_id,state,last_observed_at_unix,updated_at_unix) VALUES (?1,'block_created',?2,?2) ON CONFLICT(agent_run_id) DO NOTHING", params![authority.agent_run_id.as_str(),now_unix()?]).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(authority_inserted == 1)
+    }
+
+    pub fn agent_launch_authority(
+        &self,
+        agent_run_id: &AgentRunId,
+    ) -> Result<Option<AgentLaunchAuthority>, String> {
+        let stored: Option<(String,String,String)> = self.connection.query_row(
+            "SELECT authority_json,descriptor_digest,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+            [agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        stored
+            .map(|(json, descriptor_digest, authority_digest)| {
+                let authority: AgentLaunchAuthority =
+                    crate::protocol::parse_unique(json.as_bytes()).map_err(|error| {
+                        format!("stored Agent launch authority is invalid: {error}")
+                    })?;
+                authority.validate()?;
+                if authority.agent_run_id != *agent_run_id
+                    || authority.descriptor_digest.as_str() != descriptor_digest
+                    || authority.digest()?.as_str() != authority_digest
+                {
+                    return Err("stored Agent launch authority digest fields do not match".into());
+                }
+                Ok(authority)
+            })
+            .transpose()
     }
 
     pub fn register_agent_mailbox(
@@ -2562,6 +3230,167 @@ impl ConfigStore {
         })
         .transpose()
     }
+
+    /// Persist and return the host launch acknowledgement. Provider execution remains gated
+    /// until the wrapper receives this exact durable receipt.
+    pub fn authorize_agent_start(
+        &mut self,
+        current_generation: u64,
+        request: &AgentStartRequest,
+        observed: &ObservedWrapperIdentity,
+    ) -> Result<AgentLaunchReceipt, String> {
+        request.validate()?;
+        observed.matches_start_request(request)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, current_generation)?;
+        let authority_json: String = tx
+            .query_row(
+                "SELECT authority_json FROM agent_launch_authority WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("Agent start request has no persisted host launch authority")?;
+        let authority: AgentLaunchAuthority =
+            crate::protocol::parse_unique(authority_json.as_bytes())
+                .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
+        authority.validate()?;
+        let qualification_json: String = tx
+            .query_row(
+                "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
+                [authority.qualification_receipt_digest.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("launch authority provider qualification is missing")?;
+        let qualification: ProviderQualification =
+            crate::protocol::parse_unique(qualification_json.as_bytes())
+                .map_err(|error| format!("stored provider qualification is invalid: {error}"))?;
+        let expected = authority.expectation(&qualification);
+        let receipt = authorize_start(current_generation, &expected, &qualification, request)?;
+        let run: Option<(String, u64, String)> = tx
+            .query_row(
+                "SELECT state,controller_generation,launch_operation_id FROM agent_runs WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(run, Some((ref state, generation, ref operation)) if state == "launch_pending" && generation == current_generation && operation == request.operation_id.as_str())
+        {
+            return Err(
+                "AgentRun is not launch-pending under the active controller generation".into(),
+            );
+        }
+        let stored_ack: Option<(String, String)> = tx
+            .query_row(
+                "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
+        let request_digest =
+            Digest::parse(format!("{:x}", Sha256::digest(request_json.as_bytes())))?;
+        let receipt_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        if let Some((previous_digest, previous_receipt)) = stored_ack {
+            if previous_digest != request_digest.as_str() || previous_receipt != receipt_json {
+                return Err(
+                    "AgentRun already has a different persisted start acknowledgement".into(),
+                );
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(receipt);
+        }
+        let wrapper_json = serde_json::to_string(observed).map_err(|error| error.to_string())?;
+        let changed = tx.execute(
+            "UPDATE agent_launch_state SET state='awaiting_provider',start_request_id=?2,start_request_digest=?3,wrapper_process_identity_json=?4,launch_receipt_json=?5,last_observed_at_unix=?6,updated_at_unix=?6 WHERE agent_run_id=?1 AND state IN ('block_created','unknown') AND start_request_id IS NULL",
+            params![request.agent_run_id.as_str(),request.operation_id.as_str(),request_digest.as_str(),wrapper_json,receipt_json,now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("Agent launch state is not ready for a new start acknowledgement".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(receipt)
+    }
+
+    /// Mark a run active only after the host process observer confirms the exact provider
+    /// executable and process tree. An unconfirmed observation remains unresolved.
+    pub fn confirm_provider_started(
+        &mut self,
+        current_generation: u64,
+        observation: &ObservedProviderStart,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, current_generation)?;
+        let authority_json: String = tx
+            .query_row(
+                "SELECT authority_json FROM agent_launch_authority WHERE agent_run_id=?1",
+                [observation.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("provider start observation references no launch authority")?;
+        let authority: AgentLaunchAuthority =
+            crate::protocol::parse_unique(authority_json.as_bytes())
+                .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
+        if authority.controller_generation != current_generation
+            || authority.operation_id != observation.operation_id
+        {
+            return Err(
+                "provider start observation does not match the active launch authority".into(),
+            );
+        }
+        let qualification_json: String = tx
+            .query_row(
+                "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
+                [authority.qualification_receipt_digest.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("provider start qualification receipt is missing")?;
+        let qualification: ProviderQualification =
+            crate::protocol::parse_unique(qualification_json.as_bytes())
+                .map_err(|error| format!("stored provider qualification is invalid: {error}"))?;
+        observation.validate(&qualification)?;
+        let process_tree_json =
+            serde_json::to_string(observation).map_err(|error| error.to_string())?;
+        let now = now_unix()?;
+        let changed = tx.execute(
+            "UPDATE agent_launch_state SET state='running',provider_process_tree_json=?2,last_observed_at_unix=?3,updated_at_unix=?3 WHERE agent_run_id=?1 AND state='awaiting_provider' AND start_request_id=?4",
+            params![observation.agent_run_id.as_str(),process_tree_json,now,observation.operation_id.as_str()],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("AgentRun has no matching provider launch awaiting observation".into());
+        }
+        let process_identity = serde_json::json!({
+            "provider_pid": observation.provider_pid,
+            "provider_start_identity": observation.provider_start_identity,
+            "executable_digest": observation.executable_digest,
+            "process_tree_digest": observation.process_tree_digest,
+        });
+        let run_changed = tx.execute(
+            "UPDATE agent_runs SET state='running',process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state='launch_pending' AND controller_generation=?4",
+            params![observation.agent_run_id.as_str(),serde_json::to_string(&process_identity).map_err(|error| error.to_string())?,now,current_generation],
+        ).map_err(|error| error.to_string())?;
+        if run_changed != 1 {
+            return Err(
+                "AgentRun state changed before provider start observation was committed".into(),
+            );
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
 }
 
 fn acquire_machine_lock(state_root: &Path) -> Result<File, String> {
@@ -2879,6 +3708,7 @@ mod tests {
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
     use crate::engine::reducer::Input;
+    use crate::launch::{RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind};
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -3130,6 +3960,96 @@ mod tests {
                 .map(|(_, request)| request.attempt_count)
                 .collect::<Vec<_>>(),
             [1, 1, 1, 1, 2]
+        );
+    }
+
+
+    #[test]
+    fn rex_view_history_pin_and_user_blocks_prevent_automatic_cleanup() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("view-project").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            mode: "operations".into(),
+            goal_revision: 0,
+            desired_lifecycle: "running".into(),
+            state_revision: Revision(0),
+        };
+        store.insert_project(&project).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "view-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "view-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let view_id =
+            RexView::derive_id(&project.id, RexViewKind::Supervisor, None, None, 1).unwrap();
+        let view = RexView {
+            view_id: view_id.clone(),
+            project_id: project.id.clone(),
+            kind: RexViewKind::Supervisor,
+            ticket_namespace: None,
+            ticket_id: None,
+            view_epoch: 1,
+            rex_server_identity: "fixture-instance".into(),
+            rex_session_id: "session-1".into(),
+            rex_window_id: "window-1".into(),
+        };
+        assert!(store.register_rex_view(generation, &view).unwrap());
+        assert!(!store.register_rex_view(generation, &view).unwrap());
+        assert_eq!(store.rex_view_history(&project.id).unwrap().len(), 1);
+        store.set_rex_view_pin(generation, &view_id, true).unwrap();
+        store.set_rex_view_pin(generation, &view_id, false).unwrap();
+        assert!(
+            store
+                .register_rex_view_block(
+                    generation,
+                    &RexViewBlock {
+                        view_id: view_id.clone(),
+                        block_id: "human-block".into(),
+                        agent_run_id: None,
+                        role: None,
+                        ownership: RexBlockOwnership::User,
+                        lifecycle: RexBlockLifecycle::Active,
+                        process_absent_confirmed: false,
+                        retained_until_unix: None,
+                    },
+                )
+                .unwrap()
+        );
+        let focus = store
+            .rex_focus_target(generation, &view_id, "human-block")
+            .unwrap();
+        assert_eq!(focus.rex_session_id, "session-1");
+        assert!(
+            store
+                .rex_view_cleanup_candidates(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    1,
+                )
+                .unwrap()
+                .is_empty()
         );
     }
 

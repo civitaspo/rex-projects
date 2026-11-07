@@ -9,6 +9,7 @@ pub mod host_commit;
 pub mod human;
 pub mod knowledge;
 pub mod learning;
+pub mod launch;
 pub mod mailbox;
 pub mod operations;
 pub mod process;
