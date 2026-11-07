@@ -242,6 +242,7 @@ pub fn set_ticket_pin(
     owner_generation: u64,
     ticket_run_id: &TicketRunId,
     expected_revision: u64,
+    expected_view_id: &Digest,
     pinned: bool,
 ) -> Result<(), String> {
     let path = state_root.join("state.sqlite3");
@@ -287,10 +288,13 @@ pub fn set_ticket_pin(
             |row| row.get(0),
         )
         .map_err(|_| "active Rex ticket view not found".to_owned())?;
+    if view_id != expected_view_id.as_str() {
+        return Err("active Rex ticket view changed; refresh the dashboard".into());
+    }
     let changed = tx
         .execute(
-            "UPDATE rex_views SET pinned=?2,updated_at_unix=?3 WHERE view_id=?1 AND lifecycle='active'",
-            params![view_id, pinned, unix_now()],
+            "UPDATE rex_views SET pinned=?4,updated_at_unix=?5 WHERE view_id=?1 AND project_id=?2 AND ticket_namespace=?3 AND ticket_id=?6 AND lifecycle='active'",
+            params![view_id, project_id, namespace, pinned, unix_now(), ticket_id],
         )
         .map_err(|error| error.to_string())?;
     if changed != 1 {

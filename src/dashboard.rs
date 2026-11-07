@@ -17,7 +17,9 @@ static SHUTDOWN_REQUESTED: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 use crate::adapters::rex::RexCliTransport;
-use crate::domain::ids::{HumanRequestId, ProjectId, TicketId, TicketNamespace, TicketRunId};
+use crate::domain::ids::{
+    Digest, HumanRequestId, ProjectId, TicketId, TicketNamespace, TicketRunId,
+};
 use crate::human_runtime::{HumanDecisionIntent, HumanRequestLifecycle};
 use crate::store::{ConfigStore, dashboard_projection};
 
@@ -145,6 +147,7 @@ impl DashboardBackend for RuntimeDashboardBackend {
         &mut self,
         ticket_run: &TicketRunId,
         expected_revision: u64,
+        expected_view_id: &Digest,
         pinned: bool,
     ) -> Result<(), String> {
         dashboard_projection::set_ticket_pin(
@@ -152,6 +155,7 @@ impl DashboardBackend for RuntimeDashboardBackend {
             self.owner_generation()?,
             ticket_run,
             expected_revision,
+            expected_view_id,
             pinned,
         )
     }
@@ -358,6 +362,7 @@ pub trait DashboardBackend {
         &mut self,
         ticket_run: &TicketRunId,
         expected_revision: u64,
+        expected_view_id: &Digest,
         pinned: bool,
     ) -> Result<(), String>;
     fn instruct_coordinator(
@@ -509,10 +514,14 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                         if let Selection::Ticket(i) = selected
                             && let Some(t) = snapshot.tickets.get(i)
                         {
-                            status_message = Some(
-                                match backend.set_pin(
+                            status_message = Some(match t.rex_view_id.as_ref() {
+                                None => {
+                                    "Pin failed: no active Rex ticket view in this snapshot".into()
+                                }
+                                Some(view_id) => match backend.set_pin(
                                     &t.ticket_run_id,
                                     t.revision,
+                                    view_id,
                                     !t.pinned.unwrap_or(false),
                                 ) {
                                     Ok(()) => {
@@ -524,7 +533,7 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                                     }
                                     Err(error) => format!("Pin failed: {error}"),
                                 },
-                            );
+                            });
                         }
                     }
                     KeyCode::Char('i') => {
@@ -831,6 +840,7 @@ mod tests {
         use crate::domain::ids::{
             Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
         };
+        use crate::launch::{RexView, RexViewKind};
         use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
         use std::collections::BTreeMap;
 
@@ -906,9 +916,41 @@ mod tests {
                 "ToDo",
             )
             .unwrap();
+        let first_view_id = RexView::derive_id(
+            &project_id,
+            RexViewKind::Ticket,
+            Some(namespace.as_str()),
+            Some(ticket_id.as_str()),
+            1,
+        )
+        .unwrap();
+        store
+            .register_rex_view(
+                generation,
+                &RexView {
+                    view_id: first_view_id.clone(),
+                    project_id: project_id.clone(),
+                    kind: RexViewKind::Ticket,
+                    ticket_namespace: Some(namespace.to_string()),
+                    ticket_id: Some(ticket_id.to_string()),
+                    view_epoch: 1,
+                    rex_server_identity: "fixture-instance".into(),
+                    rex_session_id: "fixture-session".into(),
+                    rex_window_id: "ticket-window-1".into(),
+                },
+            )
+            .unwrap();
         drop(store);
 
         let mut backend = RuntimeDashboardBackend::new(temp.path(), "rex");
+        let old_snapshot = backend.snapshot().unwrap();
+        let old_ticket = old_snapshot
+            .tickets
+            .iter()
+            .find(|ticket| ticket.ticket_run_id == ticket_run_id)
+            .unwrap();
+        let stale_view_id = old_ticket.rex_view_id.clone().unwrap();
+        assert_eq!(stale_view_id, first_view_id);
         let receipt = backend
             .instruct_coordinator(&ticket_run_id, 0, "Please clarify the acceptance criteria.")
             .unwrap();
@@ -928,6 +970,54 @@ mod tests {
         assert_eq!(payload["body"], "Please clarify the acceptance criteria.");
         assert_eq!(payload["ticket_run_id"], ticket_run_id.as_str());
         assert_eq!(payload["expected_revision"], 0);
+
+        db.execute(
+            "UPDATE rex_views SET lifecycle='closed',closed_at_unix=1 WHERE view_id=?1",
+            [first_view_id.as_str()],
+        )
+        .unwrap();
+        let second_view_id = RexView::derive_id(
+            &project_id,
+            RexViewKind::Ticket,
+            Some(namespace.as_str()),
+            Some(ticket_id.as_str()),
+            2,
+        )
+        .unwrap();
+        let mut control = ConfigStore::open_control(temp.path()).unwrap();
+        control
+            .register_rex_view(
+                generation,
+                &RexView {
+                    view_id: second_view_id.clone(),
+                    project_id: project_id.clone(),
+                    kind: RexViewKind::Ticket,
+                    ticket_namespace: Some(namespace.to_string()),
+                    ticket_id: Some(ticket_id.to_string()),
+                    view_epoch: 2,
+                    rex_server_identity: "fixture-instance".into(),
+                    rex_session_id: "fixture-session".into(),
+                    rex_window_id: "ticket-window-2".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            backend
+                .set_pin(&ticket_run_id, 0, &stale_view_id, true)
+                .unwrap_err()
+                .contains("view changed")
+        );
+        let new_view_pinned: bool = db
+            .query_row(
+                "SELECT pinned FROM rex_views WHERE view_id=?1",
+                [second_view_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !new_view_pinned,
+            "a stale snapshot must not pin the replacement view"
+        );
     }
 
     #[test]
@@ -1048,8 +1138,15 @@ mod tests {
             self.calls.push(format!("focus-ticket:{ticket_run}"));
             Ok(())
         }
-        fn set_pin(&mut self, id: &TicketRunId, revision: u64, pinned: bool) -> Result<(), String> {
-            self.calls.push(format!("pin:{id}:{revision}:{pinned}"));
+        fn set_pin(
+            &mut self,
+            id: &TicketRunId,
+            revision: u64,
+            view_id: &Digest,
+            pinned: bool,
+        ) -> Result<(), String> {
+            self.calls
+                .push(format!("pin:{id}:{revision}:{view_id}:{pinned}"));
             Ok(())
         }
         fn instruct_coordinator(
@@ -1383,7 +1480,11 @@ mod tests {
                     .iter()
                     .any(|c| c == "focus:rex-fixture:session-1:ticket-window:worker-block")
             );
-            assert!(calls.iter().any(|c| c == "pin:tr-1:8:true"));
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == &format!("pin:tr-1:8:{}:true", "a".repeat(64)))
+            );
             assert!(
                 calls
                     .iter()
