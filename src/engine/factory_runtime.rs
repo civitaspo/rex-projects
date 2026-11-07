@@ -2769,6 +2769,179 @@ pub(crate) mod tests {
     use crate::engine::reducer::Phase;
     use sha2::Digest as ShaDigest;
 
+    struct WorkerPublicationFixtureServices {
+        configuration_digest: Digest,
+        published_effect: Option<crate::store::EffectIntent>,
+    }
+
+    impl super::FactoryRuntimeServices for WorkerPublicationFixtureServices {
+        fn process_one_agent_request(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<bool, String> { Ok(false) }
+
+        fn recover_agents(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
+            Ok(crate::agent_recovery::AgentRecoveryReport { examined: 0, observations: Vec::new(), more_pending: false })
+        }
+
+        fn ingest_one_agent_result(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> { Ok(None) }
+
+        fn observe_base_heads(&mut self) -> Result<BTreeMap<crate::domain::ids::RepositoryId, String>, String> { Ok(BTreeMap::new()) }
+
+        fn configuration_digest(&self) -> &Digest { &self.configuration_digest }
+
+        fn read_verified_artifact(
+            &self,
+            _: &crate::store::artifact_registry::VerifiedArtifact,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused by Worker publication fixture".into())
+        }
+
+        fn profile_commit_mode(
+            &self,
+            _: &ProjectId,
+            _: Role,
+        ) -> Result<crate::domain::types::CommitMode, String> { Ok(crate::domain::types::CommitMode::Native) }
+
+        fn worker_publication_effect(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+            _: &Config,
+            run: &crate::store::scheduler::ActiveTicketRun,
+            result: &crate::store::agent_results::IngestedAgentResult,
+            effect_revision: u64,
+        ) -> Result<Option<crate::store::EffectIntent>, String> {
+            let request_json = "{\"evidence_id\":\"fixture\",\"node\":\"node-a\"}".to_owned();
+            let effect = crate::store::EffectIntent {
+                project_id: run.project_id.clone(),
+                subject_type: "ticket_run".into(),
+                subject_id: run.ticket_run_id.as_str().into(),
+                operation_id: format!("publish-{}", result.receipt.evidence_id()),
+                logical_key: format!("{}:publish:node-a", run.ticket_run_id),
+                kind: "publish_implementation".into(),
+                request_digest: format!("{:x}", sha2::Sha256::digest(request_json.as_bytes())),
+                request_json,
+                expected_revision: Some(effect_revision),
+            };
+            self.published_effect = Some(effect.clone());
+            Ok(Some(effect))
+        }
+
+        fn tick_profile_trials(&mut self, _: &mut crate::store::ConfigStore, _: u64, _: i64, _: u32, _: u32) -> Result<(), String> { Ok(()) }
+
+        fn ticket_namespace(&mut self, _: &crate::domain::ids::AdapterId) -> Result<TicketNamespace, String> { TicketNamespace::parse("fixture") }
+
+        fn list_ticket_page(&mut self, _: &super::TicketScanKey, _: Option<&str>, _: usize) -> Result<super::ExternalTicketPage, String> { Ok(super::ExternalTicketPage { tickets: Vec::new(), next_cursor: None }) }
+
+        fn observe_publications(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String> { Ok(crate::runtime_delivery::PublicationMonitorTick::Idle) }
+
+        fn prepare_role_launch(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: &Config,
+            _: &crate::store::scheduler::PendingRoleWakeSession,
+            _: i64,
+        ) -> Result<bool, String> { Ok(false) }
+
+        fn effect_handlers(&self) -> Vec<&dyn crate::effects::EffectHandler> { Vec::new() }
+    }
+
+    #[test]
+    fn host_validated_worker_result_advances_and_persists_publication_before_ack() {
+        use crate::domain::ids::Digest;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use serde_json::json;
+
+        let structured_result = json!({
+            "change_references": [{
+                "repository": "repo-a",
+                "worktree_id": "node-a",
+                "commit_mode": "native",
+                "base_commit": "0000000000000000000000000000000000000000",
+                "previous_head": "1111111111111111111111111111111111111111",
+                "branch_head": "2222222222222222222222222222222222222222",
+                "commit_shas": ["2222222222222222222222222222222222222222"]
+            }],
+            "completed_acceptance_items": ["tests pass"],
+            "unresolved_items": [],
+            "irregularity_references": []
+        });
+        let result_digest = Digest::parse(format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap()))).unwrap();
+        let mut fixture = crate::store::agent_results::host_validation_fixture::host_validated_result(
+            Role::Worker,
+            RoleResultMessage {
+                schema_version: 1,
+                message_id: "worker-message-1".into(),
+                kind: RoleOutputKind::ImplementationReady,
+                assertion: AgentAssertion::Succeeded,
+                structured_result,
+                result_digest,
+                artifact_refs: Vec::new(),
+            },
+        ).unwrap();
+        let config: Config = toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            published_effect: None,
+        };
+
+        assert!(super::apply_agent_result(
+            &mut fixture.store,
+            fixture.owner_generation,
+            10,
+            &config,
+            &mut services,
+            &fixture.ingested,
+        ).unwrap());
+
+        let run = fixture.store.active_ticket_runs(fixture.owner_generation, 1).unwrap().remove(0);
+        assert_eq!(run.phase, Phase::Publishing);
+        assert_eq!(run.revision, 5);
+        let intended = services.published_effect.unwrap();
+        assert_eq!(fixture.store.effect_by_logical_key(&intended.logical_key).unwrap(), Some(intended.clone()));
+        let acknowledgement = crate::store::agent_results::host_validation_fixture::result_ack(
+            &fixture.store,
+            fixture.ingested.receipt.evidence_id(),
+        ).unwrap();
+        assert_eq!(acknowledgement, Some((5, "applied".into())));
+        assert!(fixture.store.pending_validated_agent_results(&fixture.artifacts, fixture.owner_generation, 8).unwrap().is_empty());
+
+        let state_root = fixture._temp.path().to_path_buf();
+        drop(fixture.store);
+        let mut reopened = crate::store::ConfigStore::open_test(&state_root).unwrap();
+        assert_eq!(reopened.active_ticket_runs(fixture.owner_generation, 1).unwrap()[0].phase, Phase::Publishing);
+        assert_eq!(reopened.effect_by_logical_key(&intended.logical_key).unwrap(), Some(intended));
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &reopened,
+                fixture.ingested.receipt.evidence_id(),
+            ).unwrap(),
+            Some((5, "applied".into())),
+        );
+        assert!(reopened.pending_validated_agent_results(&fixture.artifacts, fixture.owner_generation, 8).unwrap().is_empty());
+    }
+
     #[test]
     fn filter_rotation_advances_one_status_at_a_time_and_wraps() {
         let statuses = [

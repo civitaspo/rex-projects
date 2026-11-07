@@ -2265,30 +2265,39 @@ pub(crate) mod host_validation_fixture {
             rex_block_id: Some("fixture-block".into()),
         })?;
         let ticket_run_id = TicketRunId::parse("fixture-ticket-run")?;
-        let initial_phase = if role == Role::Postmortem {
-            "postmortem"
-        } else {
-            "reviewing"
+        let (phase, external_status, ticket_revision) = match role {
+            Role::Postmortem => ("postmortem", "in_progress", 1_u64),
+            Role::Worker => ("implementing", "in_progress", 4_u64),
+            _ => ("reviewing", "in_review", 1_u64),
         };
         store.connection.execute(
-            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision) VALUES (?1,?2,'fixture',?3,?4,'fixture','T-1',1,?5,'running','in_review','in_review',1)",
-            rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), applied.revision.0, config_digest, initial_phase],
+            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision) VALUES (?1,?2,'fixture',?3,?4,'fixture','T-1',1,?5,'running',?6,?6,?7)",
+            rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), applied.revision.0, config_digest, phase, external_status, ticket_revision],
         ).map_err(|error| error.to_string())?;
+        let recipe_id = if role == Role::Worker {
+            Some("fixture-recipe")
+        } else {
+            None
+        };
         store.connection.execute(
-            "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,NULL,0,1)",
-            rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+            "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,?3,1,1)",
+            rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), recipe_id],
         ).map_err(|error| error.to_string())?;
         let agent_run_id = AgentRunId::parse("fixture-agent-run")?;
         let mut authority = crate::store::agent_results::tests::test_authority();
         authority.agent_run_id = agent_run_id.clone();
         authority.project_id = project_id.clone();
         authority.role = role;
-        authority.role_session_id = format!("fixture-{:?}", role).to_lowercase();
+        authority.role_session_id = if role == Role::Worker {
+            "ticket:fixture-ticket-run:worker:node-a".into()
+        } else {
+            format!("fixture-{:?}", role).to_lowercase()
+        };
         let parent_run_id = AgentRunId::parse("fixture-parent-run")?;
         authority.parent_run_id = Some(parent_run_id.clone());
         authority.parent_role = Some(Role::Coordinator);
         authority.ticket_run_id = Some(ticket_run_id.clone());
-        authority.ticket_revision = Some(Revision(1));
+        authority.ticket_revision = Some(Revision(ticket_revision));
         authority.config_revision = applied.revision;
         authority.config_digest = Digest::parse(config_digest.clone())?;
         authority.controller_generation = owner_generation;
@@ -2308,9 +2317,10 @@ pub(crate) mod host_validation_fixture {
         authority.profile_digest =
             digest(&serde_json::to_vec(&profile).map_err(|error| error.to_string())?)?;
         let schema_name = match role {
+            Role::Worker => "worker-v1.json",
             Role::Reviewer => "reviewer-v1.json",
             Role::Postmortem => "postmortem-v1.json",
-            _ => return Err("fixture currently supports Reviewer and Postmortem roles".into()),
+            _ => return Err("fixture currently supports Worker, Reviewer, and Postmortem roles".into()),
         };
         let schema_bytes = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2331,7 +2341,6 @@ pub(crate) mod host_validation_fixture {
             .as_str()
             .unwrap()
             .to_owned();
-        let ticket_revision = 1_u64;
         let now = 1_i64;
         store.connection.execute(
             "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,state,controller_generation) VALUES (?1,?2,'fixture',?3,?4,?5,'fixture-owner',1,?6,?7,?8,?9,'running',?10)",
@@ -2504,14 +2513,14 @@ pub(crate) mod host_validation_fixture {
             effective_permission_mode: "workspace_write".into(),
             conversation_id: None,
             provider_version: Some("fixture-1".into()),
+            provider_process_failure: None,
+            provider_result_failure: None,
             capability_receipt_digest: Some(authority.qualification_receipt_digest.clone()),
             schema_projection: projection,
             launch_pid_hint: Some(pid),
             exit_code: Some(0),
             timed_out: false,
             cancellation_signal: None,
-            provider_process_failure: None,
-            provider_result_failure: None,
             cleanup: CleanupState::Confirmed,
             cleanup_detail: None,
             processes: vec![process],
@@ -2555,5 +2564,19 @@ pub(crate) mod host_validation_fixture {
             terminal,
             ingested,
         })
+    }
+
+    pub(crate) fn result_ack(
+        store: &ConfigStore,
+        evidence_id: &str,
+    ) -> Result<Option<(u64, String)>, String> {
+        store.connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
     }
 }
