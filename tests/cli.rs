@@ -410,6 +410,54 @@ fn controller_once_publishes_local_project_status_then_releases_ownership() {
 }
 
 #[test]
+fn provider_status_is_read_only_and_reports_missing_request_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let apply = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let missing_id = command(&config, &state, &home)
+        .args(["--json", "provider", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(missing_id.status.code(), Some(2));
+    let body: serde_json::Value = serde_json::from_slice(&missing_id.stdout).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--request-id")
+    );
+
+    let missing_request = command(&config, &state, &home)
+        .args([
+            "--json",
+            "provider",
+            "status",
+            "--request-id",
+            "missing-qualification",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(missing_request.status.code(), Some(3));
+    let body: serde_json::Value = serde_json::from_slice(&missing_request.stdout).unwrap();
+    assert_eq!(body["error"]["code"], "not_found");
+    assert_eq!(
+        body["error"]["message"],
+        "provider qualification request `missing-qualification` was not found"
+    );
+    assert!(missing_request.stderr.is_empty());
+}
+
+#[test]
 fn project_start_queues_only_to_the_active_foreground_owner() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);

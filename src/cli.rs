@@ -146,6 +146,11 @@ enum ProviderCommand {
         #[arg(long)]
         request_id: Option<String>,
     },
+    /// Read the durable state of a provider qualification request.
+    Status {
+        #[arg(long)]
+        request_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -924,6 +929,57 @@ fn provider_command(
 ) -> Result<(), CliError> {
     require_human_context()?;
     match command {
+        ProviderCommand::Status { request_id } => {
+            let state_root = selected_state_root(config_path, explicit_state_root)?;
+            let store = ConfigStore::open_control(&state_root).map_err(CliError::unavailable)?;
+            let job = store
+                .provider_qualification_job(&request_id)
+                .map_err(CliError::unavailable)?
+                .ok_or_else(|| {
+                    CliError::not_found(format!(
+                        "provider qualification request `{request_id}` was not found"
+                    ))
+                })?;
+            let report = serde_json::json!({
+                "request_id": job.request.request_id,
+                "request_digest": job.request_digest,
+                "status": job.status,
+                "project_id": job.request.project_id,
+                "role": job.request.role,
+                "profile_id": job.request.profile_id,
+                "profile_digest": job.request.profile_digest,
+                "config_revision": job.request.config_revision,
+                "config_digest": job.request.config_digest,
+                "controller_generation": job.controller_generation,
+                "qualification_receipt_digest": job.evidence_digest,
+                "created_at_unix": job.created_at_unix,
+                "updated_at_unix": job.updated_at_unix,
+            });
+            if json {
+                print_json(&report)
+            } else {
+                println!(
+                    "Provider qualification {}: {:?}",
+                    job.request.request_id, job.status
+                );
+                println!(
+                    "Project: {}  Role: {:?}",
+                    job.request.project_id, job.request.role
+                );
+                println!(
+                    "Profile: {} ({})",
+                    job.request.profile_id, job.request.profile_digest
+                );
+                println!(
+                    "Configuration revision: {} ({})",
+                    job.request.config_revision, job.request.config_digest
+                );
+                if let Some(digest) = job.evidence_digest {
+                    println!("Qualification receipt: {digest}");
+                }
+                Ok(())
+            }
+        }
         ProviderCommand::Qualify {
             project,
             role,
@@ -2177,7 +2233,9 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_executable;
+    use clap::Parser;
+
+    use super::{Cli, Command, ProviderCommand, resolve_executable};
 
     #[test]
     fn doctor_resolves_a_path_with_spaces_without_splitting_it() {
@@ -2194,5 +2252,26 @@ mod tests {
             resolve_executable(executable.to_str().unwrap()).as_deref(),
             Some(canonical.as_path())
         );
+    }
+
+    #[test]
+    fn provider_status_requires_a_request_id_and_parses_as_read_only_command() {
+        let cli = Cli::try_parse_from([
+            "rex-projects",
+            "--json",
+            "provider",
+            "status",
+            "--request-id",
+            "qualification-123",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::Provider {
+                command: ProviderCommand::Status { request_id }
+            } if request_id == "qualification-123"
+        ));
+        assert!(Cli::try_parse_from(["rex-projects", "provider", "status"]).is_err());
     }
 }
