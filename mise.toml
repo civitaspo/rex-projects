@@ -9,6 +9,7 @@
 "aqua:suzuki-shunsuke/pinact" = "5.0.2"
 "github:github/gh-actions-lock" = { version = "v0.4.1", bin = "gh-actions-lock" }
 rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"] }
+lua = "5.1.5"
 
 [tasks.lint]
 run = [
@@ -46,6 +47,11 @@ run = [
   "ast-grep test --skip-snapshot-tests",
   "python3 -m unittest discover -s tests/fixtures/agents -p 'test_*.py'",
   "python3 -m unittest discover -s tests -p 'test_release_assets.py'",
+  "python3 tests/fixtures/rex/bootstrap/verify-link-publication.py",
+  "python3 tests/fixtures/rex/bootstrap/verify-mock-override.py",
+  "lua tests/lua/bootstrap_version_contract.lua",
+  "lua tests/lua/bootstrap_spec.lua",
+  "lua tests/lua/runtime_details_spec.lua",
   "cargo test --workspace --all-features --locked",
 ]
 

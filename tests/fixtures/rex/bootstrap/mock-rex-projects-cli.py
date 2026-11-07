@@ -9,7 +9,9 @@ if sys.argv[1:] != ["version", "--json"]:
 print(json.dumps({
     "name": "rex-projects",
     "version": "0.1.0-dev.fixture",
-    "target": "darwin-aarch64",
-    "protocol_version": 1,
-    "bootstrap_schema": 1,
+    "target": "aarch64-apple-darwin",
+    "cli_protocol": 1,
+    "database_schema": 1,
+    "source_revision": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": False,
 }, sort_keys=True))
