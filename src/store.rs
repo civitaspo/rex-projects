@@ -1532,9 +1532,7 @@ impl ConfigStore {
         if expected_profile != &authority.profile_id {
             return Err("launch profile does not match the effective project role profile".into());
         }
-        let profile_json = canonical_json(profile)?;
-        let profile_digest =
-            Digest::parse(format!("{:x}", Sha256::digest(profile_json.as_bytes())))?;
+        let profile_digest = agent_profile_digest(profile)?;
         if profile_digest != authority.profile_digest {
             return Err("launch profile digest does not match the applied config snapshot".into());
         }
@@ -4879,6 +4877,11 @@ pub(crate) fn canonical_json<T: serde::Serialize>(value: &T) -> Result<String, S
     serde_json::to_string(&value).map_err(|e| e.to_string())
 }
 
+pub(crate) fn agent_profile_digest(profile: &Profile) -> Result<Digest, String> {
+    let profile_json = canonical_json(profile)?;
+    Digest::parse(format!("{:x}", Sha256::digest(profile_json.as_bytes())))
+}
+
 fn now_unix() -> Result<i64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4893,15 +4896,38 @@ mod tests {
 
     use super::{
         AgentLaunchAuthority, ConfigStore, DurableInput, EffectIntent, EffectOutcome,
-        ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, canonical_json,
+        ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, agent_profile_digest,
+        canonical_json,
         content_digest, durable_input_digest, persisted_start_ack,
     };
-    use crate::config::{AppliedConfig, SourceFile, SourceKind};
+    use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
     use crate::engine::reducer::Input;
     use crate::launch::{RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind};
+    use sha2::{Digest as _, Sha256};
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn agent_profile_digest_matches_canonical_profile_representation() {
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "turn_timeout_seconds": 60,
+            "command": ["/bin/codex"],
+            "adapter": "codex",
+            "model": "fixture",
+            "commit_mode": "native"
+        }))
+        .unwrap();
+
+        let canonical = canonical_json(&profile).unwrap();
+        let expected = Digest::parse(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+            .unwrap();
+        let raw = serde_json::to_vec(&profile).unwrap();
+
+        assert_eq!(agent_profile_digest(&profile).unwrap(), expected);
+        let raw_digest = Digest::parse(format!("{:x}", Sha256::digest(raw))).unwrap();
+        assert_ne!(agent_profile_digest(&profile).unwrap(), raw_digest);
+    }
 
     #[test]
     fn start_ack_decoder_treats_empty_pair_as_pending_and_rejects_partial_receipts() {
