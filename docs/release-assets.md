@@ -15,54 +15,59 @@ manifest includes the normalized and Rust targets, the measured runtime floor, s
 clean build flag, parsed `version --json` response, and SHA-256 computed from the executable bytes.
 The CLI protocol and database schema stay inside `version_json` so release metadata remains generic.
 
-After a release has published every required target asset, download that exact version and
-validate/render the Lua pin:
+After csm-ci has published the release, validate the exact Cargo-version tag and refresh the
+Lua pin:
 
 ```sh
-gh release download v0.1.0 --dir /tmp/rex-projects-assets
-python3 scripts/release_assets.py pin \
-  --artifact-root /tmp/rex-projects-assets \
-  --protocol 1 \
-  --check
+python3 scripts/release_assets.py refresh --check
+# After reviewing the proposed diff:
+python3 scripts/release_assets.py refresh --write
 ```
 
-The command reads the version from `Cargo.toml` through `cargo metadata`. It requires exactly the
-four target directories for that version, validates each manifest against the expected target,
-version, protocol, source revision, and database schema, and recomputes every binary digest. All
-four builds must have the same source revision, CLI protocol, and database schema. The command
-does not execute cross-target binaries; native build jobs run each binary's JSON version probe
-before producing its manifest. It accepts the local per-target build layout or csm-ci's flat
-release-download layout. For flat downloads it validates the complete closed asset set, every
-binary `.sha256` sidecar, and the aggregate `SHA256SUMS`. A manifest is build evidence, not a
-substitute for verifying the release builder and its attestation against the expected repository,
-tag, and merge revision.
+`refresh` reads the package version and release repository from `Cargo.toml`, uses only the
+matching stable `v<Cargo version>` release, obtains that tag's commit SHA from GitHub, and
+downloads its assets. It verifies the csm-ci release attestation for every expected binary,
+`.artifact.json`, `.sha256`, and `SHA256SUMS` asset. Verification pins the csm-ci signer workflow
+and release predicate, rejects self-hosted runners, and checks the attested client repository,
+merge SHA, and tag against this repository and the tag commit. GitHub CLI authentication and
+`gh attestation verify` must be available; lookup or verification failures stop the update.
 
-Each `artifact.json` also carries exactly one measured runtime floor: `minimum_os` for macOS,
-read from the executable's `otool -l` deployment load command, or `minimum_libc` for Linux GNU,
-read from the native build runner's `getconf GNU_LIBC_VERSION`. The pin generator copies this
-evidence into the corresponding target entry together with its Rust target triple. Linux GNU
-assets are supported only on glibc 2.39 or newer; the current target profile does not claim
-compatibility with older Linux distributions. The value describes the conservative build-runner
-floor and must be checked against the release builder evidence.
+After attestation checks, `refresh` validates the closed four-target asset set, each parsed
+`version --json` response, runtime evidence, sidecar checksums, aggregate `SHA256SUMS`, matching
+source revisions, and the expected tag commit. It derives the accepted CLI protocol from the
+current Lua runtime pin and writes the new pin only with `--write`. The local `pin` subcommand is
+also available for fixture or downloaded assets; it defaults to the protocol in the current pin
+and accepts `--expected-source-revision` when the caller has verified the release provenance.
+Neither subcommand executes cross-target binaries. Native csm-ci build jobs run `version --json`
+on each just-built binary and store its parsed output in the sidecar.
+
+Each `artifact.json` also carries exactly one measured runtime floor: `minimum_os` for macOS is
+the bare deployment target value from the executable's `otool -l` load command (for example,
+`11.0`), and `minimum_libc` for Linux GNU is `glibc X.Y` from the native build runner's
+`getconf GNU_LIBC_VERSION` (for example, `glibc 2.39`). The pin generator copies this evidence
+into the corresponding target entry together with its Rust target triple. Linux GNU assets are
+supported only on glibc 2.39 or newer; the current target profile does not claim compatibility
+with older Linux distributions. The value describes the conservative build-runner floor and must
+be checked against the release builder evidence.
 
 The default `--check` mode prints a diff and fails when `lua/rex_projects/runtime_version.lua` is
-not the exact output. Once the versioned raw assets have been published and their URLs verified,
-use `--write` to atomically update that file, review the resulting source diff, and submit it as a
-separate change. The generated URLs use the Cargo repository's GitHub release URL and the raw
-asset names `rex-projects-<Rust-target-triple>`. The generated pin embeds the exact version,
-protocol, URL, and recomputed SHA-256; it never uses a latest-version lookup or a downloaded
-checksum sidecar as its trust root. Do not run `--write` from a PR or release job before real
-versioned assets exist.
+not the exact output. `--write` atomically updates that file after the release tag, all asset
+attestations, and all content digests pass. Review the source diff and submit it as a separate
+signed change; the refresh command does not create or merge a PR. Generated URLs use the Cargo
+repository's GitHub release URL and the raw asset names `rex-projects-<Rust-target-triple>`. The
+generated pin embeds the exact version, protocol, URLs, and recomputed SHA-256. It never queries a
+mutable latest version or treats a downloaded checksum sidecar as its trust root.
 
-The csm-ci `cargo-raw` extension for this project must support the four exact targets in
-`scripts/release_assets.py`. Linux GNU builds must run on the supported Ubuntu 24.04 baseline,
+The csm-ci server-side release entry for this repository must use `build_type: cargo-raw`, binary
+`rex-projects`, the four exact Rust targets in `scripts/release_assets.py`, and
+`version_probe_args: [version, --json]`. This creates a target-specific metadata sidecar containing
+the parsed CLI response. The csm-ci-generated release callers stay managed by csm-ci; do not edit
+them in this repository. Linux GNU builds must run on the supported Ubuntu 24.04 baseline,
 validate executable format and GLIBC symbol requirements through 2.39, and retain the runner's
-glibc 2.39 floor as evidence. Keep the four-target matrix; do not substitute a different Linux
-ABI or pin a target that has not been built. The csm-ci-generated release callers stay managed by
-csm-ci and must not be edited in this repository. The release builder must provide the trusted
-merge revision to Cargo builds from source archives so `version --json` reports a full source
-revision; the release job should validate `name`, `version`, `target`, `cli_protocol`, positive
-`database_schema`, `source_revision`, and `dirty=false` for every native artifact.
+glibc floor as evidence. Keep the four-target matrix and do not pin a target that has not been
+built. The release builder provides the trusted merge revision to Cargo builds from source
+archives; the sidecar consumer requires `name`, `version`, `target`, `cli_protocol`, positive
+`database_schema`, `source_revision`, and `dirty=false` in `version_json`.
 
 `build.rs` accepts `CSM_CI_SOURCE_REVISION` and `CSM_CI_SOURCE_CLEAN` only as a pair. The revision
 must be a lowercase 40-character Git SHA. The clean marker must be exactly `true` or `false`; a
