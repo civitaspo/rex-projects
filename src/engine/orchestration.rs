@@ -1,20 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::config::{Config, OperationRecipe, ProjectConfig, SuccessPredicate};
 use crate::domain::ids::{
-    AgentRunId, Digest, OperationId, ProjectId, RepositoryId, Revision, TicketId, TicketNamespace,
-    TicketRunId,
+    AgentRunId, Digest, OperationId, ProfileId, ProjectId, RepositoryId, Revision, TicketId,
+    TicketNamespace, TicketRunId,
 };
+use crate::domain::types::CommitMode;
 use crate::domain::types::{ProjectMode, RecipeStage, Role, TicketStatus};
 use crate::engine::reducer::Input;
 
 /// Stable plan-local identity for a task in a TicketRun DAG.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct WorkNodeId(String);
 
@@ -267,17 +269,12 @@ impl RoleResultBinding {
         let valid_parent = match self.role {
             Role::Supervisor => self.parent_role.is_none(),
             Role::Coordinator => self.parent_role == Some(Role::Supervisor),
-            Role::Planner | Role::Reviewer => matches!(
-                self.parent_role,
-                Some(Role::Coordinator | Role::Planner | Role::Reviewer)
-            ),
-            Role::Worker => matches!(
-                self.parent_role,
-                Some(Role::Coordinator | Role::Planner | Role::Reviewer)
-            ),
-            Role::MergeDecision | Role::Operator | Role::Postmortem => {
-                self.parent_role == Some(Role::Coordinator)
-            }
+            Role::Planner
+            | Role::Worker
+            | Role::Reviewer
+            | Role::MergeDecision
+            | Role::Operator
+            | Role::Postmortem => self.parent_role == Some(Role::Coordinator),
         };
         if !valid_parent {
             return Err("role result binding has an invalid parent role for this run".into());
@@ -288,7 +285,7 @@ impl RoleResultBinding {
 
 /// Local logical identity for a durable role session. It is not an Agent
 /// supplied destination; validation matches it against the host descriptor.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct RoleSessionId(String);
 
@@ -320,7 +317,7 @@ impl RoleSessionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleOutputKind {
     Progress,
@@ -354,7 +351,7 @@ pub enum AgentAssertion {
     Cancelled { reason: Option<String> },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleArtifactKind {
     Plan,
@@ -371,7 +368,7 @@ pub enum RoleArtifactKind {
 /// A pointer into this AgentRun's registered output root. The host artifact
 /// registrar must still open without following links, copy, hash and publish
 /// the same bytes before acknowledging the reference.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleArtifactReference {
     pub kind: RoleArtifactKind,
@@ -379,6 +376,483 @@ pub struct RoleArtifactReference {
     pub path: String,
     pub digest: Digest,
     pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct GitCommitId(String);
+
+impl GitCommitId {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if !matches!(value.len(), 40 | 64)
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("Git commit ID must be a full lowercase SHA-1 or SHA-256 ID".into());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for GitCommitId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+macro_rules! role_payload {
+    ($name:ident { $($field:ident : $type:ty),* $(,)? }) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            $(pub $field: $type,)*
+        }
+    };
+}
+
+role_payload!(ProgressPayload {
+    summary: String,
+    completed_node_keys: Vec<WorkNodeId>,
+    pending_node_keys: Vec<WorkNodeId>,
+    evidence: Vec<RoleArtifactReference>,
+    next_observation_at: Option<String>,
+});
+role_payload!(IrregularityPayload {
+    severity: String,
+    observed_facts: Vec<String>,
+    source_references: Vec<RoleArtifactReference>,
+    affected_node_keys: Vec<WorkNodeId>,
+    requested_pause_scope: String,
+    proposed_options: Vec<String>,
+});
+role_payload!(HumanRequestPayload {
+    kind: String,
+    question: String,
+    choices: Vec<String>,
+    evidence_references: Vec<RoleArtifactReference>,
+    subject_digest: Digest,
+    requested_continuation: Option<String>,
+});
+role_payload!(TicketProposalPayload {
+    goal_revision: u64,
+    gap_key: String,
+    title: String,
+    body: String,
+    acceptance: Vec<String>,
+    priority_rationale: String,
+    parent: Option<TicketId>,
+    dependencies: Vec<TicketId>,
+});
+role_payload!(DispatchRequestPayload {
+    ticket_reference: TicketId,
+    expected_ticket_revision: Revision,
+    coordinator_profile: ProfileId,
+    priority: i32,
+    rationale: String,
+});
+role_payload!(InterventionPayload {
+    coordinator_role_session_id: RoleSessionId,
+    ticket_run_revision: Revision,
+    reason: String,
+    evidence: Vec<RoleArtifactReference>,
+    proposed_plan_change: String,
+});
+role_payload!(SpawnRequestPayload {
+    work_node: WorkNodeId,
+    role: Role,
+    profile_id: ProfileId,
+    plan_digest: Digest,
+    allowed_repositories: Vec<RepositoryId>,
+    artifact_inputs: Vec<RoleArtifactReference>,
+    parent_run_id: Option<AgentRunId>,
+});
+role_payload!(InvestigationRequestPayload {
+    question: String,
+    allowed_repositories: Vec<RepositoryId>,
+    required_evidence: Vec<String>,
+    parent_run_id: Option<AgentRunId>,
+});
+role_payload!(PrepareWorktreesPayload {
+    accepted_plan_digest: Digest,
+    worker_nodes: Vec<WorkNodeId>,
+});
+role_payload!(PlanReadyPayload {
+    plan: WorkPlan,
+    unresolved_questions: Vec<String>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeReference {
+    pub repository: RepositoryId,
+    pub worktree_id: WorkNodeId,
+    pub commit_mode: CommitMode,
+    pub base_commit: GitCommitId,
+    pub previous_head: GitCommitId,
+    pub branch_head: GitCommitId,
+    pub commit_shas: Vec<GitCommitId>,
+}
+
+role_payload!(ImplementationReadyPayload {
+    change_references: Vec<ChangeReference>,
+    completed_acceptance_items: Vec<String>,
+    unresolved_items: Vec<String>,
+    irregularity_references: Vec<RoleArtifactReference>,
+});
+role_payload!(ReviewReadyPayload {
+    subject_kind: String,
+    subject_digest: Digest,
+    findings: Vec<String>,
+    evidence_coverage: Vec<String>,
+    disposition: String,
+    unknowns: Vec<String>,
+});
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskDimension {
+    ChangeImpact,
+    Complexity,
+    VerificationGaps,
+    ReviewUncertainty,
+    OperationalExposure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateOutcome {
+    Pass,
+    Fail,
+    Unknown,
+}
+
+role_payload!(DeterministicGateEvidence {
+    gate_id: String,
+    outcome: GateOutcome,
+    evidence_references: Vec<RoleArtifactReference>,
+});
+
+role_payload!(RiskFactorAssessment {
+    rating: u8,
+    source: String,
+    rationale: String,
+    evidence_references: Vec<RoleArtifactReference>,
+    uncertainty: Option<String>,
+});
+
+role_payload!(MergeAssessmentPayload {
+    pr_references: Vec<String>,
+    subject_digest: Digest,
+    deterministic_gate_evidence: Vec<DeterministicGateEvidence>,
+    ratings: BTreeMap<RiskDimension, RiskFactorAssessment>,
+    confidence: MergeConfidence,
+    rationale: String,
+    disposition: String,
+});
+role_payload!(MergeIntentPayload {
+    assessment_id: String,
+    pr_identities: Vec<String>,
+    policy_digest: Digest,
+    prepared_body_digest: Digest,
+    steps: Vec<String>,
+    post_merge_verification: Vec<String>,
+});
+role_payload!(OperationActionPayload {
+    operation_plan_digest: Digest,
+    node_key: WorkNodeId,
+    action_id: String,
+    parameters: BTreeMap<String, String>,
+    preconditions: Vec<String>,
+    approval_receipt: String,
+});
+role_payload!(OperationResultPayload {
+    node_key: WorkNodeId,
+    outcome: String,
+    remote_receipt: BTreeMap<String, String>,
+    source_commit: GitCommitId,
+    environment: String,
+    evidence_references: Vec<RoleArtifactReference>,
+});
+role_payload!(PostmortemReadyPayload {
+    candidate_publication_manifest: BTreeMap<String, String>,
+    findings: Vec<String>,
+    source_references: Vec<RoleArtifactReference>,
+    unresolved_provenance: Vec<String>,
+});
+role_payload!(LearningDecisionPayload {
+    batch_id: String,
+    batch_digest: Digest,
+    config_revision: Revision,
+    observations: Vec<String>,
+    topic_changes: Vec<String>,
+    checkpoint: BTreeMap<String, String>,
+    improvements: Vec<String>,
+    candidate_change: Option<BTreeMap<String, String>>,
+});
+role_payload!(ProfileTrialResultPayload {
+    candidate_digest: Digest,
+    base_digest: Digest,
+    authorization_receipt: String,
+    run_ids: Vec<AgentRunId>,
+    frozen_inputs: Vec<String>,
+    evidence_references: Vec<RoleArtifactReference>,
+    outcome: String,
+});
+role_payload!(ProfilePromotionProposalPayload {
+    candidate_revision: Revision,
+    efficacy_outcome: String,
+    evidence_references: Vec<RoleArtifactReference>,
+    managed_slot: String,
+    profile_diff: BTreeMap<String, String>,
+    expected_target_digests: BTreeMap<String, Digest>,
+    uncertain_efficacy_exception: Option<BTreeMap<String, String>>,
+});
+
+/// Closed role payloads that can cross the durable evidence boundary. These
+/// represent Agent assertions only; host observations and effects are stored
+/// separately by the controller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoleResultPayload {
+    Progress(ProgressPayload),
+    Irregularity(IrregularityPayload),
+    HumanRequest(HumanRequestPayload),
+    TicketProposal(TicketProposalPayload),
+    DispatchRequest(DispatchRequestPayload),
+    Intervention(InterventionPayload),
+    SpawnRequest(SpawnRequestPayload),
+    InvestigationRequest(InvestigationRequestPayload),
+    PrepareWorktrees(PrepareWorktreesPayload),
+    PlanReady(PlanReadyPayload),
+    ImplementationReady(ImplementationReadyPayload),
+    ReviewReady(ReviewReadyPayload),
+    MergeAssessment(MergeAssessmentPayload),
+    MergeIntent(MergeIntentPayload),
+    OperationAction(OperationActionPayload),
+    OperationResult(OperationResultPayload),
+    PostmortemReady(PostmortemReadyPayload),
+    LearningDecision(LearningDecisionPayload),
+    ProfileTrialResult(ProfileTrialResultPayload),
+    ProfilePromotionProposal(ProfilePromotionProposalPayload),
+}
+
+impl RoleResultPayload {
+    fn parse(kind: RoleOutputKind, value: Value) -> Result<Self, String> {
+        macro_rules! parse_variant {
+            ($type:ty, $variant:ident) => {
+                serde_json::from_value::<$type>(value)
+                    .map(Self::$variant)
+                    .map_err(|error| format!("invalid {:?} payload: {error}", kind))
+            };
+        }
+        match kind {
+            RoleOutputKind::Progress => parse_variant!(ProgressPayload, Progress),
+            RoleOutputKind::Irregularity => parse_variant!(IrregularityPayload, Irregularity),
+            RoleOutputKind::HumanRequest => parse_variant!(HumanRequestPayload, HumanRequest),
+            RoleOutputKind::TicketProposal => parse_variant!(TicketProposalPayload, TicketProposal),
+            RoleOutputKind::DispatchRequest => {
+                parse_variant!(DispatchRequestPayload, DispatchRequest)
+            }
+            RoleOutputKind::Intervention => parse_variant!(InterventionPayload, Intervention),
+            RoleOutputKind::SpawnRequest => parse_variant!(SpawnRequestPayload, SpawnRequest),
+            RoleOutputKind::InvestigationRequest => {
+                parse_variant!(InvestigationRequestPayload, InvestigationRequest)
+            }
+            RoleOutputKind::PrepareWorktrees => {
+                parse_variant!(PrepareWorktreesPayload, PrepareWorktrees)
+            }
+            RoleOutputKind::PlanReady => parse_variant!(PlanReadyPayload, PlanReady),
+            RoleOutputKind::ImplementationReady => {
+                parse_variant!(ImplementationReadyPayload, ImplementationReady)
+            }
+            RoleOutputKind::ReviewReady => parse_variant!(ReviewReadyPayload, ReviewReady),
+            RoleOutputKind::MergeAssessment => {
+                parse_variant!(MergeAssessmentPayload, MergeAssessment)
+            }
+            RoleOutputKind::MergeIntent => parse_variant!(MergeIntentPayload, MergeIntent),
+            RoleOutputKind::OperationAction => {
+                parse_variant!(OperationActionPayload, OperationAction)
+            }
+            RoleOutputKind::OperationResult => {
+                parse_variant!(OperationResultPayload, OperationResult)
+            }
+            RoleOutputKind::PostmortemReady => {
+                parse_variant!(PostmortemReadyPayload, PostmortemReady)
+            }
+            RoleOutputKind::LearningDecision => {
+                parse_variant!(LearningDecisionPayload, LearningDecision)
+            }
+            RoleOutputKind::ProfileTrialResult => {
+                parse_variant!(ProfileTrialResultPayload, ProfileTrialResult)
+            }
+            RoleOutputKind::ProfilePromotionProposal => {
+                parse_variant!(ProfilePromotionProposalPayload, ProfilePromotionProposal)
+            }
+        }
+    }
+
+    pub fn kind(&self) -> RoleOutputKind {
+        match self {
+            Self::Progress(_) => RoleOutputKind::Progress,
+            Self::Irregularity(_) => RoleOutputKind::Irregularity,
+            Self::HumanRequest(_) => RoleOutputKind::HumanRequest,
+            Self::TicketProposal(_) => RoleOutputKind::TicketProposal,
+            Self::DispatchRequest(_) => RoleOutputKind::DispatchRequest,
+            Self::Intervention(_) => RoleOutputKind::Intervention,
+            Self::SpawnRequest(_) => RoleOutputKind::SpawnRequest,
+            Self::InvestigationRequest(_) => RoleOutputKind::InvestigationRequest,
+            Self::PrepareWorktrees(_) => RoleOutputKind::PrepareWorktrees,
+            Self::PlanReady(_) => RoleOutputKind::PlanReady,
+            Self::ImplementationReady(_) => RoleOutputKind::ImplementationReady,
+            Self::ReviewReady(_) => RoleOutputKind::ReviewReady,
+            Self::MergeAssessment(_) => RoleOutputKind::MergeAssessment,
+            Self::MergeIntent(_) => RoleOutputKind::MergeIntent,
+            Self::OperationAction(_) => RoleOutputKind::OperationAction,
+            Self::OperationResult(_) => RoleOutputKind::OperationResult,
+            Self::PostmortemReady(_) => RoleOutputKind::PostmortemReady,
+            Self::LearningDecision(_) => RoleOutputKind::LearningDecision,
+            Self::ProfileTrialResult(_) => RoleOutputKind::ProfileTrialResult,
+            Self::ProfilePromotionProposal(_) => RoleOutputKind::ProfilePromotionProposal,
+        }
+    }
+}
+
+fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
+    match payload {
+        RoleResultPayload::ImplementationReady(result) => {
+            if result.change_references.is_empty() {
+                return Err("implementation-ready result must identify at least one change".into());
+            }
+            let mut work_nodes = BTreeSet::new();
+            for change in &result.change_references {
+                if change.commit_shas.is_empty()
+                    || change.commit_shas.last() != Some(&change.branch_head)
+                    || change.previous_head == change.branch_head
+                    || !work_nodes.insert((&change.repository, &change.worktree_id))
+                {
+                    return Err(
+                        "implementation change must identify a unique work node and exact resulting commit chain".into(),
+                    );
+                }
+            }
+        }
+        RoleResultPayload::MergeAssessment(result)
+            if result.ratings.len() != 5
+                || result.ratings.values().any(|factor| {
+                    factor.rating > 4
+                        || factor.source.trim().is_empty()
+                        || factor.rationale.trim().is_empty()
+                        || factor.evidence_references.is_empty()
+                }) =>
+        {
+            return Err(
+                "merge assessment must provide all five evidenced 0..4 risk factors".into(),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_payload_artifacts(payload: &RoleResultPayload, role: Role) -> Result<(), String> {
+    let mut references = Vec::new();
+    match payload {
+        RoleResultPayload::Progress(value) => references.extend(&value.evidence),
+        RoleResultPayload::Irregularity(value) => references.extend(&value.source_references),
+        RoleResultPayload::HumanRequest(value) => references.extend(&value.evidence_references),
+        RoleResultPayload::SpawnRequest(value) => references.extend(&value.artifact_inputs),
+        RoleResultPayload::ImplementationReady(value) => {
+            references.extend(&value.irregularity_references)
+        }
+        RoleResultPayload::MergeAssessment(value) => {
+            for gate in &value.deterministic_gate_evidence {
+                references.extend(&gate.evidence_references);
+            }
+            for factor in value.ratings.values() {
+                references.extend(&factor.evidence_references);
+            }
+        }
+        RoleResultPayload::OperationResult(value) => references.extend(&value.evidence_references),
+        RoleResultPayload::PostmortemReady(value) => references.extend(&value.source_references),
+        RoleResultPayload::ProfileTrialResult(value) => {
+            references.extend(&value.evidence_references)
+        }
+        RoleResultPayload::ProfilePromotionProposal(value) => {
+            references.extend(&value.evidence_references)
+        }
+        RoleResultPayload::TicketProposal(_)
+        | RoleResultPayload::DispatchRequest(_)
+        | RoleResultPayload::Intervention(_)
+        | RoleResultPayload::InvestigationRequest(_)
+        | RoleResultPayload::PrepareWorktrees(_)
+        | RoleResultPayload::PlanReady(_)
+        | RoleResultPayload::ReviewReady(_)
+        | RoleResultPayload::MergeIntent(_)
+        | RoleResultPayload::OperationAction(_)
+        | RoleResultPayload::LearningDecision(_) => {}
+    }
+    for reference in references {
+        validate_artifact_reference(reference)?;
+        if !role_may_submit_artifact(role, reference.kind) {
+            return Err(format!(
+                "role {role:?} cannot reference artifact kind {:?}",
+                reference.kind
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
+    macro_rules! schema_for_kind {
+        ($type:ty) => {
+            serde_json::to_value(schemars::schema_for!($type))
+                .expect("role payload JsonSchema serializes")
+        };
+    }
+    match kind {
+        RoleOutputKind::Progress => schema_for_kind!(ProgressPayload),
+        RoleOutputKind::Irregularity => schema_for_kind!(IrregularityPayload),
+        RoleOutputKind::HumanRequest => schema_for_kind!(HumanRequestPayload),
+        RoleOutputKind::TicketProposal => schema_for_kind!(TicketProposalPayload),
+        RoleOutputKind::DispatchRequest => schema_for_kind!(DispatchRequestPayload),
+        RoleOutputKind::Intervention => schema_for_kind!(InterventionPayload),
+        RoleOutputKind::SpawnRequest => schema_for_kind!(SpawnRequestPayload),
+        RoleOutputKind::InvestigationRequest => schema_for_kind!(InvestigationRequestPayload),
+        RoleOutputKind::PrepareWorktrees => schema_for_kind!(PrepareWorktreesPayload),
+        RoleOutputKind::PlanReady => schema_for_kind!(PlanReadyPayload),
+        RoleOutputKind::ImplementationReady => schema_for_kind!(ImplementationReadyPayload),
+        RoleOutputKind::ReviewReady => schema_for_kind!(ReviewReadyPayload),
+        RoleOutputKind::MergeAssessment => schema_for_kind!(MergeAssessmentPayload),
+        RoleOutputKind::MergeIntent => schema_for_kind!(MergeIntentPayload),
+        RoleOutputKind::OperationAction => schema_for_kind!(OperationActionPayload),
+        RoleOutputKind::OperationResult => schema_for_kind!(OperationResultPayload),
+        RoleOutputKind::PostmortemReady => schema_for_kind!(PostmortemReadyPayload),
+        RoleOutputKind::LearningDecision => schema_for_kind!(LearningDecisionPayload),
+        RoleOutputKind::ProfileTrialResult => schema_for_kind!(ProfileTrialResultPayload),
+        RoleOutputKind::ProfilePromotionProposal => {
+            schema_for_kind!(ProfilePromotionProposalPayload)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -404,6 +878,7 @@ pub struct ValidatedRoleResult {
     /// hook success, merge completion, or deployment success.
     pub assertion: AgentAssertion,
     pub structured_result: Value,
+    pub typed_payload: RoleResultPayload,
     pub result_digest: Digest,
     pub artifact_refs: Vec<RoleArtifactReference>,
     /// Derived from the verified parent binding, never from Agent content.
@@ -448,6 +923,9 @@ pub fn validate_role_result(
     if actual_digest != submission.result_digest {
         return Err("structured result digest does not match its content".into());
     }
+    let typed_payload =
+        RoleResultPayload::parse(submission.kind, submission.structured_result.clone())?;
+    validate_role_payload(&typed_payload)?;
     if submission.artifact_refs.len() > MAX_ROLE_RESULT_ARTIFACTS
         || serde_json::to_vec(&submission.artifact_refs)
             .map_err(|error| format!("serialize role result artifact references: {error}"))?
@@ -466,6 +944,7 @@ pub fn validate_role_result(
             return Err("role result repeats an artifact path".into());
         }
     }
+    validate_payload_artifacts(&typed_payload, submission.binding.role)?;
     let wake_recipients = result_wake_recipients(&submission.binding, submission.kind);
     Ok(ValidatedRoleResult {
         binding: submission.binding,
@@ -473,6 +952,7 @@ pub fn validate_role_result(
         kind: submission.kind,
         assertion: submission.assertion,
         structured_result: submission.structured_result,
+        typed_payload,
         result_digest: submission.result_digest,
         artifact_refs: submission.artifact_refs,
         wake_recipients,
@@ -802,7 +1282,8 @@ fn recipe_valid_for_project(
     true
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlannedWorkNode {
     pub id: WorkNodeId,
     pub repository: RepositoryId,
@@ -814,21 +1295,23 @@ pub struct PlannedWorkNode {
     pub investigation: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkDependency {
     pub node: WorkNodeId,
     pub kind: WorkDependencyKind,
     pub affected_evidence: BTreeSet<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkDependencyKind {
     GitBase,
     Delivery,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkPlan {
     pub nodes: Vec<PlannedWorkNode>,
     pub requested_investigation_children: usize,
@@ -1474,6 +1957,34 @@ mod tests {
         }
     }
 
+    fn worker_implementation_ready_payload() -> Value {
+        json!({
+            "change_references": [{
+                "repository": "repo-a",
+                "worktree_id": "node-a",
+                "commit_mode": "native",
+                "base_commit": "0000000000000000000000000000000000000000",
+                "previous_head": "1111111111111111111111111111111111111111",
+                "branch_head": "2222222222222222222222222222222222222222",
+                "commit_shas": ["2222222222222222222222222222222222222222"]
+            }],
+            "completed_acceptance_items": [],
+            "unresolved_items": [],
+            "irregularity_references": []
+        })
+    }
+
+    fn worker_irregularity_payload() -> Value {
+        json!({
+            "severity": "high",
+            "observed_facts": ["unexpected state"],
+            "source_references": [],
+            "affected_node_keys": [],
+            "requested_pause_scope": "ticket_run",
+            "proposed_options": ["pause and ask Coordinator"]
+        })
+    }
+
     fn goal_project() -> ProjectConfig {
         ProjectConfig {
             mode: ProjectMode::Goal,
@@ -2089,7 +2600,10 @@ mod tests {
         let binding = worker_result_binding();
         let validated = validate_role_result(
             &binding,
-            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []})),
+            worker_result_submission(
+                RoleOutputKind::ImplementationReady,
+                worker_implementation_ready_payload(),
+            ),
         )
         .unwrap();
         assert_eq!(validated.binding, binding);
@@ -2103,16 +2617,108 @@ mod tests {
             }]
         );
 
-        let mut stale =
-            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        let mut stale = worker_result_submission(
+            RoleOutputKind::ImplementationReady,
+            worker_implementation_ready_payload(),
+        );
         stale.binding.ticket_revision = Some(Revision(3));
         assert!(validate_role_result(&binding, stale).is_err());
     }
 
     #[test]
+    fn implementation_ready_rejects_empty_and_inconsistent_change_payloads() {
+        let binding = worker_result_binding();
+        assert!(
+            validate_role_result(
+                &binding,
+                worker_result_submission(RoleOutputKind::ImplementationReady, json!({})),
+            )
+            .is_err()
+        );
+
+        let mut payload = worker_implementation_ready_payload();
+        payload["change_references"][0]["branch_head"] =
+            json!("3333333333333333333333333333333333333333");
+        assert!(
+            validate_role_result(
+                &binding,
+                worker_result_submission(RoleOutputKind::ImplementationReady, payload),
+            )
+            .is_err()
+        );
+
+        let schema = role_result_payload_schema(RoleOutputKind::ImplementationReady);
+        assert_eq!(schema["additionalProperties"], json!(false));
+        let required: BTreeSet<_> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(required.contains("change_references"));
+        assert!(required.contains("completed_acceptance_items"));
+        assert!(required.contains("unresolved_items"));
+    }
+
+    #[test]
+    fn every_role_output_has_a_bounded_closed_generated_schema() {
+        let kinds = [
+            RoleOutputKind::Progress,
+            RoleOutputKind::Irregularity,
+            RoleOutputKind::HumanRequest,
+            RoleOutputKind::TicketProposal,
+            RoleOutputKind::DispatchRequest,
+            RoleOutputKind::Intervention,
+            RoleOutputKind::SpawnRequest,
+            RoleOutputKind::InvestigationRequest,
+            RoleOutputKind::PrepareWorktrees,
+            RoleOutputKind::PlanReady,
+            RoleOutputKind::ImplementationReady,
+            RoleOutputKind::ReviewReady,
+            RoleOutputKind::MergeAssessment,
+            RoleOutputKind::MergeIntent,
+            RoleOutputKind::OperationAction,
+            RoleOutputKind::OperationResult,
+            RoleOutputKind::PostmortemReady,
+            RoleOutputKind::LearningDecision,
+            RoleOutputKind::ProfileTrialResult,
+            RoleOutputKind::ProfilePromotionProposal,
+        ];
+        for kind in kinds {
+            let schema = role_result_payload_schema(kind);
+            assert_eq!(schema["type"], json!("object"), "{kind:?}");
+            assert_eq!(schema["additionalProperties"], json!(false), "{kind:?}");
+            assert!(
+                !schema["required"].as_array().unwrap().is_empty(),
+                "{kind:?}"
+            );
+            assert!(
+                serde_json::to_vec(&schema).unwrap().len() < 256 * 1024,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_result_cannot_bypass_coordinator_through_planner_or_reviewer_parent() {
+        for parent_role in [Role::Planner, Role::Reviewer] {
+            let mut binding = worker_result_binding();
+            binding.parent_role = Some(parent_role);
+            let mut submission = worker_result_submission(
+                RoleOutputKind::ImplementationReady,
+                worker_implementation_ready_payload(),
+            );
+            submission.binding = binding.clone();
+            assert!(validate_role_result(&binding, submission).is_err());
+        }
+    }
+
+    #[test]
     fn result_assertions_cannot_claim_host_effects_or_choose_a_wake_target() {
-        let submission =
-            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        let submission = worker_result_submission(
+            RoleOutputKind::ImplementationReady,
+            worker_implementation_ready_payload(),
+        );
         let mut value = serde_json::to_value(submission).unwrap();
         value["host_exit_succeeded"] = json!(true);
         value["wake_target"] = json!("supervisor");
@@ -2129,7 +2735,7 @@ mod tests {
         let binding = worker_result_binding();
         let result = validate_role_result(
             &binding,
-            worker_result_submission(RoleOutputKind::Irregularity, json!({"severity": "high"})),
+            worker_result_submission(RoleOutputKind::Irregularity, worker_irregularity_payload()),
         )
         .unwrap();
         let recipients: BTreeSet<_> = result.wake_recipients.into_iter().collect();
@@ -2153,8 +2759,10 @@ mod tests {
     #[test]
     fn result_artifact_path_must_be_safe_and_role_owned() {
         let binding = worker_result_binding();
-        let mut submission =
-            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        let mut submission = worker_result_submission(
+            RoleOutputKind::ImplementationReady,
+            worker_implementation_ready_payload(),
+        );
         submission.artifact_refs.push(RoleArtifactReference {
             kind: RoleArtifactKind::Change,
             schema_version: 1,
@@ -2164,8 +2772,10 @@ mod tests {
         });
         assert!(validate_role_result(&binding, submission).is_err());
 
-        let mut wrong_role_artifact =
-            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        let mut wrong_role_artifact = worker_result_submission(
+            RoleOutputKind::ImplementationReady,
+            worker_implementation_ready_payload(),
+        );
         wrong_role_artifact
             .artifact_refs
             .push(RoleArtifactReference {
