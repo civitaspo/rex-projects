@@ -244,7 +244,7 @@ fn sortable_utc(value: &str) -> bool {
     (1..=month_days).contains(&day)
 }
 
-fn unix_seconds_to_utc(seconds: u64) -> Result<String, LearningError> {
+pub(crate) fn unix_seconds_to_utc(seconds: u64) -> Result<String, LearningError> {
     let days = i64::try_from(seconds / 86_400)
         .map_err(|_| LearningError::Invalid("approval timestamp is out of range".into()))?;
     let day_seconds = seconds % 86_400;
@@ -602,13 +602,13 @@ pub struct ProfilePackage {
     pub(crate) approval: ValidatedHumanApproval,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum ProfilePublicationStatus {
     Published,
     AlreadyPublished,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProfilePublicationReceipt {
     pub profile_path: PathBuf,
     pub profile_manifest_digest: Digest,

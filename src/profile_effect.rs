@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{Digest, OperationId};
+use crate::effects::{
+    EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation, EffectRequest,
+};
 use crate::learning::{ProfilePublicationReceipt, publish_approved_profile_package};
 use crate::store::{ConfigStore, EffectIntent};
 
@@ -16,6 +19,7 @@ pub struct ProfileEffectHandler {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProfileEffectPayload {
     operation_id: OperationId,
     manifest_digest: Digest,
@@ -85,5 +89,22 @@ impl ProfileEffectHandler {
         store
             .profile_publication_receipt(&payload.operation_id)?
             .ok_or_else(|| "profile publication receipt was not persisted".into())
+    }
+}
+
+impl EffectHandler for ProfileEffectHandler {
+    fn kind(&self) -> EffectKind {
+        EffectKind::PublishProfile
+    }
+
+    fn handle(
+        &self,
+        _mode: EffectMode,
+        request: &EffectRequest,
+        context: &mut EffectContext<'_>,
+    ) -> Result<EffectObservation, String> {
+        let receipt = self.execute(context.store, context.owner_generation, &request.intent)?;
+        let receipt = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        Ok(EffectObservation::Applied { receipt })
     }
 }

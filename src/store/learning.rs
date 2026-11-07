@@ -95,8 +95,19 @@ pub struct LearningCandidateRecord {
     pub revision: CandidateRevision,
     pub profile_id: ProfileId,
     pub package_manifest_digest: Digest,
+    /// Canonical JSON encoding of the exact UTF-8 file path/content manifest.
+    pub package_files_json: String,
     pub package_json: String,
     pub expected_pairs: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LearningCandidatePackage {
+    pub revision: CandidateRevision,
+    pub profile_id: ProfileId,
+    pub manifest_digest: Digest,
+    pub files: std::collections::BTreeMap<String, Vec<u8>>,
+    pub evidence: Option<TrialEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -220,6 +231,7 @@ pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
             profile_id TEXT NOT NULL,
             revision_json TEXT NOT NULL CHECK(length(revision_json)<=65536),
             package_manifest_digest TEXT NOT NULL CHECK(length(package_manifest_digest)=64),
+            package_files_json TEXT NOT NULL CHECK(length(package_files_json)<=4194304),
             package_json TEXT NOT NULL CHECK(length(package_json)<=4194304),
             expected_pairs INTEGER NOT NULL CHECK(expected_pairs BETWEEN 5 AND 10),
             status TEXT NOT NULL CHECK(status IN ('proposed','trialing','awaiting_approval','promoted','superseded','expired','rejected')),
@@ -228,6 +240,12 @@ pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
             PRIMARY KEY(project_id,candidate_id,digest)
         );
         CREATE INDEX learning_candidates_slots ON learning_candidates(project_id,role,status,created_at_unix);
+        CREATE TABLE supervisor_learning_schedule (
+            project_id TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+            next_due_at_unix INTEGER NOT NULL,
+            last_run_at_unix INTEGER,
+            last_snapshot_digest TEXT CHECK(last_snapshot_digest IS NULL OR length(last_snapshot_digest)=64)
+        );
         CREATE TABLE learning_trial_pairs (
             project_id TEXT NOT NULL,
             candidate_id TEXT NOT NULL,
@@ -274,6 +292,76 @@ pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
         PRAGMA user_version=10;"
     ).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+/// Refuse databases that claim v10 but do not contain this exact unreleased
+/// learning layout before WAL or other connection PRAGMAs can mutate them.
+pub(crate) fn validate_v10_schema(connection: &Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version != 10 {
+        return Err(format!(
+            "learning layout validation requires schema v10, found v{version}"
+        ));
+    }
+    for (table, expected) in [
+        (
+            "knowledge_publications",
+            &["operation_id", "request_json", "manifest_json"][..],
+        ),
+        (
+            "learning_candidates",
+            &[
+                "package_files_json",
+                "package_manifest_digest",
+                "evidence_json",
+            ][..],
+        ),
+        (
+            "learning_trial_pairs",
+            &["pair_index", "observation_json"][..],
+        ),
+        (
+            "profile_promotions",
+            &[
+                "config_source",
+                "config_file",
+                "approval_subject_digest",
+                "profile_material_digest",
+                "approved_package_json",
+            ][..],
+        ),
+        (
+            "supervisor_learning_schedule",
+            &[
+                "next_due_at_unix",
+                "last_run_at_unix",
+                "last_snapshot_digest",
+            ][..],
+        ),
+    ] {
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .map_err(|e| e.to_string())?;
+        let actual = statement
+            .query_map([table], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if expected.iter().any(|column| !actual.contains(*column)) {
+            let missing = expected
+                .iter()
+                .filter(|column| !actual.contains(**column))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "database claims schema v10 but {table} is missing required columns: {missing}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ConfigStore {
@@ -773,6 +861,50 @@ impl ConfigStore {
         Ok(true)
     }
 
+    /// Reconstruct exact candidate bytes from the immutable bounded manifest.
+    /// The digest is revalidated before host review code can observe them.
+    pub fn learning_candidate_package(
+        &self,
+        project: &ProjectId,
+        candidate_id: &str,
+        candidate_digest: &Digest,
+    ) -> Result<Option<LearningCandidatePackage>, String> {
+        let row: Option<(String, String, String, String, Option<String>)> = self.connection.query_row(
+            "SELECT revision_json,profile_id,package_manifest_digest,package_files_json,evidence_json FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+            params![project.as_str(),candidate_id,candidate_digest.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((revision_json, profile_id, manifest_raw, files_json, evidence_json)) = row else {
+            return Ok(None);
+        };
+        let revision: CandidateRevision = crate::protocol::parse_unique(revision_json.as_bytes())?;
+        let profile_id = ProfileId::parse(profile_id)?;
+        let manifest_digest = Digest::parse(manifest_raw)?;
+        let files: std::collections::BTreeMap<String, Vec<u8>> =
+            crate::protocol::parse_unique(files_json.as_bytes())?;
+        if revision.project_id != *project
+            || revision.candidate_id != candidate_id
+            || revision.digest != *candidate_digest
+            || serde_json::to_string(&files).map_err(|e| e.to_string())? != files_json
+            || crate::learning::manifest_digest(&files).map_err(|e| e.to_string())?
+                != manifest_digest
+        {
+            return Err(
+                "stored candidate files do not match the immutable candidate identity".into(),
+            );
+        }
+        let evidence = evidence_json
+            .map(|json| crate::protocol::parse_unique(json.as_bytes()))
+            .transpose()?;
+        Ok(Some(LearningCandidatePackage {
+            revision,
+            profile_id,
+            manifest_digest,
+            files,
+            evidence,
+        }))
+    }
+
     pub fn register_learning_candidate(
         &mut self,
         generation: u64,
@@ -780,11 +912,20 @@ impl ConfigStore {
     ) -> Result<CandidateRegistration, String> {
         if !(5..=MAX_TRIALS).contains(&record.expected_pairs)
             || record.package_json.len() > MAX_RECORD_BYTES
+            || record.package_files_json.len() > MAX_RECORD_BYTES
             || record.revision.status != CandidateStatus::Proposed
         {
             return Err("candidate package, identity, or trial count exceeds bounds".into());
         }
         verify_digest(&record.package_json, &record.package_manifest_digest)?;
+        let files: std::collections::BTreeMap<String, Vec<u8>> =
+            crate::protocol::parse_unique(record.package_files_json.as_bytes())?;
+        if serde_json::to_string(&files).map_err(|e| e.to_string())? != record.package_files_json
+            || crate::learning::manifest_digest(&files).map_err(|e| e.to_string())?
+                != record.package_manifest_digest
+        {
+            return Err("candidate file bytes do not match their immutable manifest".into());
+        }
         let revision_json = serde_json::to_string(&record.revision).map_err(|e| e.to_string())?;
         let role = serde_json::to_value(record.revision.role)
             .map_err(|e| e.to_string())?
@@ -801,11 +942,12 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, generation)?;
-        let prior:Option<(String,String,String,usize)>=tx.query_row("SELECT revision_json,package_manifest_digest,package_json,expected_pairs FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",params![record.revision.project_id.as_str(),record.revision.candidate_id,record.revision.digest.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
+        let prior:Option<(String,String,String,String,usize)>=tx.query_row("SELECT revision_json,package_manifest_digest,package_files_json,package_json,expected_pairs FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",params![record.revision.project_id.as_str(),record.revision.candidate_id,record.revision.digest.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
         if let Some(found) = prior {
             let expected = (
                 revision_json,
                 record.package_manifest_digest.to_string(),
+                record.package_files_json.clone(),
                 record.package_json.clone(),
                 record.expected_pairs,
             );
@@ -849,7 +991,7 @@ impl ConfigStore {
                 .map_err(|e| e.to_string())?;
             }
         }
-        tx.execute("INSERT INTO learning_candidates(project_id,candidate_id,role,digest,profile_id,revision_json,package_manifest_digest,package_json,expected_pairs,status,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![record.revision.project_id.as_str(),record.revision.candidate_id,role,record.revision.digest.as_str(),record.profile_id.as_str(),revision_json,record.package_manifest_digest.as_str(),record.package_json,record.expected_pairs,status,super::now_unix()?]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO learning_candidates(project_id,candidate_id,role,digest,profile_id,revision_json,package_manifest_digest,package_files_json,package_json,expected_pairs,status,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![record.revision.project_id.as_str(),record.revision.candidate_id,role,record.revision.digest.as_str(),record.profile_id.as_str(),revision_json,record.package_manifest_digest.as_str(),record.package_files_json,record.package_json,record.expected_pairs,status,super::now_unix()?]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(CandidateRegistration::Registered)
     }
@@ -1007,6 +1149,90 @@ impl ConfigStore {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(snapshot)
+    }
+
+    /// At most one due Project per controller tick gets a bounded learning
+    /// snapshot and a durable Supervisor wake. The wake and next due time commit
+    /// together; a crash cannot lose a completed maintenance batch.
+    pub fn queue_due_supervisor_learning(
+        &mut self,
+        generation: u64,
+        configured_projects: &[ProjectId],
+        now_unix: i64,
+        interval_seconds: u64,
+        knowledge_limit: usize,
+    ) -> Result<Option<ProjectId>, String> {
+        if now_unix < 0 || interval_seconds == 0 {
+            return Err("Supervisor learning schedule requires positive bounded timing".into());
+        }
+        let now_utc =
+            crate::learning::unix_seconds_to_utc(now_unix as u64).map_err(|e| e.to_string())?;
+        let mut statement = self.connection.prepare(
+            "SELECT p.project_id,COALESCE(s.next_due_at_unix,0) FROM projects p JOIN project_runtimes r USING(project_id) LEFT JOIN supervisor_learning_schedule s USING(project_id) WHERE p.desired_lifecycle='running' AND r.observed_lifecycle='running' AND r.controller_generation=?1 AND COALESCE(s.next_due_at_unix,0)<=?2 ORDER BY COALESCE(s.next_due_at_unix,0),p.project_id",
+        ).map_err(|e|e.to_string())?;
+        let due_rows = statement
+            .query_map(params![generation, now_unix], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let due_rows = due_rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(statement);
+        let Some((project_raw, scheduled_due)) = due_rows.into_iter().find(|(id, _)| {
+            configured_projects
+                .iter()
+                .any(|project| project.as_str() == id)
+        }) else {
+            return Ok(None);
+        };
+        let project = ProjectId::parse(project_raw)?;
+        let snapshot = self.maintain_project_supervisor_learning(
+            generation,
+            &project,
+            &now_utc,
+            knowledge_limit,
+        )?;
+        let payload_json = serde_json::to_string(&serde_json::json!({
+            "type": "supervisor_learning_maintenance",
+            "maintenance": snapshot,
+        }))
+        .map_err(|e| e.to_string())?;
+        if payload_json.len() > MAX_SUPERVISOR_CONTEXT_BYTES {
+            return Err("Supervisor learning wake exceeds its aggregate byte limit".into());
+        }
+        let digest = Digest::parse(format!("{:x}", Sha256::digest(payload_json.as_bytes())))?;
+        let next_due = now_unix
+            .checked_add(
+                i64::try_from(interval_seconds)
+                    .map_err(|_| "learning interval exceeds supported range")?,
+            )
+            .ok_or("Supervisor learning due time overflow")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let current_due: Option<i64> = tx.query_row(
+            "SELECT COALESCE(next_due_at_unix,0) FROM supervisor_learning_schedule WHERE project_id=?1",
+            [project.as_str()],
+            |row| row.get(0),
+        ).optional().map_err(|e|e.to_string())?;
+        let current_due = current_due.unwrap_or(0);
+        if current_due != scheduled_due {
+            return Err("Supervisor learning schedule advanced during snapshot preparation".into());
+        }
+        let source_id = format!("learning-review:{scheduled_due}");
+        tx.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'learning_maintenance',?3,?4,1,?5,'pending',?6)",
+            params![project.as_str(),format!("project:{}:supervisor",project.as_str()),source_id,scheduled_due,payload_json,now_unix],
+        ).map_err(|e|e.to_string())?;
+        tx.execute(
+            "INSERT INTO supervisor_learning_schedule(project_id,next_due_at_unix,last_run_at_unix,last_snapshot_digest) VALUES (?1,?2,?3,?4) ON CONFLICT(project_id) DO UPDATE SET next_due_at_unix=excluded.next_due_at_unix,last_run_at_unix=excluded.last_run_at_unix,last_snapshot_digest=excluded.last_snapshot_digest",
+            params![project.as_str(),next_due,now_unix,digest.as_str()],
+        ).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(project))
     }
 
     pub fn record_learning_trial(
@@ -1755,6 +1981,7 @@ mod tests {
             "learning_candidates",
             "learning_trial_pairs",
             "profile_promotions",
+            "supervisor_learning_schedule",
         ] {
             let exists: bool = fixture
                 .query_row(
@@ -1765,6 +1992,23 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing {table}");
         }
+        super::validate_v10_schema(&fixture).unwrap();
+    }
+
+    #[test]
+    fn startup_refuses_a_v10_database_with_an_incomplete_learning_layout_without_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
+        drop(connection);
+        let before = fs::read(&database).unwrap();
+        let error = match ConfigStore::open_test(temp.path()) {
+            Ok(_) => panic!("incomplete schema v10 unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.contains("database claims schema v10"));
+        assert_eq!(fs::read(&database).unwrap(), before);
     }
 
     fn test_snapshot() -> AppliedConfig {
@@ -1972,9 +2216,22 @@ mod tests {
     #[test]
     fn candidates_and_trial_pairs_survive_database_round_trips_and_reject_conflicts() {
         let (_temp, mut store, project, generation, _) = running_store();
-        let package_json = r#"{"instructions":"Keep changes focused."}"#.to_owned();
-        let package_digest =
-            Digest::parse(format!("{:x}", Sha256::digest(package_json.as_bytes()))).unwrap();
+        let candidate_files = BTreeMap::from([(
+            "instructions.md".to_owned(),
+            b"Keep changes focused.".to_vec(),
+        )]);
+        let package_files_json = serde_json::to_string(&candidate_files).unwrap();
+        let package_digest = crate::learning::manifest_digest(&candidate_files).unwrap();
+        let manifest_rows: Vec<_> = candidate_files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path,
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+                )
+            })
+            .collect();
+        let package_json = serde_json::to_string(&manifest_rows).unwrap();
         let candidate_digest = Digest::parse("b".repeat(64)).unwrap();
         let record = LearningCandidateRecord {
             revision: CandidateRevision {
@@ -1988,6 +2245,7 @@ mod tests {
             },
             profile_id: ProfileId::parse("worker-profile").unwrap(),
             package_manifest_digest: package_digest,
+            package_files_json,
             package_json,
             expected_pairs: 5,
         };
@@ -2003,6 +2261,11 @@ mod tests {
                 .unwrap(),
             CandidateRegistration::AlreadyRegistered
         );
+        let candidate_package = store
+            .learning_candidate_package(&project, &record.revision.candidate_id, &candidate_digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate_package.files, candidate_files);
         for pair_index in 0usize..5 {
             let observation = TrialObservation {
                 input_digest: Digest::parse(format!(
@@ -2073,6 +2336,67 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_learning_runs_on_durable_per_project_cadence_and_wakes_supervisor() {
+        let (_temp, mut store, project, generation, _) = running_store();
+        store.connection.execute(
+            "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+            rusqlite::params![project.as_str(),generation],
+        ).unwrap();
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    100,
+                    3600,
+                    12
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    101,
+                    3600,
+                    12
+                )
+                .unwrap(),
+            None
+        );
+        let wake: (String,String,String) = store.connection.query_row(
+            "SELECT role_session_id,source_type,payload_json FROM role_wake_inputs WHERE project_id=?1",
+            [project.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(wake.0, format!("project:{}:supervisor", project.as_str()));
+        assert_eq!(wake.1, "learning_maintenance");
+        let payload: serde_json::Value = serde_json::from_str(&wake.2).unwrap();
+        assert_eq!(payload["type"], "supervisor_learning_maintenance");
+        assert_eq!(payload["maintenance"]["project_id"], project.as_str());
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    3700,
+                    3600,
+                    12
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let wake_count: usize = store.connection.query_row(
+            "SELECT count(*) FROM role_wake_inputs WHERE project_id=?1 AND source_type='learning_maintenance'",
+            [project.as_str()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(wake_count, 2);
+    }
+
+    #[test]
     fn approved_inconclusive_profile_publishes_replays_and_activates_after_config_cas() {
         let (temp, mut store, project, generation, _) = running_store();
         let profile_id = ProfileId::parse("worker-learned").unwrap();
@@ -2111,6 +2435,7 @@ mod tests {
             },
             profile_id: profile_id.clone(),
             package_manifest_digest: manifest_digest,
+            package_files_json: serde_json::to_string(&files).unwrap(),
             package_json,
             expected_pairs: 5,
         };
@@ -2145,6 +2470,12 @@ mod tests {
         let evidence = evidence.unwrap();
         assert_eq!(evidence.outcome, TrialOutcome::Inconclusive);
         assert_eq!(evidence.distinct_inputs, 5);
+        let candidate_package = store
+            .learning_candidate_package(&project, candidate_id, &candidate_digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate_package.files, files);
+        assert_eq!(candidate_package.evidence, Some(evidence.clone()));
 
         let declarative_root = temp.path().join("declarative");
         fs::create_dir_all(&declarative_root).unwrap();

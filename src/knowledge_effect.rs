@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::OperationId;
+use crate::effects::{
+    EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation, EffectRequest,
+};
 use crate::knowledge::{PostmortemInput, publish_postmortem};
 use crate::store::{ConfigStore, EffectIntent, KnowledgePublicationReceipt};
 
@@ -67,5 +70,22 @@ impl KnowledgeEffectHandler {
         store
             .knowledge_publication_receipt(&operation_id)?
             .ok_or("knowledge publisher completed without a durable receipt".into())
+    }
+}
+
+impl EffectHandler for KnowledgeEffectHandler {
+    fn kind(&self) -> EffectKind {
+        EffectKind::PublishKnowledge
+    }
+
+    fn handle(
+        &self,
+        _mode: EffectMode,
+        request: &EffectRequest,
+        context: &mut EffectContext<'_>,
+    ) -> Result<EffectObservation, String> {
+        let receipt = self.execute(context.store, context.owner_generation, &request.intent)?;
+        let receipt = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        Ok(EffectObservation::Applied { receipt })
     }
 }

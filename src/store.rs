@@ -29,9 +29,9 @@ pub mod human;
 mod learning_store;
 pub use learning_store::{
     CandidateRegistration, KnowledgePublicationIntent, KnowledgePublicationReceipt,
-    LearningCandidateRecord, ProfilePromotionIntent, ProjectSupervisorMaintenance,
-    StoredApprovedProfilePackage, StoredTrial, SupervisorCandidateEntry, SupervisorKnowledgeEntry,
-    TrialProgress,
+    LearningCandidatePackage, LearningCandidateRecord, ProfilePromotionIntent,
+    ProjectSupervisorMaintenance, StoredApprovedProfilePackage, StoredTrial,
+    SupervisorCandidateEntry, SupervisorKnowledgeEntry, TrialProgress,
 };
 pub mod operations;
 pub mod scheduler;
@@ -446,6 +446,9 @@ impl ConfigStore {
             // development database that already claims this schema version.
             Self::validate_human_v8_schema(&connection)?;
         }
+        if existing_version == 10 {
+            learning_store::validate_v10_schema(&connection)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
@@ -500,6 +503,7 @@ impl ConfigStore {
             }
             learning_store::migrate_v10(&connection)?;
         }
+        learning_store::validate_v10_schema(&connection)?;
         if existing_version < 11 {
             if existing_version > 0 {
                 backup_before_migration(&connection, state_root)?;

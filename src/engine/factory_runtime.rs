@@ -132,6 +132,7 @@ pub struct FactoryTickReport {
     pub ingested_agent_result: bool,
     pub effect: DispatchTick,
     pub role_run_started: bool,
+    pub supervisor_learning_project: Option<ProjectId>,
     pub scanned: Option<TicketScanKey>,
     pub ticket_run_started: Option<TicketRunId>,
 }
@@ -178,6 +179,19 @@ impl FactoryRuntime {
         }
 
         let runnable = store.runnable_projects(owner_generation)?;
+        let configured_projects = config.projects.keys().cloned().collect::<Vec<_>>();
+        let learning_interval = config
+            .learning
+            .review_interval_hours
+            .checked_mul(60 * 60)
+            .ok_or("learning review interval exceeds supported range")?;
+        let supervisor_learning_project = store.queue_due_supervisor_learning(
+            owner_generation,
+            &configured_projects,
+            now_unix,
+            learning_interval,
+            12,
+        )?;
         let keys = build_scan_keys(config, &runnable, services)?;
         if let Some(key) = next_pending_candidate_key(store, &runnable, config, &keys)? {
             if let Some((project_run, disposition)) =
@@ -228,6 +242,7 @@ impl FactoryRuntime {
                     ingested_agent_result,
                     effect,
                     role_run_started,
+                    supervisor_learning_project,
                     scanned: None,
                     ticket_run_started,
                 });
@@ -239,6 +254,7 @@ impl FactoryRuntime {
                 ingested_agent_result,
                 effect,
                 role_run_started,
+                supervisor_learning_project,
                 scanned: None,
                 ticket_run_started: None,
             });
@@ -284,6 +300,7 @@ impl FactoryRuntime {
             ingested_agent_result,
             effect,
             role_run_started,
+            supervisor_learning_project,
             scanned: Some(key),
             ticket_run_started: None,
         })
