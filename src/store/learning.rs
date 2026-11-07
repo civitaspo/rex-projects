@@ -433,6 +433,8 @@ pub(crate) fn validate_v10_schema(connection: &Connection) -> Result<(), String>
 }
 
 impl ConfigStore {
+    /// Resolve the exact immutable profile-trial authorization for a pending human request.
+    /// The table is created by the coordinated v12 learning migration.
     /// Persist the exact bounded trial batch before making its human request visible.
     /// A crash between these writes leaves a harmless pending batch that can be retried.
     pub fn prepare_profile_trial_authorization(
