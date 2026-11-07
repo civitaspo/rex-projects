@@ -816,18 +816,16 @@ mod tests {
     fn applied_config(state_path: &Path) -> AppliedConfig {
         let mut config: Config = toml::from_str(include_str!("../examples/fixture/config.toml"))
             .expect("public fixture configuration parses");
-        let fixture = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/operations/lost_reply_adapter.py"
-        );
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/xtask");
         config.operation_actions.insert(
             "deploy".into(),
             OperationActionConfig::Command {
                 command: vec![
-                    "/usr/bin/python3".into(),
                     fixture.into(),
+                    "fixture".into(),
+                    "operations".into(),
+                    "--state-dir".into(),
                     state_path.to_string_lossy().into_owned(),
-                    "--drop-first-invoke-reply".into(),
                 ],
             },
         );
@@ -917,7 +915,7 @@ mod tests {
         };
         let bundle = operation_review_bundle(&applied, &request).unwrap();
         assert!(bundle.summary.contains(SOURCE_SHA));
-        assert!(bundle.evidence[0].body.contains("lost_reply_adapter.py"));
+        assert!(bundle.evidence[0].body.contains("xtask fixture operations"));
         assert!(
             bundle.evidence[2]
                 .body
