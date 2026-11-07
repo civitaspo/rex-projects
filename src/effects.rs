@@ -4,7 +4,7 @@ use serde::Serialize;
 
 pub use crate::engine::reducer::EffectKind;
 use crate::engine::reducer::effect_name;
-use crate::store::{ClaimedEffect, ConfigStore, EffectIntent, EffectOutcome};
+use crate::store::{ClaimedEffect, ConfigStore, EffectClaimState, EffectIntent, EffectOutcome};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectMode {
@@ -168,25 +168,15 @@ impl EffectDispatcher {
             .map(|kind| effect_name(kind).to_owned())
             .collect::<Vec<_>>();
 
-        if let Some(claimed) = store
-            .claim_due_effect(owner_generation, now_unix, &kind_names)
-            .map_err(EffectDispatchError::Store)?
-        {
-            return Self::run_claim(
-                store,
-                owner_generation,
-                now_unix,
-                handlers,
-                limits,
-                EffectMode::Submit,
-                claimed,
-            );
-        }
         let Some(claimed) = store
-            .claim_uncertain_effect(owner_generation, now_unix, &kind_names)
+            .claim_next_due_effect(owner_generation, now_unix, &kind_names)
             .map_err(EffectDispatchError::Store)?
         else {
             return Ok(DispatchTick::Idle);
+        };
+        let mode = match claimed.state {
+            EffectClaimState::Pending => EffectMode::Submit,
+            EffectClaimState::Uncertain => EffectMode::Reconcile,
         };
         Self::run_claim(
             store,
@@ -194,7 +184,7 @@ impl EffectDispatcher {
             now_unix,
             handlers,
             limits,
-            EffectMode::Reconcile,
+            mode,
             claimed,
         )
     }
@@ -265,7 +255,7 @@ impl EffectDispatcher {
                         &request.intent.operation_id,
                         owner_generation,
                         Some(&receipt),
-                        now_unix.saturating_add(duration_seconds(limits.retry_base)),
+                        now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                     )
                     .map_err(EffectDispatchError::Store)?;
                 Ok(DispatchTick::WaitingForReconciliation {
@@ -278,7 +268,7 @@ impl EffectDispatcher {
                         &request.intent.operation_id,
                         owner_generation,
                         None,
-                        now_unix.saturating_add(duration_seconds(limits.retry_base)),
+                        now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                     )
                     .map_err(EffectDispatchError::Store)?;
                 Ok(DispatchTick::WaitingForReconciliation {
@@ -294,7 +284,8 @@ impl EffectDispatcher {
                             &request.intent.operation_id,
                             owner_generation,
                             Some("{\"error\":\"invalid absence proof\"}"),
-                            now_unix.saturating_add(duration_seconds(limits.retry_base)),
+                            now_unix
+                                .saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                         )
                         .map_err(EffectDispatchError::Store)?;
                     return Err(EffectDispatchError::InvalidAbsenceProof);
@@ -314,8 +305,8 @@ impl EffectDispatcher {
                         operation_id: request.intent.operation_id,
                     });
                 }
-                let next_attempt = now_unix
-                    .saturating_add(duration_seconds(retry_delay(limits, request.attempt_count)));
+                let next_attempt =
+                    now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age)));
                 store
                     .retry_effect_after_absence(
                         &request.intent.operation_id,
@@ -359,8 +350,10 @@ fn proof_matches(proof: &AbsentProof, kind: EffectKind, intent: &EffectIntent) -
         && !proof.evidence.trim().is_empty()
 }
 
-fn retry_delay(limits: EffectLimits, attempt_count: u32) -> Duration {
-    let exponent = attempt_count.saturating_sub(1).min(30);
+fn retry_delay_for_age(limits: EffectLimits, age_secs: u64) -> Duration {
+    let base = limits.retry_base.as_secs();
+    let ratio = age_secs.checked_div(base).unwrap_or(0).max(1);
+    let exponent = (u64::BITS - 1 - ratio.leading_zeros()).min(30);
     let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
     limits
         .retry_base

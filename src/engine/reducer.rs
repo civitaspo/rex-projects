@@ -77,6 +77,10 @@ pub struct EffectIntent {
 #[serde(rename_all = "snake_case")]
 pub enum EffectKind {
     PublishTicketStatus,
+    TicketCreate,
+    TicketDuplicateComment,
+    TicketCancelDuplicate,
+    TicketResolveDuplicate,
     StartSupervisor,
     StartCoordinator,
     PrepareWorktrees,
@@ -287,6 +291,10 @@ pub fn bind_effects(decision: &Decision, ids: &[OperationId]) -> Result<Vec<Effe
 pub const fn effect_name(kind: &EffectKind) -> &'static str {
     match kind {
         EffectKind::PublishTicketStatus => "publish_ticket_status",
+        EffectKind::TicketCreate => "ticket_create",
+        EffectKind::TicketDuplicateComment => "ticket_duplicate_comment",
+        EffectKind::TicketCancelDuplicate => "ticket_cancel_duplicate",
+        EffectKind::TicketResolveDuplicate => "ticket_resolve_duplicate",
         EffectKind::StartSupervisor => "start_supervisor",
         EffectKind::StartCoordinator => "start_coordinator",
         EffectKind::PrepareWorktrees => "prepare_worktrees",
