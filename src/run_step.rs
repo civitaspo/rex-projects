@@ -2832,14 +2832,77 @@ mod tests {
             executable.to_str().unwrap(),
         );
         turn.shutdown_grace = Duration::from_millis(50);
-        let canceller = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(300));
-            super::PENDING_SIGNAL.store(libc::SIGTERM, std::sync::atomic::Ordering::Relaxed);
-        });
-        let mut observer = SystemProcessObserver;
-        let result = run_fixture_turn(&turn, &mut observer).unwrap();
-        canceller.join().unwrap();
+        struct CancelAfterChildObserved {
+            system: SystemProcessObserver,
+            child_pid_path: PathBuf,
+            cancellation_sent: bool,
+        }
 
+        impl ProcessObserver for CancelAfterChildObserved {
+            type Identity = process::ProcessIdentity;
+
+            fn inspect(&mut self) -> Result<Vec<Self::Identity>, String> {
+                let table = self.system.inspect()?;
+                let child_pid = fs::read_to_string(&self.child_pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if !self.cancellation_sent
+                    && child_pid.is_some_and(|pid| table.iter().any(|identity| identity.pid == pid))
+                {
+                    super::PENDING_SIGNAL
+                        .store(libc::SIGTERM, std::sync::atomic::Ordering::Relaxed);
+                    self.cancellation_sent = true;
+                }
+                Ok(table)
+            }
+
+            fn try_wait(
+                &mut self,
+                child: &mut std::process::Child,
+            ) -> std::io::Result<Option<ExitStatus>> {
+                self.system.try_wait(child)
+            }
+
+            fn pid(identity: &Self::Identity) -> u32 {
+                SystemProcessObserver::pid(identity)
+            }
+
+            fn group(identity: &Self::Identity) -> u32 {
+                SystemProcessObserver::group(identity)
+            }
+
+            fn capture_tree(&self, root_pid: u32, table: &[Self::Identity]) -> Vec<Self::Identity> {
+                self.system.capture_tree(root_pid, table)
+            }
+
+            fn matching(
+                &self,
+                observed: &[Self::Identity],
+                current: &[Self::Identity],
+            ) -> Vec<Self::Identity> {
+                self.system.matching(observed, current)
+            }
+
+            fn signal_group_if_observed(
+                &self,
+                group: u32,
+                observed: &[Self::Identity],
+                current: &[Self::Identity],
+                signal: ProcessSignal,
+            ) -> Result<bool, String> {
+                self.system
+                    .signal_group_if_observed(group, observed, current, signal)
+            }
+        }
+
+        let mut observer = CancelAfterChildObserved {
+            system: SystemProcessObserver,
+            child_pid_path: child_pid_path.clone(),
+            cancellation_sent: false,
+        };
+        let result = run_fixture_turn(&turn, &mut observer).unwrap();
+
+        assert!(matches!(result.receipt.outcome, TurnOutcome::Cancelled));
         assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
         let child_pid: u32 = fs::read_to_string(child_pid_path)
             .unwrap()
