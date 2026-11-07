@@ -659,7 +659,10 @@ impl ConfigStore {
             if claimed != 1 {
                 return Err("ready work changed during reservation".into());
             }
-            tx.execute("INSERT INTO execution_slots(pool, slot_index, project_id, owner_kind, owner_id, reservation_epoch, controller_generation, disposition) VALUES (?1, ?2, ?3, 'ready_work', ?4, ?5, ?6, 'launch_pending')", params![pool, slot_index, project, work_key, project_epoch, owner_generation]).map_err(|e| e.to_string())?;
+            let reserved = tx.execute("INSERT INTO execution_slots(pool, slot_index, project_id, owner_kind, owner_id, reservation_epoch, controller_generation, disposition) VALUES (?1, ?2, ?3, 'ready_work', ?4, ?5, ?6, 'launch_pending') ON CONFLICT(pool,slot_index) DO UPDATE SET project_id=excluded.project_id,owner_kind=excluded.owner_kind,owner_id=excluded.owner_id,reservation_epoch=excluded.reservation_epoch,controller_generation=excluded.controller_generation,process_identity_json=NULL,disposition='launch_pending' WHERE execution_slots.disposition='released'", params![pool, slot_index, project, work_key, project_epoch, owner_generation]).map_err(|e| e.to_string())?;
+            if reserved != 1 {
+                return Err("execution slot was concurrently reserved".into());
+            }
             tx.execute("INSERT INTO scheduler_state(singleton,last_project_id,revision) VALUES (1,?1,1) ON CONFLICT(singleton) DO UPDATE SET last_project_id=excluded.last_project_id,revision=scheduler_state.revision+1", [&project]).map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(Some(ReadyWork {
@@ -1627,14 +1630,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        store
-            .release_slot_after_confirmed_exit(
-                generation,
-                "agent",
-                reserved.slot_index,
-                &reserved.work_key,
-            )
-            .unwrap();
         let payload = r#"{"kind":"plan_accepted"}"#;
         let input = DurableInput {
             producer_id: "agent-run-1".into(),
@@ -1747,6 +1742,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(new_generation, generation + 1);
+        store
+            .enqueue_ready(
+                new_generation,
+                &project.id,
+                "payments:ticket-2:coordinator",
+                "ticket",
+                "ticket-2",
+                "coordinator",
+                "agent",
+                10,
+                1,
+                epoch,
+            )
+            .unwrap();
+        assert!(
+            store
+                .reserve_next_ready(new_generation, 1, 1, 1, 1)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .release_slot_after_confirmed_exit(
+                new_generation,
+                "agent",
+                reserved.slot_index,
+                &reserved.work_key,
+            )
+            .unwrap();
+        assert!(
+            store
+                .reserve_next_ready(new_generation, 1, 1, 1, 1)
+                .unwrap()
+                .is_some()
+        );
         let delayed = DurableInput {
             producer_id: "agent-run-1".into(),
             message_id: "late-result".into(),
