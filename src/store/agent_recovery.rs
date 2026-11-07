@@ -354,7 +354,7 @@ impl ConfigStore {
                  JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=r.agent_run_id
                  JOIN agent_launch_authority a ON a.agent_run_id=r.agent_run_id
                  JOIN agent_launch_state l ON l.agent_run_id=r.agent_run_id
-                 WHERE r.project_id=?1 AND r.ticket_run_id=?2 AND r.controller_generation=?3
+                 WHERE r.project_id=?1 AND a.ticket_run_id=?2 AND r.controller_generation=?3
                    AND r.state IN ('unknown','running','launch_pending')
                    AND s.disposition IN ('unknown','live','launch_pending')
                  ORDER BY r.agent_run_id",
@@ -833,6 +833,167 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_owned_runs_payload_is_bound_to_the_explicit_durable_effect() {
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let ticket_run_id = TicketRunId::parse("ticket-run-a").unwrap();
+        let request_json = serde_json::json!({
+            "schema_version": 1,
+            "project_id": project_id.as_str(),
+            "ticket_run_id": ticket_run_id.as_str(),
+        })
+        .to_string();
+        let effect = crate::effects::EffectRequest {
+            intent: crate::store::EffectIntent {
+                project_id: project_id.clone(),
+                subject_type: "ticket_run".into(),
+                subject_id: ticket_run_id.as_str().into(),
+                operation_id: "stop-operation".into(),
+                logical_key: "ticket-run:stop".into(),
+                kind: crate::engine::reducer::effect_name(
+                    &crate::engine::reducer::EffectKind::StopOwnedRuns,
+                )
+                .into(),
+                request_json,
+                request_digest: "a".repeat(64),
+                expected_revision: Some(4),
+            },
+            attempt_count: 1,
+            created_at_unix: 10,
+        };
+        let payload = StopOwnedRunsEffectPayload::from_effect_request(&effect).unwrap();
+        assert_eq!(payload.project_id, project_id);
+        assert_eq!(payload.ticket_run_id, ticket_run_id);
+        assert_eq!(payload.expected_revision, 4);
+
+        let mut stale = effect;
+        stale.intent.kind = "publish_ticket_status".into();
+        assert!(StopOwnedRunsEffectPayload::from_effect_request(&stale).is_err());
+    }
+
+    #[test]
+    fn stop_owned_runs_intent_replays_exact_targets_and_rejects_stale_decisions() {
+        use crate::config::{AppliedConfig, SourceFile, SourceKind};
+        use crate::domain::ids::{TicketId, TicketNamespace};
+        use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
+        use std::collections::BTreeMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let tx = store.connection.transaction().unwrap();
+        migrate_v12_recovery_tables(&tx).unwrap();
+        tx.commit().unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {
+                "kind": "command", "command": ["test"],
+                "status_values": {
+                    "triage":"Triage", "backlog":"Backlog", "ready":"Ready",
+                    "in_progress":"In Progress", "in_review":"In Review",
+                    "done":"Done", "canceled":"Canceled"
+                }
+            }},
+            "projects": {}
+        }))
+        .unwrap();
+        let config_digest = Digest::parse("a".repeat(64)).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &AppliedConfig {
+                    config,
+                    profiles: BTreeMap::new(),
+                    source_root: temp.path().display().to_string(),
+                    source_files: vec![SourceFile {
+                        kind: SourceKind::File,
+                        path: temp.path().join("factory.toml").display().to_string(),
+                        canonical_path: temp.path().join("factory.toml").display().to_string(),
+                        sha256: config_digest.clone(),
+                        bytes: 0,
+                        contents: String::new(),
+                    }],
+                    digest: config_digest.clone(),
+                },
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("project-a").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest,
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: crate::domain::ids::Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "stop-test-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-start".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-fixture.sock".into()),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let ticket_run_id = TicketRunId::parse("ticket-run-a").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &TicketNamespace::parse("github:org/repo").unwrap(),
+                &TicketId::parse("PAY-1").unwrap(),
+                &ticket_run_id,
+                1,
+                "planning",
+                "In Progress",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET activity='paused',revision=4 WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            )
+            .unwrap();
+        let payload = StopOwnedRunsRequest {
+            schema_version: 1,
+            project_id,
+            ticket_run_id,
+            expected_revision: 4,
+        };
+        let operation_id = OperationId::parse("stop-operation").unwrap();
+        let intent = store
+            .prepare_stop_owned_runs_intent(generation, &operation_id, &payload, 10)
+            .unwrap();
+        assert!(intent.targets.is_empty());
+        assert_eq!(
+            store
+                .prepare_stop_owned_runs_intent(generation, &operation_id, &payload, 11)
+                .unwrap(),
+            intent
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET activity='running',revision=5 WHERE ticket_run_id=?1",
+                [payload.ticket_run_id.as_str()],
+            )
+            .unwrap();
+        assert!(store
+            .prepare_stop_owned_runs_intent(generation, &operation_id, &payload, 12)
+            .is_err());
+    }
 
     #[test]
     fn migration_creates_immutable_adoption_evidence_and_observation_cursor() {
