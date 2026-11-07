@@ -21,5 +21,7 @@ pub mod protocol;
 pub mod providers;
 pub mod roles;
 pub mod run_step;
+pub mod run_step_package;
+pub mod run_step_spool;
 pub mod store;
 pub mod worktrees;
