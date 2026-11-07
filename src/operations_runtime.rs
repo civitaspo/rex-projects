@@ -1082,7 +1082,7 @@ mod tests {
 
     const SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    fn applied_config(_state_path: &Path) -> AppliedConfig {
+    fn applied_config(state_path: &Path) -> AppliedConfig {
         let mut config: Config = toml::from_str(include_str!("../examples/fixture/config.toml"))
             .expect("public fixture configuration parses");
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/xtask");
@@ -1129,6 +1129,14 @@ mod tests {
                 not_required_reason: None,
             },
         );
+        config
+            .projects
+            .get_mut(&ProjectId::parse("operations_project").unwrap())
+            .unwrap()
+            .operation_matches = vec![crate::config::OperationMatch {
+            labels_all: vec!["docs".into()],
+            recipe: "rollout".into(),
+        }];
         AppliedConfig {
             config,
             profiles: BTreeMap::new(),
@@ -1184,7 +1192,11 @@ mod tests {
         };
         let bundle = operation_review_bundle(&applied, &request).unwrap();
         assert!(bundle.summary.contains(SOURCE_SHA));
-        assert!(bundle.evidence[0].body.contains("xtask fixture operations"));
+        assert!(
+            bundle.evidence[0]
+                .body
+                .contains("Configured argv (direct execution, no shell)")
+        );
         assert!(
             bundle.evidence[2]
                 .body
@@ -1209,7 +1221,7 @@ mod tests {
         let config_snapshot = store
             .apply_snapshot("factory", &applied, ExpectedRevision::Bootstrap)
             .unwrap();
-        let project_id = ProjectId::parse("operations-project").unwrap();
+        let project_id = ProjectId::parse("operations_project").unwrap();
         let ticket_id = TicketId::parse("ticket-retry").unwrap();
         let ticket_run_id = TicketRunId::parse("run-retry").unwrap();
         let namespace = crate::domain::ids::TicketNamespace::parse("github:org/repo").unwrap();

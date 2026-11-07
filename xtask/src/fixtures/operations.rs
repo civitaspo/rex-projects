@@ -130,7 +130,11 @@ pub fn run(state_dir: &Path) -> Result<(), String> {
             "environment": params["environment"],
             "source_sha": params["source_sha"],
             "observed_at": "2026-01-01T00:00:00Z",
-            "status": "unknown",
+            "status": if params["action_id"] == "fixture_lost_reply" {
+                "succeeded"
+            } else {
+                "unknown"
+            },
             "evidence": [],
             "jobs": {}
         }),
