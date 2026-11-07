@@ -1721,4 +1721,224 @@ mod tests {
                 .is_ok()
         );
     }
+    #[test]
+    fn knowledge_publication_then_completion_effect_publishes_external_done() {
+        use crate::knowledge::PostmortemInput;
+        use crate::knowledge_effect::KnowledgeEffectHandler;
+        use crate::store::EffectOutcome;
+
+        let (temp, mut store, project, owner) = test_store();
+        let namespace = TicketNamespace::parse("fixture:workspace").unwrap();
+        let ticket = TicketId::parse("ticket-knowledge-done").unwrap();
+        let run = TicketRunId::parse("run-knowledge-done").unwrap();
+        store
+            .create_ticket_run(
+                owner,
+                &project,
+                &namespace,
+                &ticket,
+                &run,
+                1,
+                "postmortem",
+                "In Progress",
+            )
+            .unwrap();
+
+        let applied_snapshot = store.load_snapshot("factory").unwrap().unwrap();
+        let applied = applied_snapshot.config;
+        let plan = crate::operations::validate_recipe_value(
+            &applied.config,
+            "not-required",
+            &crate::config::OperationRecipe {
+                roles: BTreeMap::new(),
+                required_stages: Vec::new(),
+                required_evidence: Vec::new(),
+                targets: Vec::new(),
+                not_required_reason: Some("No deployment is required for this ticket.".into()),
+            },
+        )
+        .unwrap();
+        store
+            .operations()
+            .unwrap()
+            .persist_plan(
+                owner,
+                &project,
+                &ticket,
+                &run,
+                Revision(1),
+                applied_snapshot.revision,
+                &applied,
+                &plan,
+                &crate::operations::DeliveryFacts {
+                    merge_commits: BTreeMap::new(),
+                    planned_revisions: BTreeMap::new(),
+                },
+                1,
+            )
+            .unwrap();
+        let operation_receipt = crate::domain::ids::Digest::parse("b".repeat(64)).unwrap();
+        store
+            .operations()
+            .unwrap()
+            .record_postmortem_receipt(owner, &project, &run, &operation_receipt, 9)
+            .unwrap();
+        let postmortem_operation = OperationId::parse("knowledge-done-postmortem").unwrap();
+        let postmortem = PostmortemInput {
+            operation_id: postmortem_operation.clone(),
+            project_id: project.clone(),
+            ticket_run_id: run.clone(),
+            title: "Ticket completion learning".into(),
+            summary: "The bounded operation completed without deployment.".into(),
+            findings: vec!["No deployment was required.".into()],
+            sources: vec![],
+            generated_at: "2026-11-07T00:00:00Z".into(),
+            max_source_bytes: 1024,
+        };
+        let request_json = serde_json::to_string(&postmortem).unwrap();
+        let request_digest = hash(&request_json);
+        let publication_intent = crate::store::KnowledgePublicationIntent {
+            operation_id: postmortem_operation.clone(),
+            project_id: project.clone(),
+            ticket_run_id: run.clone(),
+            request_digest: crate::domain::ids::Digest::parse(request_digest).unwrap(),
+            request_json,
+        };
+        store
+            .prepare_knowledge_publication(owner, &publication_intent)
+            .unwrap();
+        let knowledge_effect = store
+            .claim_next_due_effect(owner, i64::MAX, &["publish_knowledge".into()])
+            .unwrap()
+            .expect("publication intent creates a durable effect");
+        let knowledge_request = EffectRequest {
+            intent: knowledge_effect.intent.clone(),
+            attempt_count: knowledge_effect.attempt_count,
+            created_at_unix: knowledge_effect.created_at_unix,
+        };
+        let mut context = EffectContext {
+            store: &mut store,
+            owner_generation: owner,
+            now_unix: 10,
+        };
+        let knowledge_handler = KnowledgeEffectHandler::new(temp.path().join("knowledge"));
+        let knowledge_observation = knowledge_handler
+            .handle(EffectMode::Submit, &knowledge_request, &mut context)
+            .unwrap();
+        let EffectObservation::Applied { receipt } = knowledge_observation else {
+            panic!("knowledge publication did not return a terminal receipt");
+        };
+        context
+            .store
+            .finish_effect(
+                &knowledge_effect.intent.operation_id,
+                owner,
+                EffectOutcome::Succeeded,
+                Some(&receipt),
+            )
+            .unwrap();
+        let completion_intent = EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: run.as_str().into(),
+            operation_id: "complete-ticket-knowledge-done".into(),
+            logical_key: "complete-ticket-knowledge-done".into(),
+            kind: "complete_ticket".into(),
+            request_json: serde_json::json!({
+                "schema_version":1,
+                "project_id":project.as_str(),
+                "ticket_run_id":run.as_str(),
+                "ticket_run_revision":1
+            })
+            .to_string(),
+            request_digest: String::new(),
+            expected_revision: Some(1),
+        };
+        let mut completion_intent = completion_intent;
+        completion_intent.request_digest = hash(&completion_intent.request_json);
+        let knowledge_published = "{\"kind\":\"knowledge_published\"}";
+        context
+            .store
+            .commit_ticket_transition(
+                owner,
+                &run,
+                Revision(0),
+                &crate::store::DurableInput {
+                    producer_id: "host:test".into(),
+                    message_id: "knowledge-published-done".into(),
+                    content_digest: crate::store::durable_input_digest(
+                        "ticket_run",
+                        knowledge_published,
+                    ),
+                    recipient: "ticket_run".into(),
+                    payload: knowledge_published.into(),
+                },
+                Input::KnowledgePublished,
+                "knowledge publication receipt persisted",
+                "{}",
+                &[completion_intent],
+            )
+            .unwrap();
+        let completion_effect = context
+            .store
+            .claim_next_due_effect(owner, i64::MAX, &["complete_ticket".into()])
+            .unwrap()
+            .expect("completion transition creates a durable effect");
+        let completion_request = EffectRequest {
+            intent: completion_effect.intent.clone(),
+            attempt_count: completion_effect.attempt_count,
+            created_at_unix: completion_effect.created_at_unix,
+        };
+        let completion = CompleteTicketHandler
+            .handle(EffectMode::Submit, &completion_request, &mut context)
+            .unwrap();
+        assert!(matches!(completion, EffectObservation::Applied { .. }));
+        context
+            .store
+            .finish_effect(
+                &completion_effect.intent.operation_id,
+                owner,
+                EffectOutcome::Succeeded,
+                Some("host validated completion receipts"),
+            )
+            .unwrap();
+
+        let status_effect = context
+            .store
+            .claim_next_due_effect(owner, i64::MAX, &["publish_ticket_status".into()])
+            .unwrap()
+            .expect("completion creates an external Done status effect");
+        let status_request = EffectRequest {
+            intent: status_effect.intent.clone(),
+            attempt_count: status_effect.attempt_count,
+            created_at_unix: status_effect.created_at_unix,
+        };
+        let adapter = Arc::new(FakeAdapter::new(
+            scope(),
+            namespace.as_str(),
+            ticket.as_str(),
+            NormalizedTicketStatus::InProgress,
+        ));
+        let status_handler = PublishTicketStatusHandler::new(
+            adapter.clone(),
+            BTreeMap::from([(project.clone(), scope())]),
+        );
+        let status = status_handler
+            .handle(EffectMode::Submit, &status_request, &mut context)
+            .unwrap();
+        assert!(matches!(status, EffectObservation::Applied { .. }));
+        assert_eq!(
+            adapter.ticket.lock().unwrap().status.value,
+            NormalizedTicketStatus::Done
+        );
+        context
+            .store
+            .finish_effect(
+                &status_effect.intent.operation_id,
+                owner,
+                EffectOutcome::Succeeded,
+                Some("external ticket status is Done"),
+            )
+            .unwrap();
+    }
 }
