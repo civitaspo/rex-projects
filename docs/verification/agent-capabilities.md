@@ -24,7 +24,7 @@ The publication guard log is inside the writable fixture workspace and copied in
 
 ## Interruption and abrupt loss
 
-For each provider, the host first observed the wrapper, native provider, and busy tool identities. It sent SIGINT to the still-running wrapper, waited for a structured cleanup receipt, and independently confirmed that every tracked PID/group/start-time identity was absent. Only then did it close the Rex block. Both receipts reported `cancelled=true`, exit 130, and `cleanup_verified=true`; no forced kill was required.
+For each provider, the host first observed the wrapper, native provider, and busy tool identities. It sent SIGINT to the still-running wrapper, waited for a structured cleanup receipt, and independently confirmed that every tracked PID/group/start-time identity was absent. Only then did it close the Rex block. Both receipts reported `cancelled=true`, exit 130, and `cleanup_verified=true`. Both also reported `forced_kill=true`: cleanup escalated beyond the initial SIGINT grace period. This fixture flag records escalation and does not distinguish a successful SIGTERM from a later SIGKILL. The external absence checks establish termination after bounded cleanup, not interruption by SIGINT alone.
 
 Direct block closure is a separate crash path. A busy Codex provider survived after its wrapper's Rex block closed. The host stopped those fixture-owned processes and confirmed absence. The controller must retain capacity and worktree ownership after abrupt block loss until process reconciliation succeeds. Missing blocks and missing receipts are not termination evidence.
 

@@ -124,7 +124,6 @@ def main() -> int:
         if inject_query_failure:
             env["REX_PR0_FIXTURE_PROCESS_TABLE_FAILURE_MARKER"] = str(failure_marker)
         if inject_receipt_failure:
-            failure_marker.touch()
             env["REX_PR0_FIXTURE_RECEIPT_FAILURE_MARKER"] = str(failure_marker)
         with (root / "launcher.stdout").open("wb") as stdout, (root / "launcher.stderr").open("wb") as stderr:
             launcher = subprocess.Popen(
@@ -156,7 +155,19 @@ def main() -> int:
 
                 child_receipt = json.loads(ready_receipt.read_text(encoding="utf-8"))
                 expected_pids = {child_receipt["provider_pid"], child_receipt["tool_child_pid"]}
+                process_receipt = artifacts / "process-tree.json"
+                observation_deadline = time.monotonic() + 5
+                while time.monotonic() < observation_deadline:
+                    if process_receipt.exists():
+                        tree = json.loads(process_receipt.read_text(encoding="utf-8"))
+                        observed = {process["pid"] for process in tree["processes"]}
+                        if expected_pids.issubset(observed):
+                            break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("launcher did not observe both fixture process IDs before cancellation")
                 if inject_receipt_failure:
+                    failure_marker.touch()
                     try:
                         launcher.wait(timeout=8)
                     except subprocess.TimeoutExpired:
@@ -174,17 +185,6 @@ def main() -> int:
                         "known_child_pids": sorted(expected_pids),
                     }))
                     return 0
-                process_receipt = artifacts / "process-tree.json"
-                observation_deadline = time.monotonic() + 5
-                while time.monotonic() < observation_deadline:
-                    if process_receipt.exists():
-                        tree = json.loads(process_receipt.read_text(encoding="utf-8"))
-                        observed = {process["pid"] for process in tree["processes"]}
-                        if expected_pids.issubset(observed):
-                            break
-                    time.sleep(0.1)
-                else:
-                    raise RuntimeError("launcher did not observe both fixture process IDs before cancellation")
                 if inject_query_failure:
                     failure_marker.touch()
                 try:
