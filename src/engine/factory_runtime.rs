@@ -255,6 +255,8 @@ impl FactoryRuntime {
             store,
             owner_generation,
             now_unix,
+            config,
+            services.configuration_digest(),
         )?;
 
         // A result or an already-persisted effect is processed before another

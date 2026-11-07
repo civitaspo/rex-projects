@@ -1,8 +1,9 @@
 //! Apply TicketRun transitions only from receipts persisted by trusted host
 //! effect handlers. This module never consumes Agent assertions.
 
+use crate::config::Config;
 use crate::delivery_runtime::{PrepareWorktreesEffectPayload, PreparedWorktreesEffectReceipt};
-use crate::domain::ids::{OperationId, Revision};
+use crate::domain::ids::{Digest, OperationId, Revision};
 use crate::effects::EffectKind;
 use crate::engine::reducer::{Input, Phase};
 use crate::store::operations::CompletionGate;
@@ -18,6 +19,8 @@ pub fn consume_one_host_transition(
     store: &mut ConfigStore,
     owner_generation: u64,
     now_unix: i64,
+    config: &Config,
+    configuration_digest: &Digest,
 ) -> Result<bool, String> {
     for run in store.active_ticket_runs(owner_generation, MAX_RUNS_PER_TICK)? {
         let receipts = store.list_succeeded_effect_receipts(
@@ -75,6 +78,111 @@ pub fn consume_one_host_transition(
                 )?;
                 return Ok(true);
             }
+        }
+
+        if run.phase == Phase::Publishing {
+            let Some(accepted) =
+                store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
+            else {
+                continue;
+            };
+            if accepted.configuration_digest != *configuration_digest {
+                return Err("accepted work plan belongs to a stale configuration snapshot".into());
+            }
+            let project = config
+                .projects
+                .get(&run.project_id)
+                .ok_or("publishing TicketRun Project is no longer configured")?;
+            let _validated = accepted.validate_for(project, configuration_digest)?;
+            let mut prepared_receipt = None;
+            let mut publication_receipts = Vec::new();
+            for stored in &receipts {
+                let intent = stored.intent();
+                if intent.project_id != run.project_id
+                    || intent.subject_type != "ticket_run"
+                    || intent.subject_id != run.ticket_run_id.as_str()
+                {
+                    continue;
+                }
+                if intent.kind == effect_name(EffectKind::PrepareWorktrees) {
+                    if intent.expected_revision != Some(accepted.accepted_revision) {
+                        continue;
+                    }
+                    let payload: PrepareWorktreesEffectPayload =
+                        decode_canonical(&intent.request_json, &intent.request_digest)?;
+                    if payload.ticket_run_id != run.ticket_run_id
+                        || payload.configuration_digest != accepted.configuration_digest
+                    {
+                        return Err("prepared worktree request does not match accepted plan".into());
+                    }
+                    let receipt: PreparedWorktreesEffectReceipt =
+                        decode_canonical_receipt(stored.receipt_json())?;
+                    validate_prepared_receipt(&payload, &receipt)?;
+                    prepared_receipt = Some(receipt);
+                } else if intent.kind == effect_name(EffectKind::PublishImplementation) {
+                    if intent.expected_revision == Some(run.revision) {
+                        publication_receipts.push(stored.clone());
+                    }
+                }
+            }
+            let Some(prepared_receipt) = prepared_receipt else {
+                continue;
+            };
+            let required_publications = accepted
+                .proposal
+                .nodes
+                .iter()
+                .filter(|node| !node.investigation)
+                .count();
+            if publication_receipts.len() < required_publications {
+                continue;
+            }
+            let proof = crate::delivery_runtime::validate_implementation_publication_receipt(
+                &accepted.proposal,
+                &prepared_receipt,
+                &run.project_id,
+                &config.repositories,
+                &publication_receipts,
+            )?;
+            let receipt_digest = sha256_hex(
+                format!(
+                    "{}:{}",
+                    accepted.plan_digest,
+                    publication_receipts
+                        .iter()
+                        .map(|item| item.intent().operation_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+                .as_bytes(),
+            );
+            let payload_json = serde_json::json!({
+                "schema_version": 1,
+                "kind": "implementation_published",
+                "ticket_run_id": run.ticket_run_id,
+                "source_revision": run.revision,
+                "plan_digest": accepted.plan_digest,
+                "publication_set_digest": receipt_digest,
+            })
+            .to_string();
+            let durable = durable_host_input(
+                &format!(
+                    "implementation-published:{}:{}",
+                    run.ticket_run_id, receipt_digest
+                ),
+                &payload_json,
+            );
+            store.commit_ticket_transition(
+                owner_generation,
+                &run.ticket_run_id,
+                Revision(run.revision),
+                &durable,
+                Input::ImplementationPublished(proof),
+                "host-validated complete implementation publication receipts",
+                &payload_json,
+                &[],
+            )?;
+            return Ok(true);
         }
 
         if run.phase == Phase::Operating
