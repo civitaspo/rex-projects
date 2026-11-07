@@ -229,6 +229,12 @@ pub fn human_present_envelope(
         operation_id: None,
         method: MethodName::new("human.present").expect("static method is valid"),
         project_id: Some(project_id),
+        run_id: None,
+        attempt: None,
+        run_epoch: None,
+        expected_subject_revision: None,
+        role: None,
+        request_type: None,
         params,
     }
 }
@@ -803,6 +809,35 @@ mod tests {
         };
         bundle.title.shrink_to_fit();
         (request, bundle)
+    }
+
+    #[test]
+    fn human_present_envelope_leaves_agent_only_context_empty() {
+        let (request, bundle) = sample();
+        let params = HumanPresentParams {
+            request_id: request.request_id.clone(),
+            kind: request.kind,
+            subject: request.subject.clone(),
+            subject_digest: subject_digest(&request.subject),
+            bundle_digest: request.subject.bundle_digest.clone(),
+            bundle_path: "/private/review.html".into(),
+            summary_markdown: bundle.summary,
+            question: request.question,
+            choices: request.choices,
+            expires_at: request.expires_at,
+            response_command: "rex-projects human respond".into(),
+        };
+        let envelope = human_present_envelope(
+            ProtocolRequestId::new("call-1").unwrap(),
+            request.subject.project_id,
+            params,
+        );
+        assert!(envelope.run_id.is_none());
+        assert!(envelope.attempt.is_none());
+        assert!(envelope.run_epoch.is_none());
+        assert!(envelope.expected_subject_revision.is_none());
+        assert!(envelope.role.is_none());
+        assert!(envelope.request_type.is_none());
     }
 
     #[test]
