@@ -1332,6 +1332,7 @@ mod tests {
             source_revision: 1,
             priority: 10,
             payload_json: serde_json::json!({"kind":"start"}),
+            host_artifacts: vec![],
         };
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,

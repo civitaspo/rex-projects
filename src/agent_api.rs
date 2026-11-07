@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{Digest, ProjectId};
+use crate::domain::ids::{ArtifactId, Digest, ProjectId};
 use crate::engine::orchestration::{RoleArtifactKind, RoleArtifactReference};
 
 const MAX_INBOX_BYTES: usize = 1024 * 1024;
@@ -37,6 +37,57 @@ pub struct AgentWakeItem {
     pub source_revision: u64,
     pub priority: i32,
     pub payload_json: serde_json::Value,
+    /// Host-generated, workspace-relative copies of artifacts named by this wake's
+    /// persisted source result. These locators are included in the wake digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_artifacts: Vec<HostArtifactLocator>,
+}
+
+/// A parent-workspace copy of a host-verified artifact. `path` is always relative
+/// to the Agent workspace; host store paths are never exposed to the Agent.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostArtifactLocator {
+    pub artifact_id: ArtifactId,
+    pub kind: RoleArtifactKind,
+    pub schema_version: u32,
+    pub digest: Digest,
+    pub bytes: u64,
+    pub path: String,
+    pub source_run_id: String,
+    pub source_evidence_id: String,
+    pub source_authority_digest: Digest,
+}
+
+impl HostArtifactLocator {
+    pub fn validate(&self) -> Result<(), String> {
+        let id = self.artifact_id.as_str();
+        if !is_lower_hex_64(id) {
+            return Err("host artifact locator has a malformed artifact ID".into());
+        }
+        let expected = format!(".rex-artifacts/sha256/{}/{}", &id[..2], id);
+        if self.schema_version == 0
+            || self.bytes == 0
+            || self.bytes > 64 * 1024 * 1024
+            || self.path != expected
+            || !is_lower_hex_64(&self.source_evidence_id)
+            || self.source_run_id.trim().is_empty()
+            || self.source_run_id.chars().any(char::is_control)
+        {
+            return Err(
+                "host artifact locator is malformed or outside its workspace namespace".into(),
+            );
+        }
+        crate::domain::ids::AgentRunId::parse(self.source_run_id.clone())?;
+        Ok(())
+    }
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl AgentWakeSnapshot {
@@ -51,6 +102,8 @@ impl AgentWakeSnapshot {
             return Err("Agent inbox snapshot exceeds the 256 item limit".into());
         }
         let mut previous = 0;
+        let mut artifact_count = 0usize;
+        let mut artifact_bytes = 0u64;
         for item in &self.inputs {
             if item.wake_input_id == 0
                 || item.wake_input_id <= previous
@@ -65,6 +118,30 @@ impl AgentWakeSnapshot {
                 );
             }
             previous = item.wake_input_id;
+            if item.host_artifacts.len() > 256 {
+                return Err("Agent inbox item exceeds the 256 artifact limit".into());
+            }
+            artifact_count += item.host_artifacts.len();
+            if !item.host_artifacts.is_empty() && item.source_type != "agent_result" {
+                return Err("host artifact locators must accompany an Agent result wake".into());
+            }
+            let mut seen_artifacts = std::collections::BTreeSet::new();
+            for artifact in &item.host_artifacts {
+                artifact.validate()?;
+                if artifact.source_evidence_id != item.source_id
+                    || !seen_artifacts.insert(artifact.artifact_id.as_str())
+                {
+                    return Err(
+                        "host artifact locator source or identity differs from its wake".into(),
+                    );
+                }
+                artifact_bytes = artifact_bytes
+                    .checked_add(artifact.bytes)
+                    .ok_or("Agent inbox artifact byte count overflow")?;
+            }
+        }
+        if artifact_count > 256 || artifact_bytes > 64 * 1024 * 1024 {
+            return Err("Agent inbox artifacts exceed their 256 reference or 64 MiB limit".into());
         }
         if self.digest != self.content_digest()? {
             return Err("Agent inbox digest does not match its content".into());
@@ -429,5 +506,41 @@ mod tests {
             assert!(validate_relative_path(invalid).is_err(), "{invalid}");
         }
         assert!(validate_relative_path("src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn host_artifact_locator_is_typed_workspace_relative_and_digest_bound() {
+        let locator = HostArtifactLocator {
+            artifact_id: ArtifactId::parse("a".repeat(64)).unwrap(),
+            kind: RoleArtifactKind::Change,
+            schema_version: 1,
+            digest: Digest::parse("b".repeat(64)).unwrap(),
+            bytes: 12,
+            path: format!(".rex-artifacts/sha256/{}/{}", "aa", "a".repeat(64)),
+            source_run_id: "child-run".into(),
+            source_evidence_id: "e".repeat(64),
+            source_authority_digest: Digest::parse("d".repeat(64)).unwrap(),
+        };
+        locator.validate().unwrap();
+        let mut snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role_session_id: "coordinator-session".into(),
+            agent_run_id: "parent-run".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: vec![AgentWakeItem {
+                wake_input_id: 1,
+                source_type: "agent_result".into(),
+                source_id: "e".repeat(64),
+                source_revision: 1,
+                priority: 0,
+                payload_json: serde_json::json!({"kind":"validated_agent_result"}),
+                host_artifacts: vec![locator],
+            }],
+        };
+        snapshot.digest = snapshot.content_digest().unwrap();
+        snapshot.validate().unwrap();
+        snapshot.inputs[0].host_artifacts[0].path = "../../outside".into();
+        assert!(snapshot.validate().is_err());
     }
 }

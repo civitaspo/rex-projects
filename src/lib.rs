@@ -27,6 +27,7 @@ pub mod merge_executor;
 pub mod merge_policy;
 pub mod operations;
 pub mod operations_runtime;
+pub mod parent_artifacts;
 pub mod process;
 pub mod profile_effect;
 pub mod profile_trial_runtime;

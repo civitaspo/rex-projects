@@ -1299,6 +1299,161 @@ mod tests {
             persisted.read_bytes(&reopened_artifact_store).unwrap(),
             b"verified diff\n"
         );
+        let parent_workspace = temp.path().join("parent-workspace");
+        fs::create_dir(&parent_workspace).unwrap();
+        let evidence_id = "e".repeat(64);
+        let staged = crate::parent_artifacts::stage_verified_parent_artifacts(
+            &mut store,
+            &reopened_artifact_store,
+            &authority,
+            &evidence_id,
+            &authority.project_id,
+            authority.config_revision.0,
+            &authority.config_digest,
+            &parent_workspace,
+            &[verified.reference().clone()],
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            fs::read(parent_workspace.join(&staged[0].path)).unwrap(),
+            b"verified diff\n"
+        );
+        assert_eq!(
+            staged,
+            crate::parent_artifacts::stage_verified_parent_artifacts(
+                &mut store,
+                &reopened_artifact_store,
+                &authority,
+                &evidence_id,
+                &authority.project_id,
+                authority.config_revision.0,
+                &authority.config_digest,
+                &parent_workspace,
+                &[verified.reference().clone()],
+            )
+            .unwrap()
+        );
+        let staged_file = parent_workspace.join(&staged[0].path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staged_file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::write(&staged_file, b"changed diff!\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staged_file, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let different_content_error = crate::parent_artifacts::stage_verified_parent_artifacts(
+            &mut store,
+            &reopened_artifact_store,
+            &authority,
+            &evidence_id,
+            &authority.project_id,
+            authority.config_revision.0,
+            &authority.config_digest,
+            &parent_workspace,
+            &[verified.reference().clone()],
+        )
+        .unwrap_err();
+        assert!(
+            different_content_error.contains("different content"),
+            "{different_content_error}"
+        );
+
+        let mut wrong_source = authority.clone();
+        wrong_source.agent_run_id = AgentRunId::parse("other-run").unwrap();
+        assert!(
+            crate::parent_artifacts::stage_verified_parent_artifacts(
+                &mut store,
+                &reopened_artifact_store,
+                &wrong_source,
+                &evidence_id,
+                &authority.project_id,
+                authority.config_revision.0,
+                &authority.config_digest,
+                &parent_workspace,
+                &[verified.reference().clone()],
+            )
+            .is_err()
+        );
+        assert!(
+            crate::parent_artifacts::stage_verified_parent_artifacts(
+                &mut store,
+                &reopened_artifact_store,
+                &authority,
+                &evidence_id,
+                &authority.project_id,
+                authority.config_revision.0 + 1,
+                &authority.config_digest,
+                &parent_workspace,
+                &[verified.reference().clone()],
+            )
+            .is_err()
+        );
+        let mut wrong_reference = verified.reference().clone();
+        wrong_reference.digest = Digest::parse("0".repeat(64)).unwrap();
+        assert!(
+            crate::parent_artifacts::stage_verified_parent_artifacts(
+                &mut store,
+                &reopened_artifact_store,
+                &authority,
+                &evidence_id,
+                &authority.project_id,
+                authority.config_revision.0,
+                &authority.config_digest,
+                &parent_workspace,
+                &[wrong_reference],
+            )
+            .is_err()
+        );
+
+        let mut oversized = verified.reference().clone();
+        oversized.artifact_id = ArtifactId::parse("f".repeat(64)).unwrap();
+        oversized.bytes = 40 * 1024 * 1024;
+        let mut oversized_again = oversized.clone();
+        oversized_again.artifact_id = ArtifactId::parse("0".repeat(64)).unwrap();
+        assert!(
+            crate::parent_artifacts::stage_verified_parent_artifacts(
+                &mut store,
+                &reopened_artifact_store,
+                &authority,
+                &evidence_id,
+                &authority.project_id,
+                authority.config_revision.0,
+                &authority.config_digest,
+                &parent_workspace,
+                &[oversized, oversized_again],
+            )
+            .unwrap_err()
+            .contains("64 MiB")
+        );
+
+        #[cfg(unix)]
+        {
+            let linked_workspace = temp.path().join("linked-parent-workspace");
+            fs::create_dir(&linked_workspace).unwrap();
+            let outside = temp.path().join("outside-artifacts");
+            fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, linked_workspace.join(".rex-artifacts")).unwrap();
+            assert!(
+                crate::parent_artifacts::stage_verified_parent_artifacts(
+                    &mut store,
+                    &reopened_artifact_store,
+                    &authority,
+                    &evidence_id,
+                    &authority.project_id,
+                    authority.config_revision.0,
+                    &authority.config_digest,
+                    &linked_workspace,
+                    &[verified.reference().clone()],
+                )
+                .unwrap_err()
+                .contains("real directory")
+            );
+        }
         let receipt = mailbox.read_receipt("message1", now).unwrap().unwrap();
         let receipt: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
         assert_eq!(

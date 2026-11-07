@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{Digest, ProjectId};
+use crate::domain::ids::{AgentRunId, Digest, ProjectId};
 use crate::domain::types::Role;
 use crate::engine::orchestration::{RoleArtifactKind, RoleArtifactReference};
 

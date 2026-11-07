@@ -1090,23 +1090,23 @@ impl FactoryRuntimeServices for RuntimeServices {
         let control_dir = run_root.join("control");
         create_private_dir(&workspace)?;
         create_private_dir(&control_dir)?;
+        let wake_items = Self::wake_items_with_staged_artifacts(
+            &self.artifacts,
+            store,
+            owner_generation,
+            &candidate.project_id,
+            runnable.record.config_revision.0,
+            &runnable.record.config_digest,
+            &workspace,
+            wake_inputs,
+        )?;
         let wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: candidate.project_id.clone(),
             role_session_id: candidate.role_session_id.clone(),
             agent_run_id: run_id.as_str().to_owned(),
             digest: Digest::parse("0".repeat(64))?,
-            inputs: wake_inputs
-                .into_iter()
-                .map(|input| crate::agent_api::AgentWakeItem {
-                    wake_input_id: input.wake_input_id,
-                    source_type: input.source_type,
-                    source_id: input.source_id,
-                    source_revision: input.source_revision,
-                    priority: input.priority,
-                    payload_json: input.payload_json,
-                })
-                .collect(),
+            inputs: wake_items,
         };
         let mut wake_snapshot = wake_snapshot;
         wake_snapshot.digest = wake_snapshot.content_digest()?;
@@ -1205,6 +1205,92 @@ impl FactoryRuntimeServices for RuntimeServices {
 }
 
 impl RuntimeServices {
+    #[allow(clippy::too_many_arguments)]
+    fn wake_items_with_staged_artifacts(
+        artifact_store: &ArtifactStore,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        project_id: &crate::domain::ids::ProjectId,
+        config_revision: u64,
+        config_digest: &Digest,
+        workspace: &Path,
+        wake_inputs: Vec<crate::store::agent_runtime::PendingRoleWakeInput>,
+    ) -> Result<Vec<crate::agent_api::AgentWakeItem>, String> {
+        let mut items = Vec::with_capacity(wake_inputs.len());
+        for input in wake_inputs {
+            let mut host_artifacts = Vec::new();
+            if input.source_type == "agent_result" {
+                let wake_id = i64::try_from(input.wake_input_id)
+                    .map_err(|_| "Agent result wake ID exceeds the durable SQLite identity")?;
+                let result = store
+                    .validated_agent_result_for_wake(artifact_store, owner_generation, wake_id)?
+                    .ok_or_else(|| {
+                        format!(
+                            "cannot launch parent for wake {}: its durable Agent result source is missing or no longer pending",
+                            input.wake_input_id
+                        )
+                    })?;
+                if !result.receipt.wake_input_ids().contains(&wake_id)
+                    || result.receipt.evidence_id() != input.source_id
+                    || result.validated.binding.project_id != *project_id
+                {
+                    return Err(format!(
+                        "cannot launch parent for wake {}: validated source result does not match the wake scope",
+                        input.wake_input_id
+                    ));
+                }
+                let source_run_id = result.validated.binding.agent_run_id.clone();
+                let source_authority = store.agent_launch_authority(&source_run_id)?.ok_or_else(
+                    || {
+                        format!(
+                            "cannot launch parent for wake {}: child AgentRun authority is missing",
+                            input.wake_input_id
+                        )
+                    },
+                )?;
+                if source_authority.role_session_id
+                    != result.validated.binding.role_session_id.as_str()
+                    || source_authority.project_id != *project_id
+                    || source_authority.run_epoch != input.source_revision
+                {
+                    return Err(format!(
+                        "cannot launch parent for wake {}: child result no longer matches launch authority",
+                        input.wake_input_id
+                    ));
+                }
+                if !result.validated.claimed_artifact_refs.is_empty() {
+                    host_artifacts = crate::parent_artifacts::stage_verified_parent_artifacts(
+                        store,
+                        artifact_store,
+                        &source_authority,
+                        result.receipt.evidence_id(),
+                        project_id,
+                        config_revision,
+                        config_digest,
+                        workspace,
+                        &result.validated.claimed_artifact_refs,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "cannot launch parent for wake {} because a child artifact could not be staged: {error}",
+                            input.wake_input_id
+                        )
+                    })?;
+                }
+            }
+            items.push(crate::agent_api::AgentWakeItem {
+                wake_input_id: input.wake_input_id,
+                source_type: input.source_type,
+                source_id: input.source_id,
+                source_revision: input.source_revision,
+                priority: input.priority,
+                payload_json: input.payload_json,
+                host_artifacts,
+            });
+        }
+        Ok(items)
+    }
+
     fn prepare_ticket_role_launch(
         &mut self,
         store: &mut ConfigStore,
@@ -1490,23 +1576,23 @@ impl RuntimeServices {
             create_private_dir(&workspace)?;
         }
         create_private_dir(&control_dir)?;
+        let wake_items = Self::wake_items_with_staged_artifacts(
+            &self.artifacts,
+            store,
+            self.owner_generation,
+            &candidate.project_id,
+            runnable.record.config_revision.0,
+            &runnable.record.config_digest,
+            &workspace,
+            wake_inputs,
+        )?;
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: candidate.project_id.clone(),
             role_session_id: candidate.role_session_id.clone(),
             agent_run_id: agent_run_id.as_str().to_owned(),
             digest: Digest::parse("0".repeat(64))?,
-            inputs: wake_inputs
-                .into_iter()
-                .map(|input| crate::agent_api::AgentWakeItem {
-                    wake_input_id: input.wake_input_id,
-                    source_type: input.source_type,
-                    source_id: input.source_id,
-                    source_revision: input.source_revision,
-                    priority: input.priority,
-                    payload_json: input.payload_json,
-                })
-                .collect(),
+            inputs: wake_items,
         };
         wake_snapshot.digest = wake_snapshot.content_digest()?;
         let capacity = u32::try_from(self.config.runtime.max_agent_runs)
