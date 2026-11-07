@@ -1,0 +1,7 @@
+adapter = "codex"
+command = ["/absolute/path/to/codex"]
+model = "configured-supported-model"
+
+[options]
+sandbox = "workspace_write"
+approval = "never"

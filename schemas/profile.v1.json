@@ -1,0 +1,212 @@
+{
+  "$defs": {
+    "AgentAdapter": {
+      "enum": [
+        "codex",
+        "claude_code"
+      ],
+      "type": "string"
+    },
+    "ClaudeCodeOptions": {
+      "additionalProperties": false,
+      "properties": {
+        "permission_mode": {
+          "$ref": "#/$defs/ClaudePermissionMode",
+          "default": "auto"
+        },
+        "permission_prompts": {
+          "$ref": "#/$defs/ClaudePermissionPrompts",
+          "default": "none"
+        }
+      },
+      "type": "object"
+    },
+    "ClaudePermissionMode": {
+      "enum": [
+        "auto"
+      ],
+      "type": "string"
+    },
+    "ClaudePermissionPrompts": {
+      "enum": [
+        "none"
+      ],
+      "type": "string"
+    },
+    "CodexApproval": {
+      "enum": [
+        "never"
+      ],
+      "type": "string"
+    },
+    "CodexOptions": {
+      "additionalProperties": false,
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/CodexApproval",
+          "default": "never"
+        },
+        "approve_for_me": {
+          "default": false,
+          "type": "boolean"
+        },
+        "sandbox": {
+          "$ref": "#/$defs/CodexSandbox",
+          "default": "workspace_write"
+        }
+      },
+      "type": "object"
+    },
+    "CodexSandbox": {
+      "enum": [
+        "workspace_write"
+      ],
+      "type": "string"
+    },
+    "CommitMode": {
+      "enum": [
+        "auto",
+        "native",
+        "host"
+      ],
+      "type": "string"
+    },
+    "LearnedGuidance": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "repository_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        }
+      },
+      "required": [
+        "file",
+        "project_id",
+        "role",
+        "repository_ids"
+      ],
+      "type": "object"
+    },
+    "ProfileOptions": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CodexOptions"
+        },
+        {
+          "$ref": "#/$defs/ClaudeCodeOptions"
+        }
+      ]
+    },
+    "Role": {
+      "enum": [
+        "supervisor",
+        "coordinator",
+        "planner",
+        "worker",
+        "reviewer",
+        "merge_decision",
+        "operator",
+        "postmortem"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "adapter": {
+      "$ref": "#/$defs/AgentAdapter"
+    },
+    "command": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "commit_mode": {
+      "$ref": "#/$defs/CommitMode",
+      "default": "auto"
+    },
+    "description": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "effort": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "instruction_files": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "learned_guidance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LearnedGuidance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "model": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "options": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProfileOptions"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "skill_paths": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "turn_timeout_seconds": {
+      "default": 1800,
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "adapter",
+    "command"
+  ],
+  "title": "Profile",
+  "type": "object"
+}

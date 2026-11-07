@@ -1,0 +1,7 @@
+adapter = "claude_code"
+command = ["/absolute/path/to/claude"]
+model = "configured-supported-model"
+
+[options]
+permission_mode = "auto"
+permission_prompts = "none"
