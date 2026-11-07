@@ -431,6 +431,40 @@ pub trait TicketAdapter: Send + Sync {
     ) -> Result<OperationLookup, TicketAdapterError>;
 }
 
+/// Construct the configured normalized ticket adapter. The provider CLI owns its own
+/// authentication; this factory only forwards names explicitly allowlisted in runtime config.
+pub fn build_ticket_adapter(
+    config: &crate::config::Config,
+    environment_snapshot: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+) -> Result<Box<dyn TicketAdapter>, TicketAdapterError> {
+    let adapter = &config.adapters.tickets;
+    let shutdown_grace = Duration::from_secs(config.runtime.shutdown_grace_seconds);
+    match adapter.kind.as_str() {
+        "command" => Ok(Box::new(TicketCommandAdapter::new_discovering_namespace(
+            &adapter.command,
+            environment_snapshot,
+            &adapter.environment_allow,
+            cwd,
+            Duration::from_secs(
+                adapter
+                    .read_timeout_seconds
+                    .max(adapter.write_timeout_seconds),
+            ),
+            shutdown_grace,
+        )?)),
+        "linear_cli" => Ok(Box::new(super::linear_cli::LinearCliAdapter::new(
+            adapter,
+            environment_snapshot,
+            cwd,
+            shutdown_grace,
+        )?)),
+        _ => Err(TicketAdapterError::Invalid(
+            "unsupported ticket adapter kind".into(),
+        )),
+    }
+}
+
 impl TicketCommandAdapter {
     pub fn new(
         command: &[String],
@@ -1123,6 +1157,79 @@ fn receipt_ticket_id(receipt: &Value) -> Option<&str> {
 
 use std::ffi::OsStr;
 
+impl TicketAdapter for TicketCommandAdapter {
+    fn describe(&self, request_id: RequestId) -> Result<AdapterDescription, TicketAdapterError> {
+        TicketCommandAdapter::describe(self, request_id)
+    }
+
+    fn list(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        query: TicketListRequest,
+    ) -> Result<TicketPage, TicketAdapterError> {
+        TicketCommandAdapter::list(self, request_id, project_id, query)
+    }
+
+    fn get(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        query: TicketGetRequest,
+    ) -> Result<TicketGetResult, TicketAdapterError> {
+        TicketCommandAdapter::get(self, request_id, project_id, query)
+    }
+
+    fn create(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketCreateRequest,
+    ) -> Result<ScopedTicketResult, TicketAdapterError> {
+        TicketCommandAdapter::create(self, request_id, operation_id, project_id, input)
+    }
+
+    fn update(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketUpdateRequest,
+    ) -> Result<ScopedTicketResult, TicketAdapterError> {
+        TicketCommandAdapter::update(self, request_id, operation_id, project_id, input)
+    }
+
+    fn comment(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketCommentRequest,
+    ) -> Result<CommentResult, TicketAdapterError> {
+        TicketCommandAdapter::comment(self, request_id, operation_id, project_id, input)
+    }
+
+    fn resolve_duplicate(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: DuplicateResolutionRequest,
+    ) -> Result<DuplicateResolutionResult, TicketAdapterError> {
+        TicketCommandAdapter::resolve_duplicate(self, request_id, operation_id, project_id, input)
+    }
+
+    fn find_operation(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        input: OperationFindRequest,
+    ) -> Result<OperationLookup, TicketAdapterError> {
+        TicketCommandAdapter::find_operation(self, request_id, project_id, input)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1657,78 +1764,5 @@ sys.stdout.write(json.dumps(response, separators=(",", ":")))
             page_size,
             updated_since: None,
         }
-    }
-}
-
-impl TicketAdapter for TicketCommandAdapter {
-    fn describe(&self, request_id: RequestId) -> Result<AdapterDescription, TicketAdapterError> {
-        TicketCommandAdapter::describe(self, request_id)
-    }
-
-    fn list(
-        &self,
-        request_id: RequestId,
-        project_id: Option<ProjectId>,
-        query: TicketListRequest,
-    ) -> Result<TicketPage, TicketAdapterError> {
-        TicketCommandAdapter::list(self, request_id, project_id, query)
-    }
-
-    fn get(
-        &self,
-        request_id: RequestId,
-        project_id: Option<ProjectId>,
-        query: TicketGetRequest,
-    ) -> Result<TicketGetResult, TicketAdapterError> {
-        TicketCommandAdapter::get(self, request_id, project_id, query)
-    }
-
-    fn create(
-        &self,
-        request_id: RequestId,
-        operation_id: OperationId,
-        project_id: Option<ProjectId>,
-        input: TicketCreateRequest,
-    ) -> Result<ScopedTicketResult, TicketAdapterError> {
-        TicketCommandAdapter::create(self, request_id, operation_id, project_id, input)
-    }
-
-    fn update(
-        &self,
-        request_id: RequestId,
-        operation_id: OperationId,
-        project_id: Option<ProjectId>,
-        input: TicketUpdateRequest,
-    ) -> Result<ScopedTicketResult, TicketAdapterError> {
-        TicketCommandAdapter::update(self, request_id, operation_id, project_id, input)
-    }
-
-    fn comment(
-        &self,
-        request_id: RequestId,
-        operation_id: OperationId,
-        project_id: Option<ProjectId>,
-        input: TicketCommentRequest,
-    ) -> Result<CommentResult, TicketAdapterError> {
-        TicketCommandAdapter::comment(self, request_id, operation_id, project_id, input)
-    }
-
-    fn resolve_duplicate(
-        &self,
-        request_id: RequestId,
-        operation_id: OperationId,
-        project_id: Option<ProjectId>,
-        input: DuplicateResolutionRequest,
-    ) -> Result<DuplicateResolutionResult, TicketAdapterError> {
-        TicketCommandAdapter::resolve_duplicate(self, request_id, operation_id, project_id, input)
-    }
-
-    fn find_operation(
-        &self,
-        request_id: RequestId,
-        project_id: Option<ProjectId>,
-        input: OperationFindRequest,
-    ) -> Result<OperationLookup, TicketAdapterError> {
-        TicketCommandAdapter::find_operation(self, request_id, project_id, input)
     }
 }
