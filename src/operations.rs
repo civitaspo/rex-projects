@@ -1759,6 +1759,12 @@ pub fn new_request<P>(
         operation_id,
         method: MethodName::new(method)?,
         project_id,
+        run_id: None,
+        attempt: None,
+        run_epoch: None,
+        expected_subject_revision: None,
+        role: None,
+        request_type: None,
         params,
     })
 }
