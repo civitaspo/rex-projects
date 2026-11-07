@@ -43,6 +43,7 @@ pub mod run_step_spool;
 pub mod runtime_delivery;
 pub mod runtime_services;
 pub mod start_agent;
+pub mod stop_owned_runs;
 pub mod store;
 pub mod trial_step;
 pub mod worktrees;
