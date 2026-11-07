@@ -559,7 +559,7 @@ impl ConfigStore {
             return Err("final launch authority has no matching persisted active Rex block".into());
         }
         let wake_json = crate::store::canonical_json(&reservation.wake_snapshot)?;
-        let wake_digest = Digest::parse(format!("{:x}", Sha256::digest(wake_json.as_bytes())))?;
+        let wake_digest = reservation.wake_snapshot.content_digest()?;
         if wake_digest != authority.wake_snapshot_digest {
             return Err(
                 "authority wake snapshot digest does not match the reserved snapshot".into(),
@@ -1505,6 +1505,99 @@ mod tests {
             store.prepare_role_launch(&reservation).unwrap(),
             LaunchPreparationOutcome::Prepared { .. }
         ));
+
+        // A launch authority binds the semantic wake snapshot digest. The serialized envelope
+        // includes that digest field itself, so hashing the JSON would produce a different value.
+        let authority = crate::launch::AgentLaunchAuthority {
+            agent_run_id: reservation.agent_run_id.clone(),
+            project_id: reservation.project_id.clone(),
+            role: reservation.role,
+            role_session_id: reservation.role_session_id.clone(),
+            parent_run_id: reservation.parent_run_id.clone(),
+            parent_role: reservation.parent_role,
+            ticket_run_id: reservation.ticket_run_id.clone(),
+            ticket_revision: reservation.ticket_revision,
+            config_revision: reservation.config_revision,
+            config_digest: reservation.config_digest.clone(),
+            attempt: reservation.attempt,
+            run_epoch: reservation.run_epoch,
+            controller_generation: reservation.controller_generation,
+            operation_id: reservation.operation_id.clone(),
+            operation_recipe_id: reservation.operation_recipe_id.clone(),
+            rex_view_id: reservation.rex_view_id.clone(),
+            descriptor_digest: digest('a'),
+            runtime_binary_digest: reservation.runtime_binary_digest.clone(),
+            descriptor_path: reservation.descriptor_path.clone(),
+            environment_snapshot_id: reservation.environment_snapshot_id.clone(),
+            profile_id: reservation.profile_id.clone(),
+            profile_digest: reservation.profile_digest.clone(),
+            instruction_digest: reservation.instruction_digest.clone(),
+            result_schema_digest: reservation.result_schema_digest.clone(),
+            wake_snapshot_digest: reservation.wake_snapshot.digest.clone(),
+            qualification_receipt_digest: reservation.qualification_receipt_digest.clone(),
+            rex_server_identity: view.rex_server_identity.clone(),
+            rex_session_id: view.rex_session_id.clone(),
+            rex_window_id: view.rex_window_id.clone(),
+            rex_block_id: "block-run-1".into(),
+            workspace_path: reservation.workspace_path.clone(),
+            control_dir: reservation.control_dir.clone(),
+            mailbox_capability_digest: reservation.mailbox_capability_digest.clone(),
+        };
+        store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap();
+        store
+            .register_rex_view_block(
+                generation,
+                &crate::launch::RexViewBlock {
+                    view_id: reservation.rex_view_id.clone(),
+                    block_id: authority.rex_block_id.clone(),
+                    agent_run_id: Some(reservation.agent_run_id.clone()),
+                    role: Some(reservation.role),
+                    ownership: crate::launch::RexBlockOwnership::Factory,
+                    lifecycle: crate::launch::RexBlockLifecycle::Active,
+                    process_absent_confirmed: false,
+                    retained_until_unix: None,
+                },
+            )
+            .unwrap();
+        store
+            .finalize_agent_launch_reservation(
+                generation,
+                &reservation.agent_run_id,
+                &reservation.digest().unwrap(),
+                &authority,
+            )
+            .unwrap();
+        let start_request = crate::launch::AgentStartRequest {
+            schema_version: LAUNCH_SCHEMA_VERSION,
+            operation_id: authority.operation_id.clone(),
+            agent_run_id: authority.agent_run_id.clone(),
+            project_id: authority.project_id.clone(),
+            controller_generation: generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            wrapper_pid: 42,
+            wrapper_start_identity: "wrapper-start-1".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+        };
+        let receipt = store
+            .authorize_agent_start(
+                generation,
+                &start_request,
+                &crate::launch::ObservedWrapperIdentity {
+                    pid: start_request.wrapper_pid,
+                    start_identity: start_request.wrapper_start_identity.clone(),
+                    rex_session_id: start_request.rex_session_id.clone(),
+                    rex_block_id: start_request.rex_block_id.clone(),
+                    runtime_binary_digest: start_request.runtime_binary_digest.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(receipt.decision, crate::launch::LaunchDecision::Accepted);
         let persisted_role: String = store
             .connection
             .query_row(
@@ -1520,6 +1613,20 @@ mod tests {
         ));
         drop(store);
         let mut reopened = ConfigStore::open_test(temp.path()).unwrap();
+        let (snapshot_digest, snapshot_json): (String, String) = reopened
+            .connection
+            .query_row(
+                "SELECT snapshot_digest,snapshot_json FROM agent_wake_context WHERE agent_run_id='run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let loaded_wake: crate::agent_api::AgentWakeSnapshot =
+            crate::protocol::parse_unique(snapshot_json.as_bytes()).unwrap();
+        loaded_wake.validate().unwrap();
+        assert_eq!(snapshot_digest, reservation.wake_snapshot.digest.as_str());
+        assert_eq!(loaded_wake, reservation.wake_snapshot);
+        assert!(reopened.persisted_start_receipt(&start_request).unwrap().is_some());
         assert!(matches!(
             reopened.prepare_role_launch(&reservation).unwrap(),
             LaunchPreparationOutcome::Prepared { .. }
