@@ -10,9 +10,18 @@ use crate::domain::types::{ProjectMode, RecipeStage, Role, TicketStatus};
 use crate::engine::reducer::Input;
 
 /// Stable plan-local identity for a task in a TicketRun DAG.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct WorkNodeId(String);
+
+impl<'de> Deserialize<'de> for WorkNodeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl WorkNodeId {
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
@@ -1225,6 +1234,35 @@ mod tests {
                 annotate_and_cancel: vec![]
             }
         );
+    }
+
+    #[test]
+    fn work_plan_deserialization_rejects_invalid_work_node_ids() {
+        let template = serde_json::json!({
+            "nodes": [{
+                "id": "valid-node",
+                "repository": "repo-a",
+                "task": "implement feature",
+                "depends_on": [],
+                "required_evidence": ["tests"],
+                "investigation": false
+            }],
+            "requested_investigation_children": 0
+        });
+        let oversized = "x".repeat(81);
+        for invalid in [
+            "../outside",
+            "folder/node",
+            "bad\u{0007}id",
+            oversized.as_str(),
+        ] {
+            let mut value = template.clone();
+            value["nodes"][0]["id"] = serde_json::Value::String(invalid.into());
+            assert!(
+                serde_json::from_value::<WorkPlan>(value).is_err(),
+                "accepted invalid work node ID {invalid:?}"
+            );
+        }
     }
 
     #[test]
