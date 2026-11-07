@@ -167,9 +167,6 @@ impl RuntimeDelivery {
                 revision: saved.revision,
             });
         };
-        if baseline.configuration_digest != accepted_configuration_digest {
-            return Ok(PublicationMonitorTick::Unknown);
-        }
         if baseline.configuration_digest != self.configuration_digest {
             return Ok(PublicationMonitorTick::Unknown);
         }

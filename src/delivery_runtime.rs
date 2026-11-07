@@ -1528,6 +1528,7 @@ impl RepositoryDeliveryEffects {
             owner_generation,
             &resource,
             &repository.base_branch,
+            &payload.configuration_digest,
             &observation,
             now_unix,
         )?;

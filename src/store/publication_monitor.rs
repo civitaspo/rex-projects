@@ -36,6 +36,7 @@ pub fn migrate_v12_publication_baselines(tx: &Transaction<'_>) -> Result<(), Str
 pub struct PublicationBaseline {
     pub resource: PublicationResource,
     pub base_branch: String,
+    pub configuration_digest: crate::domain::ids::Digest,
     pub observation: crate::delivery_runtime::RepositoryPublicationObservation,
     pub revision: u64,
     pub digest: String,
@@ -84,6 +85,7 @@ impl ConfigStore {
         owner_generation: u64,
         resource: &PublicationResource,
         base_branch: &str,
+        configuration_digest: &crate::domain::ids::Digest,
         observation: &crate::delivery_runtime::RepositoryPublicationObservation,
         now_unix: i64,
     ) -> Result<PublicationBaseline, String> {
@@ -115,14 +117,17 @@ impl ConfigStore {
             return Err("publication baseline does not match its durable TicketRun".into());
         }
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO publication_baselines(project_id,ticket_run_id,repository_id,branch,base_branch,initial_snapshot_json,initial_digest,current_snapshot_json,current_digest,revision,last_effect_operation_id,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?7,1,NULL,?8)",
-            params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch,base_branch,snapshot_json,snapshot_digest,now_unix],
+            "INSERT OR IGNORE INTO publication_baselines(project_id,ticket_run_id,repository_id,branch,base_branch,configuration_digest,initial_snapshot_json,initial_digest,current_snapshot_json,current_digest,revision,last_effect_operation_id,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?7,?8,1,NULL,?9)",
+            params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch,base_branch,configuration_digest.as_str(),snapshot_json,snapshot_digest,now_unix],
         ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         let row = self
             .load_publication_baseline(resource)?
             .ok_or("publication baseline insert disappeared")?;
-        if row.base_branch != base_branch || row.digest != snapshot_digest {
+        if row.base_branch != base_branch
+            || row.configuration_digest != *configuration_digest
+            || row.digest != snapshot_digest
+        {
             return Err(
                 "initial publication baseline conflicts with a previously captured observation"
                     .into(),
@@ -136,12 +141,12 @@ impl ConfigStore {
         &self,
         resource: &PublicationResource,
     ) -> Result<Option<PublicationBaseline>, String> {
-        let row: Option<(String,String,String,u64,Option<String>)> = self.connection.query_row(
-            "SELECT base_branch,current_snapshot_json,current_digest,revision,last_effect_operation_id FROM publication_baselines WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4",
+        let row: Option<(String,String,String,String,u64,Option<String>)> = self.connection.query_row(
+            "SELECT base_branch,configuration_digest,current_snapshot_json,current_digest,revision,last_effect_operation_id FROM publication_baselines WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4",
             params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let Some((base_branch, json, digest, revision, last_effect_operation_id)) = row else {
+        let Some((base_branch, configuration_digest, json, digest, revision, last_effect_operation_id)) = row else {
             return Ok(None);
         };
         if baseline_digest(json.as_bytes()) != digest {
@@ -152,6 +157,7 @@ impl ConfigStore {
         Ok(Some(PublicationBaseline {
             resource: resource.clone(),
             base_branch,
+            configuration_digest: crate::domain::ids::Digest::parse(configuration_digest)?,
             observation,
             revision,
             digest,
@@ -665,6 +671,7 @@ mod tests {
                     generation,
                     &resource,
                     "main",
+                    &Digest::parse("a".repeat(64)).unwrap(),
                     &crate::delivery_runtime::RepositoryPublicationObservation {
                         remote_head: Some("a".repeat(40)),
                         ..absent.clone()
@@ -674,7 +681,14 @@ mod tests {
                 .is_err()
         );
         let saved = store
-            .insert_initial_publication_baseline(generation, &resource, "main", &absent, 11)
+            .insert_initial_publication_baseline(
+                generation,
+                &resource,
+                "main",
+                &Digest::parse("a".repeat(64)).unwrap(),
+                &absent,
+                11,
+            )
             .unwrap();
         assert_eq!(saved.revision, 1);
         assert!(
@@ -683,6 +697,7 @@ mod tests {
                     generation,
                     &resource,
                     "main",
+                    &Digest::parse("a".repeat(64)).unwrap(),
                     &crate::delivery_runtime::RepositoryPublicationObservation {
                         remote_head: None,
                         pull_requests: crate::delivery_forge::ObservationCapability::Known(vec![
