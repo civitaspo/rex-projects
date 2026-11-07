@@ -214,3 +214,53 @@ impl ResolveDuplicateTicket {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CreateGoalTicket, GoalTicketProposal, TicketCreationRequest};
+    use crate::domain::ids::{Digest, ProjectId, TicketNamespace};
+
+    #[test]
+    fn goal_ticket_effect_binds_key_digest_and_cli_request() {
+        let project_id = ProjectId::parse("payments").unwrap();
+        let proposal = GoalTicketProposal {
+            project_id: project_id.clone(),
+            goal_revision: 2,
+            title: "Add migration".into(),
+            body: "Update the interface.".into(),
+            labels: ["agent-created".to_owned()].into(),
+        };
+        let canonical = serde_json::to_vec(&serde_json::to_value(&proposal).unwrap()).unwrap();
+        use sha2::Digest as _;
+        let proposal_digest = format!("{:x}", sha2::Sha256::digest(canonical));
+        let payload = CreateGoalTicket {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            namespace: TicketNamespace::parse("linear:workspace-a").unwrap(),
+            goal_revision: 2,
+            request_key: format!("goal-{proposal_digest}"),
+            request_digest: Digest::parse(proposal_digest.clone()).unwrap(),
+            request: TicketCreationRequest {
+                scope: [("project".into(), "example".into())].into(),
+                creation_key: format!("goal-{proposal_digest}"),
+                title: proposal.title.clone(),
+                body: proposal.body.clone(),
+                status: None,
+                template: None,
+                parent: None,
+                dependencies: None,
+                project: None,
+                milestone: None,
+                assignee: None,
+                priority: None,
+                due_date: None,
+                labels: Some(proposal.labels.iter().cloned().collect()),
+            },
+            proposal,
+        };
+        assert!(payload.validate().is_ok());
+        let mut changed = payload;
+        changed.request.body.push_str("extra");
+        assert!(changed.validate().is_err());
+    }
+}

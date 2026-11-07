@@ -308,21 +308,22 @@ impl ConfigStore {
         if active_owner != Some(owner_generation) {
             return Err("controller owner generation is stale".into());
         }
-        let stored: Option<(String, String, String, u64)> = self
+        let stored: Option<(String, String, String, u64, Option<String>)> = self
             .connection
             .query_row(
-                "SELECT namespace,ticket_id,internal_phase,revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                "SELECT namespace,ticket_id,internal_phase,revision,external_revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
                 params![payload.ticket_run_id.as_str(), payload.project_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((namespace, ticket_id, phase, revision)) = stored else {
+        let Some((namespace, ticket_id, phase, revision, external_revision)) = stored else {
             return Err("ticket status effect references an unknown TicketRun".into());
         };
         if namespace != payload.namespace.as_str()
             || ticket_id != payload.ticket_id.as_str()
             || revision != payload.ticket_run_revision
+            || external_revision != payload.expected_external_revision
         {
             return Err("ticket status effect is stale or has mismatched scope".into());
         }
