@@ -315,7 +315,14 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
     tx.execute_batch(
-        "CREATE TABLE provider_qualifications (
+        "ALTER TABLE agent_runs ADD COLUMN role TEXT
+            CHECK(role IS NULL OR role IN ('supervisor','coordinator','planner','worker','reviewer','merge_decision','operator','postmortem'));
+        CREATE TRIGGER agent_runs_role_immutable
+        BEFORE UPDATE OF role ON agent_runs
+        WHEN OLD.role IS NOT NEW.role
+        BEGIN SELECT RAISE(ABORT, 'AgentRun role reservation is immutable'); END;
+
+        CREATE TABLE provider_qualifications (
             receipt_digest TEXT PRIMARY KEY CHECK(length(receipt_digest) = 64),
             project_id TEXT NOT NULL REFERENCES projects(project_id),
             profile_id TEXT NOT NULL,

@@ -85,6 +85,7 @@ type LaunchAgentRunRow = (
     u64,
     String,
     Option<String>,
+    Option<String>,
 );
 type PendingControlRow = (
     String,
@@ -1111,10 +1112,15 @@ impl ConfigStore {
                 "new launch authority must belong to the active controller generation".into(),
             );
         }
+        let expected_role = serde_json::to_value(authority.role)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or("Agent role did not serialize as a string")?
+            .to_owned();
         let run: Option<LaunchAgentRunRow> = tx.query_row(
-            "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source,role_session_id FROM agent_runs WHERE agent_run_id=?1",
+            "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source,role_session_id,role FROM agent_runs WHERE agent_run_id=?1",
             [authority.agent_run_id.as_str()],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
         ).optional().map_err(|error| error.to_string())?;
         let Some((
             project_id,
@@ -1125,6 +1131,7 @@ impl ConfigStore {
             config_revision,
             config_source,
             role_session_id,
+            role,
         )) = run
         else {
             return Err("launch authority references an unknown AgentRun".into());
@@ -1136,8 +1143,12 @@ impl ConfigStore {
             || config_digest != authority.config_digest.as_str()
             || config_revision != authority.config_revision.0
             || role_session_id.as_deref() != Some(authority.role_session_id.as_str())
+            || role.as_deref() != Some(expected_role.as_str())
         {
-            return Err("AgentRun identity does not match the proposed launch authority".into());
+            return Err(
+                "AgentRun identity or reserved role does not match the proposed launch authority"
+                    .into(),
+            );
         }
         let snapshot: Option<(String, String)> = tx.query_row(
             "SELECT snapshots.digest,snapshots.effective_config_json FROM config_current current JOIN config_snapshots snapshots USING(source_identity,revision) WHERE current.source_identity=?1 AND current.revision=?2",
@@ -5035,7 +5046,7 @@ mod tests {
             )
             .unwrap();
         store.connection.execute(
-            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES ('run-1',?1,'factory',?2,?3,'role-session','supervisor',1,'op-1','launch_pending',?4)",
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES ('run-1',?1,'factory',?2,?3,'role-session','supervisor','supervisor',1,'op-1','launch_pending',?4)",
             rusqlite::params![project_id.as_str(), applied.revision.0, "a".repeat(64), generation],
         ).unwrap();
         let mismatched_session_authority = AgentLaunchAuthority {
@@ -5080,6 +5091,13 @@ mod tests {
             mismatch_error.contains("AgentRun identity"),
             "{mismatch_error}"
         );
+        let mut mismatched_role_authority = mismatched_session_authority.clone();
+        mismatched_role_authority.role_session_id = "role-session".into();
+        mismatched_role_authority.role = crate::domain::types::Role::Coordinator;
+        let role_error = store
+            .register_agent_launch_authority(generation, &mismatched_role_authority)
+            .unwrap_err();
+        assert!(role_error.contains("reserved role"), "{role_error}");
         store
             .connection
             .execute_batch("PRAGMA foreign_keys=OFF;")

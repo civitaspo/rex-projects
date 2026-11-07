@@ -29,6 +29,13 @@ use crate::store::scheduler::{ObservedTicket, TicketScanKey};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+struct PreparedWorkerContext {
+    plan_record: crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    validated_plan: crate::engine::orchestration::ValidatedPlan,
+    node: crate::engine::orchestration::ValidatedWorkNode,
+    token: crate::store::accepted_plans::PreparedWorkerLaunch,
+}
+
 /// Long-lived adapters and effect handlers for a single controller process.
 /// Adapter namespaces are learned once and pinned by their `describe` call.
 pub struct RuntimeServices {
@@ -495,8 +502,31 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
         } else {
             None
         };
-        if reservation.role == Role::Worker {
-            return Err("Worker package requires the opaque prepared-worktree launch token".into());
+        let worker_context = if reservation.role == Role::Worker {
+            Some(resolve_prepared_worker_context_for_reservation(
+                store,
+                owner_generation,
+                reservation,
+                project,
+                &self.applied_config.digest,
+            )?)
+        } else {
+            None
+        };
+        if worker_context.as_ref().is_some_and(|context| {
+            context.token.worktree_path() != reservation.workspace_path
+                || context.token.ticket_revision()
+                    != reservation
+                        .ticket_revision
+                        .map(|revision| revision.0)
+                        .unwrap_or(0)
+                || reservation.parent_run_id.as_ref()
+                    != Some(context.token.coordinator_agent_run_id())
+                || reservation.parent_role != Some(Role::Coordinator)
+        }) {
+            return Err(
+                "Worker package reservation differs from prepared worktree authority".into(),
+            );
         }
         let profile = self
             .applied_config
@@ -507,7 +537,12 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
         if profile_digest != reservation.profile_digest {
             return Err("Agent profile changed after launch reservation".into());
         }
-        let operation_recipe = reservation.operation_recipe_id.clone();
+        let operation_recipe = if reservation.role == Role::Operator {
+            reservation.operation_recipe_id.clone()
+        } else {
+            None
+        };
+        let worker_node = worker_context.as_ref().map(|context| context.node.clone());
         let accepted_plan = if let Some(run) = active_run.as_ref() {
             let accepted = store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?;
             if let Some(plan) = &accepted {
@@ -524,18 +559,44 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 profile_id: Some(reservation.profile_id.clone()),
                 role: reservation.role,
                 operation_recipe,
-                repositories: project.repositories.clone(),
+                repositories: worker_node
+                    .as_ref()
+                    .map(|node| vec![node.repository.clone()])
+                    .unwrap_or_else(|| project.repositories.clone()),
                 ticket,
                 recovery_summary: None,
-                accepted_plan: accepted_plan
-                    .as_ref()
-                    .map(|plan| serde_json::to_string(&plan.proposal))
-                    .transpose()
-                    .map_err(|error| error.to_string())?,
+                accepted_plan: match (&worker_context, &accepted_plan) {
+                    (Some(context), _) => Some(worker_assignment_context(
+                        &context.plan_record,
+                        &context.validated_plan,
+                        &context.node,
+                        context.token.worktree_path(),
+                        context.token.branch(),
+                        context.token.base_sha(),
+                        context.token.commit_mode(),
+                        context.token.repository_id(),
+                    )?),
+                    (None, Some(plan)) => Some(
+                        serde_json::to_string(&plan.proposal).map_err(|error| error.to_string())?,
+                    ),
+                    (None, None) => None,
+                },
                 previous_decisions: Vec::new(),
-                required_evidence: Vec::new(),
-                stop_conditions: Vec::new(),
-                assigned_commit_mode: Some(profile.commit_mode),
+                required_evidence: worker_node
+                    .as_ref()
+                    .map(|node| node.required_evidence.clone())
+                    .unwrap_or_default(),
+                stop_conditions: if reservation.role == Role::Worker {
+                    vec![
+                        "Work only in the assigned repository worktree and follow the assigned node's base/dependency semantics.".into(),
+                        "Do not push, create a pull request, request a merge, or merge; the host controls publication.".into(),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                assigned_commit_mode: worker_context
+                    .as_ref()
+                    .map(|context| context.token.commit_mode()),
             },
         )?;
         if rendered.instruction_digest != reservation.instruction_digest
@@ -1108,18 +1169,25 @@ impl RuntimeServices {
             .ticket_run_id
             .as_ref()
             .ok_or("ticket role wake lacks TicketRun identity")?;
-        if candidate.role == Role::Worker {
-            if candidate.work_node_id.is_none() {
-                return Err("generic or malformed Worker wake cannot authorize a launch".into());
+        let worker_node_id = if candidate.role == Role::Worker {
+            let node_id = candidate
+                .work_node_id
+                .as_ref()
+                .ok_or("generic Worker wake cannot authorize a launch")?;
+            if candidate.role_session_id != format!("ticket:{ticket_run_id}:worker:{node_id}") {
+                return Err("Worker wake does not match its per-node role session".into());
             }
-            return Err(
-                "Worker launch requires the dedicated prepared-worktree reservation API".into(),
-            );
-        }
-        if candidate.work_node_id.is_some()
-            || candidate.role_session_id
-                != format!("ticket_run:{ticket_run_id}:{}", role_name(candidate.role))
-        {
+            Some(node_id.clone())
+        } else {
+            if candidate.work_node_id.is_some()
+                || candidate.role_session_id
+                    != format!("ticket_run:{ticket_run_id}:{}", role_name(candidate.role))
+            {
+                return Err("ticket role wake scope does not match its TicketRun".into());
+            }
+            None
+        };
+        if candidate.role != Role::Worker && candidate.work_node_id.is_some() {
             return Err("ticket role wake scope does not match its TicketRun".into());
         }
         let active_run = store
@@ -1139,6 +1207,19 @@ impl RuntimeServices {
             .get(&candidate.project_id)
             .ok_or("pending ticket role references an unconfigured Project")?
             .clone();
+        let worker_context = if let Some(node_id) = &worker_node_id {
+            Some(resolve_prepared_worker_context(
+                store,
+                self.owner_generation,
+                &candidate.project_id,
+                ticket_run_id,
+                node_id,
+                &project,
+                &self.configuration_digest,
+            )?)
+        } else {
+            None
+        };
         let runnable = store
             .runnable_projects(self.owner_generation)?
             .into_iter()
@@ -1230,14 +1311,38 @@ impl RuntimeServices {
         if let Some(plan) = &accepted_plan {
             plan.validate_for(&project, &self.configuration_digest)?;
         }
+        let validated_plan = accepted_plan
+            .as_ref()
+            .map(|plan| plan.validate_for(&project, &self.configuration_digest))
+            .transpose()?;
+        let worker_node = worker_context
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .validated_plan
+                    .nodes_in_execution_order
+                    .iter()
+                    .find(|node| Some(&node.id) == worker_node_id.as_ref())
+            })
+            .cloned();
+        if candidate.role == Role::Worker && worker_node.is_none() {
+            return Err("prepared Worker token does not resolve to an accepted plan node".into());
+        }
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
                 project_id: candidate.project_id.clone(),
                 profile_id: Some(profile_id.clone()),
                 role: candidate.role,
-                operation_recipe: active_run.recipe_id.clone(),
-                repositories: project.repositories.clone(),
+                operation_recipe: if candidate.role == Role::Operator {
+                    active_run.recipe_id.clone()
+                } else {
+                    None
+                },
+                repositories: worker_node
+                    .as_ref()
+                    .map(|node| vec![node.repository.clone()])
+                    .unwrap_or_else(|| project.repositories.clone()),
                 ticket: Some(crate::roles::TicketBrief {
                     ticket_id: active_run.ticket_id.clone(),
                     ticket_revision: active_run.revision,
@@ -1246,15 +1351,47 @@ impl RuntimeServices {
                     acceptance: Vec::new(),
                 }),
                 recovery_summary: None,
-                accepted_plan: accepted_plan
-                    .as_ref()
-                    .map(|plan| serde_json::to_string(&plan.proposal))
-                    .transpose()
-                    .map_err(|error| error.to_string())?,
+                accepted_plan: match (
+                    &accepted_plan,
+                    &validated_plan,
+                    &worker_context,
+                    &worker_node,
+                ) {
+                    (Some(plan), Some(validated), Some(context), Some(node))
+                        if candidate.role == Role::Worker =>
+                    {
+                        Some(worker_assignment_context(
+                            plan,
+                            validated,
+                            node,
+                            context.token.worktree_path(),
+                            context.token.branch(),
+                            context.token.base_sha(),
+                            context.token.commit_mode(),
+                            context.token.repository_id(),
+                        )?)
+                    }
+                    (Some(plan), _, _, _) => Some(
+                        serde_json::to_string(&plan.proposal).map_err(|error| error.to_string())?,
+                    ),
+                    _ => None,
+                },
                 previous_decisions: Vec::new(),
-                required_evidence: Vec::new(),
-                stop_conditions: Vec::new(),
-                assigned_commit_mode: None,
+                required_evidence: worker_node
+                    .as_ref()
+                    .map(|node| node.required_evidence.clone())
+                    .unwrap_or_default(),
+                stop_conditions: if candidate.role == Role::Worker {
+                    vec![
+                        "Work only in the assigned repository worktree and follow the assigned node's base/dependency semantics.".into(),
+                        "Do not push, create a pull request, request a merge, or merge; the host controls publication.".into(),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                assigned_commit_mode: worker_context
+                    .as_ref()
+                    .map(|context| context.token.commit_mode()),
             },
         )?;
         let wake_inputs = store.pending_role_wake_inputs(
@@ -1279,15 +1416,27 @@ impl RuntimeServices {
         let suffix = &seed_digest.as_str()[..32];
         let agent_run_id = crate::domain::ids::AgentRunId::parse(format!("agent-{suffix}"))?;
         let operation_id = crate::domain::ids::OperationId::parse(format!("start-{suffix}"))?;
-        let workspace = self
-            .state_root
-            .join("projects")
-            .join(candidate.project_id.as_str())
-            .join("role-workspaces")
-            .join(role_name(candidate.role));
+        let workspace = worker_context
+            .as_ref()
+            .map(|context| context.token.worktree_path().to_owned())
+            .unwrap_or_else(|| {
+                self.state_root
+                    .join("projects")
+                    .join(candidate.project_id.as_str())
+                    .join("role-workspaces")
+                    .join(role_name(candidate.role))
+            });
         let run_root = self.state_root.join("agents").join(agent_run_id.as_str());
         let control_dir = run_root.join("control");
-        create_private_dir(&workspace)?;
+        if candidate.role == Role::Worker {
+            if !workspace.is_dir()
+                || std::fs::canonicalize(&workspace).ok().as_ref() != Some(&workspace)
+            {
+                return Err("prepared Worker worktree is missing or not canonical".into());
+            }
+        } else {
+            create_private_dir(&workspace)?;
+        }
         create_private_dir(&control_dir)?;
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
@@ -1324,8 +1473,10 @@ impl RuntimeServices {
             project_id: candidate.project_id.clone(),
             role: candidate.role,
             role_session_id: candidate.role_session_id.clone(),
-            parent_run_id: None,
-            parent_role: None,
+            parent_run_id: worker_context
+                .as_ref()
+                .map(|context| context.token.coordinator_agent_run_id().clone()),
+            parent_role: worker_context.as_ref().map(|_| Role::Coordinator),
             ticket_run_id: Some(ticket_run_id.clone()),
             ticket_revision: Some(crate::domain::ids::Revision(active_run.revision)),
             config_revision: runnable.record.config_revision,
@@ -1336,6 +1487,9 @@ impl RuntimeServices {
             project_epoch: active_run.project_epoch,
             operation_id,
             operation_recipe_id: active_run.recipe_id,
+            worker_assignment: worker_context
+                .as_ref()
+                .map(|context| context.token.reservation_binding()),
             rex_view_id: view.view_id,
             runtime_binary_digest: self.runtime_binary_digest.clone(),
             environment_snapshot_id: self.environment.metadata().id.clone(),
@@ -1358,7 +1512,12 @@ impl RuntimeServices {
             global_capacity: capacity,
             project_capacity: capacity,
         };
-        match store.prepare_role_launch(&reservation)? {
+        let result = if let Some(context) = &worker_context {
+            store.prepare_worker_role_launch(&reservation, &context.token)?
+        } else {
+            store.prepare_role_launch(&reservation)?
+        };
+        match result {
             crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. } => Ok(true),
             crate::store::agent_runtime::LaunchPreparationOutcome::CapacityUnavailable => Ok(false),
         }
@@ -1586,6 +1745,291 @@ fn role_allowed_in_phase(role: Role, phase: crate::engine::reducer::Phase) -> bo
         Role::MergeDecision => matches!(phase, Phase::Assessing | Phase::AwaitingMerge),
         Role::Operator => phase == Phase::Operating,
         Role::Postmortem => phase == Phase::Postmortem,
+    }
+}
+
+fn resolve_prepared_worker_context(
+    store: &ConfigStore,
+    owner_generation: u64,
+    project_id: &crate::domain::ids::ProjectId,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    node_id: &crate::engine::orchestration::WorkNodeId,
+    project: &crate::config::ProjectConfig,
+    configuration_digest: &Digest,
+) -> Result<PreparedWorkerContext, String> {
+    let plan_record = store
+        .latest_accepted_work_plan(project_id, ticket_run_id)?
+        .ok_or("Worker wake has no accepted Coordinator work plan")?;
+    let validated_plan = plan_record.validate_for(project, configuration_digest)?;
+    let node = validated_plan
+        .nodes_in_execution_order
+        .iter()
+        .find(|node| &node.id == node_id)
+        .cloned()
+        .ok_or("Worker wake node is absent from the accepted work plan")?;
+    if node.role != Role::Worker || !project.repositories.contains(&node.repository) {
+        return Err("accepted plan node is not an allowed Worker repository assignment".into());
+    }
+
+    let receipts = store.list_succeeded_effect_receipts(
+        owner_generation,
+        project_id,
+        "ticket_run",
+        ticket_run_id.as_str(),
+        256,
+    )?;
+    let mut tokens = Vec::new();
+    for receipt in receipts {
+        let intent = receipt.intent();
+        if intent.kind != "prepare_worktrees"
+            || intent.expected_revision != Some(plan_record.accepted_revision)
+        {
+            continue;
+        }
+        if let Some(token) = store.prepared_worker_launch(
+            owner_generation,
+            plan_record.accepted_revision,
+            node_id,
+            &receipt,
+            project,
+            configuration_digest,
+        )? {
+            tokens.push(token);
+        }
+    }
+    let token = match tokens.len() {
+        0 => return Err("Worker node has no succeeded, matching prepared-worktree receipt".into()),
+        1 => tokens.pop().expect("one prepared Worker token exists"),
+        _ => {
+            return Err(
+                "multiple succeeded prepared-worktree receipts match one Worker node".into(),
+            );
+        }
+    };
+    if token.project_id() != project_id
+        || token.ticket_run_id() != ticket_run_id
+        || token.node_id() != node_id
+        || token.repository_id() != &node.repository
+    {
+        return Err("prepared Worker token differs from the selected plan node".into());
+    }
+    Ok(PreparedWorkerContext {
+        plan_record,
+        validated_plan,
+        node,
+        token,
+    })
+}
+
+fn resolve_prepared_worker_context_for_reservation(
+    store: &ConfigStore,
+    owner_generation: u64,
+    reservation: &crate::launch::AgentLaunchReservation,
+    project: &crate::config::ProjectConfig,
+    configuration_digest: &Digest,
+) -> Result<PreparedWorkerContext, String> {
+    let assignment = reservation
+        .worker_assignment
+        .as_ref()
+        .ok_or("Worker reservation has no host-bound work assignment")?;
+    let ticket_run_id = reservation
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Worker reservation has no TicketRun")?;
+    let plan_record = store
+        .accepted_work_plan(
+            &reservation.project_id,
+            ticket_run_id,
+            assignment.accepted_revision,
+        )?
+        .ok_or("Worker reservation's accepted plan is no longer available")?;
+    let validated_plan = plan_record.validate_for(project, configuration_digest)?;
+    let node = validated_plan
+        .nodes_in_execution_order
+        .iter()
+        .find(|node| node.id == assignment.node_id)
+        .cloned()
+        .ok_or("Worker reservation node is absent from its accepted plan")?;
+    let receipt = store
+        .succeeded_effect_receipt(&assignment.prepare_operation_id)?
+        .ok_or("Worker reservation's prepared-worktree effect is no longer succeeded")?;
+    let token = store
+        .prepared_worker_launch(
+            owner_generation,
+            assignment.accepted_revision,
+            &assignment.node_id,
+            &receipt,
+            project,
+            configuration_digest,
+        )?
+        .ok_or("Worker reservation's prepared-worktree token is stale")?;
+    if token.reservation_binding() != *assignment
+        || node.role != Role::Worker
+        || node.repository != token.repository_id().clone()
+        || !project.repositories.contains(&node.repository)
+    {
+        return Err("Worker package is outside its persisted accepted-plan assignment".into());
+    }
+    Ok(PreparedWorkerContext {
+        plan_record,
+        validated_plan,
+        node,
+        token,
+    })
+}
+
+fn worker_assignment_context(
+    plan_record: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    validated_plan: &crate::engine::orchestration::ValidatedPlan,
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    worktree_path: &Path,
+    branch: &str,
+    base_sha: &str,
+    commit_mode: crate::domain::types::CommitMode,
+    repository_id: &crate::domain::ids::RepositoryId,
+) -> Result<String, String> {
+    let describe_base = |source: &crate::engine::orchestration::WorkBaseSource,
+                         resolved_sha: Option<&str>| {
+        match source {
+            crate::engine::orchestration::WorkBaseSource::ControllerObservedCommit { commit } => {
+                serde_json::json!({"kind":"controller_observed_commit","commit":commit})
+            }
+            crate::engine::orchestration::WorkBaseSource::PredecessorWorkNodeHead {
+                node: predecessor,
+            } => serde_json::json!({
+                "kind":"predecessor_work_node_head",
+                "predecessor_node":predecessor,
+                "resolved_base_sha":resolved_sha,
+                "instruction":"Use the exact predecessor head selected by the host; do not substitute the trunk base."
+            }),
+        }
+    };
+    let execution_order = validated_plan
+        .nodes_in_execution_order
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "node_id":entry.id,
+                "repository_id":entry.repository,
+                "role":entry.role,
+                "task":entry.task,
+                "base":describe_base(&entry.base, None),
+                "depends_on":entry.depends_on,
+                "required_evidence":entry.required_evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    let assigned_base = describe_base(&node.base, Some(base_sha));
+    let value = serde_json::json!({
+        "schema_version":1,
+        "ticket_run_id":plan_record.ticket_run_id,
+        "accepted_revision":plan_record.accepted_revision,
+        "accepted_plan_digest":plan_record.plan_digest,
+        "plan":plan_record.proposal,
+        "validated_execution_order":execution_order,
+        "assigned_node":{
+            "node_id":node.id,
+            "repository_id":node.repository,
+            "task":node.task,
+            "base":assigned_base,
+            "depends_on":node.depends_on,
+            "required_evidence":node.required_evidence,
+        },
+        "prepared_worktree":{
+            "path":worktree_path,
+            "branch":branch,
+            "base_sha":base_sha,
+            "commit_mode":commit_mode,
+            "repository_id":repository_id,
+        },
+        "delivery_authority":"The host owns push, pull request creation, merge, and delivery."
+    });
+    serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod worker_assignment_context_tests {
+    use super::*;
+    use crate::domain::ids::{AgentRunId, Digest, ProjectId, TicketRunId};
+    use crate::domain::types::{CommitMode, Role};
+    use crate::engine::orchestration::{
+        PlannedWorkNode, ValidatedPlan, ValidatedWorkNode, WorkBaseSource, WorkNodeId, WorkPlan,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn predecessor_base_context_uses_the_host_prepared_sha() {
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-a").unwrap();
+        let repository = crate::domain::ids::RepositoryId::parse("repo-a").unwrap();
+        let node_id = WorkNodeId::parse("worker-b").unwrap();
+        let predecessor = WorkNodeId::parse("worker-a").unwrap();
+        let base_sha = "a".repeat(40);
+        let node = ValidatedWorkNode {
+            id: node_id.clone(),
+            repository: repository.clone(),
+            base: WorkBaseSource::PredecessorWorkNodeHead {
+                node: predecessor.clone(),
+            },
+            task: "Implement the dependent change".into(),
+            depends_on: Vec::new(),
+            required_evidence: vec!["tests pass".into()],
+            role: Role::Worker,
+        };
+        let validated = ValidatedPlan {
+            ticket_run_id: ticket_run_id.clone(),
+            nodes_in_execution_order: vec![node.clone()],
+            spawned_investigation_children: 0,
+        };
+        let plan_record = crate::store::accepted_plans::AcceptedWorkPlanRecord {
+            project_id,
+            ticket_run_id: ticket_run_id.clone(),
+            accepted_revision: 3,
+            configuration_digest: Digest::parse("b".repeat(64)).unwrap(),
+            plan_digest: Digest::parse("c".repeat(64)).unwrap(),
+            proposal: WorkPlan {
+                nodes: vec![PlannedWorkNode {
+                    id: node_id,
+                    repository: repository.clone(),
+                    task: node.task.clone(),
+                    depends_on: Vec::new(),
+                    required_evidence: node.required_evidence.clone(),
+                    investigation: false,
+                }],
+                requested_investigation_children: 0,
+            },
+            observed_base_shas: BTreeMap::new(),
+            source_evidence_id: "evidence-1".into(),
+            source_agent_run_id: AgentRunId::parse("coordinator-a").unwrap(),
+            source_message_id: "result-1".into(),
+            source_result_digest: Digest::parse("d".repeat(64)).unwrap(),
+            coordinator_agent_run_id: AgentRunId::parse("coordinator-a").unwrap(),
+            coordinator_role_session_id: "ticket_run:run-a:coordinator".into(),
+            coordinator_authority_digest: Digest::parse("e".repeat(64)).unwrap(),
+        };
+
+        let context = worker_assignment_context(
+            &plan_record,
+            &validated,
+            &node,
+            Path::new("/state/worktree"),
+            "agent/run-a/worker-b",
+            &base_sha,
+            CommitMode::Host,
+            &repository,
+        )
+        .unwrap();
+        let context: serde_json::Value = serde_json::from_str(&context).unwrap();
+        let assigned_base = &context["assigned_node"]["base"];
+        assert_eq!(assigned_base["kind"], "predecessor_work_node_head");
+        assert_eq!(assigned_base["predecessor_node"], predecessor.as_str());
+        assert_eq!(assigned_base["resolved_base_sha"], base_sha);
+        assert_eq!(
+            assigned_base["instruction"],
+            "Use the exact predecessor head selected by the host; do not substitute the trunk base."
+        );
+        assert_eq!(context["prepared_worktree"]["base_sha"], base_sha);
+        assert_eq!(context["prepared_worktree"]["repository_id"], "repo-a");
     }
 }
 
