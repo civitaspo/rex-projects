@@ -13,7 +13,7 @@ use crate::domain::ids::{
     Digest, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 2;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (

@@ -85,3 +85,40 @@ fn json_validation_error_is_machine_readable_and_never_opens_state() {
     assert_eq!(body["error"]["code"], "invalid_request");
     assert!(!state.exists());
 }
+
+#[test]
+fn version_metadata_matches_the_created_database_schema() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let config =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+    let apply = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .arg("--config")
+        .arg(config)
+        .arg("--state-root")
+        .arg(&state)
+        .args(["config", "apply", "--bootstrap"])
+        .env("XDG_STATE_HOME", temp.path().join("xdg-state"))
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let version = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    let metadata: serde_json::Value = serde_json::from_slice(&version.stdout).unwrap();
+    let db = rusqlite::Connection::open_with_flags(
+        state.join("state.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let actual_schema: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(metadata["database_schema"].as_i64(), Some(actual_schema));
+}
