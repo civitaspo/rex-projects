@@ -199,8 +199,9 @@ impl DashboardBackend for RuntimeDashboardBackend {
             unix_now(),
         )?;
         Ok(format!(
-            "queued Coordinator wake {} for {}/{} at revision {}{}",
+            "queued Coordinator wake {} and Supervisor notification {} for {}/{} at revision {}{}",
             receipt.wake_input_id,
+            receipt.supervisor_wake_input_id,
             namespace,
             ticket_id,
             receipt.revision,

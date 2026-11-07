@@ -2387,6 +2387,179 @@ pub(crate) mod tests {
 }
 #[allow(clippy::items_after_test_module)]
 impl ConfigStore {
+    /// Atomically consumes a host-validated Supervisor intervention and wakes the exact
+    /// canonical Coordinator for the still-current TicketRun revision.
+    pub fn apply_supervisor_intervention(
+        &mut self,
+        owner_generation: u64,
+        result: &IngestedAgentResult,
+    ) -> Result<bool, String> {
+        use crate::engine::orchestration::RoleResultPayload;
+
+        let binding = &result.validated.binding;
+        let RoleResultPayload::Intervention(intervention) = &result.validated.typed_payload else {
+            return Err("Supervisor intervention consumer received another result kind".into());
+        };
+        let coordinator_session = intervention.coordinator_role_session_id.as_str();
+        let ticket_run_raw = coordinator_session
+            .strip_prefix("ticket_run:")
+            .and_then(|value| value.strip_suffix(":coordinator"))
+            .ok_or("Supervisor intervention Coordinator session is not canonical")?;
+        let ticket_run_id = TicketRunId::parse(ticket_run_raw.to_owned())?;
+        let revision = intervention.ticket_run_revision.0;
+        if binding.role != crate::domain::types::Role::Supervisor
+            || result.validated.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+            || binding.ticket_run_id.is_some()
+            || binding.ticket_revision.is_some()
+            || coordinator_session != format!("ticket_run:{}:coordinator", ticket_run_id.as_str())
+            || intervention.reason.is_empty()
+            || intervention.proposed_plan_change.is_empty()
+            || revision == 0
+        {
+            return Err("Supervisor intervention target is invalid or noncanonical".into());
+        }
+        let role_session_id = intervention.coordinator_role_session_id.as_str();
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "supervisor_intervention",
+            "evidence_id": result.receipt.evidence_id(),
+            "ticket_run_id": ticket_run_id.as_str(),
+            "revision": revision,
+            "reason": intervention.reason,
+            "proposed_plan_change": intervention.proposed_plan_change,
+            "evidence": intervention.evidence,
+        });
+        let payload_json = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::validate_active_generation(&tx, owner_generation)?;
+
+        let source: Option<(String, String, Option<String>, Option<u64>, String, u64, String, String, String)> = tx.query_row(
+            "SELECT e.project_id,e.role,e.ticket_run_id,a.ticket_revision,a.role_session_id,a.config_revision,a.config_digest,a.authority_json,a.authority_digest FROM agent_result_evidence e JOIN agent_launch_authority a USING(agent_run_id) WHERE e.evidence_id=?1 AND e.result_digest=?2",
+            rusqlite::params![result.receipt.evidence_id(), result.validated.result_digest.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((
+            source_project,
+            source_role,
+            source_ticket_run,
+            source_revision,
+            source_session,
+            source_config_revision,
+            source_config_digest,
+            source_authority_json,
+            source_authority_digest,
+        )) = source
+        else {
+            return Err("Supervisor intervention has no matching immutable host evidence".into());
+        };
+        let source_authority: AgentLaunchAuthority =
+            crate::protocol::parse_unique(source_authority_json.as_bytes())?;
+        if source_project != binding.project_id.as_str()
+            || source_role != "supervisor"
+            || source_ticket_run.is_some()
+            || source_session != format!("project:{}:supervisor", binding.project_id.as_str())
+            || source_revision.is_some()
+            || source_config_revision != binding.config_revision.0
+            || source_config_digest != binding.config_digest.as_str()
+            || source_authority.agent_run_id != binding.agent_run_id
+            || source_authority.digest()?.as_str() != source_authority_digest
+            || source_authority.role != crate::domain::types::Role::Supervisor
+            || source_authority.ticket_run_id.is_some()
+            || source_authority.project_id.as_str() != source_project
+            || source_authority.role_session_id != source_session
+            || source_authority.config_revision.0 != source_config_revision
+            || source_authority.config_digest.as_str() != source_config_digest
+        {
+            return Err(
+                "Supervisor intervention provenance is outside its Project authority".into(),
+            );
+        }
+        if let Some((ack_revision, disposition)) = tx
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [result.receipt.evidence_id()],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            if disposition == "rejected_by_host" {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(true);
+            }
+            if ack_revision != revision || disposition != "applied" {
+                return Err("Supervisor intervention was acknowledged with conflicting semantics".into());
+            }
+            let wake: Option<String> = tx.query_row(
+                "SELECT payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='supervisor_intervention' AND source_id=?3 AND source_revision=?4",
+                rusqlite::params![source_project,role_session_id,result.receipt.evidence_id(),revision],
+                |row| row.get(0),
+            ).optional().map_err(|error| error.to_string())?;
+            if wake.as_deref() != Some(payload_json.as_str()) {
+                return Err("acknowledged Supervisor intervention has no matching Coordinator wake".into());
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        let project_config: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [binding.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(project_config, Some((revision, ref digest)) if revision == binding.config_revision.0 && digest == binding.config_digest.as_str())
+        {
+            let rejected_revision = project_config
+                .as_ref()
+                .map(|value| value.0)
+                .unwrap_or(binding.config_revision.0)
+                .max(1);
+            tx.execute(
+                "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'rejected_by_host',?3)",
+                rusqlite::params![result.receipt.evidence_id(), rejected_revision, unix_now()?],
+            ).map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        let current: Option<(String, u64, String)> = tx
+            .query_row(
+                "SELECT project_id,revision,internal_phase FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((project_id, current_revision, phase)) = current else {
+            return Err("Supervisor intervention TicketRun no longer exists".into());
+        };
+        if project_id != binding.project_id.as_str() {
+            return Err("Supervisor intervention TicketRun changed Project ownership".into());
+        }
+        if current_revision != revision || matches!(phase.as_str(), "done" | "canceled") {
+            tx.execute(
+                "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'rejected_by_host',?3)",
+                rusqlite::params![result.receipt.evidence_id(), current_revision.max(1), unix_now()?],
+            ).map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        tx.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'supervisor_intervention',?3,?4,90,?5,'pending',?6)",
+            rusqlite::params![project_id,role_session_id,result.receipt.evidence_id(),revision,payload_json,unix_now()?],
+        ).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'applied',?3)",
+            rusqlite::params![result.receipt.evidence_id(),revision,unix_now()?],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     pub fn acknowledge_committed_role_result(
         &mut self,
         owner_generation: u64,

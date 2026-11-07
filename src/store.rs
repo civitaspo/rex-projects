@@ -6269,6 +6269,125 @@ mod tests {
     }
 
     #[test]
+    fn human_instruction_atomically_notifies_coordinator_and_project_supervisor() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("instruction-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "instruction-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "instruction-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let namespace = TicketNamespace::parse("fixture").unwrap();
+        let ticket = TicketId::parse("T-1").unwrap();
+        let run = TicketRunId::parse("instruction-run").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &namespace,
+                &ticket,
+                &run,
+                1,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+        let first = store
+            .enqueue_coordinator_instruction(
+                generation,
+                &project_id,
+                &run,
+                &namespace,
+                &ticket,
+                0,
+                "human-request-1",
+                "Please stop and explain the failing test before changing code.",
+                10,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=1 WHERE ticket_run_id=?1",
+                [run.as_str()],
+            )
+            .unwrap();
+        let replay = store
+            .enqueue_coordinator_instruction(
+                generation,
+                &project_id,
+                &run,
+                &namespace,
+                &ticket,
+                0,
+                "human-request-1",
+                "Please stop and explain the failing test before changing code.",
+                11,
+            )
+            .unwrap();
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(first.wake_input_id, replay.wake_input_id);
+        assert_eq!(
+            first.supervisor_wake_input_id,
+            replay.supervisor_wake_input_id
+        );
+        assert_ne!(first.wake_input_id, first.supervisor_wake_input_id);
+        let wakes: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM role_wake_inputs WHERE source_id='human-request-1' AND lifecycle='pending'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(wakes, 2);
+        assert!(
+            store
+                .enqueue_coordinator_instruction(
+                    generation,
+                    &project_id,
+                    &run,
+                    &namespace,
+                    &ticket,
+                    0,
+                    "human-request-stale",
+                    "stale",
+                    12
+                )
+                .unwrap_err()
+                .contains("stale")
+        );
+    }
+
+    #[test]
     fn effect_restart_reconciles_same_identity_before_retry() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();

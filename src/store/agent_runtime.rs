@@ -268,6 +268,18 @@ pub enum LaunchPreparationOutcome {
     CapacityUnavailable,
 }
 
+fn ticket_has_active_child(
+    connection: &rusqlite::Connection,
+    project_id: &crate::domain::ids::ProjectId,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+) -> Result<bool, String> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_runs r JOIN agent_launch_authority a USING(agent_run_id) WHERE r.project_id=?1 AND a.ticket_run_id=?2 AND a.role!='coordinator' AND r.state IN ('launch_pending','running','parked','unknown'))",
+        params![project_id.as_str(), ticket_run_id.as_str()],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())
+}
+
 impl ConfigStore {
     pub fn agent_launch_project_epoch(
         &self,
@@ -942,6 +954,15 @@ impl ConfigStore {
         if active_same_session {
             return Ok(LaunchPreparationOutcome::CapacityUnavailable);
         }
+        if reservation.role == crate::domain::types::Role::Coordinator {
+            if let Some(ticket_run_id) = &reservation.ticket_run_id {
+                let active_child =
+                    ticket_has_active_child(&tx, &reservation.project_id, ticket_run_id)?;
+                if active_child {
+                    return Ok(LaunchPreparationOutcome::CapacityUnavailable);
+                }
+            }
+        }
         if let Some(parent_id) = &reservation.parent_run_id {
             let parent: Option<(String,String,String)> = tx
                 .query_row(
@@ -1070,7 +1091,7 @@ mod tests {
     use super::{
         ConfigStore, LaunchPreparationOutcome, LegacyWakeInput, LegacyWakeSnapshot,
         MAX_PROFILE_QUALIFICATION_CANDIDATES, legacy_wake_snapshot_digest,
-        migrate_v12_agent_wake_context,
+        migrate_v12_agent_wake_context, ticket_has_active_child,
     };
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision};
@@ -1079,6 +1100,42 @@ mod tests {
         AgentLaunchReservation, LAUNCH_SCHEMA_VERSION, ProviderQualification, QualificationProof,
         QualificationStatus, RexView, RexViewKind,
     };
+
+    #[test]
+    fn coordinator_waits_for_active_or_ambiguous_ticket_agents_to_finish() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,project_id TEXT,state TEXT);
+             CREATE TABLE agent_launch_authority(agent_run_id TEXT PRIMARY KEY,role TEXT,ticket_run_id TEXT);
+             INSERT INTO agent_runs VALUES ('worker-1','project-a','running');
+             INSERT INTO agent_launch_authority VALUES ('worker-1','worker','ticket-1');"
+        ).unwrap();
+        let project = ProjectId::parse("project-a").unwrap();
+        let ticket_run = crate::domain::ids::TicketRunId::parse("ticket-1").unwrap();
+        assert!(ticket_has_active_child(&connection, &project, &ticket_run).unwrap());
+        connection
+            .execute(
+                "UPDATE agent_runs SET state='unknown' WHERE agent_run_id='worker-1'",
+                [],
+            )
+            .unwrap();
+        assert!(ticket_has_active_child(&connection, &project, &ticket_run).unwrap());
+        connection
+            .execute(
+                "UPDATE agent_runs SET state='completed' WHERE agent_run_id='worker-1'",
+                [],
+            )
+            .unwrap();
+        assert!(!ticket_has_active_child(&connection, &project, &ticket_run).unwrap());
+        connection
+            .execute(
+                "INSERT INTO agent_runs VALUES ('other-project-worker','project-b','running')",
+                [],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO agent_launch_authority VALUES ('other-project-worker','worker','ticket-1')", []).unwrap();
+        assert!(!ticket_has_active_child(&connection, &project, &ticket_run).unwrap());
+    }
     use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
 
     fn digest(ch: char) -> Digest {

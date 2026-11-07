@@ -141,6 +141,7 @@ pub struct SupervisorDispatchAuthority {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoordinatorInstructionReceipt {
     pub wake_input_id: u64,
+    pub supervisor_wake_input_id: u64,
     pub project_id: ProjectId,
     pub ticket_run_id: TicketRunId,
     pub revision: u64,
@@ -317,6 +318,31 @@ impl TicketScanKey {
 }
 
 impl ConfigStore {
+    pub fn coordinator_instruction_scope(
+        &self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<(ProjectId, TicketNamespace, TicketId), String> {
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let row: Option<(String, String, String)> = tx.query_row(
+            "SELECT project_id,namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1 AND internal_phase NOT IN ('done','canceled')",
+            [ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((project, namespace, ticket)) = row else {
+            return Err("instruction target TicketRun does not exist or is terminal".into());
+        };
+        Ok((
+            ProjectId::parse(project)?,
+            TicketNamespace::parse(namespace)?,
+            TicketId::parse(ticket)?,
+        ))
+    }
+
     pub fn queue_due_supervisor_reviews(
         &mut self,
         owner_generation: u64,
@@ -925,9 +951,16 @@ impl ConfigStore {
         if stored_namespace != namespace.as_str() || stored_ticket != ticket_id.as_str() {
             return Err("Coordinator instruction target scope does not match the TicketRun".into());
         }
-        if revision != expected_revision || matches!(phase.as_str(), "done" | "canceled") {
-            return Err("Coordinator instruction is stale or the TicketRun is terminal".into());
-        }
+        let supervisor_role_session = format!("project:{}:supervisor", project_id.as_str());
+        let supervisor_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "human_instruction_notice",
+            "ticket_run_id": ticket_run_id.as_str(),
+            "revision": expected_revision,
+            "request_id": request_id,
+            "body_digest": body_digest.as_str(),
+        });
+        let supervisor_payload_json = supervisor_payload.to_string();
 
         let existing: Option<(u64, String)> = tx
             .query_row(
@@ -944,9 +977,23 @@ impl ConfigStore {
                         .into(),
                 );
             }
+            let supervisor_role_session = format!("project:{}:supervisor", project_id.as_str());
+            let supervisor_row: (u64, String) = tx.query_row(
+                "SELECT wake_input_id,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='human_instruction_notice' AND source_id=?3 AND source_revision=?4",
+                params![project_id.as_str(), supervisor_role_session, request_id, expected_revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|error| error.to_string())?
+                .ok_or("replayed instruction has no matching Supervisor notification")?;
+            if supervisor_row.1 != supervisor_payload_json {
+                return Err(
+                    "replayed instruction has a conflicting Supervisor notification".into(),
+                );
+            }
+            let supervisor_wake_input_id = supervisor_row.0;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(CoordinatorInstructionReceipt {
                 wake_input_id,
+                supervisor_wake_input_id,
                 project_id: project_id.clone(),
                 ticket_run_id: ticket_run_id.clone(),
                 revision: expected_revision,
@@ -954,15 +1001,24 @@ impl ConfigStore {
                 replayed: true,
             });
         }
+        if revision != expected_revision || matches!(phase.as_str(), "done" | "canceled") {
+            return Err("Coordinator instruction is stale or the TicketRun is terminal".into());
+        }
         tx.execute(
             "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'human_instruction',?3,?4,100,?5,'pending',?6)",
             params![project_id.as_str(), role_session_id, request_id, expected_revision, payload_json, now_unix],
         )
         .map_err(|error| error.to_string())?;
         let wake_input_id = tx.last_insert_rowid() as u64;
+        tx.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'human_instruction_notice',?3,?4,80,?5,'pending',?6)",
+            params![project_id.as_str(), supervisor_role_session, request_id, expected_revision, supervisor_payload_json, now_unix],
+        ).map_err(|error| error.to_string())?;
+        let supervisor_wake_input_id = tx.last_insert_rowid() as u64;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(CoordinatorInstructionReceipt {
             wake_input_id,
+            supervisor_wake_input_id,
             project_id: project_id.clone(),
             ticket_run_id: ticket_run_id.clone(),
             revision: expected_revision,
@@ -1390,8 +1446,8 @@ impl ConfigStore {
             return Err("goal ticket proposal must be canonical and match its digest".into());
         }
         ticket_request.validate()?;
-        let ticket_proposal = serde_json::to_value(&ticket_request.proposal)
-            .map_err(|error| error.to_string())?;
+        let ticket_proposal =
+            serde_json::to_value(&ticket_request.proposal).map_err(|error| error.to_string())?;
         if ticket_request.project_id != *project_id
             || ticket_request.namespace != *namespace
             || ticket_request.request_key != request_key
@@ -2159,7 +2215,10 @@ mod tests {
         use super::ConfigStore;
         use crate::store::MachineLock;
 
-        let path = std::env::temp_dir().join(format!("rex-ticket-observations-{}.sqlite", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "rex-ticket-observations-{}.sqlite",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch(
@@ -2185,7 +2244,12 @@ mod tests {
             status: TicketStatus::Ready,
         };
         let page = store.pending_ticket_observations(&key, 2).unwrap();
-        assert_eq!(page.iter().map(|item| item.ticket_id.as_str()).collect::<Vec<_>>(), ["first-a", "first-b"]);
+        assert_eq!(
+            page.iter()
+                .map(|item| item.ticket_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first-a", "first-b"]
+        );
         drop(store);
         let _ = std::fs::remove_file(path);
     }

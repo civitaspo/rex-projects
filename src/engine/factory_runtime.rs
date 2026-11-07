@@ -487,6 +487,12 @@ fn apply_agent_result(
         return apply_coordinator_spawn_request(store, owner_generation, config, services, result);
     }
     if binding.role == Role::Supervisor
+        && result.validated.kind == RoleOutputKind::Intervention
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return store.apply_supervisor_intervention(owner_generation, result);
+    }
+    if binding.role == Role::Supervisor
         && result.validated.kind == RoleOutputKind::TicketProposal
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
     {

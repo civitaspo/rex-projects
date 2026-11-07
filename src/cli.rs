@@ -110,6 +110,16 @@ enum HumanChoiceArg {
 
 #[derive(Debug, Subcommand)]
 enum TicketCommand {
+    Instruct {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        message_file: PathBuf,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     ReleaseClaim {
         namespace: String,
         ticket: String,
@@ -773,6 +783,79 @@ fn ticket_command(
 ) -> Result<(), CliError> {
     require_human_context()?;
     match command {
+        TicketCommand::Instruct {
+            run,
+            expected_revision,
+            message_file,
+            request_id,
+        } => {
+            let body = std::fs::read_to_string(&message_file).map_err(|error| {
+                CliError::usage(format!("cannot read instruction file: {error}"))
+            })?;
+            if body.is_empty() || body.len() > 64 * 1024 || body.contains('\0') {
+                return Err(CliError::usage(
+                    "instruction must be nonempty UTF-8 text no larger than 64 KiB",
+                ));
+            }
+            let state_root = selected_state_root(config_path, explicit_state_root)?;
+            let status = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
+            let owner_generation = status.owner_generation.ok_or_else(|| CliError::unavailable("no foreground machine controller is running; start `rex-projects runtime run` first"))?;
+            if !status.owner_is_live() {
+                return Err(CliError::unavailable(
+                    "controller ownership is stale or ambiguous; cannot submit an instruction",
+                ));
+            }
+            let ticket_run_id =
+                crate::domain::ids::TicketRunId::parse(run).map_err(CliError::usage)?;
+            let request_id = request_id.unwrap_or(generated_request_id()?);
+            let mut store =
+                ConfigStore::open_control(&state_root).map_err(CliError::unavailable)?;
+            let (project_id, namespace, ticket) = store
+                .coordinator_instruction_scope(owner_generation, &ticket_run_id)
+                .map_err(CliError::usage)?;
+            let receipt = store
+                .enqueue_coordinator_instruction(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    &namespace,
+                    &ticket,
+                    expected_revision,
+                    &request_id,
+                    &body,
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|error| CliError::unavailable(error.to_string()))?
+                        .as_secs() as i64,
+                )
+                .map_err(CliError::usage)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "request_id": request_id,
+                        "ticket_run_id": ticket_run_id,
+                        "revision": receipt.revision,
+                        "coordinator_wake_input_id": receipt.wake_input_id,
+                        "supervisor_wake_input_id": receipt.supervisor_wake_input_id,
+                        "body_digest": receipt.body_digest,
+                        "replayed": receipt.replayed,
+                    }))
+                    .map_err(|error| CliError::unavailable(error.to_string()))?
+                );
+            } else {
+                println!(
+                    "queued Coordinator wake {} and Supervisor notification {} for {}/{} at revision {}{}",
+                    receipt.wake_input_id,
+                    receipt.supervisor_wake_input_id,
+                    namespace,
+                    ticket,
+                    receipt.revision,
+                    if receipt.replayed { " (replayed)" } else { "" }
+                );
+            }
+            Ok(())
+        }
         TicketCommand::ReleaseClaim {
             namespace,
             ticket,

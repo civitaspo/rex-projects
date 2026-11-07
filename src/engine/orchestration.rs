@@ -1019,9 +1019,9 @@ fn validate_payload_artifacts(
         RoleResultPayload::ProfilePromotionProposal(value) => {
             references.extend(&value.evidence_references)
         }
+        RoleResultPayload::Intervention(value) => references.extend(&value.evidence),
         RoleResultPayload::TicketProposal(_)
         | RoleResultPayload::DispatchRequest(_)
-        | RoleResultPayload::Intervention(_)
         | RoleResultPayload::InvestigationRequest(_)
         | RoleResultPayload::PrepareWorktrees(_)
         | RoleResultPayload::PlanReady(_)
@@ -3434,6 +3434,46 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_intervention_evidence_must_be_declared() {
+        let artifact = RoleArtifactReference {
+            artifact_id: ArtifactId::parse("f".repeat(64)).unwrap(),
+            kind: RoleArtifactKind::General,
+            schema_version: 1,
+            path: "evidence/intervention.json".into(),
+            digest: test_digest('f'),
+            bytes: 10,
+        };
+        let mut binding = worker_result_binding();
+        binding.role = Role::Supervisor;
+        binding.role_session_id = RoleSessionId::parse("project:project-a:supervisor").unwrap();
+        binding.ticket_run_id = None;
+        binding.ticket_revision = None;
+        binding.parent_role = None;
+        binding.parent_run_id = None;
+        let payload = json!({
+            "coordinator_role_session_id": "ticket_run:ticket-run-1:coordinator",
+            "ticket_run_revision": 4,
+            "reason": "The implementation is taking longer than expected.",
+            "evidence": [artifact],
+            "proposed_plan_change": "Ask the Coordinator to narrow the remaining work."
+        });
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let mut submission = RoleResultSubmission {
+            schema_version: ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "intervention-1".into(),
+            binding: binding.clone(),
+            kind: RoleOutputKind::Intervention,
+            assertion: AgentAssertion::Succeeded,
+            result_digest: Digest::parse(format!("{:x}", Sha256::digest(encoded))).unwrap(),
+            structured_result: payload,
+            artifact_refs: vec![],
+        };
+        assert!(validate_role_result(&binding, submission.clone()).is_err());
+        submission.artifact_refs.push(artifact);
+        assert!(validate_role_result(&binding, submission).is_ok());
+    }
+
+    #[test]
     fn every_role_output_has_a_bounded_closed_generated_schema() {
         let kinds = [
             RoleOutputKind::Progress,
@@ -3901,6 +3941,7 @@ mod tests {
     #[test]
     fn role_session_id_deserialization_uses_constructor_validation() {
         assert!(RoleSessionId::parse("ticket_run:run-a:coordinator").is_ok());
+        assert!(RoleSessionId::parse("project:project-a:supervisor").is_ok());
         for invalid in [
             "../outside",
             "folder/session",
