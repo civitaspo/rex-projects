@@ -4,6 +4,7 @@ pub mod config;
 pub mod domain;
 pub mod effects;
 pub mod engine;
+pub mod environment;
 pub mod hooks;
 pub mod host_commit;
 pub mod human;

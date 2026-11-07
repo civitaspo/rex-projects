@@ -116,7 +116,7 @@ pub struct EnvironmentConfig {
     pub source: EnvironmentSource,
     #[serde(default)]
     pub shell: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_environment_interactive")]
     pub interactive: bool,
     #[serde(default = "default_environment_timeout")]
     pub timeout_seconds: u64,
@@ -127,23 +127,27 @@ impl Default for EnvironmentConfig {
         Self {
             source: default_environment_source(),
             shell: None,
-            interactive: false,
+            interactive: default_environment_interactive(),
             timeout_seconds: default_environment_timeout(),
         }
     }
 }
 
 fn default_environment_source() -> EnvironmentSource {
-    EnvironmentSource::Current
+    EnvironmentSource::LoginShell
 }
 fn default_environment_timeout() -> u64 {
     15
+}
+fn default_environment_interactive() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentSource {
-    Current,
+    #[serde(alias = "current")]
+    Inherit,
     LoginShell,
 }
 
@@ -798,14 +802,13 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
             "runtime.completed_blocks_to_keep must be less than runtime.max_blocks_per_tab".into(),
         );
     }
-    if runtime.environment.source == EnvironmentSource::LoginShell
-        && runtime
-            .environment
-            .shell
-            .as_deref()
-            .is_none_or(str::is_empty)
+    if runtime
+        .environment
+        .shell
+        .as_deref()
+        .is_some_and(str::is_empty)
     {
-        return Err("runtime.environment.shell is required when source is `login_shell`".into());
+        return Err("runtime.environment.shell must not be empty".into());
     }
     if config.adapters.tickets.kind != "command" {
         return Err("adapters.tickets.kind: only `command` is supported".into());
@@ -1632,9 +1635,24 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use super::{Config, ProjectConfig, ensure_acyclic_targets};
+    use super::{
+        Config, EnvironmentConfig, EnvironmentSource, ProjectConfig, ensure_acyclic_targets,
+    };
     use crate::domain::ids::{AdapterId, ProfileId, ProjectId};
     use crate::domain::types::{ProjectMode, Role};
+
+    #[test]
+    fn environment_defaults_to_bounded_interactive_login_shell_and_accepts_inherit() {
+        let defaults = toml::from_str::<EnvironmentConfig>("").unwrap();
+        assert_eq!(defaults.source, EnvironmentSource::LoginShell);
+        assert!(defaults.interactive);
+        assert_eq!(defaults.timeout_seconds, 15);
+
+        let legacy = toml::from_str::<EnvironmentConfig>("source = 'current'").unwrap();
+        assert_eq!(legacy.source, EnvironmentSource::Inherit);
+        let explicit = toml::from_str::<EnvironmentConfig>("source = 'inherit'").unwrap();
+        assert_eq!(explicit.source, EnvironmentSource::Inherit);
+    }
 
     #[test]
     fn checked_in_goal_and_operations_fixture_is_valid() {

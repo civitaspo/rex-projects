@@ -32,7 +32,7 @@
       "additionalProperties": false,
       "properties": {
         "interactive": {
-          "default": false,
+          "default": true,
           "type": "boolean"
         },
         "shell": {
@@ -44,7 +44,7 @@
         },
         "source": {
           "$ref": "#/$defs/EnvironmentSource",
-          "default": "current"
+          "default": "login_shell"
         },
         "timeout_seconds": {
           "default": 15,
@@ -57,7 +57,7 @@
     },
     "EnvironmentSource": {
       "enum": [
-        "current",
+        "inherit",
         "login_shell"
       ],
       "type": "string"
@@ -769,9 +769,9 @@
         "environment": {
           "$ref": "#/$defs/EnvironmentConfig",
           "default": {
-            "interactive": false,
+            "interactive": true,
             "shell": null,
-            "source": "current",
+            "source": "login_shell",
             "timeout_seconds": 15
           }
         },
@@ -1040,9 +1040,9 @@
         "completed_blocks_to_keep": 1,
         "completed_ticket_tab_retention_hours": 24,
         "environment": {
-          "interactive": false,
+          "interactive": true,
           "shell": null,
-          "source": "current",
+          "source": "login_shell",
           "timeout_seconds": 15
         },
         "external_poll_seconds": 30,
