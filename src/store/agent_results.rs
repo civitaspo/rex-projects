@@ -26,6 +26,21 @@ use crate::run_step_spool::{AgentTurnResult, StartRequestEnvelope};
 use crate::store::ConfigStore;
 
 const MAX_TERMINAL_BYTES: usize = 2 * 1024 * 1024;
+type ObsoleteConfigurationSourceRow = (
+    String,
+    String,
+    String,
+    String,
+    u32,
+    u64,
+    String,
+    String,
+    String,
+    u64,
+    u64,
+    String,
+    String,
+);
 
 /// An immutable host receipt proving that the persisted provider run completed and its observed
 /// process tree is absent. Its private fields prevent callers from manufacturing or deserializing
@@ -741,6 +756,130 @@ pub fn acknowledge_agent_result(
         return Err("cannot acknowledge missing role result evidence".into());
     }
     tx.commit().map_err(|error| error.to_string())
+}
+
+/// Acknowledge a host-validated Worker or Reviewer result when its Project configuration has
+/// changed, provided the TicketRun is still at the exact revision and phase that launched it.
+/// Evidence is retained, and the ACK is scoped to the TicketRun revision so config reloads do not
+/// make the same stale result eligible for reduction again.
+pub fn acknowledge_obsolete_configuration_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    binding: &RoleResultBinding,
+    evidence_id: &str,
+    active_config_digest: &Digest,
+) -> Result<bool, String> {
+    if !matches!(binding.role, Role::Worker | Role::Reviewer) {
+        return Err(
+            "obsolete configuration disposition only supports Worker and Reviewer results".into(),
+        );
+    }
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("obsolete configuration result lacks TicketRun scope")?;
+    let ticket_revision = binding
+        .ticket_revision
+        .ok_or("obsolete configuration result lacks TicketRun revision")?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    super::validate_active_generation(&tx, owner_generation)?;
+    let source: Option<ObsoleteConfigurationSourceRow> = tx.query_row(
+        "SELECT e.agent_run_id,e.project_id,e.role,e.ticket_run_id,e.attempt,e.run_epoch,a.authority_json,a.authority_digest,p.config_digest,p.config_revision,tr.revision,tr.internal_phase,tr.project_id FROM agent_result_evidence e JOIN agent_terminal_receipts t USING(agent_run_id) JOIN agent_launch_authority a USING(agent_run_id) JOIN projects p ON p.project_id=e.project_id JOIN ticket_runs tr ON tr.ticket_run_id=e.ticket_run_id WHERE e.evidence_id=?1 AND e.outcome='completed'",
+        [evidence_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((
+        run_id,
+        project_id,
+        role,
+        ticket_id,
+        attempt,
+        epoch,
+        authority_json,
+        authority_digest,
+        current_digest,
+        current_config_revision,
+        ticket_revision_now,
+        phase,
+        ticket_project,
+    )) = source
+    else {
+        return Err(
+            "obsolete configuration disposition requires host-validated result evidence".into(),
+        );
+    };
+    let expected_role = match binding.role {
+        Role::Worker => "worker",
+        Role::Reviewer => "reviewer",
+        _ => unreachable!(),
+    };
+    let authority: AgentLaunchAuthority = crate::protocol::parse_unique(authority_json.as_bytes())?;
+    if authority.digest()?.as_str() != authority_digest
+        || binding_for(&authority)? != *binding
+        || run_id != binding.agent_run_id.as_str()
+        || project_id != binding.project_id.as_str()
+        || role != expected_role
+        || ticket_id != ticket_run_id.as_str()
+        || attempt != binding.attempt
+        || epoch != binding.run_epoch
+        || ticket_project != binding.project_id.as_str()
+        || ticket_revision_now != ticket_revision.0
+    {
+        return Err(
+            "obsolete configuration result does not match its immutable authority and TicketRun"
+                .into(),
+        );
+    }
+    let expected_phase = match binding.role {
+        Role::Worker => "implementing",
+        Role::Reviewer => "reviewing",
+        _ => unreachable!(),
+    };
+    if phase != expected_phase {
+        return Err(
+            "obsolete configuration result is outside its exact active TicketRun phase".into(),
+        );
+    }
+    if current_digest != active_config_digest.as_str() {
+        return Err(
+            "Project configuration record differs from the active configuration snapshot".into(),
+        );
+    }
+    if binding.config_digest.as_str() == current_digest
+        && binding.config_revision.0 == current_config_revision
+    {
+        tx.commit().map_err(|error| error.to_string())?;
+        return Ok(false);
+    }
+    if current_config_revision == 0 || ticket_revision_now == 0 {
+        return Err("current Project and TicketRun revisions must be positive".into());
+    }
+    let existing: Option<(u64, String)> = tx
+        .query_row(
+            "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+            [evidence_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((revision, disposition)) = existing {
+        if revision != ticket_revision_now || disposition != "rejected_by_host" {
+            return Err(
+                "obsolete configuration result already has a different reducer acknowledgement"
+                    .into(),
+            );
+        }
+    } else {
+        let changed = tx.execute("INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) SELECT evidence_id,?2,'rejected_by_host',?3 FROM agent_result_evidence WHERE evidence_id=?1", params![evidence_id, ticket_revision_now, unix_now()?]).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("cannot acknowledge missing obsolete configuration result evidence".into());
+        }
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 /// Recover the ACK when a role transition committed but the process stopped before its separate
@@ -2676,7 +2815,7 @@ impl ConfigStore {
 pub(crate) mod host_validation_fixture {
     use super::*;
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
-    use crate::domain::ids::{ProfileId, Revision};
+    use crate::domain::ids::{OperationId, ProfileId, Revision};
     use crate::domain::types::{AgentAdapter, Role};
     use crate::launch::ObservedProviderStart;
     use crate::roles::RoleResultMessage;
@@ -2821,6 +2960,7 @@ pub(crate) mod host_validation_fixture {
             format!("fixture-{:?}", role).to_lowercase()
         };
         let parent_run_id = AgentRunId::parse("fixture-parent-run")?;
+        let parent_role_session_id = format!("ticket_run:{ticket_run_id}:coordinator");
         authority.parent_run_id = Some(parent_run_id.clone());
         authority.parent_role = Some(Role::Coordinator);
         authority.ticket_run_id = Some(ticket_run_id.clone());
@@ -2896,14 +3036,28 @@ pub(crate) mod host_validation_fixture {
         );
         authority.descriptor_digest = package.publish_once(&authority.descriptor_path)?;
         let parent_run_id_str = parent_run_id.as_str();
+        let mut parent_authority = authority.clone();
+        parent_authority.agent_run_id = parent_run_id.clone();
+        parent_authority.role = Role::Coordinator;
+        parent_authority.role_session_id = parent_role_session_id.clone();
+        parent_authority.parent_run_id = None;
+        parent_authority.parent_role = None;
+        parent_authority.operation_id = OperationId::parse("fixture-parent-operation")?;
+        parent_authority.rex_block_id = "fixture-parent-block".into();
+        parent_authority.descriptor_path = root.join("parent-package.json");
+        parent_authority.workspace_path = root.join("parent-workspace");
+        parent_authority.control_dir = root.join("parent-control");
+        parent_authority.validate()?;
+        let parent_authority_json =
+            serde_json::to_string(&parent_authority).map_err(|error| error.to_string())?;
+        let parent_authority_digest = parent_authority.digest()?;
         store.connection.execute(
-            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,'fixture-coordinator','fixture-owner',1,'fixture-parent-operation','running',?6)",
-            rusqlite::params![parent_run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, owner_generation],
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,?6,'coordinator','fixture-owner',1,'fixture-parent-operation','completed',?7)",
+            rusqlite::params![parent_run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, parent_role_session_id, owner_generation],
         ).map_err(|error| error.to_string())?;
-        let parent_authority_digest = "c".repeat(64);
         store.connection.execute(
-            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'coordinator','fixture-coordinator',?3,1,?4,?5,1,1,?6,'fixture-parent-operation',?7,?8,?8,'/fixture/parent-package',?8,'fixture-profile',?8,?8,?8,?9,'fixture-rex','fixture-session','fixture-window','fixture-parent-block','/fixture/workspace','/fixture/control',?8,'{}',?10,?11)",
-            rusqlite::params![parent_run_id_str, project_id.as_str(), ticket_run_id.as_str(), config_revision.0, config_digest, owner_generation, authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.qualification_receipt_digest.as_str(), parent_authority_digest, now],
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'coordinator',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
+            rusqlite::params![parent_authority.agent_run_id.as_str(), parent_authority.project_id.as_str(), parent_authority.role_session_id, parent_authority.ticket_run_id.as_ref().map(TicketRunId::as_str), parent_authority.ticket_revision.map(|revision| revision.0), parent_authority.config_revision.0, parent_authority.config_digest.as_str(), parent_authority.attempt, parent_authority.run_epoch, parent_authority.controller_generation, parent_authority.operation_id.as_str(), parent_authority.rex_view_id.as_str(), parent_authority.descriptor_digest.as_str(), parent_authority.runtime_binary_digest.as_str(), parent_authority.descriptor_path.display().to_string(), parent_authority.environment_snapshot_id.as_str(), parent_authority.profile_id.as_str(), parent_authority.profile_digest.as_str(), parent_authority.instruction_digest.as_str(), parent_authority.result_schema_digest.as_str(), parent_authority.qualification_receipt_digest.as_str(), parent_authority.rex_server_identity, parent_authority.rex_session_id, parent_authority.rex_window_id, parent_authority.rex_block_id, parent_authority.workspace_path.display().to_string(), parent_authority.control_dir.display().to_string(), parent_authority.mailbox_capability_digest.as_str(), parent_authority_json, parent_authority_digest.as_str(), now],
         ).map_err(|error| error.to_string())?;
         store.connection.execute(
             "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,'coordinator',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)",

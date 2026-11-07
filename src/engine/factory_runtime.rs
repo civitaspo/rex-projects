@@ -1455,6 +1455,15 @@ fn apply_reviewer_result(
     {
         return Err("Reviewer ReviewReady result is stale or outside Reviewing".into());
     }
+    if crate::store::agent_results::acknowledge_obsolete_configuration_result(
+        store,
+        owner_generation,
+        binding,
+        result.receipt.evidence_id(),
+        services.configuration_digest(),
+    )? {
+        return Ok(true);
+    }
     let project_record = store
         .project(&binding.project_id)?
         .ok_or("Reviewer result Project has no durable configuration record")?;
@@ -1885,6 +1894,15 @@ fn apply_worker_result(
         || run.phase != Phase::Implementing
     {
         return Err("Worker ImplementationReady result is stale or outside Implementing".into());
+    }
+    if crate::store::agent_results::acknowledge_obsolete_configuration_result(
+        store,
+        owner_generation,
+        binding,
+        result.receipt.evidence_id(),
+        services.configuration_digest(),
+    )? {
+        return Ok(true);
     }
     let project_record = store
         .project(&binding.project_id)?
@@ -3153,6 +3171,525 @@ pub(crate) mod tests {
                 .pending_validated_agent_results(&fixture.artifacts, fixture.owner_generation, 8)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn obsolete_host_validated_worker_result_is_acknowledged_without_publication() {
+        use crate::domain::ids::Digest;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use serde_json::json;
+
+        let structured_result = json!({
+            "change_references": [{
+                "repository": "repo-a", "worktree_id": "node-a", "commit_mode": "native",
+                "base_commit": "0000000000000000000000000000000000000000",
+                "previous_head": "1111111111111111111111111111111111111111",
+                "branch_head": "2222222222222222222222222222222222222222",
+                "commit_shas": ["2222222222222222222222222222222222222222"]
+            }],
+            "completed_acceptance_items": ["tests pass"],
+            "unresolved_items": [], "irregularity_references": []
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Worker,
+                RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "obsolete-config-worker-result".into(),
+                    kind: RoleOutputKind::ImplementationReady,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result,
+                    result_digest,
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let current_digest = Digest::parse("b".repeat(64)).unwrap();
+        let mut snapshot = fixture
+            .store
+            .load_snapshot("fixture")
+            .unwrap()
+            .unwrap()
+            .config;
+        let config: Config = serde_json::from_value(json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind": "command", "command": ["ticket-cli"]}},
+            "projects": {"fixture-project": {
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "goal": {"revision": 1, "statement": "fixture goal", "acceptance": ["resume the ticket"]},
+                "roles": {"supervisor": "fixture-profile", "coordinator": "fixture-profile"}
+            }}
+        }))
+        .unwrap();
+        let profile: crate::config::Profile = serde_json::from_value(json!({
+            "adapter": "codex", "command": ["/bin/codex"], "model": "fixture",
+            "commit_mode": "native", "turn_timeout_seconds": 60
+        }))
+        .unwrap();
+        let profile_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::store::canonical_json(&profile).unwrap().as_bytes())
+        ))
+        .unwrap();
+        snapshot.config = config.clone();
+        snapshot.profiles = std::collections::BTreeMap::from([(
+            crate::domain::ids::ProfileId::parse("fixture-profile").unwrap(),
+            profile,
+        )]);
+        snapshot.digest = current_digest.clone();
+        let applied = fixture
+            .store
+            .apply_snapshot(
+                "fixture",
+                &snapshot,
+                crate::store::ExpectedRevision::Current(crate::domain::ids::Revision(1)),
+            )
+            .unwrap();
+        assert_eq!(applied.revision.0, 2);
+        let project_id = crate::domain::ids::ProjectId::parse("fixture-project").unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
+            .unwrap();
+
+        let existing_qualification_json: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT receipt_json FROM provider_qualifications WHERE project_id='fixture-project' AND profile_id='fixture-profile' ORDER BY created_at_unix LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut qualification: crate::launch::ProviderQualification =
+            crate::protocol::parse_unique(existing_qualification_json.as_bytes()).unwrap();
+        qualification.profile_digest = profile_digest.clone();
+        let qualification_digest = fixture
+            .store
+            .store_provider_qualification(fixture.owner_generation, &qualification)
+            .unwrap();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest: current_digest.clone(),
+            published_effect: None,
+        };
+
+        assert!(
+            super::apply_agent_result(
+                &mut fixture.store,
+                fixture.owner_generation,
+                10,
+                &config,
+                &mut services,
+                &fixture.ingested
+            )
+            .unwrap()
+        );
+        assert!(services.published_effect.is_none());
+        let ack = crate::store::agent_results::host_validation_fixture::result_ack(
+            &fixture.store,
+            fixture.ingested.receipt.evidence_id(),
+        )
+        .unwrap();
+        assert_eq!(ack, Some((4, "rejected_by_host".into())));
+        assert!(
+            super::apply_agent_result(
+                &mut fixture.store,
+                fixture.owner_generation,
+                10,
+                &config,
+                &mut services,
+                &fixture.ingested
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                fixture.ingested.receipt.evidence_id()
+            )
+            .unwrap(),
+            Some((4, "rejected_by_host".into()))
+        );
+
+        let project = ProjectId::parse("fixture-project").unwrap();
+        let ticket_run = crate::domain::ids::TicketRunId::parse("fixture-ticket-run").unwrap();
+        let coordinator_session = format!("ticket_run:{ticket_run}:coordinator");
+        let pending_wakes = fixture
+            .store
+            .pending_role_wake_inputs(&project, &coordinator_session, 256)
+            .unwrap();
+        assert_eq!(pending_wakes.len(), 1);
+        assert_eq!(pending_wakes[0].source_type, "agent_result");
+        assert_eq!(
+            pending_wakes[0].source_id,
+            fixture.ingested.receipt.evidence_id()
+        );
+
+        let supervisor_view_id = crate::launch::RexView::derive_id(
+            &project,
+            crate::launch::RexViewKind::Supervisor,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        fixture
+            .store
+            .register_rex_view(
+                fixture.owner_generation,
+                &crate::launch::RexView {
+                    view_id: supervisor_view_id.clone(),
+                    project_id: project.clone(),
+                    kind: crate::launch::RexViewKind::Supervisor,
+                    ticket_namespace: None,
+                    ticket_id: None,
+                    view_epoch: 1,
+                    rex_server_identity: "fixture-rex".into(),
+                    rex_session_id: "fixture-supervisor-session".into(),
+                    rex_window_id: "fixture-supervisor-window".into(),
+                },
+            )
+            .unwrap();
+
+        // The pre-existing Supervisor is a fixture prerecord; register its typed authority
+        // through the production verifier so the replan has a valid parent lineage.
+        let supervisor_run_id =
+            crate::domain::ids::AgentRunId::parse("fixture-supervisor-run").unwrap();
+        let supervisor_operation =
+            crate::domain::ids::OperationId::parse("fixture-supervisor-operation").unwrap();
+        let supervisor_session = format!("project:{project}:supervisor");
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'fixture',?3,?4,?5,'supervisor','fixture-owner',1,?6,'launch_pending',?7)",
+                rusqlite::params![
+                    supervisor_run_id.as_str(), project.as_str(), applied.revision.0,
+                    current_digest.as_str(), supervisor_session, supervisor_operation.as_str(),
+                    fixture.owner_generation
+                ],
+            )
+            .unwrap();
+        let supervisor_control = fixture._temp.path().join("supervisor-control");
+        std::fs::create_dir(&supervisor_control).unwrap();
+        let supervisor_mailbox_digest = Digest::parse("c".repeat(64)).unwrap();
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,9999999999,1048576,32)",
+                rusqlite::params![
+                    supervisor_run_id.as_str(), supervisor_control.display().to_string(),
+                    supervisor_mailbox_digest.as_str()
+                ],
+            )
+            .unwrap();
+        let supervisor_authority = crate::launch::AgentLaunchAuthority {
+            agent_run_id: supervisor_run_id.clone(),
+            project_id: project.clone(),
+            role: Role::Supervisor,
+            role_session_id: supervisor_session,
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: applied.revision,
+            config_digest: current_digest.clone(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: fixture.owner_generation,
+            operation_id: supervisor_operation,
+            operation_recipe_id: None,
+            rex_view_id: supervisor_view_id,
+            descriptor_digest: Digest::parse("d".repeat(64)).unwrap(),
+            runtime_binary_digest: Digest::parse("e".repeat(64)).unwrap(),
+            descriptor_path: fixture._temp.path().join("supervisor-package.json"),
+            environment_snapshot_id: Digest::parse("f".repeat(64)).unwrap(),
+            profile_id: crate::domain::ids::ProfileId::parse("fixture-profile").unwrap(),
+            profile_digest: profile_digest.clone(),
+            instruction_digest: Digest::parse("1".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("2".repeat(64)).unwrap(),
+            wake_snapshot_digest: Digest::parse("3".repeat(64)).unwrap(),
+            qualification_receipt_digest: qualification_digest.clone(),
+            rex_server_identity: "fixture-rex".into(),
+            rex_session_id: "fixture-supervisor-session".into(),
+            rex_window_id: "fixture-supervisor-window".into(),
+            rex_block_id: "fixture-supervisor-block".into(),
+            workspace_path: fixture._temp.path().join("supervisor-workspace"),
+            control_dir: supervisor_control,
+            mailbox_capability_digest: supervisor_mailbox_digest,
+        };
+        fixture
+            .store
+            .register_agent_launch_authority(fixture.owner_generation, &supervisor_authority)
+            .unwrap();
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE agent_runs SET state='running' WHERE agent_run_id=?1",
+                [supervisor_run_id.as_str()],
+            )
+            .unwrap();
+
+        let worker_authority = fixture
+            .store
+            .agent_launch_authority(
+                &crate::domain::ids::AgentRunId::parse("fixture-agent-run").unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let original_coordinator_id =
+            crate::domain::ids::AgentRunId::parse("fixture-parent-run").unwrap();
+        assert_eq!(
+            worker_authority.parent_run_id,
+            Some(original_coordinator_id.clone())
+        );
+        assert_eq!(worker_authority.parent_role, Some(Role::Coordinator));
+        let original_coordinator = fixture
+            .store
+            .agent_launch_authority(&original_coordinator_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original_coordinator.role, Role::Coordinator);
+        assert_eq!(original_coordinator.role_session_id, coordinator_session);
+        let view_id = worker_authority.rex_view_id.clone();
+        let wake_run_id =
+            crate::domain::ids::AgentRunId::parse("fixture-coordinator-replan").unwrap();
+        let wake_items = pending_wakes
+            .iter()
+            .map(|wake| crate::agent_api::AgentWakeItem {
+                wake_input_id: wake.wake_input_id,
+                source_type: wake.source_type.clone(),
+                source_id: wake.source_id.clone(),
+                source_revision: wake.source_revision,
+                priority: wake.priority,
+                payload_json: wake.payload_json.clone(),
+                host_artifacts: Vec::new(),
+            })
+            .collect();
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project.clone(),
+            role_session_id: coordinator_session.clone(),
+            agent_run_id: wake_run_id.as_str().into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: wake_items,
+        };
+        wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+        let workspace = fixture._temp.path().join("coordinator-replan-workspace");
+        let control = fixture._temp.path().join("coordinator-replan-control");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        let runnable = fixture
+            .store
+            .runnable_projects(fixture.owner_generation)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.record.id == project)
+            .unwrap();
+        assert_eq!(runnable.record.config_revision, applied.revision);
+        assert_eq!(runnable.record.config_digest, current_digest);
+        let reservation = crate::launch::AgentLaunchReservation {
+            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+            agent_run_id: wake_run_id.clone(),
+            project_id: project.clone(),
+            role: Role::Coordinator,
+            role_session_id: coordinator_session.clone(),
+            parent_run_id: Some(supervisor_run_id.clone()),
+            parent_role: Some(Role::Supervisor),
+            ticket_run_id: Some(ticket_run.clone()),
+            ticket_revision: Some(crate::domain::ids::Revision(4)),
+            config_revision: applied.revision,
+            config_digest: current_digest.clone(),
+            attempt: 1,
+            run_epoch: 2,
+            controller_generation: fixture.owner_generation,
+            project_epoch: runnable.project_epoch,
+            operation_id: crate::domain::ids::OperationId::parse("fixture-coordinator-replan-op")
+                .unwrap(),
+            operation_recipe_id: None,
+            worker_assignment: None,
+            rex_view_id: view_id.clone(),
+            runtime_binary_digest: Digest::parse("4".repeat(64)).unwrap(),
+            environment_snapshot_id: Digest::parse("5".repeat(64)).unwrap(),
+            profile_id: crate::domain::ids::ProfileId::parse("fixture-profile").unwrap(),
+            profile_digest: profile_digest.clone(),
+            instruction_digest: Digest::parse("6".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("7".repeat(64)).unwrap(),
+            wake_snapshot: wake_snapshot.clone(),
+            qualification_receipt_digest: qualification_digest.clone(),
+            descriptor_path: fixture._temp.path().join("coordinator-replan-package.json"),
+            workspace_path: workspace.clone(),
+            control_dir: control.clone(),
+            mailbox_directory: control,
+            mailbox_capability_digest: Digest::parse("8".repeat(64)).unwrap(),
+            mailbox_expires_at_unix: 9_999_999_999,
+            mailbox_max_request_bytes: 1_048_576,
+            mailbox_max_pending_requests: 32,
+            pool: "agent".into(),
+            slot_index: 0,
+            global_capacity: 4,
+            project_capacity: 4,
+        };
+        let reservation_digest = reservation.digest().unwrap();
+        assert!(matches!(
+            fixture.store.prepare_role_launch(&reservation).unwrap(),
+            crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. }
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .agent_launch_reservation(&wake_run_id, &reservation_digest)
+                .unwrap(),
+            Some(reservation.clone())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .verified_provider_qualifications(
+                    &project,
+                    &reservation.profile_id,
+                    &reservation.profile_digest,
+                    4,
+                )
+                .unwrap(),
+            vec![qualification.clone()]
+        );
+        let authority = crate::launch::AgentLaunchAuthority {
+            agent_run_id: wake_run_id.clone(),
+            project_id: project.clone(),
+            role: Role::Coordinator,
+            role_session_id: coordinator_session.clone(),
+            parent_run_id: reservation.parent_run_id.clone(),
+            parent_role: reservation.parent_role,
+            ticket_run_id: Some(ticket_run.clone()),
+            ticket_revision: reservation.ticket_revision,
+            config_revision: reservation.config_revision,
+            config_digest: reservation.config_digest.clone(),
+            attempt: reservation.attempt,
+            run_epoch: reservation.run_epoch,
+            controller_generation: reservation.controller_generation,
+            operation_id: reservation.operation_id.clone(),
+            operation_recipe_id: reservation.operation_recipe_id.clone(),
+            rex_view_id: reservation.rex_view_id.clone(),
+            descriptor_digest: Digest::parse("9".repeat(64)).unwrap(),
+            runtime_binary_digest: reservation.runtime_binary_digest.clone(),
+            descriptor_path: reservation.descriptor_path.clone(),
+            environment_snapshot_id: reservation.environment_snapshot_id.clone(),
+            profile_id: reservation.profile_id.clone(),
+            profile_digest: reservation.profile_digest.clone(),
+            instruction_digest: reservation.instruction_digest.clone(),
+            result_schema_digest: reservation.result_schema_digest.clone(),
+            wake_snapshot_digest: wake_snapshot.digest.clone(),
+            qualification_receipt_digest: reservation.qualification_receipt_digest.clone(),
+            rex_server_identity: worker_authority.rex_server_identity,
+            rex_session_id: worker_authority.rex_session_id,
+            rex_window_id: worker_authority.rex_window_id,
+            rex_block_id: "fixture-coordinator-replan-block".into(),
+            workspace_path: reservation.workspace_path.clone(),
+            control_dir: reservation.control_dir.clone(),
+            mailbox_capability_digest: reservation.mailbox_capability_digest.clone(),
+        };
+        fixture
+            .store
+            .register_agent_launch_authority(fixture.owner_generation, &authority)
+            .unwrap();
+        fixture
+            .store
+            .register_rex_view_block(
+                fixture.owner_generation,
+                &crate::launch::RexViewBlock {
+                    view_id: reservation.rex_view_id.clone(),
+                    block_id: authority.rex_block_id.clone(),
+                    agent_run_id: Some(wake_run_id.clone()),
+                    role: Some(Role::Coordinator),
+                    ownership: crate::launch::RexBlockOwnership::Factory,
+                    lifecycle: crate::launch::RexBlockLifecycle::Active,
+                    process_absent_confirmed: false,
+                    retained_until_unix: None,
+                },
+            )
+            .unwrap();
+        fixture
+            .store
+            .finalize_agent_launch_reservation(
+                fixture.owner_generation,
+                &wake_run_id,
+                &reservation_digest,
+                &authority,
+            )
+            .unwrap();
+        let (persisted_wake_digest, persisted_wake_json): (String, String) = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT snapshot_digest,snapshot_json FROM agent_wake_context WHERE agent_run_id=?1",
+                [wake_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let persisted_wake: crate::agent_api::AgentWakeSnapshot =
+            crate::protocol::parse_unique(persisted_wake_json.as_bytes()).unwrap();
+        assert_eq!(persisted_wake_digest, wake_snapshot.digest.as_str());
+        assert_eq!(persisted_wake, wake_snapshot);
+        assert!(matches!(
+            fixture.store.prepare_role_launch(&reservation).unwrap(),
+            crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. }
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .agent_launch_reservation(&wake_run_id, &reservation_digest)
+                .unwrap(),
+            Some(reservation)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT count(*) FROM agent_result_wakes WHERE evidence_id=?1",
+                    [fixture.ingested.receipt.evidence_id()],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "replaying the rejected result must not add a duplicate Coordinator wake"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT count(*) FROM agent_runs WHERE role_session_id=?1 AND role='coordinator'",
+                    [&coordinator_session],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            2,
+            "result replay must not reserve another Coordinator AgentRun"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT revision FROM ticket_runs WHERE ticket_run_id=?1",
+                    [ticket_run.as_str()],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            4,
+            "replanning must keep the TicketRun revision bound by the Worker result"
         );
     }
 
