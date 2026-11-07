@@ -2811,6 +2811,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn wrapper_exit_still_cleans_observed_descendants_by_kernel_identity() {
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let executable = root.path().join("wrapper-exits-with-child");
+        let child_pid_path = root.path().join("child.pid");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n(trap '' INT; while :; do /bin/sleep 1; done) &\nchild=$!\necho \"$child\" > '{}'\nwait\n",
+                child_pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        turn.shutdown_grace = Duration::from_millis(50);
+        let canceller = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            super::PENDING_SIGNAL.store(libc::SIGTERM, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mut observer = SystemProcessObserver;
+        let result = run_fixture_turn(&turn, &mut observer).unwrap();
+        canceller.join().unwrap();
+
+        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+        let child_pid: u32 = fs::read_to_string(child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let remaining = process::inspect_process_table().unwrap();
+        assert!(
+            !remaining.iter().any(|identity| identity.pid == child_pid),
+            "the observed child must be gone after confirmed cleanup"
+        );
+        assert!(result.receipt.processes.iter().any(|identity| {
+            identity.pid == child_pid
+                && identity.identity_quality == "kernel_birth_token"
+                && !identity.start_identity.is_empty()
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fake_provider_rejects_changed_conversation_and_invalid_result() {
         let _run_lock = TEST_RUN_LOCK.lock().unwrap();
         let root = tempdir().unwrap();
