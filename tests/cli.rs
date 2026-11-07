@@ -79,12 +79,21 @@ impl Drop for ForegroundOwner {
 }
 
 fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::Path) -> Command {
+    let path = std::iter::once(home.join("bin"))
+        .chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ))
+        .collect::<Vec<_>>();
     let mut command = Command::new(env!("CARGO_BIN_EXE_rex-projects"));
     command
         .args(["--config"])
         .arg(config)
         .args(["--state-root"])
         .arg(state)
+        .env(
+            "PATH",
+            std::env::join_paths(path).expect("join fixture PATH"),
+        )
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"));
@@ -95,10 +104,37 @@ fn fixture(
     temp: &tempfile::TempDir,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let config = temp.path().join("factory.toml");
+    let test_binary = std::env::current_exe().expect("locate CLI test executable");
+    let xtask = test_binary
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("CLI test binary is under target/debug/deps")
+        .join(if cfg!(windows) { "xtask.exe" } else { "xtask" });
+    assert!(xtask.is_file(), "workspace xtask binary is available");
+    let ticket_database = temp.path().join("ticket-adapter.sqlite3");
+    let ticket_command = serde_json::to_string(&[
+        xtask.to_string_lossy().into_owned(),
+        "fixture".to_owned(),
+        "ticket".to_owned(),
+        "--database".to_owned(),
+        ticket_database.to_string_lossy().into_owned(),
+        "--namespace".to_owned(),
+        "fixture/cli".to_owned(),
+    ])
+    .expect("encode the generic fixture command as TOML-compatible JSON");
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
     )
     .unwrap();
+    let source = source
+        .replace(
+            "command = [\"/absolute/path/to/ticket-adapter\"]",
+            &format!("command = {ticket_command}"),
+        )
+        .replace(
+            "https://example.invalid/team/example.git",
+            "https://github.com/example/example.git",
+        );
     std::fs::write(
         &config,
         source.replacen(
@@ -117,17 +153,26 @@ fn fixture(
     for profile in ["judgment_claude", "worker_codex"] {
         let destination = profiles.join(profile);
         std::fs::create_dir_all(&destination).unwrap();
-        for file in ["config.toml", "instructions.md"] {
-            std::fs::copy(
-                profile_source.join(profile).join(file),
-                destination.join(file),
-            )
-            .unwrap();
-        }
+        let profile_config =
+            std::fs::read_to_string(profile_source.join(profile).join("config.toml"))
+                .unwrap()
+                .replace("/absolute/path/to/claude", &xtask.to_string_lossy())
+                .replace("/absolute/path/to/codex", &xtask.to_string_lossy());
+        std::fs::write(destination.join("config.toml"), profile_config).unwrap();
+        std::fs::copy(
+            profile_source.join(profile).join("instructions.md"),
+            destination.join("instructions.md"),
+        )
+        .unwrap();
     }
     let state = temp.path().join("runtime");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
+    let fixture_bin = home.join("bin");
+    std::fs::create_dir_all(&fixture_bin).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&xtask, fixture_bin.join("gh"))
+        .expect("provide the Rust fixture executable as the unused gh tool path");
     (config, state, home)
 }
 
@@ -474,10 +519,13 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(
-        applied,
-        "active controller did not apply and load the durable config snapshot"
-    );
+    if !applied {
+        owner.terminate();
+        let stderr = owner.stderr_tail();
+        panic!(
+            "active controller did not apply and load the durable config snapshot; stderr: {stderr}"
+        );
+    }
 
     let mut stale_config = std::fs::read_to_string(&config).unwrap();
     stale_config = stale_config.replace(
