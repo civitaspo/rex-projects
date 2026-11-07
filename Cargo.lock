@@ -390,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fs2",
+ "libc",
  "rusqlite",
  "schemars",
  "serde",
