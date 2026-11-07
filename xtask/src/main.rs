@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod fixtures;
 mod release;
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,20 @@ enum Command {
         #[arg(long)]
         write: bool,
     },
+    /// Run deterministic external-protocol fixtures for integration tests.
+    Fixture {
+        #[command(subcommand)]
+        fixture: FixtureCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FixtureCommand {
+    /// Emulate the operations adapter protocol with durable local state.
+    Operations {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
 }
 
 fn default_repository_root() -> PathBuf {
@@ -81,5 +96,8 @@ fn run(cli: Cli) -> Result<(), String> {
             check: _,
             write,
         } => release::refresh_pin(&default_repository_root(), &pin_path, &gh, write),
+        Command::Fixture { fixture } => match fixture {
+            FixtureCommand::Operations { state_dir } => fixtures::operations::run(&state_dir),
+        },
     }
 }
