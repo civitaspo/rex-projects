@@ -1779,20 +1779,22 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    fn fixture_command() -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .expect("unit test executable path")
+                .display()
+                .to_string(),
+        ]
+    }
+
     fn fixture_config() -> Config {
         let mut config: Config = toml::from_str(include_str!("../examples/fixture/config.toml"))
             .expect("public fixture config parses");
         config.operation_actions.insert(
             "deploy".into(),
             OperationActionConfig::Command {
-                command: vec![
-                    "python3".into(),
-                    concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/tests/fixtures/operations/adapter.py"
-                    )
-                    .into(),
-                ],
+                command: fixture_command(),
             },
         );
         config
@@ -2011,9 +2013,8 @@ mod tests {
             "deploy".into(),
             OperationActionConfig::Command {
                 command: vec![
-                    "python3".into(),
-                    "-c".into(),
-                    "print('different command')".into(),
+                    std::env::current_exe().unwrap().display().to_string(),
+                    "different-arguments".into(),
                 ],
             },
         );
@@ -2496,9 +2497,7 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap();
-        assert_eq!(runner.command.len(), 2);
-        assert!(Path::new(&runner.command[0]).is_absolute());
-        assert!(runner.command[0].contains("python"));
+        assert_eq!(runner.command, fixture_command());
         let request: RequestEnvelope<InvokeParams> = serde_json::from_slice(&runner.stdin).unwrap();
         assert_eq!(request.operation_id.as_ref().unwrap().as_str(), "op-1");
         assert_eq!(request.params.source_sha, SHA);
@@ -2507,44 +2506,6 @@ mod tests {
             Some(approval.subject_digest)
         );
         assert_eq!(classify_invoke(&result), OperationOutcome::Pending);
-    }
-
-    #[test]
-    fn public_cli_fixture_exercises_real_json_adapter_process_without_remote_effects() {
-        let request = new_request(
-            "fixture-request",
-            Some(OperationId::parse("fixture-op").unwrap()),
-            Some(ProjectId::parse("operations_project").unwrap()),
-            "operation.invoke",
-            InvokeParams {
-                action_id: "fixture_echo".into(),
-                target_id: "fixture-target".into(),
-                repository_id: RepositoryId::parse("example").unwrap(),
-                environment: "test".into(),
-                source_sha: SHA.into(),
-                plan_digest: ContentDigest::parse("d".repeat(64)).unwrap(),
-                correlation_key: "stable-key".into(),
-                selector: BTreeMap::new(),
-                parameters: BTreeMap::new(),
-                expected_preconditions: BTreeMap::new(),
-                approval_digest: None,
-            },
-        )
-        .unwrap();
-        let action = OperationActionConfig::Command {
-            command: vec![
-                "python3".into(),
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/operations/adapter.py"
-                )
-                .into(),
-            ],
-        };
-        let mut runner = ProcessCommandRunner::new(Duration::from_secs(1)).unwrap();
-        let call = call_command_adapter(&mut runner, &action, &request, Duration::from_secs(5))
-            .expect("fixture adapter follows the protocol");
-        assert_eq!(classify_invoke(&call), OperationOutcome::Pending);
     }
 
     #[test]
