@@ -195,6 +195,7 @@ impl FactoryRuntime {
         config: &Config,
         services: &mut impl FactoryRuntimeServices,
     ) -> Result<FactoryTickReport, String> {
+        store.activate_starting_projects(owner_generation)?;
         let agent_result = services.ingest_one_agent_result(store, owner_generation, now_unix)?;
         let ingested_agent_result = if let Some(result) = &agent_result {
             apply_agent_result(store, owner_generation, now_unix, config, services, result)?

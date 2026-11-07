@@ -2131,6 +2131,22 @@ impl ConfigStore {
         Ok(epoch)
     }
 
+    pub fn activate_starting_projects(&mut self, owner_generation: u64) -> Result<usize, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let activated = tx
+            .execute(
+                "UPDATE project_runtimes SET observed_lifecycle='running' WHERE desired_lifecycle='running' AND observed_lifecycle='starting' AND controller_generation=?1",
+                [owner_generation],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(activated)
+    }
+
     pub fn reserve_next_ready(
         &mut self,
         owner_generation: u64,
@@ -5682,6 +5698,71 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn controller_activates_only_its_starting_projects() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("payments").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            mode: "goal".into(),
+            goal_revision: 1,
+            desired_lifecycle: "stopped".into(),
+            state_revision: Revision(0),
+        };
+        store.insert_project(&project).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "activation-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        ConfigStore::append_control(
+            temp.path(),
+            "start-payments",
+            &super::ControlCommand {
+                request_id: "start-payments".into(),
+                kind: "project_lifecycle".into(),
+                project_id: Some(project.id.clone()),
+                lifecycle: Some("running".into()),
+                created_at_unix: 1,
+                applied_config: None,
+            },
+            generation,
+        )
+        .unwrap();
+        store.process_next_control(generation).unwrap().unwrap();
+        assert_eq!(
+            ConfigStore::status(temp.path()).unwrap().projects[0].observed_lifecycle,
+            "starting"
+        );
+
+        assert_eq!(store.activate_starting_projects(generation).unwrap(), 1);
+        assert_eq!(
+            ConfigStore::status(temp.path()).unwrap().projects[0].observed_lifecycle,
+            "running"
+        );
+        assert_eq!(store.activate_starting_projects(generation).unwrap(), 0);
     }
 
     #[test]
