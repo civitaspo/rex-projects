@@ -380,7 +380,7 @@ def main() -> int:
                         "login": False,
                         "command": [sys.executable, str(FIXTURES / "wait_probe.py"),
                                     "--ready-file", str(session_child_ready),
-                                    "--stop-file", str(session_child_stop), "--timeout-seconds", "20"],
+                                    "--stop-file", str(session_child_stop), "--timeout-seconds", str(probe_lifetime)],
                         "cwd": str(args.artifacts),
                         "exit": {"on_completion": False},
                     },
