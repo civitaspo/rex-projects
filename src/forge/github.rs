@@ -526,12 +526,8 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                     .and_then(|item| item.get("html_url"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                resulting_head_sha: response
-                    .records
-                    .first()
-                    .and_then(|item| item.get("sha"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                // The merge endpoint's `sha` is the resulting merge commit, not a new PR head.
+                resulting_head_sha: None,
                 resulting_merge_sha: response.records.first().and_then(|item| {
                     item.get("merge_commit_sha")
                         .and_then(Value::as_str)
@@ -1470,10 +1466,15 @@ mod tests {
         }
     }
 
-    fn fixture_forge(reply: Value) -> GitHubCliForge<FixtureRunner> {
+    fn fixture_forge_responses(replies: Vec<Value>) -> GitHubCliForge<FixtureRunner> {
         GitHubCliForge::new(
             FixtureRunner {
-                replies: Mutex::new(VecDeque::from([serde_json::to_vec(&reply).unwrap()])),
+                replies: Mutex::new(
+                    replies
+                        .into_iter()
+                        .map(|reply| serde_json::to_vec(&reply).unwrap())
+                        .collect(),
+                ),
                 requests: Mutex::new(Vec::new()),
             },
             PathBuf::from("/usr/bin/gh"),
@@ -1486,6 +1487,10 @@ mod tests {
             5,
         )
         .unwrap()
+    }
+
+    fn fixture_forge(reply: Value) -> GitHubCliForge<FixtureRunner> {
+        fixture_forge_responses(vec![reply])
     }
 
     fn test_pull() -> PullRequestRef {
@@ -1584,6 +1589,46 @@ mod tests {
         assert!(!human_approval_current(Some(500), Some(500)));
         assert!(!human_approval_current(Some(500), None));
         assert!(human_approval_current(None, None));
+    }
+
+    #[test]
+    fn successful_merge_ack_does_not_mislabel_merge_sha_as_pr_head() {
+        let head_sha = "a".repeat(40);
+        let base_sha = "b".repeat(40);
+        let merge_sha = "c".repeat(40);
+        let body = "PR body";
+        let forge = fixture_forge_responses(vec![
+            serde_json::json!({
+                "id": 1,
+                "node_id": "PR_node",
+                "number": 7,
+                "state": "open",
+                "draft": false,
+                "merged": false,
+                "head": {"sha": head_sha, "ref": "feature", "repo": {"id": 1}},
+                "base": {"sha": base_sha, "ref": "main", "repo": {"id": 1}},
+                "body": body
+            }),
+            serde_json::json!({"sha": merge_sha, "merged": true, "message": "Pull Request successfully merged"}),
+        ]);
+        let intent = DirectMergeIntent {
+            pull: test_pull(),
+            operation_key: "merge-op".into(),
+            method: MergeMethod::Merge,
+            expected_head_sha: head_sha,
+            expected_base_sha: base_sha,
+            expected_body: body.into(),
+            expected_body_digest: Digest::parse(hex_digest(body.as_bytes())).unwrap(),
+            expected_commit_message: String::new(),
+            approval_expires_at_unix: None,
+            expected_trailers: Vec::new(),
+        };
+
+        let acknowledgement = forge.execute_merge(&intent).unwrap();
+
+        assert_eq!(acknowledgement.certainty, EffectCertainty::Applied);
+        assert_eq!(acknowledgement.resulting_head_sha, None);
+        assert_eq!(acknowledgement.resulting_merge_sha, Some(merge_sha));
     }
 
     #[test]
