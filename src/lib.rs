@@ -18,6 +18,7 @@ pub mod merge_policy;
 pub mod operations;
 pub mod process;
 pub mod protocol;
+pub mod providers;
 pub mod roles;
 pub mod store;
 pub mod worktrees;
