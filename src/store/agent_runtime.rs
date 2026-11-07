@@ -207,6 +207,7 @@ fn read_legacy_wake_context_rows(
                     source_revision: input.source_revision,
                     priority,
                     payload_json,
+                    host_artifacts: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
