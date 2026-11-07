@@ -32,6 +32,7 @@ pub mod process;
 pub mod profile_effect;
 pub mod profile_trial_runtime;
 pub mod protocol;
+pub mod provider_qualification_run;
 pub mod providers;
 pub mod publication_monitor;
 pub mod roles;

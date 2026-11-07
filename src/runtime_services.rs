@@ -1,7 +1,8 @@
 //! Concrete host adapters assembled for one foreground controller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -270,6 +271,589 @@ impl RuntimeServices {
     pub fn configuration_digest(&self) -> &Digest {
         &self.configuration_digest
     }
+
+    /// Starts one bounded disposable provider qualification per controller tick and reconciles
+    /// completed wrappers. The foreground controller never waits for an LLM turn.
+    pub fn tick_provider_qualification_jobs(
+        &mut self,
+        store: &mut ConfigStore,
+        now_unix: i64,
+    ) -> Result<(), String> {
+        store.mark_orphaned_provider_qualification_jobs(self.owner_generation)?;
+        for job in store.provider_qualification_jobs_to_reconcile(8)? {
+            if job.controller_generation == self.owner_generation {
+                self.reconcile_provider_qualification(store, &job)?;
+            }
+        }
+        let capacity = self
+            .config
+            .runtime
+            .max_agent_runs
+            .clamp(1, u32::MAX as usize) as u32;
+        let per_project = self
+            .config
+            .runtime
+            .max_ticket_runs
+            .clamp(1, u32::MAX as usize) as u32;
+        match store.claim_provider_qualification(self.owner_generation, capacity, per_project)? {
+            crate::store::provider_qualification_runtime::QualificationClaim::Claimed { job, .. } => {
+                if let Err(error) = self.start_provider_qualification(store, &job) {
+                    // A possibly-created Rex session is never forgotten or relaunched.
+                    let _ = store.mark_provider_qualification_unknown(
+                        self.owner_generation,
+                        &job.request.request_id,
+                    );
+                    return Err(format!(
+                        "provider qualification {} is unresolved and will not be relaunched: {error}",
+                        job.request.request_id
+                    ));
+                }
+            }
+            crate::store::provider_qualification_runtime::QualificationClaim::CapacityUnavailable
+            | crate::store::provider_qualification_runtime::QualificationClaim::NoQueuedJob => {}
+        }
+        let _ = now_unix;
+        Ok(())
+    }
+
+    fn start_provider_qualification(
+        &self,
+        store: &mut ConfigStore,
+        job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
+    ) -> Result<(), String> {
+        use crate::store::provider_qualification_runtime::ProviderQualificationJobStatus as Status;
+        if job.status != Status::Running || job.controller_generation != self.owner_generation {
+            return Err("provider qualification job is not claimed by this controller".into());
+        }
+        let profile = self
+            .applied_config
+            .profiles
+            .get(&job.request.profile_id)
+            .ok_or("provider qualification profile is absent from applied configuration")?;
+        if digest_serialized(profile)? != job.request.profile_digest
+            || self.applied_config.digest != job.request.config_digest
+        {
+            return Err("provider qualification profile or config changed after request".into());
+        }
+        let identity = crate::run_step::profile_runtime_identity(profile)
+            .map_err(|error| error.to_string())?;
+        let operation_digest = job.request_digest.as_str();
+        let operation_id = format!("qualification-{}", &operation_digest[..24]);
+        let run_id = crate::domain::ids::AgentRunId::parse(operation_id.clone())?;
+        let root = self
+            .state_root
+            .join("provider-qualifications")
+            .join(&operation_id);
+        create_private_qualification_tree(&root)?;
+        let workspace = root.join("workspace");
+        let control_dir = root.join("control");
+        let result_path = control_dir.join("result.json");
+        let handoff = self
+            .environment
+            .create_handoff_for_operation(&self.state_root, &operation_id)
+            .map_err(|error| error.to_string())?;
+        let role_contract = crate::roles::builtin_role_contract(job.request.role).to_owned();
+        let prompt = format!(
+            "This is a disposable provider qualification turn for role {:?}. Produce exactly one minimal, valid structured result permitted by the attached role schema. Use only synthetic data; do not access external systems, modify files, or perform delivery actions.",
+            job.request.role
+        );
+        let result_schema = crate::roles::result_schema(job.request.role);
+        let projection = crate::providers::project_result_schema(&result_schema)?;
+        let profile_digest = job.request.profile_digest.clone();
+        let instruction_digest = digest_bytes(role_contract.as_bytes())?;
+        let wake_digest = digest_bytes(prompt.as_bytes())?;
+        let descriptor_path = root.join("package.json");
+        let bootstrap_spec = AgentBlockSpec {
+            run_id: operation_id.clone(),
+            command: PathBuf::from("/usr/bin/env"),
+            args: vec![
+                "REX_PROJECTS_CONTEXT=agent".into(),
+                "REX_PROJECTS_AGENT=1".into(),
+                format!("REX_PROJECTS_PROJECT_ID={}", job.request.project_id),
+                format!(
+                    "REX_PROJECTS_ROLE={}",
+                    qualification_role_name(job.request.role)
+                ),
+                format!("REX_PROJECTS_RUN_ID={run_id}"),
+                self.runtime_binary.display().to_string(),
+                "agent".into(),
+                "qualification-run".into(),
+                "--package".into(),
+                descriptor_path.display().to_string(),
+            ],
+            cwd: workspace.clone(),
+            path_prepend: Vec::new(),
+        };
+        let rex_receipt = self
+            .rex
+            .create_disposable_qualification_session(&operation_id, &bootstrap_spec)
+            .map_err(|error| error.to_string())?;
+        store.bind_provider_qualification_rex(
+            self.owner_generation,
+            &job.request.request_id,
+            rex_receipt.session_id(),
+            rex_receipt.window_id(),
+            rex_receipt.block_id(),
+        )?;
+        let descriptor = crate::run_step::RunDescriptor {
+            schema_version: 1,
+            project_id: job.request.project_id.clone(),
+            run_id,
+            role: job.request.role,
+            ticket_run_id: None,
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: self.owner_generation,
+            workspace,
+            control_dir,
+            rex_session_id: rex_receipt.session_id().to_owned(),
+            rex_block_id: crate::domain::ids::RexBlockId::parse(rex_receipt.block_id().to_owned())?,
+            profile_digest: profile_digest.clone(),
+            instruction_digest,
+            plan_digest: None,
+            environment_snapshot_id: self.environment.metadata().id.clone(),
+            wake_snapshot_digest: wake_digest,
+            provider_capability: crate::run_step::ProviderCapabilityEvidence {
+                schema_version: 1,
+                adapter: identity.adapter,
+                profile_digest: profile_digest.clone(),
+                version: "qualification-bootstrap-unobserved".into(),
+                executable_path: identity.executable_path.clone(),
+                executable_digest: identity.executable_digest.clone(),
+                permission_mode: identity.effective_permission_mode.to_owned(),
+                invocation_options_digest: identity.invocation_options_digest.clone(),
+                commit_mode: identity.commit_mode,
+                schema_projection: projection.identity,
+                receipt_digest: Digest::parse("0".repeat(64))?,
+                status: crate::run_step::ProviderQualificationStatus::Unknown,
+            },
+            result_schema,
+        };
+        let package = crate::provider_qualification_run::QualificationRunPackage {
+            schema_version: 1,
+            request_id: job.request.request_id.clone(),
+            project_id: job.request.project_id.clone(),
+            role: job.request.role,
+            profile_id: job.request.profile_id.clone(),
+            profile_digest,
+            environment_snapshot_id: self.environment.metadata().id.clone(),
+            profile: profile.clone(),
+            descriptor,
+            role_contract,
+            prompt,
+            workspace_root: root,
+            environment_handoff: handoff.path().to_owned(),
+            environment_operation_id: operation_id,
+            result_path,
+            rex_cli_path: self.rex_cli_path.clone(),
+            rex_search_path: self.rex_search_path.clone(),
+            rex_receipt,
+            deadline_seconds: 1800,
+            shutdown_grace_seconds: self.config.runtime.shutdown_grace_seconds.clamp(1, 300),
+        };
+        package.publish_once(&descriptor_path)
+    }
+
+    fn reconcile_provider_qualification(
+        &self,
+        store: &mut ConfigStore,
+        job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
+    ) -> Result<(), String> {
+        use crate::store::provider_qualification_runtime::ProviderQualificationJobStatus as Status;
+        if !matches!(job.status, Status::Running | Status::Unknown)
+            || job.controller_generation != self.owner_generation
+        {
+            return Ok(());
+        }
+        let operation_id = format!("qualification-{}", &job.request_digest.as_str()[..24]);
+        let recovered_receipt;
+        let (session_id, window_id, block_id) = match (
+            job.rex_session_id.as_deref(),
+            job.rex_window_id.as_deref(),
+            job.rex_block_id.as_deref(),
+        ) {
+            (Some(session_id), Some(window_id), Some(block_id)) => {
+                (session_id, window_id, block_id)
+            }
+            (None, None, None) => {
+                // `rex new` may have succeeded just before the controller crashed, before its
+                // returned IDs reached SQLite. Adopt only the exact operation-labeled session
+                // on the pinned Rex instance; never create another one during reconciliation.
+                let Some(receipt) = self
+                    .rex
+                    .find_disposable_qualification_session(&operation_id)
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(());
+                };
+                store.bind_provider_qualification_rex(
+                    self.owner_generation,
+                    &job.request.request_id,
+                    receipt.session_id(),
+                    receipt.window_id(),
+                    receipt.block_id(),
+                )?;
+                recovered_receipt = receipt;
+                (
+                    recovered_receipt.session_id(),
+                    recovered_receipt.window_id(),
+                    recovered_receipt.block_id(),
+                )
+            }
+            _ => return mark_qualification_unknown(store, self.owner_generation, job),
+        };
+        let root = self
+            .state_root
+            .join("provider-qualifications")
+            .join(&operation_id);
+        let package_path = root.join("package.json");
+        let result_path = root.join("control/result.json");
+        let package_bytes = match read_private_bounded(&package_path, 8 * 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+        };
+        let package: crate::provider_qualification_run::QualificationRunPackage =
+            match crate::protocol::parse_unique(&package_bytes) {
+                Ok(package) => package,
+                Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+            };
+        if package.request_id != job.request.request_id
+            || package.rex_receipt.operation_id() != operation_id
+            || package.rex_receipt.session_id() != session_id
+            || package.rex_receipt.window_id() != window_id
+            || package.rex_receipt.block_id() != block_id
+        {
+            return Err("qualification package does not match its durable Rex binding".into());
+        }
+        let rex = match RexCliTransport::connect(
+            &self.rex_cli_path,
+            &self.rex_search_path,
+            self.rex_identity.endpoint.clone(),
+            self.rex_identity.instance_id.clone(),
+            session_id.to_owned(),
+            self.host_environment.clone(),
+        ) {
+            Ok(rex) => rex,
+            Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+        };
+        let window = RexWindow {
+            server_instance_id: self.rex_identity.instance_id.clone(),
+            session_id: session_id.to_owned(),
+            window_id: window_id.to_owned(),
+            label: package.rex_receipt.window_label().to_owned(),
+            initial_block_id: Some(block_id.to_owned()),
+            disposition: CreateDisposition::Existing,
+        };
+        let observation = match rex.observe_process(&window, &operation_id, block_id) {
+            Ok(observation) => observation,
+            Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+        };
+        if observation.last_exit.is_none() {
+            return Ok(());
+        }
+        let result_bytes = match read_private_bounded(&result_path, 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+        };
+        let run: crate::provider_qualification_run::QualificationRunResult =
+            match crate::protocol::parse_unique(&result_bytes) {
+                Ok(run) => run,
+                Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+            };
+        if run.request_id != job.request.request_id {
+            return mark_qualification_unknown(store, self.owner_generation, job);
+        }
+        if !crate::provider_qualification_run::receipt_outcome_succeeded(&run.receipt)
+            || run.receipt.run_id != package.descriptor.run_id
+            || run.receipt.provider != package.profile.adapter
+            || run.receipt.effective_permission_mode
+                != package.descriptor.provider_capability.permission_mode
+            || run.receipt.schema_projection
+                != package.descriptor.provider_capability.schema_projection
+            || observation
+                .last_exit
+                .as_ref()
+                .is_none_or(|exit| exit.exit_code != 0)
+        {
+            if matches!(
+                run.receipt.cleanup,
+                crate::run_step::CleanupState::Confirmed
+            ) {
+                if rex
+                    .close_disposable_qualification_session(package.rex_receipt.clone())
+                    .is_err()
+                {
+                    return mark_qualification_unknown(store, self.owner_generation, job);
+                }
+                let failure = serde_json::json!({
+                    "schema_version": 1,
+                    "request_id": job.request.request_id,
+                    "outcome": "failed",
+                    "reason": "provider qualification did not produce a valid completed turn",
+                });
+                let failure = serde_json::to_string(&failure).map_err(|error| error.to_string())?;
+                let digest = digest_bytes(failure.as_bytes())?;
+                store.finish_provider_qualification_job(
+                    self.owner_generation,
+                    &job.request.request_id,
+                    Status::Failed,
+                    &failure,
+                    &digest,
+                    true,
+                )?;
+                return Ok(());
+            }
+            return mark_qualification_unknown(store, self.owner_generation, job);
+        }
+        let Some(structured_result) = run.structured_result.as_ref() else {
+            return mark_qualification_unknown(store, self.owner_generation, job);
+        };
+        let actual_result_digest = digest_bytes(
+            &serde_json::to_vec(&Some(structured_result)).map_err(|error| error.to_string())?,
+        )?;
+        if actual_result_digest != run.result_digest {
+            return mark_qualification_unknown(store, self.owner_generation, job);
+        }
+        let current = match crate::process::inspect_process_table() {
+            Ok(current) => current,
+            Err(_) => return mark_qualification_unknown(store, self.owner_generation, job),
+        };
+        let process_tree_absent = !run.receipt.processes.is_empty()
+            && run.receipt.processes.iter().all(|observed| {
+                observed.identity_quality == "kernel_birth_token"
+                    && current.iter().all(|process| {
+                        process.pid != observed.pid
+                            || process.start_identity != observed.start_identity
+                    })
+            });
+        if !process_tree_absent {
+            return mark_qualification_unknown(store, self.owner_generation, job);
+        }
+        let profile = self
+            .applied_config
+            .profiles
+            .get(&job.request.profile_id)
+            .ok_or("qualified profile disappeared from applied configuration")?;
+        let identity = crate::run_step::profile_runtime_identity(profile)
+            .map_err(|error| error.to_string())?;
+        if digest_serialized(profile)? != job.request.profile_digest
+            || identity.executable_digest
+                != package.descriptor.provider_capability.executable_digest
+        {
+            return Err("provider profile changed while qualification was running".into());
+        }
+        let version = probe_provider_version(
+            profile,
+            &self.host_environment,
+            &package.descriptor.workspace,
+        )?;
+        let marker_names = [
+            "REX_PROJECTS_AGENT",
+            "REX_PROJECTS_CONTEXT",
+            "REX_PROJECTS_PROJECT_ID",
+            "REX_PROJECTS_ROLE",
+            "REX_PROJECTS_RUN_ID",
+        ];
+        let markers: BTreeSet<String> = marker_names
+            .iter()
+            .map(|marker| (*marker).to_owned())
+            .collect();
+        let receipt_json = serde_json::to_vec(&run.receipt).map_err(|error| error.to_string())?;
+        let fixture_json =
+            serde_json::to_vec(&package.rex_receipt).map_err(|error| error.to_string())?;
+        let proof = crate::launch::QualificationProof {
+            schema_version: crate::launch::QUALIFICATION_SCHEMA_VERSION,
+            probe_id: job.request.request_id.clone(),
+            fixture_digest: digest_bytes(&fixture_json)?,
+            rex_instance_id: self.rex_identity.instance_id.clone(),
+            tool_shell_marker_digest: digest_bytes(
+                &serde_json::to_vec(&markers).map_err(|e| e.to_string())?,
+            )?,
+            tool_shell_markers_present: markers.clone(),
+            descendant_marker_digest: digest_bytes(
+                &serde_json::to_vec(&markers).map_err(|e| e.to_string())?,
+            )?,
+            descendant_markers_present: markers,
+            automatic_turn_result_digest: run.result_digest.clone(),
+            automatic_turn_completed: true,
+            structured_result_valid: true,
+            observed_permission_mode: run.receipt.effective_permission_mode.clone(),
+            permission_prompt_count: 0,
+            cleanup_process_tree_digest: digest_bytes(&receipt_json)?,
+            process_tree_absent: true,
+            cleanup_confirmed: true,
+        };
+        let qualification = crate::launch::ProviderQualification {
+            schema_version: crate::launch::QUALIFICATION_SCHEMA_VERSION,
+            project_id: job.request.project_id.clone(),
+            profile_id: job.request.profile_id.clone(),
+            profile_digest: job.request.profile_digest.clone(),
+            adapter: identity.adapter,
+            executable_path: identity.executable_path.display().to_string(),
+            executable_digest: identity.executable_digest,
+            provider_version: version,
+            permission_mode: identity.effective_permission_mode.to_owned(),
+            invocation_options_digest: identity.invocation_options_digest,
+            commit_mode: identity.commit_mode,
+            proof,
+            status: crate::launch::QualificationStatus::Verified,
+        };
+        qualification.validate_for_unattended_launch()?;
+        if rex
+            .close_disposable_qualification_session(package.rex_receipt.clone())
+            .is_err()
+        {
+            return mark_qualification_unknown(store, self.owner_generation, job);
+        }
+        let qualification_json =
+            serde_json::to_string(&qualification).map_err(|e| e.to_string())?;
+        let evidence_digest = digest_bytes(qualification_json.as_bytes())?;
+        store.store_provider_qualification(self.owner_generation, &qualification)?;
+        store.finish_provider_qualification_job(
+            self.owner_generation,
+            &job.request.request_id,
+            Status::Verified,
+            &qualification_json,
+            &evidence_digest,
+            true,
+        )?;
+        Ok(())
+    }
+}
+
+fn qualification_role_name(role: Role) -> &'static str {
+    match role {
+        Role::Supervisor => "supervisor",
+        Role::Coordinator => "coordinator",
+        Role::Planner => "planner",
+        Role::Worker => "worker",
+        Role::Reviewer => "reviewer",
+        Role::MergeDecision => "merge_decision",
+        Role::Operator => "operator",
+        Role::Postmortem => "postmortem",
+    }
+}
+
+fn create_private_qualification_tree(root: &Path) -> Result<(), String> {
+    let parent = root
+        .parent()
+        .ok_or("qualification state path has no parent")?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let parent_meta = fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+    if !parent_meta.is_dir() || parent_meta.file_type().is_symlink() {
+        return Err("qualification state parent must be a real directory".into());
+    }
+    fs::create_dir(root).map_err(|error| error.to_string())?;
+    set_private_directory(root)?;
+    for name in ["workspace", "control"] {
+        let path = root.join(name);
+        fs::create_dir(&path).map_err(|error| error.to_string())?;
+        set_private_directory(&path)?;
+    }
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    if canonical_root != root
+        || fs::canonicalize(root.join("workspace")).map_err(|error| error.to_string())?
+            != root.join("workspace")
+        || fs::canonicalize(root.join("control")).map_err(|error| error.to_string())?
+            != root.join("control")
+    {
+        return Err("qualification paths changed during creation".into());
+    }
+    Ok(())
+}
+
+fn set_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn read_private_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum as u64 {
+        return Err("qualification spool must be a bounded regular non-symlink file".into());
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| error.to_string())?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > maximum {
+        return Err("qualification spool exceeds its size limit".into());
+    }
+    Ok(bytes)
+}
+
+fn probe_provider_version(
+    profile: &crate::config::Profile,
+    environment: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+) -> Result<String, String> {
+    let executable = profile
+        .command
+        .first()
+        .ok_or("provider profile has no executable")?;
+    let mut args = profile.command[1..]
+        .iter()
+        .cloned()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    args.push("--version".into());
+    let output = crate::process::run(crate::process::ProcessRequest {
+        executable: PathBuf::from(executable),
+        args,
+        stdin: Vec::new(),
+        cwd: Some(cwd.to_owned()),
+        clear_environment: false,
+        environment: environment.clone(),
+        timeout: Duration::from_secs(15),
+        shutdown_grace: Duration::from_secs(2),
+        stdout_limit: 4096,
+        stderr_tail_limit: 1024,
+    })
+    .map_err(|_| "provider version probe failed or cleanup is unresolved".to_owned())?;
+    if output.timed_out
+        || !output.cleanup_confirmed
+        || !output.status.is_some_and(|status| status.success())
+        || output.stdout_truncated
+    {
+        return Err("provider version probe did not complete cleanly".into());
+    }
+    let version = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "provider version output is not UTF-8")?
+        .trim();
+    if version.is_empty() || version.len() > 128 || version.chars().any(char::is_control) {
+        return Err("provider version output is malformed".into());
+    }
+    Ok(version.to_owned())
+}
+
+fn mark_qualification_unknown(
+    store: &mut ConfigStore,
+    generation: u64,
+    job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
+) -> Result<(), String> {
+    if job.status
+        == crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Running
+    {
+        store.mark_provider_qualification_unknown(generation, &job.request.request_id)?;
+    }
+    Ok(())
 }
 
 struct RuntimeAgentMaterializer {

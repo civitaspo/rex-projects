@@ -132,6 +132,14 @@ pub(crate) struct RexQualificationSessionReceipt {
 }
 
 impl RexQualificationSessionReceipt {
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -142,6 +150,14 @@ impl RexQualificationSessionReceipt {
 
     pub(crate) fn block_id(&self) -> &str {
         &self.block_id
+    }
+
+    pub(crate) fn window_label(&self) -> &str {
+        &self.window_label
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
     }
 }
 
@@ -616,7 +632,14 @@ impl RexCliTransport {
             initial_agent.command.as_os_str().to_owned(),
         ];
         args.extend(initial_agent.args.iter().cloned().map(OsString::from));
-        let output = self.command(&args)?;
+        let output = match self.command(&args) {
+            Ok(output) => output,
+            Err(error) => {
+                return self
+                    .find_disposable_qualification_session(operation_id)?
+                    .ok_or(error);
+            }
+        };
         self.verify_identity()?;
         let response: Value = parse(&output.stdout)?;
         let session_id = required_string(&response, "session_id")?.to_owned();
@@ -671,6 +694,74 @@ impl RexCliTransport {
         Ok(receipt)
     }
 
+    /// Reconciles an uncertain `rex new` using its unique immutable session label. It never
+    /// creates a session and accepts only one exact owned window and block on the pinned server.
+    pub(crate) fn find_disposable_qualification_session(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RexQualificationSessionReceipt>, RexError> {
+        let session_label = qualification_session_label(operation_id)?;
+        let window_label = ticket_window_label(QUALIFICATION_WINDOW_NAMESPACE, operation_id)?;
+        self.verify_identity()?;
+        let output = self.command(&["session".into(), "ls".into(), "--json".into()])?;
+        let listed: Value = parse(&output.stdout)?;
+        let sessions = listed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session list has no sessions array".into()))?;
+        let matches = sessions
+            .iter()
+            .filter(|session| session.get("label").and_then(Value::as_str) == Some(&session_label))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            self.verify_identity()?;
+            return Ok(None);
+        }
+        if matches.len() != 1 {
+            return Err(RexError::Uncertain);
+        }
+        let session_id = required_string(matches[0], "session_id")?.to_owned();
+        let bound = Self::connect(
+            &self.executable,
+            &[],
+            self.endpoint.clone(),
+            self.expected_instance_id.clone(),
+            session_id.clone(),
+            self.environment.clone(),
+        )?;
+        let view = bound.session_view()?;
+        let windows = view
+            .get("windows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session view has no windows array".into()))?;
+        let matching_windows = windows_with_label(&view, &window_label)?;
+        if windows.len() != 1 || matching_windows.len() != 1 {
+            return Err(RexError::Uncertain);
+        }
+        let (window_id, listed_block_id) = matching_windows[0].clone();
+        let blocks = all_blocks_in_window(&view, &window_id)?;
+        if blocks.len() != 1
+            || blocks[0].flavor != SHELL_FLAVOR
+            || listed_block_id.as_deref() != Some(blocks[0].block_id.as_str())
+        {
+            return Err(RexError::Uncertain);
+        }
+        let block_id = blocks[0].block_id.clone();
+        let receipt = RexQualificationSessionReceipt {
+            endpoint: self.endpoint.clone(),
+            instance_id: self.expected_instance_id.clone(),
+            session_id,
+            window_id,
+            block_id,
+            operation_id: operation_id.to_owned(),
+            session_label,
+            window_label,
+        };
+        bound.disposable_qualification_fixture(receipt.clone())?;
+        self.verify_identity()?;
+        Ok(Some(receipt))
+    }
+
     /// Re-observe a serialized host receipt before producing the opaque token
     /// accepted by `run_qualification_turn`.
     pub(crate) fn disposable_qualification_fixture(
@@ -714,6 +805,25 @@ impl RexCliTransport {
             block_id: receipt.block_id,
             operation_id: receipt.operation_id,
         })
+    }
+
+    /// Close only the exact isolated session minted by `rex new`, then verify it is absent
+    /// from this explicit Rex server. Call after its provider process tree is confirmed gone.
+    pub(crate) fn close_disposable_qualification_session(
+        &self,
+        receipt: RexQualificationSessionReceipt,
+    ) -> Result<(), RexError> {
+        self.disposable_qualification_fixture(receipt.clone())?;
+        let output = self.command(&["kill".into(), receipt.session_id.clone().into()])?;
+        let _ = output;
+        self.verify_identity()?;
+        let output = self.command(&["session".into(), "ls".into(), "--json".into()])?;
+        let sessions: Value = parse(&output.stdout)?;
+        if value_contains_exact_string(&sessions, &receipt.session_id) {
+            return Err(RexError::Uncertain);
+        }
+        self.verify_identity()?;
+        Ok(())
     }
 
     pub fn list_owned_windows_and_blocks(&self) -> Result<Vec<OwnedWindow>, RexError> {
@@ -1061,6 +1171,19 @@ fn raw_cli(
 
 fn parse<T: for<'de> Deserialize<'de>>(input: &[u8]) -> Result<T, RexError> {
     crate::protocol::parse_unique(input).map_err(RexError::Protocol)
+}
+
+fn value_contains_exact_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_exact_string(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_exact_string(value, expected)),
+        _ => false,
+    }
 }
 
 fn parse_method_names(input: &[u8]) -> Result<BTreeSet<String>, RexError> {

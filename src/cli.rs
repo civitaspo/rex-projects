@@ -186,6 +186,12 @@ enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
+    /// Internal bounded runner for a controller-owned disposable provider qualification block.
+    #[command(hide = true)]
+    QualificationRun {
+        #[arg(long)]
+        package: PathBuf,
+    },
     RunStep {
         #[arg(long)]
         run: String,
@@ -1547,6 +1553,16 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
     use crate::protocol::RequestEnvelope;
     use serde_json::Value;
     match command {
+        AgentCommand::QualificationRun { package } => {
+            let result_digest = crate::provider_qualification_run::run_wrapper(&package)
+                .map_err(CliError::unavailable)?;
+            if json {
+                print_json(&serde_json::json!({"result_digest": result_digest}))
+            } else {
+                println!("Provider qualification turn finished.");
+                Ok(())
+            }
+        }
         AgentCommand::RunStep {
             run,
             package,

@@ -265,12 +265,12 @@ impl ConfigStore {
         let now = now_unix()?;
         let changed = tx
             .execute(
-                "UPDATE provider_qualification_jobs SET status='unknown',updated_at_unix=?2 WHERE status='running' AND controller_generation!=?1",
+                "UPDATE provider_qualification_jobs SET status='unknown',controller_generation=?1,updated_at_unix=?2 WHERE status IN ('running','unknown') AND controller_generation!=?1",
                 params![owner_generation, now],
             )
             .map_err(|error| error.to_string())?;
         tx.execute(
-            "UPDATE execution_slots SET disposition='unknown',controller_generation=?1 WHERE owner_kind='provider_qualification' AND controller_generation!=?1 AND disposition IN ('launch_pending','live','parked')",
+            "UPDATE execution_slots SET disposition='unknown',controller_generation=?1 WHERE owner_kind='provider_qualification' AND controller_generation!=?1 AND disposition IN ('launch_pending','live','parked','unknown')",
             [owner_generation],
         )
         .map_err(|error| error.to_string())?;
@@ -299,7 +299,7 @@ impl ConfigStore {
         validate_active_generation(&tx, owner_generation)?;
         let existing: Option<(Option<String>, Option<String>, Option<String>)> = tx
             .query_row(
-                "SELECT rex_session_id,rex_window_id,rex_block_id FROM provider_qualification_jobs WHERE request_id=?1 AND controller_generation=?2 AND status='running'",
+                "SELECT rex_session_id,rex_window_id,rex_block_id FROM provider_qualification_jobs WHERE request_id=?1 AND controller_generation=?2 AND status IN ('running','unknown')",
                 params![request_id, owner_generation],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -324,7 +324,7 @@ impl ConfigStore {
         } else {
             let changed = tx
                 .execute(
-                    "UPDATE provider_qualification_jobs SET rex_session_id=?3,rex_window_id=?4,rex_block_id=?5,updated_at_unix=?6 WHERE request_id=?1 AND controller_generation=?2 AND status='running' AND rex_session_id IS NULL AND rex_window_id IS NULL AND rex_block_id IS NULL",
+                    "UPDATE provider_qualification_jobs SET rex_session_id=?3,rex_window_id=?4,rex_block_id=?5,updated_at_unix=?6 WHERE request_id=?1 AND controller_generation=?2 AND status IN ('running','unknown') AND rex_session_id IS NULL AND rex_window_id IS NULL AND rex_block_id IS NULL",
                     params![request_id, owner_generation, session_id, window_id, block_id, now_unix()?],
                 )
                 .map_err(|error| error.to_string())?;
@@ -332,6 +332,30 @@ impl ConfigStore {
                 return Err("provider qualification Rex binding changed concurrently".into());
             }
         }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn mark_provider_qualification_unknown(
+        &mut self,
+        owner_generation: u64,
+        request_id: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
+            "UPDATE provider_qualification_jobs SET status='unknown',updated_at_unix=?3 WHERE request_id=?1 AND controller_generation=?2 AND status='running'",
+            params![request_id, owner_generation, now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("provider qualification job is not running under this controller".into());
+        }
+        tx.execute(
+            "UPDATE execution_slots SET disposition='unknown' WHERE owner_kind='provider_qualification' AND owner_id=?1 AND controller_generation=?2 AND disposition!='released'",
+            params![request_id, owner_generation],
+        ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
     }
 
