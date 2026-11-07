@@ -1,7 +1,12 @@
 {
   "schema_version": 1,
   "name": "goal-and-operations-local-acceptance",
-  "description": "Disposable local dependencies for the rex-projects user-path acceptance story.",
+  "description": "Acceptance story and runtime requirements, with currently available Rust protocol fixtures.",
+  "acceptance_status": {
+    "full_project_driver": "not_implemented",
+    "evidence": "Ticket and operation adapter protocol tests do not establish a complete Project lifecycle.",
+    "next_verification": "Run the story through the public CLI and an explicitly disposable Rex server after all runtime transitions are callable."
+  },
   "required_cli": {
     "config validate": {"argv": ["config", "validate"], "options": []},
     "config apply": {"argv": ["config", "apply"], "options": ["--bootstrap"]},
@@ -27,21 +32,32 @@
     "operator operation adapter command protocol v1",
     "knowledge publication and ticket completion"
   ],
-  "fixtures": {
-    "tickets": "cargo run --package rex-projects-xtask -- fixture ticket",
-    "forge": "forge_fixture.py",
-    "operations": "operations_fixture.py",
-    "agent": "deterministic_agent.py",
-    "rex_agent_runner": "run_rex_agent.py",
-    "local_git": "create_local_git.py"
+  "available_rust_fixtures": {
+    "ticket": {
+      "command": "cargo xtask fixture ticket",
+      "integration_test": "cargo test --locked -p rex-projects-xtask --test ticket_adapter",
+      "state": "caller-selected SQLite database",
+      "controls": ["--drop-create-response-once", "--index-delay-ms", "--native-shape", "--mutate-response"]
+    },
+    "operations": {
+      "command": "cargo xtask fixture operations",
+      "integration_test": "cargo test --locked -p rex-projects-xtask --test operations",
+      "state": "caller-selected directory",
+      "controls": ["fixture_lost_reply action with durable operation.find reconciliation"]
+    }
   },
-  "fault_controls": {
+  "not_yet_implemented_fixtures": {
+    "forge": "No local Forge provider fixture is available.",
+    "coding_agent_and_rex_transport": "No deterministic Agent is launched through Rex by this fixture pack.",
+    "full_acceptance_driver": "No driver currently proves merge, operation, knowledge publication, completion, and restart recovery together."
+  },
+  "implemented_fault_controls": {
     "ticket_create_reply": "--drop-create-response-once OPERATION_ID",
-    "forge_reply": "--drop-response-once OPERATION_ID",
-    "forge_check_state": "--check-conclusion success|failure|cancelled|timed_out",
-    "operation_reply": "--drop-response-once OPERATION_ID"
+    "ticket_index_visibility": "--index-delay-ms MILLISECONDS",
+    "ticket_response_mutation": "--mutate-response MODE",
+    "operation_reply": "fixture_lost_reply invocation followed by operation.find"
   },
-  "forge_policy_fixture": {
+  "planned_forge_policy_acceptance": {
     "required_checks": ["required-tests"],
     "required_approval_count": 1,
     "merge_strategy": "fast_forward"
