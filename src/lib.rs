@@ -35,6 +35,7 @@ pub mod protocol;
 pub mod provider_qualification_run;
 pub mod providers;
 pub mod publication_monitor;
+pub mod rex_view_lifecycle;
 pub mod roles;
 pub mod run_step;
 pub mod run_step_cli;

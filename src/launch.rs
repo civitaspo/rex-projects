@@ -341,6 +341,28 @@ pub struct RexViewBlock {
     pub retained_until_unix: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RexViewBlockRecord {
+    pub block: RexViewBlock,
+    pub terminal_at_unix: Option<u64>,
+    pub archive_digest: Option<ContentDigest>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RexViewAnchorRecord {
+    pub view_id: ContentDigest,
+    pub block_id: String,
+    pub run_id: String,
+    pub owned_label: String,
+    pub command_digest: ContentDigest,
+    pub lifecycle: RexBlockLifecycle,
+    pub process_absent_confirmed: bool,
+    pub terminal_at_unix: Option<u64>,
+    pub archive_digest: Option<ContentDigest>,
+}
+
 impl RexViewBlock {
     pub fn validate(&self) -> Result<(), String> {
         if self.block_id.trim().is_empty() || self.block_id.chars().any(char::is_control) {

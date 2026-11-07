@@ -74,6 +74,8 @@ pub struct RuntimeServices {
     artifacts: ArtifactStore,
     delivery: RuntimeDelivery,
     mailbox_cursor: Option<String>,
+    rex_lifecycle_cursor: usize,
+    rex_lifecycle_last_tick: Option<i64>,
 }
 
 impl RuntimeServices {
@@ -253,6 +255,12 @@ impl RuntimeServices {
             rex: rex.clone(),
             tickets: tickets.clone(),
         });
+        handlers.push(Box::new(crate::stop_owned_runs::StopOwnedRunsHandler::new(
+            rex.clone(),
+            runtime_binary.to_owned(),
+            runtime_binary_digest.clone(),
+            Duration::from_secs(applied_config.config.runtime.shutdown_grace_seconds),
+        )?));
         handlers.push(Box::new(
             crate::start_agent::StartAgentEffectHandler::for_all_roles(materializer),
         ));
@@ -277,6 +285,8 @@ impl RuntimeServices {
             artifacts,
             delivery,
             mailbox_cursor: None,
+            rex_lifecycle_cursor: 0,
+            rex_lifecycle_last_tick: None,
         })
     }
 
@@ -1018,6 +1028,14 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             }
             return Ok(observed);
         }
+        let recorded = store.rex_view_blocks(&reservation.rex_view_id)?;
+        if !crate::rex_view_lifecycle::has_block_capacity(
+            &recorded,
+            &blocks,
+            self.applied_config.config.runtime.max_blocks_per_tab,
+        ) {
+            return Err("Rex view reached its configured block capacity".into());
+        }
         let anchor = blocks
             .first()
             .ok_or("owned Rex view has no anchor block for a finite Agent turn")?;
@@ -1438,6 +1456,67 @@ impl FactoryRuntimeServices for RuntimeServices {
             owner_generation,
             &self.rex,
             &policy,
+        )
+    }
+
+    fn maintain_rex_views(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+    ) -> Result<(), String> {
+        if self
+            .rex_lifecycle_last_tick
+            .is_some_and(|previous| now_unix.saturating_sub(previous) < 1)
+        {
+            return Ok(());
+        }
+        self.rex_lifecycle_last_tick = Some(now_unix);
+        let projects = config.projects.keys().cloned().collect::<Vec<_>>();
+        let views = crate::rex_view_lifecycle::project_views(
+            store,
+            &projects,
+            &self.rex_identity.instance_id,
+            &self.rex_identity.session_id,
+        )?;
+        if views.is_empty() {
+            return Ok(());
+        }
+        let index = self.rex_lifecycle_cursor % views.len();
+        self.rex_lifecycle_cursor = self.rex_lifecycle_cursor.wrapping_add(1);
+        let retention_seconds = config
+            .runtime
+            .completed_ticket_tab_retention_hours
+            .checked_mul(60 * 60)
+            .ok_or("ticket tab retention exceeds supported range")?;
+        let anchor_run_id = store
+            .rex_view_anchor(&views[index].view.view_id)?
+            .map(|anchor| anchor.run_id)
+            .unwrap_or_else(|| match views[index].view.kind {
+                crate::launch::RexViewKind::Ticket => format!(
+                    "ticket-{}-view-{}",
+                    views[index].view.ticket_id.as_deref().unwrap_or_default(),
+                    views[index].view.view_epoch
+                ),
+                crate::launch::RexViewKind::Supervisor => format!(
+                    "project-{}-view-{}",
+                    views[index].view.project_id, views[index].view.view_epoch
+                ),
+            });
+        let anchor_spec = self.view_anchor_spec(anchor_run_id);
+        crate::rex_view_lifecycle::maintain_view(
+            store,
+            owner_generation,
+            now_unix.max(0) as u64,
+            &views[index],
+            &self.rex,
+            crate::rex_view_lifecycle::RexViewLifecyclePolicy {
+                max_blocks_per_tab: config.runtime.max_blocks_per_tab,
+                completed_blocks_to_keep: config.runtime.completed_blocks_to_keep,
+                completed_ticket_tab_retention_seconds: retention_seconds,
+            },
+            Some(&anchor_spec),
         )
     }
 
@@ -2002,6 +2081,9 @@ impl FactoryRuntimeServices for RuntimeServices {
         }
 
         let view = self.ensure_supervisor_view(store, &candidate.project_id, now_unix)?;
+        if !self.view_has_block_capacity(store, &view)? {
+            return Ok(false);
+        }
         let project_root = self
             .state_root
             .join("projects")
@@ -2365,6 +2447,9 @@ impl RuntimeServices {
             &active_run.ticket_id,
             now_unix,
         )?;
+        if !self.view_has_block_capacity(store, &view)? {
+            return Ok(false);
+        }
         let accepted_plan =
             store.latest_accepted_work_plan(&candidate.project_id, ticket_run_id)?;
         if let Some(plan) = &accepted_plan {
@@ -2632,6 +2717,45 @@ impl RuntimeServices {
             .ok_or_else(|| "profile has no exact verified unattended qualification".into())
     }
 
+    fn view_has_block_capacity(
+        &self,
+        store: &ConfigStore,
+        view: &crate::launch::RexView,
+    ) -> Result<bool, String> {
+        let label = match view.kind {
+            crate::launch::RexViewKind::Supervisor => {
+                owned_supervisor_window_label(view.project_id.as_str())
+            }
+            crate::launch::RexViewKind::Ticket => owned_ticket_window_label(
+                view.ticket_namespace
+                    .as_deref()
+                    .ok_or("ticket view namespace is missing")?,
+                view.ticket_id
+                    .as_deref()
+                    .ok_or("ticket view ID is missing")?,
+            )
+            .map_err(|error| error.to_string())?,
+        };
+        let window = RexWindow {
+            server_instance_id: view.rex_server_identity.clone(),
+            session_id: view.rex_session_id.clone(),
+            window_id: view.rex_window_id.clone(),
+            label: label.clone(),
+            initial_block_id: None,
+            disposition: CreateDisposition::Existing,
+        };
+        let blocks = self
+            .rex
+            .list_window_blocks(&window, &label)
+            .map_err(|error| error.to_string())?;
+        let records = store.rex_view_blocks(&view.view_id)?;
+        Ok(crate::rex_view_lifecycle::has_block_capacity(
+            &records,
+            &blocks,
+            self.config.runtime.max_blocks_per_tab,
+        ))
+    }
+
     fn ensure_ticket_view(
         &self,
         store: &mut ConfigStore,
@@ -2667,21 +2791,13 @@ impl RuntimeServices {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let spec = crate::adapters::rex::AgentBlockSpec {
-            run_id: format!("ticket-{}-view-{epoch}", ticket_id.as_str()),
-            command: PathBuf::from("/usr/bin/env"),
-            args: vec![
-                self.runtime_binary.display().to_string(),
-                "status".into(),
-                "--json".into(),
-            ],
-            cwd: self.state_root.clone(),
-            path_prepend: self.search_path(),
-        };
+        let spec = self.view_anchor_spec(format!("ticket-{}-view-{epoch}", ticket_id.as_str()));
         let window = self
             .rex
             .find_or_create_ticket_window(namespace.as_str(), ticket_id.as_str(), &spec)
             .map_err(|error| error.to_string())?;
+        let anchor_block_id = window.initial_block_id.clone();
+        let anchor_disposition = window.disposition;
         let view = crate::launch::RexView {
             view_id: crate::launch::RexView::derive_id(
                 project_id,
@@ -2695,11 +2811,19 @@ impl RuntimeServices {
             ticket_namespace: Some(namespace.as_str().to_owned()),
             ticket_id: Some(ticket_id.as_str().to_owned()),
             view_epoch: epoch,
-            rex_server_identity: window.server_instance_id,
-            rex_session_id: window.session_id,
-            rex_window_id: window.window_id,
+            rex_server_identity: window.server_instance_id.clone(),
+            rex_session_id: window.session_id.clone(),
+            rex_window_id: window.window_id.clone(),
         };
         store.register_rex_view(self.owner_generation, &view)?;
+        self.record_created_view_anchor(
+            store,
+            &view,
+            &window,
+            &spec,
+            anchor_disposition,
+            anchor_block_id,
+        )?;
         let _ = now_unix;
         Ok(view)
     }
@@ -2733,22 +2857,13 @@ impl RuntimeServices {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let bootstrap_id = format!("project-{}-view-{epoch}", project_id);
-        let spec = crate::adapters::rex::AgentBlockSpec {
-            run_id: bootstrap_id,
-            command: PathBuf::from("/usr/bin/env"),
-            args: vec![
-                self.runtime_binary.display().to_string(),
-                "status".into(),
-                "--json".into(),
-            ],
-            cwd: self.state_root.clone(),
-            path_prepend: self.search_path(),
-        };
+        let spec = self.view_anchor_spec(format!("project-{}-view-{epoch}", project_id));
         let window = self
             .rex
             .find_or_create_project_window(project_id, &spec)
             .map_err(|error| error.to_string())?;
+        let anchor_block_id = window.initial_block_id.clone();
+        let anchor_disposition = window.disposition;
         let view = crate::launch::RexView {
             view_id: crate::launch::RexView::derive_id(
                 project_id,
@@ -2762,11 +2877,19 @@ impl RuntimeServices {
             ticket_namespace: None,
             ticket_id: None,
             view_epoch: epoch,
-            rex_server_identity: window.server_instance_id,
-            rex_session_id: window.session_id,
-            rex_window_id: window.window_id,
+            rex_server_identity: window.server_instance_id.clone(),
+            rex_session_id: window.session_id.clone(),
+            rex_window_id: window.window_id.clone(),
         };
         store.register_rex_view(self.owner_generation, &view)?;
+        self.record_created_view_anchor(
+            store,
+            &view,
+            &window,
+            &spec,
+            anchor_disposition,
+            anchor_block_id,
+        )?;
         let _ = now_unix;
         Ok(view)
     }
@@ -2778,6 +2901,62 @@ impl RuntimeServices {
             .into_iter()
             .flatten()
             .collect()
+    }
+
+    fn view_anchor_spec(&self, run_id: String) -> AgentBlockSpec {
+        AgentBlockSpec {
+            run_id,
+            command: PathBuf::from("/usr/bin/env"),
+            args: vec![
+                self.runtime_binary.display().to_string(),
+                "status".into(),
+                "--json".into(),
+            ],
+            cwd: self.state_root.clone(),
+            path_prepend: self.search_path(),
+        }
+    }
+
+    fn record_created_view_anchor(
+        &self,
+        store: &mut ConfigStore,
+        view: &crate::launch::RexView,
+        window: &RexWindow,
+        spec: &AgentBlockSpec,
+        disposition: CreateDisposition,
+        block_id: Option<String>,
+    ) -> Result<(), String> {
+        if disposition != CreateDisposition::Created {
+            return Ok(());
+        }
+        let Some(block_id) = block_id else {
+            return Ok(());
+        };
+        let label = owned_agent_block_label(&spec.run_id).map_err(|error| error.to_string())?;
+        let blocks = self
+            .rex
+            .list_window_blocks(window, &window.label)
+            .map_err(|error| error.to_string())?;
+        if !blocks
+            .iter()
+            .any(|block| block.block_id == block_id && block.label == label)
+            || !self
+                .rex
+                .agent_block_matches_spec(window, spec, &block_id)
+                .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+        let command_digest = crate::rex_view_lifecycle::anchor_command_digest(spec)?;
+        store.register_rex_view_anchor(
+            self.owner_generation,
+            &view.view_id,
+            &block_id,
+            &spec.run_id,
+            &label,
+            &command_digest,
+        )?;
+        Ok(())
     }
 }
 

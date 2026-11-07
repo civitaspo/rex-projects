@@ -17,7 +17,8 @@ use crate::engine::reducer::{Input, Phase, TicketRun, WakeTarget, reduce};
 use crate::launch::{
     AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, ObservedProviderStart,
     ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle, RexFocusTarget, RexView,
-    RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
+    RexViewAnchorRecord, RexViewBlock, RexViewBlockRecord, RexViewCleanupCandidate, RexViewKind,
+    RexViewRecord, authorize_start,
 };
 
 pub mod agent_recovery;
@@ -709,7 +710,7 @@ impl ConfigStore {
         let status = serde_json::to_value(lifecycle).map_err(|error| error.to_string())?;
         let status = status.as_str().ok_or("Rex block lifecycle is invalid")?;
         let changed = tx.execute(
-            "UPDATE rex_view_blocks SET lifecycle=?3,process_absent_confirmed=?4,last_observed_at_unix=?5,retained_until_unix=COALESCE(?6,retained_until_unix) WHERE view_id=?1 AND block_id=?2 AND lifecycle!='closed' AND (lifecycle='unknown' OR ?3='unknown' OR (?3='closed' AND process_absent_confirmed=1) OR lifecycle='active')",
+            "UPDATE rex_view_blocks SET lifecycle=?3,process_absent_confirmed=?4,last_observed_at_unix=?5,terminal_at_unix=CASE WHEN ?3 IN ('completed','failed') THEN COALESCE(terminal_at_unix,?5) WHEN ?3='active' THEN NULL ELSE terminal_at_unix END,retained_until_unix=COALESCE(?6,retained_until_unix) WHERE view_id=?1 AND block_id=?2 AND lifecycle!='closed' AND (lifecycle='unknown' OR ?3='unknown' OR (?3='closed' AND process_absent_confirmed=1) OR lifecycle='active')",
             params![view_id.as_str(),block_id,status,process_absent_confirmed,now_unix()?,retained_until_unix],
         ).map_err(|error|error.to_string())?;
         if changed != 1 {
@@ -838,6 +839,29 @@ impl ConfigStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    pub fn mark_rex_view_terminal(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        now_unix: u64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        tx.execute(
+            "UPDATE rex_views SET terminal_at_unix=NULL WHERE view_id=?1 AND lifecycle='active' AND view_kind='ticket' AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase NOT IN ('done','canceled'))",
+            [view_id.as_str()],
+        ).map_err(|error| error.to_string())?;
+        let changed = tx.execute(
+            "UPDATE rex_views SET terminal_at_unix=?2,updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND view_kind='ticket' AND terminal_at_unix IS NULL AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase IN ('done','canceled')) AND NOT EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase NOT IN ('done','canceled')) AND (EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) OR EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id)) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.ownership='factory' AND NOT EXISTS (SELECT 1 FROM rex_block_archives a WHERE a.view_id=b.view_id AND a.block_id=b.block_id)))) AND NOT EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id AND (a.lifecycle NOT IN ('completed','failed','closed') OR a.process_absent_confirmed=0 OR NOT EXISTS (SELECT 1 FROM rex_view_anchor_archives ar WHERE ar.view_id=a.view_id AND ar.block_id=a.block_id))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=rex_views.view_id AND h.lifecycle IN ('pending','presented','response_queued'))",
+            params![view_id.as_str(), now_unix],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
     pub fn rex_view_cleanup_candidates(
         &self,
         now_unix: u64,
@@ -848,7 +872,7 @@ impl ConfigStore {
         }
         let cutoff = now_unix.saturating_sub(retention_seconds);
         let mut statement=self.connection.prepare(
-            "SELECT v.view_id,v.project_id,v.view_kind,v.ticket_namespace,v.ticket_id,v.view_epoch,v.rex_server_identity,v.rex_session_id,v.rex_window_id,v.updated_at_unix FROM rex_views v WHERE v.lifecycle='active' AND v.pinned=0 AND v.updated_at_unix<=?1 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=v.view_id AND h.lifecycle IN ('pending','presented','response_queued')) ORDER BY v.updated_at_unix",
+            "SELECT v.view_id,v.project_id,v.view_kind,v.ticket_namespace,v.ticket_id,v.view_epoch,v.rex_server_identity,v.rex_session_id,v.rex_window_id,CASE WHEN v.view_kind='ticket' THEN v.terminal_at_unix ELSE v.updated_at_unix END FROM rex_views v WHERE v.lifecycle='active' AND v.pinned=0 AND ((v.view_kind='ticket' AND v.terminal_at_unix IS NOT NULL AND v.terminal_at_unix<=?1 AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id AND t.internal_phase IN ('done','canceled')) AND NOT EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id AND t.internal_phase NOT IN ('done','canceled'))) OR (v.view_kind='supervisor' AND v.updated_at_unix<=?1)) AND (EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id) OR EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=v.view_id)) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2) OR (b.ownership='factory' AND NOT EXISTS (SELECT 1 FROM rex_block_archives a WHERE a.view_id=b.view_id AND a.block_id=b.block_id)))) AND NOT EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=v.view_id AND (a.lifecycle NOT IN ('completed','failed','closed') OR a.process_absent_confirmed=0 OR NOT EXISTS (SELECT 1 FROM rex_view_anchor_archives ar WHERE ar.view_id=a.view_id AND ar.block_id=a.block_id))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=v.view_id AND h.lifecycle IN ('pending','presented','response_queued')) ORDER BY 10",
         ).map_err(|error|error.to_string())?;
         let rows = statement
             .query_map(params![cutoff, now_unix], |row| {
@@ -915,7 +939,7 @@ impl ConfigStore {
         validate_active_generation(&tx, owner_generation)?;
         let cutoff = now_unix.saturating_sub(retention_seconds);
         let changed=tx.execute(
-            "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND updated_at_unix<=?3 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=rex_views.view_id AND h.lifecycle IN ('pending','presented','response_queued'))",
+            "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND ((view_kind='ticket' AND terminal_at_unix IS NOT NULL AND terminal_at_unix<=?3 AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase IN ('done','canceled')) AND NOT EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase NOT IN ('done','canceled'))) OR (view_kind='supervisor' AND updated_at_unix<=?3)) AND (EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) OR EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id)) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2) OR (b.ownership='factory' AND NOT EXISTS (SELECT 1 FROM rex_block_archives a WHERE a.view_id=b.view_id AND a.block_id=b.block_id)))) AND NOT EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id AND (a.lifecycle NOT IN ('completed','failed','closed') OR a.process_absent_confirmed=0 OR NOT EXISTS (SELECT 1 FROM rex_view_anchor_archives ar WHERE ar.view_id=a.view_id AND ar.block_id=a.block_id))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=rex_views.view_id AND h.lifecycle IN ('pending','presented','response_queued'))",
             params![candidate.view.view_id.as_str(),now_unix,cutoff],
         ).map_err(|error|error.to_string())?;
         if changed != 1 {
@@ -960,8 +984,10 @@ impl ConfigStore {
         }
         if observed_closed {
             tx.execute("UPDATE rex_view_blocks SET lifecycle='closed',process_absent_confirmed=1,last_observed_at_unix=?2 WHERE view_id=?1",params![view_id.as_str(),now]).map_err(|error|error.to_string())?;
+            tx.execute("UPDATE rex_view_anchors SET lifecycle='closed',process_absent_confirmed=1 WHERE view_id=?1",[view_id.as_str()]).map_err(|error|error.to_string())?;
         } else {
             tx.execute("UPDATE rex_view_blocks SET lifecycle='unknown',process_absent_confirmed=0,last_observed_at_unix=?2 WHERE view_id=?1 AND lifecycle!='closed'",params![view_id.as_str(),now]).map_err(|error|error.to_string())?;
+            tx.execute("UPDATE rex_view_anchors SET lifecycle='unknown',process_absent_confirmed=0 WHERE view_id=?1 AND lifecycle!='closed'",[view_id.as_str()]).map_err(|error|error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())
     }
@@ -1019,6 +1045,13 @@ impl ConfigStore {
                 .and_then(|value| value.as_str().map(str::to_owned))
         });
         let inserted=tx.execute("INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix,retained_until_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9) ON CONFLICT(view_id,block_id) DO NOTHING",params![block.view_id.as_str(),block.block_id,block.agent_run_id.as_ref().map(AgentRunId::as_str),role.flatten(),ownership.as_str().unwrap_or_default(),lifecycle.as_str().unwrap_or_default(),block.process_absent_confirmed,now_unix()?,block.retained_until_unix]).map_err(|error|error.to_string())?==1;
+        if inserted && block.ownership == crate::launch::RexBlockOwnership::Factory {
+            tx.execute(
+                "UPDATE rex_views SET updated_at_unix=?2,terminal_at_unix=NULL WHERE view_id=?1 AND lifecycle='active'",
+                params![block.view_id.as_str(), now_unix()?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
         let requested_role = block.role.map(|role| {
             serde_json::to_value(role)
                 .ok()
@@ -1037,6 +1070,241 @@ impl ConfigStore {
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(inserted)
+    }
+
+    pub fn rex_view_blocks(&self, view_id: &Digest) -> Result<Vec<RexViewBlockRecord>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT b.block_id,b.agent_run_id,b.role,b.ownership,b.lifecycle,b.process_absent_confirmed,b.retained_until_unix,b.terminal_at_unix,a.content_digest FROM rex_view_blocks b LEFT JOIN rex_block_archives a USING(view_id,block_id) WHERE b.view_id=?1 ORDER BY b.terminal_at_unix DESC,b.created_at_unix DESC",
+        ).map_err(|error| error.to_string())?;
+        statement
+            .query_map([view_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<u64>>(6)?,
+                    row.get::<_, Option<u64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let (
+                    block_id,
+                    run_id,
+                    role,
+                    ownership,
+                    lifecycle,
+                    absent,
+                    retained,
+                    terminal,
+                    digest,
+                ) = row.map_err(|error| error.to_string())?;
+                let block = RexViewBlock {
+                    view_id: view_id.clone(),
+                    block_id,
+                    agent_run_id: run_id.map(AgentRunId::parse).transpose()?,
+                    role: role
+                        .map(|value| {
+                            serde_json::from_value(serde_json::Value::String(value))
+                                .map_err(|_| "stored Rex block role is invalid".to_owned())
+                        })
+                        .transpose()?,
+                    ownership: serde_json::from_value(serde_json::Value::String(ownership))
+                        .map_err(|_| "stored Rex block ownership is invalid".to_owned())?,
+                    lifecycle: serde_json::from_value(serde_json::Value::String(lifecycle))
+                        .map_err(|_| "stored Rex block lifecycle is invalid".to_owned())?,
+                    process_absent_confirmed: absent,
+                    retained_until_unix: retained,
+                };
+                block.validate()?;
+                Ok(RexViewBlockRecord {
+                    block,
+                    terminal_at_unix: terminal,
+                    archive_digest: digest.map(Digest::parse).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn archive_rex_view_block(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+        output: &str,
+    ) -> Result<Digest, String> {
+        if output.len() > 1_048_576 {
+            return Err("Rex block archive exceeds the 1 MiB limit".into());
+        }
+        let digest = Digest::parse(format!("{:x}", Sha256::digest(output.as_bytes())))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let block: Option<(String, String, bool)> = tx.query_row(
+            "SELECT ownership,lifecycle,process_absent_confirmed FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(), block_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if block.as_ref().is_none_or(|(ownership, lifecycle, absent)| {
+            ownership != "factory"
+                || !matches!(lifecycle.as_str(), "completed" | "failed")
+                || !absent
+        }) {
+            return Err("only a confirmed terminal factory block can be archived".into());
+        }
+        tx.execute(
+            "INSERT INTO rex_block_archives(view_id,block_id,content_digest,output,created_at_unix) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(view_id,block_id) DO NOTHING",
+            params![view_id.as_str(),block_id,digest.as_str(),output,now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        let stored: (String,String) = tx.query_row(
+            "SELECT content_digest,output FROM rex_block_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored != (digest.as_str().to_owned(), output.to_owned()) {
+            return Err("Rex block archive already exists with different content".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(digest)
+    }
+
+    pub fn read_rex_view_block_archive(
+        &self,
+        view_id: &Digest,
+        block_id: &str,
+    ) -> Result<Option<String>, String> {
+        let stored: Option<(String,String)> = self.connection.query_row(
+            "SELECT content_digest,output FROM rex_block_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((digest, output)) = stored else {
+            return Ok(None);
+        };
+        if format!("{:x}", Sha256::digest(output.as_bytes())) != digest {
+            return Err("stored Rex block archive digest does not match its output".into());
+        }
+        Ok(Some(output))
+    }
+
+    pub fn register_rex_view_anchor(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+        run_id: &str,
+        owned_label: &str,
+        command_digest: &Digest,
+    ) -> Result<bool, String> {
+        if block_id.trim().is_empty() || run_id.trim().is_empty() || owned_label.trim().is_empty()
+            || [block_id, run_id, owned_label].iter().any(|value| value.chars().any(char::is_control))
+        {
+            return Err("Rex view anchor identity is malformed".into());
+        }
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rex_views WHERE view_id=?1 AND lifecycle='active')",
+            [view_id.as_str()], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !active { return Err("Rex view anchor requires an active view".into()); }
+        let inserted = tx.execute(
+            "INSERT INTO rex_view_anchors(view_id,block_id,run_id,owned_label,command_digest,lifecycle,process_absent_confirmed,created_at_unix) VALUES (?1,?2,?3,?4,?5,'unknown',0,?6) ON CONFLICT(view_id) DO NOTHING",
+            params![view_id.as_str(),block_id,run_id,owned_label,command_digest.as_str(),now_unix()?],
+        ).map_err(|error| error.to_string())? == 1;
+        let stored: (String,String,String,String) = tx.query_row(
+            "SELECT block_id,run_id,owned_label,command_digest FROM rex_view_anchors WHERE view_id=?1",
+            [view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored != (block_id.to_owned(),run_id.to_owned(),owned_label.to_owned(),command_digest.as_str().to_owned()) {
+            return Err("Rex view already has a different recorded anchor".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
+    }
+
+    pub fn rex_view_anchor(&self, view_id: &Digest) -> Result<Option<RexViewAnchorRecord>, String> {
+        let row: Option<(String,String,String,String,String,bool,Option<u64>,Option<String>)> = self.connection.query_row(
+            "SELECT a.block_id,a.run_id,a.owned_label,a.command_digest,a.lifecycle,a.process_absent_confirmed,a.terminal_at_unix,r.content_digest FROM rex_view_anchors a LEFT JOIN rex_view_anchor_archives r USING(view_id,block_id) WHERE a.view_id=?1",
+            [view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        row.map(|(block_id,run_id,owned_label,command_digest,lifecycle,absent,terminal,archive_digest)| Ok(RexViewAnchorRecord {
+            view_id: view_id.clone(), block_id, run_id, owned_label,
+            command_digest: Digest::parse(command_digest)?,
+            lifecycle: serde_json::from_value(serde_json::Value::String(lifecycle)).map_err(|_| "stored Rex anchor lifecycle is invalid".to_owned())?,
+            process_absent_confirmed: absent, terminal_at_unix: terminal,
+            archive_digest: archive_digest.map(Digest::parse).transpose()?,
+        })).transpose()
+    }
+
+    pub fn observe_rex_view_anchor(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        lifecycle: RexBlockLifecycle,
+        process_absent_confirmed: bool,
+    ) -> Result<(), String> {
+        if lifecycle == RexBlockLifecycle::Unknown && process_absent_confirmed
+            || lifecycle == RexBlockLifecycle::Active && process_absent_confirmed
+        { return Err("Rex anchor process absence claim is invalid".into()); }
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let lifecycle = serde_json::to_value(lifecycle).map_err(|error| error.to_string())?;
+        let lifecycle = lifecycle.as_str().ok_or("Rex anchor lifecycle is invalid")?;
+        let now = now_unix()?;
+        let changed = tx.execute(
+            "UPDATE rex_view_anchors SET lifecycle=?2,process_absent_confirmed=?3,terminal_at_unix=CASE WHEN ?2 IN ('completed','failed') THEN COALESCE(terminal_at_unix,?4) WHEN ?2='active' THEN NULL ELSE terminal_at_unix END WHERE view_id=?1 AND lifecycle!='closed' AND (lifecycle IN ('active','unknown') OR ?2='unknown' OR (?2='closed' AND process_absent_confirmed=1))",
+            params![view_id.as_str(),lifecycle,process_absent_confirmed,now],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 { return Err("Rex anchor not found or observation would regress a terminal state".into()); }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn archive_rex_view_anchor(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+        output: &str,
+    ) -> Result<Digest, String> {
+        if output.len() > 1_048_576 { return Err("Rex block archive exceeds the 1 MiB limit".into()); }
+        let digest = Digest::parse(format!("{:x}", Sha256::digest(output.as_bytes())))?;
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let state: Option<(String,bool)> = tx.query_row(
+            "SELECT lifecycle,process_absent_confirmed FROM rex_view_anchors WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if state.as_ref().is_none_or(|(lifecycle,absent)| !matches!(lifecycle.as_str(),"completed"|"failed") || !absent) {
+            return Err("only a confirmed terminal Rex anchor can be archived".into());
+        }
+        tx.execute(
+            "INSERT INTO rex_view_anchor_archives(view_id,block_id,content_digest,output,created_at_unix) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(view_id,block_id) DO NOTHING",
+            params![view_id.as_str(),block_id,digest.as_str(),output,now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        let stored: (String,String) = tx.query_row(
+            "SELECT content_digest,output FROM rex_view_anchor_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored != (digest.as_str().to_owned(),output.to_owned()) { return Err("Rex anchor archive already exists with different content".into()); }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(digest)
+    }
+
+    pub fn read_rex_view_anchor_archive(&self, view_id: &Digest, block_id: &str) -> Result<Option<String>, String> {
+        let stored: Option<(String,String)> = self.connection.query_row(
+            "SELECT content_digest,output FROM rex_view_anchor_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((digest,output)) = stored else { return Ok(None); };
+        if format!("{:x}",Sha256::digest(output.as_bytes())) != digest { return Err("stored Rex anchor archive digest does not match its output".into()); }
+        Ok(Some(output))
     }
 
     /// Persist immutable provider qualification evidence. A caller-supplied digest is never
@@ -6288,6 +6556,39 @@ mod tests {
             "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'factory-block','synthetic-run','supervisor','factory','completed',1,1,1)",
             [view_id.as_str()],
         ).unwrap();
+        let archive_digest = store.archive_rex_view_block(
+            generation,
+            &view_id,
+            "factory-block",
+            "completed output\n",
+        ).unwrap();
+        assert_eq!(
+            store.read_rex_view_block_archive(&view_id, "factory-block").unwrap().as_deref(),
+            Some("completed output\n"),
+        );
+        assert_eq!(
+            store.rex_view_blocks(&view_id).unwrap()[0].archive_digest.as_ref(),
+            Some(&archive_digest),
+        );
+        assert!(store.archive_rex_view_block(generation, &view_id, "factory-block", "different output").is_err());
+        assert!(store.archive_rex_view_block(generation, &view_id, "factory-block", &"x".repeat(1_048_577)).is_err());
+        let anchor_run = "ticket-T-1-view-1";
+        let anchor_label = crate::adapters::rex::owned_agent_block_label(anchor_run).unwrap();
+        store.register_rex_view_anchor(
+            generation,
+            &view_id,
+            "owned-anchor",
+            anchor_run,
+            &anchor_label,
+            &Digest::parse("c".repeat(64)).unwrap(),
+        ).unwrap();
+        store.observe_rex_view_anchor(generation, &view_id, RexBlockLifecycle::Completed, true).unwrap();
+        store.archive_rex_view_anchor(generation, &view_id, "owned-anchor", "status output\n").unwrap();
+        assert_eq!(
+            store.read_rex_view_anchor_archive(&view_id, "owned-anchor").unwrap().as_deref(),
+            Some("status output\n"),
+        );
+        assert!(store.archive_rex_view_anchor(generation, &view_id, "owned-anchor", "changed status").is_err());
         store.connection.execute(
             "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix) VALUES ('request-1',?2,'ticket_review','ticket_run','run-1',0,?1,?3,?3,?3,?3,?3,'{}','/tmp/request.html','pending',1,9999999999)",
             rusqlite::params![view_id.as_str(), project.id.as_str(), "a".repeat(64)],

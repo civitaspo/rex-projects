@@ -107,6 +107,17 @@ pub trait FactoryRuntimeServices {
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<AgentRecoveryReport, String>;
+    /// Reconcile one persisted Rex view before launch decisions. Implementations must bound
+    /// external work so this does not make a controller iteration unbounded.
+    fn maintain_rex_views(
+        &mut self,
+        _store: &mut ConfigStore,
+        _owner_generation: u64,
+        _now_unix: i64,
+        _config: &Config,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Import and validate at most one completed mailbox result, then commit
     /// its typed reducer transition through the runtime's durable boundary.
     fn ingest_one_agent_result(
@@ -291,6 +302,8 @@ impl FactoryRuntime {
             i64::try_from(learning_interval)
                 .map_err(|_| "Supervisor review interval exceeds supported range")?,
         )?;
+
+        services.maintain_rex_views(store, owner_generation, now_unix, config)?;
 
         // A result or an already-persisted effect is processed before another
         // role turn. Launch preparation is bounded to one successful turn and

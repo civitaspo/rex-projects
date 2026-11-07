@@ -215,6 +215,8 @@ const V12_TABLES: &[&str] = &[
     "agent_stop_owned_runs_process_snapshots",
     "agent_stop_owned_runs_completions",
     "rex_block_archives",
+    "rex_view_anchors",
+    "rex_view_anchor_archives",
     "provider_qualification_jobs",
     "host_effect_jobs",
     "human_request_authority",

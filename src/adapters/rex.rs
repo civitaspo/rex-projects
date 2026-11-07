@@ -1120,6 +1120,48 @@ impl RexCliTransport {
             .map_err(|_| RexError::Protocol("Rex block capture is not UTF-8 text".into()))
     }
 
+    /// Confirm a recorded owned block still has its original terminal command configuration.
+    /// A matching label alone is insufficient because users can reuse terminal blocks.
+    pub fn agent_block_matches_spec(
+        &self,
+        window: &TicketWindow,
+        spec: &AgentBlockSpec,
+        block_id: &str,
+    ) -> Result<bool, RexError> {
+        self.check_window(window)?;
+        let expected = terminal_block(spec)?;
+        let expected_label = owned_block_label(&spec.run_id)?;
+        let view = self.session_view()?;
+        let windows = view
+            .get("windows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session view has no windows".into()))?;
+        let Some(window_value) = windows.iter().find(|value| {
+            value.get("window_id").and_then(Value::as_str) == Some(window.window_id.as_str())
+        }) else {
+            return Ok(false);
+        };
+        let actual = window_value
+            .get("layers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|layer| layer.get("blocks").and_then(Value::as_array))
+            .flatten()
+            .find(|block| block.get("block_id").and_then(Value::as_str) == Some(block_id));
+        let Some(actual) = actual else {
+            return Ok(false);
+        };
+        if actual.get("label").and_then(Value::as_str) != Some(expected_label.as_str())
+            || actual.get("flavor") != expected.get("flavor")
+            || actual.get("options") != expected.get("options")
+        {
+            return Ok(false);
+        }
+        self.verify_identity()?;
+        Ok(true)
+    }
+
     /// Observe the verified block-scoped `terminal.process` action. Rex does
     /// not advertise this dynamic action in the global `api list`, so this
     /// deliberately bypasses the global method-name capability set.
@@ -1707,5 +1749,67 @@ mod tests {
             .observe_process(&window, run_id, "block-1")
             .unwrap();
         assert_eq!(observation.child.unwrap().name, "codex");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matches_owned_anchor_by_label_and_full_terminal_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = "ticket-T-9-view-2";
+        let window_label = ticket_window_label("tracker", "T-9").unwrap();
+        let spec = AgentBlockSpec {
+            run_id: run_id.into(),
+            command: PathBuf::from("/usr/bin/env"),
+            args: vec!["/tmp/rex-projects".into(), "status".into(), "--json".into()],
+            cwd: dir.path().to_path_buf(),
+            path_prepend: vec![PathBuf::from("/usr/bin")],
+        };
+        let terminal = super::terminal_block(&spec).unwrap();
+        let view = serde_json::json!({"windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":[{
+            "block_id":"anchor-1",
+            "label":owned_block_label(run_id).unwrap(),
+            "flavor":terminal["flavor"],
+            "options":terminal["options"]
+        }]}]}]});
+        let whoami = serde_json::json!({"endpoint":"unix:///tmp/rex-test.sock","instance_id":"instance-1","host_id":"host-1","rex_version":"1.2.3"});
+        let api = serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}});
+        let script = dir.path().join("rex fake");
+        let body = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{}' ;;\n  *\"session.view\"*) printf '%s\\n' '{}' ;;\n  *) exit 3 ;;\nesac\n",
+            whoami, api, view
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let transport = RexCliTransport::connect(
+            &script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "instance-1".into(),
+            "session-1".into(),
+            BTreeMap::<OsString, OsString>::new(),
+        )
+        .unwrap();
+        let window = TicketWindow {
+            server_instance_id: "instance-1".into(),
+            session_id: "session-1".into(),
+            window_id: "window-1".into(),
+            label: window_label,
+            initial_block_id: Some("anchor-1".into()),
+            disposition: CreateDisposition::Existing,
+        };
+        assert!(
+            transport
+                .agent_block_matches_spec(&window, &spec, "anchor-1")
+                .unwrap()
+        );
+        let mut changed = spec;
+        changed.cwd = PathBuf::from("/tmp");
+        assert!(
+            !transport
+                .agent_block_matches_spec(&window, &changed, "anchor-1")
+                .unwrap()
+        );
     }
 }
