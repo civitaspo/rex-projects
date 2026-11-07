@@ -423,17 +423,29 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         "Deliver the revised example migration.",
     );
     std::fs::write(&config, updated_config).unwrap();
-    let apply = command(&config, &state, &home)
-        .args(["config", "apply", "--expected-revision", "1", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        apply.status.success(),
-        "{}",
-        String::from_utf8_lossy(&apply.stdout)
-    );
-    let apply_report: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
-    assert_eq!(apply_report["state"], "queued");
+    let mut apply_processes = Vec::new();
+    for _ in 0..8 {
+        let mut apply = command(&config, &state, &home);
+        apply
+            .args(["config", "apply", "--expected-revision", "1", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_processes.push(apply.spawn().unwrap());
+    }
+    let outputs = apply_processes
+        .into_iter()
+        .map(|process| process.wait_with_output().unwrap())
+        .collect::<Vec<_>>();
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "config apply stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["state"], "queued");
+    }
     let mut applied = false;
     for _ in 0..100 {
         let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();

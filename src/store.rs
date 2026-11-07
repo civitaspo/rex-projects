@@ -1700,7 +1700,7 @@ impl ConfigStore {
             return Err("invalid control request ID".into());
         }
         let database = state_root.join("state.sqlite3");
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -1709,7 +1709,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
         let tx = connection
-            .unchecked_transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let project_id = command.project_id.as_ref().map(ProjectId::as_str);
@@ -1754,7 +1754,7 @@ impl ConfigStore {
             return Err("configuration command exceeds the 1 MiB limit".into());
         }
         let database = state_root.join("state.sqlite3");
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -1763,7 +1763,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         let tx = connection
-            .unchecked_transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         tx.execute(
@@ -1806,7 +1806,7 @@ impl ConfigStore {
         }
         let payload = canonical_json(release)?;
         let database = state_root.join("state.sqlite3");
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -1815,7 +1815,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         let tx = connection
-            .unchecked_transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         tx.execute("INSERT INTO human_claim_release_commands(request_id,payload_json,state,created_at_unix,expected_generation) VALUES (?1,?2,'pending',?3,?4) ON CONFLICT(request_id) DO NOTHING", params![request_id,payload,now_unix()?,owner_generation]).map_err(|error| error.to_string())?;
@@ -3131,6 +3131,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 1, 1, 1, 2]
         );
+    }
+
+    #[test]
+    fn config_apply_queue_survives_a_concurrent_wal_writer() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let owner = OwnerMetadata {
+            owner_nonce: "queue-writer-test".into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: "queue-writer-test".into(),
+            executable_path: "/tmp/rex-projects-test".into(),
+            executable_digest: "f".repeat(64),
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let generation = store.start_owner(&owner).unwrap();
+
+        let mut writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let writer_tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let state_root = temp.path().to_owned();
+        let next_snapshot = snapshot(&"b".repeat(64));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let append = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            ConfigStore::append_config_apply(
+                &state_root,
+                "queued-during-controller-write",
+                "factory",
+                &next_snapshot,
+                ExpectedRevision::Current(Revision(1)),
+                generation,
+            )
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        writer_tx.commit().unwrap();
+
+        append
+            .join()
+            .unwrap()
+            .expect("config apply should wait for and follow the active WAL writer");
     }
 
     #[test]
