@@ -57,6 +57,21 @@ enum FixtureCommand {
         #[arg(long)]
         state_dir: PathBuf,
     },
+    /// Emulate the normalized generic ticket protocol with durable SQLite state.
+    Ticket {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        namespace: String,
+        #[arg(long)]
+        drop_create_response_once: Option<String>,
+        #[arg(long)]
+        mutate_response: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        index_delay_ms: u64,
+        #[arg(long, default_value = "record", value_parser = ["record", "edges"])]
+        native_shape: String,
+    },
 }
 
 fn default_repository_root() -> PathBuf {
@@ -98,6 +113,21 @@ fn run(cli: Cli) -> Result<(), String> {
         } => release::refresh_pin(&default_repository_root(), &pin_path, &gh, write),
         Command::Fixture { fixture } => match fixture {
             FixtureCommand::Operations { state_dir } => fixtures::operations::run(&state_dir),
+            FixtureCommand::Ticket {
+                database,
+                namespace,
+                drop_create_response_once,
+                mutate_response,
+                index_delay_ms,
+                native_shape,
+            } => fixtures::ticket::run(
+                &database,
+                &namespace,
+                drop_create_response_once.as_deref(),
+                mutate_response.as_deref(),
+                index_delay_ms,
+                &native_shape,
+            ),
         },
     }
 }
