@@ -341,7 +341,16 @@ impl ConfigStore {
         if profile_digest != reservation.profile_digest {
             return Err("launch profile digest does not match the applied profile".into());
         }
-        let view: Option<(String,String,String,String,String,Option<String>,Option<String>)> = tx
+        type ViewScope = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let view: Option<ViewScope> = tx
             .query_row(
                 "SELECT project_id,view_kind,rex_server_identity,rex_session_id,rex_window_id,ticket_namespace,ticket_id FROM rex_views WHERE view_id=?1 AND lifecycle='active'",
                 [reservation.rex_view_id.as_str()],
@@ -491,14 +500,11 @@ impl ConfigStore {
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
-            let expected_parent_role = reservation
-                .parent_role
-                .map(|role| {
-                    serde_json::to_value(role)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                })
-                .flatten();
+            let expected_parent_role = reservation.parent_role.and_then(|role| {
+                serde_json::to_value(role)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+            });
             if !matches!(parent,Some((ref parent_project,ref state,ref role)) if parent_project==reservation.project_id.as_str() && matches!(state.as_str(),"running"|"parked") && expected_parent_role.as_deref()==Some(role.as_str()))
             {
                 return Err(

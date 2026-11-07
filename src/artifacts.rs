@@ -70,6 +70,7 @@ impl ArtifactStore {
         Ok(Self { root })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         workspace: &Path,
