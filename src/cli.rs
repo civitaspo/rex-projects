@@ -1089,6 +1089,22 @@ fn run_controller(
         rex_block_id: rex_identity.block_id.clone(),
     };
     let generation = store.start_owner(&owner).map_err(CliError::unavailable)?;
+    let mut environment = crate::environment::capture(&snapshot.config.config.runtime.environment)
+        .map_err(|error| CliError::unavailable(error.to_string()))?;
+    let config_dir = canonical_source
+        .parent()
+        .ok_or_else(|| CliError::usage("configuration file has no parent directory"))?;
+    let mut services = crate::runtime_services::RuntimeServices::new(
+        &snapshot.config,
+        &environment,
+        config_dir,
+        &state_root,
+        generation,
+        &rex_identity,
+        &executable_path,
+        &Digest::parse(executable_digest.clone()).map_err(CliError::usage)?,
+    )
+    .map_err(CliError::unavailable)?;
     let projection = state_root.join("runtime-owner.json");
     publish_owner_projection(
         &projection,
@@ -1120,6 +1136,20 @@ fn run_controller(
                     .map_err(CliError::unexpected)?
                     .filter(|loaded| loaded.revision == applied.revision && loaded.config.digest == applied.digest)
                     .ok_or_else(|| CliError::unexpected("applied configuration snapshot is missing or does not match its durable receipt"))?;
+                environment =
+                    crate::environment::capture(&snapshot.config.config.runtime.environment)
+                        .map_err(|error| CliError::unavailable(error.to_string()))?;
+                services = crate::runtime_services::RuntimeServices::new(
+                    &snapshot.config,
+                    &environment,
+                    config_dir,
+                    &state_root,
+                    generation,
+                    &rex_identity,
+                    &executable_path,
+                    &Digest::parse(executable_digest.clone()).map_err(CliError::usage)?,
+                )
+                .map_err(CliError::unavailable)?;
             }
             if command.kind == "machine_stop" {
                 should_stop = true;
@@ -1129,6 +1159,19 @@ fn run_controller(
         store
             .heartbeat_owner(generation)
             .map_err(CliError::unavailable)?;
+        let tick = crate::engine::factory_runtime::FactoryRuntime::tick(
+            &mut store,
+            generation,
+            unix_now_i64()?,
+            &snapshot.config.config,
+            &mut services,
+        )
+        .map_err(CliError::unavailable)?;
+        if !tick.external_errors.is_empty() {
+            for error in tick.external_errors {
+                eprintln!("rex-projects runtime: {error}");
+            }
+        }
         publish_owner_projection(
             &projection,
             generation,

@@ -926,8 +926,8 @@ fn handoff_nonce(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildContext, EnvironmentConfig, EnvironmentError, EnvironmentSource, FRAME_MAGIC,
-        ShellKind, fresh_nonce, parse_frame, snapshot_from_variables,
+        ChildContext, EnvironmentConfig, EnvironmentError, EnvironmentHandoff, EnvironmentSource,
+        FRAME_MAGIC, ShellKind, fresh_nonce, parse_frame, snapshot_from_variables,
     };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
