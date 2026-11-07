@@ -20,7 +20,9 @@ use crate::domain::ids::{
     Digest, OperationId, ProjectId, RepositoryId, TicketId, TicketNamespace, TicketRunId,
 };
 use crate::domain::types::CommitMode;
-use crate::effects::{AbsentProof, EffectHandler, EffectMode, EffectObservation, EffectRequest};
+use crate::effects::{
+    AbsentProof, EffectContext, EffectHandler, EffectMode, EffectObservation, EffectRequest,
+};
 use crate::engine::orchestration::{WorkNodeId, WorkPlan};
 use crate::engine::reducer::EffectKind;
 use crate::hooks::{HookReceipt, HookRunContext, HookRunner};
@@ -2013,6 +2015,7 @@ impl EffectHandler for PrepareWorktreesEffectHandler {
         &self,
         _mode: EffectMode,
         request: &EffectRequest,
+        _context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String> {
         let payload: PrepareWorktreesEffectPayload = match decode_effect_payload(request) {
             Ok(payload) => payload,
@@ -2041,6 +2044,7 @@ impl EffectHandler for PublishImplementationEffectHandler {
         &self,
         mode: EffectMode,
         request: &EffectRequest,
+        _context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String> {
         let payload: PublishImplementationEffectPayload = match decode_effect_payload(request) {
             Ok(payload) => payload,
@@ -2497,9 +2501,16 @@ mod tests {
             created_at_unix: 1,
         };
         let handler = effects.prepare_worktrees_handler();
+        let mut store =
+            crate::store::ConfigStore::open_test(&temp.path().join("controller")).unwrap();
+        let mut context = EffectContext {
+            store: &mut store,
+            owner_generation: 1,
+            now_unix: 1,
+        };
         assert!(matches!(
             handler
-                .handle(EffectMode::Submit, &invalid_request)
+                .handle(EffectMode::Submit, &invalid_request, &mut context)
                 .unwrap(),
             EffectObservation::Rejected { .. }
         ));
@@ -2521,8 +2532,12 @@ mod tests {
             attempt_count: 0,
             created_at_unix: 1,
         };
-        let first = handler.handle(EffectMode::Submit, &request).unwrap();
-        let second = handler.handle(EffectMode::Reconcile, &request).unwrap();
+        let first = handler
+            .handle(EffectMode::Submit, &request, &mut context)
+            .unwrap();
+        let second = handler
+            .handle(EffectMode::Reconcile, &request, &mut context)
+            .unwrap();
         let (
             EffectObservation::Applied { receipt: first },
             EffectObservation::Applied { receipt: second },
@@ -2614,10 +2629,17 @@ mod tests {
             created_at_unix: 1,
         };
 
+        let mut store =
+            crate::store::ConfigStore::open_test(&temp.path().join("controller")).unwrap();
+        let mut context = EffectContext {
+            store: &mut store,
+            owner_generation: 1,
+            now_unix: 1,
+        };
         assert!(matches!(
             effects
                 .publish_implementation_handler()
-                .handle(EffectMode::Submit, &request)
+                .handle(EffectMode::Submit, &request, &mut context)
                 .unwrap(),
             EffectObservation::Rejected { .. }
         ));

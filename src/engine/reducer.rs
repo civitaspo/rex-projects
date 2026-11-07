@@ -45,8 +45,7 @@ pub struct TicketRun {
     pub required_review_revision: Option<Revision>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Input {
     Dispatch,
     PlanAccepted,

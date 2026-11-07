@@ -24,7 +24,7 @@ fn fixture(
     std::fs::write(
         &config,
         format!(
-            "{}\n[runtime.environment]\nsource = \"inherit\"\ninteractive = false\ntimeout_seconds = 15\n",
+            "{}\n[runtime.environment]\nsource = \"current\"\ninteractive = false\ntimeout_seconds = 15\n",
             source.replacen(
             "schema_version = 1",
             &format!(

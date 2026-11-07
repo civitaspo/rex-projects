@@ -4,10 +4,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use crate::adapters::tickets::{
-    NormalizedTicketStatus, TicketAdapter, TicketCommandAdapter, TicketListRequest, TicketScope,
+    NormalizedTicketStatus, TicketAdapter, TicketListRequest, TicketScope, build_ticket_adapter,
 };
 use crate::config::Config;
 use crate::domain::ids::{AdapterId, TicketId, TicketNamespace};
@@ -37,28 +36,10 @@ impl RuntimeServices {
         _state_root: &Path,
         _owner_generation: u64,
     ) -> Result<Self, String> {
-        let ticket_config = &config.adapters.tickets;
-        if ticket_config.kind != "command" {
-            return Err(format!(
-                "ticket adapter kind `{}` is not available in this runtime build",
-                ticket_config.kind
-            ));
-        }
-        let tickets = TicketCommandAdapter::new_discovering_namespace(
-            &ticket_config.command,
-            environment,
-            &ticket_config.environment_allow,
-            config_dir,
-            Duration::from_secs(
-                ticket_config
-                    .read_timeout_seconds
-                    .max(ticket_config.write_timeout_seconds),
-            ),
-            Duration::from_secs(config.runtime.shutdown_grace_seconds),
-        )
-        .map_err(|error| error.to_string())?;
+        let tickets = build_ticket_adapter(config, environment, config_dir)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
-            tickets: Box::new(tickets),
+            tickets,
             namespaces: BTreeMap::new(),
             handlers: Vec::new(),
             config: config.clone(),

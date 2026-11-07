@@ -414,7 +414,7 @@ impl ConfigStore {
     }
 
     #[cfg(test)]
-    fn open_test(state_root: &Path) -> Result<Self, String> {
+    pub(crate) fn open_test(state_root: &Path) -> Result<Self, String> {
         let lock_root = state_root.join("machine-registry");
         let machine_lock = MachineLock::acquire_in_registry(state_root, &lock_root)?;
         Self::open_with_lock(state_root, machine_lock)
@@ -5239,7 +5239,8 @@ mod tests {
             .unwrap();
         assert_eq!(stored_receipt.intent().operation_id, "op-other-project");
         assert_eq!(stored_receipt.receipt_json(), "{}");
-        assert!(store.succeeded_effect_receipt("op-1").unwrap().is_none());
+        let first_receipt = store.succeeded_effect_receipt("op-1").unwrap().unwrap();
+        assert_eq!(first_receipt.intent().operation_id, "op-1");
         assert!(
             store
                 .succeeded_effect_receipt("missing-operation")
