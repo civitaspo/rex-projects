@@ -808,11 +808,10 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             {
                 return Err(ForgeError("required merge trailer block is invalid".into()));
             }
-            let mut commit_message = before.body.unwrap_or_default().trim_end().to_owned();
-            if !commit_message.is_empty() {
-                commit_message.push_str("\n\n");
-            }
-            commit_message.push_str(&intent.expected_trailers.join("\n"));
+            let commit_message = merge_commit_message(
+                before.body.as_deref().unwrap_or_default(),
+                &intent.expected_trailers,
+            )?;
             body.insert("commit_message".into(), Value::String(commit_message));
         }
         // GitHub accepts an expected head SHA but no expected base SHA. The separate base SHA is
@@ -1353,6 +1352,40 @@ fn hex_digest(bytes: &[u8]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn merge_commit_message(body: &str, expected_trailers: &[String]) -> Result<String, ForgeError> {
+    if expected_trailers.is_empty()
+        || expected_trailers
+            .iter()
+            .any(|line| !line.starts_with("Co-authored-by: ") || line.contains(['\n', '\r']))
+    {
+        return Err(ForgeError("required merge trailer block is invalid".into()));
+    }
+    let body = body.trim_end();
+    let trailer_lines = body
+        .lines()
+        .filter(|line| line.starts_with("Co-authored-by: "))
+        .collect::<Vec<_>>();
+    let expected = expected_trailers
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !trailer_lines.is_empty() {
+        let body_lines = body.lines().collect::<Vec<_>>();
+        if trailer_lines != expected || !body_lines.ends_with(&expected) {
+            return Err(ForgeError(
+                "PR body has a different or misplaced co-author trailer block".into(),
+            ));
+        }
+        return Ok(body.to_owned());
+    }
+    let mut message = body.to_owned();
+    if !message.is_empty() {
+        message.push_str("\n\n");
+    }
+    message.push_str(&expected_trailers.join("\n"));
+    Ok(message)
+}
+
 fn value_to_string(value: &Value) -> String {
     value
         .as_str()
@@ -1482,6 +1515,30 @@ mod tests {
         .unwrap();
         assert_eq!(comparison.base_sha, "base123");
         assert_eq!(comparison.head_sha, "head456");
+    }
+
+    #[test]
+    fn squash_message_preserves_one_exact_final_trailer_block() {
+        let trailers = vec!["Co-authored-by: Agent <agent@example.com>".to_owned()];
+        assert_eq!(
+            merge_commit_message(
+                "PR body\n\nCo-authored-by: Agent <agent@example.com>\n",
+                &trailers
+            )
+            .unwrap(),
+            "PR body\n\nCo-authored-by: Agent <agent@example.com>"
+        );
+        assert_eq!(
+            merge_commit_message("PR body", &trailers).unwrap(),
+            "PR body\n\nCo-authored-by: Agent <agent@example.com>"
+        );
+        assert!(
+            merge_commit_message(
+                "PR body\n\nCo-authored-by: Other <other@example.com>",
+                &trailers,
+            )
+            .is_err()
+        );
     }
 
     #[test]
