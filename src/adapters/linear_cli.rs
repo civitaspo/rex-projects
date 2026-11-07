@@ -795,6 +795,48 @@ impl LinearCliAdapter {
         Ok(Value::Object(fields))
     }
 
+    fn update_patch_matches(
+        &self,
+        ticket: &NormalizedTicket,
+        patch: &BTreeMap<String, Value>,
+    ) -> bool {
+        patch.iter().all(|(field, expected)| match field.as_str() {
+            "title" => expected.as_str() == Some(ticket.title.as_str()),
+            "body" => expected
+                .as_str()
+                .unwrap_or_default()
+                .eq(ticket.body.as_str()),
+            "status" => expected
+                .as_str()
+                .is_some_and(|value| parse_status(value).ok() == Some(ticket.status.value)),
+            "priority" => expected.as_i64() == ticket.priority,
+            "labels" => {
+                let Some(expected) = expected.as_array() else {
+                    return false;
+                };
+                let Some(mut expected) = expected
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                let mut observed = ticket.labels.clone();
+                expected.sort();
+                observed.sort();
+                expected == observed
+            }
+            "assignee" => ticket.extensions.get("linear.assignee_id") == Some(expected),
+            "project" => ticket.extensions.get("linear.project_id") == Some(expected),
+            "milestone" => ticket.extensions.get("linear.milestone_id") == Some(expected),
+            "due_date" => ticket.extensions.get("linear.due_date") == Some(expected),
+            "parent" => ticket.extensions.get("linear.parent_id") == Some(expected),
+            // These fields are rejected by update_fields, but keep this comparison closed if the
+            // patch allowlist changes later.
+            _ => false,
+        })
+    }
+
     fn update_issue(&self, input: Value) -> Result<(), TicketAdapterError> {
         let response = self.run_api(
             "mutation RexProjectsUpdateIssue($input: IssueUpdateInput!) { issueUpdate(input: $input) { success issue { id updatedAt } } }",
@@ -1172,6 +1214,9 @@ impl TicketAdapter for LinearCliAdapter {
             .get_issue_value(&input.ticket_id)?
             .ok_or(TicketAdapterError::Uncertain)?;
         let ticket = self.normalized_ticket(&updated, &input.scope)?;
+        if ticket.id != input.ticket_id || !self.update_patch_matches(&ticket, &input.patch) {
+            return Err(TicketAdapterError::Uncertain);
+        }
         Ok(ScopedTicketResult {
             ticket_namespace: self.namespace()?.into(),
             ticket,
@@ -1639,6 +1684,49 @@ esac
             adapter.describe(RequestId::new("unsupported-version").unwrap()),
             Err(TicketAdapterError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn update_success_requires_readback_to_match_every_requested_patch_field() {
+        let issue = r#"{"data":{"issue":{"id":"ticket-1","identifier":"APP-1","title":"Old title","description":"Body","url":"https://linear.example/APP-1","createdAt":"2026-11-07T00:00:00Z","updatedAt":"2026-11-07T00:00:00Z","dueDate":null,"priority":2,"state":{"id":"state-ready","name":"To Do","type":"unstarted"},"team":{"id":"team-1","key":"APP"},"project":null,"projectMilestone":null,"assignee":null,"parent":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":false}},"relations":{"nodes":[],"pageInfo":{"hasNextPage":false}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}"#;
+        let script = format!(
+            r#"case "$*" in
+  *--version*) echo 'linear 3.1.0';;
+  *RexProjectsTicket*) printf '%s' '{issue}';;
+  *RexProjectsWorkflowStates*) printf '%s' '{{"data":{{"workflowStates":{{"nodes":[{{"id":"state-done","name":"Done"}}],"pageInfo":{{"hasNextPage":false}}}}}}}}';;
+  *RexProjectsUpdateIssue*) printf '%s' '{{"data":{{"issueUpdate":{{"success":true,"issue":{{"id":"ticket-1","updatedAt":"2026-11-07T00:02:00Z"}}}}}}}}';;
+  *) exit 2;;
+esac"#
+        );
+        let scope =
+            TicketScope::new(BTreeMap::from([("team_id".into(), "team-1".into())])).unwrap();
+
+        for (request_id, patch) in [
+            (
+                "stale-status-readback",
+                BTreeMap::from([("status".into(), json!("done"))]),
+            ),
+            (
+                "stale-title-readback",
+                BTreeMap::from([("title".into(), json!("New title"))]),
+            ),
+        ] {
+            let dir = FixtureDir::new();
+            let adapter = fixture_adapter(&dir, &script, BTreeMap::new(), &[]);
+            adapter.pin_namespace("linear/acme".into()).unwrap();
+            let result = adapter.update(
+                RequestId::new(request_id).unwrap(),
+                OperationId::parse("update-operation").unwrap(),
+                None,
+                TicketUpdateRequest {
+                    scope: scope.clone(),
+                    ticket_id: "ticket-1".into(),
+                    expected_revision: "2026-11-07T00:00:00Z".into(),
+                    patch,
+                },
+            );
+            assert!(matches!(result, Err(TicketAdapterError::Uncertain)));
+        }
     }
 
     #[test]
