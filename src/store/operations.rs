@@ -200,7 +200,7 @@ impl<'a> OperationsStore<'a> {
             .map_err(|error| error.to_string())?;
         if version != crate::store::SCHEMA_VERSION {
             return Err(format!(
-                "operations store requires schema {}, found {version}",
+                "operations store requires current schema {}, found {version}",
                 crate::store::SCHEMA_VERSION
             ));
         }
