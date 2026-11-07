@@ -44,6 +44,12 @@ pub struct QueuedHumanDecision {
     pub intent: HumanDecisionIntent,
 }
 
+#[derive(Debug)]
+enum TicketValidationError {
+    Stale(String),
+    Storage(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanPresentationReceipt {
     pub request_id: HumanRequestId,
@@ -197,7 +203,7 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let affected = tx.execute("UPDATE human_requests SET lifecycle=CASE WHEN lifecycle='pending' THEN 'presented' ELSE lifecycle END, presentation_reference=COALESCE(?2,presentation_reference) WHERE request_id=?1 AND lifecycle IN ('pending','presented')", params![receipt.request_id.as_str(), receipt.reference]).map_err(|error| error.to_string())?;
+        let affected = tx.execute("UPDATE human_requests SET lifecycle=CASE WHEN lifecycle='pending' AND ?3 IN ('opened','presented') THEN 'presented' ELSE lifecycle END, presentation_reference=CASE WHEN ?3 IN ('opened','presented') THEN COALESCE(?2,presentation_reference) ELSE presentation_reference END WHERE request_id=?1 AND lifecycle IN ('pending','presented')", params![receipt.request_id.as_str(), receipt.reference, receipt.outcome]).map_err(|error| error.to_string())?;
         if affected != 1 {
             return Err("human request is no longer presentable".into());
         }
@@ -427,11 +433,15 @@ impl ConfigStore {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(result);
         }
-        if let Err(reason) = validate_current_ticket(&tx, &request) {
-            let result = HumanDecisionResult::Stale { reason };
-            persist_rejected(&tx, response_id, request_id.as_str(), &result, "stale", now)?;
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok(result);
+        match validate_current_ticket(&tx, &request) {
+            Ok(()) => {}
+            Err(TicketValidationError::Stale(reason)) => {
+                let result = HumanDecisionResult::Stale { reason };
+                persist_rejected(&tx, response_id, request_id.as_str(), &result, "stale", now)?;
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(result);
+            }
+            Err(TicketValidationError::Storage(error)) => return Err(error),
         }
         let approved = intent.choice == HumanDecisionChoice::Approve;
         let receipt = HumanApprovalReceipt {
@@ -494,19 +504,36 @@ impl ConfigStore {
 fn validate_current_ticket(
     tx: &rusqlite::Transaction<'_>,
     request: &HumanRuntimeRequest,
-) -> Result<(), String> {
+) -> Result<(), TicketValidationError> {
     if request.subject.kind != HumanSubjectKind::TicketRun {
         return Ok(());
     }
-    let ticket_run = TicketRunId::parse(request.subject.subject_id.clone())?;
-    let (project_id,revision,phase,required_review_revision): (String,u64,String,Option<u64>) = tx.query_row("SELECT project_id,revision,internal_phase,required_review_revision FROM ticket_runs WHERE ticket_run_id=?1", [ticket_run.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|error| error.to_string())?.ok_or_else(|| "ticket run no longer exists".to_owned())?;
+    let ticket_run = TicketRunId::parse(request.subject.subject_id.clone())
+        .map_err(TicketValidationError::Stale)?;
+    let observed: Option<(String, u64, String, Option<u64>)> = tx
+        .query_row(
+            "SELECT project_id,revision,internal_phase,required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
+            [ticket_run.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| TicketValidationError::Storage(error.to_string()))?;
+    let Some((project_id, revision, phase, required_review_revision)) = observed else {
+        return Err(TicketValidationError::Stale(
+            "ticket run no longer exists".into(),
+        ));
+    };
     if project_id != request.subject.project_id.as_str() || revision != request.subject.revision.0 {
-        return Err("ticket run changed after the review request was presented".into());
+        return Err(TicketValidationError::Stale(
+            "ticket run changed after the review request was presented".into(),
+        ));
     }
     if request.purpose == HumanPurpose::TicketReview
         && (phase != "waiting_human" || required_review_revision != Some(revision))
     {
-        return Err("ticket is no longer waiting for review of this revision".into());
+        return Err(TicketValidationError::Stale(
+            "ticket is no longer waiting for review of this revision".into(),
+        ));
     }
     Ok(())
 }
@@ -568,14 +595,14 @@ fn load_request(
     connection: &Connection,
     request_id: &HumanRequestId,
 ) -> Result<Option<HumanRequestSummary>, String> {
-    let row: Option<(String,String,Option<String>,String)> = connection.query_row("SELECT request_json,lifecycle,artifact_path,presentation_reference FROM human_requests WHERE request_id=?1", [request_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|error| error.to_string())?;
+    let row: Option<(String, String, Option<String>, Option<String>)> = connection.query_row("SELECT request_json,lifecycle,artifact_path,presentation_reference FROM human_requests WHERE request_id=?1", [request_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|error| error.to_string())?;
     row.map(|(json, lifecycle, artifact_path, reference)| {
         Ok(HumanRequestSummary {
             request: crate::protocol::parse_unique(json.as_bytes())?,
             lifecycle: parse_lifecycle(&lifecycle)?,
             bundle_path: artifact_path
                 .ok_or_else(|| "human review artifact path is missing".to_owned())?,
-            presentation_reference: Some(reference),
+            presentation_reference: reference,
         })
     })
     .transpose()
@@ -835,6 +862,19 @@ mod tests {
                 .register_human_request(generation, &request, &artifact, 10)
                 .unwrap()
         );
+        let listed =
+            ConfigStore::list_human_requests(temp.path(), Some(&request.subject.project_id))
+                .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].lifecycle, HumanRequestLifecycle::Pending);
+        assert_eq!(listed[0].presentation_reference, None);
+        assert_eq!(
+            ConfigStore::read_human_request(temp.path(), &request.request_id)
+                .unwrap()
+                .unwrap()
+                .presentation_reference,
+            None
+        );
         let intent = HumanDecisionIntent {
             request_id: request.request_id.clone(),
             response_id: "response-1".into(),
@@ -955,6 +995,117 @@ mod tests {
                 )
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn ticket_database_error_rolls_back_processing_so_the_response_can_retry() {
+        let (temp, mut store, generation, mut request, _) = runtime_fixture();
+        request.request_id = HumanRequestId::parse("human-ticket-1").unwrap();
+        request.purpose = HumanPurpose::TicketReview;
+        request.subject.kind = HumanSubjectKind::TicketRun;
+        request.subject.subject_id = "run-1".into();
+        request.choices = vec![
+            HumanDecisionChoice::Approve,
+            HumanDecisionChoice::RequestChanges,
+            HumanDecisionChoice::Defer,
+            HumanDecisionChoice::Cancel,
+        ];
+        store.connection.execute(
+            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision,external_revision,required_review_revision) VALUES ('run-1','human_project','fixture',1,?1,'github:org/repo','T-1',1,'waiting_human','blocked','in_progress','in_progress',1,NULL,1)",
+            [request.subject.configuration_digest.as_str()],
+        ).unwrap();
+        let artifact_root = temp.path().join("human-artifacts");
+        let artifact = write_runtime_review_artifact(&artifact_root, &request).unwrap();
+        store
+            .register_human_request(generation, &request, &artifact, 10)
+            .unwrap();
+        let intent = HumanDecisionIntent {
+            request_id: request.request_id.clone(),
+            response_id: "response-ticket-1".into(),
+            expected_subject_digest: request.subject.digest().unwrap(),
+            choice: HumanDecisionChoice::Approve,
+            explanation: Some("Review passed.".into()),
+        };
+        ConfigStore::enqueue_human_decision(temp.path(), &intent, 11).unwrap();
+
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE ticket_runs RENAME TO ticket_runs_saved;
+                 CREATE TABLE ticket_runs (ticket_run_id TEXT PRIMARY KEY, project_id TEXT, revision INTEGER, internal_phase TEXT);",
+            )
+            .unwrap();
+        assert!(
+            store
+                .process_human_decision(generation, &intent.response_id, &request.subject, 12)
+                .is_err()
+        );
+        let queued = store.pending_human_decisions(generation, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].intent.response_id, intent.response_id);
+        let decisions: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM human_decisions", [], |row| row.get(0))
+            .unwrap();
+        let wakes: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='human_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((decisions, wakes), (0, 0));
+    }
+
+    #[test]
+    fn failed_presentation_keeps_the_request_pending_until_a_successful_open() {
+        let (temp, mut store, generation, request, artifact) = runtime_fixture();
+        store
+            .register_human_request(generation, &request, &artifact, 10)
+            .unwrap();
+        store
+            .record_human_presentation(
+                generation,
+                &HumanPresentationReceipt {
+                    request_id: request.request_id.clone(),
+                    presenter_kind: "command".into(),
+                    reference: None,
+                    location: None,
+                    outcome: "failed".into(),
+                    detail: Some("presenter exited nonzero".into()),
+                    attempted_at_unix: 11,
+                },
+            )
+            .unwrap();
+        let after_failure = ConfigStore::read_human_request(temp.path(), &request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_failure.lifecycle, HumanRequestLifecycle::Pending);
+        assert_eq!(after_failure.presentation_reference, None);
+
+        store
+            .record_human_presentation(
+                generation,
+                &HumanPresentationReceipt {
+                    request_id: request.request_id.clone(),
+                    presenter_kind: "local_html".into(),
+                    reference: Some("file-opened".into()),
+                    location: None,
+                    outcome: "opened".into(),
+                    detail: None,
+                    attempted_at_unix: 12,
+                },
+            )
+            .unwrap();
+        let after_success = ConfigStore::read_human_request(temp.path(), &request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_success.lifecycle, HumanRequestLifecycle::Presented);
+        assert_eq!(
+            after_success.presentation_reference.as_deref(),
+            Some("file-opened")
         );
     }
 

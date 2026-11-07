@@ -460,11 +460,7 @@ pub fn run_command_presenter(
     if command.is_empty() || command.iter().any(String::is_empty) {
         return Err("human command presenter argv must be nonempty".into());
     }
-    let search_path = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let executable = crate::process::resolve_executable(Path::new(&command[0]), &search_path)
-        .ok_or_else(|| "configured human presenter executable was not found".to_owned())?;
+    let executable = resolve_human_child(&command[0], environment)?;
     let response_command = format!(
         "rex-projects human respond {} --subject-digest {} --choice <choice> --explanation <text>",
         request.request_id,
@@ -515,11 +511,7 @@ pub fn open_runtime_review_html(
             "local human opener requires a nonempty argv and absolute artifact path".into(),
         );
     }
-    let search_path = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let executable = crate::process::resolve_executable(Path::new(&opener[0]), &search_path)
-        .ok_or_else(|| "configured human opener executable was not found".to_owned())?;
+    let executable = resolve_human_child(&opener[0], environment)?;
     let mut args = opener[1..].iter().map(OsString::from).collect::<Vec<_>>();
     args.push(html_path.as_os_str().to_owned());
     let output = crate::process::run(crate::process::ProcessRequest {
@@ -544,6 +536,19 @@ pub fn open_runtime_review_html(
         return Err("configured local human opener failed".into());
     }
     Ok(())
+}
+
+fn resolve_human_child(
+    program: &str,
+    environment: &std::collections::BTreeMap<OsString, OsString>,
+) -> Result<PathBuf, String> {
+    let search_path = environment
+        .get(&OsString::from("PATH"))
+        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    crate::process::resolve_executable(Path::new(program), &search_path).ok_or_else(|| {
+        "configured human presenter/opener executable was not found in its child PATH".to_owned()
+    })
 }
 
 /// Build a static, offline review page for all typed subject kinds. Approval is always entered
@@ -917,6 +922,27 @@ mod presenter_tests {
         let unsafe_location = serde_json::to_vec(&unsafe_location).unwrap();
         assert!(
             parse_runtime_presenter_reference(&unsafe_location, &protocol_id, &request).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn presenter_binary_resolution_uses_the_explicit_child_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("login shell bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("review presenter");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = std::collections::BTreeMap::from([(
+            OsString::from("PATH"),
+            bin.as_os_str().to_owned(),
+        )]);
+        assert_eq!(
+            resolve_human_child("review presenter", &environment).unwrap(),
+            executable.canonicalize().unwrap()
         );
     }
 }
