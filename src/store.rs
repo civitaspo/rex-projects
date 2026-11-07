@@ -24,7 +24,16 @@ pub mod agent_recovery;
 #[path = "store/dashboard_projection.rs"]
 pub mod dashboard_projection;
 
-pub const SCHEMA_VERSION: i64 = 11;
+#[path = "store/agent_results.rs"]
+pub mod agent_results;
+#[path = "store/artifact_registry.rs"]
+pub mod artifact_registry;
+#[path = "store/provider_qualification.rs"]
+pub(crate) mod provider_qualification;
+#[path = "store/rex_view_tables.rs"]
+pub(crate) mod rex_view_tables;
+
+pub const SCHEMA_VERSION: i64 = 12;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -456,6 +465,9 @@ impl ConfigStore {
         if existing_version == 10 {
             learning_store::validate_v10_schema(&connection)?;
         }
+        if existing_version == 12 {
+            artifact_registry::validate_v12_schema(&connection)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
@@ -510,12 +522,20 @@ impl ConfigStore {
             }
             learning_store::migrate_v10(&connection)?;
         }
+        learning_store::validate_v10_schema(&connection)?;
         if existing_version < 11 {
             if existing_version > 0 {
                 backup_before_migration(&connection, state_root)?;
             }
             operations::migrate_v11(&connection)?;
         }
+        if existing_version < 12 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            artifact_registry::migrate_v12(&connection)?;
+        }
+        artifact_registry::validate_v12_schema(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,
