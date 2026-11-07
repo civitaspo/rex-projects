@@ -387,7 +387,7 @@ impl ShellKind {
         interactive: bool,
     ) -> Vec<OsString> {
         let mut args = match self {
-            Self::Bash if interactive => vec!["--login", "--interactive", "-c", CAPTURE_PROGRAM],
+            Self::Bash if interactive => vec!["--login", "-i", "-c", CAPTURE_PROGRAM],
             Self::Bash => vec!["--login", "-c", CAPTURE_PROGRAM],
             Self::Zsh if interactive => vec!["-l", "-i", "-c", CAPTURE_PROGRAM],
             Self::Zsh => vec!["-l", "-c", CAPTURE_PROGRAM],
@@ -766,10 +766,11 @@ fn read_handoff(
 mod tests {
     use super::{
         ChildContext, EnvironmentConfig, EnvironmentError, EnvironmentSource, FRAME_MAGIC,
-        fresh_nonce, parse_frame, snapshot_from_variables,
+        ShellKind, fresh_nonce, parse_frame, snapshot_from_variables,
     };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use std::path::Path;
 
     fn get<'a>(values: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a OsString> {
         values.get(std::ffi::OsStr::new(key))
@@ -897,5 +898,18 @@ mod tests {
                 Err(EnvironmentError::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn bash_login_shell_uses_supported_short_interactive_option() {
+        let args = ShellKind::Bash.arguments(
+            Path::new("/usr/bin/rex-projects"),
+            Path::new("/tmp/capture.bin"),
+            &fresh_nonce(),
+            true,
+        );
+        assert_eq!(args[0], "--login");
+        assert_eq!(args[1], "-i");
+        assert_eq!(args[2], "-c");
     }
 }
