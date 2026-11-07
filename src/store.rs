@@ -509,7 +509,6 @@ impl ConfigStore {
             }
             learning_store::migrate_v10(&connection)?;
         }
-        learning_store::validate_v10_schema(&connection)?;
         if existing_version < 11 {
             if existing_version > 0 {
                 backup_before_migration(&connection, state_root)?;
