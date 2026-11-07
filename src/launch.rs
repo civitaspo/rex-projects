@@ -509,8 +509,36 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
         PRAGMA user_version = 7;",
     )
     .map_err(|error| error.to_string())?;
+    migrate_agent_run_role(&tx)?;
     migrate_launch_reservation_tables(&tx)?;
     tx.commit().map_err(|error| error.to_string())
+}
+
+pub(crate) const AGENT_RUN_ROLE_CHECK: &str = "CHECK(role IS NULL OR role IN ('supervisor','coordinator','planner','worker','reviewer','merge_decision','operator','postmortem'))";
+
+/// Add the v7 role projection without guessing roles for existing runs. The
+/// v12 migrator reuses this helper for databases created before the column existed.
+pub(crate) fn migrate_agent_run_role(tx: &Transaction<'_>) -> Result<(), String> {
+    let has_role_column: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_runs') WHERE name='role')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_role_column {
+        tx.execute_batch(&format!(
+            "ALTER TABLE agent_runs ADD COLUMN role TEXT {AGENT_RUN_ROLE_CHECK};"
+        ))
+        .map_err(|error| error.to_string())?;
+    }
+    tx.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS agent_runs_role_immutable
+         BEFORE UPDATE OF role ON agent_runs
+         WHEN OLD.role IS NOT NEW.role
+         BEGIN SELECT RAISE(ABORT, 'AgentRun role reservation is immutable'); END;",
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Ensure the durable StartAgent reservation projection exists. Schema-v7 uses this in its
@@ -1346,6 +1374,44 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 7);
+        let role_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agent_runs') WHERE name='role' AND type='TEXT' AND \"notnull\"=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(role_column_count, 1);
+        connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,role) VALUES ('reserved-run','worker')",
+                [],
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE agent_runs SET role='coordinator' WHERE agent_run_id='reserved-run'",
+                [],
+            )
+            .is_err());
+        connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id) VALUES ('legacy-run')",
+                [],
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE agent_runs SET role='worker' WHERE agent_run_id='legacy-run'",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,role) VALUES ('invalid-role','other')",
+                [],
+            )
+            .is_err());
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('provider_qualifications','agent_launch_authority','agent_launch_state','agent_result_evidence','agent_result_wakes')",

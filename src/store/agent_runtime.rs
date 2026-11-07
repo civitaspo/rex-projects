@@ -503,6 +503,26 @@ impl ConfigStore {
         }) {
             return Err("final launch authority is not durably registered".into());
         }
+        let persisted_run: Option<(Option<String>, Option<String>, Option<u64>)> = tx
+            .query_row(
+                "SELECT role,role_session_id,config_revision FROM agent_runs WHERE agent_run_id=?1",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let authority_role = serde_json::to_value(authority.role)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or("Agent role did not serialize as a string")?
+            .to_owned();
+        if !matches!(persisted_run, Some((Some(ref role), Some(ref session), Some(revision)))
+            if role == &authority_role
+                && session == &authority.role_session_id
+                && revision == authority.config_revision.0)
+        {
+            return Err("AgentRun typed role, role session, or configuration revision does not match launch authority".into());
+        }
         let block: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2 AND agent_run_id=?3 AND ownership='factory' AND lifecycle='active')",
             rusqlite::params![authority.rex_view_id.as_str(), authority.rex_block_id, agent_run_id.as_str()],
@@ -885,9 +905,14 @@ impl ConfigStore {
         }
 
         let ticket_run_id = reservation.ticket_run_id.as_ref().map(|id| id.as_str());
+        let role = serde_json::to_value(reservation.role)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or("Agent role did not serialize as a string")?
+            .to_owned();
         tx.execute(
-            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,process_identity_json,state,controller_generation,started_at_unix,finished_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,NULL,NULL,NULL,'launch_pending',?10,NULL,NULL)",
-            params![reservation.agent_run_id.as_str(),reservation.project_id.as_str(),config_source,reservation.config_revision.0,reservation.config_digest.as_str(),reservation.role_session_id,format!("role:{}",reservation.role_session_id),reservation.run_epoch,reservation.operation_id.as_str(),reservation.controller_generation],
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,process_identity_json,state,controller_generation,started_at_unix,finished_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,NULL,NULL,NULL,'launch_pending',?11,NULL,NULL)",
+            params![reservation.agent_run_id.as_str(),reservation.project_id.as_str(),config_source,reservation.config_revision.0,reservation.config_digest.as_str(),reservation.role_session_id,role,format!("role:{}",reservation.role_session_id),reservation.run_epoch,reservation.operation_id.as_str(),reservation.controller_generation],
         ).map_err(|error| error.to_string())?;
         let slot_changed = tx.execute(
             "INSERT INTO execution_slots(pool,slot_index,project_id,ticket_run_id,owner_kind,owner_id,reservation_epoch,controller_generation,process_identity_json,disposition) VALUES (?1,?2,?3,?4,'agent_run',?5,?6,?7,NULL,'launch_pending') ON CONFLICT(pool,slot_index) DO UPDATE SET project_id=excluded.project_id,ticket_run_id=excluded.ticket_run_id,owner_kind=excluded.owner_kind,owner_id=excluded.owner_id,reservation_epoch=excluded.reservation_epoch,controller_generation=excluded.controller_generation,process_identity_json=NULL,disposition='launch_pending' WHERE execution_slots.disposition='released'",
@@ -1349,6 +1374,15 @@ mod tests {
             store.prepare_role_launch(&reservation).unwrap(),
             LaunchPreparationOutcome::Prepared { .. }
         ));
+        let persisted_role: String = store
+            .connection
+            .query_row(
+                "SELECT role FROM agent_runs WHERE agent_run_id='run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_role, "supervisor");
         assert!(matches!(
             store.prepare_role_launch(&reservation).unwrap(),
             LaunchPreparationOutcome::Prepared { .. }

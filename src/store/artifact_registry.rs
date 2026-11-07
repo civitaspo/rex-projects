@@ -93,6 +93,7 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
         let tx = connection
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
+        crate::launch::migrate_agent_run_role(&tx)?;
         crate::launch::migrate_launch_reservation_tables(&tx)?;
         crate::store::agent_runtime::migrate_v12_agent_wake_context(&tx)?;
         migrate_v12_artifact_tables(&tx)?;
@@ -311,7 +312,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
             ));
         }
     }
-    for (table, column) in [("rex_views", "terminal_at_unix")] {
+    for (table, column) in [("rex_views", "terminal_at_unix"), ("agent_runs", "role")] {
         let actual = read_column_layout(connection, table, column)?;
         let expected = read_column_layout(&canonical, table, column)?;
         if actual != expected {
@@ -319,6 +320,37 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
                 "schema 12 column {table}.{column} has an incompatible layout"
             ));
         }
+    }
+    let actual_agent_runs_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_runs'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !actual_agent_runs_sql.contains(crate::launch::AGENT_RUN_ROLE_CHECK) {
+        return Err("schema 12 agent_runs.role has an incompatible role constraint".into());
+    }
+    let actual_role_trigger: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='agent_runs_role_immutable'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let expected_role_trigger: Option<String> = canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='agent_runs_role_immutable'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if actual_role_trigger.is_none() || actual_role_trigger != expected_role_trigger {
+        return Err(
+            "schema 12 agent_runs.role immutable trigger is missing or incompatible".into(),
+        );
     }
     Ok(())
 }
@@ -350,6 +382,7 @@ fn canonical_v12_schema() -> Result<Connection, String> {
         .map_err(|error| error.to_string())?;
     {
         let tx = canonical.transaction().map_err(|error| error.to_string())?;
+        crate::launch::migrate_agent_run_role(&tx)?;
         crate::launch::migrate_launch_reservation_tables(&tx)?;
         crate::store::agent_runtime::migrate_v12_agent_wake_context(&tx)?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -620,6 +653,35 @@ mod tests {
         assert!(
             foreign_keys_enabled,
             "migration restores the original FK setting"
+        );
+        let legacy_role: Option<String> = connection
+            .query_row(
+                "SELECT role FROM agent_runs WHERE agent_run_id='run1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_role, None,
+            "migration does not infer legacy AgentRun role"
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE agent_runs SET role='worker' WHERE agent_run_id='run1'",
+                    [],
+                )
+                .is_err(),
+            "legacy NULL role remains immutable"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO agent_runs(agent_run_id,role) VALUES ('invalid-role','unknown_role')",
+                    [],
+                )
+                .is_err(),
+            "AgentRun role CHECK accepts only known typed roles"
         );
         let preserved: (String, String, String) = connection
             .query_row(
