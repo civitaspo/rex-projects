@@ -3050,6 +3050,14 @@ mod tests {
             ) -> Result<Option<IngestedAgentResult>, String> {
                 Err("unused".into())
             }
+            fn process_one_agent_request(
+                &mut self,
+                _: &mut ConfigStore,
+                _: u64,
+                _: i64,
+            ) -> Result<bool, String> {
+                Err("unused".into())
+            }
             fn observe_base_heads(
                 &mut self,
             ) -> Result<std::collections::BTreeMap<crate::domain::ids::RepositoryId, String>, String>
@@ -3058,6 +3066,12 @@ mod tests {
             }
             fn configuration_digest(&self) -> &Digest {
                 &self.0
+            }
+            fn read_verified_artifact(
+                &self,
+                _: &crate::store::artifact_registry::VerifiedArtifact,
+            ) -> Result<Vec<u8>, String> {
+                Err("unused".into())
             }
             fn profile_commit_mode(
                 &self,
@@ -3103,6 +3117,18 @@ mod tests {
                 _: &super::PendingRoleWakeSession,
                 _: i64,
             ) -> Result<bool, String> {
+                Err("unused".into())
+            }
+            fn worker_publication_effect(
+                &mut self,
+                _: &mut ConfigStore,
+                _: u64,
+                _: i64,
+                _: &Config,
+                _: &crate::store::scheduler::ActiveTicketRun,
+                _: &IngestedAgentResult,
+                _: u64,
+            ) -> Result<Option<crate::store::EffectIntent>, String> {
                 Err("unused".into())
             }
             fn effect_handlers(&self) -> Vec<&dyn EffectHandler> {
@@ -3237,6 +3263,7 @@ mod tests {
                 wake_recipients: Vec::new(),
             },
             receipt: StoredRoleResultReceipt::test_receipt("evidence-clarify"),
+            verified_artifacts: Vec::new(),
         };
         let mut services = Services(loaded.digest.clone());
         assert!(
