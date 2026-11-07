@@ -271,7 +271,7 @@ pub struct ConfigStore {
 }
 
 pub struct MachineLock {
-    _file: File,
+    _file: Option<File>,
 }
 
 impl MachineLock {
@@ -306,7 +306,7 @@ impl MachineLock {
         }
         restrict_directory_permissions(lock_root)?;
         Ok(Self {
-            _file: acquire_machine_lock(lock_root)?,
+            _file: Some(acquire_machine_lock(lock_root)?),
         })
     }
 }
@@ -314,6 +314,38 @@ impl MachineLock {
 impl ConfigStore {
     pub fn open(state_root: &Path) -> Result<Self, String> {
         Self::open_with_lock(state_root, MachineLock::acquire(state_root)?)
+    }
+
+    /// Open the state database for a bounded external control request while the foreground
+    /// controller owns the machine lock. Mutations remain available only through typed APIs
+    /// which fence on the active owner generation.
+    pub fn open_control(state_root: &Path) -> Result<Self, String> {
+        let database = state_root.join("state.sqlite3");
+        let metadata = fs::symlink_metadata(&database)
+            .map_err(|error| format!("{}: {error}", database.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("control database must be an existing regular file".into());
+        }
+        let connection = Connection::open(&database)
+            .map_err(|error| format!("{}: {error}", database.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| error.to_string())?;
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if schema_version != SCHEMA_VERSION as i64 {
+            return Err(format!(
+                "control request requires current schema {SCHEMA_VERSION}, found {schema_version}; run the foreground controller first"
+            ));
+        }
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        })
     }
 
     #[cfg(test)]
@@ -2067,6 +2099,59 @@ impl ConfigStore {
         evidence_json: &str,
         effects: &[EffectIntent],
     ) -> Result<InputReceipt, String> {
+        self.commit_ticket_transition_impl(
+            owner_generation,
+            ticket_run_id,
+            expected_revision,
+            input,
+            transition,
+            reason,
+            evidence_json,
+            effects,
+            None,
+        )
+    }
+
+    /// Commit the final Done transition only with a host proof derived from operation and
+    /// Postmortem receipts. The general transition API deliberately cannot accept this event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_ticket_completion(
+        &mut self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+        expected_revision: Revision,
+        input: &DurableInput,
+        reason: &str,
+        evidence_json: &str,
+        effects: &[EffectIntent],
+        proof: &crate::engine::ticket_effects::TicketCompletionProof,
+    ) -> Result<InputReceipt, String> {
+        self.commit_ticket_transition_impl(
+            owner_generation,
+            ticket_run_id,
+            expected_revision,
+            input,
+            Input::CompletionObserved,
+            reason,
+            evidence_json,
+            effects,
+            Some(proof),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_ticket_transition_impl(
+        &mut self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+        expected_revision: Revision,
+        input: &DurableInput,
+        transition: Input,
+        reason: &str,
+        evidence_json: &str,
+        effects: &[EffectIntent],
+        completion_proof: Option<&crate::engine::ticket_effects::TicketCompletionProof>,
+    ) -> Result<InputReceipt, String> {
         validate_input(input)?;
         if reason.is_empty()
             || reason.len() > 1024
@@ -2137,6 +2222,74 @@ impl ConfigStore {
             external_status: parse_ticket_status(&status_raw)?,
             required_review_revision: review_revision.map(Revision),
         };
+        match (&transition, completion_proof) {
+            (Input::CompletionObserved, Some(proof)) => {
+                if proof.project_id() != &project_id
+                    || proof.ticket_run_id() != ticket_run_id
+                    || proof.expected_revision() != revision
+                {
+                    return Err(
+                        "completion proof is bound to a different TicketRun revision".into(),
+                    );
+                }
+                let receipt: Option<(String, String, String, String, String, String)> = tx
+                    .query_row(
+                        "SELECT p.plan_digest,p.state,p.postmortem_receipt_digest,m.receipt_digest,k.operation_id,k.manifest_digest FROM operation_plans p JOIN operation_postmortems m USING(project_id,ticket_run_id) JOIN knowledge_publications k USING(project_id,ticket_run_id) WHERE p.project_id=?1 AND p.ticket_run_id=?2 AND k.state='published'",
+                        params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let Some((
+                    plan_digest,
+                    plan_state,
+                    plan_postmortem,
+                    operation_postmortem,
+                    knowledge_operation,
+                    knowledge_digest,
+                )) = receipt
+                else {
+                    return Err("completion receipts are incomplete".into());
+                };
+                if !matches!(plan_state.as_str(), "not_required" | "succeeded")
+                    || plan_postmortem != operation_postmortem
+                    || Digest::parse(plan_digest)? != *proof.plan_digest()
+                    || Digest::parse(operation_postmortem)? != *proof.postmortem_receipt_digest()
+                    || knowledge_operation != proof.knowledge_operation_id()
+                    || Digest::parse(knowledge_digest)? != *proof.knowledge_manifest_digest()
+                {
+                    return Err("completion proof no longer matches persisted operation and Postmortem receipts".into());
+                }
+                let manifest_json: String = tx
+                    .query_row(
+                        "SELECT manifest_json FROM knowledge_publications WHERE operation_id=?1 AND ticket_run_id=?2 AND state='published'",
+                        params![proof.knowledge_operation_id(), ticket_run_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let manifest: serde_json::Value =
+                    crate::protocol::parse_unique(manifest_json.as_bytes()).map_err(|error| {
+                        format!("stored Postmortem manifest is invalid: {error}")
+                    })?;
+                if canonical_json(&manifest)? != manifest_json
+                    || manifest["operation_id"].as_str() != Some(proof.knowledge_operation_id())
+                    || content_digest(&manifest_json) != proof.knowledge_manifest_digest().as_str()
+                {
+                    return Err(
+                        "completion Postmortem publication receipt failed verification".into(),
+                    );
+                }
+            }
+            (Input::CompletionObserved, None) => {
+                return Err(
+                    "completion requires host-validated operation and Postmortem receipts".into(),
+                );
+            }
+            (_, Some(_)) => {
+                return Err("completion proof cannot authorize a different transition".into());
+            }
+            (_, None) => {}
+        }
         let decision = reduce(&current, expected_revision, transition)?;
         let expected_kinds = decision
             .effects

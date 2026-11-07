@@ -108,6 +108,17 @@ pub struct AgentWakeSnapshot {
     pub digest: Digest,
 }
 
+/// Receipt for a durable human instruction routed to one exact Coordinator run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorInstructionReceipt {
+    pub wake_input_id: u64,
+    pub project_id: ProjectId,
+    pub ticket_run_id: TicketRunId,
+    pub revision: u64,
+    pub body_digest: Digest,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunnableProject {
     pub record: super::ProjectRecord,
@@ -277,6 +288,267 @@ impl TicketScanKey {
 }
 
 impl ConfigStore {
+    /// Verify a host status publication against the current persisted TicketRun state.
+    /// External adapters call this immediately before mutation and again when reconciling.
+    pub fn validate_ticket_status_publication(
+        &self,
+        owner_generation: u64,
+        payload: &crate::engine::ticket_effects::PublishTicketStatus,
+    ) -> Result<(), String> {
+        payload.validate()?;
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let stored: Option<(String, String, String, u64)> = self
+            .connection
+            .query_row(
+                "SELECT namespace,ticket_id,internal_phase,revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                params![payload.ticket_run_id.as_str(), payload.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((namespace, ticket_id, phase, revision)) = stored else {
+            return Err("ticket status effect references an unknown TicketRun".into());
+        };
+        if namespace != payload.namespace.as_str()
+            || ticket_id != payload.ticket_id.as_str()
+            || revision != payload.ticket_run_revision
+        {
+            return Err("ticket status effect is stale or has mismatched scope".into());
+        }
+        let status: String = self
+            .connection
+            .query_row(
+                "SELECT external_status FROM ticket_runs WHERE ticket_run_id=?1",
+                [payload.ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if super::parse_ticket_status(&status)? != payload.desired_status {
+            return Err("ticket status effect does not match persisted TicketRun status".into());
+        }
+        let phase_allows_status = match payload.desired_status {
+            TicketStatus::InReview => phase == "waiting_human",
+            TicketStatus::Done => phase == "done",
+            TicketStatus::Canceled => phase == "canceled",
+            TicketStatus::InProgress => {
+                !matches!(phase.as_str(), "done" | "canceled" | "waiting_human")
+            }
+            TicketStatus::Triage | TicketStatus::Backlog | TicketStatus::Ready => false,
+        };
+        if !phase_allows_status {
+            return Err("ticket status is not authorized by the persisted TicketRun phase".into());
+        }
+        Ok(())
+    }
+
+    /// Produce the opaque final-completion proof only after the persisted operations gate and
+    /// Postmortem publication receipts both validate for this exact TicketRun revision.
+    pub fn ticket_completion_proof(
+        &mut self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        expected_revision: u64,
+    ) -> Result<Option<crate::engine::ticket_effects::TicketCompletionProof>, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let run: Option<(String, u64)> = tx
+            .query_row(
+                "SELECT internal_phase,revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                params![ticket_run_id.as_str(), project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if run != Some(("completing".into(), expected_revision)) {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        let plan: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT plan_digest,postmortem_receipt_digest FROM operation_plans WHERE project_id=?1 AND ticket_run_id=?2 AND state IN ('not_required','succeeded')",
+                params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((plan_digest, Some(postmortem_digest))) = plan else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        let operation_receipt: Option<String> = tx
+            .query_row(
+                "SELECT receipt_digest FROM operation_postmortems WHERE project_id=?1 AND ticket_run_id=?2",
+                params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if operation_receipt.as_deref() != Some(postmortem_digest.as_str()) {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        let publication: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT operation_id,manifest_digest,manifest_json FROM knowledge_publications WHERE project_id=?1 AND ticket_run_id=?2 AND state='published'",
+                params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((knowledge_operation_id, manifest_digest, manifest_json)) = publication else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        let manifest: serde_json::Value =
+            crate::protocol::parse_unique(manifest_json.as_bytes())
+                .map_err(|error| format!("stored Postmortem manifest is invalid: {error}"))?;
+        if super::canonical_json(&manifest)? != manifest_json
+            || manifest["operation_id"].as_str() != Some(knowledge_operation_id.as_str())
+        {
+            return Err("stored Postmortem manifest identity or encoding is invalid".into());
+        }
+        let verified_manifest_digest = Digest::parse(super::content_digest(&manifest_json))?;
+        let manifest_digest = Digest::parse(manifest_digest)?;
+        if verified_manifest_digest != manifest_digest {
+            return Err("stored Postmortem manifest digest is invalid".into());
+        }
+        let proof =
+            crate::engine::ticket_effects::TicketCompletionProof::from_validated_host_receipts(
+                project_id.clone(),
+                ticket_run_id.clone(),
+                expected_revision,
+                Digest::parse(plan_digest)?,
+                Digest::parse(postmortem_digest)?,
+                knowledge_operation_id,
+                manifest_digest,
+            );
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some(proof))
+    }
+
+    /// Enqueue a dashboard instruction as a high-priority Coordinator wake. The request is
+    /// bound to an exact TicketRun revision so stale dashboard views cannot redirect input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_coordinator_instruction(
+        &mut self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        namespace: &TicketNamespace,
+        ticket_id: &TicketId,
+        expected_revision: u64,
+        request_id: &str,
+        body: &str,
+        now_unix: i64,
+    ) -> Result<CoordinatorInstructionReceipt, String> {
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || !request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+        {
+            return Err("invalid dashboard request ID".into());
+        }
+        if body.is_empty() || body.len() > 64 * 1024 || body.contains('\0') {
+            return Err(
+                "Coordinator instruction must be nonempty UTF-8 text no larger than 64 KiB".into(),
+            );
+        }
+        let body_digest = Digest::parse(content_digest(body))?;
+        let role_session_id = format!("ticket_run:{}:coordinator", ticket_run_id.as_str());
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "request_id": request_id,
+            "project_id": project_id.as_str(),
+            "ticket_run_id": ticket_run_id.as_str(),
+            "namespace": namespace.as_str(),
+            "ticket_id": ticket_id.as_str(),
+            "expected_revision": expected_revision,
+            "body": body,
+            "body_digest": body_digest.as_str(),
+        });
+        let payload_json = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let run: Option<(String, String, u64, String)> = tx
+            .query_row(
+                "SELECT namespace,ticket_id,revision,internal_phase FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                params![ticket_run_id.as_str(), project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((stored_namespace, stored_ticket, revision, phase)) = run else {
+            return Err("Coordinator instruction target TicketRun does not exist".into());
+        };
+        if stored_namespace != namespace.as_str() || stored_ticket != ticket_id.as_str() {
+            return Err("Coordinator instruction target scope does not match the TicketRun".into());
+        }
+        if revision != expected_revision || matches!(phase.as_str(), "done" | "canceled") {
+            return Err("Coordinator instruction is stale or the TicketRun is terminal".into());
+        }
+
+        let existing: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT wake_input_id,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='human_instruction' AND source_id=?3 AND source_revision=?4",
+                params![project_id.as_str(), role_session_id, request_id, expected_revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((wake_input_id, stored_payload)) = existing {
+            if stored_payload != payload_json {
+                return Err(
+                    "dashboard request ID was already used for different instruction content"
+                        .into(),
+                );
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(CoordinatorInstructionReceipt {
+                wake_input_id,
+                project_id: project_id.clone(),
+                ticket_run_id: ticket_run_id.clone(),
+                revision: expected_revision,
+                body_digest,
+                replayed: true,
+            });
+        }
+        tx.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'human_instruction',?3,?4,100,?5,'pending',?6)",
+            params![project_id.as_str(), role_session_id, request_id, expected_revision, payload_json, now_unix],
+        )
+        .map_err(|error| error.to_string())?;
+        let wake_input_id = tx.last_insert_rowid() as u64;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(CoordinatorInstructionReceipt {
+            wake_input_id,
+            project_id: project_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            revision: expected_revision,
+            body_digest,
+            replayed: false,
+        })
+    }
+
     pub fn runnable_projects(&self, owner_generation: u64) -> Result<Vec<RunnableProject>, String> {
         let mut statement = self.connection.prepare(
             "SELECT p.project_id,p.config_source,p.config_revision,p.config_digest,p.mode,p.goal_revision,p.desired_lifecycle,p.state_revision,r.project_epoch FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.desired_lifecycle='running' AND r.observed_lifecycle='running' AND r.controller_generation=?1 ORDER BY p.project_id",
@@ -379,6 +651,37 @@ impl ConfigStore {
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(sequence)
+    }
+
+    /// Defer only the currently claimed page after a transient adapter failure. The cursor and
+    /// page generation remain unchanged, so retrying cannot skip external tickets.
+    pub fn defer_ticket_scan_after_error(
+        &mut self,
+        owner_generation: u64,
+        key: &TicketScanKey,
+        expected_cursor: Option<&str>,
+        expected_generation: u64,
+        expected_page_count: u64,
+        now_unix: i64,
+        retry_after_seconds: u64,
+    ) -> Result<(), String> {
+        key.validate()?;
+        if retry_after_seconds == 0 || retry_after_seconds > 3600 {
+            return Err("ticket scan error backoff is outside bounds".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
+            "UPDATE ticket_scan_cursors SET next_due_at_unix=?1 WHERE project_id=?2 AND adapter_id=?3 AND namespace=?4 AND scope_digest=?5 AND filter_digest=?6 AND status=?7 AND scan_generation=?8 AND page_count=?9 AND cursor IS ?10",
+            params![now_unix.saturating_add(retry_after_seconds.min(i64::MAX as u64) as i64),key.project_id.as_str(),key.adapter_id.as_str(),key.namespace.as_str(),key.scope_digest.as_str(),key.filter_digest.as_str(),status_key(key.status),expected_generation,expected_page_count,expected_cursor],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("ticket scan changed before error backoff could be committed".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Atomically snapshot the highest-priority pending wake inputs for a

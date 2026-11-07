@@ -208,7 +208,21 @@ impl FactoryRuntime {
                 ticket_run_started: None,
             });
         };
-        let page = services.list_ticket_page(&key, cursor.cursor.as_deref(), 100)?;
+        let page = match services.list_ticket_page(&key, cursor.cursor.as_deref(), 100) {
+            Ok(page) => page,
+            Err(error) => {
+                store.defer_ticket_scan_after_error(
+                    owner_generation,
+                    &key,
+                    cursor.cursor.as_deref(),
+                    cursor.generation,
+                    cursor.page_count,
+                    now_unix,
+                    config.runtime.external_poll_seconds.clamp(2, 3600),
+                )?;
+                return Err(error);
+            }
+        };
         if page.tickets.len() > 100
             || page
                 .tickets

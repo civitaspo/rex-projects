@@ -23,13 +23,16 @@ fn fixture(
     .unwrap();
     std::fs::write(
         &config,
-        source.replacen(
+        format!(
+            "{}\n[runtime.environment]\nsource = \"inherit\"\ninteractive = false\ntimeout_seconds = 15\n",
+            source.replacen(
             "schema_version = 1",
             &format!(
                 "schema_version = 1\nstate_root = \"{}\"",
                 temp.path().join("runtime").display()
             ),
             1,
+            )
         ),
     )
     .unwrap();
@@ -279,6 +282,7 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
 
     let mut owner = command(&config, &state, &home)
         .args(["runtime", "run"])
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let mut active = false;
@@ -296,7 +300,13 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(active, "foreground controller did not become visible");
+    if !active {
+        let output = owner.wait_with_output().unwrap();
+        panic!(
+            "foreground controller did not become visible: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let start = command(&config, &state, &home)
         .args([
             "--json",
