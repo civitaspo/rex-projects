@@ -54,7 +54,7 @@ pub struct RunStepSpool {
 }
 
 impl RunStepSpool {
-    /// Opens or creates the private `run-step` child of an already registered control directory.
+    /// Opens or creates the `run-step` child of an already registered control directory.
     pub fn open(control_dir: &Path) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(control_dir)
             .map_err(|error| format!("control directory: {error}"))?;
@@ -337,7 +337,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let file = match options.open(path) {
         Ok(file) => file,
@@ -554,6 +554,51 @@ mod tests {
         std::fs::write(&target, b"{}").unwrap();
         std::os::unix::fs::symlink(target, spool.directory().join("start.receipt.json")).unwrap();
         assert!(spool.wait_start_receipt(&envelope, Duration::ZERO).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readers_reject_fifo_spool_files_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+
+        fn fifo(path: &std::path::Path) {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is a valid NUL-terminated path and mode is an ordinary permission mask.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+
+        fn completes_without_blocking<T: Send + 'static>(
+            read: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || sender.send(read()).unwrap());
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("FIFO read blocked instead of rejecting the non-regular file")
+        }
+
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let request = spool.publish_start_once(request()).unwrap();
+
+        let request_path = spool.directory().join("start.request.json");
+        std::fs::remove_file(&request_path).unwrap();
+        fifo(&request_path);
+        let request_spool = spool.clone();
+        assert!(completes_without_blocking(move || request_spool.read_start_request()).is_err());
+
+        let receipt_path = spool.directory().join("start.receipt.json");
+        fifo(&receipt_path);
+        let receipt_spool = spool.clone();
+        assert!(
+            completes_without_blocking(move || receipt_spool.read_start_receipt(&request)).is_err()
+        );
+
+        let result_path = spool.directory().join("turn.result.json");
+        fifo(&result_path);
+        let result_spool = spool.clone();
+        assert!(completes_without_blocking(move || result_spool.read_result()).is_err());
     }
 
     #[test]
