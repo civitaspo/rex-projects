@@ -753,7 +753,10 @@ fn lock_handoff(path: &Path) -> Result<std::fs::File, EnvironmentError> {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let lock_path = path.with_extension("env.lock");
+    let lock_path = path
+        .parent()
+        .ok_or(EnvironmentError::Handoff)?
+        .join(".handoff.lock");
     let file = match private_create_new(&lock_path) {
         Ok(file) => file,
         Err(_) => {
@@ -1081,6 +1084,31 @@ mod tests {
         assert_eq!(get(&values, "API_TOKEN").unwrap(), "ephemeral");
         assert!(!path.exists());
         assert!(!path.with_extension("env.claim").exists());
+    }
+
+    #[test]
+    fn consumed_ephemeral_handoffs_reuse_a_bounded_lock_file() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_from_variables(
+            EnvironmentSource::Inherit,
+            None,
+            BTreeMap::from([("TOKEN".into(), "once".into())]),
+        )
+        .unwrap();
+
+        for index in 0..32 {
+            snapshot
+                .create_handoff(root.path(), &format!("bounded-{index}"))
+                .unwrap()
+                .consume()
+                .unwrap();
+        }
+
+        let entries = std::fs::read_dir(root.path().join("environment-handoffs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [".handoff.lock"]);
     }
 
     #[test]
