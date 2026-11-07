@@ -19,7 +19,9 @@ pub const DEFAULT_MAX_ARTICLE_BYTES: usize = 256 * 1024;
 const MAX_POSTMORTEM_ITEMS: usize = 256;
 
 /// One bounded, attributable input to a postmortem. `content` is curated text,
-/// never an environment dump or raw credential-bearing artifact.
+/// never an environment dump or raw credential-bearing artifact. `trusted` is
+/// provenance metadata, not proof; the controller must derive it from a
+/// validated source receipt before constructing this value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeSource {
     pub id: String,

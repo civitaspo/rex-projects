@@ -24,7 +24,9 @@ avoids `rename` replacing an empty destination directory. A retry verifies the
 existing bytes and returns the same receipt; conflicting content is an error.
 
 Only curated source excerpts are accepted, with a configured aggregate byte
-limit. Sources carry their digest, resource, and trust label. Untrusted source
+limit. Sources carry their digest, resource, and trust label. The trust label is
+caller-supplied provenance metadata, not proof of authority; controller
+integration must derive it from a validated source receipt. Untrusted source
 material is explicitly marked as data rather than instructions. Callers must
 exclude environment dumps, credentials, and other secret-bearing material
 before constructing an input; the format layer does not claim general-purpose
