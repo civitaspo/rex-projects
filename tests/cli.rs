@@ -1,4 +1,82 @@
+use std::collections::VecDeque;
+use std::io::{self, Read};
 use std::process::Command;
+use std::process::{Child, ExitStatus, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const MAX_CAPTURED_STDERR_BYTES: usize = 8 * 1024;
+
+struct ForegroundOwner {
+    child: Child,
+    stderr_reader: Option<JoinHandle<VecDeque<u8>>>,
+}
+
+impl ForegroundOwner {
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        let mut child = command.stderr(Stdio::piped()).spawn()?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .expect("piped stderr is available after spawn");
+        let stderr_reader = std::thread::spawn(move || {
+            let mut tail = VecDeque::with_capacity(MAX_CAPTURED_STDERR_BYTES);
+            let mut chunk = [0; 2048];
+            loop {
+                let read = match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                for byte in &chunk[..read] {
+                    if tail.len() == MAX_CAPTURED_STDERR_BYTES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
+            }
+            tail
+        });
+        Ok(Self {
+            child,
+            stderr_reader: Some(stderr_reader),
+        })
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
+    }
+
+    fn terminate(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+
+    fn stderr_tail(&mut self) -> String {
+        self.stderr_reader
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .map(|bytes| {
+                let bytes: Vec<u8> = bytes.into_iter().collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+            .unwrap_or_else(|| "<stderr capture unavailable>".into())
+    }
+}
+
+impl Drop for ForegroundOwner {
+    fn drop(&mut self) {
+        self.terminate();
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rex-projects"));
@@ -66,6 +144,31 @@ fn version_reports_the_cargo_package_version() {
         format!("rex-projects {}\n", env!("CARGO_PKG_VERSION"))
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn foreground_owner_reports_exit_status_and_bounds_captured_stderr() {
+    let mut child = ForegroundOwner::spawn({
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import sys; sys.stderr.write('x' * 20000); sys.exit(17)",
+        ]);
+        command
+    })
+    .expect("spawn stderr fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "stderr fixture timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = child.stderr_tail();
+    assert_eq!(status.code(), Some(17));
+    assert_eq!(stderr.len(), MAX_CAPTURED_STDERR_BYTES);
+    assert!(stderr.bytes().all(|byte| byte == b'x'));
 }
 
 #[test]
@@ -265,12 +368,19 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         .unwrap();
     assert!(apply.status.success());
 
-    let mut owner = command(&config, &state, &home)
-        .args(["runtime", "run"])
-        .spawn()
-        .unwrap();
-    let mut active = false;
-    for _ in 0..100 {
+    let mut owner_command = command(&config, &state, &home);
+    owner_command.args(["runtime", "run"]);
+    let mut owner = ForegroundOwner::spawn(owner_command)
+        .expect("spawn foreground controller with captured stderr");
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = owner
+            .try_wait()
+            .expect("poll foreground controller process")
+        {
+            let stderr = owner.stderr_tail();
+            panic!("foreground controller exited during startup ({status}); stderr: {stderr}");
+        }
         let status = command(&config, &state, &home)
             .args(["--json", "status"])
             .output()
@@ -279,12 +389,15 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
             && serde_json::from_slice::<serde_json::Value>(&status.stdout)
                 .is_ok_and(|report| report["owner"]["active"] == true)
         {
-            active = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        if Instant::now() >= startup_deadline {
+            owner.terminate();
+            let stderr = owner.stderr_tail();
+            panic!("foreground controller startup timed out after 10s; stderr: {stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(active, "foreground controller did not become visible");
     let start = command(&config, &state, &home)
         .args([
             "--json",
@@ -390,5 +503,9 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         .unwrap();
     assert!(stop.status.success());
     let status = owner.wait().unwrap();
-    assert!(status.success());
+    let stderr = owner.stderr_tail();
+    assert!(
+        status.success(),
+        "foreground controller exited with {status}; stderr: {stderr}"
+    );
 }
