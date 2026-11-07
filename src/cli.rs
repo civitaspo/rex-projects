@@ -1390,10 +1390,14 @@ fn run_controller(
         store
             .heartbeat_owner(generation)
             .map_err(CliError::unavailable)?;
+        let tick_now = unix_now_i64()?;
+        if let Err(error) = services.tick_provider_qualification_jobs(&mut store, tick_now) {
+            eprintln!("rex-projects provider qualification: {error}");
+        }
         let tick = crate::engine::factory_runtime::FactoryRuntime::tick(
             &mut store,
             generation,
-            unix_now_i64()?,
+            tick_now,
             &snapshot.config.config,
             &mut services,
         )
