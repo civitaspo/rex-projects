@@ -35,6 +35,16 @@ pub struct MailboxRequest {
     pub envelope: RequestEnvelope<Value>,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxDescriptor {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub expires_at_unix: u64,
+    pub max_request_bytes: usize,
+    pub max_pending_requests: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum QueueResult {
     Queued { digest: String },
@@ -58,15 +68,129 @@ impl MailboxCapability {
         limits: MailboxLimits,
     ) -> Result<Self, String> {
         let run_id = run_id.into();
-        if run_id.is_empty() || run_id.len() > MAX_ID_BYTES || run_id.chars().any(char::is_control)
-        {
-            return Err("invalid mailbox run id".into());
-        }
-        if limits.max_request_bytes == 0 || limits.max_pending_requests == 0 {
-            return Err("mailbox limits must be positive".into());
-        }
+        validate_run_id(&run_id, limits)?;
         fs::create_dir_all(directory)
             .map_err(|error| format!("{}: {error}", directory.display()))?;
+        let capability = Self::open_unregistered(run_id, directory, expires_at, limits)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            capability
+                .directory_handle
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("secure mailbox root: {error}"))?;
+        }
+        #[cfg(not(unix))]
+        set_private_directory_permissions(&capability.directory)?;
+        let descriptor = MailboxDescriptor {
+            schema_version: 1,
+            run_id: capability.run_id.clone(),
+            expires_at_unix: expires_at,
+            max_request_bytes: limits.max_request_bytes,
+            max_pending_requests: limits.max_pending_requests,
+        };
+        let descriptor = serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?;
+        match capability.atomic_publish("descriptor.json", &descriptor) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing =
+                    capability
+                        .read_bounded("descriptor.json", 4096)
+                        .map_err(|read_error| {
+                            format!("read existing mailbox descriptor: {read_error}")
+                        })?;
+                if existing != descriptor {
+                    return Err(
+                        "mailbox directory is already registered with a different capability"
+                            .into(),
+                    );
+                }
+            }
+            Err(error) => return Err(format!("publish mailbox descriptor: {error}")),
+        }
+        Ok(capability)
+    }
+
+    pub fn open_existing(
+        run_id: impl Into<String>,
+        directory: &Path,
+        expires_at: u64,
+        limits: MailboxLimits,
+    ) -> Result<Self, String> {
+        let capability = Self::open_unregistered(run_id, directory, expires_at, limits)?;
+        let bytes = capability
+            .read_bounded("descriptor.json", 4096)
+            .map_err(|error| format!("read mailbox descriptor: {error}"))?;
+        let descriptor: MailboxDescriptor = parse_unique(&bytes)?;
+        if descriptor.schema_version != 1
+            || descriptor.run_id != capability.run_id
+            || descriptor.expires_at_unix != expires_at
+            || descriptor.max_request_bytes != limits.max_request_bytes
+            || descriptor.max_pending_requests != limits.max_pending_requests
+        {
+            return Err("mailbox descriptor does not match its run-scoped capability".into());
+        }
+        Ok(capability)
+    }
+
+    pub fn open_registered(
+        run_id: impl Into<String>,
+        directory: &Path,
+        limits: MailboxLimits,
+    ) -> Result<Self, String> {
+        let mut capability = Self::open_unregistered(run_id, directory, u64::MAX, limits)?;
+        let bytes = capability
+            .read_bounded("descriptor.json", 4096)
+            .map_err(|error| format!("read mailbox descriptor: {error}"))?;
+        let descriptor: MailboxDescriptor = parse_unique(&bytes)?;
+        if descriptor.schema_version != 1
+            || descriptor.run_id != capability.run_id
+            || descriptor.max_request_bytes != limits.max_request_bytes
+            || descriptor.max_pending_requests != limits.max_pending_requests
+        {
+            return Err("mailbox descriptor does not match its run-scoped capability".into());
+        }
+        capability.expires_at = descriptor.expires_at_unix;
+        Ok(capability)
+    }
+
+    pub fn open_registered_verified(
+        run_id: impl Into<String>,
+        directory: &Path,
+        limits: MailboxLimits,
+        expected_digest: &str,
+    ) -> Result<Self, String> {
+        let capability = Self::open_registered(run_id, directory, limits)?;
+        let bytes = capability
+            .read_bounded("descriptor.json", 4096)
+            .map_err(|error| format!("read mailbox descriptor: {error}"))?;
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        if digest != expected_digest {
+            return Err(
+                "registered mailbox descriptor digest does not match durable host registration"
+                    .into(),
+            );
+        }
+        let canonical = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+        if canonical != capability.directory {
+            return Err("registered mailbox path changed after canonicalization".into());
+        }
+        Ok(capability)
+    }
+
+    fn open_unregistered(
+        run_id: impl Into<String>,
+        directory: &Path,
+        expires_at: u64,
+        limits: MailboxLimits,
+    ) -> Result<Self, String> {
+        let run_id = run_id.into();
+        validate_run_id(&run_id, limits)?;
+        let root_metadata = fs::symlink_metadata(directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+            return Err("mailbox root must be a real directory, not a symlink".into());
+        }
         let canonical = fs::canonicalize(directory)
             .map_err(|error| format!("{}: {error}", directory.display()))?;
         let metadata = fs::symlink_metadata(&canonical)
@@ -77,15 +201,6 @@ impl MailboxCapability {
         #[cfg(unix)]
         let directory_handle =
             open_dir(&canonical).map_err(|error| format!("open mailbox root: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            directory_handle
-                .set_permissions(std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| format!("secure mailbox root: {error}"))?;
-        }
-        #[cfg(not(unix))]
-        set_private_directory_permissions(&canonical)?;
         Ok(Self {
             run_id,
             directory: canonical,
@@ -386,6 +501,16 @@ impl MailboxCapability {
     }
 }
 
+fn validate_run_id(run_id: &str, limits: MailboxLimits) -> Result<(), String> {
+    if run_id.is_empty() || run_id.len() > MAX_ID_BYTES || run_id.chars().any(char::is_control) {
+        return Err("invalid mailbox run id".into());
+    }
+    if limits.max_request_bytes == 0 || limits.max_pending_requests == 0 {
+        return Err("mailbox limits must be positive".into());
+    }
+    Ok(())
+}
+
 pub fn unix_time_now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -601,6 +726,17 @@ mod tests {
     }
 
     #[test]
+    fn opening_agent_capability_never_creates_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("not-registered");
+        assert!(
+            MailboxCapability::open_existing("agent-run-1", &missing, 10, MailboxLimits::default())
+                .is_err()
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn queues_valid_request_and_replays_same_receipt_key() {
         let root = tempfile::tempdir().unwrap();
         let mailbox = capability(root.path());
@@ -637,9 +773,10 @@ mod tests {
                 .is_err()
         );
         assert!(mailbox.queue("r-1", &request("r-1", "x"), 11).is_err());
+        let limited_root = tempfile::tempdir().unwrap();
         let limited = MailboxCapability::create(
             "agent-run-1",
-            root.path(),
+            limited_root.path(),
             10,
             MailboxLimits {
                 max_request_bytes: 4096,
@@ -700,7 +837,7 @@ mod tests {
         symlink(&outside, &mailbox_path).unwrap();
         mailbox.queue("r-1", &request("r-1", "safe"), 1).unwrap();
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
-        assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 2);
     }
 
     #[test]
