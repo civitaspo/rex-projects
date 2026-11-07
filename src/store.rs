@@ -20,9 +20,8 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
+pub const SCHEMA_VERSION: i64 = 8;
 pub mod human;
-
-pub const SCHEMA_VERSION: i64 = 7;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
@@ -364,6 +363,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             crate::launch::migrate_v7(&mut connection)?;
+        }
+        if existing_version < 8 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            Self::migrate_human_v8(&mut connection)?;
         }
         Ok(Self {
             connection,

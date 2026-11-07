@@ -121,8 +121,8 @@ pub struct HumanPresentationReceipt {
 }
 
 impl ConfigStore {
-    /// Apply v8 after v7. Tests build a v6 fixture, promote only its user_version to 7, and invoke
-    /// this function directly so this branch can be reviewed before PR3d is merged.
+    /// Apply v8 after v7. The controller owns migration ordering and updates the shared schema
+    /// version only after this transaction succeeds.
     pub fn migrate_human_v8(connection: &mut Connection) -> Result<(), String> {
         let current: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -815,11 +815,6 @@ mod tests {
             state_revision: Revision(0),
         };
         store.insert_project(&project).unwrap();
-        store
-            .connection
-            .pragma_update(None, "user_version", 7)
-            .unwrap();
-        ConfigStore::migrate_human_v8(&mut store.connection).unwrap();
         let generation = store
             .start_owner(&OwnerMetadata {
                 owner_nonce: "human-test-owner".into(),
@@ -891,14 +886,32 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            HUMAN_SCHEMA_VERSION
         );
+        // Start from the real v7 schema produced by the versioned migration chain. Remove only
+        // v8's tables and marker so this database can exercise the preceding upgrade boundary.
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE human_presentations;
+                 DROP TABLE human_decisions;
+                 DROP TABLE human_decision_intents;
+                 DROP TABLE human_requests;
+                 DELETE FROM schema_migrations WHERE version=8;
+                 PRAGMA user_version=7;",
+            )
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "user_version", 6)
+            .unwrap();
         assert!(ConfigStore::migrate_human_v8(&mut store.connection).is_err());
         store
             .connection
             .pragma_update(None, "user_version", 7)
             .unwrap();
-        ConfigStore::migrate_human_v8(&mut store.connection).unwrap();
+        drop(store);
+        let store = ConfigStore::open_test(temp.path()).unwrap();
         assert_eq!(
             store
                 .connection
