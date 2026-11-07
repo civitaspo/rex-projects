@@ -682,20 +682,29 @@ fn observe_operation_subject(
     {
         return Err("current operation configuration snapshot is inconsistent".into());
     }
-    let bundle = crate::operations_runtime::operation_review_bundle(&snapshot.config, &intent)?;
-    let policy_digest =
-        crate::operations::operation_policy_digest(&snapshot.config.config, &intent.subject)?;
-    let binding = HumanSubjectBinding {
-        project_id: intent.project_id,
-        kind: HumanSubjectKind::Operation,
-        subject_id: operation_id.to_string(),
-        ticket_run_id: Some(intent.ticket_run_id),
-        revision: intent.ticket_revision,
-        material_digest: intent.subject.digest().map_err(|error| error.to_string())?,
-        configuration_digest: snapshot.config.digest,
-        policy_digest,
-        bundle_digest: review_bundle_digest(&bundle)?,
-    };
+    let applied = &snapshot.config;
+    let bundle = crate::operations::operation_review_bundle(
+        applied,
+        &intent.subject,
+        &intent.target,
+        &intent.ticket_id,
+    )?;
+    let binding =
+        crate::operations::operation_human_subject_binding(applied, &intent.subject, &bundle)?;
+    let expected_request_id = intent
+        .approval_request_id
+        .as_deref()
+        .ok_or("operation approval request has no durable request ID")?;
+    if request.purpose != HumanPurpose::OperationApproval
+        || request.request_id.as_str() != expected_request_id
+        || request.review_bundle != bundle
+        || request.subject != binding
+        || !request.choices.contains(&HumanDecisionChoice::Approve)
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the operation approval evidence or policy changed; review the new request".into(),
+        ));
+    }
     Ok(HumanSubjectObservation::Current(binding))
 }
 
