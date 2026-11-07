@@ -52,6 +52,7 @@ type PromotionIntentRow = (
     String,
     String,
     String,
+    String,
 );
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,8 +78,10 @@ pub struct ProfilePromotionIntent {
     pub profile_id: ProfileId,
     pub role: crate::domain::types::Role,
     pub manifest_digest: Digest,
+    pub profile_material_digest: Digest,
     pub expected_config_revision: Digest,
     pub config_source: String,
+    pub config_file: String,
     pub human_request_id: HumanRequestId,
     pub approval_subject_digest: Digest,
     pub approval_configuration_digest: Digest,
@@ -146,6 +149,7 @@ pub(crate) struct ProfilePromotionRequest {
     pub operation_id: OperationId,
     pub candidate_id: String,
     pub config_source: String,
+    pub config_file: String,
     pub human_request_id: HumanRequestId,
 }
 
@@ -174,6 +178,7 @@ pub struct StoredApprovedProfilePackage {
     pub approval_policy_digest: Digest,
     pub response_receipt_digest: Digest,
     pub config_revision: Digest,
+    pub profile_material_digest: Digest,
 }
 
 /// Install v10 over a v9 database as part of the caller's backed-up migration transaction.
@@ -245,10 +250,12 @@ pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
             evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
             manifest_digest TEXT NOT NULL CHECK(length(manifest_digest)=64),
             config_source TEXT NOT NULL,
+            config_file TEXT NOT NULL,
             expected_config_revision TEXT NOT NULL CHECK(length(expected_config_revision)=64),
             human_request_id TEXT NOT NULL,
             human_response_digest TEXT NOT NULL CHECK(length(human_response_digest)=64),
             approval_subject_digest TEXT NOT NULL CHECK(length(approval_subject_digest)=64),
+            profile_material_digest TEXT NOT NULL CHECK(length(profile_material_digest)=64),
             approval_configuration_digest TEXT NOT NULL CHECK(length(approval_configuration_digest)=64),
             approval_policy_digest TEXT NOT NULL CHECK(length(approval_policy_digest)=64),
             approved_package_json TEXT NOT NULL CHECK(length(approved_package_json)<=4194304),
@@ -314,11 +321,13 @@ impl ConfigStore {
             String,
             String,
             String,
+            String,
+            String,
         );
         let row: Option<Row> = self.connection.query_row(
-            "SELECT project_id,candidate_id,candidate_digest,evidence_digest,profile_id,role,manifest_digest,expected_config_revision,config_source,human_request_id,approval_subject_digest,approval_configuration_digest,approval_policy_digest,human_response_digest,approved_package_json,state FROM profile_promotions WHERE operation_id=?1",
+            "SELECT project_id,candidate_id,candidate_digest,evidence_digest,profile_id,role,manifest_digest,expected_config_revision,config_source,config_file,human_request_id,approval_subject_digest,profile_material_digest,approval_configuration_digest,approval_policy_digest,human_response_digest,approved_package_json,state FROM profile_promotions WHERE operation_id=?1",
             [operation_id.as_str()],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?)),
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?,r.get(17)?)),
         ).optional().map_err(|e| e.to_string())?;
         let Some((
             project_id,
@@ -330,8 +339,10 @@ impl ConfigStore {
             manifest,
             config_revision,
             source,
+            config_file,
             request_id,
             subject,
+            profile_material,
             configuration,
             policy,
             response,
@@ -355,6 +366,7 @@ impl ConfigStore {
         let expected_config_revision = Digest::parse(config_revision)?;
         let human_request_id = HumanRequestId::parse(request_id)?;
         let approval_subject_digest = Digest::parse(subject)?;
+        let profile_material_digest = Digest::parse(profile_material)?;
         let approval_configuration_digest = Digest::parse(configuration)?;
         let approval_policy_digest = Digest::parse(policy)?;
         let response_receipt_digest = Digest::parse(response)?;
@@ -371,6 +383,7 @@ impl ConfigStore {
             || package.candidate_digest != candidate_digest
             || package.human_request_id != human_request_id
             || package.approval_subject_digest != approval_subject_digest
+            || package.profile_material_digest != profile_material_digest
             || package.approval_configuration_digest != approval_configuration_digest
             || package.approval_policy_digest != approval_policy_digest
             || package.response_receipt_digest != response_receipt_digest
@@ -393,7 +406,7 @@ impl ConfigStore {
             &expected_config_revision,
         )
         .map_err(|e| e.to_string())?;
-        if subject != approval_subject_digest
+        if subject != profile_material_digest
             || crate::learning::evidence_digest(&package.evidence).map_err(|e| e.to_string())?
                 != evidence_digest
         {
@@ -406,8 +419,10 @@ impl ConfigStore {
             profile_id,
             role,
             manifest_digest,
+            profile_material_digest,
             expected_config_revision,
             config_source: source,
+            config_file,
             human_request_id,
             approval_subject_digest,
             approval_configuration_digest,
@@ -428,6 +443,30 @@ impl ConfigStore {
         if current != *intent {
             return Err("profile promotion intent changed during dispatch".into());
         }
+        let request_json: String = self
+            .connection
+            .query_row(
+                "SELECT request_json FROM human_requests WHERE request_id=?1",
+                [intent.human_request_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| "profile promotion human request is missing".to_owned())?;
+        let request: crate::human_runtime::HumanRuntimeRequest =
+            crate::protocol::parse_unique(request_json.as_bytes())?;
+        if request.purpose != crate::human_runtime::HumanPurpose::ProfilePromotion
+            || request.subject.kind != crate::human_runtime::HumanSubjectKind::Profile
+            || request.subject.project_id != intent.project_id
+            || request.subject.subject_id != intent.profile_id.as_str()
+            || request.subject.material_digest != intent.profile_material_digest
+            || request.subject.configuration_digest != intent.approval_configuration_digest
+            || request.subject.policy_digest != intent.approval_policy_digest
+            || request.subject.digest().map_err(|e| e.to_string())?
+                != intent.approval_subject_digest
+        {
+            return Err(
+                "durable profile approval request no longer matches the approved package".into(),
+            );
+        }
         let receipt = self
             .accepted_human_approval(
                 &intent.human_request_id,
@@ -446,6 +485,8 @@ impl ConfigStore {
             stored.candidate_digest.clone(),
             stored.evidence.clone(),
             stored.files.clone(),
+            intent.approval_subject_digest.clone(),
+            intent.profile_material_digest.clone(),
             stored.config_revision.clone(),
             stored.approval_configuration_digest.clone(),
             stored.approval_policy_digest.clone(),
@@ -1059,13 +1100,83 @@ impl ConfigStore {
             .as_str()
             .bytes()
             .all(|byte| byte == b'0')
-            || !std::path::Path::new(&request.config_source).is_absolute()
+            || request.config_source.is_empty()
+            || request.config_source.chars().any(char::is_control)
+            || !std::path::Path::new(&request.config_file).is_absolute()
             || request.human_request_id.as_str().is_empty()
             || request.human_request_id != claims.human_request_id
         {
             return Err(
                 "profile promotion needs a validated human response and config source".into(),
             );
+        }
+        // The human API's receipt digest covers a HumanSubjectBinding envelope. The
+        // profile-specific digest lives in that envelope's material_digest; verify
+        // both layers against the durable original request before accepting a package.
+        let request_json: String = self
+            .connection
+            .query_row(
+                "SELECT request_json FROM human_requests WHERE request_id=?1",
+                [claims.human_request_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| "profile promotion has no durable human request".to_owned())?;
+        let human_request: crate::human_runtime::HumanRuntimeRequest =
+            crate::protocol::parse_unique(request_json.as_bytes())?;
+        let material_digest = crate::learning::profile_approval_subject_digest(
+            &claims.project_id,
+            claims.role,
+            &claims.profile_id,
+            &claims.candidate_digest,
+            &package.files,
+            &package.evidence,
+            &claims.config_revision,
+        )
+        .map_err(|e| e.to_string())?;
+        if human_request.purpose != crate::human_runtime::HumanPurpose::ProfilePromotion
+            || human_request.subject.kind != crate::human_runtime::HumanSubjectKind::Profile
+            || human_request.subject.project_id != claims.project_id
+            || human_request.subject.subject_id != claims.profile_id.as_str()
+            || human_request.subject.material_digest != material_digest
+            || human_request.subject.configuration_digest != claims.approval_configuration_digest
+            || human_request.subject.policy_digest != claims.approval_policy_digest
+            || human_request.subject.digest().map_err(|e| e.to_string())?
+                != claims.approval_subject_digest
+        {
+            return Err(
+                "profile approval request does not bind the complete approved package".into(),
+            );
+        }
+        let now_unix: u64 = super::now_unix()?
+            .try_into()
+            .map_err(|_| "system clock is before the Unix epoch")?;
+        let accepted = self
+            .accepted_human_approval(
+                &claims.human_request_id,
+                &claims.approval_subject_digest,
+                &claims.approval_configuration_digest,
+                &claims.approval_policy_digest,
+                now_unix,
+            )?
+            .ok_or("profile promotion has no current accepted human approval")?;
+        let regenerated = crate::learning::profile_package_from_accepted_approval(
+            &accepted,
+            claims.project_id.clone(),
+            claims.role,
+            claims.profile_id.clone(),
+            claims.candidate_digest.clone(),
+            package.evidence.clone(),
+            package.files.clone(),
+            claims.approval_subject_digest.clone(),
+            material_digest.clone(),
+            claims.config_revision.clone(),
+            claims.approval_configuration_digest.clone(),
+            claims.approval_policy_digest.clone(),
+            now_unix,
+        )
+        .map_err(|e| e.to_string())?;
+        if validated_promotion_claims(&regenerated).map_err(|e| e.to_string())? != claims {
+            return Err("profile package differs from the authoritative human approval".into());
         }
         let tx = self
             .connection
@@ -1127,15 +1238,16 @@ impl ConfigStore {
             approval_policy_digest: claims.approval_policy_digest.clone(),
             response_receipt_digest: claims.response_receipt_digest.clone(),
             config_revision: claims.config_revision.clone(),
+            profile_material_digest: material_digest.clone(),
         })
         .map_err(|e| e.to_string())?;
         if approved_package_json.len() > MAX_RECORD_BYTES {
             return Err("approved profile package exceeds the durable intent limit".into());
         }
         let prior: Option<PromotionIntentRow> = tx.query_row(
-            "SELECT project_id,candidate_digest,profile_id,role,evidence_digest,manifest_digest,config_source,expected_config_revision,human_request_id,human_response_digest FROM profile_promotions WHERE operation_id=?1",
+            "SELECT project_id,candidate_digest,profile_id,role,evidence_digest,manifest_digest,config_source,config_file,expected_config_revision,human_request_id,human_response_digest FROM profile_promotions WHERE operation_id=?1",
             [request.operation_id.as_str()],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
         ).optional().map_err(|e| e.to_string())?;
         if let Some(existing) = prior {
             let expected = (
@@ -1146,6 +1258,7 @@ impl ConfigStore {
                 claims.evidence_digest.to_string(),
                 claims.manifest_digest.to_string(),
                 request.config_source.clone(),
+                request.config_file.clone(),
                 claims.config_revision.to_string(),
                 request.human_request_id.to_string(),
                 claims.response_receipt_digest.to_string(),
@@ -1172,13 +1285,13 @@ impl ConfigStore {
             return Ok(());
         }
         tx.execute(
-            "INSERT INTO profile_promotions(operation_id,project_id,candidate_id,candidate_digest,profile_id,role,evidence_digest,manifest_digest,config_source,expected_config_revision,human_request_id,human_response_digest,approval_subject_digest,approval_configuration_digest,approval_policy_digest,approved_package_json,state,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'approved',?17)",
+            "INSERT INTO profile_promotions(operation_id,project_id,candidate_id,candidate_digest,profile_id,role,evidence_digest,manifest_digest,config_source,config_file,expected_config_revision,human_request_id,human_response_digest,approval_subject_digest,profile_material_digest,approval_configuration_digest,approval_policy_digest,approved_package_json,state,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,'approved',?19)",
             params![request.operation_id.as_str(), claims.project_id.as_str(), request.candidate_id,
                 claims.candidate_digest.as_str(), claims.profile_id.as_str(),
                 role_name,
-                claims.evidence_digest.as_str(), claims.manifest_digest.as_str(), request.config_source,
+                claims.evidence_digest.as_str(), claims.manifest_digest.as_str(), request.config_source, request.config_file,
                 claims.config_revision.as_str(), request.human_request_id.as_str(),
-                claims.response_receipt_digest.as_str(), claims.approval_subject_digest.as_str(),
+                claims.response_receipt_digest.as_str(), claims.approval_subject_digest.as_str(), material_digest.as_str(),
                 claims.approval_configuration_digest.as_str(), claims.approval_policy_digest.as_str(),
                 approved_package_json, super::now_unix()?],
         ).map_err(|e| e.to_string())?;
@@ -1508,7 +1621,7 @@ impl ConfigStore {
                 CandidateStatus::Superseded,
             )?;
         }
-        let changed = tx.execute("UPDATE learning_candidates SET status='promoted' WHERE project_id=?1 AND candidate_digest=?2 AND candidate_id=(SELECT candidate_id FROM profile_promotions WHERE operation_id=?3) AND status='awaiting_approval'", params![project.as_str(),candidate_digest,operation_id.as_str()]).map_err(|e| e.to_string())?;
+        let changed = tx.execute("UPDATE learning_candidates SET status='promoted' WHERE project_id=?1 AND digest=?2 AND candidate_id=(SELECT candidate_id FROM profile_promotions WHERE operation_id=?3) AND status='awaiting_approval'", params![project.as_str(),candidate_digest,operation_id.as_str()]).map_err(|e| e.to_string())?;
         if changed != 1 {
             return Err("approved profile candidate disappeared before activation".into());
         }
@@ -1572,6 +1685,7 @@ fn verify_digest(json: &str, digest: &Digest) -> Result<(), String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     use rusqlite::Connection;
     use sha2::{Digest as _, Sha256};
@@ -1586,11 +1700,19 @@ mod tests {
         Digest, OperationId, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
     };
     use crate::domain::types::Role;
+    use crate::human::{RepositoryReview, ReviewBundle, ReviewEvidence};
+    use crate::human_runtime::{
+        HumanDecisionChoice, HumanDecisionIntent, HumanPurpose, HumanRuntimeRequest,
+        HumanSubjectBinding, HumanSubjectKind, write_runtime_review_artifact,
+    };
     use crate::knowledge::PostmortemInput;
     use crate::knowledge_effect::KnowledgeEffectHandler;
+    use crate::launch::{RexView, RexViewKind};
     use crate::learning::{
         CandidateRevision, CandidateStatus, TrialObservation, TrialOutcome, TrialRunStatus,
     };
+    use crate::learning::{ProfilePackage, profile_approval_subject_digest};
+    use crate::store::human::HumanDecisionResult;
     use crate::store::{
         ConfigStore, DurableInput, EffectIntent, ExpectedRevision, OwnerMetadata, ProjectRecord,
         content_digest, durable_input_digest,
@@ -1948,5 +2070,327 @@ mod tests {
             TrialOutcome::Improved
         );
         let _ = ProfileId::parse("worker-profile").unwrap();
+    }
+
+    #[test]
+    fn approved_inconclusive_profile_publishes_replays_and_activates_after_config_cas() {
+        let (temp, mut store, project, generation, _) = running_store();
+        let profile_id = ProfileId::parse("worker-learned").unwrap();
+        let candidate_id = "worker-learned-v1";
+        let candidate_digest = Digest::parse("d".repeat(64)).unwrap();
+        let files = BTreeMap::from([
+            (
+                "config.toml".to_owned(),
+                b"adapter = \"codex\"\ncommand = [\"codex\"]\n".to_vec(),
+            ),
+            (
+                "instructions.md".to_owned(),
+                b"Keep changes small and record test results.".to_vec(),
+            ),
+        ]);
+        let manifest_digest = crate::learning::manifest_digest(&files).unwrap();
+        let package_rows: Vec<_> = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path,
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+                )
+            })
+            .collect();
+        let package_json = serde_json::to_string(&package_rows).unwrap();
+        let candidate = LearningCandidateRecord {
+            revision: CandidateRevision {
+                candidate_id: candidate_id.into(),
+                project_id: project.clone(),
+                role: Role::Worker,
+                digest: candidate_digest.clone(),
+                created_at: "2026-11-07T00:00:00Z".into(),
+                expires_at: "2027-11-07T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            },
+            profile_id: profile_id.clone(),
+            package_manifest_digest: manifest_digest,
+            package_json,
+            expected_pairs: 5,
+        };
+        store
+            .register_learning_candidate(generation, &candidate)
+            .unwrap();
+        let mut evidence = None;
+        for pair_index in 0usize..5 {
+            let observation = TrialObservation {
+                input_digest: Digest::parse(format!(
+                    "{:x}",
+                    Sha256::digest(pair_index.to_be_bytes())
+                ))
+                .unwrap(),
+                baseline: TrialRunStatus::Equivalent,
+                candidate: TrialRunStatus::Equivalent,
+            };
+            evidence = Some(
+                store
+                    .record_learning_trial(
+                        generation,
+                        &project,
+                        candidate_id,
+                        &candidate_digest,
+                        pair_index,
+                        &observation,
+                    )
+                    .unwrap()
+                    .evidence,
+            );
+        }
+        let evidence = evidence.unwrap();
+        assert_eq!(evidence.outcome, TrialOutcome::Inconclusive);
+        assert_eq!(evidence.distinct_inputs, 5);
+
+        let declarative_root = temp.path().join("declarative");
+        fs::create_dir_all(&declarative_root).unwrap();
+        let config_file = declarative_root.join("config.toml");
+        fs::write(&config_file, "schema_version = 1\n").unwrap();
+        let config_revision =
+            crate::learning::config_revision(&config_file, &declarative_root.join("profiles"))
+                .unwrap();
+        let config_digest = store
+            .load_snapshot("factory")
+            .unwrap()
+            .unwrap()
+            .config
+            .digest;
+        let policy_digest = Digest::parse("e".repeat(64)).unwrap();
+        let material_digest = profile_approval_subject_digest(
+            &project,
+            Role::Worker,
+            &profile_id,
+            &candidate_digest,
+            &files,
+            &evidence,
+            &config_revision,
+        )
+        .unwrap();
+        let bundle = ReviewBundle {
+            title: "Approve a bounded worker profile trial".into(),
+            summary: "The candidate was inconclusive across five distinct inputs.".into(),
+            risk: None,
+            repositories: vec![RepositoryReview {
+                repository: "sample/repo".into(),
+                pull_request: "candidate profile".into(),
+                url: None,
+                base_ref: "main".into(),
+                base_sha: "a".repeat(40),
+                head_ref: "candidate".into(),
+                head_sha: "b".repeat(40),
+                checks: vec!["five paired trials recorded".into()],
+                review_receipts: vec![],
+                merge_steps: vec![],
+            }],
+            evidence: vec![ReviewEvidence {
+                title: "Trial interpretation".into(),
+                body: "Results are inconclusive; no efficacy claim is made.".into(),
+                truncated: false,
+            }],
+            unknowns: vec!["The candidate may not improve future work.".into()],
+        };
+        let request = HumanRuntimeRequest {
+            request_id: crate::domain::ids::HumanRequestId::parse("profile-approval-1").unwrap(),
+            purpose: HumanPurpose::ProfilePromotion,
+            subject: HumanSubjectBinding {
+                project_id: project.clone(),
+                kind: HumanSubjectKind::Profile,
+                subject_id: profile_id.to_string(),
+                ticket_run_id: None,
+                revision: Revision(1),
+                material_digest: material_digest.clone(),
+                configuration_digest: config_digest.clone(),
+                policy_digest: policy_digest.clone(),
+                bundle_digest: crate::human::review_bundle_digest(&bundle).unwrap(),
+            },
+            question: "Approve publishing this profile to the declarative staging directory?"
+                .into(),
+            choices: vec![HumanDecisionChoice::Approve, HumanDecisionChoice::Refuse],
+            expires_at_unix: 4_102_444_800,
+            review_bundle: bundle,
+        };
+        let supervisor_view = RexView {
+            view_id: RexView::derive_id(&project, RexViewKind::Supervisor, None, None, 1).unwrap(),
+            project_id: project.clone(),
+            kind: RexViewKind::Supervisor,
+            ticket_namespace: None,
+            ticket_id: None,
+            view_epoch: 1,
+            rex_server_identity: "test-server".into(),
+            rex_session_id: "test-session".into(),
+            rex_window_id: "supervisor-window".into(),
+        };
+        store
+            .register_rex_view(generation, &supervisor_view)
+            .unwrap();
+        let artifact_root = temp.path().join("human-artifacts");
+        fs::create_dir_all(&artifact_root).unwrap();
+        fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let artifact = write_runtime_review_artifact(&artifact_root, &request).unwrap();
+        assert!(
+            store
+                .register_human_request(
+                    generation,
+                    &request,
+                    &supervisor_view.view_id,
+                    &artifact,
+                    super::super::now_unix().unwrap() as u64,
+                )
+                .unwrap()
+        );
+        let now = super::super::now_unix().unwrap() as u64;
+        let response = HumanDecisionIntent {
+            request_id: request.request_id.clone(),
+            response_id: "profile-approval-response-1".into(),
+            expected_subject_digest: request.subject.digest().unwrap(),
+            choice: HumanDecisionChoice::Approve,
+            explanation: Some("Promote only this worker profile for further evaluation; these trials do not establish efficacy.".into()),
+        };
+        ConfigStore::enqueue_human_decision(temp.path(), &response, now + 1).unwrap();
+        assert!(matches!(
+            store
+                .process_human_decision(
+                    generation,
+                    &response.response_id,
+                    &request.subject,
+                    now + 2
+                )
+                .unwrap(),
+            HumanDecisionResult::Applied
+        ));
+        let receipt = store
+            .accepted_human_approval(
+                &request.request_id,
+                &request.subject.digest().unwrap(),
+                &config_digest,
+                &policy_digest,
+                now + 3,
+            )
+            .unwrap()
+            .unwrap();
+        let package: ProfilePackage = crate::learning::profile_package_from_accepted_approval(
+            &receipt,
+            project.clone(),
+            Role::Worker,
+            profile_id.clone(),
+            candidate_digest.clone(),
+            evidence.clone(),
+            files.clone(),
+            request.subject.digest().unwrap(),
+            material_digest.clone(),
+            config_revision.clone(),
+            config_digest.clone(),
+            policy_digest.clone(),
+            now + 3,
+        )
+        .unwrap();
+        let operation_id = OperationId::parse("profile-promotion-op-1").unwrap();
+        store
+            .register_profile_promotion(
+                generation,
+                &super::ProfilePromotionRequest {
+                    operation_id: operation_id.clone(),
+                    candidate_id: candidate_id.into(),
+                    config_source: "factory".into(),
+                    config_file: config_file.display().to_string(),
+                    human_request_id: request.request_id.clone(),
+                },
+                &package,
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin_profile_publication(generation, &operation_id)
+                .unwrap()
+        );
+        let effect = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let handler = crate::profile_effect::ProfileEffectHandler::new(declarative_root.clone());
+        let published = handler.execute(&mut store, generation, &effect).unwrap();
+        assert!(published.profile_path.is_dir());
+        let replay = handler.execute(&mut store, generation, &effect).unwrap();
+        assert_eq!(replay, published);
+
+        let current = store.load_snapshot("factory").unwrap().unwrap();
+        let mut target = current.config;
+        let mut config_value = serde_json::to_value(&target.config).unwrap();
+        config_value["projects"][project.as_str()] = serde_json::json!({
+            "mode":"goal", "ticket_adapter":"tickets", "roles":{"worker":profile_id.as_str()}
+        });
+        target.config = serde_json::from_value(config_value).unwrap();
+        let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
+            "adapter":"codex", "command":["codex"], "model":"test"
+        }))
+        .unwrap();
+        target.profiles.insert(profile_id, profile);
+        target.digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&target.config).unwrap())
+        ))
+        .unwrap();
+        assert!(
+            store
+                .prepare_profile_activation(
+                    generation,
+                    &operation_id,
+                    current.revision,
+                    &target.digest
+                )
+                .unwrap()
+        );
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &target,
+                ExpectedRevision::Current(current.revision),
+            )
+            .unwrap();
+        assert!(
+            store
+                .confirm_profile_activation(generation, &operation_id, &applied)
+                .unwrap()
+        );
+        let status: String = store.connection.query_row(
+            "SELECT status FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+            rusqlite::params![project.as_str(), candidate_id, candidate_digest.as_str()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(status, "promoted");
+        store.stop_owner(generation).unwrap();
+        drop(store);
+        let mut reopened = ConfigStore::open_test(temp.path()).unwrap();
+        let recovered_generation = reopened
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "recovered-profile-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "test-recovered-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(
+            !reopened
+                .confirm_profile_activation(recovered_generation, &operation_id, &applied)
+                .unwrap()
+        );
+        let recovered_state: String = reopened
+            .connection
+            .query_row(
+                "SELECT state FROM profile_promotions WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_state, "active");
     }
 }

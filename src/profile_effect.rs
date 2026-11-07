@@ -65,7 +65,7 @@ impl ProfileEffectHandler {
         // the durable promotion is already publication_pending, so false means
         // “prepared earlier”; a missing receipt still requires reconciliation.
         store.begin_profile_publication(generation, &payload.operation_id)?;
-        let config_file = PathBuf::from(&intent.config_source);
+        let config_file = PathBuf::from(&intent.config_file);
         if !config_file.is_absolute() {
             return Err("profile configuration source must be an absolute path".into());
         }

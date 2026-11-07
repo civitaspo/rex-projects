@@ -505,6 +505,8 @@ pub(crate) fn profile_package_from_accepted_approval(
     candidate_digest: Digest,
     evidence: TrialEvidence,
     files: BTreeMap<String, Vec<u8>>,
+    approval_subject_digest: Digest,
+    expected_profile_material_digest: Digest,
     config_revision: Digest,
     configuration_digest: Digest,
     policy_digest: Digest,
@@ -520,7 +522,7 @@ pub(crate) fn profile_package_from_accepted_approval(
     }
     let manifest = manifest_digest(&files)?;
     let evidence_hash = evidence_digest(&evidence)?;
-    let subject = profile_approval_subject_digest(
+    let profile_material_digest = profile_approval_subject_digest(
         &project_id,
         role,
         &profile_id,
@@ -529,7 +531,8 @@ pub(crate) fn profile_package_from_accepted_approval(
         &evidence,
         &config_revision,
     )?;
-    if receipt.subject_digest() != &subject
+    if profile_material_digest != expected_profile_material_digest
+        || receipt.subject_digest() != &approval_subject_digest
         || receipt.configuration_digest() != &configuration_digest
         || receipt.policy_digest() != &policy_digest
     {
@@ -579,7 +582,7 @@ pub(crate) fn profile_package_from_accepted_approval(
             approved_evidence_digest: evidence_hash,
             approved_config_revision: config_revision,
             human_request_id: receipt.request_id().clone(),
-            approval_subject_digest: subject,
+            approval_subject_digest,
             approval_configuration_digest: configuration_digest,
             approval_policy_digest: policy_digest,
             response_receipt_digest,
