@@ -136,7 +136,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 - [ ] Create or update `src/protocol/`. Record the reviewed diff.
 - [ ] Create or update `src/config.rs`. Record the reviewed diff.
 - [ ] Create or update `schemas/`. Record the reviewed diff.
-- [ ] Create or update `schemas/version.v1.json` and `scripts/build-release-assets.sh`. Record the reviewed diff.
+- [ ] Create or update `schemas/version.v1.json` and document the csm-ci `cargo-raw` release contract in `docs/release-assets.md`. Release builds and uploaded artifacts are produced by the managed csm-ci service; do not add a repository-local release builder.
 - [ ] Create or update `mise.toml`. Record the reviewed diff.
 - [ ] Create or update `.github/workflows/`. Record the reviewed diff.
 
@@ -145,7 +145,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 - [ ] Add one Rust package and the rex-projects binary. Keep modules within one crate until a real consumer needs a separate crate.
 - [ ] Implement branded identifiers, request and response envelopes, configuration parsing, validation errors, and JSON Schema emission. Load named profiles from adjacent `profiles/<name>/` directories as specified in Appendix L.
 - [ ] Add config validate, config apply, doctor, schema, and version commands. Apply a validated complete configuration snapshot atomically in SQLite. Make stdout machine-readable under --json and reserve stderr for diagnostics.
-- [ ] Wire cargo fmt --check, cargo clippy with warnings denied, and cargo test into existing mise tasks and CI. Preserve workflow security checks. Build the Appendix O standalone release assets and SHA-256 metadata for verified targets; publication is a separate authorized release step. Do not change a Lua pin until its assets are available and validated.
+- [ ] Wire cargo fmt --check, cargo clippy with warnings denied, and cargo test into existing mise tasks and CI. Preserve workflow security checks. Configure the managed csm-ci `cargo-raw` release for the Appendix O targets and SHA-256 metadata; publication is a separate authorized release step. Use the development-only `cargo xtask` verifier to update a Lua pin only after signed assets are available and validated.
 
 **You see.**
 
@@ -1208,9 +1208,9 @@ Validate at the boundary. Internal domain logic works with parsed types.
 
 `result` and `error` are mutually exclusive. `error` contains `code`, `message`, `retryable`, optional `retry_after_seconds`, and optional structured details.
 Use normalized codes `not_found`, `unauthorized`, `forbidden`, `conflict`, `rate_limited`, `unavailable`, `unsupported`, and `invalid_request`.
-Keep provider details under `extensions` or error details. Do not branch the engine on Linear-specific labels or status IDs.
+Keep provider details under `extensions` or error details. Do not branch the engine on tracker-specific labels or status IDs.
 `revision` is opaque and may be unavailable if the provider has no stable revision. `adapter.describe` states whether conditional writes are supported. Without compare-and-set, re-read immediately before mutation and record that a race remains.
-The normalized external status is exactly `triage`, `backlog`, `ready`, `in_progress`, `in_review`, `done`, or `canceled`, as defined in Appendix E. In `[adapters.tickets.status_values]`, normalized semantic keys map to the native status strings to use when reading and writing tickets. The adapter response returns the normalized key plus the observed native value and display label. Reject unmapped statuses; never guess that an unknown status is `ready`.
+The normalized external status is exactly `triage`, `backlog`, `ready`, `in_progress`, `in_review`, `done`, or `canceled`, as defined in Appendix E. The external wrapper keeps its own mapping from these semantic keys to native status strings and returns that map in `adapter.describe`. The adapter response returns the normalized key plus the observed native value and display label. Reject unmapped statuses; never guess that an unknown status is `ready`.
 A Project's adapter scope filters every list and mutation. Out-of-scope tickets are rejected even if a model requests them. Adapters declare supported scoped filters and optional operations; core logic never sends opaque provider requests.
 
 ### Ticket methods
@@ -1709,15 +1709,6 @@ command = ["/absolute/path/example-ticket-adapter"]
 environment_allow = ["PATH", "HOME", "EXAMPLE_TICKET_TOKEN"]
 read_timeout_seconds = 30
 write_timeout_seconds = 120
-
-[adapters.tickets.status_values]
-triage = "Triage"
-backlog = "Backlog"
-ready = "ToDo"
-in_progress = "In Progress"
-in_review = "In Review"
-done = "Done"
-canceled = "Canceled"
 
 [human]
 kind = "local_html"

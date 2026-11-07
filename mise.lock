@@ -242,27 +242,6 @@ url = "https://github.com/github/gh-actions-lock/releases/download/v0.4.1/darwin
 url_api = "https://api.github.com/repos/github/gh-actions-lock/releases/assets/702813196"
 provenance = "github-attestations"
 
-[[tools.lua]]
-version = "5.1.5"
-backend = "vfox:jdx/vfox-lua"
-specifiers = ["5.1.5"]
-
-[tools.lua."platforms.linux-arm64"]
-checksum = "sha256:2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
-url = "https://www.lua.org/ftp/lua-5.1.5.tar.gz"
-
-[tools.lua."platforms.linux-x64"]
-checksum = "sha256:2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
-url = "https://www.lua.org/ftp/lua-5.1.5.tar.gz"
-
-[tools.lua."platforms.macos-arm64"]
-checksum = "sha256:2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
-url = "https://www.lua.org/ftp/lua-5.1.5.tar.gz"
-
-[tools.lua."platforms.macos-x64"]
-checksum = "sha256:2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
-url = "https://www.lua.org/ftp/lua-5.1.5.tar.gz"
-
 [[tools.rust]]
 version = "1.99.1"
 backend = "core:rust"

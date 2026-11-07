@@ -39,14 +39,6 @@ here. The Securefix caller is part of this repository's PR workflow.
 - Set a timeout on each runner job. Use `bash -euo pipefail` for shell steps.
   Pin the mise version, install from `mise.lock`, and disable the mise cache in
   CI so PR runs cannot populate a cache later used by trusted workflows.
-- Before mise setup, run
-  `scripts/ci/install-lua-system-dependencies.sh` in each Ubuntu workflow. It
-  installs `libreadline-dev`, required when the pinned Lua 5.1 mise plugin builds
-  Lua from source. Keep this system prerequisite in the shared script instead of
-  duplicating package-manager commands across workflows.
-- The mise setup step sets `MISE_HTTP_RETRIES=5` so transient source-download
-  network failures can recover without changing the pinned Lua build or accepting
-  an unreviewed binary artifact.
 - `mise run lint` checks workflow syntax, shell code, action pins, security
   policies, and local action-lock coverage. `mise run test` runs project tests.
 - After changing actions or workflow files, run `mise run actions-lock` and

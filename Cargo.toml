@@ -19,8 +19,13 @@ toml = "0.9"
 
 [dev-dependencies]
 jsonschema = { version = "0.60.2", default-features = false }
+mlua = { version = "0.12.2", features = ["lua51", "vendored"] }
 tempfile = "3"
 
 [profile.release]
 strip = true
+
+[workspace]
+members = ["xtask"]
+resolver = "3"
 

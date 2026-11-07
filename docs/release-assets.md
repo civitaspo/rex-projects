@@ -1,27 +1,27 @@
 # Release assets
 
-Build one versioned executable and digest manifest with:
+The release build and upload are owned by csm-ci. This repository keeps only the
+release-time pin verifier/updater in its development-only `xtask` package. Cargo's
+root `Cargo.toml` remains the version authority.
+
+To validate a locally collected four-target asset set and print the proposed Lua pin:
 
 ```sh
-scripts/build-release-asset.sh macos-aarch64 /tmp/rex-projects-assets
+cargo xtask pin --artifact-root /tmp/rex-projects-assets --check
 ```
 
-The target argument must be one of `macos-aarch64`, `macos-x86_64`, `linux-aarch64`, or
-`linux-x86_64`. The matching Rust target must be installed and the host must have a compatible
-linker. Run each target on a native compatible runner. The script reads the package version from
-Cargo metadata, builds the locked release profile, verifies `--version` and `version --json`, then
-writes the executable and its `artifact.json` beneath `<output-root>/<version>/<target>/`. The
-manifest includes the normalized and Rust targets, the measured runtime floor, source revision,
-clean build flag, parsed `version --json` response, and SHA-256 computed from the executable bytes.
-The CLI protocol and database schema stay inside `version_json` so release metadata remains generic.
+The artifact root may contain the flat csm release asset set, or a local fixture layout with
+`<Cargo version>/<normalized target>/rex-projects` and `artifact.json`. The validator requires all
+four targets and checks each executable against its metadata, target, Cargo version, CLI protocol,
+source revision, runtime floor, and digest. It does not execute cross-target binaries.
 
-After csm-ci has published the release, validate the exact Cargo-version tag and refresh the
-Lua pin:
+After csm-ci has published a release, verify its exact Cargo-version tag, all asset attestations,
+and checksums, then compare the proposed pin:
 
 ```sh
-python3 scripts/release_assets.py refresh --check
-# After reviewing the proposed diff:
-python3 scripts/release_assets.py refresh --write
+cargo xtask refresh-pin --check
+# After reviewing the diff:
+cargo xtask refresh-pin --write
 ```
 
 `refresh` reads the package version and release repository from `Cargo.toml`, uses only the
@@ -50,8 +50,8 @@ supported only on glibc 2.39 or newer; the current target profile does not claim
 with older Linux distributions. The value describes the conservative build-runner floor and must
 be checked against the release builder evidence.
 
-The default `--check` mode prints a diff and fails when `lua/rex_projects/runtime_version.lua` is
-not the exact output. `--write` atomically updates that file after the release tag, all asset
+The default mode prints a diff and fails when `lua/rex_projects/runtime_version.lua` is not the
+exact output. `--write` atomically updates that file after the release tag, all asset
 attestations, and all content digests pass. Review the source diff and submit it as a separate
 signed change; the refresh command does not create or merge a PR. Generated URLs use the Cargo
 repository's GitHub release URL and the raw asset names `rex-projects-<Rust-target-triple>`. The
@@ -59,7 +59,7 @@ generated pin embeds the exact version, protocol, URLs, and recomputed SHA-256. 
 mutable latest version or treats a downloaded checksum sidecar as its trust root.
 
 The csm-ci server-side release entry for this repository must use `build_type: cargo-raw`, binary
-`rex-projects`, the four exact Rust targets in `scripts/release_assets.py`, and
+`rex-projects`, these four exact Rust targets,
 `version_probe_args: [version, --json]`. This creates a target-specific metadata sidecar containing
 the parsed CLI response. The csm-ci-generated release callers stay managed by csm-ci; do not edit
 them in this repository. Linux GNU builds must run on the supported Ubuntu 24.04 baseline,

@@ -168,7 +168,6 @@ pub struct TicketAdapterConfig {
     pub read_timeout_seconds: u64,
     #[serde(default = "default_ticket_write_timeout")]
     pub write_timeout_seconds: u64,
-    pub status_values: StatusValues,
 }
 
 fn default_ticket_read_timeout() -> u64 {
@@ -176,44 +175,6 @@ fn default_ticket_read_timeout() -> u64 {
 }
 fn default_ticket_write_timeout() -> u64 {
     120
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StatusValues {
-    pub triage: String,
-    pub backlog: String,
-    pub ready: String,
-    pub in_progress: String,
-    pub in_review: String,
-    pub done: String,
-    pub canceled: String,
-}
-
-impl StatusValues {
-    pub fn get(&self, status: TicketStatus) -> &str {
-        match status {
-            TicketStatus::Triage => &self.triage,
-            TicketStatus::Backlog => &self.backlog,
-            TicketStatus::Ready => &self.ready,
-            TicketStatus::InProgress => &self.in_progress,
-            TicketStatus::InReview => &self.in_review,
-            TicketStatus::Done => &self.done,
-            TicketStatus::Canceled => &self.canceled,
-        }
-    }
-
-    fn all(&self) -> [&str; 7] {
-        [
-            &self.triage,
-            &self.backlog,
-            &self.ready,
-            &self.in_progress,
-            &self.in_review,
-            &self.done,
-            &self.canceled,
-        ]
-    }
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -810,37 +771,14 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
     {
         return Err("runtime.environment.shell must not be empty".into());
     }
-    if !matches!(
-        config.adapters.tickets.kind.as_str(),
-        "command" | "linear_cli"
-    ) {
-        return Err("adapters.tickets.kind must be `command` or `linear_cli`".into());
+    if !matches!(config.adapters.tickets.kind.as_str(), "command") {
+        return Err("adapters.tickets.kind must be `command`".into());
     }
     validate_argv("adapters.tickets.command", &config.adapters.tickets.command)?;
-    if config.adapters.tickets.kind == "linear_cli"
-        && ["HOME", "PATH", "XDG_CONFIG_HOME"].iter().any(|required| {
-            !config
-                .adapters
-                .tickets
-                .environment_allow
-                .iter()
-                .any(|name| name == required)
-        })
-    {
-        return Err("adapters.tickets.environment_allow must include `HOME`, `PATH`, and `XDG_CONFIG_HOME` for linear_cli".into());
-    }
     if config.adapters.tickets.read_timeout_seconds == 0
         || config.adapters.tickets.write_timeout_seconds == 0
     {
         return Err("ticket adapter timeouts must be positive".into());
-    }
-    let statuses = config.adapters.tickets.status_values.all();
-    let unique = statuses.iter().copied().collect::<BTreeSet<_>>();
-    if statuses.iter().any(|status| status.trim().is_empty()) || unique.len() != statuses.len() {
-        return Err(
-            "adapters.tickets.status_values must contain seven distinct nonempty native values"
-                .into(),
-        );
     }
     if let Some(human) = &config.human {
         validate_argv("human.command", &human.command)?;
@@ -1680,22 +1618,16 @@ mod tests {
     }
 
     #[test]
-    fn linear_cli_kind_requires_cli_configuration_environment() {
+    fn tracker_specific_adapter_kinds_are_rejected() {
         let config_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
-        let mut loaded = super::load(&config_path).unwrap();
-        {
-            let ticket = &mut loaded.config.adapters.tickets;
-            ticket.kind = "linear_cli".into();
-            ticket.command = vec!["linear".into()];
-            ticket.environment_allow = vec!["HOME".into(), "PATH".into(), "XDG_CONFIG_HOME".into()];
-        }
-        assert!(super::validate_config(&loaded.config, &loaded.profiles).is_ok());
-        loaded.config.adapters.tickets.environment_allow.pop();
+        let loaded = super::load(&config_path).unwrap();
+        let mut config = loaded.config;
+        config.adapters.tickets.kind = "tracker_native".into();
         assert!(
-            super::validate_config(&loaded.config, &loaded.profiles)
+            super::validate_config(&config, &loaded.profiles)
                 .unwrap_err()
-                .contains("HOME`, `PATH`, and `XDG_CONFIG_HOME")
+                .contains("adapters.tickets.kind must be `command`")
         );
     }
 
@@ -1746,7 +1678,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fields_with_key_path() {
-        let error = toml::from_str::<Config>("schema_version=1\nunknown=true\n[adapters.tickets]\nkind='command'\ncommand=['x']\nstatus_values={triage='t',backlog='b',ready='r',in_progress='p',in_review='v',done='d',canceled='c'}\n[projects.p]\nmode='goal'\nticket_adapter='tickets'\n").unwrap_err().to_string();
+        let error = toml::from_str::<Config>("schema_version=1\nunknown=true\n[adapters.tickets]\nkind='command'\ncommand=['x']\n[projects.p]\nmode='goal'\nticket_adapter='tickets'\n").unwrap_err().to_string();
         assert!(error.contains("unknown"));
     }
 

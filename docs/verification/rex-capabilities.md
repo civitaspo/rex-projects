@@ -37,7 +37,7 @@ The transport-recovery fixture deliberately truncated a successful create respon
 
 ## Cancellation boundary
 
-Local wrapper self-tests cover SIGINT, SIGTERM, SIGHUP, independent tool process groups, and unavailable process observations. Actual provider probes separately confirm finite turns, continuation, and graceful interruption; see [Coding Agent observations](agent-capabilities.md).
+The retired PR0 wrapper's local self-tests covered SIGINT, SIGTERM, SIGHUP, independent tool process groups, and unavailable process observations. Actual provider probes separately confirmed finite turns, continuation, and graceful interruption; see [Coding Agent observations](agent-capabilities.md).
 
 Direct Rex block closure is an abrupt-loss path. In one busy Codex probe, the native provider process survived after its wrapper's block closed. A missing wrapper receipt or block therefore cannot release a slot. Planned cancellation must interrupt the wrapper first, wait for bounded cleanup, and independently confirm process absence before closing the block. Abrupt block loss requires the host-owned process manifest and reconciliation in Appendix G. Unknown identities retain capacity and worktree ownership.
 
@@ -47,6 +47,6 @@ A 20-sample read-only `session.new_window` capability query completed with zero 
 
 The retained 34-second video renders timestamped actual CLI output for an unsupported API error, recovery with a supported API, a bounded foreground process, and verified session cleanup. It is a CLI transcript video, not a Rex GUI recording. A Rex application visual check and the minimum supported Rex release remain separate integration evidence.
 
-## Reproduction
+## Evidence retention
 
-Run `python3 tests/fixtures/rex/run_lifecycle.py --help` for the bounded fixture driver. It records the tested source SHA, Rex version/server identity, full generated IDs, exact argv, exit observations, and cleanup result. It requires an explicit server endpoint, disables server auto-start for every call, and optionally requires an expected instance ID. It creates and cleans up only its own session by full ID. Keep per-lane receipts outside the repository, with the exact tested source revision or unchanged fixture digests. Raw provider output and environment values must remain private.
+The disposable PR0 drivers that produced these observations have been retired. This report and the sanitized capability snapshot are retained as historical, version-specific evidence. Private live receipts remain outside the repository; raw provider output and environment values must remain private. Repeat live verification with a separately reviewed, bounded fixture before treating these observations as current compatibility guarantees.

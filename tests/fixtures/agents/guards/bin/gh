@@ -1,4 +1,0 @@
-#!/bin/sh
-set -eu
-printf '%s\n' 'gh denied by PR0 disposable fixture' >> "${REX_PROJECTS_PROBE_GUARD_LOG:?}"
-exit 125

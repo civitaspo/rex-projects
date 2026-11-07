@@ -147,13 +147,18 @@ fn version_reports_the_cargo_package_version() {
 }
 
 #[test]
+#[ignore = "subprocess fixture invoked by the bounded stderr test"]
+fn stderr_exit_fixture() {
+    use std::io::Write;
+    std::io::stderr().write_all(&[b'x'; 20_000]).unwrap();
+    std::process::exit(17);
+}
+
+#[test]
 fn foreground_owner_reports_exit_status_and_bounds_captured_stderr() {
     let mut child = ForegroundOwner::spawn({
-        let mut command = Command::new("python3");
-        command.args([
-            "-c",
-            "import sys; sys.stderr.write('x' * 20000); sys.exit(17)",
-        ]);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "stderr_exit_fixture", "--ignored", "--nocapture"]);
         command
     })
     .expect("spawn stderr fixture");
