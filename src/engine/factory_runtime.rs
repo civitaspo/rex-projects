@@ -295,7 +295,7 @@ impl FactoryRuntime {
             .review_interval_hours
             .checked_mul(60 * 60)
             .ok_or("learning review interval exceeds supported range")?;
-        let supervisor_reviews_queued = store.queue_due_supervisor_reviews(
+        let _supervisor_reviews_queued = store.queue_due_supervisor_reviews(
             owner_generation,
             &configured_projects,
             now_unix,
@@ -330,45 +330,44 @@ impl FactoryRuntime {
             12,
         )?;
         let (keys, mut external_errors) = build_scan_keys(config, &runnable, services);
-        if let Some(key) = next_pending_candidate_key(store, &runnable, config, &keys)? {
-            if let Some((project_run, disposition)) =
+        if let Some(key) = next_pending_candidate_key(store, &runnable, config, &keys)?
+            && let Some((project_run, disposition)) =
                 next_disposition(store, config, &runnable, &key)?
-            {
-                let ticket_id = project_run.ticket_id;
-                match &disposition {
-                    TicketDisposition::Dispatch { .. } => {
-                        if let Some(ticket) = store.pending_ticket_observations(&key, 1)?.first() {
-                            store.enqueue_supervisor_ticket_observation(
-                                owner_generation,
-                                &key,
-                                ticket,
-                                now_unix,
-                            )?;
-                        }
-                    }
-                    TicketDisposition::AwaitHuman { reason } => {
-                        store.classify_ticket_observation(
+        {
+            let ticket_id = project_run.ticket_id;
+            match &disposition {
+                TicketDisposition::Dispatch { .. } => {
+                    if let Some(ticket) = store.pending_ticket_observations(&key, 1)?.first() {
+                        store.enqueue_supervisor_ticket_observation(
                             owner_generation,
                             &key,
-                            &ticket_id,
-                            TicketObservationClassification::Human,
-                            reason,
-                            now_unix,
-                        )?;
-                    }
-                    TicketDisposition::Skip => {
-                        store.classify_ticket_observation(
-                            owner_generation,
-                            &key,
-                            &ticket_id,
-                            TicketObservationClassification::Ignored,
-                            "ticket status is outside configured dispatch policy",
+                            ticket,
                             now_unix,
                         )?;
                     }
                 }
-                store.mark_ticket_scan_served(owner_generation, &key)?;
+                TicketDisposition::AwaitHuman { reason } => {
+                    store.classify_ticket_observation(
+                        owner_generation,
+                        &key,
+                        &ticket_id,
+                        TicketObservationClassification::Human,
+                        reason,
+                        now_unix,
+                    )?;
+                }
+                TicketDisposition::Skip => {
+                    store.classify_ticket_observation(
+                        owner_generation,
+                        &key,
+                        &ticket_id,
+                        TicketObservationClassification::Ignored,
+                        "ticket status is outside configured dispatch policy",
+                        now_unix,
+                    )?;
+                }
             }
+            store.mark_ticket_scan_served(owner_generation, &key)?;
         }
 
         let Some((key, cursor)) = store.next_due_ticket_scan(&keys, now_unix)? else {
@@ -521,20 +520,19 @@ fn apply_agent_result(
     if binding.role == Role::Supervisor
         && result.validated.kind == RoleOutputKind::HumanRequest
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
-    {
-        if matches!(
+        && matches!(
             &result.validated.typed_payload,
             RoleResultPayload::HumanRequest(request) if request.kind == "goal_completion"
-        ) {
-            return apply_supervisor_goal_completion_request(
-                store,
-                owner_generation,
-                now_unix,
-                config,
-                services,
-                result,
-            );
-        }
+        )
+    {
+        return apply_supervisor_goal_completion_request(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            services,
+            result,
+        );
     }
     if result.validated.kind == RoleOutputKind::ImplementationReady
         && binding.role == Role::Worker
@@ -2602,6 +2600,126 @@ impl FilterRotation {
         Some(selected)
     }
 }
+fn apply_coordinator_spawn_request(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    config: &Config,
+    services: &impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Coordinator SpawnRequest lacks TicketRun scope")?;
+    let crate::engine::orchestration::RoleResultPayload::SpawnRequest(request) =
+        &result.validated.typed_payload
+    else {
+        return Err("validated SpawnRequest kind has a different typed payload".into());
+    };
+    if matches!(
+        request.role,
+        Role::Worker | Role::Supervisor | Role::Coordinator
+    ) {
+        return Err("Coordinator SpawnRequest targets a role without a generic launch path".into());
+    }
+    let project_record = store
+        .project(&binding.project_id)?
+        .ok_or("Coordinator SpawnRequest Project has no durable configuration record")?;
+    let configuration_digest = services.configuration_digest();
+    if project_record.config_digest != *configuration_digest
+        || binding.config_digest != *configuration_digest
+        || binding.config_revision != project_record.config_revision
+    {
+        return Err("Coordinator SpawnRequest belongs to a stale configuration snapshot".into());
+    }
+    let source_revision = binding
+        .ticket_revision
+        .ok_or("Coordinator SpawnRequest lacks TicketRun revision")?;
+    let current = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("Coordinator SpawnRequest references no active TicketRun")?;
+    if current.project_id != binding.project_id
+        || current.revision != source_revision.0
+        || !crate::runtime_services::role_allowed_in_phase(request.role, current.phase)
+    {
+        return Err("Coordinator SpawnRequest is stale or outside its TicketRun".into());
+    }
+    if !config
+        .projects
+        .get(&binding.project_id)
+        .is_some_and(|project| {
+            request
+                .allowed_repositories
+                .iter()
+                .all(|id| project.repositories.contains(id))
+        })
+    {
+        return Err(
+            "Coordinator SpawnRequest references a repository outside Project policy".into(),
+        );
+    }
+    let accepted = store.latest_accepted_work_plan(&binding.project_id, ticket_run_id)?;
+    if request.role == Role::Planner {
+        if accepted.as_ref().is_some_and(|plan| {
+            plan.plan_digest != request.plan_digest
+                || !plan
+                    .proposal
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == request.work_node && node.investigation)
+        }) {
+            return Err(
+                "Coordinator Planner SpawnRequest differs from the accepted investigation node"
+                    .into(),
+            );
+        }
+    } else {
+        let accepted = accepted.ok_or("Coordinator SpawnRequest has no accepted plan")?;
+        if accepted.plan_digest != request.plan_digest
+            || !accepted
+                .proposal
+                .nodes
+                .iter()
+                .any(|node| node.id == request.work_node)
+        {
+            return Err("Coordinator SpawnRequest does not match an accepted plan node".into());
+        }
+    }
+    let mut expected_profile =
+        crate::config::effective_project_roles(&binding.project_id, &config.projects)?
+            .get(&request.role)
+            .cloned()
+            .ok_or("Project has no profile for the requested child role")?;
+    if let Some(recipe_id) = &current.recipe_id
+        && let Some(recipe_profile) = config
+            .operation_recipes
+            .get(recipe_id)
+            .and_then(|recipe| recipe.roles.get(&request.role))
+    {
+        expected_profile = recipe_profile.clone();
+    }
+    if expected_profile != request.profile_id {
+        return Err("Coordinator SpawnRequest profile differs from current Project policy".into());
+    }
+    let session = format!("ticket_run:{ticket_run_id}:{}", role_name(request.role));
+    let payload = serde_json::json!({
+        "kind": "coordinator_spawn",
+        "request": request,
+        "source_evidence_id": result.receipt.evidence_id(),
+    });
+    store.persist_coordinator_child_wake(
+        owner_generation,
+        result,
+        request.role,
+        &session,
+        source_revision.0,
+        &payload,
+    )?;
+    Ok(true)
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -3714,125 +3832,4 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(status, "in_progress");
     }
-}
-fn apply_coordinator_spawn_request(
-    store: &mut ConfigStore,
-    owner_generation: u64,
-    config: &Config,
-    services: &impl FactoryRuntimeServices,
-    result: &crate::store::agent_results::IngestedAgentResult,
-) -> Result<bool, String> {
-    let binding = &result.validated.binding;
-    let ticket_run_id = binding
-        .ticket_run_id
-        .as_ref()
-        .ok_or("Coordinator SpawnRequest lacks TicketRun scope")?;
-    let crate::engine::orchestration::RoleResultPayload::SpawnRequest(request) =
-        &result.validated.typed_payload
-    else {
-        return Err("validated SpawnRequest kind has a different typed payload".into());
-    };
-    if matches!(
-        request.role,
-        Role::Worker | Role::Supervisor | Role::Coordinator
-    ) {
-        return Err("Coordinator SpawnRequest targets a role without a generic launch path".into());
-    }
-    let project_record = store
-        .project(&binding.project_id)?
-        .ok_or("Coordinator SpawnRequest Project has no durable configuration record")?;
-    let configuration_digest = services.configuration_digest();
-    if project_record.config_digest != *configuration_digest
-        || binding.config_digest != *configuration_digest
-        || binding.config_revision != project_record.config_revision
-    {
-        return Err("Coordinator SpawnRequest belongs to a stale configuration snapshot".into());
-    }
-    let source_revision = binding
-        .ticket_revision
-        .ok_or("Coordinator SpawnRequest lacks TicketRun revision")?;
-    let current = store
-        .active_ticket_runs(owner_generation, 128)?
-        .into_iter()
-        .find(|run| run.ticket_run_id == *ticket_run_id)
-        .ok_or("Coordinator SpawnRequest references no active TicketRun")?;
-    if current.project_id != binding.project_id
-        || current.revision != source_revision.0
-        || !crate::runtime_services::role_allowed_in_phase(request.role, current.phase)
-    {
-        return Err("Coordinator SpawnRequest is stale or outside its TicketRun".into());
-    }
-    if !config
-        .projects
-        .get(&binding.project_id)
-        .is_some_and(|project| {
-            request
-                .allowed_repositories
-                .iter()
-                .all(|id| project.repositories.contains(id))
-        })
-    {
-        return Err(
-            "Coordinator SpawnRequest references a repository outside Project policy".into(),
-        );
-    }
-    let accepted = store.latest_accepted_work_plan(&binding.project_id, ticket_run_id)?;
-    if request.role == Role::Planner {
-        if accepted.as_ref().is_some_and(|plan| {
-            plan.plan_digest != request.plan_digest
-                || !plan
-                    .proposal
-                    .nodes
-                    .iter()
-                    .any(|node| node.id == request.work_node && node.investigation)
-        }) {
-            return Err(
-                "Coordinator Planner SpawnRequest differs from the accepted investigation node"
-                    .into(),
-            );
-        }
-    } else {
-        let accepted = accepted.ok_or("Coordinator SpawnRequest has no accepted plan")?;
-        if accepted.plan_digest != request.plan_digest
-            || !accepted
-                .proposal
-                .nodes
-                .iter()
-                .any(|node| node.id == request.work_node)
-        {
-            return Err("Coordinator SpawnRequest does not match an accepted plan node".into());
-        }
-    }
-    let mut expected_profile =
-        crate::config::effective_project_roles(&binding.project_id, &config.projects)?
-            .get(&request.role)
-            .cloned()
-            .ok_or("Project has no profile for the requested child role")?;
-    if let Some(recipe_id) = &current.recipe_id {
-        if let Some(recipe_profile) = config
-            .operation_recipes
-            .get(recipe_id)
-            .and_then(|recipe| recipe.roles.get(&request.role))
-        {
-            expected_profile = recipe_profile.clone();
-        }
-    }
-    if expected_profile != request.profile_id {
-        return Err("Coordinator SpawnRequest profile differs from current Project policy".into());
-    }
-    let session = format!("ticket_run:{ticket_run_id}:{}", role_name(request.role));
-    let payload = serde_json::json!({
-        "kind": "coordinator_spawn",
-        "request": request,
-        "source_evidence_id": result.receipt.evidence_id(),
-    });
-    store.persist_coordinator_child_wake(
-        owner_generation,
-        result,
-        request.role,
-        &session,
-        source_revision.0,
-        &payload,
-    )?;
-    Ok(true)
 }

@@ -424,7 +424,7 @@ impl ConfigStore {
         let schema_version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        if schema_version != SCHEMA_VERSION as i64 {
+        if schema_version != SCHEMA_VERSION {
             return Err(format!(
                 "control request requires current schema {SCHEMA_VERSION}, found {schema_version}; run the foreground controller first"
             ));
@@ -1199,19 +1199,30 @@ impl ConfigStore {
         owned_label: &str,
         command_digest: &Digest,
     ) -> Result<bool, String> {
-        if block_id.trim().is_empty() || run_id.trim().is_empty() || owned_label.trim().is_empty()
-            || [block_id, run_id, owned_label].iter().any(|value| value.chars().any(char::is_control))
+        if block_id.trim().is_empty()
+            || run_id.trim().is_empty()
+            || owned_label.trim().is_empty()
+            || [block_id, run_id, owned_label]
+                .iter()
+                .any(|value| value.chars().any(char::is_control))
         {
             return Err("Rex view anchor identity is malformed".into());
         }
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let active: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM rex_views WHERE view_id=?1 AND lifecycle='active')",
-            [view_id.as_str()], |row| row.get(0),
-        ).map_err(|error| error.to_string())?;
-        if !active { return Err("Rex view anchor requires an active view".into()); }
+        let active: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rex_views WHERE view_id=?1 AND lifecycle='active')",
+                [view_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !active {
+            return Err("Rex view anchor requires an active view".into());
+        }
         let inserted = tx.execute(
             "INSERT INTO rex_view_anchors(view_id,block_id,run_id,owned_label,command_digest,lifecycle,process_absent_confirmed,created_at_unix) VALUES (?1,?2,?3,?4,?5,'unknown',0,?6) ON CONFLICT(view_id) DO NOTHING",
             params![view_id.as_str(),block_id,run_id,owned_label,command_digest.as_str(),now_unix()?],
@@ -1220,7 +1231,14 @@ impl ConfigStore {
             "SELECT block_id,run_id,owned_label,command_digest FROM rex_view_anchors WHERE view_id=?1",
             [view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).map_err(|error| error.to_string())?;
-        if stored != (block_id.to_owned(),run_id.to_owned(),owned_label.to_owned(),command_digest.as_str().to_owned()) {
+        if stored
+            != (
+                block_id.to_owned(),
+                run_id.to_owned(),
+                owned_label.to_owned(),
+                command_digest.as_str().to_owned(),
+            )
+        {
             return Err("Rex view already has a different recorded anchor".into());
         }
         tx.commit().map_err(|error| error.to_string())?;
@@ -1232,13 +1250,32 @@ impl ConfigStore {
             "SELECT a.block_id,a.run_id,a.owned_label,a.command_digest,a.lifecycle,a.process_absent_confirmed,a.terminal_at_unix,r.content_digest FROM rex_view_anchors a LEFT JOIN rex_view_anchor_archives r USING(view_id,block_id) WHERE a.view_id=?1",
             [view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
         ).optional().map_err(|error| error.to_string())?;
-        row.map(|(block_id,run_id,owned_label,command_digest,lifecycle,absent,terminal,archive_digest)| Ok(RexViewAnchorRecord {
-            view_id: view_id.clone(), block_id, run_id, owned_label,
-            command_digest: Digest::parse(command_digest)?,
-            lifecycle: serde_json::from_value(serde_json::Value::String(lifecycle)).map_err(|_| "stored Rex anchor lifecycle is invalid".to_owned())?,
-            process_absent_confirmed: absent, terminal_at_unix: terminal,
-            archive_digest: archive_digest.map(Digest::parse).transpose()?,
-        })).transpose()
+        row.map(
+            |(
+                block_id,
+                run_id,
+                owned_label,
+                command_digest,
+                lifecycle,
+                absent,
+                terminal,
+                archive_digest,
+            )| {
+                Ok(RexViewAnchorRecord {
+                    view_id: view_id.clone(),
+                    block_id,
+                    run_id,
+                    owned_label,
+                    command_digest: Digest::parse(command_digest)?,
+                    lifecycle: serde_json::from_value(serde_json::Value::String(lifecycle))
+                        .map_err(|_| "stored Rex anchor lifecycle is invalid".to_owned())?,
+                    process_absent_confirmed: absent,
+                    terminal_at_unix: terminal,
+                    archive_digest: archive_digest.map(Digest::parse).transpose()?,
+                })
+            },
+        )
+        .transpose()
     }
 
     pub fn observe_rex_view_anchor(
@@ -1250,18 +1287,28 @@ impl ConfigStore {
     ) -> Result<(), String> {
         if lifecycle == RexBlockLifecycle::Unknown && process_absent_confirmed
             || lifecycle == RexBlockLifecycle::Active && process_absent_confirmed
-        { return Err("Rex anchor process absence claim is invalid".into()); }
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        {
+            return Err("Rex anchor process absence claim is invalid".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let lifecycle = serde_json::to_value(lifecycle).map_err(|error| error.to_string())?;
-        let lifecycle = lifecycle.as_str().ok_or("Rex anchor lifecycle is invalid")?;
+        let lifecycle = lifecycle
+            .as_str()
+            .ok_or("Rex anchor lifecycle is invalid")?;
         let now = now_unix()?;
         let changed = tx.execute(
             "UPDATE rex_view_anchors SET lifecycle=?2,process_absent_confirmed=?3,terminal_at_unix=CASE WHEN ?2 IN ('completed','failed') THEN COALESCE(terminal_at_unix,?4) WHEN ?2='active' THEN NULL ELSE terminal_at_unix END WHERE view_id=?1 AND lifecycle!='closed' AND (lifecycle IN ('active','unknown') OR ?2='unknown' OR (?2='closed' AND process_absent_confirmed=1))",
             params![view_id.as_str(),lifecycle,process_absent_confirmed,now],
         ).map_err(|error| error.to_string())?;
-        if changed != 1 { return Err("Rex anchor not found or observation would regress a terminal state".into()); }
+        if changed != 1 {
+            return Err(
+                "Rex anchor not found or observation would regress a terminal state".into(),
+            );
+        }
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -1272,16 +1319,22 @@ impl ConfigStore {
         block_id: &str,
         output: &str,
     ) -> Result<Digest, String> {
-        if output.len() > 1_048_576 { return Err("Rex block archive exceeds the 1 MiB limit".into()); }
+        if output.len() > 1_048_576 {
+            return Err("Rex block archive exceeds the 1 MiB limit".into());
+        }
         let digest = Digest::parse(format!("{:x}", Sha256::digest(output.as_bytes())))?;
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let state: Option<(String,bool)> = tx.query_row(
             "SELECT lifecycle,process_absent_confirmed FROM rex_view_anchors WHERE view_id=?1 AND block_id=?2",
             params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
-        if state.as_ref().is_none_or(|(lifecycle,absent)| !matches!(lifecycle.as_str(),"completed"|"failed") || !absent) {
+        if state.as_ref().is_none_or(|(lifecycle, absent)| {
+            !matches!(lifecycle.as_str(), "completed" | "failed") || !absent
+        }) {
             return Err("only a confirmed terminal Rex anchor can be archived".into());
         }
         tx.execute(
@@ -1292,18 +1345,28 @@ impl ConfigStore {
             "SELECT content_digest,output FROM rex_view_anchor_archives WHERE view_id=?1 AND block_id=?2",
             params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
         ).map_err(|error| error.to_string())?;
-        if stored != (digest.as_str().to_owned(),output.to_owned()) { return Err("Rex anchor archive already exists with different content".into()); }
+        if stored != (digest.as_str().to_owned(), output.to_owned()) {
+            return Err("Rex anchor archive already exists with different content".into());
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(digest)
     }
 
-    pub fn read_rex_view_anchor_archive(&self, view_id: &Digest, block_id: &str) -> Result<Option<String>, String> {
+    pub fn read_rex_view_anchor_archive(
+        &self,
+        view_id: &Digest,
+        block_id: &str,
+    ) -> Result<Option<String>, String> {
         let stored: Option<(String,String)> = self.connection.query_row(
             "SELECT content_digest,output FROM rex_view_anchor_archives WHERE view_id=?1 AND block_id=?2",
             params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let Some((digest,output)) = stored else { return Ok(None); };
-        if format!("{:x}",Sha256::digest(output.as_bytes())) != digest { return Err("stored Rex anchor archive digest does not match its output".into()); }
+        let Some((digest, output)) = stored else {
+            return Ok(None);
+        };
+        if format!("{:x}", Sha256::digest(output.as_bytes())) != digest {
+            return Err("stored Rex anchor archive digest does not match its output".into());
+        }
         Ok(Some(output))
     }
 
@@ -6781,39 +6844,67 @@ mod tests {
             "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'factory-block','synthetic-run','supervisor','factory','completed',1,1,1)",
             [view_id.as_str()],
         ).unwrap();
-        let archive_digest = store.archive_rex_view_block(
-            generation,
-            &view_id,
-            "factory-block",
-            "completed output\n",
-        ).unwrap();
+        let archive_digest = store
+            .archive_rex_view_block(generation, &view_id, "factory-block", "completed output\n")
+            .unwrap();
         assert_eq!(
-            store.read_rex_view_block_archive(&view_id, "factory-block").unwrap().as_deref(),
+            store
+                .read_rex_view_block_archive(&view_id, "factory-block")
+                .unwrap()
+                .as_deref(),
             Some("completed output\n"),
         );
         assert_eq!(
-            store.rex_view_blocks(&view_id).unwrap()[0].archive_digest.as_ref(),
+            store.rex_view_blocks(&view_id).unwrap()[0]
+                .archive_digest
+                .as_ref(),
             Some(&archive_digest),
         );
-        assert!(store.archive_rex_view_block(generation, &view_id, "factory-block", "different output").is_err());
-        assert!(store.archive_rex_view_block(generation, &view_id, "factory-block", &"x".repeat(1_048_577)).is_err());
+        assert!(
+            store
+                .archive_rex_view_block(generation, &view_id, "factory-block", "different output")
+                .is_err()
+        );
+        assert!(
+            store
+                .archive_rex_view_block(
+                    generation,
+                    &view_id,
+                    "factory-block",
+                    &"x".repeat(1_048_577)
+                )
+                .is_err()
+        );
         let anchor_run = "ticket-T-1-view-1";
         let anchor_label = crate::adapters::rex::owned_agent_block_label(anchor_run).unwrap();
-        store.register_rex_view_anchor(
-            generation,
-            &view_id,
-            "owned-anchor",
-            anchor_run,
-            &anchor_label,
-            &Digest::parse("c".repeat(64)).unwrap(),
-        ).unwrap();
-        store.observe_rex_view_anchor(generation, &view_id, RexBlockLifecycle::Completed, true).unwrap();
-        store.archive_rex_view_anchor(generation, &view_id, "owned-anchor", "status output\n").unwrap();
+        store
+            .register_rex_view_anchor(
+                generation,
+                &view_id,
+                "owned-anchor",
+                anchor_run,
+                &anchor_label,
+                &Digest::parse("c".repeat(64)).unwrap(),
+            )
+            .unwrap();
+        store
+            .observe_rex_view_anchor(generation, &view_id, RexBlockLifecycle::Completed, true)
+            .unwrap();
+        store
+            .archive_rex_view_anchor(generation, &view_id, "owned-anchor", "status output\n")
+            .unwrap();
         assert_eq!(
-            store.read_rex_view_anchor_archive(&view_id, "owned-anchor").unwrap().as_deref(),
+            store
+                .read_rex_view_anchor_archive(&view_id, "owned-anchor")
+                .unwrap()
+                .as_deref(),
             Some("status output\n"),
         );
-        assert!(store.archive_rex_view_anchor(generation, &view_id, "owned-anchor", "changed status").is_err());
+        assert!(
+            store
+                .archive_rex_view_anchor(generation, &view_id, "owned-anchor", "changed status")
+                .is_err()
+        );
         store.connection.execute(
             "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix) VALUES ('request-1',?2,'ticket_review','ticket_run','run-1',0,?1,?3,?3,?3,?3,?3,'{}','/tmp/request.html','pending',1,9999999999)",
             rusqlite::params![view_id.as_str(), project.id.as_str(), "a".repeat(64)],

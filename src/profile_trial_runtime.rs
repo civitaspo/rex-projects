@@ -846,13 +846,12 @@ fn cleanup_trial_workspace(
         Err(error) => return Err(error.to_string()),
     }
     let handoff_dir = state_root.join("environment-handoffs");
-    if let Ok(metadata) = std::fs::symlink_metadata(&handoff_dir) {
-        if !metadata.is_dir()
+    if let Ok(metadata) = std::fs::symlink_metadata(&handoff_dir)
+        && (!metadata.is_dir()
             || metadata.file_type().is_symlink()
-            || std::fs::canonicalize(&handoff_dir).map_err(|e| e.to_string())? != handoff_dir
-        {
-            return Err("trial environment handoff directory changed unexpectedly".into());
-        }
+            || std::fs::canonicalize(&handoff_dir).map_err(|e| e.to_string())? != handoff_dir)
+    {
+        return Err("trial environment handoff directory changed unexpectedly".into());
     }
     let token = format!("{:x}", Sha256::digest(operation_id.as_str().as_bytes()));
     let handoff = handoff_dir.join(format!("profile-trial-{token}.env"));

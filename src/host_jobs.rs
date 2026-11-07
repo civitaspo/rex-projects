@@ -611,13 +611,13 @@ impl HostJobPool {
     }
 
     fn finish_worker(&mut self, job_id: &str) {
-        if let Some(mut active) = self.active.remove(job_id) {
-            if let Some(worker) = active.worker.take() {
-                if worker.is_finished() {
-                    let _ = worker.join();
-                } else {
-                    drop(worker);
-                }
+        if let Some(mut active) = self.active.remove(job_id)
+            && let Some(worker) = active.worker.take()
+        {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                drop(worker);
             }
         }
     }

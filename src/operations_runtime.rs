@@ -383,7 +383,7 @@ impl OperationEffectHandler {
         attempt_count: u32,
         context: &mut EffectContext<'_>,
     ) -> Result<OperationExecutionOutcome, String> {
-        let (request, applied, target, permit) = {
+        let (request, record) = {
             let store = context.store.operations()?;
             let request = store.effect_request(effect)?;
             let record = store
@@ -433,7 +433,9 @@ impl OperationEffectHandler {
                 }
                 return Ok(cached.outcome);
             }
-            drop(store);
+            (request, record)
+        };
+        let (applied, target, permit) = {
             let applied = self
                 .snapshots
                 .get(request.config_digest.as_str())
@@ -553,7 +555,7 @@ impl OperationEffectHandler {
                 approval.as_ref(),
             )
             .map_err(|error| error.to_string())?;
-            (request, applied.clone(), target.clone(), permit)
+            (applied.clone(), target.clone(), permit)
         };
         match mode {
             OperationExecutionMode::Submit => self.submit(
@@ -1304,25 +1306,8 @@ mod tests {
             request_digest: Digest::parse(first_effect.intent.request_digest.clone()).unwrap(),
             subject_digest: request.subject.digest().unwrap(),
         };
-        let mut operations = store.operations().unwrap();
-        operations
-            .record_invoking(
-                generation,
-                &operation_id,
-                &project_id,
-                &ticket_run_id,
-                request.ticket_revision,
-                request.config_revision,
-                &request.config_digest,
-                first_effect.attempt_count,
-                &invocation(1),
-                101,
-            )
-            .unwrap();
-        operations
-            .record_unknown(generation, &operation_id, 102)
-            .unwrap();
-        assert!(
+        {
+            let mut operations = store.operations().unwrap();
             operations
                 .record_invoking(
                     generation,
@@ -1333,13 +1318,31 @@ mod tests {
                     request.config_revision,
                     &request.config_digest,
                     first_effect.attempt_count,
-                    &invocation(2),
-                    103,
+                    &invocation(1),
+                    101,
                 )
-                .is_err(),
-            "a caller cannot create a second invoke without an accepted Find absence"
-        );
-        drop(operations);
+                .unwrap();
+            operations
+                .record_unknown(generation, &operation_id, 102)
+                .unwrap();
+            assert!(
+                operations
+                    .record_invoking(
+                        generation,
+                        &operation_id,
+                        &project_id,
+                        &ticket_run_id,
+                        request.ticket_revision,
+                        request.config_revision,
+                        &request.config_digest,
+                        first_effect.attempt_count,
+                        &invocation(2),
+                        103,
+                    )
+                    .is_err(),
+                "a caller cannot create a second invoke without an accepted Find absence"
+            );
+        }
 
         let proof = AbsentProof::from_authoritative_lookup(
             EffectKind::Operation,

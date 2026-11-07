@@ -1537,7 +1537,7 @@ mod tests {
                 Input::Dispatch,
                 "dispatch",
                 "{}",
-                &[status_intent.clone()],
+                std::slice::from_ref(&status_intent),
             )
             .unwrap();
         let adapter = Arc::new(FakeAdapter::new(
@@ -2088,28 +2088,30 @@ mod tests {
             attempt_count: knowledge_effect.attempt_count,
             created_at_unix: knowledge_effect.created_at_unix,
         };
-        let mut context = EffectContext {
-            store: &mut fixture.store,
-            owner_generation: owner,
-            now_unix: 10,
-        };
-        let knowledge_handler = KnowledgeEffectHandler::new(fixture._temp.path().join("knowledge"));
-        let knowledge_observation = knowledge_handler
-            .handle(EffectMode::Submit, &knowledge_request, &mut context)
-            .unwrap();
-        let EffectObservation::Applied { receipt } = knowledge_observation else {
-            panic!("knowledge publication did not return a terminal receipt");
-        };
-        context
-            .store
-            .finish_effect(
-                &knowledge_effect.intent.operation_id,
-                owner,
-                EffectOutcome::Succeeded,
-                Some(&receipt),
-            )
-            .unwrap();
-        drop(context);
+        {
+            let mut context = EffectContext {
+                store: &mut fixture.store,
+                owner_generation: owner,
+                now_unix: 10,
+            };
+            let knowledge_handler =
+                KnowledgeEffectHandler::new(fixture._temp.path().join("knowledge"));
+            let knowledge_observation = knowledge_handler
+                .handle(EffectMode::Submit, &knowledge_request, &mut context)
+                .unwrap();
+            let EffectObservation::Applied { receipt } = knowledge_observation else {
+                panic!("knowledge publication did not return a terminal receipt");
+            };
+            context
+                .store
+                .finish_effect(
+                    &knowledge_effect.intent.operation_id,
+                    owner,
+                    EffectOutcome::Succeeded,
+                    Some(&receipt),
+                )
+                .unwrap();
+        }
         assert!(
             crate::engine::host_transitions::consume_one_host_transition(
                 &mut fixture.store,

@@ -1488,7 +1488,7 @@ impl RepositoryDeliveryEffects {
             .review_material(
                 &repository.clone_url,
                 receipt.pull_request.number,
-                &receipt.commit.head(),
+                receipt.commit.head(),
             )
             .map_err(|error| error.to_string())?;
         Ok((pull, material))

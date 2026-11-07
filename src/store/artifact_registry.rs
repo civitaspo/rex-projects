@@ -545,6 +545,387 @@ fn read_table_layout(connection: &Connection, table: &str) -> Result<TableLayout
     })
 }
 
+impl crate::store::ConfigStore {
+    /// Process one ArtifactAdd mailbox request. The object is copied and synced before the short
+    /// owner-fenced transaction; the mailbox receipt is published only after that transaction
+    /// commits and the durable object has been re-read and verified.
+    pub fn process_artifact_add(
+        &mut self,
+        owner_generation: u64,
+        authority: &AgentLaunchAuthority,
+        artifact_store: &ArtifactStore,
+        mailbox: &MailboxCapability,
+        mailbox_request: &MailboxRequest,
+        request: &crate::engine::orchestration::ArtifactAddRequest,
+    ) -> Result<VerifiedArtifact, String> {
+        authority.validate()?;
+        request.validate()?;
+        let envelope = &mailbox_request.envelope;
+        let expected_params = serde_json::to_value(request).map_err(|e| e.to_string())?;
+        let method = serde_json::to_value(&envelope.method).map_err(|e| e.to_string())?;
+        if method.as_str() != Some("artifact.add")
+            || envelope.params != expected_params
+            || envelope.request_id.as_str() != request.message_id
+            || envelope.operation_id.as_ref() != Some(&authority.operation_id)
+            || mailbox_request.request_id != request.message_id
+            || envelope.run_id.as_deref() != Some(authority.agent_run_id.as_str())
+            || envelope.project_id.as_ref() != Some(&authority.project_id)
+            || envelope.role != Some(authority.role)
+            || envelope.attempt != Some(authority.attempt)
+            || envelope.run_epoch != Some(authority.run_epoch)
+        {
+            return Err(
+                "ArtifactAdd mailbox request does not match the immutable launch authority".into(),
+            );
+        }
+        if !crate::engine::orchestration::role_may_submit_artifact(authority.role, request.kind) {
+            return Err("Agent role is not authorized to register this artifact kind".into());
+        }
+        let request_digest = Digest::parse(mailbox_request.digest.clone())?;
+        let stored: StoredArtifact = artifact_store.register(
+            &authority.workspace_path,
+            &authority.project_id,
+            authority.agent_run_id.as_str(),
+            authority.role,
+            &request.path,
+            request.kind,
+            request.artifact_schema_version,
+        )?;
+        if stored.project_id != authority.project_id
+            || stored.agent_run_id != authority.agent_run_id.as_str()
+            || stored.kind != request.kind
+            || stored.schema_version != request.artifact_schema_version
+            || stored.reference.digest != stored.content_digest
+            || stored.reference.bytes != stored.byte_count
+        {
+            return Err(
+                "ArtifactStore returned an artifact outside the requested host scope".into(),
+            );
+        }
+        let registration = persist_registration(
+            &mut self.connection,
+            owner_generation,
+            authority,
+            &request.message_id,
+            &request_digest,
+            &stored.reference,
+            &stored.object_path,
+        )?;
+        let verified = verify_registered_object(registration, artifact_store)?;
+        let receipt = ArtifactAddReceipt {
+            schema_version: 1,
+            message_id: request.message_id.clone(),
+            artifact: verified.reference().clone(),
+        };
+        let ack = ResponseEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: RequestId::new(request.message_id.clone())?,
+            result: Some(receipt),
+            error: None,
+            extensions: Default::default(),
+        };
+        let bytes = serde_json::to_vec(&ack).map_err(|e| e.to_string())?;
+        mailbox.publish_receipt(&request.message_id, &bytes, unix_time_now()?)?;
+        Ok(verified)
+    }
+
+    /// Resolve a host reference to an opaque proof after verifying its immutable object bytes.
+    pub fn lookup_verified_artifact(
+        &mut self,
+        artifact_store: &ArtifactStore,
+        authority: &AgentLaunchAuthority,
+        reference: &RoleArtifactReference,
+    ) -> Result<Option<VerifiedArtifact>, String> {
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let registration = lookup_registered_artifact_tx(&tx, authority, reference)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        registration
+            .map(|registration| verify_registered_object(registration, artifact_store))
+            .transpose()
+    }
+}
+
+fn verify_registered_object(
+    registration: ArtifactRegistration,
+    artifact_store: &ArtifactStore,
+) -> Result<VerifiedArtifact, String> {
+    read_registered_object(&registration, artifact_store)?;
+    Ok(VerifiedArtifact { registration })
+}
+
+fn read_registered_object(
+    registration: &ArtifactRegistration,
+    artifact_store: &ArtifactStore,
+) -> Result<Vec<u8>, String> {
+    if !artifact_store.owns_object_path(&registration.reference, &registration.object_path)? {
+        return Err("registered artifact path is outside the configured immutable store".into());
+    }
+    let metadata = fs::symlink_metadata(&registration.object_path)
+        .map_err(|e| format!("inspect immutable artifact: {e}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != registration.reference.bytes
+        || metadata.len() > 64 * 1024 * 1024
+    {
+        return Err("registered artifact object is missing, linked, or has an invalid size".into());
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&registration.object_path)
+            .map_err(|e| e.to_string())?
+    };
+    #[cfg(not(unix))]
+    let mut file = File::open(&registration.object_path).map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    if !opened.is_file() || opened.len() != metadata.len() {
+        return Err("registered artifact object changed during verification".into());
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    let digest = Digest::parse(format!("{:x}", sha2::Sha256::digest(&bytes)))?;
+    if bytes.len() as u64 != registration.reference.bytes || digest != registration.reference.digest
+    {
+        return Err("registered artifact object bytes do not match the host registry".into());
+    }
+    Ok(bytes)
+}
+
+/// Look up a reference inside a caller-owned transaction. This performs only SQLite work;
+/// immutable object bytes are verified outside the transaction with `verify_registered_object`.
+pub(crate) fn lookup_registered_artifact_tx(
+    tx: &Transaction<'_>,
+    authority: &AgentLaunchAuthority,
+    reference: &RoleArtifactReference,
+) -> Result<Option<ArtifactRegistration>, String> {
+    crate::artifacts::validate_relative_path(&reference.path)?;
+    let authoritative: Option<(String,String)> = tx.query_row(
+        "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+        [authority.agent_run_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((authority_json, authority_digest_stored)) = authoritative else {
+        return Ok(None);
+    };
+    let authority_stored: AgentLaunchAuthority =
+        crate::protocol::parse_unique(authority_json.as_bytes())?;
+    authority_stored.validate()?;
+    if authority_digest_stored != authority_stored.digest()?.as_str() {
+        return Err("stored artifact lookup authority digest is invalid".into());
+    }
+    if authority_stored != *authority {
+        return Ok(None);
+    }
+    let row: Option<(String,String,String,String,String,Option<String>,Option<u64>,u64,String,String,String,String,String,String,String,String,String,i64,String,String,u64,String)> = tx.query_row(
+        "SELECT artifact_id,project_id,agent_run_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,profile_id,profile_digest,workspace_path,control_dir,authority_digest,message_id,request_digest,kind,schema_version,relative_path,content_digest,byte_count,object_path FROM registered_artifacts WHERE artifact_id=?1",
+        [reference.artifact_id.as_str()],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?,r.get(17)?,r.get(18)?,r.get(19)?,r.get(20)?,r.get(21)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((
+        id,
+        project_id,
+        agent_run_id,
+        role,
+        session_id,
+        ticket_run_id,
+        ticket_revision,
+        config_revision,
+        config_digest,
+        profile_id,
+        profile_digest,
+        workspace_path,
+        control_dir,
+        authority_digest,
+        message_id,
+        request_digest,
+        kind,
+        schema_version,
+        relative_path,
+        content_digest,
+        byte_count,
+        object_path,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let parsed_project = ProjectId::parse(project_id)?;
+    let parsed_id = ArtifactId::parse(id)?;
+    let parsed_digest = Digest::parse(config_digest)?;
+    let parsed_profile_digest = Digest::parse(profile_digest)?;
+    let parsed_authority_digest = Digest::parse(authority_digest)?;
+    let parsed_request_digest = Digest::parse(request_digest)?;
+    let parsed_content_digest = Digest::parse(content_digest)?;
+    let parsed_kind: RoleArtifactKind =
+        serde_json::from_str(&format!("\"{}\"", kind)).map_err(|error| error.to_string())?;
+    if !crate::engine::orchestration::role_may_submit_artifact(authority.role, parsed_kind) {
+        return Err(
+            "authoritative Agent role is not authorized for the registered artifact kind".into(),
+        );
+    }
+    let reference_matches = parsed_id == reference.artifact_id
+        && parsed_kind == reference.kind
+        && u32::try_from(schema_version).ok() == Some(reference.schema_version)
+        && relative_path == reference.path
+        && parsed_content_digest == reference.digest
+        && byte_count == reference.bytes;
+    if !reference_matches {
+        return Err("artifact reference does not match its host registration".into());
+    }
+    let authority_digest_expected = authority.digest()?;
+    let expected_id = ArtifactId::from_registration_identity(
+        &authority.project_id,
+        &authority.agent_run_id,
+        reference.kind.as_str(),
+        reference.schema_version,
+        &reference.digest,
+    )?;
+    if parsed_id != expected_id {
+        return Err("registered artifact ID does not match its authority scope".into());
+    }
+    if parsed_project != authority.project_id
+        || agent_run_id != authority.agent_run_id.as_str()
+        || role
+            != serde_json::to_value(authority.role)
+                .map_err(|error| error.to_string())?
+                .as_str()
+                .unwrap_or_default()
+        || session_id != authority.role_session_id
+        || ticket_run_id.as_deref() != authority.ticket_run_id.as_ref().map(|value| value.as_str())
+        || ticket_revision != authority.ticket_revision.map(|value| value.0)
+        || config_revision != authority.config_revision.0
+        || parsed_digest != authority.config_digest
+        || profile_id != authority.profile_id.as_str()
+        || parsed_profile_digest != authority.profile_digest
+        || workspace_path != authority.workspace_path.to_string_lossy()
+        || control_dir != authority.control_dir.to_string_lossy()
+        || parsed_authority_digest != authority_digest_expected
+    {
+        return Err("registered artifact is outside the authoritative AgentRun scope".into());
+    }
+    Ok(Some(ArtifactRegistration {
+        artifact_id: parsed_id,
+        project_id: parsed_project,
+        agent_run_id,
+        role: authority.role,
+        role_session_id: session_id,
+        ticket_run_id: authority.ticket_run_id.clone(),
+        ticket_revision,
+        config_revision,
+        config_digest: parsed_digest,
+        profile_id,
+        profile_digest: parsed_profile_digest,
+        workspace_path: PathBuf::from(workspace_path),
+        control_dir: PathBuf::from(control_dir),
+        authority_digest: parsed_authority_digest,
+        message_id,
+        request_digest: parsed_request_digest,
+        reference: reference.clone(),
+        object_path: PathBuf::from(object_path),
+    }))
+}
+
+pub(crate) fn persist_registration(
+    connection: &mut Connection,
+    owner_generation: u64,
+    authority: &AgentLaunchAuthority,
+    message_id: &str,
+    request_digest: &Digest,
+    reference: &RoleArtifactReference,
+    object_path: &std::path::Path,
+) -> Result<ArtifactRegistration, String> {
+    authority.validate()?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    crate::store::validate_active_generation(&tx, owner_generation)?;
+    let stored_authority: Option<(String,String)> = tx.query_row(
+        "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+        [authority.agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional().map_err(|e| e.to_string())?;
+    let Some((authority_json, authority_digest)) = stored_authority else {
+        return Err("ArtifactAdd references an unknown AgentRun".into());
+    };
+    let stored: AgentLaunchAuthority = crate::protocol::parse_unique(authority_json.as_bytes())?;
+    if stored != *authority
+        || authority_digest != authority.digest()?.as_str()
+        || authority.controller_generation != owner_generation
+    {
+        return Err("ArtifactAdd launch authority is stale or does not match the AgentRun".into());
+    }
+    let expected_id = ArtifactId::from_registration_identity(
+        &authority.project_id,
+        &authority.agent_run_id,
+        reference.kind.as_str(),
+        reference.schema_version,
+        &reference.digest,
+    )?;
+    if expected_id != reference.artifact_id {
+        return Err("artifact ID does not match host registration identity".into());
+    }
+    if !crate::engine::orchestration::role_may_submit_artifact(authority.role, reference.kind) {
+        return Err("Agent role is not authorized to register this artifact kind".into());
+    }
+    let role_json = serde_json::to_value(authority.role).map_err(|e| e.to_string())?;
+    let role = role_json.as_str().ok_or("role is not a string")?;
+    let kind = reference.kind.as_str();
+    let ticket_revision = authority.ticket_revision.map(|value| value.0);
+    let existing: Option<(String,String)> = tx.query_row(
+        "SELECT request_digest,artifact_id FROM registered_artifact_messages WHERE agent_run_id=?1 AND message_id=?2",
+        params![authority.agent_run_id.as_str(),message_id], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional().map_err(|e| e.to_string())?;
+    if let Some((old_request, old_id)) = existing {
+        if old_request != request_digest.as_str() || old_id != reference.artifact_id.as_str() {
+            return Err("ArtifactAdd message ID was replayed with different content".into());
+        }
+        let existing_artifact = lookup_registered_artifact_tx(&tx, authority, reference)?
+            .ok_or("ArtifactAdd replay has no immutable artifact registration")?;
+        if existing_artifact.object_path != object_path {
+            return Err("ArtifactAdd replay resolved to a different immutable object".into());
+        }
+    } else {
+        if let Some(existing_artifact) = lookup_registered_artifact_tx(&tx, authority, reference)? {
+            if existing_artifact.object_path != object_path {
+                return Err(
+                    "deterministic artifact ID collides with a different object path".into(),
+                );
+            }
+        } else {
+            tx.execute("INSERT INTO registered_artifacts(artifact_id,project_id,agent_run_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,profile_id,profile_digest,workspace_path,control_dir,authority_digest,message_id,request_digest,kind,schema_version,relative_path,content_digest,byte_count,object_path,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)", params![reference.artifact_id.as_str(),authority.project_id.as_str(),authority.agent_run_id.as_str(),role,authority.role_session_id,authority.ticket_run_id.as_ref().map(|value| value.as_str()),ticket_revision,authority.config_revision.0,authority.config_digest.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.workspace_path.to_string_lossy(),authority.control_dir.to_string_lossy(),authority.digest()?.as_str(),message_id,request_digest.as_str(),kind,reference.schema_version,reference.path,reference.digest.as_str(),reference.bytes,object_path.to_string_lossy(),crate::store::now_unix()?]).map_err(|e| e.to_string())?;
+        }
+        tx.execute("INSERT INTO registered_artifact_messages(agent_run_id,message_id,request_digest,artifact_id,created_at_unix) VALUES (?1,?2,?3,?4,?5)", params![authority.agent_run_id.as_str(),message_id,request_digest.as_str(),reference.artifact_id.as_str(),crate::store::now_unix()?]).map_err(|e| e.to_string())?;
+    }
+    let result = ArtifactRegistration {
+        artifact_id: reference.artifact_id.clone(),
+        project_id: authority.project_id.clone(),
+        agent_run_id: authority.agent_run_id.to_string(),
+        role: authority.role,
+        role_session_id: authority.role_session_id.clone(),
+        ticket_run_id: authority.ticket_run_id.clone(),
+        ticket_revision,
+        config_revision: authority.config_revision.0,
+        config_digest: authority.config_digest.clone(),
+        profile_id: authority.profile_id.to_string(),
+        profile_digest: authority.profile_digest.clone(),
+        workspace_path: authority.workspace_path.clone(),
+        control_dir: authority.control_dir.clone(),
+        authority_digest: authority.digest()?,
+        message_id: message_id.to_owned(),
+        request_digest: request_digest.clone(),
+        reference: reference.clone(),
+        object_path: object_path.to_owned(),
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1512,385 +1893,4 @@ mod tests {
         fs::write(&stored.object_path, b"tampered result").unwrap();
         assert!(verify_registered_object(registration, &store).is_err());
     }
-}
-
-impl crate::store::ConfigStore {
-    /// Process one ArtifactAdd mailbox request. The object is copied and synced before the short
-    /// owner-fenced transaction; the mailbox receipt is published only after that transaction
-    /// commits and the durable object has been re-read and verified.
-    pub fn process_artifact_add(
-        &mut self,
-        owner_generation: u64,
-        authority: &AgentLaunchAuthority,
-        artifact_store: &ArtifactStore,
-        mailbox: &MailboxCapability,
-        mailbox_request: &MailboxRequest,
-        request: &crate::engine::orchestration::ArtifactAddRequest,
-    ) -> Result<VerifiedArtifact, String> {
-        authority.validate()?;
-        request.validate()?;
-        let envelope = &mailbox_request.envelope;
-        let expected_params = serde_json::to_value(request).map_err(|e| e.to_string())?;
-        let method = serde_json::to_value(&envelope.method).map_err(|e| e.to_string())?;
-        if method.as_str() != Some("artifact.add")
-            || envelope.params != expected_params
-            || envelope.request_id.as_str() != request.message_id
-            || envelope.operation_id.as_ref() != Some(&authority.operation_id)
-            || mailbox_request.request_id != request.message_id
-            || envelope.run_id.as_deref() != Some(authority.agent_run_id.as_str())
-            || envelope.project_id.as_ref() != Some(&authority.project_id)
-            || envelope.role != Some(authority.role)
-            || envelope.attempt != Some(authority.attempt)
-            || envelope.run_epoch != Some(authority.run_epoch)
-        {
-            return Err(
-                "ArtifactAdd mailbox request does not match the immutable launch authority".into(),
-            );
-        }
-        if !crate::engine::orchestration::role_may_submit_artifact(authority.role, request.kind) {
-            return Err("Agent role is not authorized to register this artifact kind".into());
-        }
-        let request_digest = Digest::parse(mailbox_request.digest.clone())?;
-        let stored: StoredArtifact = artifact_store.register(
-            &authority.workspace_path,
-            &authority.project_id,
-            authority.agent_run_id.as_str(),
-            authority.role,
-            &request.path,
-            request.kind,
-            request.artifact_schema_version,
-        )?;
-        if stored.project_id != authority.project_id
-            || stored.agent_run_id != authority.agent_run_id.as_str()
-            || stored.kind != request.kind
-            || stored.schema_version != request.artifact_schema_version
-            || stored.reference.digest != stored.content_digest
-            || stored.reference.bytes != stored.byte_count
-        {
-            return Err(
-                "ArtifactStore returned an artifact outside the requested host scope".into(),
-            );
-        }
-        let registration = persist_registration(
-            &mut self.connection,
-            owner_generation,
-            authority,
-            &request.message_id,
-            &request_digest,
-            &stored.reference,
-            &stored.object_path,
-        )?;
-        let verified = verify_registered_object(registration, artifact_store)?;
-        let receipt = ArtifactAddReceipt {
-            schema_version: 1,
-            message_id: request.message_id.clone(),
-            artifact: verified.reference().clone(),
-        };
-        let ack = ResponseEnvelope {
-            schema_version: crate::protocol::SCHEMA_VERSION,
-            request_id: RequestId::new(request.message_id.clone())?,
-            result: Some(receipt),
-            error: None,
-            extensions: Default::default(),
-        };
-        let bytes = serde_json::to_vec(&ack).map_err(|e| e.to_string())?;
-        mailbox.publish_receipt(&request.message_id, &bytes, unix_time_now()?)?;
-        Ok(verified)
-    }
-
-    /// Resolve a host reference to an opaque proof after verifying its immutable object bytes.
-    pub fn lookup_verified_artifact(
-        &mut self,
-        artifact_store: &ArtifactStore,
-        authority: &AgentLaunchAuthority,
-        reference: &RoleArtifactReference,
-    ) -> Result<Option<VerifiedArtifact>, String> {
-        let tx = self
-            .connection
-            .unchecked_transaction()
-            .map_err(|e| e.to_string())?;
-        let registration = lookup_registered_artifact_tx(&tx, authority, reference)?;
-        tx.commit().map_err(|e| e.to_string())?;
-        registration
-            .map(|registration| verify_registered_object(registration, artifact_store))
-            .transpose()
-    }
-}
-
-fn verify_registered_object(
-    registration: ArtifactRegistration,
-    artifact_store: &ArtifactStore,
-) -> Result<VerifiedArtifact, String> {
-    read_registered_object(&registration, artifact_store)?;
-    Ok(VerifiedArtifact { registration })
-}
-
-fn read_registered_object(
-    registration: &ArtifactRegistration,
-    artifact_store: &ArtifactStore,
-) -> Result<Vec<u8>, String> {
-    if !artifact_store.owns_object_path(&registration.reference, &registration.object_path)? {
-        return Err("registered artifact path is outside the configured immutable store".into());
-    }
-    let metadata = fs::symlink_metadata(&registration.object_path)
-        .map_err(|e| format!("inspect immutable artifact: {e}"))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() != registration.reference.bytes
-        || metadata.len() > 64 * 1024 * 1024
-    {
-        return Err("registered artifact object is missing, linked, or has an invalid size".into());
-    }
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&registration.object_path)
-            .map_err(|e| e.to_string())?
-    };
-    #[cfg(not(unix))]
-    let mut file = File::open(&registration.object_path).map_err(|e| e.to_string())?;
-    let opened = file.metadata().map_err(|e| e.to_string())?;
-    if !opened.is_file() || opened.len() != metadata.len() {
-        return Err("registered artifact object changed during verification".into());
-    }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    file.take(64 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    let digest = Digest::parse(format!("{:x}", sha2::Sha256::digest(&bytes)))?;
-    if bytes.len() as u64 != registration.reference.bytes || digest != registration.reference.digest
-    {
-        return Err("registered artifact object bytes do not match the host registry".into());
-    }
-    Ok(bytes)
-}
-
-/// Look up a reference inside a caller-owned transaction. This performs only SQLite work;
-/// immutable object bytes are verified outside the transaction with `verify_registered_object`.
-pub(crate) fn lookup_registered_artifact_tx(
-    tx: &Transaction<'_>,
-    authority: &AgentLaunchAuthority,
-    reference: &RoleArtifactReference,
-) -> Result<Option<ArtifactRegistration>, String> {
-    crate::artifacts::validate_relative_path(&reference.path)?;
-    let authoritative: Option<(String,String)> = tx.query_row(
-        "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
-        [authority.agent_run_id.as_str()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional().map_err(|error| error.to_string())?;
-    let Some((authority_json, authority_digest_stored)) = authoritative else {
-        return Ok(None);
-    };
-    let authority_stored: AgentLaunchAuthority =
-        crate::protocol::parse_unique(authority_json.as_bytes())?;
-    authority_stored.validate()?;
-    if authority_digest_stored != authority_stored.digest()?.as_str() {
-        return Err("stored artifact lookup authority digest is invalid".into());
-    }
-    if authority_stored != *authority {
-        return Ok(None);
-    }
-    let row: Option<(String,String,String,String,String,Option<String>,Option<u64>,u64,String,String,String,String,String,String,String,String,String,i64,String,String,u64,String)> = tx.query_row(
-        "SELECT artifact_id,project_id,agent_run_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,profile_id,profile_digest,workspace_path,control_dir,authority_digest,message_id,request_digest,kind,schema_version,relative_path,content_digest,byte_count,object_path FROM registered_artifacts WHERE artifact_id=?1",
-        [reference.artifact_id.as_str()],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?,r.get(17)?,r.get(18)?,r.get(19)?,r.get(20)?,r.get(21)?)),
-    ).optional().map_err(|error| error.to_string())?;
-    let Some((
-        id,
-        project_id,
-        agent_run_id,
-        role,
-        session_id,
-        ticket_run_id,
-        ticket_revision,
-        config_revision,
-        config_digest,
-        profile_id,
-        profile_digest,
-        workspace_path,
-        control_dir,
-        authority_digest,
-        message_id,
-        request_digest,
-        kind,
-        schema_version,
-        relative_path,
-        content_digest,
-        byte_count,
-        object_path,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    let parsed_project = ProjectId::parse(project_id)?;
-    let parsed_id = ArtifactId::parse(id)?;
-    let parsed_digest = Digest::parse(config_digest)?;
-    let parsed_profile_digest = Digest::parse(profile_digest)?;
-    let parsed_authority_digest = Digest::parse(authority_digest)?;
-    let parsed_request_digest = Digest::parse(request_digest)?;
-    let parsed_content_digest = Digest::parse(content_digest)?;
-    let parsed_kind: RoleArtifactKind =
-        serde_json::from_str(&format!("\"{}\"", kind)).map_err(|error| error.to_string())?;
-    if !crate::engine::orchestration::role_may_submit_artifact(authority.role, parsed_kind) {
-        return Err(
-            "authoritative Agent role is not authorized for the registered artifact kind".into(),
-        );
-    }
-    let reference_matches = parsed_id == reference.artifact_id
-        && parsed_kind == reference.kind
-        && u32::try_from(schema_version).ok() == Some(reference.schema_version)
-        && relative_path == reference.path
-        && parsed_content_digest == reference.digest
-        && byte_count == reference.bytes;
-    if !reference_matches {
-        return Err("artifact reference does not match its host registration".into());
-    }
-    let authority_digest_expected = authority.digest()?;
-    let expected_id = ArtifactId::from_registration_identity(
-        &authority.project_id,
-        &authority.agent_run_id,
-        reference.kind.as_str(),
-        reference.schema_version,
-        &reference.digest,
-    )?;
-    if parsed_id != expected_id {
-        return Err("registered artifact ID does not match its authority scope".into());
-    }
-    if parsed_project != authority.project_id
-        || agent_run_id != authority.agent_run_id.as_str()
-        || role
-            != serde_json::to_value(authority.role)
-                .map_err(|error| error.to_string())?
-                .as_str()
-                .unwrap_or_default()
-        || session_id != authority.role_session_id
-        || ticket_run_id.as_deref() != authority.ticket_run_id.as_ref().map(|value| value.as_str())
-        || ticket_revision != authority.ticket_revision.map(|value| value.0)
-        || config_revision != authority.config_revision.0
-        || parsed_digest != authority.config_digest
-        || profile_id != authority.profile_id.as_str()
-        || parsed_profile_digest != authority.profile_digest
-        || workspace_path != authority.workspace_path.to_string_lossy()
-        || control_dir != authority.control_dir.to_string_lossy()
-        || parsed_authority_digest != authority_digest_expected
-    {
-        return Err("registered artifact is outside the authoritative AgentRun scope".into());
-    }
-    Ok(Some(ArtifactRegistration {
-        artifact_id: parsed_id,
-        project_id: parsed_project,
-        agent_run_id,
-        role: authority.role,
-        role_session_id: session_id,
-        ticket_run_id: authority.ticket_run_id.clone(),
-        ticket_revision,
-        config_revision,
-        config_digest: parsed_digest,
-        profile_id,
-        profile_digest: parsed_profile_digest,
-        workspace_path: PathBuf::from(workspace_path),
-        control_dir: PathBuf::from(control_dir),
-        authority_digest: parsed_authority_digest,
-        message_id,
-        request_digest: parsed_request_digest,
-        reference: reference.clone(),
-        object_path: PathBuf::from(object_path),
-    }))
-}
-
-pub(crate) fn persist_registration(
-    connection: &mut Connection,
-    owner_generation: u64,
-    authority: &AgentLaunchAuthority,
-    message_id: &str,
-    request_digest: &Digest,
-    reference: &RoleArtifactReference,
-    object_path: &std::path::Path,
-) -> Result<ArtifactRegistration, String> {
-    authority.validate()?;
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
-    crate::store::validate_active_generation(&tx, owner_generation)?;
-    let stored_authority: Option<(String,String)> = tx.query_row(
-        "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
-        [authority.agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
-    ).optional().map_err(|e| e.to_string())?;
-    let Some((authority_json, authority_digest)) = stored_authority else {
-        return Err("ArtifactAdd references an unknown AgentRun".into());
-    };
-    let stored: AgentLaunchAuthority = crate::protocol::parse_unique(authority_json.as_bytes())?;
-    if stored != *authority
-        || authority_digest != authority.digest()?.as_str()
-        || authority.controller_generation != owner_generation
-    {
-        return Err("ArtifactAdd launch authority is stale or does not match the AgentRun".into());
-    }
-    let expected_id = ArtifactId::from_registration_identity(
-        &authority.project_id,
-        &authority.agent_run_id,
-        reference.kind.as_str(),
-        reference.schema_version,
-        &reference.digest,
-    )?;
-    if expected_id != reference.artifact_id {
-        return Err("artifact ID does not match host registration identity".into());
-    }
-    if !crate::engine::orchestration::role_may_submit_artifact(authority.role, reference.kind) {
-        return Err("Agent role is not authorized to register this artifact kind".into());
-    }
-    let role_json = serde_json::to_value(authority.role).map_err(|e| e.to_string())?;
-    let role = role_json.as_str().ok_or("role is not a string")?;
-    let kind = reference.kind.as_str();
-    let ticket_revision = authority.ticket_revision.map(|value| value.0);
-    let existing: Option<(String,String)> = tx.query_row(
-        "SELECT request_digest,artifact_id FROM registered_artifact_messages WHERE agent_run_id=?1 AND message_id=?2",
-        params![authority.agent_run_id.as_str(),message_id], |r| Ok((r.get(0)?,r.get(1)?)),
-    ).optional().map_err(|e| e.to_string())?;
-    if let Some((old_request, old_id)) = existing {
-        if old_request != request_digest.as_str() || old_id != reference.artifact_id.as_str() {
-            return Err("ArtifactAdd message ID was replayed with different content".into());
-        }
-        let existing_artifact = lookup_registered_artifact_tx(&tx, authority, reference)?
-            .ok_or("ArtifactAdd replay has no immutable artifact registration")?;
-        if existing_artifact.object_path != object_path {
-            return Err("ArtifactAdd replay resolved to a different immutable object".into());
-        }
-    } else {
-        if let Some(existing_artifact) = lookup_registered_artifact_tx(&tx, authority, reference)? {
-            if existing_artifact.object_path != object_path {
-                return Err(
-                    "deterministic artifact ID collides with a different object path".into(),
-                );
-            }
-        } else {
-            tx.execute("INSERT INTO registered_artifacts(artifact_id,project_id,agent_run_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,profile_id,profile_digest,workspace_path,control_dir,authority_digest,message_id,request_digest,kind,schema_version,relative_path,content_digest,byte_count,object_path,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)", params![reference.artifact_id.as_str(),authority.project_id.as_str(),authority.agent_run_id.as_str(),role,authority.role_session_id,authority.ticket_run_id.as_ref().map(|value| value.as_str()),ticket_revision,authority.config_revision.0,authority.config_digest.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.workspace_path.to_string_lossy(),authority.control_dir.to_string_lossy(),authority.digest()?.as_str(),message_id,request_digest.as_str(),kind,reference.schema_version,reference.path,reference.digest.as_str(),reference.bytes,object_path.to_string_lossy(),crate::store::now_unix()?]).map_err(|e| e.to_string())?;
-        }
-        tx.execute("INSERT INTO registered_artifact_messages(agent_run_id,message_id,request_digest,artifact_id,created_at_unix) VALUES (?1,?2,?3,?4,?5)", params![authority.agent_run_id.as_str(),message_id,request_digest.as_str(),reference.artifact_id.as_str(),crate::store::now_unix()?]).map_err(|e| e.to_string())?;
-    }
-    let result = ArtifactRegistration {
-        artifact_id: reference.artifact_id.clone(),
-        project_id: authority.project_id.clone(),
-        agent_run_id: authority.agent_run_id.to_string(),
-        role: authority.role,
-        role_session_id: authority.role_session_id.clone(),
-        ticket_run_id: authority.ticket_run_id.clone(),
-        ticket_revision,
-        config_revision: authority.config_revision.0,
-        config_digest: authority.config_digest.clone(),
-        profile_id: authority.profile_id.to_string(),
-        profile_digest: authority.profile_digest.clone(),
-        workspace_path: authority.workspace_path.clone(),
-        control_dir: authority.control_dir.clone(),
-        authority_digest: authority.digest()?,
-        message_id: message_id.to_owned(),
-        request_digest: request_digest.clone(),
-        reference: reference.clone(),
-        object_path: object_path.to_owned(),
-    };
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(result)
 }

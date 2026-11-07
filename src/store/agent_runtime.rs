@@ -954,13 +954,13 @@ impl ConfigStore {
         if active_same_session {
             return Ok(LaunchPreparationOutcome::CapacityUnavailable);
         }
-        if reservation.role == crate::domain::types::Role::Coordinator {
-            if let Some(ticket_run_id) = &reservation.ticket_run_id {
-                let active_child =
-                    ticket_has_active_child(&tx, &reservation.project_id, ticket_run_id)?;
-                if active_child {
-                    return Ok(LaunchPreparationOutcome::CapacityUnavailable);
-                }
+        if reservation.role == crate::domain::types::Role::Coordinator
+            && let Some(ticket_run_id) = &reservation.ticket_run_id
+        {
+            let active_child =
+                ticket_has_active_child(&tx, &reservation.project_id, ticket_run_id)?;
+            if active_child {
+                return Ok(LaunchPreparationOutcome::CapacityUnavailable);
             }
         }
         if let Some(parent_id) = &reservation.parent_run_id {
@@ -1090,8 +1090,7 @@ mod tests {
 
     use super::{
         ConfigStore, LaunchPreparationOutcome, LegacyWakeInput, LegacyWakeSnapshot,
-        MAX_PROFILE_QUALIFICATION_CANDIDATES, legacy_wake_snapshot_digest,
-        migrate_v12_agent_wake_context, ticket_has_active_child,
+        legacy_wake_snapshot_digest, migrate_v12_agent_wake_context, ticket_has_active_child,
     };
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision};
@@ -1626,7 +1625,12 @@ mod tests {
         loaded_wake.validate().unwrap();
         assert_eq!(snapshot_digest, reservation.wake_snapshot.digest.as_str());
         assert_eq!(loaded_wake, reservation.wake_snapshot);
-        assert!(reopened.persisted_start_receipt(&start_request).unwrap().is_some());
+        assert!(
+            reopened
+                .persisted_start_receipt(&start_request)
+                .unwrap()
+                .is_some()
+        );
         assert!(matches!(
             reopened.prepare_role_launch(&reservation).unwrap(),
             LaunchPreparationOutcome::Prepared { .. }

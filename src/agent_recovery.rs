@@ -355,7 +355,7 @@ impl AgentRecoveryRuntime {
         if attention || timeout_exceeded {
             store.queue_agent_recovery_attention(
                 owner_generation,
-                &authority,
+                authority,
                 reason.unwrap_or(RecoveryUnknown::HeartbeatMissingOrInvalid),
                 policy.now_unix,
             )?;

@@ -581,7 +581,7 @@ impl OperationPermit {
     }
 }
 
-pub fn authorize_operation(
+pub(crate) fn authorize_operation(
     applied: &AppliedConfig,
     delivery_facts: &DeliveryFacts,
     plan: &ValidatedOperationPlan,

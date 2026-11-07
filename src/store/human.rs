@@ -2066,7 +2066,11 @@ mod tests {
         store
             .archive_rex_view_block(generation, &view_id, "finished-worker", "finished output")
             .unwrap();
-        assert!(store.mark_rex_view_terminal(generation, &view_id, 0).unwrap());
+        assert!(
+            store
+                .mark_rex_view_terminal(generation, &view_id, 0)
+                .unwrap()
+        );
 
         let stale_candidate = store.rex_view_cleanup_candidates(1000, 1).unwrap();
         assert_eq!(stale_candidate.len(), 1);

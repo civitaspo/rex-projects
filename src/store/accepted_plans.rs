@@ -82,13 +82,11 @@ pub(crate) fn prepare_accepted_plan_write(
     for node in &plan.nodes_in_execution_order {
         if let crate::engine::orchestration::WorkBaseSource::ControllerObservedCommit { commit } =
             &node.base
-        {
-            if let Some(previous) =
+            && let Some(previous) =
                 observed_base_shas.insert(node.repository.clone(), commit.clone())
-                && previous != *commit
-            {
-                return Err("validated plan has inconsistent observed repository bases".into());
-            }
+            && previous != *commit
+        {
+            return Err("validated plan has inconsistent observed repository bases".into());
         }
     }
     let persisted = PersistedWorkPlan {
@@ -1031,6 +1029,21 @@ fn parse_canonical<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, Stri
     serde_json::from_value(value).map_err(|error| error.to_string())
 }
 
+fn parse_unique<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
+    crate::protocol::parse_unique(json.as_bytes()).map_err(|error| error.to_string())
+}
+
+fn digest_json(json: &str) -> Digest {
+    use sha2::Digest as _;
+    Digest::parse(format!("{:x}", sha2::Sha256::digest(json.as_bytes())))
+        .expect("sha256 is valid digest")
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,19 +1105,4 @@ mod tests {
         wrong_role.nodes[0].investigation = true;
         assert!(!validated_plan_matches_claim(&validated, &wrong_role));
     }
-}
-
-fn parse_unique<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
-    crate::protocol::parse_unique(json.as_bytes()).map_err(|error| error.to_string())
-}
-
-fn digest_json(json: &str) -> Digest {
-    use sha2::Digest as _;
-    Digest::parse(format!("{:x}", sha2::Sha256::digest(json.as_bytes())))
-        .expect("sha256 is valid digest")
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    format!("{:x}", sha2::Sha256::digest(bytes))
 }

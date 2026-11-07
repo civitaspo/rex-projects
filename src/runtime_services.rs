@@ -2204,7 +2204,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             .get(profile_id)
             .ok_or("Supervisor profile is absent from the applied configuration")?;
         let profile_digest = digest_serialized(&profile)?;
-        let runtime_identity = crate::run_step::profile_runtime_identity(&profile)
+        let runtime_identity = crate::run_step::profile_runtime_identity(profile)
             .map_err(|error| error.to_string())?;
         let qualifications = store.verified_provider_qualifications(
             &candidate.project_id,
@@ -3396,6 +3396,30 @@ fn worker_assignment_context(
     serde_json::to_string(&value).map_err(|error| error.to_string())
 }
 
+fn mailbox_expiration(now_unix: i64, turn_timeout_seconds: u64) -> Result<u64, String> {
+    let timeout = i64::try_from(turn_timeout_seconds)
+        .map_err(|_| "Agent turn timeout exceeds supported range")?;
+    u64::try_from(
+        now_unix
+            .checked_add(timeout)
+            .and_then(|value| value.checked_add(86_400))
+            .ok_or("Agent mailbox expiration overflow")?,
+    )
+    .map_err(|_| "Agent mailbox expiration is negative".into())
+}
+
+fn normalized_status(status: TicketStatus) -> NormalizedTicketStatus {
+    match status {
+        TicketStatus::Triage => NormalizedTicketStatus::Triage,
+        TicketStatus::Backlog => NormalizedTicketStatus::Backlog,
+        TicketStatus::Ready => NormalizedTicketStatus::Ready,
+        TicketStatus::InProgress => NormalizedTicketStatus::InProgress,
+        TicketStatus::InReview => NormalizedTicketStatus::InReview,
+        TicketStatus::Done => NormalizedTicketStatus::Done,
+        TicketStatus::Canceled => NormalizedTicketStatus::Canceled,
+    }
+}
+
 #[cfg(test)]
 mod worker_assignment_context_tests {
     use super::*;
@@ -3479,29 +3503,5 @@ mod worker_assignment_context_tests {
         );
         assert_eq!(context["prepared_worktree"]["base_sha"], base_sha);
         assert_eq!(context["prepared_worktree"]["repository_id"], "repo-a");
-    }
-}
-
-fn mailbox_expiration(now_unix: i64, turn_timeout_seconds: u64) -> Result<u64, String> {
-    let timeout = i64::try_from(turn_timeout_seconds)
-        .map_err(|_| "Agent turn timeout exceeds supported range")?;
-    u64::try_from(
-        now_unix
-            .checked_add(timeout)
-            .and_then(|value| value.checked_add(86_400))
-            .ok_or("Agent mailbox expiration overflow")?,
-    )
-    .map_err(|_| "Agent mailbox expiration is negative".into())
-}
-
-fn normalized_status(status: TicketStatus) -> NormalizedTicketStatus {
-    match status {
-        TicketStatus::Triage => NormalizedTicketStatus::Triage,
-        TicketStatus::Backlog => NormalizedTicketStatus::Backlog,
-        TicketStatus::Ready => NormalizedTicketStatus::Ready,
-        TicketStatus::InProgress => NormalizedTicketStatus::InProgress,
-        TicketStatus::InReview => NormalizedTicketStatus::InReview,
-        TicketStatus::Done => NormalizedTicketStatus::Done,
-        TicketStatus::Canceled => NormalizedTicketStatus::Canceled,
     }
 }

@@ -93,17 +93,17 @@ pub fn consume_one_host_transition(
             }
         }
 
-        if run.phase == Phase::Publishing {
-            if advance_work_plan_stage(
+        if run.phase == Phase::Publishing
+            && advance_work_plan_stage(
                 store,
                 owner_generation,
                 config,
                 configuration_digest,
                 &run,
                 &receipts,
-            )? {
-                return Ok(true);
-            }
+            )?
+        {
+            return Ok(true);
         }
 
         if run.phase == Phase::Operating

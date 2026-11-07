@@ -246,7 +246,7 @@ impl RuntimeDelivery {
                     && receipt.push.branch == resource.branch)
                     .then_some((entry, receipt))
             })
-            .last();
+            .next_back();
         let mut host = crate::publication_monitor::ReconciledHostEffects::default();
         if let Some((_, receipt)) = publication.as_ref() {
             if observation.remote_head.as_deref() == Some(receipt.push.pushed_head.as_str()) {
@@ -254,22 +254,18 @@ impl RuntimeDelivery {
             }
             if let crate::delivery_forge::ObservationCapability::Known(pulls) =
                 &observation.pull_requests
-            {
-                if let Some(pull) = pulls
+                && let Some(pull) = pulls
                     .iter()
                     .find(|pull| pull.number == receipt.pull_request.number)
-                {
-                    if pull.node_id == receipt.pull_request.node_id
-                        && pull.source_head == receipt.pull_request.source_head
-                        && pull.source_branch == receipt.pull_request.source_branch
-                        && pull.base_branch == receipt.pull_request.base_branch
-                        && pull.title == receipt.pull_request.title
-                        && pull.body.as_deref().map(|body| sha256(body.as_bytes()))
-                            == Some(receipt.pull_request.body_digest.clone())
-                    {
-                        host.confirmed_pull_request = Some(pull.clone());
-                    }
-                }
+                && pull.node_id == receipt.pull_request.node_id
+                && pull.source_head == receipt.pull_request.source_head
+                && pull.source_branch == receipt.pull_request.source_branch
+                && pull.base_branch == receipt.pull_request.base_branch
+                && pull.title == receipt.pull_request.title
+                && pull.body.as_deref().map(|body| sha256(body.as_bytes()))
+                    == Some(receipt.pull_request.body_digest.clone())
+            {
+                host.confirmed_pull_request = Some(pull.clone());
             }
         }
         match store.classify_publication_observation(&resource, &observation, &host)? {

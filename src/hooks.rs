@@ -1176,7 +1176,6 @@ mod tests {
         let project = ProjectId::parse("fixture-project").unwrap();
         let first_repository = RepositoryId::parse("fixture-repo").unwrap();
         let second_repository = RepositoryId::parse("second-repo").unwrap();
-        let config_digest = config_digest;
         let blocked = HookConfig {
             id: "blocked".into(),
             command: [
