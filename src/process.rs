@@ -1210,9 +1210,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_stat_parser_handles_parentheses_in_command_names() {
-        let stat = "12 (tool ) name) S 1 12 12 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 7654 0";
-        let (command, fields) = super::parse_linux_stat(stat).unwrap();
+        let mut fields = vec!["0"; 22];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[2] = "12";
+        fields[3] = "12";
+        fields[19] = "7654";
+        let stat = format!("12 (tool ) name) {}", fields.join(" "));
+        let (command, fields) = super::parse_linux_stat(&stat).unwrap();
         assert_eq!(command, "tool ) name");
+        assert_eq!(super::parse_field::<u32>(&fields, 1).unwrap(), 1);
+        assert_eq!(super::parse_field::<u32>(&fields, 2).unwrap(), 12);
         assert_eq!(super::parse_field::<u32>(&fields, 19).unwrap(), 7654);
     }
 
