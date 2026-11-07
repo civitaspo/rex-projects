@@ -1024,6 +1024,12 @@ impl TicketCommandAdapter {
             operation_id,
             MethodName::new(method.as_str()).map_err(TicketAdapterError::Invalid)?,
             project_id,
+            run_id: None,
+            attempt: None,
+            run_epoch: None,
+            expected_subject_revision: None,
+            role: None,
+            request_type: None,
             params,
         );
         request.validate().map_err(TicketAdapterError::Protocol)?;

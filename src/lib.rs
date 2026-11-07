@@ -17,6 +17,7 @@ pub mod launch;
 pub mod learning;
 pub mod mailbox;
 pub mod operations;
+pub mod operations_runtime;
 pub mod process;
 pub mod profile_effect;
 pub mod protocol;

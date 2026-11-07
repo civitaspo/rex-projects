@@ -816,7 +816,8 @@ pub fn target_readiness(
     Ok(TargetReadiness::Ready)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryFacts {
     pub merge_commits: BTreeMap<RepositoryId, String>,
     pub planned_revisions: BTreeMap<String, BTreeMap<RepositoryId, String>>,
@@ -1758,6 +1759,12 @@ pub fn new_request<P>(
         operation_id,
         MethodName::new(method)?,
         project_id,
+        run_id: None,
+        attempt: None,
+        run_epoch: None,
+        expected_subject_revision: None,
+        role: None,
+        request_type: None,
         params,
     ))
 }

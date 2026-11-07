@@ -34,6 +34,7 @@ pub use learning_store::{
     TrialProgress,
 };
 pub mod scheduler;
+pub mod operations;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
