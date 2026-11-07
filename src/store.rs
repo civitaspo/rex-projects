@@ -5624,10 +5624,253 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(
-            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
-            Phase::Reviewing
+        let reviewing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(reviewing.phase, Phase::Reviewing);
+        let snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                reviewing.revision,
+            )
+            .unwrap();
+        assert_eq!(snapshot.publication_revision(), reviewing.revision);
+        assert_eq!(snapshot.publication_receipts().len(), 2);
+        crate::delivery_runtime::validate_implementation_publication_receipt(
+            &snapshot.accepted_plan().proposal,
+            snapshot.prepared_receipt(),
+            &project_id,
+            &config.repositories,
+            snapshot.publication_receipts(),
+        )
+        .unwrap();
+        let publication_revision = snapshot.publication_revision();
+        let evidence_json: String = store.connection.query_row(
+            "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision],
+            |row| row.get(0),
+        ).unwrap();
+        let mut wrong_node: serde_json::Value = serde_json::from_str(&evidence_json).unwrap();
+        wrong_node["publication_receipts"][0]["work_node_id"] = serde_json::json!("unknown-node");
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, wrong_node.to_string()],
+        ).unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision
+                )
+                .is_err()
         );
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, evidence_json],
+        ).unwrap();
+
+        let bound = snapshot.publication_receipts()[0].clone();
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json='{}' WHERE operation_id=?1",
+                [bound.intent().operation_id.as_str()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![bound.intent().operation_id.as_str(), bound.receipt_json()],
+            )
+            .unwrap();
+
+        let mut wrong_configuration: serde_json::Value =
+            serde_json::from_str(&evidence_json).unwrap();
+        wrong_configuration["configuration_digest"] = serde_json::json!("f".repeat(64));
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, wrong_configuration.to_string()],
+        ).unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision
+                )
+                .is_err()
+        );
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, evidence_json],
+        ).unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision - 1,
+                )
+                .is_err()
+        );
+
+        let corrections_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review_assessment",
+            "source_revision": reviewing.revision,
+            "accepted_revision": reviewing.revision + 1,
+            "transition": "corrections_remain",
+        })
+        .to_string();
+        let corrections_input = DurableInput {
+            producer_id: "reviewer-test".into(),
+            message_id: "review-corrections-for-snapshot-test".into(),
+            content_digest: durable_input_digest("ticket_run", &corrections_payload),
+            recipient: "ticket_run".into(),
+            payload: corrections_payload.clone(),
+        };
+        store
+            .commit_ticket_transition(
+                owner_generation,
+                &ticket_run_id,
+                Revision(reviewing.revision),
+                &corrections_input,
+                Input::CorrectionsRemain,
+                "test accepted correction transition",
+                &corrections_payload,
+                &[],
+            )
+            .unwrap();
+        let correcting = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        let corrected_head = "f".repeat(40);
+        let (corrected_intent, corrected_receipt) = publication(
+            &stacked_id,
+            &first_head,
+            &corrected_head,
+            staged_branch,
+            correcting.revision + 1,
+            "publish-stacked-correction",
+        );
+        let evidence_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "worker_evidence",
+            "source_revision": correcting.revision,
+        })
+        .to_string();
+        let evidence_input = DurableInput {
+            producer_id: "worker-test".into(),
+            message_id: "worker-correction-evidence-for-snapshot-test".into(),
+            content_digest: durable_input_digest("ticket_run", &evidence_payload),
+            recipient: "ticket_run".into(),
+            payload: evidence_payload.clone(),
+        };
+        store
+            .commit_ticket_transition(
+                owner_generation,
+                &ticket_run_id,
+                Revision(correcting.revision),
+                &evidence_input,
+                Input::EvidenceSubmitted,
+                "test submitted correction evidence",
+                &evidence_payload,
+                std::slice::from_ref(&corrected_intent),
+            )
+            .unwrap();
+        store.connection.execute(
+            "UPDATE effects SET status='succeeded',attempt_count=1,receipt_json=?2 WHERE operation_id=?1",
+            rusqlite::params![corrected_intent.operation_id, serde_json::to_string(&corrected_receipt).unwrap()],
+        ).unwrap();
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                15,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        let corrected_review = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(corrected_review.phase, Phase::Reviewing);
+        let corrected_snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                corrected_review.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            corrected_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        assert_ne!(
+            corrected_snapshot.publication_revision(),
+            snapshot.publication_revision()
+        );
+        assert!(
+            corrected_snapshot
+                .publication_receipts()
+                .iter()
+                .any(|receipt| receipt.intent().operation_id == corrected_intent.operation_id)
+        );
+
+        let review_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review_assessment",
+            "source_revision": corrected_review.revision,
+            "accepted_revision": corrected_review.revision + 1,
+            "transition": "review_converged",
+        })
+        .to_string();
+        let review_input = DurableInput {
+            producer_id: "reviewer-test".into(),
+            message_id: "review-converged-for-snapshot-test".into(),
+            content_digest: durable_input_digest("ticket_run", &review_payload),
+            recipient: "ticket_run".into(),
+            payload: review_payload.clone(),
+        };
+        store
+            .commit_ticket_transition(
+                owner_generation,
+                &ticket_run_id,
+                Revision(corrected_review.revision),
+                &review_input,
+                Input::ReviewConverged,
+                "test accepted Reviewer transition for snapshot lookup",
+                &review_payload,
+                &[],
+            )
+            .unwrap();
+        let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        let merge_snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                assessing.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            merge_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        assert_eq!(merge_snapshot.publication_receipts().len(), 2);
         assert!(
             !crate::engine::host_transitions::consume_one_host_transition(
                 &mut store,

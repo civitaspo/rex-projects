@@ -167,6 +167,32 @@ pub struct AcceptedWorkPlanRecord {
     pub coordinator_authority_digest: Digest,
 }
 
+#[derive(Clone, Debug)]
+pub struct AcceptedImplementationPublicationSnapshot {
+    accepted_plan: AcceptedWorkPlanRecord,
+    publication_revision: u64,
+    prepared_receipt: PreparedWorktreesEffectReceipt,
+    publication_receipts: Vec<SucceededEffectReceipt>,
+}
+
+impl AcceptedImplementationPublicationSnapshot {
+    pub fn accepted_plan(&self) -> &AcceptedWorkPlanRecord {
+        &self.accepted_plan
+    }
+
+    pub fn publication_revision(&self) -> u64 {
+        self.publication_revision
+    }
+
+    pub fn prepared_receipt(&self) -> &PreparedWorktreesEffectReceipt {
+        &self.prepared_receipt
+    }
+
+    pub fn publication_receipts(&self) -> &[SucceededEffectReceipt] {
+        &self.publication_receipts
+    }
+}
+
 impl AcceptedWorkPlanRecord {
     pub fn validate_for(
         &self,
@@ -605,6 +631,245 @@ impl ConfigStore {
         }))
     }
 
+    /// Rebuild the exact host-accepted implementation publication snapshot for Reviewer or MergeIntent.
+    pub fn accepted_implementation_publication_snapshot(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        consumer_revision: u64,
+    ) -> Result<AcceptedImplementationPublicationSnapshot, String> {
+        let current: Option<(u64, String, String, String)> = self.connection.query_row(
+            "SELECT revision,internal_phase,config_digest,project_id FROM ticket_runs WHERE ticket_run_id=?1",
+            [ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((revision, phase, config_digest, stored_project)) = current else {
+            return Err("publication snapshot TicketRun is missing".into());
+        };
+        if revision != consumer_revision || stored_project != project_id.as_str() {
+            return Err("publication snapshot consumer revision or Project is stale".into());
+        }
+        let active_generation: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if active_generation != Some(owner_generation) {
+            return Err("publication snapshot requires the active controller generation".into());
+        }
+        let mut stmt = self.connection.prepare(
+            "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC LIMIT 2",
+        ).map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![
+                    ticket_run_id.as_str(),
+                    project_id.as_str(),
+                    consumer_revision
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let Some((source_revision, publication_revision, evidence_json)) = rows
+            .iter()
+            .find(|(_, _, evidence)| {
+                serde_json::from_str::<serde_json::Value>(evidence)
+                    .is_ok_and(|value| value["kind"] == "implementation_published")
+            })
+            .cloned()
+        else {
+            return Err("TicketRun has no committed implementation publication snapshot".into());
+        };
+        let evidence: serde_json::Value = crate::protocol::parse_unique(evidence_json.as_bytes())?;
+        if source_revision.checked_add(1) != Some(publication_revision)
+            || evidence["source_revision"].as_u64() != Some(source_revision)
+            || evidence["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
+        {
+            return Err("committed implementation publication transition is malformed".into());
+        }
+        match (
+            phase.as_str(),
+            consumer_revision.checked_sub(publication_revision),
+        ) {
+            ("reviewing", Some(0)) => {}
+            ("assessing", Some(1))
+                if rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "review_converged"
+                            },
+                        )
+                }) => {}
+            _ => return Err("publication snapshot is no longer the current review subject".into()),
+        }
+        let accepted = self
+            .latest_accepted_work_plan(project_id, ticket_run_id)?
+            .ok_or("publication snapshot has no accepted work plan")?;
+        let configuration_digest = Digest::parse(config_digest)?;
+        if evidence["plan_digest"].as_str() != Some(accepted.plan_digest.as_str())
+            || evidence["configuration_digest"].as_str()
+                != Some(accepted.configuration_digest.as_str())
+            || accepted.configuration_digest != configuration_digest
+        {
+            return Err("publication snapshot is bound to a stale plan or configuration".into());
+        }
+        let prepared_bindings = evidence["prepared_receipts"]
+            .as_array()
+            .ok_or("publication snapshot has no prepared receipt bindings")?;
+        let expected_ids = accepted
+            .proposal
+            .nodes
+            .iter()
+            .filter(|node| !node.investigation)
+            .map(|node| node.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut prepared_ids = std::collections::BTreeSet::new();
+        let mut prepared_nodes = BTreeMap::new();
+        for binding in prepared_bindings {
+            let work_node_id = binding["work_node_id"]
+                .as_str()
+                .ok_or("prepared binding has no node ID")?;
+            let operation_id = binding["operation_id"]
+                .as_str()
+                .ok_or("prepared binding has no operation ID")?;
+            let receipt_digest = binding["receipt_digest"]
+                .as_str()
+                .ok_or("prepared binding has no receipt digest")?;
+            if !prepared_ids.insert(work_node_id.to_owned()) {
+                return Err("prepared receipt snapshot repeats a work node".into());
+            }
+            let stored = self
+                .succeeded_effect_receipt(operation_id)?
+                .ok_or("bound prepared-worktree receipt is no longer succeeded")?;
+            if stored.intent().kind
+                != crate::engine::reducer::effect_name(
+                    &crate::engine::reducer::EffectKind::PrepareWorktrees,
+                )
+                || stored.intent().project_id != *project_id
+                || stored.intent().subject_type != "ticket_run"
+                || stored.intent().subject_id != ticket_run_id.as_str()
+                || stored
+                    .intent()
+                    .expected_revision
+                    .is_none_or(|source| source > source_revision)
+                || sha256(stored.receipt_json().as_bytes()) != receipt_digest
+            {
+                return Err(
+                    "bound prepared-worktree receipt differs from the publication snapshot".into(),
+                );
+            }
+            let prepare_request: crate::delivery_runtime::PrepareWorktreesEffectPayload =
+                crate::protocol::parse_unique(stored.intent().request_json.as_bytes())?;
+            if prepare_request.ticket_run_id != *ticket_run_id
+                || prepare_request.configuration_digest != configuration_digest
+            {
+                return Err(
+                    "prepared receipt request differs from the accepted run or configuration"
+                        .into(),
+                );
+            }
+            let (_, prepared) = crate::delivery_runtime::validate_prepared_worktree_stage(&stored)?;
+            let node = prepared
+                .work_nodes
+                .into_iter()
+                .find(|node| node.work_node_id.as_str() == work_node_id)
+                .ok_or("prepared receipt binding names a node absent from its receipt")?;
+            prepared_nodes.insert(work_node_id.to_owned(), node);
+        }
+        if prepared_ids != expected_ids {
+            return Err(
+                "prepared receipt snapshot does not cover every accepted implementation node"
+                    .into(),
+            );
+        }
+        let prepared_receipt = PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: prepared_nodes.into_values().collect(),
+        };
+        let bindings = evidence["publication_receipts"]
+            .as_array()
+            .ok_or("publication snapshot has no receipt bindings")?;
+        let mut observed_ids = std::collections::BTreeSet::new();
+        let mut publication_receipts = Vec::new();
+        for binding in bindings {
+            let work_node_id = binding["work_node_id"]
+                .as_str()
+                .ok_or("publication binding has no node ID")?;
+            let operation_id = binding["operation_id"]
+                .as_str()
+                .ok_or("publication binding has no operation ID")?;
+            let receipt_digest = binding["receipt_digest"]
+                .as_str()
+                .ok_or("publication binding has no receipt digest")?;
+            if !observed_ids.insert(work_node_id.to_owned()) {
+                return Err("publication snapshot repeats a work node".into());
+            }
+            let receipt = self
+                .succeeded_effect_receipt(operation_id)?
+                .ok_or("bound implementation publication receipt is no longer succeeded")?;
+            if receipt.intent().kind
+                != crate::engine::reducer::effect_name(
+                    &crate::engine::reducer::EffectKind::PublishImplementation,
+                )
+                || receipt.intent().project_id != *project_id
+                || receipt.intent().subject_type != "ticket_run"
+                || receipt.intent().subject_id != ticket_run_id.as_str()
+                || receipt
+                    .intent()
+                    .expected_revision
+                    .is_none_or(|revision| revision > source_revision)
+                || sha256(receipt.receipt_json().as_bytes()) != receipt_digest
+            {
+                return Err(
+                    "bound implementation receipt differs from the committed publication snapshot"
+                        .into(),
+                );
+            }
+            let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                crate::protocol::parse_unique(receipt.intent().request_json.as_bytes())?;
+            if request.work_node_id.as_str() != work_node_id
+                || request.ticket_run_id != *ticket_run_id
+                || request.configuration_digest != configuration_digest
+            {
+                return Err("publication receipt request differs from its node, run, or configuration binding".into());
+            }
+            publication_receipts.push(receipt);
+        }
+        if observed_ids != expected_ids || publication_receipts.is_empty() {
+            return Err(
+                "publication snapshot does not cover every accepted implementation node".into(),
+            );
+        }
+        let digest_input = serde_json::to_string(&(&accepted.plan_digest, &bindings))
+            .map_err(|error| error.to_string())?;
+        if sha256(digest_input.as_bytes())
+            != evidence["publication_set_digest"]
+                .as_str()
+                .unwrap_or_default()
+        {
+            return Err(
+                "publication snapshot digest does not match its committed receipt bindings".into(),
+            );
+        }
+        Ok(AcceptedImplementationPublicationSnapshot {
+            accepted_plan: accepted,
+            publication_revision,
+            prepared_receipt,
+            publication_receipts,
+        })
+    }
+
     /// Return a Worker context only when the supplied success receipt was
     /// re-read from the effects table and exactly covers the current accepted
     /// plan plus prepared worktree receipt.
@@ -837,4 +1102,9 @@ fn digest_json(json: &str) -> Digest {
     use sha2::Digest as _;
     Digest::parse(format!("{:x}", sha2::Sha256::digest(json.as_bytes())))
         .expect("sha256 is valid digest")
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }

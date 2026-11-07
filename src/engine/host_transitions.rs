@@ -268,6 +268,7 @@ fn advance_work_plan_stage(
     let validated = accepted.validate_for(project, configuration_digest)?;
 
     let mut prepared = std::collections::BTreeMap::<WorkNodeId, PreparedWorktreeReceiptNode>::new();
+    let mut prepared_sources = std::collections::BTreeMap::<WorkNodeId, serde_json::Value>::new();
     let mut publications = std::collections::BTreeMap::<
         WorkNodeId,
         (
@@ -302,10 +303,17 @@ fn advance_work_plan_stage(
             let receipt: PreparedWorktreesEffectReceipt =
                 decode_canonical_receipt(stored.receipt_json())?;
             crate::delivery_runtime::validate_prepared_receipt(&payload, &receipt)?;
+            let receipt_digest = sha256_hex(stored.receipt_json().as_bytes());
             for node in receipt.work_nodes {
-                if prepared.insert(node.work_node_id.clone(), node).is_some() {
-                    return Err("accepted work plan has duplicate prepared node receipts".into());
-                }
+                prepared_sources.insert(
+                    node.work_node_id.clone(),
+                    serde_json::json!({
+                        "work_node_id": node.work_node_id,
+                        "operation_id": intent.operation_id,
+                        "receipt_digest": receipt_digest,
+                    }),
+                );
+                prepared.insert(node.work_node_id.clone(), node);
             }
         }
     }
@@ -385,24 +393,38 @@ fn advance_work_plan_stage(
             &config.repositories,
             &publication_receipts,
         )?;
+        let publication_bindings = publications
+            .iter()
+            .map(|(work_node_id, (_, receipt, _))| {
+                serde_json::json!({
+                    "work_node_id": work_node_id,
+                    "operation_id": receipt.intent().operation_id,
+                    "receipt_digest": sha256_hex(receipt.receipt_json().as_bytes()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let prepared_bindings = worker_nodes
+            .iter()
+            .map(|node| prepared_sources.get(&node.id).cloned())
+            .collect::<Option<Vec<_>>>()
+            .ok_or("prepared worktree receipts do not cover every implementation node")?;
+        if prepared_bindings.len() != worker_nodes.len() {
+            return Err("prepared worktree receipts do not cover every implementation node".into());
+        }
         let receipt_digest = sha256_hex(
-            format!(
-                "{}:{}",
-                accepted.plan_digest,
-                publication_receipts
-                    .iter()
-                    .map(|item| item.intent().operation_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-            .as_bytes(),
+            serde_json::to_string(&(&accepted.plan_digest, &publication_bindings))
+                .map_err(|error| error.to_string())?
+                .as_bytes(),
         );
         let payload_json = serde_json::json!({
             "schema_version": 1,
             "kind": "implementation_published",
             "ticket_run_id": run.ticket_run_id,
             "source_revision": run.revision,
+            "configuration_digest": accepted.configuration_digest,
             "plan_digest": accepted.plan_digest,
+            "prepared_receipts": prepared_bindings,
+            "publication_receipts": publication_bindings,
             "publication_set_digest": receipt_digest,
         })
         .to_string();

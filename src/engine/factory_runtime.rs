@@ -1437,65 +1437,28 @@ fn apply_reviewer_result(
         .projects
         .get(&binding.project_id)
         .ok_or("Reviewer result Project is no longer configured")?;
-    let Some(accepted) = store.latest_accepted_work_plan(&binding.project_id, ticket_run_id)?
-    else {
-        return Err("Reviewer result has no accepted work plan".into());
-    };
+    let snapshot = store.accepted_implementation_publication_snapshot(
+        owner_generation,
+        &run.project_id,
+        ticket_run_id,
+        run.revision,
+    )?;
+    let accepted = snapshot.accepted_plan();
     if accepted.configuration_digest != configuration_digest {
         return Err("accepted work plan belongs to a stale configuration snapshot".into());
     }
     let _validated_plan = accepted.validate_for(project, &configuration_digest)?;
-
-    let receipts = store.list_succeeded_effect_receipts(
-        owner_generation,
-        &run.project_id,
-        "ticket_run",
-        run.ticket_run_id.as_str(),
-        256,
-    )?;
-    let prepared_receipt = receipts
-        .iter()
-        .find(|receipt| {
-            receipt.intent().kind
-                == crate::engine::reducer::effect_name(
-                    &crate::engine::reducer::EffectKind::PrepareWorktrees,
-                )
-                && receipt.intent().expected_revision == Some(accepted.accepted_revision)
-        })
-        .ok_or("accepted work plan has no succeeded prepared-worktree receipt")?;
-    let prepared: crate::delivery_runtime::PreparedWorktreesEffectReceipt =
-        serde_json::from_str(prepared_receipt.receipt_json())
-            .map_err(|error| format!("invalid prepared-worktree receipt: {error}"))?;
-    let publications = receipts
-        .iter()
-        .filter(|receipt| {
-            receipt.intent().kind
-                == crate::engine::reducer::effect_name(
-                    &crate::engine::reducer::EffectKind::PublishImplementation,
-                )
-                && receipt.intent().expected_revision == Some(run.revision)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let publication_proof = crate::delivery_runtime::validate_implementation_publication_receipt(
+    if snapshot.publication_revision() != run.revision {
+        return Err("Reviewer result does not match the current publication transition".into());
+    }
+    let publications = snapshot.publication_receipts();
+    crate::delivery_runtime::validate_implementation_publication_receipt(
         &accepted.proposal,
-        &prepared,
+        snapshot.prepared_receipt(),
         &run.project_id,
         &config.repositories,
-        &publications,
+        publications,
     )?;
-    let reducer_run = crate::engine::reducer::TicketRun {
-        project_id: run.project_id.clone(),
-        ticket_run_id: run.ticket_run_id.clone(),
-        revision: Revision(run.revision),
-        phase: run.phase,
-        activity: run.activity,
-        external_status: run.external_status,
-        required_review_revision: run.required_review_revision.map(Revision),
-    };
-    if !publication_proof.matches(&reducer_run) {
-        return Err("publication receipts do not match the current TicketRun revision".into());
-    }
     let RoleResultPayload::ReviewReady(assessment) = &result.validated.typed_payload else {
         return Err("validated ReviewReady kind has a different typed payload".into());
     };

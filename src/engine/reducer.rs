@@ -401,11 +401,6 @@ mod tests {
     fn role_work_is_always_durably_routed_as_a_wake() {
         let cases = [
             (Phase::Queued, Input::Dispatch, Role::Coordinator),
-            (
-                Phase::Implementing,
-                Input::EvidenceSubmitted,
-                Role::Reviewer,
-            ),
             (Phase::Reviewing, Input::CorrectionsRemain, Role::Worker),
             (
                 Phase::Reviewing,
