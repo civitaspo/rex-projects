@@ -46,6 +46,7 @@ fn adapter(
         &[],
         dir.path(),
         Duration::from_secs(5),
+        Duration::from_secs(5),
         Duration::from_millis(100),
     )
     .unwrap();
@@ -82,7 +83,7 @@ fn adapter_with_timeouts(
         OsString::from("PATH"),
         std::env::var_os("PATH").unwrap_or_default(),
     )]);
-    TicketCommandAdapter::new_discovering_namespace_with_timeouts(
+    TicketCommandAdapter::new_discovering_namespace(
         &command,
         &snapshot,
         &[],

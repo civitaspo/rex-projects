@@ -443,17 +443,15 @@ pub fn build_ticket_adapter(
     let adapter = &config.adapters.tickets;
     let shutdown_grace = Duration::from_secs(config.runtime.shutdown_grace_seconds);
     match adapter.kind.as_str() {
-        "command" => Ok(Box::new(
-            TicketCommandAdapter::new_discovering_namespace_with_timeouts(
-                &adapter.command,
-                environment_snapshot,
-                &adapter.environment_allow,
-                cwd,
-                Duration::from_secs(adapter.read_timeout_seconds),
-                Duration::from_secs(adapter.write_timeout_seconds),
-                shutdown_grace,
-            )?,
-        )),
+        "command" => Ok(Box::new(TicketCommandAdapter::new_discovering_namespace(
+            &adapter.command,
+            environment_snapshot,
+            &adapter.environment_allow,
+            cwd,
+            Duration::from_secs(adapter.read_timeout_seconds),
+            Duration::from_secs(adapter.write_timeout_seconds),
+            shutdown_grace,
+        )?)),
         _ => Err(TicketAdapterError::Invalid(
             "unsupported ticket adapter kind".into(),
         )),
@@ -461,76 +459,13 @@ pub fn build_ticket_adapter(
 }
 
 impl TicketCommandAdapter {
-    pub fn new(
-        command: &[String],
-        environment_snapshot: &BTreeMap<OsString, OsString>,
-        environment_allowlist: &[String],
-        cwd: &Path,
-        expected_ticket_namespace: String,
-        timeout: Duration,
-        shutdown_grace: Duration,
-    ) -> Result<Self, TicketAdapterError> {
-        Self::new_inner(
-            command,
-            environment_snapshot,
-            environment_allowlist,
-            cwd,
-            Some(expected_ticket_namespace),
-            timeout,
-            timeout,
-            shutdown_grace,
-        )
-    }
-
-    /// Construct an adapter whose namespace is learned and pinned by its first successful
+    /// Construct an adapter that learns and pins its namespace on the first successful
     /// `describe` call. Data operations fail until that call has completed.
     pub fn new_discovering_namespace(
         command: &[String],
         environment_snapshot: &BTreeMap<OsString, OsString>,
         environment_allowlist: &[String],
         cwd: &Path,
-        timeout: Duration,
-        shutdown_grace: Duration,
-    ) -> Result<Self, TicketAdapterError> {
-        Self::new_discovering_namespace_with_timeouts(
-            command,
-            environment_snapshot,
-            environment_allowlist,
-            cwd,
-            timeout,
-            timeout,
-            shutdown_grace,
-        )
-    }
-
-    /// Construct an adapter with separate read and write deadlines.
-    pub fn new_discovering_namespace_with_timeouts(
-        command: &[String],
-        environment_snapshot: &BTreeMap<OsString, OsString>,
-        environment_allowlist: &[String],
-        cwd: &Path,
-        read_timeout: Duration,
-        write_timeout: Duration,
-        shutdown_grace: Duration,
-    ) -> Result<Self, TicketAdapterError> {
-        Self::new_inner(
-            command,
-            environment_snapshot,
-            environment_allowlist,
-            cwd,
-            None,
-            read_timeout,
-            write_timeout,
-            shutdown_grace,
-        )
-    }
-
-    fn new_inner(
-        command: &[String],
-        environment_snapshot: &BTreeMap<OsString, OsString>,
-        environment_allowlist: &[String],
-        cwd: &Path,
-        expected_ticket_namespace: Option<String>,
         read_timeout: Duration,
         write_timeout: Duration,
         shutdown_grace: Duration,
@@ -557,9 +492,6 @@ impl TicketCommandAdapter {
             || read_timeout.is_zero()
             || write_timeout.is_zero()
             || shutdown_grace.is_zero()
-            || expected_ticket_namespace.as_ref().is_some_and(|namespace| {
-                namespace.is_empty() || namespace.chars().any(char::is_control)
-            })
         {
             return Err(TicketAdapterError::Invalid(
                 "working directory and deadlines must be valid".into(),
@@ -584,8 +516,7 @@ impl TicketCommandAdapter {
             shutdown_grace,
             stdout_limit: 4 * 1024 * 1024,
             stderr_tail_limit: 64 * 1024,
-            expected_ticket_namespace: expected_ticket_namespace
-                .map_or_else(OnceLock::new, OnceLock::from),
+            expected_ticket_namespace: OnceLock::new(),
         })
     }
 
