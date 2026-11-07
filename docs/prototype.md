@@ -136,7 +136,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 - [ ] Create or update `src/protocol/`. Record the reviewed diff.
 - [ ] Create or update `src/config.rs`. Record the reviewed diff.
 - [ ] Create or update `schemas/`. Record the reviewed diff.
-- [ ] Create or update `schemas/version.v1.json` and `scripts/build-release-assets.sh`. Record the reviewed diff.
+- [ ] Create or update `schemas/version.v1.json` and document the csm-ci `cargo-raw` release contract in `docs/release-assets.md`. Release builds and uploaded artifacts are produced by the managed csm-ci service; do not add a repository-local release builder.
 - [ ] Create or update `mise.toml`. Record the reviewed diff.
 - [ ] Create or update `.github/workflows/`. Record the reviewed diff.
 
@@ -145,7 +145,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 - [ ] Add one Rust package and the rex-projects binary. Keep modules within one crate until a real consumer needs a separate crate.
 - [ ] Implement branded identifiers, request and response envelopes, configuration parsing, validation errors, and JSON Schema emission. Load named profiles from adjacent `profiles/<name>/` directories as specified in Appendix L.
 - [ ] Add config validate, config apply, doctor, schema, and version commands. Apply a validated complete configuration snapshot atomically in SQLite. Make stdout machine-readable under --json and reserve stderr for diagnostics.
-- [ ] Wire cargo fmt --check, cargo clippy with warnings denied, and cargo test into existing mise tasks and CI. Preserve workflow security checks. Build the Appendix O standalone release assets and SHA-256 metadata for verified targets; publication is a separate authorized release step. Do not change a Lua pin until its assets are available and validated.
+- [ ] Wire cargo fmt --check, cargo clippy with warnings denied, and cargo test into existing mise tasks and CI. Preserve workflow security checks. Configure the managed csm-ci `cargo-raw` release for the Appendix O targets and SHA-256 metadata; publication is a separate authorized release step. Use the development-only `cargo xtask` verifier to update a Lua pin only after signed assets are available and validated.
 
 **You see.**
 

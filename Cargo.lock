@@ -861,6 +861,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rex-projects-xtask"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rex-projects",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

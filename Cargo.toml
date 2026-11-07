@@ -25,3 +25,7 @@ tempfile = "3"
 [profile.release]
 strip = true
 
+[workspace]
+members = ["xtask"]
+resolver = "3"
+
