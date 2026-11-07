@@ -57,6 +57,14 @@ pub enum OperationExecutionOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTerminalReceipt {
+    operation_id: OperationId,
+    request_digest: Digest,
+    outcome: OperationExecutionOutcome,
+}
+
 impl EffectHandler for OperationEffectHandler {
     fn kind(&self) -> EffectKind {
         EffectKind::Operation
@@ -143,6 +151,53 @@ impl OperationEffectHandler {
         let (request, applied, target, permit) = {
             let store = OperationsStore::new(&mut connection)?;
             let request = store.effect_request(effect)?;
+            let record = store
+                .operation(&request.subject.operation_id)?
+                .ok_or_else(|| "durable operation row is missing".to_owned())?;
+            if record.request_digest != Digest::parse(effect.request_digest.clone())?
+                || record.subject_digest != request.subject.digest().map_err(|e| e.to_string())?
+            {
+                return Err("operation row is not bound to the immutable effect subject".into());
+            }
+            if matches!(
+                record.state,
+                DurableOperationState::Succeeded
+                    | DurableOperationState::Failed
+                    | DurableOperationState::Skipped
+            ) {
+                let cached: StoredTerminalReceipt =
+                    serde_json::from_str(record.terminal_receipt_json.as_deref().ok_or_else(
+                        || "terminal operation result has no durable receipt".to_owned(),
+                    )?)
+                    .map_err(|_| "terminal operation receipt is invalid".to_owned())?;
+                if cached.operation_id != OperationId::parse(effect.operation_id.clone())?
+                    || cached.request_digest != Digest::parse(effect.request_digest.clone())?
+                {
+                    return Err(
+                        "terminal operation receipt is bound to a different immutable intent"
+                            .into(),
+                    );
+                }
+                let state_matches = matches!(
+                    (&record.state, &cached.outcome),
+                    (
+                        DurableOperationState::Succeeded,
+                        OperationExecutionOutcome::Applied { .. }
+                    ) | (
+                        DurableOperationState::Skipped,
+                        OperationExecutionOutcome::Applied { .. }
+                    ) | (
+                        DurableOperationState::Failed,
+                        OperationExecutionOutcome::Rejected { .. }
+                    )
+                );
+                if !state_matches {
+                    return Err(
+                        "terminal operation receipt does not match its persisted state".into(),
+                    );
+                }
+                return Ok(cached.outcome);
+            }
             let applied = self
                 .snapshots
                 .get(request.config_digest.as_str())
@@ -162,14 +217,6 @@ impl OperationEffectHandler {
                 != serde_json::to_value(&request.target).map_err(|error| error.to_string())?
             {
                 return Err("operation target differs from the applied recipe".into());
-            }
-            let record = store
-                .operation(&request.subject.operation_id)?
-                .ok_or_else(|| "durable operation row is missing".to_owned())?;
-            if record.request_digest != Digest::parse(effect.request_digest.clone())?
-                || record.subject_digest != request.subject.digest().map_err(|e| e.to_string())?
-            {
-                return Err("operation row is not bound to the immutable effect subject".into());
             }
             let stored_approval = record
                 .approval_json
@@ -284,16 +331,19 @@ impl OperationEffectHandler {
                 match result.outcome {
                     InvokeOutcome::Rejected => {
                         let receipt = serde_json::json!({"operation_id":operation_id,"state":"failed","stage":"invoke_rejected"}).to_string();
+                        let outcome = OperationExecutionOutcome::Rejected {
+                            receipt_json: receipt.clone(),
+                        };
+                        let terminal_receipt = store_terminal_receipt(effect, &outcome)?;
                         let mut store = OperationsStore::new(connection)?;
                         store.record_observation(
                             operation_id,
                             &receipt,
+                            Some(&terminal_receipt),
                             DurableOperationState::Failed,
                             unix_now()?,
                         )?;
-                        Ok(OperationExecutionOutcome::Rejected {
-                            receipt_json: receipt,
-                        })
+                        Ok(outcome)
                     }
                     InvokeOutcome::Accepted | InvokeOutcome::Completed => {
                         let Some(external_reference) = result.external_reference else {
@@ -453,7 +503,7 @@ impl OperationEffectHandler {
     fn observe(
         &self,
         connection: &mut Connection,
-        _effect: &EffectIntent,
+        effect: &EffectIntent,
         request: &OperationEffectRequest,
         applied: &AppliedConfig,
         target: &crate::config::OperationTarget,
@@ -530,12 +580,6 @@ impl OperationEffectHandler {
         };
         let observation_json =
             serde_json::to_string(&observation).map_err(|error| error.to_string())?;
-        OperationsStore::new(connection)?.record_observation(
-            &request.subject.operation_id,
-            &observation_json,
-            state,
-            unix_now()?,
-        )?;
         let receipt = serde_json::json!({
             "operation_id": request.subject.operation_id,
             "correlation_key": permit.stable_correlation_key()?,
@@ -548,7 +592,7 @@ impl OperationEffectHandler {
             "observation": observation,
         })
         .to_string();
-        Ok(match predicate {
+        let outcome = match predicate {
             PredicateResult::Satisfied => OperationExecutionOutcome::Applied {
                 receipt_json: receipt,
             },
@@ -558,7 +602,20 @@ impl OperationEffectHandler {
             PredicateResult::Failed => OperationExecutionOutcome::Rejected {
                 receipt_json: receipt,
             },
-        })
+        };
+        let terminal_receipt = if state == DurableOperationState::Running {
+            None
+        } else {
+            Some(store_terminal_receipt(effect, &outcome)?)
+        };
+        OperationsStore::new(connection)?.record_observation(
+            &request.subject.operation_id,
+            &observation_json,
+            terminal_receipt.as_deref(),
+            state,
+            unix_now()?,
+        )?;
+        Ok(outcome)
     }
 }
 
@@ -590,6 +647,18 @@ fn pending_receipt(
             serde_json::json!({"operation_id":operation_id,"state":state,"detail":detail})
                 .to_string(),
     }
+}
+
+fn store_terminal_receipt(
+    effect: &EffectIntent,
+    outcome: &OperationExecutionOutcome,
+) -> Result<String, String> {
+    serde_json::to_string(&StoredTerminalReceipt {
+        operation_id: OperationId::parse(effect.operation_id.clone())?,
+        request_digest: Digest::parse(effect.request_digest.clone())?,
+        outcome: outcome.clone(),
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn request_id(operation_id: &OperationId, stage: &str, attempt: u32) -> String {
@@ -780,6 +849,8 @@ mod tests {
         assert_eq!(state["invoke_calls"], 1);
         assert_eq!(state["duplicate_invoke_calls"], 0);
 
+        // Simulate process death after the handler durably records success but
+        // before the shared dispatcher stores its receipt on the outbox row.
         let reconciled = handler
             .handle(OperationExecutionMode::Reconcile, &effect, 1)
             .unwrap();
@@ -787,6 +858,16 @@ mod tests {
             reconciled,
             OperationExecutionOutcome::Applied { .. }
         ));
+        let restarted = OperationEffectHandler::new(
+            &db,
+            [applied_config(&remote_state)],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let replayed = restarted
+            .handle(OperationExecutionMode::Reconcile, &effect, 1)
+            .unwrap();
+        assert_eq!(replayed, reconciled);
         let state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
         assert_eq!(state["invoke_calls"], 1);

@@ -85,6 +85,7 @@ pub struct OperationRecord {
     pub request_digest: Digest,
     pub external_reference: Option<String>,
     pub observation_json: Option<String>,
+    pub terminal_receipt_json: Option<String>,
     pub approval_json: Option<String>,
 }
 
@@ -140,6 +141,7 @@ pub fn migrate_v11(connection: &Connection) -> Result<(), String> {
             approval_json TEXT,
             external_reference TEXT,
             observation_json TEXT,
+            terminal_receipt_json TEXT,
             updated_at_unix INTEGER NOT NULL,
             UNIQUE(project_id,ticket_run_id,target_id),
             FOREIGN KEY(project_id,ticket_run_id) REFERENCES operation_plans(project_id,ticket_run_id) ON DELETE CASCADE
@@ -415,6 +417,7 @@ impl<'a> OperationsStore<'a> {
         &mut self,
         operation_id: &OperationId,
         observation_json: &str,
+        terminal_receipt_json: Option<&str>,
         state: DurableOperationState,
         now: i64,
     ) -> Result<(), String> {
@@ -432,8 +435,8 @@ impl<'a> OperationsStore<'a> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let changed = tx.execute(
-            "UPDATE operation_runs SET state=?2,observation_json=?3,updated_at_unix=?4 WHERE operation_id=?1 AND state IN ('invoking','running','unknown')",
-            params![operation_id.as_str(),state.as_str(),observation_json,now],
+            "UPDATE operation_runs SET state=?2,observation_json=?3,terminal_receipt_json=?4,updated_at_unix=?5 WHERE operation_id=?1 AND state IN ('invoking','running','unknown')",
+            params![operation_id.as_str(),state.as_str(),observation_json,terminal_receipt_json,now],
         ).map_err(|error| error.to_string())?;
         if changed != 1 {
             return Err("operation observation is stale or operation is not running".into());
@@ -472,13 +475,13 @@ impl<'a> OperationsStore<'a> {
 
     pub fn operation(&self, operation_id: &OperationId) -> Result<Option<OperationRecord>, String> {
         self.connection.query_row(
-            "SELECT operation_id,project_id,ticket_run_id,target_id,state,subject_digest,request_digest,external_reference,observation_json,approval_json FROM operation_runs WHERE operation_id=?1",
+            "SELECT operation_id,project_id,ticket_run_id,target_id,state,subject_digest,request_digest,external_reference,observation_json,terminal_receipt_json,approval_json FROM operation_runs WHERE operation_id=?1",
             [operation_id.as_str()],
             |row| {
                 let state: String = row.get(4)?;
-                Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,state,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,Option<String>>(8)?,row.get::<_,Option<String>>(9)?))
+                Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,state,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,Option<String>>(8)?,row.get::<_,Option<String>>(9)?,row.get::<_,Option<String>>(10)?))
             },
-        ).optional().map_err(|error| error.to_string())?.map(|(id,project,ticket_run,target,state,subject_digest,request_digest,external_reference,observation_json,approval_json)| {
+        ).optional().map_err(|error| error.to_string())?.map(|(id,project,ticket_run,target,state,subject_digest,request_digest,external_reference,observation_json,terminal_receipt_json,approval_json)| {
             Ok(OperationRecord {
                 operation_id: OperationId::parse(id)?,
                 project_id: ProjectId::parse(project)?,
@@ -489,6 +492,7 @@ impl<'a> OperationsStore<'a> {
                 request_digest: Digest::parse(request_digest)?,
                 external_reference,
                 observation_json,
+                terminal_receipt_json,
                 approval_json,
             })
         }).transpose()
@@ -524,7 +528,7 @@ impl<'a> OperationsStore<'a> {
         if request_json != effect.request_json || request_digest != effect.request_digest {
             return Err("operation effect differs from its durable operation intent".into());
         }
-        if state == "awaiting_approval" || state == "failed" || state == "succeeded" {
+        if state == "awaiting_approval" {
             return Err("operation effect is not in a dispatchable state".into());
         }
         Ok(request)
