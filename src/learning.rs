@@ -100,7 +100,7 @@ pub struct CandidateLedger {
 
 impl CandidateLedger {
     pub fn register(&mut self, revision: CandidateRevision) -> Result<(), LearningError> {
-        if revision.candidate_id.is_empty()
+        if !valid_candidate_id(&revision.candidate_id)
             || !sortable_utc(&revision.created_at)
             || !sortable_utc(&revision.expires_at)
             || revision.expires_at <= revision.created_at
@@ -109,17 +109,24 @@ impl CandidateLedger {
                 "candidate identity and increasing expiry are required".into(),
             ));
         }
-        self.prune_terminal_to_limit(&revision.project_id);
+        if let Some(existing) = self.revisions.iter().find(|r| {
+            r.project_id == revision.project_id
+                && r.candidate_id == revision.candidate_id
+                && r.digest == revision.digest
+        }) {
+            return if existing == &revision {
+                Ok(())
+            } else {
+                Err(LearningError::Conflict(
+                    "candidate revision identity already has different content".into(),
+                ))
+            };
+        }
         let retained = self
             .revisions
             .iter()
             .filter(|r| r.project_id == revision.project_id)
             .count();
-        if retained >= 20 {
-            return Err(LearningError::Conflict(
-                "project has reached the retained candidate revision limit".into(),
-            ));
-        }
         let active = self
             .revisions
             .iter()
@@ -130,14 +137,24 @@ impl CandidateLedger {
                 "project has reached the active candidate limit".into(),
             ));
         }
-        if self.revisions.iter().any(|r| {
-            r.project_id == revision.project_id
-                && r.candidate_id == revision.candidate_id
-                && r.digest == revision.digest
-        }) {
-            return Err(LearningError::Conflict(
-                "candidate revision already exists".into(),
-            ));
+        if retained >= 20 {
+            let oldest_terminal = self
+                .revisions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.project_id == revision.project_id && r.status.is_terminal())
+                .min_by_key(|(_, r)| r.created_at.clone())
+                .map(|(index, _)| index);
+            match oldest_terminal {
+                Some(index) => {
+                    self.revisions.remove(index);
+                }
+                None => {
+                    return Err(LearningError::Conflict(
+                        "project has reached the retained candidate revision limit".into(),
+                    ));
+                }
+            }
         }
         self.revisions.push(revision);
         Ok(())
@@ -161,30 +178,6 @@ impl CandidateLedger {
         Ok(expired)
     }
 
-    fn prune_terminal_to_limit(&mut self, project: &ProjectId) {
-        while self
-            .revisions
-            .iter()
-            .filter(|r| r.project_id == *project)
-            .count()
-            >= 20
-        {
-            let oldest_terminal = self
-                .revisions
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.project_id == *project && r.status.is_terminal())
-                .min_by_key(|(_, r)| r.created_at.clone())
-                .map(|(index, _)| index);
-            match oldest_terminal {
-                Some(index) => {
-                    self.revisions.remove(index);
-                }
-                None => break,
-            }
-        }
-    }
-
     pub fn supersede(&mut self, project: &ProjectId, role: Role, except_digest: &Digest) -> usize {
         let mut count = 0;
         for revision in &mut self.revisions {
@@ -201,18 +194,54 @@ impl CandidateLedger {
     }
 }
 
-fn sortable_utc(value: &str) -> bool {
-    value.len() == 20
-        && value.as_bytes()[4] == b'-'
-        && value.as_bytes()[7] == b'-'
-        && value.as_bytes()[10] == b'T'
-        && value.as_bytes()[13] == b':'
-        && value.as_bytes()[16] == b':'
-        && value.as_bytes()[19] == b'Z'
+fn valid_candidate_id(value: &str) -> bool {
+    value.len() <= 255
         && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn sortable_utc(value: &str) -> bool {
+    if value.len() != 20
+        || value.as_bytes()[4] != b'-'
+        || value.as_bytes()[7] != b'-'
+        || value.as_bytes()[10] != b'T'
+        || value.as_bytes()[13] != b':'
+        || value.as_bytes()[16] != b':'
+        || value.as_bytes()[19] != b'Z'
+        || !value
             .bytes()
             .enumerate()
             .all(|(i, b)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || b.is_ascii_digit())
+    {
+        return false;
+    }
+    let parse = |range: std::ops::Range<usize>| value[range].parse::<u32>().ok();
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        parse(0..4),
+        parse(5..7),
+        parse(8..10),
+        parse(11..13),
+        parse(14..16),
+        parse(17..19),
+    ) else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=month_days).contains(&day)
 }
 
 /// Account for every reserved pair, including timeouts and failures. The fixed
@@ -238,9 +267,15 @@ pub fn evaluate_trials(
         .iter()
         .filter(|o| o.baseline == TrialRunStatus::Timeout || o.candidate == TrialRunStatus::Timeout)
         .count();
-    let failed_pairs = observations
+    let incomplete_pairs = observations
         .iter()
-        .filter(|o| o.baseline == TrialRunStatus::Failed || o.candidate == TrialRunStatus::Failed)
+        .filter(|o| {
+            matches!(o.baseline, TrialRunStatus::Timeout | TrialRunStatus::Failed)
+                || matches!(
+                    o.candidate,
+                    TrialRunStatus::Timeout | TrialRunStatus::Failed
+                )
+        })
         .count();
     let improved_pairs = observations
         .iter()
@@ -258,8 +293,7 @@ pub fn evaluate_trials(
         .count();
     let complete = observations.len() == expected_pairs
         && distinct_inputs >= MIN_DISTINCT_INPUTS
-        && timed_out_pairs == 0
-        && failed_pairs == 0;
+        && incomplete_pairs == 0;
     let outcome = if regressed_pairs > 0 {
         TrialOutcome::Regressed
     } else if complete && improved_pairs > 0 {
@@ -270,7 +304,7 @@ pub fn evaluate_trials(
     Ok(TrialEvidence {
         outcome,
         distinct_inputs,
-        completed_pairs: observations.len() - timed_out_pairs - failed_pairs,
+        completed_pairs: observations.len() - incomplete_pairs,
         timed_out_pairs,
         improved_pairs,
         regressed_pairs,
@@ -283,18 +317,55 @@ pub fn evaluate_trials(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HumanPromotionApproval {
-    pub approver: String,
-    pub rationale: String,
-    pub approved_project_id: ProjectId,
-    pub approved_role: Role,
-    pub approved_profile_id: ProfileId,
-    pub approved_candidate_digest: Digest,
-    pub approved_manifest_digest: Digest,
-    pub approved_evidence_digest: Digest,
-    pub approved_config_revision: Digest,
-    pub authorized_at: String,
+/// Evidence that the controller has validated a durable human response.
+/// Its fields and constructor are crate-private so callers cannot self-assert
+/// approval. The caller must separately persist/apply the approved binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedHumanApproval {
+    approver: String,
+    rationale: String,
+    approved_project_id: ProjectId,
+    approved_role: Role,
+    approved_profile_id: ProfileId,
+    approved_candidate_digest: Digest,
+    approved_manifest_digest: Digest,
+    approved_evidence_digest: Digest,
+    approved_config_revision: Digest,
+    response_receipt_digest: Digest,
+    authorized_at: String,
+}
+
+impl ValidatedHumanApproval {
+    // Wired by the controller when its durable human-response receipt is added.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_validated_response(
+        approver: String,
+        rationale: String,
+        project_id: ProjectId,
+        role: Role,
+        profile_id: ProfileId,
+        candidate_digest: Digest,
+        manifest_digest: Digest,
+        evidence_digest: Digest,
+        config_revision: Digest,
+        response_receipt_digest: Digest,
+        authorized_at: String,
+    ) -> Self {
+        Self {
+            approver,
+            rationale,
+            approved_project_id: project_id,
+            approved_role: role,
+            approved_profile_id: profile_id,
+            approved_candidate_digest: candidate_digest,
+            approved_manifest_digest: manifest_digest,
+            approved_evidence_digest: evidence_digest,
+            approved_config_revision: config_revision,
+            response_receipt_digest,
+            authorized_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,14 +376,21 @@ pub struct ProfilePackage {
     pub candidate_digest: Digest,
     pub evidence: TrialEvidence,
     pub files: BTreeMap<String, Vec<u8>>,
-    pub approval: HumanPromotionApproval,
+    pub(crate) approval: ValidatedHumanApproval,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PromotedProfile {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfilePublicationStatus {
+    Published,
+    AlreadyPublished,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfilePublicationReceipt {
     pub profile_path: PathBuf,
-    pub profile_digest: Digest,
-    pub config_revision: Digest,
+    pub profile_manifest_digest: Digest,
+    pub human_response_receipt_digest: Digest,
+    pub status: ProfilePublicationStatus,
 }
 
 #[derive(Debug)]
@@ -348,11 +426,23 @@ pub fn config_revision(config_file: &Path, profiles_root: &Path) -> Result<Diges
     let source = fs::read(config_file)?;
     let source_path = fs::canonicalize(config_file)?;
     let mut hasher = Sha256::new();
-    hasher.update(source_path.to_string_lossy().as_bytes());
-    hasher.update([0]);
-    hasher.update(source);
-    if profiles_root.exists() {
-        hash_tree(profiles_root, &mut hasher)?;
+    hasher.update(b"rex-projects-config-revision-v1\0");
+    let source_path = source_path
+        .to_str()
+        .ok_or_else(|| LearningError::Invalid("configuration source path must be UTF-8".into()))?;
+    hash_frame(&mut hasher, source_path.as_bytes());
+    hash_frame(&mut hasher, &source);
+    match fs::symlink_metadata(profiles_root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(LearningError::Conflict(
+                    "profiles root must be a real directory during revision calculation".into(),
+                ));
+            }
+            hash_tree(profiles_root, &mut hasher)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(as_digest(hasher.finalize().as_slice()))
 }
@@ -360,13 +450,18 @@ pub fn config_revision(config_file: &Path, profiles_root: &Path) -> Result<Diges
 /// Publish a complete, approved profile package through a CAS gate. Targets are
 /// immutable and must not exist; all files are validated before any target is
 /// visible. `declarative_root` is the user's configured XDG configuration source.
-pub fn promote_profile(
+pub fn publish_approved_profile_package(
     declarative_root: &Path,
     config_file: &Path,
     expected_revision: &Digest,
     package: &ProfilePackage,
-) -> Result<PromotedProfile, LearningError> {
+) -> Result<ProfilePublicationReceipt, LearningError> {
     validate_package(package)?;
+    if package.approval.approved_config_revision != *expected_revision {
+        return Err(LearningError::Conflict(
+            "approval is bound to a different declarative configuration revision".into(),
+        ));
+    }
     let root = fs::canonicalize(declarative_root)?;
     let source = fs::canonicalize(config_file)?;
     if !source.starts_with(&root) {
@@ -375,7 +470,7 @@ pub fn promote_profile(
         ));
     }
     let profiles = root.join("profiles");
-    if profiles.exists() && !fs::symlink_metadata(&profiles)?.file_type().is_dir() {
+    if entry_exists(&profiles)? && !fs::symlink_metadata(&profiles)?.file_type().is_dir() {
         return Err(LearningError::Conflict(
             "profiles path must be a real directory".into(),
         ));
@@ -390,25 +485,26 @@ pub fn promote_profile(
     }
     let lock = lock_options.open(&lock_path)?;
     fs2::FileExt::lock_exclusive(&lock)?;
-    let result = promote_locked(&root, &source, &profiles, expected_revision, package);
+    let result = publish_locked(&root, &source, &profiles, expected_revision, package);
     fs2::FileExt::unlock(&lock)?;
     result
 }
 
-fn promote_locked(
+fn publish_locked(
     root: &Path,
     source: &Path,
     profiles: &Path,
     expected: &Digest,
     p: &ProfilePackage,
-) -> Result<PromotedProfile, LearningError> {
+) -> Result<ProfilePublicationReceipt, LearningError> {
     let target = profiles.join(p.profile_id.as_str());
-    if target.exists() {
+    if entry_exists(&target)? {
         if package_directory_matches(&target, &p.files)? {
-            return Ok(PromotedProfile {
+            return Ok(ProfilePublicationReceipt {
                 profile_path: target,
-                profile_digest: manifest_digest(&p.files)?,
-                config_revision: config_revision(source, profiles)?,
+                profile_manifest_digest: manifest_digest(&p.files)?,
+                human_response_receipt_digest: p.approval.response_receipt_digest.clone(),
+                status: ProfilePublicationStatus::AlreadyPublished,
             });
         }
         return Err(LearningError::Conflict(
@@ -421,43 +517,44 @@ fn promote_locked(
             "declarative configuration changed since approval".into(),
         ));
     }
-    fs::create_dir_all(profiles)?;
-    if fs::symlink_metadata(profiles)?.file_type().is_symlink() {
+    if !entry_exists(profiles)? {
+        fs::create_dir(profiles)?;
+    }
+    if fs::symlink_metadata(profiles)?.file_type().is_symlink()
+        || !fs::symlink_metadata(profiles)?.is_dir()
+    {
         return Err(LearningError::Conflict(
             "profiles directory cannot be a symlink".into(),
         ));
     }
     let stage_root = root.join(".rex-projects-staging");
-    fs::create_dir_all(&stage_root)?;
-    if !fs::symlink_metadata(&stage_root)?.file_type().is_dir() {
-        return Err(LearningError::Conflict(
-            "promotion staging path is not a directory".into(),
-        ));
-    }
+    create_private_dir(&stage_root)?;
+    // Persist any newly created publication parents before the atomic rename.
+    File::open(root)?.sync_all()?;
     let stage = stage_root.join(format!(
         "{}-{}",
         p.project_id,
         short_hash(p.candidate_digest.as_str().as_bytes())
     ));
-    match fs::create_dir(&stage) {
+    match create_private_dir_new(&stage) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+        Err(LearningError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
             if !package_directory_is_recoverable(&stage, &p.files)? {
                 return Err(LearningError::Conflict(
                     "stale promotion staging directory has unexpected content".into(),
                 ));
             }
             fs::remove_dir_all(&stage)?;
-            fs::create_dir(&stage)?;
+            create_private_dir_new(&stage)?;
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     }
     let result = (|| {
         for (relative, bytes) in &p.files {
             let rel = validated_relative_path(relative)?;
             let dest = stage.join(rel);
             let parent = dest.parent().unwrap();
-            fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
             if path_has_symlink(&stage, dest.parent().unwrap())? {
                 return Err(LearningError::Conflict(
                     "staging tree contains a symlink".into(),
@@ -481,18 +578,24 @@ fn promote_locked(
                 "declarative configuration changed during promotion".into(),
             ));
         }
-        if target.exists() {
-            return Err(LearningError::Conflict(
-                "profile target appeared during promotion".into(),
-            ));
-        }
-        fs::rename(&stage, &target)?;
-        File::open(profiles)?.sync_all()?;
-        let profile_digest = manifest_digest(&p.files)?;
-        Ok(PromotedProfile {
+        let stage_dir = open_directory_nofollow(&stage_root)?;
+        let profiles_dir = open_directory_nofollow(profiles)?;
+        rename_directory_noreplace(
+            &stage_dir,
+            stage_name(&stage),
+            &profiles_dir,
+            p.profile_id.as_str(),
+        )?;
+        // Persist both sides of the rename. The profile parent contains the
+        // new name; the staging parent no longer contains its old name.
+        profiles_dir.sync_all()?;
+        stage_dir.sync_all()?;
+        let profile_manifest_digest = manifest_digest(&p.files)?;
+        Ok(ProfilePublicationReceipt {
             profile_path: target.clone(),
-            profile_digest,
-            config_revision: config_revision(source, profiles)?,
+            profile_manifest_digest,
+            human_response_receipt_digest: p.approval.response_receipt_digest.clone(),
+            status: ProfilePublicationStatus::Published,
         })
     })();
     if result.is_err() {
@@ -505,7 +608,9 @@ fn package_directory_matches(
     root: &Path,
     expected: &BTreeMap<String, Vec<u8>>,
 ) -> Result<bool, LearningError> {
-    if fs::symlink_metadata(root)?.file_type().is_symlink() || !fs::symlink_metadata(root)?.is_dir()
+    if !entry_exists(root)?
+        || fs::symlink_metadata(root)?.file_type().is_symlink()
+        || !fs::symlink_metadata(root)?.is_dir()
     {
         return Ok(false);
     }
@@ -516,7 +621,9 @@ fn package_directory_is_recoverable(
     root: &Path,
     expected: &BTreeMap<String, Vec<u8>>,
 ) -> Result<bool, LearningError> {
-    if fs::symlink_metadata(root)?.file_type().is_symlink() || !fs::symlink_metadata(root)?.is_dir()
+    if !entry_exists(root)?
+        || fs::symlink_metadata(root)?.file_type().is_symlink()
+        || !fs::symlink_metadata(root)?.is_dir()
     {
         return Ok(false);
     }
@@ -526,6 +633,160 @@ fn package_directory_is_recoverable(
             .get(path)
             .is_some_and(|expected_bytes| expected_bytes.starts_with(bytes))
     }))
+}
+
+fn entry_exists(path: &Path) -> Result<bool, LearningError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn stage_name(stage: &Path) -> &str {
+    stage
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("stage name is generated from safe identifiers")
+}
+
+fn create_private_dir_new(path: &Path) -> Result<(), LearningError> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    restrict_private_dir(path)
+}
+
+fn create_private_dir(path: &Path) -> Result<(), LearningError> {
+    match create_private_dir_new(path) {
+        Ok(()) => Ok(()),
+        Err(LearningError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(LearningError::Conflict(
+                    "promotion staging path must be a real directory".into(),
+                ));
+            }
+            restrict_private_dir(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_private_dir_all(path: &Path) -> Result<(), LearningError> {
+    if entry_exists(path)? {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(LearningError::Conflict(
+                "staging parent must be a real directory".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| LearningError::Invalid("staging path has no parent".into()))?;
+    create_private_dir_all(parent)?;
+    create_private_dir_new(path)
+}
+
+fn restrict_private_dir(path: &Path) -> Result<(), LearningError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        open_directory_nofollow(path)?.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn open_directory_nofollow(path: &Path) -> Result<File, LearningError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    Ok(options.open(path)?)
+}
+
+#[cfg(target_os = "macos")]
+fn rename_directory_noreplace(
+    from_dir: &File,
+    from_name: &str,
+    to_dir: &File,
+    to_name: &str,
+) -> Result<(), LearningError> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    let from = CString::new(from_name)
+        .map_err(|_| LearningError::Invalid("invalid staging entry name".into()))?;
+    let to = CString::new(to_name)
+        .map_err(|_| LearningError::Invalid("invalid profile entry name".into()))?;
+    // SAFETY: both handles are open no-follow directories and names are single,
+    // validated components. RENAME_EXCL atomically refuses any existing dentry.
+    let result = unsafe {
+        libc::renameatx_np(
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_directory_noreplace(
+    from_dir: &File,
+    from_name: &str,
+    to_dir: &File,
+    to_name: &str,
+) -> Result<(), LearningError> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    let from = CString::new(from_name)
+        .map_err(|_| LearningError::Invalid("invalid staging entry name".into()))?;
+    let to = CString::new(to_name)
+        .map_err(|_| LearningError::Invalid("invalid profile entry name".into()))?;
+    // SAFETY: both handles are open no-follow directories and names are single,
+    // validated components. RENAME_NOREPLACE atomically refuses any dentry.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+            1u32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_directory_noreplace(
+    _from_dir: &File,
+    _from_name: &str,
+    _to_dir: &File,
+    _to_name: &str,
+) -> Result<(), LearningError> {
+    Err(LearningError::Invalid(
+        "atomic no-replace profile publication is unsupported on this platform".into(),
+    ))
 }
 
 fn read_package_directory(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, LearningError> {
@@ -572,7 +833,7 @@ fn validate_package(p: &ProfilePackage) -> Result<(), LearningError> {
     }
     if p.approval.approver.trim().is_empty()
         || p.approval.rationale.trim().is_empty()
-        || p.approval.authorized_at.trim().is_empty()
+        || !sortable_utc(&p.approval.authorized_at)
     {
         return Err(LearningError::Invalid(
             "human approval requires approver, rationale, and timestamp".into(),
@@ -590,6 +851,16 @@ fn validate_package(p: &ProfilePackage) -> Result<(), LearningError> {
     {
         return Err(LearningError::Conflict(
             "approval scope does not match this project, role, and profile".into(),
+        ));
+    }
+    if p.approval
+        .response_receipt_digest
+        .as_str()
+        .bytes()
+        .all(|byte| byte == b'0')
+    {
+        return Err(LearningError::Invalid(
+            "promotion requires a host-validated human response receipt".into(),
         ));
     }
     if p.files.is_empty() {
@@ -682,24 +953,48 @@ fn path_has_symlink(root: &Path, path: &Path) -> Result<bool, LearningError> {
     Ok(false)
 }
 fn hash_tree(path: &Path, h: &mut Sha256) -> Result<(), LearningError> {
-    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|e| e.file_name());
+    hash_tree_from(path, Path::new(""), h)
+}
+
+fn hash_tree_from(directory: &Path, prefix: &Path, h: &mut Sha256) -> Result<(), LearningError> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
     for e in entries {
         let p = e.path();
         let m = fs::symlink_metadata(&p)?;
-        h.update(e.file_name().to_string_lossy().as_bytes());
-        h.update([0]);
         if m.file_type().is_symlink() {
             return Err(LearningError::Conflict(
                 "declarative profile trees cannot contain symlinks during CAS".into(),
             ));
         }
+        let name = e
+            .file_name()
+            .into_string()
+            .map_err(|_| LearningError::Invalid("profile tree paths must be UTF-8".into()))?;
+        if name.contains('\\') {
+            return Err(LearningError::Invalid(
+                "profile tree paths cannot contain backslashes".into(),
+            ));
+        }
+        let relative = prefix.join(name);
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| LearningError::Invalid("profile tree paths must be UTF-8".into()))?;
+        let mode = file_mode(&m);
         if m.is_dir() {
-            h.update([1]);
-            hash_tree(&p, h)?
+            hash_tree_record(h, relative, b'D', mode, 0, &[0; 32]);
+            hash_tree_from(&p, Path::new(&relative), h)?;
         } else if m.is_file() {
-            h.update([2]);
-            h.update(fs::read(p)?)
+            let contents = fs::read(&p)?;
+            let content_digest = Sha256::digest(&contents);
+            hash_tree_record(
+                h,
+                relative,
+                b'F',
+                mode,
+                contents.len() as u64,
+                content_digest.as_slice(),
+            );
         } else {
             return Err(LearningError::Conflict(
                 "unsupported file in declarative profile tree".into(),
@@ -707,6 +1002,30 @@ fn hash_tree(path: &Path, h: &mut Sha256) -> Result<(), LearningError> {
         }
     }
     Ok(())
+}
+
+fn hash_tree_record(h: &mut Sha256, path: &str, kind: u8, mode: u32, size: u64, digest: &[u8]) {
+    hash_frame(h, path.as_bytes());
+    h.update([kind]);
+    h.update(mode.to_be_bytes());
+    h.update(size.to_be_bytes());
+    h.update(digest);
+}
+
+fn hash_frame(h: &mut Sha256, bytes: &[u8]) {
+    h.update((bytes.len() as u64).to_be_bytes());
+    h.update(bytes);
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn file_mode(_metadata: &fs::Metadata) -> u32 {
+    0
 }
 fn sync_tree_dirs(path: &Path) -> Result<(), LearningError> {
     for e in fs::read_dir(path)? {
@@ -765,6 +1084,41 @@ mod tests {
     }
 
     #[test]
+    fn candidate_duplicate_requests_are_idempotent_or_fail_without_mutation() {
+        let project = ProjectId::parse("proj").unwrap();
+        let mut ledger = CandidateLedger::default();
+        for n in 0..20 {
+            ledger.revisions.push(CandidateRevision {
+                candidate_id: format!("candidate-{n}"),
+                project_id: project.clone(),
+                role: Role::Worker,
+                digest: hash(format!("candidate-{n}").as_bytes()),
+                created_at: format!("2026-11-{:02}T00:00:00Z", n + 1),
+                expires_at: "2027-01-01T00:00:00Z".into(),
+                status: if n == 19 {
+                    CandidateStatus::Proposed
+                } else {
+                    CandidateStatus::Expired
+                },
+            });
+        }
+        let existing = ledger.revisions[0].clone();
+        let before = ledger.clone();
+        ledger.register(existing.clone()).unwrap();
+        assert_eq!(ledger, before);
+
+        let mut conflicting_duplicate = existing;
+        conflicting_duplicate.expires_at = "2027-02-01T00:00:00Z".into();
+        assert!(ledger.register(conflicting_duplicate).is_err());
+        assert_eq!(ledger, before);
+
+        let mut invalid = before.revisions[0].clone();
+        invalid.candidate_id = "../escape".into();
+        assert!(ledger.register(invalid).is_err());
+        assert_eq!(ledger, before);
+    }
+
+    #[test]
     fn timeout_and_distinct_input_limits_stay_inconclusive() {
         let d = hash(b"input");
         let obs = (0..10)
@@ -802,6 +1156,28 @@ mod tests {
             TrialOutcome::Regressed
         );
     }
+
+    #[test]
+    fn failed_and_timed_out_legs_count_as_one_incomplete_pair() {
+        let observation = TrialObservation {
+            input_digest: hash(b"input"),
+            baseline: TrialRunStatus::Timeout,
+            candidate: TrialRunStatus::Failed,
+        };
+        let evidence = evaluate_trials(&[observation], 1).unwrap();
+        assert_eq!(evidence.outcome, TrialOutcome::Inconclusive);
+        assert_eq!(evidence.completed_pairs, 0);
+        assert_eq!(evidence.timed_out_pairs, 1);
+    }
+
+    #[test]
+    fn timestamp_validation_checks_calendar_and_leap_years() {
+        assert!(sortable_utc("2024-02-29T23:59:59Z"));
+        assert!(!sortable_utc("2023-02-29T00:00:00Z"));
+        assert!(!sortable_utc("2026-13-01T00:00:00Z"));
+        assert!(!sortable_utc("2026-04-31T00:00:00Z"));
+        assert!(!sortable_utc("2026-01-01T24:00:00Z"));
+    }
     fn approved_package(revision: Digest) -> ProfilePackage {
         let mut files = BTreeMap::new();
         files.insert("config.toml".into(), b"name='candidate'\n".to_vec());
@@ -824,19 +1200,19 @@ mod tests {
             candidate_digest: candidate.clone(),
             evidence: evidence.clone(),
             files,
-            approval: HumanPromotionApproval {
-                approver: "human".into(),
-                rationale: "Limited to this project and worker role after reviewing evidence."
-                    .into(),
-                approved_project_id: ProjectId::parse("proj").unwrap(),
-                approved_role: Role::Worker,
-                approved_profile_id: ProfileId::parse("proj-worker-learned").unwrap(),
-                approved_candidate_digest: candidate,
-                approved_manifest_digest: md,
-                approved_evidence_digest: evidence_digest(&evidence).unwrap(),
-                approved_config_revision: revision,
-                authorized_at: "2026-11-07T00:00:00Z".into(),
-            },
+            approval: ValidatedHumanApproval::from_validated_response(
+                "human".into(),
+                "Limited to this project and worker role after reviewing evidence.".into(),
+                ProjectId::parse("proj").unwrap(),
+                Role::Worker,
+                ProfileId::parse("proj-worker-learned").unwrap(),
+                candidate,
+                md,
+                evidence_digest(&evidence).unwrap(),
+                revision,
+                hash(b"validated human response receipt"),
+                "2026-11-07T00:00:00Z".into(),
+            ),
         }
     }
     fn hash(bytes: &[u8]) -> Digest {
@@ -852,10 +1228,16 @@ mod tests {
         fs::create_dir(&profiles).unwrap();
         let rev = config_revision(&config, &profiles).unwrap();
         let pkg = approved_package(rev.clone());
-        let result = promote_profile(root, &config, &rev, &pkg).unwrap();
+        let result = publish_approved_profile_package(root, &config, &rev, &pkg).unwrap();
+        assert_eq!(result.status, ProfilePublicationStatus::Published);
         assert!(result.profile_path.join("instructions.md").exists());
-        let retry = promote_profile(root, &config, &rev, &pkg).unwrap();
-        assert_eq!(result.profile_digest, retry.profile_digest);
+        fs::write(&config, "unrelated edit after publication").unwrap();
+        let retry = publish_approved_profile_package(root, &config, &rev, &pkg).unwrap();
+        assert_eq!(retry.status, ProfilePublicationStatus::AlreadyPublished);
+        assert_eq!(
+            result.profile_manifest_digest,
+            retry.profile_manifest_digest
+        );
     }
     #[test]
     fn stale_config_revision_does_not_publish_any_file() {
@@ -869,7 +1251,67 @@ mod tests {
         let pkg = approved_package(old.clone());
         fs::write(&config, "two").unwrap();
         let current = config_revision(&config, &profiles).unwrap();
-        assert!(promote_profile(root, &config, &current, &pkg).is_err());
+        assert!(publish_approved_profile_package(root, &config, &current, &pkg).is_err());
         assert!(!profiles.join("proj-worker-learned").exists());
+    }
+
+    #[test]
+    fn profile_tree_revision_uses_unambiguous_framed_records() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let profiles = dir.path().join("profiles");
+        fs::write(&config, "same config").unwrap();
+        fs::create_dir(&profiles).unwrap();
+        fs::write(profiles.join("a"), b"xb\0\x02z").unwrap();
+        let digest_a = config_revision(&config, &profiles).unwrap();
+        fs::remove_file(profiles.join("a")).unwrap();
+        fs::write(profiles.join("a"), b"x").unwrap();
+        fs::write(profiles.join("b"), b"z").unwrap();
+        let digest_b = config_revision(&config, &profiles).unwrap();
+        assert_ne!(digest_a, digest_b);
+    }
+
+    #[test]
+    fn no_replace_rename_preserves_existing_empty_directories_and_symlinks() {
+        let root = tempdir().unwrap();
+        let source_root = root.path().join("stage-root");
+        let target_root = root.path().join("profiles");
+        fs::create_dir(&source_root).unwrap();
+        fs::create_dir(&target_root).unwrap();
+        let source = source_root.join("package");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("config.toml"), "payload").unwrap();
+        let empty_target = target_root.join("empty");
+        fs::create_dir(&empty_target).unwrap();
+        let from = open_directory_nofollow(&source_root).unwrap();
+        let to = open_directory_nofollow(&target_root).unwrap();
+        assert!(rename_directory_noreplace(&from, "package", &to, "empty").is_err());
+        assert!(source.join("config.toml").is_file());
+        assert!(empty_target.is_dir());
+
+        let dangling = target_root.join("dangling");
+        std::os::unix::fs::symlink("missing-target", &dangling).unwrap();
+        assert!(rename_directory_noreplace(&from, "package", &to, "dangling").is_err());
+        assert_eq!(
+            fs::read_link(&dangling).unwrap(),
+            PathBuf::from("missing-target")
+        );
+    }
+
+    #[test]
+    fn publication_rejects_and_preserves_a_dangling_target_symlink() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let config = root.join("config.toml");
+        fs::write(&config, "schema_version = 1\n").unwrap();
+        let profiles = root.join("profiles");
+        fs::create_dir(&profiles).unwrap();
+        let revision = config_revision(&config, &profiles).unwrap();
+        let package = approved_package(revision.clone());
+        let target = profiles.join(package.profile_id.as_str());
+        std::os::unix::fs::symlink("missing-managed-profile", &target).unwrap();
+        let before = fs::read_link(&target).unwrap();
+        assert!(publish_approved_profile_package(root, &config, &revision, &package).is_err());
+        assert_eq!(fs::read_link(target).unwrap(), before);
     }
 }

@@ -16,6 +16,7 @@ use crate::domain::ids::{Digest, OperationId, ProjectId, TicketRunId};
 
 pub const OKF_VERSION: &str = "0.2";
 pub const DEFAULT_MAX_ARTICLE_BYTES: usize = 256 * 1024;
+const MAX_POSTMORTEM_ITEMS: usize = 256;
 
 /// One bounded, attributable input to a postmortem. `content` is curated text,
 /// never an environment dump or raw credential-bearing artifact.
@@ -269,16 +270,48 @@ fn validate_input(input: &PostmortemInput) -> Result<(), KnowledgeError> {
             "postmortem title, summary, and timestamp are required".into(),
         ));
     }
-    if input.generated_at.chars().any(char::is_control) {
-        return Err(KnowledgeError::Invalid("invalid timestamp".into()));
+    if !valid_utc_timestamp(&input.generated_at) {
+        return Err(KnowledgeError::Invalid(
+            "generated.at must be a real UTC timestamp in YYYY-MM-DDTHH:MM:SSZ form".into(),
+        ));
     }
     if input.max_source_bytes == 0 {
         return Err(KnowledgeError::Invalid(
             "source byte limit must be positive".into(),
         ));
     }
-    let mut total = 0usize;
+    if input.findings.len() > MAX_POSTMORTEM_ITEMS || input.sources.len() > MAX_POSTMORTEM_ITEMS {
+        return Err(KnowledgeError::Invalid(
+            "postmortem item count exceeds the configured limit".into(),
+        ));
+    }
+    let mut total = 1024usize
+        .checked_add(input.title.len())
+        .and_then(|bytes| bytes.checked_add(input.summary.len()))
+        .and_then(|bytes| bytes.checked_add(input.generated_at.len()))
+        .ok_or_else(|| KnowledgeError::Invalid("postmortem size overflow".into()))?;
+    if contains_unsafe_control(&input.title) || contains_unsafe_control(&input.summary) {
+        return Err(KnowledgeError::Invalid(
+            "postmortem title and summary contain unsupported control characters".into(),
+        ));
+    }
+    let mut source_bytes = 0usize;
     let mut ids = std::collections::BTreeSet::new();
+    for finding in &input.findings {
+        if finding.trim().is_empty() {
+            return Err(KnowledgeError::Invalid(
+                "postmortem findings cannot be empty".into(),
+            ));
+        }
+        if contains_unsafe_control(finding) {
+            return Err(KnowledgeError::Invalid(
+                "postmortem finding contains unsupported control characters".into(),
+            ));
+        }
+        total = total
+            .checked_add(finding.len() + 64)
+            .ok_or_else(|| KnowledgeError::Invalid("postmortem size overflow".into()))?;
+    }
     for source in &input.sources {
         if source.id.is_empty()
             || !source
@@ -291,10 +324,16 @@ fn validate_input(input: &PostmortemInput) -> Result<(), KnowledgeError> {
                 "source IDs must be unique safe identifiers".into(),
             ));
         }
-        total = total
+        source_bytes = source_bytes
             .checked_add(source.content.len())
             .ok_or_else(|| KnowledgeError::Invalid("source byte count overflow".into()))?;
-        if total > input.max_source_bytes {
+        total = total
+            .checked_add(source.content.len())
+            .and_then(|bytes| bytes.checked_add(source.title.len()))
+            .and_then(|bytes| bytes.checked_add(source.resource.len()))
+            .and_then(|bytes| bytes.checked_add(source.id.len() + 256))
+            .ok_or_else(|| KnowledgeError::Invalid("postmortem size overflow".into()))?;
+        if source_bytes > input.max_source_bytes {
             return Err(KnowledgeError::Invalid(
                 "postmortem source material exceeds the configured byte limit".into(),
             ));
@@ -307,6 +346,11 @@ fn validate_input(input: &PostmortemInput) -> Result<(), KnowledgeError> {
                 "source resource must not contain control characters, queries, or fragments".into(),
             ));
         }
+        if contains_unsafe_control(&source.title) || contains_unsafe_control(&source.content) {
+            return Err(KnowledgeError::Invalid(
+                "source material contains unsupported control characters".into(),
+            ));
+        }
         if digest(source.content.as_bytes()) != source.digest {
             return Err(KnowledgeError::Conflict(format!(
                 "source `{}` digest does not match its content",
@@ -314,7 +358,56 @@ fn validate_input(input: &PostmortemInput) -> Result<(), KnowledgeError> {
             )));
         }
     }
+    if total > DEFAULT_MAX_ARTICLE_BYTES {
+        return Err(KnowledgeError::Invalid(
+            "postmortem input exceeds the pre-render article size limit".into(),
+        ));
+    }
     Ok(())
+}
+
+fn contains_unsafe_control(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+}
+
+fn valid_utc_timestamp(value: &str) -> bool {
+    if value.len() != 20
+        || value.as_bytes()[4] != b'-'
+        || value.as_bytes()[7] != b'-'
+        || value.as_bytes()[10] != b'T'
+        || value.as_bytes()[13] != b':'
+        || value.as_bytes()[16] != b':'
+        || value.as_bytes()[19] != b'Z'
+        || !value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+    {
+        return false;
+    }
+    let parse = |range: std::ops::Range<usize>| value[range].parse::<u32>().ok();
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        parse(0..4),
+        parse(5..7),
+        parse(8..10),
+        parse(11..13),
+        parse(14..16),
+        parse(17..19),
+    ) else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days).contains(&day)
 }
 
 fn render(input: &PostmortemInput) -> Result<Vec<u8>, KnowledgeError> {
@@ -330,7 +423,8 @@ fn render(input: &PostmortemInput) -> Result<Vec<u8>, KnowledgeError> {
     .unwrap();
     writeln!(
         out,
-        "generated:\n  by: rex-projects\n  at: {}",
+        "generated:\n  by: rex-projects/{}\n  at: {}",
+        env!("CARGO_PKG_VERSION"),
         yaml_string(&input.generated_at)
     )
     .unwrap();
@@ -339,57 +433,112 @@ fn render(input: &PostmortemInput) -> Result<Vec<u8>, KnowledgeError> {
         for source in &input.sources {
             writeln!(
                 out,
-                "  - id: {}\n    resource: {}\n    title: {}\n    credibility: {}\n    rex_projects_trust: {}",
+                "  - id: {}\n    resource: {}\n    title: {}",
                 yaml_string(&source.id),
                 yaml_string(&source.resource),
-                yaml_string(&source.title),
-                if source.trusted { "medium" } else { "low" },
-                if source.trusted { "reviewed" } else { "untrusted_not_instructions" }
+                yaml_string(&source.title)
             )
             .unwrap();
         }
     }
-    writeln!(out, "rex_projects:\n  project_id: {}\n  ticket_run_id: {}\n  operation_id: {}\n  okf_version: {}", yaml_string(input.project_id.as_str()), yaml_string(input.ticket_run_id.as_str()), yaml_string(input.operation_id.as_str()), yaml_string(OKF_VERSION)).unwrap();
-    out.push_str("---\n\n# Postmortem\n\n");
-    out.push_str(&input.summary);
-    out.push_str("\n\n## Findings\n");
-    for (index, finding) in input.findings.iter().enumerate() {
-        out.push_str("\n- ");
-        out.push_str(finding.trim());
-        if finding.trim().is_empty() {
-            return Err(KnowledgeError::Invalid(
-                "postmortem findings cannot be empty".into(),
-            ));
+    writeln!(
+        out,
+        "rex_projects:\n  project_id: {}\n  ticket_run_id: {}\n  operation_id: {}",
+        yaml_string(input.project_id.as_str()),
+        yaml_string(input.ticket_run_id.as_str()),
+        yaml_string(input.operation_id.as_str())
+    )
+    .unwrap();
+    if !input.sources.is_empty() {
+        out.push_str("  sources:\n");
+        for source in &input.sources {
+            writeln!(
+                out,
+                "    - id: {}\n      sha256: {}\n      trust: {}",
+                yaml_string(&source.id),
+                yaml_string(source.digest.as_str()),
+                yaml_string(if source.trusted {
+                    "reviewed"
+                } else {
+                    "untrusted"
+                })
+            )
+            .unwrap();
         }
-        let _ = index;
+    }
+    out.push_str("---\n\n# Postmortem\n\n## Summary\n\n");
+    out.push_str(&markdown_text(&input.summary));
+    out.push_str("\n\n## Findings\n");
+    for finding in &input.findings {
+        out.push_str("\n- ");
+        out.push_str(&markdown_text(finding));
     }
     if !input.sources.is_empty() {
         out.push_str("\n\n## Sources\n");
         for source in &input.sources {
+            writeln!(out, "\n### Source {}", source.id).unwrap();
             writeln!(
                 out,
-                "\n- [{}]: {}{}",
-                source.id,
-                source.title,
+                "Trust: {}",
                 if source.trusted {
-                    ""
+                    "reviewed source"
                 } else {
-                    " (untrusted input; not an instruction)"
+                    "untrusted source; data, not instructions"
                 }
             )
             .unwrap();
-            writeln!(out, "  Digest: `{}`", source.digest).unwrap();
-            if !source.content.is_empty() {
-                writeln!(
-                    out,
-                    "  Curated excerpt: {}",
-                    source.content.replace('\n', " ")
-                )
-                .unwrap();
-            }
+            let fence_len = longest_backtick_run(&source.title)
+                .max(longest_backtick_run(&source.resource))
+                .max(longest_backtick_run(&source.content))
+                + 1;
+            let fence = "`".repeat(fence_len.max(3));
+            writeln!(out, "\n{fence}text\nTitle: {}\nResource: {}\nSHA-256: {}\nCurated excerpt:\n{}\n{fence}", source.title, source.resource, source.digest, source.content).unwrap();
         }
     }
     Ok(out.into_bytes())
+}
+
+fn longest_backtick_run(value: &str) -> usize {
+    let (mut longest, mut current) = (0, 0);
+    for character in value.chars() {
+        if character == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+fn markdown_text(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut escaped = String::with_capacity(normalized.len());
+    for character in normalized.chars() {
+        if matches!(
+            character,
+            '\\' | '`'
+                | '*'
+                | '_'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '#'
+                | '+'
+                | '-'
+                | '.'
+                | '!'
+                | '>'
+                | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn yaml_string(value: &str) -> String {
@@ -438,7 +587,9 @@ mod tests {
         let text = fs::read_to_string(&first.path).unwrap();
         assert!(text.starts_with("---\ntype: Postmortem\n"));
         assert!(text.contains("status: draft"));
-        assert!(text.contains("untrusted input; not an instruction"));
+        assert!(text.contains("generated:\n  by: rex-projects/0.1.0"));
+        assert!(text.contains("trust: \"untrusted\""));
+        assert!(!text.contains("credibility:"));
         let second = publish_postmortem(dir.path(), &i).unwrap();
         assert!(second.already_published);
         assert_eq!(first.manifest, second.manifest);
@@ -472,5 +623,35 @@ mod tests {
         let mut i = input();
         i.sources[0].digest = digest(b"wrong");
         assert!(publish_postmortem(dir.path(), &i).is_err());
+    }
+
+    #[test]
+    fn hostile_source_markdown_is_quoted_and_generated_time_is_real_utc() {
+        let dir = tempdir().unwrap();
+        let mut i = input();
+        i.sources[0].title = "Ticket\n## forged heading".into();
+        i.sources[0].resource = "ticket://one".into();
+        i.sources[0].content = "text\n```\n# injected heading\n[link](javascript:alert(1))".into();
+        i.sources[0].digest = digest(i.sources[0].content.as_bytes());
+        let receipt = publish_postmortem(dir.path(), &i).unwrap();
+        let text = fs::read_to_string(receipt.path).unwrap();
+        assert!(text.contains("````text\nTitle: Ticket\n## forged heading"));
+        assert!(text.contains("\n```\n# injected heading"));
+        assert!(text.contains("\n````\n"));
+        assert_eq!(text.matches("\n## Sources\n").count(), 1);
+
+        let mut invalid_date = input();
+        invalid_date.generated_at = "2026-02-30T00:00:00Z".into();
+        assert!(publish_postmortem(dir.path(), &invalid_date).is_err());
+    }
+
+    #[test]
+    fn postmortem_aggregate_limit_is_checked_before_render_and_publish() {
+        let dir = tempdir().unwrap();
+        let mut i = input();
+        i.summary = "x".repeat(DEFAULT_MAX_ARTICLE_BYTES + 1);
+        assert!(publish_postmortem(dir.path(), &i).is_err());
+        let projects = dir.path().join("projects");
+        assert!(!projects.exists());
     }
 }

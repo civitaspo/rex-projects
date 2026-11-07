@@ -14,8 +14,11 @@ Each TicketRun produces one Markdown concept below
 `<knowledge-root>/projects/<project-id>/postmortems/`. The opaque TicketRun ID
 is SHA-256 mapped into the filename. A manifest records project, TicketRun,
 operation, format, output path, source digests, content digest, and byte count;
-the machine controller persists this manifest with its durable publication
-receipt. Publishing uses a fully synced sibling temporary file and an atomic
+the article's `generated.by` identifies `rex-projects/<Cargo package version>`
+as its producer. Source credibility is represented only by attributable facts
+(resource, title, digest, and the caller's reviewed/untrusted provenance label),
+not by a subjective confidence score. The machine controller persists this
+manifest with its durable publication receipt. Publishing uses a fully synced sibling temporary file and an atomic
 hard-link create-if-absent, followed by syncing the containing directory. This
 avoids `rename` replacing an empty destination directory. A retry verifies the
 existing bytes and returns the same receipt; conflicting content is an error.
@@ -25,7 +28,9 @@ limit. Sources carry their digest, resource, and trust label. Untrusted source
 material is explicitly marked as data rather than instructions. Callers must
 exclude environment dumps, credentials, and other secret-bearing material
 before constructing an input; the format layer does not claim general-purpose
-secret detection.
+secret detection. Titles, summaries, findings, and excerpts are bounded before
+rendering; source excerpts are rendered as fenced quoted data with their
+provenance so embedded Markdown cannot escape into article structure.
 
 ## Candidate learning
 
@@ -40,11 +45,18 @@ These limits are operational bounds and do not establish statistical efficacy.
 
 An inconclusive candidate can be promoted only with explicit human approval
 bound to the exact candidate digest, full file-manifest digest, project, role,
-profile slot, and configuration revision. The approval records a rationale and
-timestamp while preserving the `inconclusive` evidence label. Promotion takes
-an exclusive lock over the declarative config root, rechecks its source and
-profile-tree revision before publishing, validates every relative file path,
-stages the complete package outside `profiles/`, and atomically publishes the
-new immutable directory. Existing managed profiles are never overwritten;
-stale approvals produce no package files. Automatic Git commits or pushes are
-outside this module.
+profile slot, and configuration revision. The approval object can only be
+constructed inside the crate from a controller-validated durable human
+response; caller-supplied approver text is not authority. Approval records a
+rationale and timestamp while preserving the `inconclusive` evidence label.
+Promotion takes an exclusive lock over the declarative config root, rechecks
+its source and profile-tree revision before publishing, validates every
+relative file path, stages the complete package outside `profiles/`, and
+atomically publishes the new immutable directory with no-replace semantics.
+The result is a publication receipt, not proof that the profile is active. The
+controller must separately apply the exact role binding through its durable
+configuration compare-and-swap path and verify the resulting snapshot before
+marking a candidate promoted. Replaying an existing publication only confirms
+that the immutable bytes exist; it cannot activate a profile or bypass a stale
+configuration revision. Existing managed profiles are never overwritten.
+Automatic Git commits or pushes are outside this module.
