@@ -2418,6 +2418,90 @@ mod presenter_tests {
     }
 
     #[test]
+    fn goal_completion_authority_binds_supervisor_evidence_and_goal_revision() {
+        use crate::domain::ids::{AgentRunId, OperationId};
+        use crate::domain::types::Role;
+        use crate::engine::orchestration::{RoleOutputKind, RoleResultBinding, RoleSessionId};
+
+        let source = HumanRoleResultSource {
+            binding: RoleResultBinding {
+                agent_run_id: AgentRunId::parse("supervisor-run").unwrap(),
+                operation_id: OperationId::parse("supervisor-op").unwrap(),
+                project_id: ProjectId::parse("project-a").unwrap(),
+                role_session_id: RoleSessionId::parse("supervisor-session").unwrap(),
+                role: Role::Supervisor,
+                parent_run_id: None,
+                parent_role: None,
+                ticket_run_id: None,
+                ticket_revision: None,
+                config_revision: Revision(4),
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                profile_digest: Digest::parse("b".repeat(64)).unwrap(),
+                instruction_digest: Digest::parse("c".repeat(64)).unwrap(),
+                provider_capability_receipt_digest: Digest::parse("d".repeat(64)).unwrap(),
+                result_schema_digest: Digest::parse("e".repeat(64)).unwrap(),
+                controller_generation: 8,
+                run_epoch: 2,
+                attempt: 1,
+            },
+            message_id: "completion-result-1".into(),
+            result_digest: Digest::parse("f".repeat(64)).unwrap(),
+            result_kind: RoleOutputKind::HumanRequest,
+            assertion: AgentAssertion::Succeeded,
+            human_request: HumanRequestPayload {
+                kind: "goal_completion".into(),
+                question: "Review whether this goal is complete.".into(),
+                choices: vec!["approve".into(), "request_changes".into()],
+                evidence_references: Vec::new(),
+                subject_digest: Digest::parse("1".repeat(64)).unwrap(),
+                requested_continuation: None,
+            },
+            claimed_artifact_refs: Vec::new(),
+        };
+        let authority = HumanAuthorityMaterial::GoalCompletion {
+            source,
+            goal_revision: 3,
+            acceptance_criteria: vec!["api is available".into()],
+            evidence: HumanGoalCompletionEvidence {
+                satisfied_acceptance: vec!["api is available".into()],
+                incomplete_ticket_ids: Vec::new(),
+                deferred_risks: Vec::new(),
+                operation_results: vec!["host ledger is clear".into()],
+                subject_digest: Digest::parse("1".repeat(64)).unwrap(),
+            },
+            documents: Vec::new(),
+        };
+        let bundle = authority.review_bundle().unwrap();
+        let request = HumanRuntimeRequest {
+            request_id: HumanRequestId::parse("goal-completion-evidence-1").unwrap(),
+            purpose: HumanPurpose::GoalCompletion,
+            subject: HumanSubjectBinding {
+                project_id: ProjectId::parse("project-a").unwrap(),
+                kind: HumanSubjectKind::Goal,
+                subject_id: "project-a".into(),
+                ticket_run_id: None,
+                revision: Revision(3),
+                material_digest: authority.material_digest().unwrap(),
+                configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+                policy_digest: authority.policy_digest().unwrap(),
+                bundle_digest: review_bundle_digest(&bundle).unwrap(),
+            },
+            question: "Review whether this goal is complete.".into(),
+            choices: vec![
+                HumanDecisionChoice::Approve,
+                HumanDecisionChoice::RequestChanges,
+            ],
+            expires_at_unix: 200,
+            review_bundle: bundle,
+        };
+        authority.validate_for(&request).unwrap();
+
+        let mut stale_revision = request;
+        stale_revision.subject.revision = Revision(4);
+        assert!(authority.validate_for(&stale_revision).is_err());
+    }
+
+    #[test]
     fn generic_command_presenter_is_bound_to_complete_subject_and_can_only_present() {
         let request = sample_request();
         let protocol_id = ProtocolRequestId::new("protocol-1").unwrap();

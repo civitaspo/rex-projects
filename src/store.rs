@@ -1512,6 +1512,26 @@ impl ConfigStore {
         Ok(inserted)
     }
 
+    pub fn effect_by_logical_key(&self, logical_key: &str) -> Result<Option<EffectIntent>, String> {
+        self.connection.query_row(
+            "SELECT project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision FROM effects WHERE logical_key=?1",
+            [logical_key],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,Option<u64>>(8)?)),
+        ).optional().map_err(|error| error.to_string())?.map(|(project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision)| {
+            Ok(EffectIntent {
+                project_id: ProjectId::parse(project_id)?,
+                subject_type,
+                subject_id,
+                operation_id,
+                logical_key,
+                kind,
+                request_json,
+                request_digest,
+                expected_revision,
+            })
+        }).transpose()
+    }
+
     pub fn claim_next_due_effect(
         &mut self,
         owner_generation: u64,
@@ -4515,6 +4535,67 @@ mod tests {
         );
         assert!(persisted_start_ack(Some((Some("digest".into()), None))).is_err());
         assert!(persisted_start_ack(Some((None, Some("receipt".into())))).is_err());
+    }
+
+    #[test]
+    fn effect_lookup_reuses_the_exact_request_after_a_result_ack_crash() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("goal-replay-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "goal".into(),
+                goal_revision: 2,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "goal-replay-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "goal-replay-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let request_json = r#"{"authority":"same","expires_at_unix":123}"#;
+        let original = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "project".into(),
+            subject_id: project_id.as_str().into(),
+            operation_id: "goal-human-original".into(),
+            logical_key: "goal-completion:goal-replay-project:evidence-1".into(),
+            kind: "request_human_review".into(),
+            request_json: request_json.into(),
+            request_digest: content_digest(request_json),
+            expected_revision: Some(0),
+        };
+        store.enqueue_effect(generation, &original).unwrap();
+
+        assert!(!store.enqueue_effect(generation, &original).unwrap());
+        let replayed = store
+            .effect_by_logical_key(&original.logical_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed, original);
     }
 
     fn snapshot(digest: &str) -> AppliedConfig {

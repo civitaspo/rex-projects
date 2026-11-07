@@ -1446,6 +1446,31 @@ impl FactoryRuntimeServices for RuntimeServices {
         &self.configuration_digest
     }
 
+    fn human_evidence_documents(
+        &mut self,
+        store: &mut ConfigStore,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<Vec<crate::human_runtime::HumanEvidenceDocument>, String> {
+        let authority = store
+            .agent_launch_authority(&result.validated.binding.agent_run_id)?
+            .ok_or("Supervisor result has no launch authority for its evidence")?;
+        result
+            .validated
+            .claimed_artifact_refs
+            .iter()
+            .map(|reference| {
+                let verified = store
+                    .lookup_verified_artifact(&self.artifacts, &authority, reference)?
+                    .ok_or("Supervisor goal evidence is no longer registered")?;
+                let bytes = verified.read_bytes(&self.artifacts)?;
+                Ok(crate::human_runtime::HumanEvidenceDocument {
+                    reference: reference.clone(),
+                    bytes,
+                })
+            })
+            .collect()
+    }
+
     fn profile_commit_mode(
         &self,
         project_id: &crate::domain::ids::ProjectId,

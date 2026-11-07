@@ -490,7 +490,7 @@ mod tests {
             "schema_version": 1,
             "adapters": {"tickets": {
                 "kind": "command",
-                "command": ["ticket-cli"],
+                "command": ["ticket-cli"]
             }},
             "repositories": {"repo": {
                 "clone_url": clone_url, "base_branch":"main", "forge":forge

@@ -1341,10 +1341,48 @@ mod tests {
     fn duplicate_effect_comments_then_cancels_with_stable_phase_operations() {
         let (_temp, mut store, project, owner) = test_store();
         let namespace = TicketNamespace::parse("fixture:workspace").unwrap();
-        let proposal = json!({"project_id":"handler-test","goal_revision":1,"title":"Add behavior","body":"Criteria","labels":[]});
-        let proposal_json = serde_json::to_string(&proposal).unwrap();
+        let proposal = crate::engine::ticket_effects::GoalTicketProposal {
+            project_id: project.clone(),
+            goal_revision: 1,
+            title: "Add behavior".into(),
+            body: "Criteria".into(),
+            labels: Default::default(),
+        };
+        let proposal_json =
+            serde_json::to_string(&serde_json::to_value(&proposal).unwrap()).unwrap();
         let proposal_digest = hash(&proposal_json);
         let key = format!("goal-{proposal_digest}");
+        let ticket_request = CreateGoalTicket {
+            schema_version: 1,
+            project_id: project.clone(),
+            namespace: namespace.clone(),
+            goal_revision: 1,
+            request_key: key.clone(),
+            request_digest: Digest::parse(proposal_digest.clone()).unwrap(),
+            proposal: crate::engine::ticket_effects::GoalTicketProposal {
+                project_id: project.clone(),
+                goal_revision: 1,
+                title: "Add behavior".into(),
+                body: "Criteria".into(),
+                labels: Default::default(),
+            },
+            request: crate::engine::ticket_effects::TicketCreationRequest {
+                scope: scope().as_map().clone(),
+                creation_key: key.clone(),
+                title: "Add behavior".into(),
+                body: "Criteria".into(),
+                status: Some(TicketStatus::Ready),
+                template: None,
+                parent: None,
+                dependencies: None,
+                project: None,
+                milestone: None,
+                assignee: None,
+                priority: None,
+                due_date: None,
+                labels: Some(vec![]),
+            },
+        };
         let reservation = store
             .reserve_goal_ticket_creation(
                 owner,
@@ -1353,6 +1391,7 @@ mod tests {
                 &key,
                 &proposal_digest,
                 &proposal_json,
+                &ticket_request,
                 5,
                 1,
             )
@@ -1554,31 +1593,19 @@ mod tests {
         let request_key = format!("goal-{proposal_digest}");
         let proposal_json =
             serde_json::to_string(&serde_json::to_value(&proposal).unwrap()).unwrap();
-        let reservation = store
-            .reserve_goal_ticket_creation(
-                owner,
-                &project,
-                &namespace,
-                &request_key,
-                &proposal_digest,
-                &proposal_json,
-                5,
-                1,
-            )
-            .unwrap();
         let payload = CreateGoalTicket {
             schema_version: 1,
             project_id: project.clone(),
             namespace: namespace.clone(),
             goal_revision: 1,
             request_key: request_key.clone(),
-            request_digest: Digest::parse(proposal_digest).unwrap(),
+            request_digest: Digest::parse(proposal_digest.clone()).unwrap(),
             proposal: proposal.clone(),
             request: crate::engine::ticket_effects::TicketCreationRequest {
                 scope: scope().as_map().clone(),
-                creation_key: request_key,
-                title: proposal.title,
-                body: proposal.body,
+                creation_key: request_key.clone(),
+                title: proposal.title.clone(),
+                body: proposal.body.clone(),
                 status: Some(TicketStatus::Ready),
                 template: None,
                 parent: None,
@@ -1591,6 +1618,19 @@ mod tests {
                 labels: Some(vec![]),
             },
         };
+        let reservation = store
+            .reserve_goal_ticket_creation(
+                owner,
+                &project,
+                &namespace,
+                &request_key,
+                &proposal_digest,
+                &proposal_json,
+                &payload,
+                5,
+                1,
+            )
+            .unwrap();
         let adapter = Arc::new(FakeAdapter::new(
             scope(),
             namespace.as_str(),

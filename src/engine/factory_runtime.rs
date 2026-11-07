@@ -120,6 +120,18 @@ pub trait FactoryRuntimeServices {
 
     fn configuration_digest(&self) -> &Digest;
 
+    fn human_evidence_documents(
+        &mut self,
+        _store: &mut ConfigStore,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<Vec<crate::human_runtime::HumanEvidenceDocument>, String> {
+        if result.validated.claimed_artifact_refs.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err("Supervisor goal evidence artifacts are unavailable to the host consumer".into())
+        }
+    }
+
     fn profile_commit_mode(
         &self,
         project_id: &ProjectId,
@@ -259,6 +271,20 @@ impl FactoryRuntime {
             services.configuration_digest(),
         )?;
 
+        let configured_projects = config.projects.keys().cloned().collect::<Vec<_>>();
+        let learning_interval = config
+            .learning
+            .review_interval_hours
+            .checked_mul(60 * 60)
+            .ok_or("learning review interval exceeds supported range")?;
+        let supervisor_reviews_queued = store.queue_due_supervisor_reviews(
+            owner_generation,
+            &configured_projects,
+            now_unix,
+            i64::try_from(learning_interval)
+                .map_err(|_| "Supervisor review interval exceeds supported range")?,
+        )?;
+
         // A result or an already-persisted effect is processed before another
         // role turn. Launch preparation is bounded to one successful turn and
         // a finite candidate window so one stale/unlaunchable wake cannot
@@ -276,12 +302,6 @@ impl FactoryRuntime {
         }
 
         let runnable = store.runnable_projects(owner_generation)?;
-        let configured_projects = config.projects.keys().cloned().collect::<Vec<_>>();
-        let learning_interval = config
-            .learning
-            .review_interval_hours
-            .checked_mul(60 * 60)
-            .ok_or("learning review interval exceeds supported range")?;
         let supervisor_learning_project = store.queue_due_supervisor_learning(
             owner_generation,
             &configured_projects,
@@ -295,9 +315,17 @@ impl FactoryRuntime {
                 next_disposition(store, config, &runnable, &key)?
             {
                 let ticket_id = project_run.ticket_id;
-                let is_dispatch = matches!(&disposition, TicketDisposition::Dispatch { .. });
-                let recipe_id = match &disposition {
-                    TicketDisposition::Dispatch { recipe_id } => recipe_id.clone(),
+                match &disposition {
+                    TicketDisposition::Dispatch { .. } => {
+                        if let Some(ticket) = store.pending_ticket_observations(&key, 1)?.first() {
+                            store.enqueue_supervisor_ticket_observation(
+                                owner_generation,
+                                &key,
+                                ticket,
+                                now_unix,
+                            )?;
+                        }
+                    }
                     TicketDisposition::AwaitHuman { reason } => {
                         store.classify_ticket_observation(
                             owner_generation,
@@ -307,7 +335,6 @@ impl FactoryRuntime {
                             reason,
                             now_unix,
                         )?;
-                        None
                     }
                     TicketDisposition::Skip => {
                         store.classify_ticket_observation(
@@ -318,34 +345,9 @@ impl FactoryRuntime {
                             "ticket status is outside configured dispatch policy",
                             now_unix,
                         )?;
-                        None
                     }
-                };
-                let ticket_run_started = if is_dispatch {
-                    store.create_dispatched_ticket_run(
-                        owner_generation,
-                        &key,
-                        &ticket_id,
-                        recipe_id.as_deref(),
-                        &config.projects[&key.project_id].dispatch_states,
-                        config.projects[&key.project_id].max_active_tickets,
-                        now_unix,
-                    )?
-                } else {
-                    None
-                };
+                }
                 store.mark_ticket_scan_served(owner_generation, &key)?;
-                return Ok(FactoryTickReport {
-                    ingested_agent_result,
-                    agent_recovery,
-                    publication_monitor,
-                    effect,
-                    role_run_started,
-                    supervisor_learning_project,
-                    scanned: None,
-                    ticket_run_started,
-                    external_errors,
-                });
             }
         }
 
@@ -410,6 +412,28 @@ impl FactoryRuntime {
             now_unix,
             config.runtime.external_poll_seconds,
         )?;
+        for ticket in &page.tickets {
+            let status_key = TicketScanKey {
+                project_id: key.project_id.clone(),
+                adapter_id: key.adapter_id.clone(),
+                namespace: key.namespace.clone(),
+                scope_digest: key.scope_digest.clone(),
+                filter_digest: key.filter_digest.clone(),
+                status: key.status,
+            };
+            let pending = store.pending_ticket_observations(&status_key, 100)?;
+            if let Some(observation) = pending
+                .iter()
+                .find(|candidate| candidate.ticket_id == ticket.id)
+            {
+                store.enqueue_supervisor_ticket_observation(
+                    owner_generation,
+                    &status_key,
+                    observation,
+                    now_unix,
+                )?;
+            }
+        }
         Ok(FactoryTickReport {
             ingested_agent_result,
             agent_recovery,
@@ -435,6 +459,50 @@ fn apply_agent_result(
     use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload, WorkBaseSource};
 
     let binding = &result.validated.binding;
+    if binding.role == Role::Supervisor
+        && result.validated.kind == RoleOutputKind::TicketProposal
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return apply_supervisor_ticket_proposal(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            services,
+            result,
+        );
+    }
+    if binding.role == Role::Supervisor
+        && result.validated.kind == RoleOutputKind::DispatchRequest
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return apply_supervisor_dispatch_request(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            services,
+            result,
+        );
+    }
+    if binding.role == Role::Supervisor
+        && result.validated.kind == RoleOutputKind::HumanRequest
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        if matches!(
+            &result.validated.typed_payload,
+            RoleResultPayload::HumanRequest(request) if request.kind == "goal_completion"
+        ) {
+            return apply_supervisor_goal_completion_request(
+                store,
+                owner_generation,
+                now_unix,
+                config,
+                services,
+                result,
+            );
+        }
+    }
     if result.validated.kind == RoleOutputKind::ImplementationReady
         && binding.role == Role::Worker
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
@@ -595,6 +663,593 @@ fn apply_agent_result(
         crate::store::agent_results::ResultDisposition::Applied,
     )?;
     let _ = now_unix;
+    Ok(true)
+}
+
+fn apply_supervisor_goal_completion_request(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::{GoalCompletionDecision, RoleResultPayload};
+
+    let binding = &result.validated.binding;
+    let project = config
+        .projects
+        .get(&binding.project_id)
+        .ok_or("Supervisor completion request Project is no longer configured")?;
+    let goal = project
+        .goal
+        .as_ref()
+        .ok_or("goal completion requires a configured Goal Project")?;
+    let record = store
+        .project(&binding.project_id)?
+        .ok_or("Supervisor completion request has no durable Project record")?;
+    let launch = store
+        .agent_launch_authority(&binding.agent_run_id)?
+        .ok_or("Supervisor completion request has no launch authority")?;
+    let runnable = store
+        .runnable_projects(owner_generation)?
+        .into_iter()
+        .find(|candidate| candidate.record.id == binding.project_id)
+        .ok_or("Supervisor completion request Project is not running")?;
+    let launch_project_epoch = store
+        .agent_launch_project_epoch(&binding.agent_run_id)?
+        .ok_or("Supervisor completion request has no launch project epoch")?;
+    if binding.ticket_run_id.is_some()
+        || binding.role_session_id.as_str() != format!("project:{}:supervisor", binding.project_id)
+        || binding.controller_generation != owner_generation
+        || binding.config_digest != *services.configuration_digest()
+        || binding.config_revision != record.config_revision
+        || record.config_digest != *services.configuration_digest()
+        || store.current_revision(&record.config_source)? != Some(record.config_revision)
+        || launch.controller_generation != owner_generation
+        || launch.role != Role::Supervisor
+        || launch.role_session_id != binding.role_session_id.as_str()
+        || launch.config_revision != binding.config_revision
+        || launch.config_digest != binding.config_digest
+        || launch.project_id != binding.project_id
+        || launch.agent_run_id != binding.agent_run_id
+        || launch.run_epoch != binding.run_epoch
+        || launch.attempt != binding.attempt
+        || launch_project_epoch != runnable.project_epoch
+        || record.mode != "goal"
+        || record.goal_revision != goal.revision
+    {
+        return Err(
+            "Supervisor completion request is stale or outside current Goal authority".into(),
+        );
+    }
+    let RoleResultPayload::HumanRequest(payload) = &result.validated.typed_payload else {
+        return Err("validated HumanRequest kind has a different typed payload".into());
+    };
+    if payload.kind != "goal_completion" {
+        return Err("Supervisor human request is not a Goal completion request".into());
+    }
+
+    let logical_key = format!(
+        "goal-completion:{}:{}",
+        binding.project_id,
+        result.receipt.evidence_id()
+    );
+    if let Some(existing) = store.effect_by_logical_key(&logical_key)? {
+        if existing.project_id != binding.project_id || existing.kind != "request_human_review" {
+            return Err("Goal completion replay key is bound to a different durable effect".into());
+        }
+        let effect: crate::human_runtime::HumanPresentationEffect =
+            crate::protocol::parse_unique(existing.request_json.as_bytes())?;
+        let matches_source = matches!(
+            &effect.authority,
+            Some(crate::human_runtime::HumanAuthorityMaterial::GoalCompletion { source, .. })
+                if source.binding == *binding
+                    && source.message_id == result.validated.message_id
+                    && source.result_digest == result.validated.result_digest
+                    && source.human_request == *payload
+        );
+        if !matches_source {
+            return Err("Goal completion replay does not match the existing human request".into());
+        }
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            record.state_revision.0.max(1),
+            crate::store::agent_results::ResultDisposition::Applied,
+        )?;
+        return Ok(true);
+    }
+
+    let active_runs = store
+        .active_ticket_runs(owner_generation, 256)?
+        .into_iter()
+        .filter(|run| run.project_id == binding.project_id)
+        .count();
+    let acceptance = goal.acceptance.iter().cloned().collect::<BTreeSet<_>>();
+    let goal_evidence = crate::engine::orchestration::GoalCompletionEvidence {
+        satisfied_acceptance: goal.acceptance.clone(),
+        incomplete_ticket_ids: Vec::new(),
+        deferred_risks: Vec::new(),
+        operation_results: vec![
+            "No unfinished or unsuccessful Goal Project work remains in the host ledger.".into(),
+        ],
+        subject_digest: payload.subject_digest.clone(),
+    };
+    if !matches!(
+        crate::engine::orchestration::propose_goal_completion(
+            project,
+            goal_evidence.clone(),
+            &acceptance,
+            active_runs
+        ),
+        GoalCompletionDecision::RequestHumanConfirmation { .. }
+    ) || !store.goal_completion_work_is_clear(&binding.project_id)?
+    {
+        return Err(
+            "Goal completion is not ready for human confirmation while work remains".into(),
+        );
+    }
+    let documents = services.human_evidence_documents(store, result)?;
+    let choices = payload
+        .choices
+        .iter()
+        .map(|choice| match choice.as_str() {
+            "approve" => Ok(crate::human_runtime::HumanDecisionChoice::Approve),
+            "request_changes" => Ok(crate::human_runtime::HumanDecisionChoice::RequestChanges),
+            "defer" => Ok(crate::human_runtime::HumanDecisionChoice::Defer),
+            "cancel" => Ok(crate::human_runtime::HumanDecisionChoice::Cancel),
+            _ => Err(format!("unsupported Goal completion choice `{choice}`")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let source = crate::human_runtime::HumanRoleResultSource {
+        binding: binding.clone(),
+        message_id: result.validated.message_id.clone(),
+        result_digest: result.validated.result_digest.clone(),
+        result_kind: result.validated.kind,
+        assertion: result.validated.assertion.clone(),
+        human_request: payload.clone(),
+        claimed_artifact_refs: result.validated.claimed_artifact_refs.clone(),
+    };
+    let evidence = crate::human_runtime::HumanGoalCompletionEvidence {
+        satisfied_acceptance: goal.acceptance.clone(),
+        incomplete_ticket_ids: Vec::new(),
+        deferred_risks: goal_evidence.deferred_risks,
+        operation_results: goal_evidence.operation_results,
+        subject_digest: payload.subject_digest.clone(),
+    };
+    let authority = crate::human_runtime::HumanAuthorityMaterial::GoalCompletion {
+        source,
+        goal_revision: goal.revision,
+        acceptance_criteria: goal.acceptance.clone(),
+        evidence,
+        documents,
+    };
+    let request_id = crate::domain::ids::HumanRequestId::parse(format!(
+        "goal-completion-{}",
+        result.receipt.evidence_id()
+    ))?;
+    let material_digest = authority.material_digest()?;
+    let policy_digest = authority.policy_digest()?;
+    let bundle = authority.review_bundle()?;
+    let bundle_digest = crate::human::review_bundle_digest(&bundle)?;
+    let request = crate::human_runtime::HumanRuntimeRequest {
+        request_id,
+        purpose: crate::human_runtime::HumanPurpose::GoalCompletion,
+        subject: crate::human_runtime::HumanSubjectBinding {
+            project_id: binding.project_id.clone(),
+            kind: crate::human_runtime::HumanSubjectKind::Goal,
+            subject_id: binding.project_id.as_str().to_owned(),
+            ticket_run_id: None,
+            revision: crate::domain::ids::Revision(goal.revision),
+            material_digest,
+            configuration_digest: binding.config_digest.clone(),
+            policy_digest,
+            bundle_digest,
+        },
+        question: payload.question.clone(),
+        choices,
+        expires_at_unix: u64::try_from(now_unix)
+            .map_err(|_| "controller time is before the Unix epoch")?
+            .saturating_add(7 * 24 * 60 * 60),
+        review_bundle: bundle,
+    };
+    authority.validate_for(&request)?;
+    request.validate(
+        u64::try_from(now_unix).map_err(|_| "controller time is before the Unix epoch")?,
+    )?;
+    let view_id = store
+        .rex_view_history(&binding.project_id)?
+        .into_iter()
+        .find(|record| {
+            record.lifecycle == "active"
+                && record.view.kind == crate::launch::RexViewKind::Supervisor
+        })
+        .map(|record| record.view.view_id)
+        .ok_or("Goal completion request has no active Supervisor Rex view")?;
+    let presentation = crate::human_runtime::HumanPresentationEffect {
+        request: request.clone(),
+        rex_view_id: view_id,
+        authority: Some(authority),
+    };
+    let request_json = serde_json::to_string(&presentation).map_err(|error| error.to_string())?;
+    let operation_id = OperationId::parse(format!("goal-human-{}", result.receipt.evidence_id()))?;
+    let effect = EffectIntent {
+        project_id: binding.project_id.clone(),
+        subject_type: "project".into(),
+        subject_id: binding.project_id.as_str().into(),
+        operation_id: operation_id.as_str().to_owned(),
+        logical_key,
+        kind: "request_human_review".into(),
+        request_digest: durable_input_digest("human_presentation", &request_json),
+        request_json,
+        expected_revision: Some(goal.revision),
+    };
+    store.enqueue_effect(owner_generation, &effect)?;
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        record.state_revision.0.max(1),
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    Ok(true)
+}
+
+fn apply_supervisor_dispatch_request(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::RoleResultPayload;
+
+    let binding = &result.validated.binding;
+    let project = config
+        .projects
+        .get(&binding.project_id)
+        .ok_or("Supervisor result Project is no longer configured")?;
+    let current = store
+        .project(&binding.project_id)?
+        .ok_or("Supervisor result Project has no durable configuration record")?;
+    let authority = store
+        .agent_launch_authority(&binding.agent_run_id)?
+        .ok_or("Supervisor result has no launch authority")?;
+    let runnable = store
+        .runnable_projects(owner_generation)?
+        .into_iter()
+        .find(|project| project.record.id == binding.project_id)
+        .ok_or("Supervisor result Project is not running under this controller")?;
+    let launch_project_epoch = store
+        .agent_launch_project_epoch(&binding.agent_run_id)?
+        .ok_or("Supervisor dispatch has no launch project epoch")?;
+    let configuration_digest = services.configuration_digest().clone();
+    if binding.ticket_run_id.is_some()
+        || binding.role_session_id.as_str() != format!("project:{}:supervisor", binding.project_id)
+        || binding.controller_generation != owner_generation
+        || binding.config_digest != configuration_digest
+        || binding.config_revision != current.config_revision
+        || current.config_digest != configuration_digest
+        || store.current_revision(&current.config_source)? != Some(current.config_revision)
+        || authority.controller_generation != owner_generation
+        || authority.role != Role::Supervisor
+        || authority.role_session_id != binding.role_session_id.as_str()
+        || authority.config_revision != binding.config_revision
+        || authority.config_digest != binding.config_digest
+        || authority.project_id != binding.project_id
+        || authority.agent_run_id != binding.agent_run_id
+        || authority.run_epoch != binding.run_epoch
+        || authority.attempt != binding.attempt
+        || launch_project_epoch != runnable.project_epoch
+    {
+        return Err("Supervisor dispatch is stale or outside the current Project authority".into());
+    }
+    let RoleResultPayload::DispatchRequest(dispatch) = &result.validated.typed_payload else {
+        return Err("validated DispatchRequest kind has a different typed payload".into());
+    };
+    let configured_roles =
+        crate::config::effective_project_roles(&binding.project_id, &config.projects)?;
+    if configured_roles.get(&Role::Coordinator) != Some(&dispatch.coordinator_profile) {
+        return Err(
+            "Supervisor requested a Coordinator profile outside current Project policy".into(),
+        );
+    }
+    let namespace = services.ticket_namespace(&project.ticket_adapter)?;
+    let mut candidate = None;
+    for status in &project.dispatch_states {
+        let key = TicketScanKey::for_project(
+            &binding.project_id,
+            &project.ticket_adapter,
+            &namespace,
+            project,
+            *status,
+        )?;
+        if let Some(observation) = store
+            .pending_ticket_observations(&key, 100)?
+            .into_iter()
+            .find(|ticket| ticket.ticket_id == dispatch.ticket_reference)
+        {
+            if observation.revision.as_deref()
+                != Some(dispatch.expected_ticket_revision.0.to_string().as_str())
+            {
+                return Err(
+                    "Supervisor dispatch references a stale external ticket revision".into(),
+                );
+            }
+            let labels = observation.labels.iter().cloned().collect::<BTreeSet<_>>();
+            let disposition = ticket_disposition(config, project, observation.status, &labels);
+            let TicketDisposition::Dispatch { recipe_id } = disposition else {
+                return Err("Supervisor dispatch target is outside current ticket policy".into());
+            };
+            candidate = Some((key, observation, recipe_id));
+            break;
+        }
+    }
+    let Some((key, observation, recipe_id)) = candidate else {
+        return Err(
+            "Supervisor dispatch target is not a current eligible ticket observation".into(),
+        );
+    };
+    let authority = crate::store::scheduler::SupervisorDispatchAuthority {
+        evidence_id: result.receipt.evidence_id().to_owned(),
+        priority: dispatch.priority,
+        expected_external_revision: dispatch.expected_ticket_revision.0.to_string(),
+    };
+    let run_id = store.create_dispatched_ticket_run(
+        owner_generation,
+        &key,
+        &observation.ticket_id,
+        recipe_id.as_deref(),
+        &project.dispatch_states,
+        project.max_active_tickets,
+        &authority,
+        now_unix,
+    )?;
+    let Some(_run_id) = run_id else {
+        return Err("Supervisor dispatch lost its capacity or ticket-observation race".into());
+    };
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        current.state_revision.0.max(1),
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    Ok(true)
+}
+
+fn apply_supervisor_ticket_proposal(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::RoleResultPayload;
+
+    let binding = &result.validated.binding;
+    let project = config
+        .projects
+        .get(&binding.project_id)
+        .ok_or("Supervisor result Project is no longer configured")?;
+    let configured_goal = project
+        .goal
+        .as_ref()
+        .ok_or("Supervisor ticket proposal requires a configured goal")?;
+    let current = store
+        .project(&binding.project_id)?
+        .ok_or("Supervisor result Project has no durable configuration record")?;
+    let authority = store
+        .agent_launch_authority(&binding.agent_run_id)?
+        .ok_or("Supervisor result has no launch authority")?;
+    let runnable = store
+        .runnable_projects(owner_generation)?
+        .into_iter()
+        .find(|project| project.record.id == binding.project_id)
+        .ok_or("Supervisor result Project is not running under this controller")?;
+    let launch_project_epoch = store
+        .agent_launch_project_epoch(&binding.agent_run_id)?
+        .ok_or("Supervisor ticket proposal has no launch project epoch")?;
+    let configuration_digest = services.configuration_digest().clone();
+    if binding.ticket_run_id.is_some()
+        || binding.role_session_id.as_str() != format!("project:{}:supervisor", binding.project_id)
+        || binding.controller_generation != owner_generation
+        || binding.config_digest != configuration_digest
+        || binding.config_revision != current.config_revision
+        || current.config_digest != configuration_digest
+        || store.current_revision(&current.config_source)? != Some(current.config_revision)
+        || authority.controller_generation != owner_generation
+        || authority.role != Role::Supervisor
+        || authority.project_id != binding.project_id
+        || authority.agent_run_id != binding.agent_run_id
+        || current.mode != "goal"
+        || current.goal_revision != configured_goal.revision
+        || authority.config_revision != binding.config_revision
+        || authority.config_digest != binding.config_digest
+        || authority.run_epoch != binding.run_epoch
+        || authority.attempt != binding.attempt
+        || launch_project_epoch != runnable.project_epoch
+    {
+        return Err(
+            "Supervisor result is stale or outside the current Goal Project authority".into(),
+        );
+    }
+    let RoleResultPayload::TicketProposal(proposal) = &result.validated.typed_payload else {
+        return Err("validated TicketProposal kind has a different typed payload".into());
+    };
+    if proposal.goal_revision != configured_goal.revision
+        || proposal.gap_key.trim().is_empty()
+        || proposal.acceptance.is_empty()
+        || proposal
+            .acceptance
+            .iter()
+            .any(|value| value.trim().is_empty())
+        || proposal.priority_rationale.trim().is_empty()
+    {
+        return Err(
+            "Supervisor ticket proposal does not match the configured goal revision".into(),
+        );
+    }
+    let mut body = format!(
+        "{}\n\nGoal gap: {}\n\nAcceptance:\n{}\n\nPriority rationale: {}",
+        proposal.body.trim(),
+        proposal.gap_key.trim(),
+        proposal
+            .acceptance
+            .iter()
+            .map(|item| format!("- {}", item.trim()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        proposal.priority_rationale.trim(),
+    );
+    body = body.replace("\r\n", "\n").replace('\r', "\n");
+    let proposal = GoalTicketProposal {
+        title: proposal.title.clone(),
+        body,
+        labels: BTreeSet::new(),
+    };
+    let replay_key = goal_ticket_request_key(
+        &binding.project_id,
+        configured_goal.revision,
+        &proposal.title,
+        &proposal.body,
+        &proposal.labels,
+    )?;
+    let replay_digest =
+        goal_ticket_request_digest(&binding.project_id, configured_goal.revision, &proposal)?;
+    if let Some(existing_digest) = store.goal_ticket_reservation_digest(
+        owner_generation,
+        &binding.project_id,
+        configured_goal.revision,
+        &replay_key,
+    )? {
+        if existing_digest != replay_digest {
+            return Err(
+                "replayed Goal ticket proposal differs from its existing reservation".into(),
+            );
+        }
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            current.state_revision.0.max(1),
+            crate::store::agent_results::ResultDisposition::Applied,
+        )?;
+        return Ok(true);
+    }
+    let active = store
+        .active_ticket_runs(owner_generation, 256)?
+        .into_iter()
+        .filter(|run| run.project_id == binding.project_id)
+        .count();
+    let reserved = store.goal_ticket_reservation_count(
+        owner_generation,
+        &binding.project_id,
+        configured_goal.revision,
+    )?;
+    let GoalSupervisorAction::Create(prepared) = bound_goal_supervisor_action(
+        &binding.project_id,
+        project,
+        active,
+        reserved,
+        false,
+        &[proposal],
+    )?
+    else {
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            binding.config_revision.0,
+            crate::store::agent_results::ResultDisposition::RetainedAsClaim,
+        )?;
+        return Ok(false);
+    };
+    let prepared = prepared
+        .first()
+        .ok_or("bounded Supervisor ticket proposal produced no reservation")?;
+    let typed_proposal = crate::engine::ticket_effects::GoalTicketProposal {
+        project_id: binding.project_id.clone(),
+        goal_revision: configured_goal.revision,
+        title: prepared.proposal.title.clone(),
+        body: prepared.proposal.body.clone(),
+        labels: prepared.proposal.labels.clone(),
+    };
+    let proposal_json = serde_json::to_string(
+        &serde_json::to_value(&typed_proposal).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let proposal_digest = prepared.request_digest.clone();
+    let namespace = services.ticket_namespace(&project.ticket_adapter)?;
+    let scope = project
+        .ticket_scope
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_owned()))
+                .ok_or_else(|| format!("ticket scope `{key}` must be a string"))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    let request = crate::engine::ticket_effects::CreateGoalTicket {
+        schema_version: 1,
+        project_id: binding.project_id.clone(),
+        namespace: namespace.clone(),
+        goal_revision: configured_goal.revision,
+        request_key: prepared.request_key.clone(),
+        request_digest: crate::domain::ids::Digest::parse(&proposal_digest)?,
+        proposal: typed_proposal,
+        request: crate::engine::ticket_effects::TicketCreationRequest {
+            scope,
+            creation_key: prepared.request_key.clone(),
+            title: prepared.proposal.title.clone(),
+            body: prepared.proposal.body.clone(),
+            status: Some(TicketStatus::Ready),
+            template: None,
+            parent: match &result.validated.typed_payload {
+                RoleResultPayload::TicketProposal(value) => {
+                    value.parent.as_ref().map(|id| id.as_str().to_owned())
+                }
+                _ => None,
+            },
+            dependencies: match &result.validated.typed_payload {
+                RoleResultPayload::TicketProposal(value) => Some(
+                    value
+                        .dependencies
+                        .iter()
+                        .map(|id| id.as_str().to_owned())
+                        .collect(),
+                ),
+                _ => None,
+            },
+            project: None,
+            milestone: None,
+            assignee: None,
+            priority: None,
+            due_date: None,
+            labels: Some(prepared.proposal.labels.iter().cloned().collect()),
+        },
+    };
+    request.validate()?;
+    let reservation = store.reserve_goal_ticket_creation(
+        owner_generation,
+        &binding.project_id,
+        &namespace,
+        &prepared.request_key,
+        &proposal_digest,
+        &proposal_json,
+        &request,
+        project.max_created_tickets_per_goal_revision,
+        now_unix,
+    )?;
+    if reservation.request_digest != request.request_digest.as_str() {
+        return Err("reserved Goal ticket digest differs from the typed create request".into());
+    }
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        current.state_revision.0.max(1),
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
     Ok(true)
 }
 
@@ -822,6 +1477,21 @@ pub fn goal_ticket_request_key(
     body: &str,
     labels: &BTreeSet<String>,
 ) -> Result<String, String> {
+    let proposal = canonical_goal_ticket_proposal(project, goal_revision, title, body, labels)?;
+    let bytes =
+        serde_json::to_vec(&serde_json::to_value(&proposal).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    use sha2::Digest as _;
+    Ok(format!("goal-{:x}", sha2::Sha256::digest(bytes)))
+}
+
+fn canonical_goal_ticket_proposal(
+    project: &ProjectId,
+    goal_revision: u64,
+    title: &str,
+    body: &str,
+    labels: &BTreeSet<String>,
+) -> Result<crate::engine::ticket_effects::GoalTicketProposal, String> {
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let body = body.replace("\r\n", "\n").replace('\r', "\n");
     if goal_revision == 0 || title.is_empty() || title.len() > 512 || body.len() > 65_536 {
@@ -834,16 +1504,13 @@ pub fn goal_ticket_request_key(
     {
         return Err("goal ticket proposal labels are invalid".into());
     }
-    let canonical = serde_json::json!({
-        "project_id": project.as_str(),
-        "goal_revision": goal_revision,
-        "title": title,
-        "body": body,
-        "labels": labels,
-    });
-    let bytes = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
-    use sha2::Digest as _;
-    Ok(format!("goal-{:x}", sha2::Sha256::digest(bytes)))
+    Ok(crate::engine::ticket_effects::GoalTicketProposal {
+        project_id: project.clone(),
+        goal_revision,
+        title,
+        body,
+        labels: labels.clone(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1021,11 +1688,20 @@ pub fn bound_goal_supervisor_action(
         if !seen.insert(request_key.clone()) {
             continue;
         }
-        let request_digest = goal_ticket_request_digest(proposal)?;
+        let normalized = GoalTicketProposal {
+            title: proposal
+                .title
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            body: proposal.body.replace("\r\n", "\n").replace('\r', "\n"),
+            labels: proposal.labels.clone(),
+        };
+        let request_digest = goal_ticket_request_digest(project_id, goal_revision, &normalized)?;
         prepared.push(PreparedGoalTicket {
             request_key,
             request_digest,
-            proposal: proposal.clone(),
+            proposal: normalized,
         });
     }
     if prepared.is_empty() {
@@ -1035,15 +1711,21 @@ pub fn bound_goal_supervisor_action(
     }
 }
 
-fn goal_ticket_request_digest(proposal: &GoalTicketProposal) -> Result<String, String> {
-    let mut labels = proposal.labels.iter().cloned().collect::<Vec<_>>();
-    labels.sort();
-    let value = serde_json::json!({
-        "title": proposal.title.split_whitespace().collect::<Vec<_>>().join(" "),
-        "body": proposal.body.replace("\r\n", "\n").replace('\r', "\n"),
-        "labels": labels,
-    });
-    let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+fn goal_ticket_request_digest(
+    project_id: &ProjectId,
+    goal_revision: u64,
+    proposal: &GoalTicketProposal,
+) -> Result<String, String> {
+    let canonical = canonical_goal_ticket_proposal(
+        project_id,
+        goal_revision,
+        &proposal.title,
+        &proposal.body,
+        &proposal.labels,
+    )?;
+    let bytes =
+        serde_json::to_vec(&serde_json::to_value(&canonical).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
     use sha2::Digest as _;
     Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
 }
@@ -1303,17 +1985,18 @@ impl FilterRotation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
         FilterRotation, TickBudget, TicketDisposition, ValidatedHostObservation,
-        ValidatedWorkflowEvent, next_status_filter, role_session_key, ticket_disposition,
-        transition_for_observation, transition_for_role,
+        ValidatedWorkflowEvent, canonical_goal_ticket_proposal, next_status_filter,
+        role_session_key, ticket_disposition, transition_for_observation, transition_for_role,
     };
     use crate::config::Config;
-    use crate::domain::ids::ProjectId;
+    use crate::domain::ids::{Digest, ProjectId, TicketNamespace};
     use crate::domain::types::{Role, TicketStatus};
     use crate::engine::reducer::Phase;
+    use sha2::Digest as ShaDigest;
 
     #[test]
     fn filter_rotation_advances_one_status_at_a_time_and_wraps() {
@@ -1536,6 +2219,57 @@ mod tests {
             .unwrap(),
             GoalSupervisorAction::Create(items) if items.len() == 1
         ));
+        let GoalSupervisorAction::Create(prepared) = bound_goal_supervisor_action(
+            &ProjectId::parse("goal_project").unwrap(),
+            goal_project,
+            0,
+            19,
+            false,
+            &proposals,
+        )
+        .unwrap() else {
+            panic!("the available Goal budget should admit one proposal");
+        };
+        let canonical = canonical_goal_ticket_proposal(
+            &ProjectId::parse("goal_project").unwrap(),
+            goal_project.goal.as_ref().unwrap().revision,
+            &prepared[0].proposal.title,
+            &prepared[0].proposal.body,
+            &prepared[0].proposal.labels,
+        )
+        .unwrap();
+        let canonical_json =
+            serde_json::to_string(&serde_json::to_value(&canonical).unwrap()).unwrap();
+        let expected_digest = format!("{:x}", sha2::Sha256::digest(canonical_json.as_bytes()));
+        assert_eq!(prepared[0].request_digest, expected_digest);
+        assert_eq!(prepared[0].request_key, format!("goal-{expected_digest}"));
+        crate::engine::ticket_effects::CreateGoalTicket {
+            schema_version: 1,
+            project_id: ProjectId::parse("goal_project").unwrap(),
+            namespace: TicketNamespace::parse("fixture:workspace").unwrap(),
+            goal_revision: goal_project.goal.as_ref().unwrap().revision,
+            request_key: prepared[0].request_key.clone(),
+            request_digest: Digest::parse(prepared[0].request_digest.clone()).unwrap(),
+            proposal: canonical,
+            request: crate::engine::ticket_effects::TicketCreationRequest {
+                scope: BTreeMap::from([("project".into(), "fixture".into())]),
+                creation_key: prepared[0].request_key.clone(),
+                title: prepared[0].proposal.title.clone(),
+                body: prepared[0].proposal.body.clone(),
+                status: Some(TicketStatus::Ready),
+                template: None,
+                parent: None,
+                dependencies: None,
+                project: None,
+                milestone: None,
+                assignee: None,
+                priority: None,
+                due_date: None,
+                labels: Some(Vec::new()),
+            },
+        }
+        .validate()
+        .unwrap();
         assert_eq!(
             bound_goal_supervisor_action(
                 &ProjectId::parse("goal_project").unwrap(),

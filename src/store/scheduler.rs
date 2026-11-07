@@ -130,6 +130,13 @@ pub struct PendingRoleWakeSession {
     pub pending_count: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisorDispatchAuthority {
+    pub evidence_id: String,
+    pub priority: i32,
+    pub expected_external_revision: String,
+}
+
 /// Receipt for a durable human instruction routed to one exact Coordinator run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoordinatorInstructionReceipt {
@@ -310,6 +317,179 @@ impl TicketScanKey {
 }
 
 impl ConfigStore {
+    pub fn queue_due_supervisor_reviews(
+        &mut self,
+        owner_generation: u64,
+        projects: &[ProjectId],
+        now_unix: i64,
+        interval_seconds: i64,
+    ) -> Result<usize, String> {
+        if interval_seconds <= 0 {
+            return Err("Supervisor review interval must be positive".into());
+        }
+        let mut queued = 0;
+        for project in projects {
+            let tx = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            validate_active_generation(&tx, owner_generation)?;
+            let row: Option<(u64, String, String, i64)> = tx.query_row(
+                "SELECT p.goal_revision,p.desired_lifecycle,r.observed_lifecycle,r.next_due_at_unix FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+                [project.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let Some((goal_revision, desired, observed, next_due)) = row else {
+                tx.commit().map_err(|error| error.to_string())?;
+                continue;
+            };
+            if desired != "running" || observed != "running" || next_due > now_unix {
+                tx.commit().map_err(|error| error.to_string())?;
+                continue;
+            }
+            let role_session = format!("project:{}:supervisor", project.as_str());
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE role_session_id=?1 AND state IN ('launch_pending','running','unknown'))",
+                [&role_session],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM role_wake_inputs WHERE role_session_id=?1 AND lifecycle='pending')",
+                [&role_session],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if active || pending {
+                tx.commit().map_err(|error| error.to_string())?;
+                continue;
+            }
+            let due = now_unix.saturating_add(interval_seconds);
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "periodic_supervisor_review",
+                "goal_revision": goal_revision,
+                "observed_at_unix": now_unix,
+            })
+            .to_string();
+            let inserted = tx.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'periodic_supervisor_review','project-review',?3,10,?4,'pending',?5)",
+                params![project.as_str(),role_session,now_unix.max(1) as u64,payload,now_unix],
+            ).map_err(|error| error.to_string())?;
+            if inserted == 1 {
+                queued += 1;
+            }
+            tx.execute(
+                "UPDATE project_runtimes SET next_due_at_unix=?1 WHERE project_id=?2 AND next_due_at_unix<=?3",
+                params![due,project.as_str(),now_unix],
+            ).map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(queued)
+    }
+
+    pub fn enqueue_supervisor_ticket_observation(
+        &mut self,
+        owner_generation: u64,
+        key: &TicketScanKey,
+        ticket: &PendingTicketObservation,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        key.validate()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let project_state: Option<(String,String,u64)> = tx.query_row(
+            "SELECT p.desired_lifecycle,r.observed_lifecycle,p.goal_revision FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+            [key.project_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((desired, observed, goal_revision)) = project_state else {
+            return Err("Supervisor observation references an unknown Project".into());
+        };
+        if desired != "running" || observed != "running" {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        let role_session = format!("project:{}:supervisor", key.project_id.as_str());
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "ticket_observation",
+            "ticket_namespace": key.namespace.as_str(),
+            "ticket_id": ticket.ticket_id.as_str(),
+            "status": status_key(ticket.status),
+            "title": ticket.title,
+            "labels": ticket.labels,
+            "external_revision": ticket.revision,
+            "goal_revision": goal_revision,
+        })
+        .to_string();
+        let source_id = format!(
+            "{}:{}:{}",
+            key.namespace.as_str(),
+            ticket.ticket_id.as_str(),
+            status_key(ticket.status)
+        );
+        let revision_digest = content_digest(&payload);
+        let source_revision =
+            u64::from_str_radix(&revision_digest[..16], 16).map_err(|error| error.to_string())?;
+        let inserted = tx.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_observation',?3,?4,30,?5,'pending',?6) ON CONFLICT(role_session_id,source_type,source_id,source_revision) DO NOTHING",
+            params![key.project_id.as_str(),role_session,source_id,source_revision.max(1),payload,now_unix],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted == 1)
+    }
+
+    pub fn goal_ticket_reservation_count(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        goal_revision: u64,
+    ) -> Result<usize, String> {
+        let active_generation: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if active_generation != Some(owner_generation) {
+            return Err("controller generation is not active".into());
+        }
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_ticket_requests WHERE project_id=?1 AND goal_revision=?2",
+                params![project_id.as_str(), goal_revision],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Return the digest for an existing Goal ticket reservation. This is used
+    /// before admission limits on replay so a result whose reservation already
+    /// committed can be acknowledged after a crash without consuming capacity a
+    /// second time.
+    pub fn goal_ticket_reservation_digest(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        goal_revision: u64,
+        request_key: &str,
+    ) -> Result<Option<String>, String> {
+        let active_generation: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if active_generation != Some(owner_generation) {
+            return Err("controller generation is not active".into());
+        }
+        self.connection.query_row(
+            "SELECT request_digest FROM goal_ticket_requests WHERE project_id=?1 AND goal_revision=?2 AND request_key=?3",
+            params![project_id.as_str(), goal_revision, request_key],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())
+    }
+
     /// Read a bounded, stable page of nonterminal TicketRuns for host-side
     /// receipt consumption. This is a hint; transition commits still CAS the
     /// exact revision and validate the owner generation.
@@ -1155,6 +1335,7 @@ impl ConfigStore {
         request_key: &str,
         request_digest: &str,
         proposal_json: &str,
+        ticket_request: &crate::engine::ticket_effects::CreateGoalTicket,
         maximum: usize,
         now_unix: i64,
     ) -> Result<GoalTicketReservation, String> {
@@ -1176,6 +1357,16 @@ impl ConfigStore {
             || content_digest(&canonical_proposal) != request_digest
         {
             return Err("goal ticket proposal must be canonical and match its digest".into());
+        }
+        ticket_request.validate()?;
+        if ticket_request.project_id != *project_id
+            || ticket_request.namespace != *namespace
+            || ticket_request.request_key != request_key
+            || ticket_request.request_digest.as_str() != request_digest
+            || serde_json::to_string(&ticket_request.proposal).map_err(|error| error.to_string())?
+                != proposal_json
+        {
+            return Err("goal ticket effect does not match its reserved proposal".into());
         }
 
         let tx = self
@@ -1233,6 +1424,7 @@ impl ConfigStore {
             "request_key": request_key,
             "request_digest": request_digest,
             "proposal": proposal,
+            "request": ticket_request.request,
         });
         let request_json = serde_json::to_string(&request).map_err(|error| error.to_string())?;
         let effect_digest = content_digest(&request_json);
@@ -1575,6 +1767,7 @@ impl ConfigStore {
         recipe_id: Option<&str>,
         eligible_statuses: &[TicketStatus],
         max_active_tickets: usize,
+        supervisor_dispatch: &SupervisorDispatchAuthority,
         now_unix: i64,
     ) -> Result<Option<TicketRunId>, String> {
         key.validate()?;
@@ -1586,6 +1779,20 @@ impl ConfigStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
+        let replay: Option<(String, i64)> = tx.query_row(
+            "SELECT r.ticket_run_id,w.priority FROM role_wake_inputs w JOIN ticket_runs r ON r.ticket_run_id=json_extract(w.payload_json,'$.ticket_run_id') WHERE w.project_id=?1 AND w.source_type='ticket_run_dispatch' AND json_extract(w.payload_json,'$.supervisor_evidence_id')=?2 AND r.namespace=?3 AND r.ticket_id=?4",
+            params![key.project_id.as_str(), supervisor_dispatch.evidence_id, key.namespace.as_str(), ticket.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some((ticket_run_id, priority)) = replay {
+            if priority != i64::from(supervisor_dispatch.priority) {
+                return Err(
+                    "Supervisor dispatch evidence was replayed with a different priority".into(),
+                );
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(Some(TicketRunId::parse(ticket_run_id)?));
+        }
         let existing: Option<String> = tx
             .query_row(
                 "SELECT ticket_run_id FROM ticket_claims WHERE namespace=?1 AND ticket_id=?2",
@@ -1607,6 +1814,17 @@ impl ConfigStore {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         };
+        if supervisor_dispatch.evidence_id.trim().is_empty()
+            || supervisor_dispatch
+                .expected_external_revision
+                .trim()
+                .is_empty()
+            || observed_revision.as_deref()
+                != Some(supervisor_dispatch.expected_external_revision.as_str())
+        {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
         let external_status = parse_status_key(&stored_status)?;
         if external_status != key.status || !eligible_statuses.contains(&external_status) {
             tx.commit().map_err(|error| error.to_string())?;
@@ -1723,8 +1941,8 @@ impl ConfigStore {
             params![key.project_id.as_str(),ticket_run_id.as_str(),format!("dispatch:{}:{}",key.namespace.as_str(),ticket.as_str()),serde_json::json!({"namespace":key.namespace.as_str(),"ticket_id":ticket.as_str(),"generation":generation,"recipe_id":recipe_id,"observed_revision":observed_revision}).to_string(),now_unix],
         ).map_err(|error| error.to_string())?;
         tx.execute(
-            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_run_dispatch',?3,1,0,?4,'pending',?5)",
-            params![key.project_id.as_str(),format!("ticket_run:{}:coordinator",ticket_run_id.as_str()),ticket_run_id.as_str(),serde_json::json!({"ticket_run_id":ticket_run_id.as_str(),"target":"coordinator","revision":1}).to_string(),now_unix],
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_run_dispatch',?3,1,?4,?5,'pending',?6)",
+            params![key.project_id.as_str(),format!("ticket_run:{}:coordinator",ticket_run_id.as_str()),ticket_run_id.as_str(),i64::from(supervisor_dispatch.priority),serde_json::json!({"ticket_run_id":ticket_run_id.as_str(),"target":"coordinator","revision":1,"supervisor_evidence_id":supervisor_dispatch.evidence_id}).to_string(),now_unix],
         ).map_err(|error| error.to_string())?;
         let classified = tx.execute(
             "UPDATE ticket_observations SET dispatch_state='started',ticket_run_id=?1 WHERE project_id=?2 AND adapter_id=?3 AND namespace=?4 AND ticket_id=?5 AND scope_digest=?6 AND filter_digest=?7 AND dispatch_state='pending'",

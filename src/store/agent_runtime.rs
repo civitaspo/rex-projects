@@ -269,6 +269,20 @@ pub enum LaunchPreparationOutcome {
 }
 
 impl ConfigStore {
+    pub fn agent_launch_project_epoch(
+        &self,
+        agent_run_id: &crate::domain::ids::AgentRunId,
+    ) -> Result<Option<u64>, String> {
+        self.connection
+            .query_row(
+                "SELECT project_epoch FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     /// Suggest the first currently free agent slot without claiming it. The launch
     /// reservation transaction remains authoritative and rechecks the slot atomically.
     pub fn available_execution_slot(
