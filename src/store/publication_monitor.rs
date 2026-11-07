@@ -146,7 +146,15 @@ impl ConfigStore {
             params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let Some((base_branch, configuration_digest, json, digest, revision, last_effect_operation_id)) = row else {
+        let Some((
+            base_branch,
+            configuration_digest,
+            json,
+            digest,
+            revision,
+            last_effect_operation_id,
+        )) = row
+        else {
             return Ok(None);
         };
         if baseline_digest(json.as_bytes()) != digest {
@@ -711,6 +719,7 @@ mod tests {
                                 source_branch: resource.branch.clone(),
                                 source_head: "a".repeat(40),
                                 base_branch: "main".into(),
+                                base_sha: "b".repeat(40),
                                 title: "change".into(),
                                 body: None,
                                 timeline: crate::delivery_forge::ObservationCapability::Known(
