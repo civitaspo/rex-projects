@@ -527,7 +527,10 @@
                   "maxLength": 64,
                   "minLength": 64,
                   "pattern": "^[a-f0-9]{64}$",
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "profile_id": {
                   "maxLength": 255,
@@ -549,7 +552,6 @@
                 "work_node",
                 "role",
                 "profile_id",
-                "plan_digest",
                 "allowed_repositories",
                 "artifact_inputs"
               ],

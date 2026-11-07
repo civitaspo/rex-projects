@@ -2714,22 +2714,24 @@ fn apply_coordinator_spawn_request(
     }
     let accepted = store.latest_accepted_work_plan(&binding.project_id, ticket_run_id)?;
     if request.role == Role::Planner {
-        if accepted.as_ref().is_some_and(|plan| {
-            plan.plan_digest != request.plan_digest
-                || !plan
-                    .proposal
-                    .nodes
-                    .iter()
-                    .any(|node| node.id == request.work_node && node.investigation)
-        }) {
-            return Err(
-                "Coordinator Planner SpawnRequest differs from the accepted investigation node"
-                    .into(),
-            );
+        match (accepted.as_ref(), request.plan_digest.as_ref()) {
+            (None, None) => {}
+            (Some(plan), Some(plan_digest))
+                if &plan.plan_digest == plan_digest
+                    && plan
+                        .proposal
+                        .nodes
+                        .iter()
+                        .any(|node| node.id == request.work_node && node.investigation) => {}
+            _ => {
+                return Err(
+                    "Coordinator Planner SpawnRequest must match an accepted investigation node or be an unbound pre-plan request".into(),
+                );
+            }
         }
     } else {
         let accepted = accepted.ok_or("Coordinator SpawnRequest has no accepted plan")?;
-        if accepted.plan_digest != request.plan_digest
+        if request.plan_digest.as_ref() != Some(&accepted.plan_digest)
             || !accepted
                 .proposal
                 .nodes
@@ -3205,6 +3207,216 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn host_validated_preplan_coordinator_request_creates_planner_wake_without_digest() {
+        use crate::domain::ids::Digest;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use serde_json::json;
+
+        let structured_result = json!({
+            "work_node": "initial-plan",
+            "role": "planner",
+            "profile_id": "fixture-profile",
+            "allowed_repositories": [],
+            "artifact_inputs": [],
+            "parent_run_id": null
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Coordinator,
+                RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "coordinator-plan-request-1".into(),
+                    kind: RoleOutputKind::SpawnRequest,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result,
+                    result_digest,
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let config: Config = serde_json::from_value(json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind": "command", "command": ["ticket-cli"]}},
+            "projects": {"fixture-project": {
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "goal": {"revision": 1, "statement": "fixture goal", "acceptance": ["produce a valid plan"]},
+                "roles": {"coordinator": "fixture-profile", "planner": "fixture-profile"}
+            }}
+        }))
+        .unwrap();
+        let configuration_digest = Digest::parse("a".repeat(64)).unwrap();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+        };
+
+        assert!(
+            super::apply_agent_result(
+                &mut fixture.store,
+                fixture.owner_generation,
+                10,
+                &config,
+                &mut services,
+                &fixture.ingested,
+            )
+            .unwrap()
+        );
+
+        let project_id = ProjectId::parse("fixture-project").unwrap();
+        let wakes = fixture
+            .store
+            .pending_role_wake_inputs(&project_id, "ticket_run:fixture-ticket-run:planner", 8)
+            .unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].source_id, fixture.ingested.receipt.evidence_id());
+        let payload = &wakes[0].payload_json;
+        assert_eq!(payload["request"]["role"], "planner");
+        assert!(payload["request"].get("plan_digest").is_none());
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                fixture.ingested.receipt.evidence_id(),
+            )
+            .unwrap(),
+            Some((3, "applied".into()))
+        );
+    }
+
+    #[test]
+    fn plan_bound_planner_request_requires_the_exact_digest_before_persisting_a_wake() {
+        use crate::domain::ids::{Digest, RepositoryId};
+        use crate::engine::orchestration::{
+            AgentAssertion, PlannedWorkNode, RoleOutputKind, WorkPlan,
+        };
+        use crate::roles::RoleResultMessage;
+        use serde_json::json;
+
+        let config: Config = serde_json::from_value(json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind": "command", "command": ["ticket-cli"]}},
+            "projects": {"fixture-project": {
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "goal": {"revision": 1, "statement": "fixture goal", "acceptance": ["produce a valid plan"]},
+                "roles": {"coordinator": "fixture-profile", "planner": "fixture-profile"}
+            }}
+        }))
+        .unwrap();
+        let configuration_digest = Digest::parse("a".repeat(64)).unwrap();
+
+        for (case, requested_digest) in [("missing", None), ("wrong", Some("b".repeat(64)))] {
+            let mut structured_result = json!({
+                "work_node": "investigate",
+                "role": "planner",
+                "profile_id": "fixture-profile",
+                "allowed_repositories": [],
+                "artifact_inputs": [],
+                "parent_run_id": null
+            });
+            if let Some(digest) = requested_digest {
+                structured_result["plan_digest"] = json!(digest);
+            }
+            let result_digest = Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+            ))
+            .unwrap();
+            let mut fixture =
+                crate::store::agent_results::host_validation_fixture::host_validated_result(
+                    Role::Coordinator,
+                    RoleResultMessage {
+                        schema_version: 1,
+                        message_id: format!("coordinator-plan-request-{case}"),
+                        kind: RoleOutputKind::SpawnRequest,
+                        assertion: AgentAssertion::Succeeded,
+                        structured_result,
+                        result_digest,
+                        artifact_refs: Vec::new(),
+                    },
+                )
+                .unwrap();
+
+            let persisted_plan = crate::store::accepted_plans::PersistedWorkPlan {
+                schema_version: 1,
+                proposal: WorkPlan {
+                    nodes: vec![PlannedWorkNode {
+                        id: crate::engine::orchestration::WorkNodeId::parse("investigate").unwrap(),
+                        repository: RepositoryId::parse("repo-a").unwrap(),
+                        task: "investigate the API contract".into(),
+                        depends_on: Vec::new(),
+                        required_evidence: vec!["API behavior".into()],
+                        investigation: true,
+                    }],
+                    requested_investigation_children: 1,
+                },
+                observed_base_shas: BTreeMap::new(),
+            };
+            let plan_value = serde_json::to_value(persisted_plan).unwrap();
+            let plan_json = serde_json::to_string(&plan_value).unwrap();
+            let accepted_digest =
+                Digest::parse(format!("{:x}", sha2::Sha256::digest(plan_json.as_bytes()))).unwrap();
+            fixture
+                .store
+                .test_connection()
+                .execute(
+                    "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES ('fixture-project','fixture-ticket-run',3,?1,?2,?3,'plan-evidence','fixture-agent-run','plan-message',?4,'fixture-agent-run','ticket_run:fixture-ticket-run:coordinator',?4,1)",
+                    rusqlite::params![configuration_digest.as_str(), accepted_digest.as_str(), plan_json, "c".repeat(64)],
+                )
+                .unwrap();
+            let mut services = WorkerPublicationFixtureServices {
+                configuration_digest: configuration_digest.clone(),
+                published_effect: None,
+            };
+            let wake_count_before: u32 = fixture
+                .store
+                .test_connection()
+                .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+
+            assert!(
+                super::apply_agent_result(
+                    &mut fixture.store,
+                    fixture.owner_generation,
+                    10,
+                    &config,
+                    &mut services,
+                    &fixture.ingested,
+                )
+                .is_err()
+            );
+            let wake_count: u32 = fixture
+                .store
+                .test_connection()
+                .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                wake_count, wake_count_before,
+                "{case} digest must not create a Planner wake"
+            );
+            assert_eq!(
+                crate::store::agent_results::host_validation_fixture::result_ack(
+                    &fixture.store,
+                    fixture.ingested.receipt.evidence_id(),
+                )
+                .unwrap(),
+                None,
+                "{case} digest must not acknowledge the Coordinator result"
+            );
+        }
     }
 
     #[test]

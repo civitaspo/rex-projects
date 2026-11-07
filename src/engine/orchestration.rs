@@ -524,11 +524,11 @@ impl<'de> Deserialize<'de> for GitCommitId {
 }
 
 macro_rules! role_payload {
-    ($name:ident { $($field:ident : $type:ty),* $(,)? }) => {
+    ($name:ident { $($(#[$attribute:meta])* $field:ident : $type:ty),* $(,)? }) => {
         #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
         #[serde(deny_unknown_fields)]
         pub struct $name {
-            $(pub $field: $type,)*
+            $($(#[$attribute])* pub $field: $type,)*
         }
     };
 }
@@ -584,7 +584,8 @@ role_payload!(SpawnRequestPayload {
     work_node: WorkNodeId,
     role: Role,
     profile_id: ProfileId,
-    plan_digest: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_digest: Option<Digest>,
     allowed_repositories: Vec<RepositoryId>,
     artifact_inputs: Vec<RoleArtifactReference>,
     parent_run_id: Option<AgentRunId>,
@@ -3554,6 +3555,27 @@ mod tests {
         assert!(encoded.contains(r"^[A-Za-z0-9._-]+$"));
         assert!(encoded.contains(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$"));
         assert!(encoded.contains(r"^[a-f0-9]{64}$"));
+    }
+
+    #[test]
+    fn preplan_planner_spawn_request_omits_the_plan_digest() {
+        let request: SpawnRequestPayload = serde_json::from_value(json!({
+            "work_node": "initial-plan",
+            "role": "planner",
+            "profile_id": "planner-default",
+            "allowed_repositories": [],
+            "artifact_inputs": [],
+            "parent_run_id": null
+        }))
+        .unwrap();
+        assert_eq!(request.plan_digest, None);
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("plan_digest").is_none());
+        let validator = jsonschema::options()
+            .build(&role_result_payload_schema(RoleOutputKind::SpawnRequest))
+            .unwrap();
+        assert!(validator.is_valid(&value));
     }
 
     #[test]
