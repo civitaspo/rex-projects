@@ -19,6 +19,7 @@ pub mod knowledge;
 pub mod knowledge_effect;
 pub mod launch;
 pub mod learning;
+pub mod learning_trials;
 pub mod mailbox;
 pub mod operations;
 pub mod operations_runtime;

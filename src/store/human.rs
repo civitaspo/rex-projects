@@ -155,7 +155,7 @@ impl ConfigStore {
             "CREATE TABLE human_requests (
                 request_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(project_id),
-                purpose TEXT NOT NULL CHECK(purpose IN ('plan_decision','ticket_review','operation_approval','profile_promotion','goal_change','goal_completion','project_configuration','release_decision')),
+                purpose TEXT NOT NULL CHECK(purpose IN ('plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision')),
                 subject_kind TEXT NOT NULL CHECK(subject_kind IN ('ticket_run','plan','operation','profile','goal','project_configuration','release')),
                 subject_id TEXT NOT NULL,
                 subject_revision INTEGER NOT NULL CHECK(subject_revision >= 0),
@@ -865,6 +865,7 @@ fn validate_active_request_view(
         HumanPurpose::GoalChange
         | HumanPurpose::GoalCompletion
         | HumanPurpose::ProfilePromotion
+        | HumanPurpose::ProfileTrial
         | HumanPurpose::ProjectConfiguration
         | HumanPurpose::ReleaseDecision => "supervisor",
         HumanPurpose::PlanDecision
@@ -909,6 +910,11 @@ fn insert_role_wake(
     receipt: &PersistedApprovalReceipt,
     now: u64,
 ) -> Result<(), String> {
+    if request.purpose == HumanPurpose::ProfileTrial {
+        // Trial approvals are consumed by the controller's typed trial coordinator. They must
+        // never wake an Agent role session or become semantic factory input.
+        return Ok(());
+    }
     let (role_session_id, role_name) = match request.wake_target() {
         HumanWakeTarget::Supervisor => (
             format!("project:{}:supervisor", request.subject.project_id),
@@ -1038,6 +1044,7 @@ fn purpose_name(value: HumanPurpose) -> &'static str {
         HumanPurpose::TicketReview => "ticket_review",
         HumanPurpose::OperationApproval => "operation_approval",
         HumanPurpose::ProfilePromotion => "profile_promotion",
+        HumanPurpose::ProfileTrial => "profile_trial",
         HumanPurpose::GoalChange => "goal_change",
         HumanPurpose::GoalCompletion => "goal_completion",
         HumanPurpose::ProjectConfiguration => "project_configuration",

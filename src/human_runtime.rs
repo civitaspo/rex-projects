@@ -48,6 +48,7 @@ pub enum HumanPurpose {
     TicketReview,
     OperationApproval,
     ProfilePromotion,
+    ProfileTrial,
     GoalChange,
     GoalCompletion,
     ProjectConfiguration,
@@ -73,7 +74,7 @@ impl HumanPurpose {
             Self::PlanDecision => HumanSubjectKind::Plan,
             Self::TicketReview => HumanSubjectKind::TicketRun,
             Self::OperationApproval => HumanSubjectKind::Operation,
-            Self::ProfilePromotion => HumanSubjectKind::Profile,
+            Self::ProfilePromotion | Self::ProfileTrial => HumanSubjectKind::Profile,
             Self::GoalChange | Self::GoalCompletion => HumanSubjectKind::Goal,
             Self::ProjectConfiguration => HumanSubjectKind::ProjectConfiguration,
             Self::ReleaseDecision => HumanSubjectKind::Release,
@@ -98,6 +99,7 @@ impl HumanPurpose {
             ),
             Self::OperationApproval
             | Self::ProfilePromotion
+            | Self::ProfileTrial
             | Self::ProjectConfiguration
             | Self::ReleaseDecision => matches!(
                 choice,
@@ -304,6 +306,7 @@ impl HumanRuntimeRequest {
             HumanPurpose::GoalChange
             | HumanPurpose::GoalCompletion
             | HumanPurpose::ProfilePromotion
+            | HumanPurpose::ProfileTrial
             | HumanPurpose::ProjectConfiguration => HumanWakeTarget::Supervisor,
             HumanPurpose::OperationApproval | HumanPurpose::ReleaseDecision => {
                 HumanWakeTarget::Operator

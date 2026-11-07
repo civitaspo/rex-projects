@@ -1265,7 +1265,7 @@ impl ConfigStore {
         Ok(Some(project))
     }
 
-    pub fn record_learning_trial(
+    pub(crate) fn record_learning_trial(
         &mut self,
         generation: u64,
         project: &ProjectId,
