@@ -25,6 +25,7 @@ type HumanRequestSummaryRow = (String, String, String, Option<String>, Option<St
 
 /// Additive schema fragment called inside the coordinated v12 migration transaction.
 pub(crate) fn migrate_v12_human_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    migrate_human_requests_publication_adoption(tx)?;
     tx.execute_batch(
         "CREATE TABLE human_request_authority (
             request_id TEXT PRIMARY KEY REFERENCES human_requests(request_id),
@@ -40,6 +41,88 @@ pub(crate) fn migrate_v12_human_tables(tx: &rusqlite::Transaction<'_>) -> Result
         BEGIN SELECT RAISE(ABORT, 'human request authority is retained'); END;",
     )
     .map_err(|error| error.to_string())
+}
+
+const HUMAN_REQUEST_COLUMNS: &str = "request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,presentation_reference,lifecycle,created_at_unix,expires_at_unix,decided_at_unix";
+
+/// Create the canonical human request row shape. The legacy option exists only for the v12
+/// canonical-layout builder, which models the v8 table before its v12 rebuild.
+pub(crate) fn create_human_requests_table(
+    connection: &Connection,
+    table_name: &str,
+    allow_publication_adoption: bool,
+) -> Result<(), String> {
+    if !matches!(table_name, "human_requests" | "human_requests_v12") {
+        return Err("invalid internal human request table name".into());
+    }
+    let purposes = if allow_publication_adoption {
+        "'plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision','publication_adoption'"
+    } else {
+        "'plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision'"
+    };
+    let subjects = if allow_publication_adoption {
+        "'ticket_run','plan','operation','profile','goal','project_configuration','release','publication'"
+    } else {
+        "'ticket_run','plan','operation','profile','goal','project_configuration','release'"
+    };
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE {table_name} (
+                request_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id),
+                purpose TEXT NOT NULL CHECK(purpose IN ({purposes})),
+                subject_kind TEXT NOT NULL CHECK(subject_kind IN ({subjects})),
+                subject_id TEXT NOT NULL,
+                subject_revision INTEGER NOT NULL CHECK(subject_revision >= 0),
+                rex_view_id TEXT NOT NULL REFERENCES rex_views(view_id),
+                subject_digest TEXT NOT NULL,
+                material_digest TEXT NOT NULL,
+                configuration_digest TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                bundle_digest TEXT NOT NULL,
+                request_json TEXT NOT NULL CHECK(length(request_json) <= 1048576),
+                artifact_path TEXT NOT NULL,
+                presentation_reference TEXT,
+                lifecycle TEXT NOT NULL CHECK(lifecycle IN ('pending','presented','response_queued','decided','stale','expired','cancelled')),
+                created_at_unix INTEGER NOT NULL,
+                expires_at_unix INTEGER NOT NULL CHECK(expires_at_unix > created_at_unix),
+                decided_at_unix INTEGER,
+                UNIQUE(project_id, purpose, subject_kind, subject_id, subject_revision, subject_digest, request_id)
+            );"
+        ))
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_human_request_indexes(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE INDEX human_requests_project_lifecycle ON human_requests(project_id, lifecycle, created_at_unix);
+             CREATE INDEX human_requests_subject ON human_requests(project_id, subject_kind, subject_id, subject_revision, subject_digest);
+             CREATE INDEX human_requests_rex_view_lifecycle ON human_requests(rex_view_id,lifecycle);",
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_human_requests_publication_adoption(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<(), String> {
+    let sql: Option<String> = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='human_requests'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let _sql = sql.ok_or("schema 11 is missing human_requests")?;
+    create_human_requests_table(tx, "human_requests_v12", true)?;
+    tx.execute_batch(&format!(
+        "INSERT INTO human_requests_v12({HUMAN_REQUEST_COLUMNS}) SELECT {HUMAN_REQUEST_COLUMNS} FROM human_requests;
+         DROP TABLE human_requests;
+         ALTER TABLE human_requests_v12 RENAME TO human_requests;"
+    ))
+    .map_err(|error| error.to_string())?;
+    create_human_request_indexes(tx)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -83,30 +83,69 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
             "artifact registry migration 12 requires schema 11, found {version}"
         ));
     }
-    let tx = connection
-        .unchecked_transaction()
+    let foreign_keys_enabled: bool = connection
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    migrate_v12_artifact_tables(&tx)?;
-    crate::store::agent_results::migrate_v12_tables(&tx)?;
-    crate::store::accepted_plans::migrate_v12_worker_plan_tables(&tx)?;
-    crate::store::agent_recovery::migrate_v12_recovery_tables(&tx)?;
-    crate::store::rex_view_tables::migrate_v12_view_tables(&tx)?;
-    crate::store::provider_qualification::migrate_v12_provider_qualification_jobs(&tx)?;
-    crate::store::host_jobs::migrate_v12_host_jobs_tables(&tx)?;
-    crate::store::human::migrate_v12_human_tables(&tx)?;
-    crate::store::learning_store::migrate_v12_learning_tables(&tx)?;
-    crate::store::publication_monitor::migrate_v12_publication_baselines(&tx)?;
-    crate::store::merge_work::migrate_v12_merge_work_items(&tx)?;
-    let now = crate::store::now_unix()?;
-    tx.execute(
-        "INSERT INTO schema_migrations(version,applied_at_unix) VALUES (12,?1)",
-        [now],
-    )
-    .map_err(|error| error.to_string())?;
-    tx.pragma_update(None, "user_version", 12)
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
         .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())?;
+    let migration_result = (|| {
+        let tx = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        crate::launch::migrate_launch_reservation_tables(&tx)?;
+        migrate_v12_artifact_tables(&tx)?;
+        crate::store::agent_results::migrate_v12_tables(&tx)?;
+        crate::store::accepted_plans::migrate_v12_worker_plan_tables(&tx)?;
+        crate::store::agent_recovery::migrate_v12_recovery_tables(&tx)?;
+        crate::store::rex_view_tables::migrate_v12_view_tables(&tx)?;
+        crate::store::provider_qualification::migrate_v12_provider_qualification_jobs(&tx)?;
+        crate::store::host_jobs::migrate_v12_host_jobs_tables(&tx)?;
+        crate::store::human::migrate_v12_human_tables(&tx)?;
+        crate::store::learning_store::migrate_v12_learning_tables(&tx)?;
+        crate::store::publication_monitor::migrate_v12_publication_baselines(&tx)?;
+        crate::store::merge_work::migrate_v12_merge_work_items(&tx)?;
+        let violations = foreign_key_violations(&tx)?;
+        if !violations.is_empty() {
+            return Err(format!(
+                "schema v12 migration produced foreign-key violations: {violations:?}"
+            ));
+        }
+        let now = crate::store::now_unix()?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version,applied_at_unix) VALUES (12,?1)",
+            [now],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.pragma_update(None, "user_version", 12)
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    })();
+    let restore_result = connection
+        .pragma_update(
+            None,
+            "foreign_keys",
+            if foreign_keys_enabled { "ON" } else { "OFF" },
+        )
+        .map_err(|error| error.to_string());
+    migration_result?;
+    restore_result?;
     validate_v12_schema(connection)
+}
+
+fn foreign_key_violations(
+    connection: &Connection,
+) -> Result<Vec<(String, Option<i64>, String, i64)>, String> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 fn migrate_v12_artifact_tables(tx: &Transaction<'_>) -> Result<(), String> {
@@ -160,6 +199,7 @@ fn migrate_v12_artifact_tables(tx: &Transaction<'_>) -> Result<(), String> {
 const V12_TABLES: &[&str] = &[
     "registered_artifacts",
     "registered_artifact_messages",
+    "agent_launch_reservations",
     "agent_result_wakes",
     "agent_terminal_receipts",
     "agent_result_reducer_ack",
@@ -171,6 +211,7 @@ const V12_TABLES: &[&str] = &[
     "provider_qualification_jobs",
     "host_effect_jobs",
     "human_request_authority",
+    "human_requests",
     "profile_trial_authorizations",
     "profile_trial_launches",
     "profile_trial_run_receipts",
@@ -301,6 +342,13 @@ fn canonical_v12_schema() -> Result<Connection, String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    {
+        let tx = canonical.transaction().map_err(|error| error.to_string())?;
+        crate::launch::migrate_launch_reservation_tables(&tx)?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    crate::store::human::create_human_requests_table(&canonical, "human_requests", false)?;
+    crate::store::human::create_human_request_indexes(&canonical)?;
     let tx = canonical.transaction().map_err(|error| error.to_string())?;
     migrate_v12_artifact_tables(&tx)?;
     crate::store::agent_results::migrate_v12_tables(&tx)?;
@@ -480,7 +528,6 @@ mod tests {
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY);
-             CREATE TABLE human_requests(request_id TEXT PRIMARY KEY);
              CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
              CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
              CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
@@ -488,15 +535,103 @@ mod tests {
              CREATE TABLE agent_result_evidence(evidence_id TEXT PRIMARY KEY);
              CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY);
              CREATE TABLE agent_result_wakes(evidence_id TEXT PRIMARY KEY,recipient_type TEXT NOT NULL,recipient_id TEXT NOT NULL,wake_input_id INTEGER,queued_at_unix INTEGER NOT NULL);
+             PRAGMA foreign_keys=ON;
              PRAGMA user_version=11;",
         ).unwrap();
+        crate::store::human::create_human_requests_table(&connection, "human_requests", false)
+            .unwrap();
+        crate::store::human::create_human_request_indexes(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE human_request_history(
+                history_id INTEGER PRIMARY KEY,
+                request_id TEXT NOT NULL REFERENCES human_requests(request_id)
+             );
+             INSERT INTO projects(project_id) VALUES ('project1');
+             INSERT INTO rex_views(view_id) VALUES ('view1');
+             INSERT INTO human_requests(
+                request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,
+                subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,
+                request_json,artifact_path,presentation_reference,lifecycle,created_at_unix,
+                expires_at_unix,decided_at_unix
+             ) VALUES (
+                'request1','project1','release_decision','release','release1',1,'view1',
+                'subject','material','configuration','policy','bundle','{}','artifact',NULL,
+                'pending',1,2,NULL
+             );
+             INSERT INTO human_request_history(request_id) VALUES ('request1');",
+            )
+            .unwrap();
         migrate_v12(&connection).unwrap();
+        let foreign_keys_enabled: bool = connection
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert!(
+            foreign_keys_enabled,
+            "migration restores the original FK setting"
+        );
+        let preserved: (String, String, String) = connection
+            .query_row(
+                "SELECT request_id,purpose,subject_kind FROM human_requests",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "request1".into(),
+                "release_decision".into(),
+                "release".into()
+            )
+        );
+        connection
+            .execute(
+                "INSERT INTO human_requests(
+                    request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,
+                    subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,
+                    request_json,artifact_path,presentation_reference,lifecycle,created_at_unix,
+                    expires_at_unix,decided_at_unix
+                 ) VALUES (
+                    'publication1','project1','publication_adoption','publication','publication1',1,'view1',
+                    'subject','material','configuration','policy','bundle','{}','artifact',NULL,
+                    'pending',2,3,NULL
+                 )",
+                [],
+            )
+            .unwrap();
+        let history_count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM human_request_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(history_count, 1, "human history rows survive table rebuild");
+        let child_fk_preserved: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('human_request_history') WHERE \"table\"='human_requests' AND \"from\"='request_id' AND \"to\"='request_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            child_fk_preserved,
+            "child foreign key still points at human_requests"
+        );
+        let index_preserved: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list('human_requests') WHERE name='human_requests_subject')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_preserved, "human request index is recreated");
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 12);
         for table in [
             "registered_artifacts",
+            "agent_launch_reservations",
             "registered_artifact_messages",
             "agent_terminal_receipts",
             "agent_result_reducer_ack",
@@ -542,9 +677,6 @@ mod tests {
             connection.query_row("SELECT 1 FROM pragma_table_info('agent_result_wakes') WHERE name='wake_input_id'", [], |_| Ok(())).is_ok(),
             "result wake input column is missing"
         );
-        connection
-            .execute("INSERT INTO projects(project_id) VALUES ('project1')", [])
-            .unwrap();
         connection
             .execute(
                 "INSERT INTO agent_launch_authority(agent_run_id) VALUES ('run1')",
@@ -799,7 +931,6 @@ mod tests {
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY);
-             CREATE TABLE human_requests(request_id TEXT PRIMARY KEY);
              CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
              CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
              CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
@@ -809,6 +940,9 @@ mod tests {
              CREATE TABLE agent_result_wakes(evidence_id TEXT PRIMARY KEY,recipient_type TEXT NOT NULL,recipient_id TEXT NOT NULL,wake_input_id INTEGER,queued_at_unix INTEGER NOT NULL);
              PRAGMA user_version=11;",
         ).unwrap();
+        crate::store::human::create_human_requests_table(&connection, "human_requests", false)
+            .unwrap();
+        crate::store::human::create_human_request_indexes(&connection).unwrap();
         super::migrate_v12(&connection).unwrap();
         let authority = test_authority();
         authority.validate().unwrap();
@@ -909,7 +1043,6 @@ mod tests {
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY);
-             CREATE TABLE human_requests(request_id TEXT PRIMARY KEY);
              CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
              CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
              CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
@@ -921,6 +1054,9 @@ mod tests {
              CREATE TABLE agent_result_wakes(evidence_id TEXT PRIMARY KEY,recipient_type TEXT NOT NULL,recipient_id TEXT NOT NULL,wake_input_id INTEGER,queued_at_unix INTEGER NOT NULL);
              PRAGMA user_version=11;",
         ).unwrap();
+        crate::store::human::create_human_requests_table(&connection, "human_requests", false)
+            .unwrap();
+        crate::store::human::create_human_request_indexes(&connection).unwrap();
         connection
             .execute(
                 "INSERT INTO projects(project_id) VALUES (?1)",

@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -509,7 +509,45 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
         PRAGMA user_version = 7;",
     )
     .map_err(|error| error.to_string())?;
+    migrate_launch_reservation_tables(&tx)?;
     tx.commit().map_err(|error| error.to_string())
+}
+
+/// Ensure the durable StartAgent reservation projection exists. Schema-v7 uses this in its
+/// migration transaction; the central v12 upgrade also repairs databases whose recorded v7
+/// layout predates the table. Layout validation rejects incompatible pre-existing tables.
+pub(crate) fn migrate_launch_reservation_tables(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_launch_reservations (
+            agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            operation_id TEXT NOT NULL UNIQUE,
+            controller_generation INTEGER NOT NULL CHECK(controller_generation > 0),
+            project_epoch INTEGER NOT NULL CHECK(project_epoch > 0),
+            reservation_digest TEXT NOT NULL CHECK(length(reservation_digest) = 64),
+            reservation_json TEXT NOT NULL CHECK(length(reservation_json) <= 1048576),
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN ('reserved','block_created','authorized','unknown','cancelled')),
+            created_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS agent_launch_reservations_project
+            ON agent_launch_reservations(project_id,lifecycle,created_at_unix);
+        CREATE TRIGGER IF NOT EXISTS agent_launch_reservation_identity_guard
+        BEFORE UPDATE ON agent_launch_reservations
+        WHEN OLD.agent_run_id IS NOT NEW.agent_run_id
+          OR OLD.project_id IS NOT NEW.project_id
+          OR OLD.operation_id IS NOT NEW.operation_id
+          OR OLD.controller_generation IS NOT NEW.controller_generation
+          OR OLD.project_epoch IS NOT NEW.project_epoch
+          OR OLD.reservation_digest IS NOT NEW.reservation_digest
+          OR OLD.reservation_json IS NOT NEW.reservation_json
+          OR OLD.created_at_unix IS NOT NEW.created_at_unix
+        BEGIN SELECT RAISE(ABORT, 'Agent launch reservation identity is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS agent_launch_reservation_no_delete
+        BEFORE DELETE ON agent_launch_reservations
+        BEGIN SELECT RAISE(ABORT, 'Agent launch reservations are retained'); END;",
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
