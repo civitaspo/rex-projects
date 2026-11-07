@@ -7,15 +7,15 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::agent_recovery::AgentRecoveryReport;
 use crate::config::{Config, ProjectConfig};
-use crate::domain::ids::{ProjectId, TicketNamespace, TicketRunId};
+use crate::domain::ids::{Digest, OperationId, ProjectId, Revision, TicketNamespace, TicketRunId};
 use crate::domain::types::{ProjectMode, Role, TicketStatus};
 use crate::effects::{DispatchTick, EffectDispatcher, EffectHandler, EffectLimits};
 use crate::engine::reducer::{Activity, Input, Phase, TicketRun};
-use crate::store::ConfigStore;
 use crate::store::scheduler::RunnableProject;
 use crate::store::scheduler::{
     ObservedTicket, PendingRoleWakeSession, TicketObservationClassification, TicketScanKey,
 };
+use crate::store::{ConfigStore, DurableInput, EffectIntent, durable_input_digest};
 
 /// Result of matching a normalized ticket to the configured Project policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,7 +103,19 @@ pub trait FactoryRuntimeServices {
         store: &mut ConfigStore,
         owner_generation: u64,
         now_unix: i64,
-    ) -> Result<bool, String>;
+    ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String>;
+
+    fn observe_base_heads(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<crate::domain::ids::RepositoryId, String>, String>;
+
+    fn configuration_digest(&self) -> &Digest;
+
+    fn profile_commit_mode(
+        &self,
+        project_id: &ProjectId,
+        role: Role,
+    ) -> Result<crate::domain::types::CommitMode, String>;
 
     fn ticket_namespace(
         &mut self,
@@ -172,8 +184,12 @@ impl FactoryRuntime {
         config: &Config,
         services: &mut impl FactoryRuntimeServices,
     ) -> Result<FactoryTickReport, String> {
-        let ingested_agent_result =
-            services.ingest_one_agent_result(store, owner_generation, now_unix)?;
+        let agent_result = services.ingest_one_agent_result(store, owner_generation, now_unix)?;
+        let ingested_agent_result = if let Some(result) = &agent_result {
+            apply_agent_result(store, owner_generation, now_unix, config, services, result)?
+        } else {
+            false
+        };
         let publication_monitor =
             services.observe_publications(store, owner_generation, now_unix)?;
         let agent_recovery = services.recover_agents(store, owner_generation, now_unix)?;
@@ -368,6 +384,174 @@ impl FactoryRuntime {
             external_errors,
         })
     }
+}
+
+fn apply_agent_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload, WorkBaseSource};
+
+    let binding = &result.validated.binding;
+    if result.validated.kind != RoleOutputKind::PlanReady
+        || binding.role != Role::Coordinator
+        || binding.ticket_run_id.is_none()
+        || result.validated.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        // Other role results remain durable claims and are delivered through
+        // the persisted parent wake. They cannot directly advance reducer state.
+        let revision = binding
+            .ticket_revision
+            .map(|revision| revision.0)
+            .unwrap_or(binding.config_revision.0);
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            revision.max(1),
+            crate::store::agent_results::ResultDisposition::RetainedAsClaim,
+        )?;
+        return Ok(false);
+    }
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Coordinator PlanReady result lacks TicketRun scope")?;
+    let project = config
+        .projects
+        .get(&binding.project_id)
+        .ok_or("Agent result Project is no longer configured")?;
+    let project_record = store
+        .project(&binding.project_id)?
+        .ok_or("Agent result Project has no durable configuration record")?;
+    let configuration_digest = services.configuration_digest().clone();
+    if project_record.config_digest != configuration_digest
+        || binding.config_digest != configuration_digest
+        || binding.config_revision != project_record.config_revision
+    {
+        return Err("Coordinator result belongs to a stale configuration snapshot".into());
+    }
+    let source_revision = binding
+        .ticket_revision
+        .ok_or("Coordinator PlanReady result lacks TicketRun revision")?;
+    let current = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("Coordinator PlanReady result references no active TicketRun")?;
+    if current.project_id != binding.project_id
+        || current.revision != source_revision.0
+        || current.phase != Phase::Planning
+    {
+        return Err("Coordinator PlanReady result is stale or outside Planning".into());
+    }
+    let RoleResultPayload::PlanReady(proposal) = &result.validated.typed_payload else {
+        return Err("validated PlanReady kind has a different typed payload".into());
+    };
+    let observed_bases = services.observe_base_heads()?;
+    let validated = crate::engine::orchestration::validate_work_plan(
+        ticket_run_id,
+        project,
+        proposal.plan.clone(),
+        &observed_bases,
+    )?;
+    let mut work_nodes = Vec::new();
+    for node in validated
+        .nodes_in_execution_order
+        .iter()
+        .filter(|node| node.role == Role::Worker)
+    {
+        // A dependent node must be prepared from its predecessor's validated
+        // accepted head. Until that head exists, preparing it from the trunk
+        // would violate the plan's declared Git base, so fail closed here.
+        let WorkBaseSource::ControllerObservedCommit { commit } = &node.base else {
+            return Err(format!(
+                "work node {} depends on a predecessor head that is not available before implementation",
+                node.id
+            ));
+        };
+        if !config.repositories.contains_key(&node.repository) {
+            return Err("validated work node repository is no longer configured".into());
+        }
+        work_nodes.push(crate::delivery_runtime::PreparedWorktreeNodeRequest {
+            work_node_id: node.id.clone(),
+            repository_id: node.repository.clone(),
+            expected_base_sha: commit.clone(),
+            commit_mode: services.profile_commit_mode(&binding.project_id, Role::Worker)?,
+        });
+    }
+    if work_nodes.is_empty() {
+        return Err("Coordinator plan contains no implementation Worker nodes".into());
+    }
+    let accepted_revision = source_revision
+        .0
+        .checked_add(1)
+        .ok_or("TicketRun revision overflow")?;
+    let payload = crate::delivery_runtime::PrepareWorktreesEffectPayload {
+        schema_version: 1,
+        source_revision: accepted_revision,
+        configuration_digest: configuration_digest.clone(),
+        ticket_namespace: current.namespace,
+        ticket_id: current.ticket_id,
+        ticket_run_id: ticket_run_id.clone(),
+        work_nodes,
+    };
+    let (request_json, request_digest) =
+        crate::delivery_runtime::canonical_delivery_payload(&payload)?;
+    let operation_id = OperationId::parse(format!("prepare-{}", result.receipt.evidence_id()))?;
+    let effect = EffectIntent {
+        project_id: binding.project_id.clone(),
+        subject_type: "ticket_run".into(),
+        subject_id: ticket_run_id.as_str().into(),
+        operation_id: operation_id.as_str().to_owned(),
+        logical_key: format!("{}:prepare:{}", ticket_run_id, result.receipt.evidence_id()),
+        kind: crate::engine::reducer::effect_name(
+            &crate::engine::reducer::EffectKind::PrepareWorktrees,
+        )
+        .into(),
+        request_json,
+        request_digest,
+        expected_revision: Some(accepted_revision),
+    };
+    let input_payload = serde_json::json!({
+        "schema_version": 1,
+        "kind": "plan_accepted",
+        "evidence_id": result.receipt.evidence_id(),
+        "result_digest": result.validated.result_digest,
+        "source_revision": source_revision.0,
+        "accepted_revision": accepted_revision,
+    })
+    .to_string();
+    let durable = DurableInput {
+        producer_id: "rex-projects-agent-result".into(),
+        message_id: format!("plan-ready:{}", result.receipt.evidence_id()),
+        content_digest: durable_input_digest("ticket_run", &input_payload),
+        recipient: "ticket_run".into(),
+        payload: input_payload.clone(),
+    };
+    store.commit_validated_work_plan(
+        owner_generation,
+        ticket_run_id,
+        Revision(source_revision.0),
+        &configuration_digest,
+        &validated,
+        result,
+        &durable,
+        "host validated Coordinator PlanReady against current Project configuration and observed repository bases",
+        &input_payload,
+        &[effect],
+    )?;
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        accepted_revision,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    let _ = now_unix;
+    Ok(true)
 }
 
 fn build_scan_keys(

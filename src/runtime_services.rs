@@ -681,12 +681,43 @@ impl FactoryRuntimeServices for RuntimeServices {
 
     fn ingest_one_agent_result(
         &mut self,
-        _store: &mut ConfigStore,
-        _owner_generation: u64,
+        store: &mut ConfigStore,
+        owner_generation: u64,
         _now_unix: i64,
-    ) -> Result<bool, String> {
-        // Mailbox decoding is wired when the provider run-step bridge is composed.
-        Ok(false)
+    ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> {
+        store.ingest_next_spooled_agent_result(&self.artifacts, owner_generation, 32)
+    }
+
+    fn observe_base_heads(
+        &mut self,
+    ) -> Result<BTreeMap<crate::domain::ids::RepositoryId, String>, String> {
+        self.delivery.observe_base_heads()
+    }
+
+    fn configuration_digest(&self) -> &Digest {
+        &self.configuration_digest
+    }
+
+    fn profile_commit_mode(
+        &self,
+        project_id: &crate::domain::ids::ProjectId,
+        role: Role,
+    ) -> Result<crate::domain::types::CommitMode, String> {
+        let project = self
+            .applied_config
+            .config
+            .projects
+            .get(project_id)
+            .ok_or("Project is not present in applied configuration")?;
+        let profile_id = project
+            .roles
+            .get(&role)
+            .ok_or("Project role has no configured profile")?;
+        self.applied_config
+            .profiles
+            .get(profile_id)
+            .map(|profile| profile.commit_mode)
+            .ok_or_else(|| "configured role profile is missing".into())
     }
 
     fn ticket_namespace(&mut self, adapter: &AdapterId) -> Result<TicketNamespace, String> {

@@ -40,11 +40,12 @@ pub(crate) fn prepare_accepted_plan_write(
         || plan.nodes_in_execution_order.is_empty()
         || plan.nodes_in_execution_order.len() > 64
         || source.validated.kind != crate::engine::orchestration::RoleOutputKind::PlanReady
+        || source.validated.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
         || binding.role != crate::domain::types::Role::Coordinator
         || binding.ticket_run_id.as_ref() != Some(ticket_run_id)
         || binding.config_digest != *configuration_digest
         || binding.role_session_id.as_str()
-            != format!("ticket:{}:coordinator", ticket_run_id.as_str())
+            != format!("ticket_run:{}:coordinator", ticket_run_id.as_str())
         || !matches!(
             source.validated.typed_payload,
             crate::engine::orchestration::RoleResultPayload::PlanReady(_)
