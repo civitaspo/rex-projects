@@ -1,0 +1,1941 @@
+//! Durable learning and knowledge-publication records owned by the machine controller.
+//! Migration 10 is intentionally standalone until controller migrations 7–9 are integrated.
+
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use super::{ConfigStore, validate_active_generation};
+use crate::domain::ids::{Digest, HumanRequestId, OperationId, ProfileId, ProjectId, TicketRunId};
+use crate::knowledge::{
+    DEFAULT_MAX_ARTICLE_BYTES, PostmortemInput, PublicationManifest, validate_postmortem_input,
+};
+use crate::learning::{
+    CandidateLedger, CandidateRevision, CandidateStatus, ProfilePackage, ProfilePublicationReceipt,
+    ProfilePublicationStatus, TrialEvidence, TrialObservation, evaluate_trials,
+    validated_promotion_claims,
+};
+
+const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRIALS: usize = 10;
+const MAX_SUPERVISOR_KNOWLEDGE_ITEMS: usize = 12;
+const MAX_SUPERVISOR_CANDIDATES: usize = 20;
+const MAX_SUPERVISOR_CONTEXT_BYTES: usize = 256 * 1024;
+type PublicationDbRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+type PromotionDbRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+    Option<String>,
+    Option<u64>,
+    Option<String>,
+);
+type PromotionIntentRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgePublicationIntent {
+    pub operation_id: OperationId,
+    pub project_id: ProjectId,
+    pub ticket_run_id: TicketRunId,
+    pub request_digest: Digest,
+    pub request_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgePublicationReceipt {
+    pub manifest: PublicationManifest,
+    pub manifest_digest: Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfilePromotionIntent {
+    pub operation_id: OperationId,
+    pub project_id: ProjectId,
+    pub candidate_id: String,
+    pub profile_id: ProfileId,
+    pub role: crate::domain::types::Role,
+    pub manifest_digest: Digest,
+    pub expected_config_revision: Digest,
+    pub config_source: String,
+    pub human_request_id: HumanRequestId,
+    pub approval_subject_digest: Digest,
+    pub approval_configuration_digest: Digest,
+    pub approval_policy_digest: Digest,
+    pub response_receipt_digest: Digest,
+    pub package: StoredApprovedProfilePackage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LearningCandidateRecord {
+    pub revision: CandidateRevision,
+    pub profile_id: ProfileId,
+    pub package_manifest_digest: Digest,
+    pub package_json: String,
+    pub expected_pairs: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredTrial {
+    pub pair_index: usize,
+    pub observation: TrialObservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CandidateRegistration {
+    Registered,
+    AlreadyRegistered,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrialProgress {
+    pub trials: Vec<StoredTrial>,
+    pub evidence: TrialEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorKnowledgeEntry {
+    pub ticket_run_id: TicketRunId,
+    pub generated_at: String,
+    pub title: String,
+    pub summary: String,
+    pub findings: Vec<String>,
+    pub source_digests: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorCandidateEntry {
+    pub revision: CandidateRevision,
+    pub profile_id: ProfileId,
+    pub package_manifest_digest: Digest,
+    pub expected_pairs: usize,
+    pub evidence: Option<TrialEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSupervisorMaintenance {
+    pub project_id: ProjectId,
+    pub expired_candidates: usize,
+    pub knowledge: Vec<SupervisorKnowledgeEntry>,
+    pub candidates: Vec<SupervisorCandidateEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProfilePromotionRequest {
+    pub operation_id: OperationId,
+    pub candidate_id: String,
+    pub config_source: String,
+    pub human_request_id: HumanRequestId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredProfilePublicationReceipt {
+    profile_path: String,
+    manifest_digest: Digest,
+    human_response_receipt_digest: Digest,
+    already_published: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredApprovedProfilePackage {
+    pub project_id: ProjectId,
+    pub role: crate::domain::types::Role,
+    pub profile_id: ProfileId,
+    pub candidate_digest: Digest,
+    pub evidence: TrialEvidence,
+    pub files: std::collections::BTreeMap<String, Vec<u8>>,
+    pub approver: String,
+    pub rationale: String,
+    pub authorized_at: String,
+    pub human_request_id: HumanRequestId,
+    pub approval_subject_digest: Digest,
+    pub approval_configuration_digest: Digest,
+    pub approval_policy_digest: Digest,
+    pub response_receipt_digest: Digest,
+    pub config_revision: Digest,
+}
+
+/// Install v10 over a v9 database as part of the caller's backed-up migration transaction.
+#[allow(dead_code)] // Wired into the ordered v9 migration chain when PR3/4/5 land.
+pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version != 9 {
+        return Err(format!(
+            "learning migration requires schema v9, found v{version}"
+        ));
+    }
+    tx.execute_batch(
+        "CREATE TABLE knowledge_publications (
+            operation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            ticket_run_id TEXT NOT NULL UNIQUE REFERENCES ticket_runs(ticket_run_id),
+            request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+            request_json TEXT NOT NULL CHECK(length(request_json)<=4194304),
+            state TEXT NOT NULL CHECK(state IN ('prepared','published','failed','uncertain')),
+            manifest_json TEXT,
+            manifest_digest TEXT,
+            created_at_unix INTEGER NOT NULL,
+            published_at_unix INTEGER,
+            CHECK((state='published' AND manifest_json IS NOT NULL AND manifest_digest IS NOT NULL)
+               OR (state!='published' AND manifest_json IS NULL AND manifest_digest IS NULL))
+        );
+        CREATE INDEX knowledge_publication_project ON knowledge_publications(project_id,created_at_unix);
+        CREATE TABLE learning_candidates (
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            candidate_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            digest TEXT NOT NULL CHECK(length(digest)=64),
+            profile_id TEXT NOT NULL,
+            revision_json TEXT NOT NULL CHECK(length(revision_json)<=65536),
+            package_manifest_digest TEXT NOT NULL CHECK(length(package_manifest_digest)=64),
+            package_json TEXT NOT NULL CHECK(length(package_json)<=4194304),
+            expected_pairs INTEGER NOT NULL CHECK(expected_pairs BETWEEN 5 AND 10),
+            status TEXT NOT NULL CHECK(status IN ('proposed','trialing','awaiting_approval','promoted','superseded','expired','rejected')),
+            evidence_json TEXT,
+            created_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(project_id,candidate_id,digest)
+        );
+        CREATE INDEX learning_candidates_slots ON learning_candidates(project_id,role,status,created_at_unix);
+        CREATE TABLE learning_trial_pairs (
+            project_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
+            candidate_digest TEXT NOT NULL,
+            pair_index INTEGER NOT NULL CHECK(pair_index BETWEEN 0 AND 9),
+            input_digest TEXT NOT NULL CHECK(length(input_digest)=64),
+            observation_json TEXT NOT NULL CHECK(length(observation_json)<=16384),
+            created_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(project_id,candidate_id,candidate_digest,pair_index),
+            FOREIGN KEY(project_id,candidate_id,candidate_digest)
+                REFERENCES learning_candidates(project_id,candidate_id,digest) ON DELETE CASCADE
+        );
+        CREATE TABLE profile_promotions (
+            operation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            candidate_id TEXT NOT NULL,
+            candidate_digest TEXT NOT NULL CHECK(length(candidate_digest)=64),
+            profile_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
+            manifest_digest TEXT NOT NULL CHECK(length(manifest_digest)=64),
+            config_source TEXT NOT NULL,
+            expected_config_revision TEXT NOT NULL CHECK(length(expected_config_revision)=64),
+            human_request_id TEXT NOT NULL,
+            human_response_digest TEXT NOT NULL CHECK(length(human_response_digest)=64),
+            approval_subject_digest TEXT NOT NULL CHECK(length(approval_subject_digest)=64),
+            approval_configuration_digest TEXT NOT NULL CHECK(length(approval_configuration_digest)=64),
+            approval_policy_digest TEXT NOT NULL CHECK(length(approval_policy_digest)=64),
+            approved_package_json TEXT NOT NULL CHECK(length(approved_package_json)<=4194304),
+            state TEXT NOT NULL CHECK(state IN ('approved','publication_pending','published','activation_pending','active','stale','rejected')),
+            publication_receipt_json TEXT,
+            activation_from_revision INTEGER,
+            activation_to_revision INTEGER,
+            activation_config_digest TEXT,
+            applied_config_revision INTEGER,
+            applied_config_digest TEXT,
+            created_at_unix INTEGER NOT NULL,
+            UNIQUE(project_id,role,profile_id,candidate_digest)
+        );
+        CREATE INDEX profile_promotions_pending ON profile_promotions(project_id,state,created_at_unix);
+        INSERT INTO schema_migrations(version,applied_at_unix) VALUES (10,unixepoch());
+        PRAGMA user_version=10;"
+    ).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+impl ConfigStore {
+    pub(crate) fn ensure_postmortem_published(
+        &self,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<(), String> {
+        let operation: Option<String> = self.connection.query_row(
+            "SELECT operation_id FROM knowledge_publications WHERE ticket_run_id=?1 AND state='published'",
+            [ticket_run_id.as_str()],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some(operation) = operation else {
+            return Err("ticket cannot become Done before durable knowledge publication".into());
+        };
+        let operation_id = OperationId::parse(operation)?;
+        if self.knowledge_publication_receipt(&operation_id)?.is_none() {
+            return Err(
+                "ticket cannot become Done before a valid knowledge publication receipt".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Read the immutable package and approval tuple required to replay a profile
+    /// publication effect. The caller must still reload the opaque human receipt.
+    pub fn profile_promotion_intent(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<ProfilePromotionIntent>, String> {
+        type Row = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        );
+        let row: Option<Row> = self.connection.query_row(
+            "SELECT project_id,candidate_id,candidate_digest,evidence_digest,profile_id,role,manifest_digest,expected_config_revision,config_source,human_request_id,approval_subject_digest,approval_configuration_digest,approval_policy_digest,human_response_digest,approved_package_json,state FROM profile_promotions WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((
+            project_id,
+            candidate_id,
+            candidate_digest,
+            evidence_digest,
+            profile_id,
+            role,
+            manifest,
+            config_revision,
+            source,
+            request_id,
+            subject,
+            configuration,
+            policy,
+            response,
+            package_json,
+            state,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            state.as_str(),
+            "approved" | "publication_pending" | "published" | "activation_pending" | "active"
+        ) {
+            return Err(format!("profile promotion is terminally {state}"));
+        }
+        let project_id = ProjectId::parse(project_id)?;
+        let candidate_digest = Digest::parse(candidate_digest)?;
+        let evidence_digest = Digest::parse(evidence_digest)?;
+        let profile_id = ProfileId::parse(profile_id)?;
+        let manifest_digest = Digest::parse(manifest)?;
+        let expected_config_revision = Digest::parse(config_revision)?;
+        let human_request_id = HumanRequestId::parse(request_id)?;
+        let approval_subject_digest = Digest::parse(subject)?;
+        let approval_configuration_digest = Digest::parse(configuration)?;
+        let approval_policy_digest = Digest::parse(policy)?;
+        let response_receipt_digest = Digest::parse(response)?;
+        let role: crate::domain::types::Role = serde_json::from_str(&format!("\"{role}\""))
+            .map_err(|e| format!("stored profile role is invalid: {e}"))?;
+        if package_json.len() > MAX_RECORD_BYTES {
+            return Err("stored approved profile package exceeds its limit".into());
+        }
+        let package: StoredApprovedProfilePackage = serde_json::from_str(&package_json)
+            .map_err(|e| format!("stored approved profile package is invalid: {e}"))?;
+        if package.project_id != project_id
+            || package.profile_id != profile_id
+            || package.role != role
+            || package.candidate_digest != candidate_digest
+            || package.human_request_id != human_request_id
+            || package.approval_subject_digest != approval_subject_digest
+            || package.approval_configuration_digest != approval_configuration_digest
+            || package.approval_policy_digest != approval_policy_digest
+            || package.response_receipt_digest != response_receipt_digest
+            || package.config_revision != expected_config_revision
+            || package.candidate_digest.as_str().is_empty()
+            || crate::learning::manifest_digest(&package.files).map_err(|e| e.to_string())?
+                != manifest_digest
+        {
+            return Err(
+                "stored profile package does not match its immutable promotion identity".into(),
+            );
+        }
+        let subject = crate::learning::profile_approval_subject_digest(
+            &project_id,
+            role,
+            &profile_id,
+            &package.candidate_digest,
+            &package.files,
+            &package.evidence,
+            &expected_config_revision,
+        )
+        .map_err(|e| e.to_string())?;
+        if subject != approval_subject_digest
+            || crate::learning::evidence_digest(&package.evidence).map_err(|e| e.to_string())?
+                != evidence_digest
+        {
+            return Err("stored promotion subject or evidence digest is invalid".into());
+        }
+        Ok(Some(ProfilePromotionIntent {
+            operation_id: operation_id.clone(),
+            project_id,
+            candidate_id,
+            profile_id,
+            role,
+            manifest_digest,
+            expected_config_revision,
+            config_source: source,
+            human_request_id,
+            approval_subject_digest,
+            approval_configuration_digest,
+            approval_policy_digest,
+            response_receipt_digest,
+            package,
+        }))
+    }
+
+    pub(crate) fn load_approved_profile_package(
+        &self,
+        intent: &ProfilePromotionIntent,
+        now_unix: u64,
+    ) -> Result<ProfilePackage, String> {
+        let current = self
+            .profile_promotion_intent(&intent.operation_id)?
+            .ok_or("profile promotion intent disappeared")?;
+        if current != *intent {
+            return Err("profile promotion intent changed during dispatch".into());
+        }
+        let receipt = self
+            .accepted_human_approval(
+                &intent.human_request_id,
+                &intent.approval_subject_digest,
+                &intent.approval_configuration_digest,
+                &intent.approval_policy_digest,
+                now_unix,
+            )?
+            .ok_or("profile promotion human approval is missing, stale, or expired")?;
+        let stored = &intent.package;
+        let package = crate::learning::profile_package_from_accepted_approval(
+            &receipt,
+            stored.project_id.clone(),
+            stored.role,
+            stored.profile_id.clone(),
+            stored.candidate_digest.clone(),
+            stored.evidence.clone(),
+            stored.files.clone(),
+            stored.config_revision.clone(),
+            stored.approval_configuration_digest.clone(),
+            stored.approval_policy_digest.clone(),
+            now_unix,
+        )
+        .map_err(|e| e.to_string())?;
+        let claims = validated_promotion_claims(&package).map_err(|e| e.to_string())?;
+        if claims.human_request_id != stored.human_request_id
+            || claims.approval_subject_digest != stored.approval_subject_digest
+            || claims.approval_configuration_digest != stored.approval_configuration_digest
+            || claims.approval_policy_digest != stored.approval_policy_digest
+            || claims.response_receipt_digest != stored.response_receipt_digest
+            || claims.rationale != stored.rationale
+            || claims.authorized_at != stored.authorized_at
+        {
+            return Err("current human receipt differs from the immutable approved package".into());
+        }
+        Ok(package)
+    }
+
+    pub fn profile_publication_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<ProfilePublicationReceipt>, String> {
+        let row: Option<(String, Option<String>, String)> = self.connection.query_row(
+            "SELECT state,publication_receipt_json,manifest_digest FROM profile_promotions WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((state, json, expected_manifest)) = row else {
+            return Ok(None);
+        };
+        if !matches!(
+            state.as_str(),
+            "published" | "activation_pending" | "active"
+        ) {
+            return Ok(None);
+        }
+        let stored: StoredProfilePublicationReceipt = serde_json::from_str(
+            json.as_deref()
+                .ok_or("published profile has no durable receipt")?,
+        )
+        .map_err(|e| format!("stored profile receipt is invalid: {e}"))?;
+        if stored.manifest_digest.as_str() != expected_manifest {
+            return Err("stored profile receipt manifest differs from approved intent".into());
+        }
+        let response: String = self
+            .connection
+            .query_row(
+                "SELECT human_response_digest FROM profile_promotions WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if stored.human_response_receipt_digest.as_str() != response {
+            return Err("stored profile receipt belongs to a different human response".into());
+        }
+        Ok(Some(ProfilePublicationReceipt {
+            profile_path: std::path::PathBuf::from(stored.profile_path),
+            profile_manifest_digest: stored.manifest_digest,
+            human_response_receipt_digest: stored.human_response_receipt_digest,
+            status: if stored.already_published {
+                ProfilePublicationStatus::AlreadyPublished
+            } else {
+                ProfilePublicationStatus::Published
+            },
+        }))
+    }
+
+    /// Load the exact durable request for an outbox effect. The effect runner
+    /// must use this stored input rather than any Agent-supplied replay payload.
+    pub fn knowledge_publication_intent(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<KnowledgePublicationIntent>, String> {
+        let row: Option<(String, String, String, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT project_id,ticket_run_id,request_digest,request_json,state FROM knowledge_publications WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((project_id, ticket_run_id, request_digest, request_json, state)) = row else {
+            return Ok(None);
+        };
+        if !matches!(state.as_str(), "prepared" | "published" | "uncertain") {
+            return Err(format!("knowledge publication is terminally {state}"));
+        }
+        let request_digest = Digest::parse(request_digest)?;
+        verify_digest(&request_json, &request_digest)?;
+        let request: PostmortemInput = serde_json::from_str(&request_json)
+            .map_err(|error| format!("stored postmortem request is invalid: {error}"))?;
+        let project_id = ProjectId::parse(project_id)?;
+        let ticket_run_id = TicketRunId::parse(ticket_run_id)?;
+        if request.operation_id != *operation_id
+            || request.project_id != project_id
+            || request.ticket_run_id != ticket_run_id
+        {
+            return Err("stored knowledge request does not match its durable identity".into());
+        }
+        validate_postmortem_input(&request).map_err(|error| error.to_string())?;
+        Ok(Some(KnowledgePublicationIntent {
+            operation_id: operation_id.clone(),
+            project_id,
+            ticket_run_id,
+            request_digest,
+            request_json,
+        }))
+    }
+
+    /// Return the committed terminal receipt, if publication completed before
+    /// the generic dispatcher recorded its outbox receipt.
+    pub fn knowledge_publication_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<KnowledgePublicationReceipt>, String> {
+        let row: Option<(String, Option<String>, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT state,manifest_json,manifest_digest FROM knowledge_publications WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((state, manifest_json, manifest_digest)) = row else {
+            return Ok(None);
+        };
+        if state != "published" {
+            return Ok(None);
+        }
+        let manifest: PublicationManifest = serde_json::from_str(
+            manifest_json
+                .as_deref()
+                .ok_or("published knowledge row has no manifest")?,
+        )
+        .map_err(|error| format!("stored publication manifest is invalid: {error}"))?;
+        let manifest_digest =
+            Digest::parse(manifest_digest.ok_or("published knowledge row has no digest")?)?;
+        let canonical = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
+        if format!("{:x}", Sha256::digest(&canonical)) != manifest_digest.as_str() {
+            return Err("stored publication receipt digest is invalid".into());
+        }
+        if manifest.operation_id != *operation_id {
+            return Err("stored publication receipt has a different operation ID".into());
+        }
+        Ok(Some(KnowledgePublicationReceipt {
+            manifest,
+            manifest_digest,
+        }))
+    }
+
+    /// Persist the immutable postmortem request before filesystem publication.
+    pub fn prepare_knowledge_publication(
+        &mut self,
+        generation: u64,
+        intent: &KnowledgePublicationIntent,
+    ) -> Result<bool, String> {
+        verify_digest(&intent.request_json, &intent.request_digest)?;
+        if intent.request_json.len() > MAX_RECORD_BYTES {
+            return Err("knowledge request exceeds size limit".into());
+        }
+        let request: PostmortemInput = serde_json::from_str(&intent.request_json)
+            .map_err(|error| format!("invalid postmortem request: {error}"))?;
+        validate_postmortem_input(&request).map_err(|error| error.to_string())?;
+        if request.operation_id != intent.operation_id
+            || request.project_id != intent.project_id
+            || request.ticket_run_id != intent.ticket_run_id
+        {
+            return Err("postmortem request does not match durable operation subject".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let old: Option<(String,String)> = tx.query_row("SELECT request_digest,request_json FROM knowledge_publications WHERE operation_id=?1",[intent.operation_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        if let Some((digest, json)) = old {
+            if digest != intent.request_digest.as_str() || json != intent.request_json {
+                return Err("knowledge operation ID reused with different content".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        let current_run: Option<(u64, String)> = tx.query_row(
+            "SELECT revision,internal_phase FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+            params![intent.ticket_run_id.as_str(), intent.project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let (revision, phase) = current_run.ok_or("knowledge ticket run no longer exists")?;
+        if phase != "postmortem" {
+            return Err("knowledge publication can only begin during the Postmortem phase".into());
+        }
+        tx.execute("INSERT INTO knowledge_publications(operation_id,project_id,ticket_run_id,request_digest,request_json,state,created_at_unix) VALUES (?1,?2,?3,?4,?5,'prepared',?6)",params![intent.operation_id.as_str(),intent.project_id.as_str(),intent.ticket_run_id.as_str(),intent.request_digest.as_str(),intent.request_json,super::now_unix()?]).map_err(|e|e.to_string())?;
+        let request_json = super::canonical_json(&serde_json::json!({
+            "operation_id": intent.operation_id.as_str(),
+            "request_digest": intent.request_digest.as_str(),
+        }))?;
+        let effect = super::EffectIntent {
+            project_id: intent.project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: intent.ticket_run_id.to_string(),
+            operation_id: intent.operation_id.to_string(),
+            logical_key: format!("publish-knowledge-{}", intent.ticket_run_id),
+            kind: "publish_knowledge".into(),
+            request_digest: super::content_digest(&request_json),
+            request_json,
+            expected_revision: Some(revision),
+        };
+        super::insert_effect(&tx, &effect, super::now_unix()?)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// Persist an immutable publication receipt. Replays must match its exact manifest.
+    pub fn record_knowledge_publication(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+        manifest: &PublicationManifest,
+        manifest_digest: &Digest,
+    ) -> Result<bool, String> {
+        let json = serde_json::to_string(manifest).map_err(|e| e.to_string())?;
+        verify_digest(&json, manifest_digest)?;
+        if manifest.operation_id != *operation_id {
+            return Err("publication operation ID mismatch".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let row: Option<PublicationDbRow> = tx.query_row("SELECT project_id,ticket_run_id,state,request_json,manifest_json,manifest_digest FROM knowledge_publications WHERE operation_id=?1",[operation_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|e|e.to_string())?;
+        let Some((project, run, state, request_json, old_json, old_digest)) = row else {
+            return Err("publication receipt has no durable intent".into());
+        };
+        if project != manifest.project_id.as_str() || run != manifest.ticket_run_id.as_str() {
+            return Err("publication receipt subject mismatch".into());
+        }
+        let request: PostmortemInput = serde_json::from_str(&request_json)
+            .map_err(|error| format!("stored postmortem request is invalid: {error}"))?;
+        let mut expected_sources = request
+            .sources
+            .iter()
+            .map(|source| source.digest.clone())
+            .collect::<Vec<_>>();
+        expected_sources.sort();
+        let key = format!(
+            "{:x}",
+            Sha256::digest(request.ticket_run_id.as_str().as_bytes())
+        );
+        let expected_path = format!(
+            "projects/{}/postmortems/{key}.md",
+            request.project_id.as_str()
+        );
+        if manifest.operation_id != request.operation_id
+            || manifest.project_id != request.project_id
+            || manifest.ticket_run_id != request.ticket_run_id
+            || manifest.format != "okf-0.2"
+            || manifest.relative_path != expected_path
+            || manifest.byte_count > DEFAULT_MAX_ARTICLE_BYTES
+            || manifest.source_digests != expected_sources
+        {
+            return Err(
+                "publication manifest does not match the durable postmortem request".into(),
+            );
+        }
+        if state == "published" {
+            if old_json.as_deref() == Some(json.as_str())
+                && old_digest.as_deref() == Some(manifest_digest.as_str())
+            {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(false);
+            }
+            return Err("immutable publication receipt conflict".into());
+        }
+        if state != "prepared" {
+            return Err(format!("knowledge operation is {state}, not prepared"));
+        }
+        tx.execute("UPDATE knowledge_publications SET state='published',manifest_json=?2,manifest_digest=?3,published_at_unix=?4 WHERE operation_id=?1 AND state='prepared'",params![operation_id.as_str(),json,manifest_digest.as_str(),super::now_unix()?]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    pub fn register_learning_candidate(
+        &mut self,
+        generation: u64,
+        record: &LearningCandidateRecord,
+    ) -> Result<CandidateRegistration, String> {
+        if !(5..=MAX_TRIALS).contains(&record.expected_pairs)
+            || record.package_json.len() > MAX_RECORD_BYTES
+            || record.revision.status != CandidateStatus::Proposed
+        {
+            return Err("candidate package, identity, or trial count exceeds bounds".into());
+        }
+        verify_digest(&record.package_json, &record.package_manifest_digest)?;
+        let revision_json = serde_json::to_string(&record.revision).map_err(|e| e.to_string())?;
+        let role = serde_json::to_value(record.revision.role)
+            .map_err(|e| e.to_string())?
+            .as_str()
+            .ok_or("invalid role")?
+            .to_owned();
+        let status = serde_json::to_value(record.revision.status)
+            .map_err(|e| e.to_string())?
+            .as_str()
+            .ok_or("invalid candidate status")?
+            .to_owned();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let prior:Option<(String,String,String,usize)>=tx.query_row("SELECT revision_json,package_manifest_digest,package_json,expected_pairs FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",params![record.revision.project_id.as_str(),record.revision.candidate_id,record.revision.digest.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
+        if let Some(found) = prior {
+            let expected = (
+                revision_json,
+                record.package_manifest_digest.to_string(),
+                record.package_json.clone(),
+                record.expected_pairs,
+            );
+            if found != expected {
+                return Err("candidate identity has different immutable content".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(CandidateRegistration::AlreadyRegistered);
+        }
+        let mut ledger = CandidateLedger::default();
+        let mut statement = tx
+            .prepare("SELECT revision_json FROM learning_candidates WHERE project_id=?1")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([record.revision.project_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            ledger.revisions.push(
+                serde_json::from_str(&row.map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("stored candidate revision is invalid: {e}"))?,
+            );
+        }
+        drop(statement);
+        let before = ledger.revisions.clone();
+        ledger
+            .register(record.revision.clone())
+            .map_err(|error| error.to_string())?;
+        let retained = ledger
+            .revisions
+            .iter()
+            .map(|revision| (revision.candidate_id.clone(), revision.digest.to_string()))
+            .collect::<std::collections::BTreeSet<_>>();
+        for old in before {
+            if !retained.contains(&(old.candidate_id.clone(), old.digest.to_string())) {
+                tx.execute(
+                    "DELETE FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                    params![record.revision.project_id.as_str(), old.candidate_id, old.digest.as_str()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute("INSERT INTO learning_candidates(project_id,candidate_id,role,digest,profile_id,revision_json,package_manifest_digest,package_json,expected_pairs,status,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![record.revision.project_id.as_str(),record.revision.candidate_id,role,record.revision.digest.as_str(),record.profile_id.as_str(),revision_json,record.package_manifest_digest.as_str(),record.package_json,record.expected_pairs,status,super::now_unix()?]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(CandidateRegistration::Registered)
+    }
+
+    /// One bounded per-project maintenance snapshot for a Supervisor tick.
+    /// Expiration is persisted before the snapshot is returned so a crash/retry
+    /// sees the same terminal candidate revisions and cannot extend their TTL.
+    pub fn maintain_project_supervisor_learning(
+        &mut self,
+        generation: u64,
+        project: &ProjectId,
+        now_utc: &str,
+        knowledge_limit: usize,
+    ) -> Result<ProjectSupervisorMaintenance, String> {
+        if knowledge_limit == 0 || knowledge_limit > MAX_SUPERVISOR_KNOWLEDGE_ITEMS {
+            return Err("Supervisor knowledge batch size is outside the configured bound".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let project_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE project_id=?1)",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !project_exists {
+            return Err("Supervisor learning tick references an unknown project".into());
+        }
+        let mut ledger = CandidateLedger::default();
+        let mut revisions_stmt = tx.prepare(
+            "SELECT revision_json FROM learning_candidates WHERE project_id=?1 ORDER BY created_at_unix,candidate_id,digest",
+        ).map_err(|e|e.to_string())?;
+        let rows = revisions_stmt
+            .query_map([project.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            ledger.revisions.push(
+                serde_json::from_str(&row.map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("stored candidate revision is invalid: {e}"))?,
+            );
+        }
+        drop(revisions_stmt);
+        let expired_candidates = ledger.expire_due(now_utc).map_err(|e| e.to_string())?;
+        for revision in ledger
+            .revisions
+            .iter()
+            .filter(|r| r.status == CandidateStatus::Expired)
+        {
+            set_candidate_revision_status(
+                &tx,
+                project,
+                &revision.candidate_id,
+                &revision.digest,
+                CandidateStatus::Expired,
+            )?;
+        }
+
+        let mut knowledge_stmt = tx.prepare(
+            "SELECT ticket_run_id,request_json,manifest_json,manifest_digest FROM knowledge_publications WHERE project_id=?1 AND state='published' ORDER BY created_at_unix DESC,ticket_run_id DESC LIMIT ?2",
+        ).map_err(|e|e.to_string())?;
+        let knowledge_rows = knowledge_stmt
+            .query_map(params![project.as_str(), knowledge_limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut knowledge = Vec::new();
+        for row in knowledge_rows {
+            let (run_id, request_json, manifest_json, digest) = row.map_err(|e| e.to_string())?;
+            let input: PostmortemInput = crate::protocol::parse_unique(request_json.as_bytes())?;
+            validate_postmortem_input(&input).map_err(|e| e.to_string())?;
+            let manifest: PublicationManifest =
+                crate::protocol::parse_unique(manifest_json.as_bytes())?;
+            let manifest_digest = Digest::parse(digest)?;
+            if manifest.project_id != *project
+                || manifest.ticket_run_id.as_str() != run_id
+                || manifest.operation_id != input.operation_id
+                || manifest_digest.as_str()
+                    != format!(
+                        "{:x}",
+                        Sha256::digest(serde_json::to_vec(&manifest).map_err(|e| e.to_string())?)
+                    )
+                    .as_str()
+            {
+                return Err(
+                    "stored Supervisor knowledge publication has invalid provenance".into(),
+                );
+            }
+            knowledge.push(SupervisorKnowledgeEntry {
+                ticket_run_id: manifest.ticket_run_id,
+                generated_at: input.generated_at,
+                title: input.title,
+                summary: input.summary,
+                findings: input.findings,
+                source_digests: manifest.source_digests,
+            });
+        }
+        drop(knowledge_stmt);
+
+        let mut candidates_stmt = tx.prepare(
+            "SELECT revision_json,profile_id,package_manifest_digest,expected_pairs,evidence_json FROM learning_candidates WHERE project_id=?1 AND status IN ('proposed','trialing','awaiting_approval') ORDER BY created_at_unix,candidate_id,digest LIMIT ?2",
+        ).map_err(|e|e.to_string())?;
+        let candidate_rows = candidates_stmt
+            .query_map(
+                params![project.as_str(), MAX_SUPERVISOR_CANDIDATES as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, usize>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let mut candidates = Vec::new();
+        for row in candidate_rows {
+            let (revision_json, profile_id, manifest_digest, expected_pairs, evidence_json) =
+                row.map_err(|e| e.to_string())?;
+            let revision: CandidateRevision =
+                crate::protocol::parse_unique(revision_json.as_bytes())?;
+            let evidence = evidence_json
+                .map(|json| crate::protocol::parse_unique(json.as_bytes()))
+                .transpose()?;
+            candidates.push(SupervisorCandidateEntry {
+                revision,
+                profile_id: ProfileId::parse(profile_id)?,
+                package_manifest_digest: Digest::parse(manifest_digest)?,
+                expected_pairs,
+                evidence,
+            });
+        }
+        drop(candidates_stmt);
+        let snapshot = ProjectSupervisorMaintenance {
+            project_id: project.clone(),
+            expired_candidates,
+            knowledge,
+            candidates,
+        };
+        if serde_json::to_vec(&snapshot)
+            .map_err(|e| e.to_string())?
+            .len()
+            > MAX_SUPERVISOR_CONTEXT_BYTES
+        {
+            return Err("Supervisor learning context exceeds its aggregate byte limit".into());
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(snapshot)
+    }
+
+    pub fn record_learning_trial(
+        &mut self,
+        generation: u64,
+        project: &ProjectId,
+        candidate_id: &str,
+        digest: &Digest,
+        pair_index: usize,
+        observation: &TrialObservation,
+    ) -> Result<TrialProgress, String> {
+        if pair_index >= MAX_TRIALS {
+            return Err("trial pair index exceeds maximum".into());
+        }
+        let json = serde_json::to_string(observation).map_err(|e| e.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let (expected,status):(usize,String)=tx.query_row("SELECT expected_pairs,status FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",params![project.as_str(),candidate_id,digest.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+        if !matches!(
+            status.as_str(),
+            "proposed" | "trialing" | "awaiting_approval"
+        ) || pair_index >= expected
+        {
+            return Err("candidate does not accept this trial pair".into());
+        }
+        let old:Option<String>=tx.query_row("SELECT observation_json FROM learning_trial_pairs WHERE project_id=?1 AND candidate_id=?2 AND candidate_digest=?3 AND pair_index=?4",params![project.as_str(),candidate_id,digest.as_str(),pair_index],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if let Some(old) = old {
+            if old != json {
+                return Err("trial pair retry conflicts with stored observation".into());
+            }
+        } else {
+            if status == "awaiting_approval" {
+                return Err("completed candidate cannot accept another trial pair".into());
+            }
+            tx.execute("INSERT INTO learning_trial_pairs(project_id,candidate_id,candidate_digest,pair_index,input_digest,observation_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![project.as_str(),candidate_id,digest.as_str(),pair_index,observation.input_digest.as_str(),json,super::now_unix()?]).map_err(|e|e.to_string())?;
+        }
+        let mut stmt=tx.prepare("SELECT pair_index,observation_json FROM learning_trial_pairs WHERE project_id=?1 AND candidate_id=?2 AND candidate_digest=?3 ORDER BY pair_index").map_err(|e|e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![project.as_str(), candidate_id, digest.as_str()],
+                |r| Ok((r.get::<_, usize>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut trials = Vec::new();
+        for row in rows {
+            let (index, json) = row.map_err(|e| e.to_string())?;
+            trials.push(StoredTrial {
+                pair_index: index,
+                observation: serde_json::from_str(&json).map_err(|e| e.to_string())?,
+            })
+        }
+        drop(stmt);
+        let observations = trials
+            .iter()
+            .map(|t| t.observation.clone())
+            .collect::<Vec<_>>();
+        let evidence = evaluate_trials(&observations, expected).map_err(|e| e.to_string())?;
+        let evidence_json = serde_json::to_string(&evidence).map_err(|e| e.to_string())?;
+        let new_status = if trials.len() < expected {
+            "trialing"
+        } else {
+            "awaiting_approval"
+        };
+        let candidate_status = if new_status == "trialing" {
+            CandidateStatus::Trialing
+        } else {
+            CandidateStatus::AwaitingApproval
+        };
+        set_candidate_revision_status(&tx, project, candidate_id, digest, candidate_status)?;
+        tx.execute("UPDATE learning_candidates SET evidence_json=?4 WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",params![project.as_str(),candidate_id,digest.as_str(),evidence_json]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(TrialProgress { trials, evidence })
+    }
+
+    /// Record promotion eligibility from a package carrying a crate-private,
+    /// controller-validated human receipt. This API is crate-private so CLI or
+    /// Agent supplied approver strings can never act as authorization.
+    #[allow(dead_code)]
+    pub(crate) fn register_profile_promotion(
+        &mut self,
+        generation: u64,
+        request: &ProfilePromotionRequest,
+        package: &ProfilePackage,
+    ) -> Result<(), String> {
+        let claims = validated_promotion_claims(package).map_err(|e| e.to_string())?;
+        if claims
+            .response_receipt_digest
+            .as_str()
+            .bytes()
+            .all(|byte| byte == b'0')
+            || !std::path::Path::new(&request.config_source).is_absolute()
+            || request.human_request_id.as_str().is_empty()
+            || request.human_request_id != claims.human_request_id
+        {
+            return Err(
+                "profile promotion needs a validated human response and config source".into(),
+            );
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let candidate: Option<(String, String, Option<String>, String, String)> = tx.query_row(
+            "SELECT role,status,evidence_json,profile_id,package_manifest_digest FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+            params![claims.project_id.as_str(), request.candidate_id, claims.candidate_digest.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((role, status, evidence_json, candidate_profile_id, candidate_manifest_digest)) =
+            candidate
+        else {
+            return Err("approved profile candidate does not exist".into());
+        };
+        if role
+            != serde_json::to_value(claims.role)
+                .map_err(|e| e.to_string())?
+                .as_str()
+                .ok_or("invalid role")?
+            || status != "awaiting_approval"
+        {
+            return Err("profile candidate is not awaiting approval for the approved role".into());
+        }
+        if candidate_profile_id != claims.profile_id.as_str()
+            || candidate_manifest_digest != claims.manifest_digest.as_str()
+        {
+            return Err(
+                "human approval does not match the candidate's complete profile manifest".into(),
+            );
+        }
+        let evidence_json = evidence_json.ok_or("candidate has no completed trial evidence")?;
+        let evidence: TrialEvidence =
+            serde_json::from_str(&evidence_json).map_err(|e| e.to_string())?;
+        if crate::learning::evidence_digest(&evidence).map_err(|e| e.to_string())?
+            != claims.evidence_digest
+        {
+            return Err("human approval does not match the stored trial evidence".into());
+        }
+        let role_name = serde_json::to_value(claims.role)
+            .map_err(|e| e.to_string())?
+            .as_str()
+            .ok_or("invalid role")?
+            .to_owned();
+        let approved_package_json = serde_json::to_string(&StoredApprovedProfilePackage {
+            project_id: claims.project_id.clone(),
+            role: claims.role,
+            profile_id: claims.profile_id.clone(),
+            candidate_digest: claims.candidate_digest.clone(),
+            evidence: package.evidence.clone(),
+            files: package.files.clone(),
+            approver: format!("human request {}", claims.human_request_id),
+            rationale: claims.rationale.clone(),
+            authorized_at: claims.authorized_at.clone(),
+            human_request_id: claims.human_request_id.clone(),
+            approval_subject_digest: claims.approval_subject_digest.clone(),
+            approval_configuration_digest: claims.approval_configuration_digest.clone(),
+            approval_policy_digest: claims.approval_policy_digest.clone(),
+            response_receipt_digest: claims.response_receipt_digest.clone(),
+            config_revision: claims.config_revision.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+        if approved_package_json.len() > MAX_RECORD_BYTES {
+            return Err("approved profile package exceeds the durable intent limit".into());
+        }
+        let prior: Option<PromotionIntentRow> = tx.query_row(
+            "SELECT project_id,candidate_digest,profile_id,role,evidence_digest,manifest_digest,config_source,expected_config_revision,human_request_id,human_response_digest FROM profile_promotions WHERE operation_id=?1",
+            [request.operation_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some(existing) = prior {
+            let expected = (
+                claims.project_id.to_string(),
+                claims.candidate_digest.to_string(),
+                claims.profile_id.to_string(),
+                role_name.clone(),
+                claims.evidence_digest.to_string(),
+                claims.manifest_digest.to_string(),
+                request.config_source.clone(),
+                claims.config_revision.to_string(),
+                request.human_request_id.to_string(),
+                claims.response_receipt_digest.to_string(),
+            );
+            if existing != expected {
+                return Err(
+                    "profile promotion operation ID was reused with different approval".into(),
+                );
+            }
+            let prior_package: String = tx
+                .query_row(
+                    "SELECT approved_package_json FROM profile_promotions WHERE operation_id=?1",
+                    [request.operation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if prior_package != approved_package_json {
+                return Err(
+                    "profile promotion operation was retried with a different package or rationale"
+                        .into(),
+                );
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        tx.execute(
+            "INSERT INTO profile_promotions(operation_id,project_id,candidate_id,candidate_digest,profile_id,role,evidence_digest,manifest_digest,config_source,expected_config_revision,human_request_id,human_response_digest,approval_subject_digest,approval_configuration_digest,approval_policy_digest,approved_package_json,state,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'approved',?17)",
+            params![request.operation_id.as_str(), claims.project_id.as_str(), request.candidate_id,
+                claims.candidate_digest.as_str(), claims.profile_id.as_str(),
+                role_name,
+                claims.evidence_digest.as_str(), claims.manifest_digest.as_str(), request.config_source,
+                claims.config_revision.as_str(), request.human_request_id.as_str(),
+                claims.response_receipt_digest.as_str(), claims.approval_subject_digest.as_str(),
+                claims.approval_configuration_digest.as_str(), claims.approval_policy_digest.as_str(),
+                approved_package_json, super::now_unix()?],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn begin_profile_publication(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let promotion: Option<(String, String)> = tx
+            .query_row(
+                "SELECT project_id,manifest_digest FROM profile_promotions WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((project_id, manifest_digest)) = promotion else {
+            return Err("profile promotion does not exist".into());
+        };
+        let changed = tx.execute(
+            "UPDATE profile_promotions SET state='publication_pending' WHERE operation_id=?1 AND state='approved'",
+            [operation_id.as_str()],
+        ).map_err(|e| e.to_string())? == 1;
+        if changed {
+            let project_revision: u64 = tx
+                .query_row(
+                    "SELECT state_revision FROM projects WHERE project_id=?1",
+                    [&project_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let request_json = super::canonical_json(&serde_json::json!({
+                "operation_id": operation_id.as_str(),
+                "manifest_digest": manifest_digest,
+            }))?;
+            let effect = super::EffectIntent {
+                project_id: ProjectId::parse(project_id.clone())?,
+                subject_type: "project".into(),
+                subject_id: project_id,
+                operation_id: operation_id.to_string(),
+                logical_key: format!("publish-profile-{}", operation_id),
+                kind: "publish_profile".into(),
+                request_digest: super::content_digest(&request_json),
+                request_json,
+                expected_revision: Some(project_revision),
+            };
+            super::insert_effect(&tx, &effect, super::now_unix()?)?;
+        }
+        if !changed {
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM profile_promotions WHERE operation_id=?1",
+                    [operation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if state.as_deref() != Some("publication_pending")
+                && state.as_deref() != Some("published")
+                && state.as_deref() != Some("activation_pending")
+                && state.as_deref() != Some("active")
+            {
+                return Err("profile promotion is not approved for publication".into());
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_profile_publication(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+        receipt: &ProfilePublicationReceipt,
+    ) -> Result<bool, String> {
+        let receipt_json = serde_json::to_string(&StoredProfilePublicationReceipt {
+            profile_path: receipt.profile_path.display().to_string(),
+            manifest_digest: receipt.profile_manifest_digest.clone(),
+            human_response_receipt_digest: receipt.human_response_receipt_digest.clone(),
+            already_published: receipt.status == ProfilePublicationStatus::AlreadyPublished,
+        })
+        .map_err(|e| e.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let row: Option<(String, String, Option<String>)> = tx.query_row(
+            "SELECT state,manifest_digest,publication_receipt_json FROM profile_promotions WHERE operation_id=?1",
+            [operation_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((state, expected_manifest, prior)) = row else {
+            return Err("profile publication has no approved intent".into());
+        };
+        if expected_manifest != receipt.profile_manifest_digest.as_str() {
+            return Err("profile publication manifest differs from human-approved package".into());
+        }
+        let expected_response: String = tx
+            .query_row(
+                "SELECT human_response_digest FROM profile_promotions WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if expected_response != receipt.human_response_receipt_digest.as_str() {
+            return Err("profile publication receipt is bound to another human response".into());
+        }
+        if matches!(
+            state.as_str(),
+            "published" | "activation_pending" | "active"
+        ) {
+            let old: StoredProfilePublicationReceipt = serde_json::from_str(
+                prior
+                    .as_deref()
+                    .ok_or("published profile is missing its receipt")?,
+            )
+            .map_err(|e| format!("stored profile receipt is invalid: {e}"))?;
+            let new: StoredProfilePublicationReceipt =
+                serde_json::from_str(&receipt_json).map_err(|e| e.to_string())?;
+            if old.profile_path == new.profile_path
+                && old.manifest_digest == new.manifest_digest
+                && old.human_response_receipt_digest == new.human_response_receipt_digest
+            {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(false);
+            }
+            return Err(
+                "profile publication receipt conflicts with immutable stored receipt".into(),
+            );
+        }
+        if state != "publication_pending" {
+            return Err("profile publication was not prepared".into());
+        }
+        tx.execute("UPDATE profile_promotions SET state='published',publication_receipt_json=?2 WHERE operation_id=?1", params![operation_id.as_str(), receipt_json]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// Mark a candidate active only after ConfigStore has accepted the exact
+    /// applied snapshot and it binds this project/role to the approved profile.
+    /// The caller writes an activation intent first; if the process stops after
+    /// `apply_snapshot`, the same target revision and digest can be reconciled.
+    #[allow(dead_code)]
+    pub(crate) fn prepare_profile_activation(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+        expected_current_revision: crate::domain::ids::Revision,
+        target_config_digest: &Digest,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let row: Option<(String, String, Option<u64>, Option<String>)> = tx.query_row(
+            "SELECT state,config_source,activation_to_revision,activation_config_digest FROM profile_promotions WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((state, source, prior_target_revision, prior_target_digest)) = row else {
+            return Err("profile activation has no promotion intent".into());
+        };
+        if state == "active" {
+            if prior_target_digest.as_deref() == Some(target_config_digest.as_str()) {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(false);
+            }
+            return Err("profile promotion is already active at another config revision".into());
+        }
+        if state == "activation_pending" {
+            if prior_target_digest.as_deref() != Some(target_config_digest.as_str()) {
+                return Err("profile activation retry changed its target config digest".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        if state != "published" {
+            return Err("profile package must be published before config activation".into());
+        }
+        let current: Option<(u64, String)> = tx.query_row(
+            "SELECT current.revision,snapshots.digest FROM config_current current JOIN config_snapshots snapshots USING(source_identity,revision) WHERE current.source_identity=?1",
+            [&source],
+            |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let Some((current_revision, current_digest)) = current else {
+            return Err("profile config source has no applied snapshot".into());
+        };
+        if current_revision != expected_current_revision.0 {
+            return Err("profile config source changed before activation intent".into());
+        }
+        let target_revision = current_revision
+            .checked_add(1)
+            .ok_or("profile config revision is exhausted")?;
+        tx.execute(
+            "UPDATE profile_promotions SET state='activation_pending',activation_from_revision=?2,activation_to_revision=?3,activation_config_digest=?4 WHERE operation_id=?1 AND state='published'",
+            params![operation_id.as_str(),current_revision,target_revision,target_config_digest.as_str()],
+        ).map_err(|e|e.to_string())?;
+        // Make sure a pending target cannot be confused with an already applied revision.
+        if current_digest == target_config_digest.as_str() {
+            return Err("target profile config is already applied; reconcile it before starting a new activation".into());
+        }
+        if prior_target_revision.is_some() {
+            return Err("published profile unexpectedly has a prior activation target".into());
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn confirm_profile_activation(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+        applied: &super::AppliedRevision,
+    ) -> Result<bool, String> {
+        let row: Option<PromotionDbRow> = self.connection.query_row(
+            "SELECT project_id,profile_id,role,config_source,state,candidate_digest,applied_config_revision,applied_config_digest,activation_to_revision,activation_config_digest FROM profile_promotions WHERE operation_id=?1",
+            [operation_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((
+            project_id,
+            profile_id,
+            role,
+            source,
+            state,
+            candidate_digest,
+            old_revision,
+            old_digest,
+            activation_target_revision,
+            activation_target_digest,
+        )) = row
+        else {
+            return Err("profile activation has no promotion intent".into());
+        };
+        if !matches!(state.as_str(), "activation_pending" | "active") {
+            return Err("profile package is not durably published".into());
+        }
+        let snapshot = self
+            .load_snapshot(&source)?
+            .ok_or("applied declarative config snapshot is missing")?;
+        if snapshot.revision != applied.revision || snapshot.config.digest != applied.digest {
+            return Err(
+                "promotion activation does not match the current ConfigStore CAS snapshot".into(),
+            );
+        }
+        if activation_target_revision != Some(applied.revision.0)
+            || activation_target_digest.as_deref() != Some(applied.digest.as_str())
+        {
+            return Err(
+                "applied config snapshot does not match the durable profile activation intent"
+                    .into(),
+            );
+        }
+        let project = ProjectId::parse(project_id.clone())?;
+        let profile = crate::domain::ids::ProfileId::parse(profile_id.clone())?;
+        let role: crate::domain::types::Role = serde_json::from_str(&format!("\"{role}\""))
+            .map_err(|e| format!("stored promotion role is invalid: {e}"))?;
+        let project_config = snapshot
+            .config
+            .config
+            .projects
+            .get(&project)
+            .ok_or("applied config does not contain the approved project")?;
+        if project_config.roles.get(&role) != Some(&profile)
+            || !snapshot.config.profiles.contains_key(&profile)
+        {
+            return Err(
+                "applied config does not bind the approved profile to the approved role".into(),
+            );
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let current: Option<(u64, String)> = tx.query_row(
+            "SELECT current.revision,snapshots.digest FROM config_current current JOIN config_snapshots snapshots USING(source_identity,revision) WHERE current.source_identity=?1",
+            [&source], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        if current != Some((applied.revision.0, applied.digest.to_string())) {
+            return Err("config source advanced before profile activation was recorded".into());
+        }
+        if state == "active" {
+            if old_revision != Some(applied.revision.0)
+                || old_digest.as_deref() != Some(applied.digest.as_str())
+            {
+                return Err("profile promotion is active at a different config revision".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        tx.execute("UPDATE profile_promotions SET state='active',applied_config_revision=?2,applied_config_digest=?3 WHERE operation_id=?1", params![operation_id.as_str(),applied.revision.0,applied.digest.as_str()]).map_err(|e| e.to_string())?;
+        let role_name = serde_json::to_value(role)
+            .map_err(|e| e.to_string())?
+            .as_str()
+            .ok_or("invalid role")?
+            .to_owned();
+        let mut prior_stmt = tx.prepare("SELECT candidate_id,digest FROM learning_candidates WHERE project_id=?1 AND role=?2 AND status='promoted'").map_err(|e|e.to_string())?;
+        let prior_rows = prior_stmt
+            .query_map(params![project.as_str(), role_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut prior_candidates = Vec::new();
+        for row in prior_rows {
+            prior_candidates.push(row.map_err(|e| e.to_string())?);
+        }
+        drop(prior_stmt);
+        for (old_id, old_digest) in prior_candidates {
+            set_candidate_revision_status(
+                &tx,
+                &project,
+                &old_id,
+                &Digest::parse(old_digest)?,
+                CandidateStatus::Superseded,
+            )?;
+        }
+        let changed = tx.execute("UPDATE learning_candidates SET status='promoted' WHERE project_id=?1 AND candidate_digest=?2 AND candidate_id=(SELECT candidate_id FROM profile_promotions WHERE operation_id=?3) AND status='awaiting_approval'", params![project.as_str(),candidate_digest,operation_id.as_str()]).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("approved profile candidate disappeared before activation".into());
+        }
+        let promoted_id: String = tx
+            .query_row(
+                "SELECT candidate_id FROM profile_promotions WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        set_candidate_revision_status(
+            &tx,
+            &project,
+            &promoted_id,
+            &Digest::parse(candidate_digest)?,
+            CandidateStatus::Promoted,
+        )?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+}
+
+fn set_candidate_revision_status(
+    tx: &rusqlite::Transaction<'_>,
+    project: &ProjectId,
+    candidate_id: &str,
+    digest: &Digest,
+    status: CandidateStatus,
+) -> Result<(), String> {
+    let revision_json: String = tx.query_row(
+        "SELECT revision_json FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+        params![project.as_str(),candidate_id,digest.as_str()],
+        |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    let mut revision: CandidateRevision = serde_json::from_str(&revision_json)
+        .map_err(|e| format!("stored candidate revision is invalid: {e}"))?;
+    revision.status = status;
+    let revision_json = serde_json::to_string(&revision).map_err(|e| e.to_string())?;
+    let status = serde_json::to_value(status)
+        .map_err(|e| e.to_string())?
+        .as_str()
+        .ok_or("invalid candidate status")?
+        .to_owned();
+    tx.execute(
+        "UPDATE learning_candidates SET status=?4,revision_json=?5 WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+        params![project.as_str(),candidate_id,digest.as_str(),status,revision_json],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn verify_digest(json: &str, digest: &Digest) -> Result<(), String> {
+    let actual = format!("{:x}", Sha256::digest(json.as_bytes()));
+    if actual != digest.as_str() {
+        Err("serialized value digest mismatch".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    use rusqlite::Connection;
+    use sha2::{Digest as _, Sha256};
+    use tempfile::TempDir;
+
+    use super::{
+        CandidateRegistration, KnowledgePublicationIntent, LearningCandidateRecord, StoredTrial,
+        migrate_v10,
+    };
+    use crate::config::{AppliedConfig, SourceFile, SourceKind};
+    use crate::domain::ids::{
+        Digest, OperationId, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
+    };
+    use crate::domain::types::Role;
+    use crate::knowledge::PostmortemInput;
+    use crate::knowledge_effect::KnowledgeEffectHandler;
+    use crate::learning::{
+        CandidateRevision, CandidateStatus, TrialObservation, TrialOutcome, TrialRunStatus,
+    };
+    use crate::store::{
+        ConfigStore, DurableInput, EffectIntent, ExpectedRevision, OwnerMetadata, ProjectRecord,
+        content_digest, durable_input_digest,
+    };
+
+    fn v9_fixture() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_unix INTEGER NOT NULL);
+             CREATE TABLE projects(project_id TEXT PRIMARY KEY);
+             CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id));
+             PRAGMA user_version=9;",
+        ).unwrap();
+        connection
+    }
+
+    #[test]
+    fn migration_requires_v9_and_installs_all_durable_ledgers_atomically() {
+        let wrong = Connection::open_in_memory().unwrap();
+        wrong.pragma_update(None, "user_version", 8).unwrap();
+        assert!(migrate_v10(&wrong).is_err());
+        let fixture = v9_fixture();
+        migrate_v10(&fixture).unwrap();
+        let version: i64 = fixture
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        for table in [
+            "knowledge_publications",
+            "learning_candidates",
+            "learning_trial_pairs",
+            "profile_promotions",
+        ] {
+            let exists: bool = fixture
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing {table}");
+        }
+    }
+
+    fn test_snapshot() -> AppliedConfig {
+        AppliedConfig {
+            config: serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "adapters": {"tickets": {"kind":"command","command":["test"],"status_values":{
+                    "triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"
+                }}},
+                "projects": {}
+            })).unwrap(),
+            profiles: BTreeMap::new(),
+            source_root: "/tmp/rex-projects-test-config".into(),
+            source_files: vec![SourceFile {
+                kind: SourceKind::File,
+                path: "/tmp/rex-projects-test-config/config.toml".into(),
+                canonical_path: "/tmp/rex-projects-test-config/config.toml".into(),
+                sha256: Digest::parse("a".repeat(64)).unwrap(),
+                bytes: 1,
+                contents: "x".into(),
+            }],
+            digest: Digest::parse("a".repeat(64)).unwrap(),
+        }
+    }
+
+    fn running_store() -> (TempDir, ConfigStore, ProjectId, u64, TicketRunId) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot("factory", &test_snapshot(), ExpectedRevision::Bootstrap)
+            .unwrap();
+        let project_id = ProjectId::parse("sample").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: applied.digest,
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "test-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let run = TicketRunId::parse("sample-1-g1").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &TicketNamespace::parse("github:org/repo").unwrap(),
+                &TicketId::parse("1").unwrap(),
+                &run,
+                1,
+                "postmortem",
+                "In Progress",
+            )
+            .unwrap();
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10, "ConfigStore applies the ordered v10 migration");
+        (temp, store, project_id, generation, run)
+    }
+
+    #[test]
+    fn publication_intent_and_receipt_are_durable_idempotent_and_subject_bound() {
+        let (temp, mut store, project, generation, run) = running_store();
+        let input = PostmortemInput {
+            operation_id: OperationId::parse("postmortem-op-1").unwrap(),
+            project_id: project.clone(),
+            ticket_run_id: run.clone(),
+            title: "Learning".into(),
+            summary: "A concise summary.".into(),
+            findings: vec![],
+            sources: vec![],
+            generated_at: "2026-11-07T00:00:00Z".into(),
+            max_source_bytes: 1024,
+        };
+        let request_json = serde_json::to_string(&input).unwrap();
+        let request_digest =
+            Digest::parse(format!("{:x}", Sha256::digest(request_json.as_bytes()))).unwrap();
+        let intent = KnowledgePublicationIntent {
+            operation_id: input.operation_id.clone(),
+            project_id: project.clone(),
+            ticket_run_id: run.clone(),
+            request_digest,
+            request_json,
+        };
+        assert!(
+            store
+                .prepare_knowledge_publication(generation, &intent)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .knowledge_publication_intent(&input.operation_id)
+                .unwrap(),
+            Some(intent.clone())
+        );
+        assert!(
+            !store
+                .prepare_knowledge_publication(generation, &intent)
+                .unwrap()
+        );
+        let effect_count: usize = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM effects WHERE operation_id=?1 AND kind='publish_knowledge'",
+                [input.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effect_count, 1);
+        let transition_input = DurableInput {
+            producer_id: "postmortem-agent".into(),
+            message_id: "knowledge-published-1".into(),
+            content_digest: durable_input_digest(
+                "ticket_run",
+                "{\"input\":\"knowledge_published\"}",
+            ),
+            recipient: "ticket_run".into(),
+            payload: "{\"input\":\"knowledge_published\"}".into(),
+        };
+        let complete_effect = EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: run.to_string(),
+            operation_id: "complete-ticket-1".into(),
+            logical_key: "complete-ticket-r1".into(),
+            kind: "complete_ticket".into(),
+            request_json: "{}".into(),
+            request_digest: content_digest("{}"),
+            expected_revision: Some(1),
+        };
+        assert!(
+            store
+                .commit_ticket_transition(
+                    generation,
+                    &run,
+                    Revision(0),
+                    &transition_input,
+                    crate::engine::reducer::Input::KnowledgePublished,
+                    "Postmortem receipt is required before completion.",
+                    "{}",
+                    std::slice::from_ref(&complete_effect),
+                )
+                .err()
+                .unwrap()
+                .contains("durable knowledge publication")
+        );
+        let effect = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let knowledge_root = temp.path().join("knowledge");
+        let handler = KnowledgeEffectHandler::new(knowledge_root.clone());
+        let receipt = handler.execute(&mut store, generation, &effect).unwrap();
+        let moved_root = temp.path().join("knowledge-published-before-crash");
+        fs::rename(&knowledge_root, &moved_root).unwrap();
+        let replay = handler.execute(&mut store, generation, &effect).unwrap();
+        assert_eq!(replay, receipt);
+        assert!(
+            !knowledge_root.exists(),
+            "terminal receipt replay reran filesystem publication"
+        );
+        let transition = store
+            .commit_ticket_transition(
+                generation,
+                &run,
+                Revision(0),
+                &transition_input,
+                crate::engine::reducer::Input::KnowledgePublished,
+                "Postmortem receipt is required before completion.",
+                "{}",
+                std::slice::from_ref(&complete_effect),
+            )
+            .unwrap();
+        assert_eq!(transition.receipt["revision"], 1);
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM knowledge_publications WHERE operation_id=?1",
+                [input.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "published");
+    }
+
+    #[test]
+    fn candidates_and_trial_pairs_survive_database_round_trips_and_reject_conflicts() {
+        let (_temp, mut store, project, generation, _) = running_store();
+        let package_json = r#"{"instructions":"Keep changes focused."}"#.to_owned();
+        let package_digest =
+            Digest::parse(format!("{:x}", Sha256::digest(package_json.as_bytes()))).unwrap();
+        let candidate_digest = Digest::parse("b".repeat(64)).unwrap();
+        let record = LearningCandidateRecord {
+            revision: CandidateRevision {
+                candidate_id: "worker-profile-v2".into(),
+                project_id: project.clone(),
+                role: Role::Worker,
+                digest: candidate_digest.clone(),
+                created_at: "2026-11-07T00:00:00Z".into(),
+                expires_at: "2026-12-07T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            },
+            profile_id: ProfileId::parse("worker-profile").unwrap(),
+            package_manifest_digest: package_digest,
+            package_json,
+            expected_pairs: 5,
+        };
+        assert_eq!(
+            store
+                .register_learning_candidate(generation, &record)
+                .unwrap(),
+            CandidateRegistration::Registered
+        );
+        assert_eq!(
+            store
+                .register_learning_candidate(generation, &record)
+                .unwrap(),
+            CandidateRegistration::AlreadyRegistered
+        );
+        for pair_index in 0usize..5 {
+            let observation = TrialObservation {
+                input_digest: Digest::parse(format!(
+                    "{:x}",
+                    Sha256::digest(pair_index.to_be_bytes())
+                ))
+                .unwrap(),
+                baseline: TrialRunStatus::Equivalent,
+                candidate: TrialRunStatus::Improved,
+            };
+            let progress = store
+                .record_learning_trial(
+                    generation,
+                    &project,
+                    &record.revision.candidate_id,
+                    &candidate_digest,
+                    pair_index,
+                    &observation,
+                )
+                .unwrap();
+            if pair_index == 4 {
+                assert_eq!(progress.evidence.outcome, TrialOutcome::Improved);
+            }
+            assert_eq!(
+                progress.trials.last().unwrap(),
+                &StoredTrial {
+                    pair_index,
+                    observation
+                }
+            );
+        }
+        let conflict = TrialObservation {
+            input_digest: Digest::parse("c".repeat(64)).unwrap(),
+            baseline: TrialRunStatus::Equivalent,
+            candidate: TrialRunStatus::Failed,
+        };
+        assert!(
+            store
+                .record_learning_trial(
+                    generation,
+                    &project,
+                    &record.revision.candidate_id,
+                    &candidate_digest,
+                    0,
+                    &conflict
+                )
+                .is_err()
+        );
+        let count: usize = store
+            .connection
+            .query_row("SELECT count(*) FROM learning_trial_pairs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 5);
+        let supervisor = store
+            .maintain_project_supervisor_learning(generation, &project, "2026-11-08T00:00:00Z", 12)
+            .unwrap();
+        assert_eq!(supervisor.project_id, project);
+        assert_eq!(supervisor.expired_candidates, 0);
+        assert_eq!(supervisor.knowledge.len(), 0);
+        assert_eq!(supervisor.candidates.len(), 1);
+        assert_eq!(
+            supervisor.candidates[0].evidence.as_ref().unwrap().outcome,
+            TrialOutcome::Improved
+        );
+        let _ = ProfileId::parse("worker-profile").unwrap();
+    }
+}

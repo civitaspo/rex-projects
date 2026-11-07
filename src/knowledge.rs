@@ -32,7 +32,7 @@ pub struct KnowledgeSource {
     pub trusted: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PostmortemInput {
     pub operation_id: OperationId,
     pub project_id: ProjectId,
@@ -103,7 +103,7 @@ pub fn publish_postmortem(
     root: &Path,
     input: &PostmortemInput,
 ) -> Result<PublicationReceipt, KnowledgeError> {
-    validate_input(input)?;
+    validate_postmortem_input(input)?;
     let root = canonical_root(root)?;
     let project_dir = ensure_child_dir(&root, "projects")?;
     let project_dir = ensure_child_dir(&project_dir, input.project_id.as_str())?;
@@ -263,7 +263,7 @@ fn ensure_child_dir(parent: &Path, name: &str) -> Result<PathBuf, KnowledgeError
     Ok(path)
 }
 
-fn validate_input(input: &PostmortemInput) -> Result<(), KnowledgeError> {
+pub(crate) fn validate_postmortem_input(input: &PostmortemInput) -> Result<(), KnowledgeError> {
     if input.title.trim().is_empty()
         || input.summary.trim().is_empty()
         || input.generated_at.trim().is_empty()

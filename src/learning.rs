@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{Digest, ProfileId, ProjectId};
+use crate::domain::ids::{Digest, HumanRequestId, ProfileId, ProjectId};
 use crate::domain::types::Role;
 
 pub const MAX_TRIAL_PAIRS_PER_REVISION: usize = 10;
@@ -244,6 +244,38 @@ fn sortable_utc(value: &str) -> bool {
     (1..=month_days).contains(&day)
 }
 
+fn unix_seconds_to_utc(seconds: u64) -> Result<String, LearningError> {
+    let days = i64::try_from(seconds / 86_400)
+        .map_err(|_| LearningError::Invalid("approval timestamp is out of range".into()))?;
+    let day_seconds = seconds % 86_400;
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    if !(1..=9999).contains(&year) {
+        return Err(LearningError::Invalid(
+            "approval timestamp is out of range".into(),
+        ));
+    }
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds % 3_600 / 60;
+    let second = day_seconds % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
+}
+
 /// Account for every reserved pair, including timeouts and failures. The fixed
 /// sample is process governance, not statistical proof of effectiveness.
 pub fn evaluate_trials(
@@ -331,6 +363,10 @@ pub(crate) struct ValidatedHumanApproval {
     approved_manifest_digest: Digest,
     approved_evidence_digest: Digest,
     approved_config_revision: Digest,
+    human_request_id: HumanRequestId,
+    approval_subject_digest: Digest,
+    approval_configuration_digest: Digest,
+    approval_policy_digest: Digest,
     response_receipt_digest: Digest,
     authorized_at: String,
 }
@@ -339,7 +375,7 @@ impl ValidatedHumanApproval {
     // Wired by the controller when its durable human-response receipt is added.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_validated_response(
+    fn from_validated_response(
         approver: String,
         rationale: String,
         project_id: ProjectId,
@@ -349,6 +385,10 @@ impl ValidatedHumanApproval {
         manifest_digest: Digest,
         evidence_digest: Digest,
         config_revision: Digest,
+        human_request_id: HumanRequestId,
+        approval_subject_digest: Digest,
+        approval_configuration_digest: Digest,
+        approval_policy_digest: Digest,
         response_receipt_digest: Digest,
         authorized_at: String,
     ) -> Self {
@@ -362,10 +402,190 @@ impl ValidatedHumanApproval {
             approved_manifest_digest: manifest_digest,
             approved_evidence_digest: evidence_digest,
             approved_config_revision: config_revision,
+            human_request_id,
+            approval_subject_digest,
+            approval_configuration_digest,
+            approval_policy_digest,
             response_receipt_digest,
             authorized_at,
         }
     }
+}
+
+/// Crate-private claims extracted only after validating a ProfilePackage's
+/// crate-private approval object and complete file/evidence digests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Consumed by ConfigStore promotion persistence.
+pub(crate) struct ValidatedPromotionClaims {
+    pub project_id: ProjectId,
+    pub role: Role,
+    pub profile_id: ProfileId,
+    pub candidate_digest: Digest,
+    pub manifest_digest: Digest,
+    pub evidence_digest: Digest,
+    pub config_revision: Digest,
+    pub human_request_id: HumanRequestId,
+    pub approval_subject_digest: Digest,
+    pub approval_configuration_digest: Digest,
+    pub approval_policy_digest: Digest,
+    pub response_receipt_digest: Digest,
+    pub rationale: String,
+    pub authorized_at: String,
+}
+
+#[allow(dead_code)] // Consumed by ConfigStore promotion persistence.
+pub(crate) fn validated_promotion_claims(
+    package: &ProfilePackage,
+) -> Result<ValidatedPromotionClaims, LearningError> {
+    validate_package(package)?;
+    Ok(ValidatedPromotionClaims {
+        project_id: package.approval.approved_project_id.clone(),
+        role: package.approval.approved_role,
+        profile_id: package.approval.approved_profile_id.clone(),
+        candidate_digest: package.approval.approved_candidate_digest.clone(),
+        manifest_digest: package.approval.approved_manifest_digest.clone(),
+        evidence_digest: package.approval.approved_evidence_digest.clone(),
+        config_revision: package.approval.approved_config_revision.clone(),
+        human_request_id: package.approval.human_request_id.clone(),
+        approval_subject_digest: package.approval.approval_subject_digest.clone(),
+        approval_configuration_digest: package.approval.approval_configuration_digest.clone(),
+        approval_policy_digest: package.approval.approval_policy_digest.clone(),
+        response_receipt_digest: package.approval.response_receipt_digest.clone(),
+        rationale: package.approval.rationale.clone(),
+        authorized_at: package.approval.authorized_at.clone(),
+    })
+}
+
+/// Stable digest of the complete profile package and config revision a person approves.
+/// Callers use this when creating the durable human request; approval conversion recomputes it.
+#[derive(Serialize)]
+struct ProfileApprovalSubject<'a> {
+    project_id: &'a ProjectId,
+    role: Role,
+    profile_id: &'a ProfileId,
+    candidate_digest: &'a Digest,
+    manifest_digest: &'a Digest,
+    evidence_digest: &'a Digest,
+    config_revision: &'a Digest,
+}
+
+pub fn profile_approval_subject_digest(
+    project_id: &ProjectId,
+    role: Role,
+    profile_id: &ProfileId,
+    candidate_digest: &Digest,
+    files: &BTreeMap<String, Vec<u8>>,
+    evidence: &TrialEvidence,
+    config_revision: &Digest,
+) -> Result<Digest, LearningError> {
+    let manifest_digest = manifest_digest(files)?;
+    let evidence_digest = evidence_digest(evidence)?;
+    let subject = ProfileApprovalSubject {
+        project_id,
+        role,
+        profile_id,
+        candidate_digest,
+        manifest_digest: &manifest_digest,
+        evidence_digest: &evidence_digest,
+        config_revision,
+    };
+    let mut bytes = b"rex-projects-profile-approval-v1\0".to_vec();
+    bytes.extend(serde_json::to_vec(&subject)?);
+    Ok(as_digest(Sha256::digest(bytes).as_slice()))
+}
+
+/// Convert an opaque receipt minted by the durable human runtime into a promotion package.
+/// Every approved field is recomputed from the complete package and compared with the receipt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn profile_package_from_accepted_approval(
+    receipt: &crate::store::human::HumanApprovalReceipt,
+    project_id: ProjectId,
+    role: Role,
+    profile_id: ProfileId,
+    candidate_digest: Digest,
+    evidence: TrialEvidence,
+    files: BTreeMap<String, Vec<u8>>,
+    config_revision: Digest,
+    configuration_digest: Digest,
+    policy_digest: Digest,
+    now_unix: u64,
+) -> Result<ProfilePackage, LearningError> {
+    if !receipt.approved()
+        || receipt.choice() != crate::human_runtime::HumanDecisionChoice::Approve
+        || now_unix >= receipt.request_expires_at_unix()
+    {
+        return Err(LearningError::Invalid(
+            "profile promotion requires a current accepted human approval".into(),
+        ));
+    }
+    let manifest = manifest_digest(&files)?;
+    let evidence_hash = evidence_digest(&evidence)?;
+    let subject = profile_approval_subject_digest(
+        &project_id,
+        role,
+        &profile_id,
+        &candidate_digest,
+        &files,
+        &evidence,
+        &config_revision,
+    )?;
+    if receipt.subject_digest() != &subject
+        || receipt.configuration_digest() != &configuration_digest
+        || receipt.policy_digest() != &policy_digest
+    {
+        return Err(LearningError::Conflict(
+            "human approval does not bind the complete profile and current config/policy".into(),
+        ));
+    }
+    let rationale = receipt
+        .explanation()
+        .ok_or_else(|| LearningError::Invalid("human approval rationale is required".into()))?
+        .to_owned();
+    if rationale.trim().is_empty()
+        || (evidence.outcome == TrialOutcome::Inconclusive && rationale.trim().len() < 20)
+    {
+        return Err(LearningError::Invalid(
+            "human rationale must be present and scope inconclusive evidence".into(),
+        ));
+    }
+    let authorized_at = unix_seconds_to_utc(receipt.decided_at_unix())?;
+    let receipt_bytes = serde_json::to_vec(&(
+        receipt.request_id(),
+        receipt.response_id(),
+        receipt.subject_digest(),
+        receipt.configuration_digest(),
+        receipt.policy_digest(),
+        receipt.choice(),
+        receipt.decided_at_unix(),
+        receipt.request_expires_at_unix(),
+        &rationale,
+    ))?;
+    let response_receipt_digest = as_digest(Sha256::digest(receipt_bytes).as_slice());
+    Ok(ProfilePackage {
+        project_id: project_id.clone(),
+        role,
+        profile_id: profile_id.clone(),
+        candidate_digest: candidate_digest.clone(),
+        evidence,
+        files,
+        approval: ValidatedHumanApproval {
+            approver: format!("human request {}", receipt.request_id()),
+            rationale,
+            approved_project_id: project_id,
+            approved_role: role,
+            approved_profile_id: profile_id,
+            approved_candidate_digest: candidate_digest,
+            approved_manifest_digest: manifest,
+            approved_evidence_digest: evidence_hash,
+            approved_config_revision: config_revision,
+            human_request_id: receipt.request_id().clone(),
+            approval_subject_digest: subject,
+            approval_configuration_digest: configuration_digest,
+            approval_policy_digest: policy_digest,
+            response_receipt_digest,
+            authorized_at,
+        },
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1210,6 +1430,10 @@ mod tests {
                 md,
                 evidence_digest(&evidence).unwrap(),
                 revision,
+                HumanRequestId::parse("test-human-request").unwrap(),
+                hash(b"approval subject"),
+                hash(b"approval config"),
+                hash(b"approval policy"),
                 hash(b"validated human response receipt"),
                 "2026-11-07T00:00:00Z".into(),
             ),
@@ -1217,6 +1441,69 @@ mod tests {
     }
     fn hash(bytes: &[u8]) -> Digest {
         as_digest(&Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn profile_approval_subject_binds_role_manifest_evidence_and_config_revision() {
+        let project = ProjectId::parse("proj").unwrap();
+        let profile = ProfileId::parse("worker-profile").unwrap();
+        let candidate = hash(b"candidate");
+        let revision = hash(b"config revision");
+        let evidence = TrialEvidence {
+            outcome: TrialOutcome::Improved,
+            distinct_inputs: 5,
+            completed_pairs: 5,
+            timed_out_pairs: 0,
+            improved_pairs: 2,
+            regressed_pairs: 0,
+            rationale: "bounded qualitative comparison".into(),
+        };
+        let files = BTreeMap::from([("instructions.md".into(), b"bounded".to_vec())]);
+        let digest = profile_approval_subject_digest(
+            &project,
+            Role::Worker,
+            &profile,
+            &candidate,
+            &files,
+            &evidence,
+            &revision,
+        )
+        .unwrap();
+        assert_ne!(
+            digest,
+            profile_approval_subject_digest(
+                &project,
+                Role::Reviewer,
+                &profile,
+                &candidate,
+                &files,
+                &evidence,
+                &revision,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            digest,
+            profile_approval_subject_digest(
+                &project,
+                Role::Worker,
+                &profile,
+                &candidate,
+                &files,
+                &evidence,
+                &hash(b"other config"),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn human_receipt_unix_timestamp_formats_real_utc_calendar_dates() {
+        assert_eq!(unix_seconds_to_utc(0).unwrap(), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            unix_seconds_to_utc(951_782_400).unwrap(),
+            "2000-02-29T00:00:00Z"
+        );
     }
     #[test]
     fn profile_promotion_requires_cas_and_is_no_replace() {

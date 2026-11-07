@@ -20,8 +20,16 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 pub mod human;
+#[path = "store/learning.rs"]
+mod learning_store;
+pub use learning_store::{
+    CandidateRegistration, KnowledgePublicationIntent, KnowledgePublicationReceipt,
+    LearningCandidateRecord, ProfilePromotionIntent, ProjectSupervisorMaintenance,
+    StoredApprovedProfilePackage, StoredTrial, SupervisorCandidateEntry, SupervisorKnowledgeEntry,
+    TrialProgress,
+};
 pub mod scheduler;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
@@ -424,6 +432,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             scheduler::migrate_v9(&connection)?;
+        }
+        if existing_version < 10 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            learning_store::migrate_v10(&connection)?;
         }
         Ok(Self {
             connection,
@@ -2153,6 +2167,9 @@ impl ConfigStore {
         completion_proof: Option<&crate::engine::ticket_effects::TicketCompletionProof>,
     ) -> Result<InputReceipt, String> {
         validate_input(input)?;
+        if matches!(transition, Input::KnowledgePublished) {
+            self.ensure_postmortem_published(ticket_run_id)?;
+        }
         if reason.is_empty()
             || reason.len() > 1024
             || evidence_json.len() > MAX_INPUT_BYTES
@@ -4414,12 +4431,9 @@ mod tests {
             "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'factory-block','synthetic-run','supervisor','factory','completed',1,1,1)",
             [view_id.as_str()],
         ).unwrap();
-        store.connection.execute_batch(
-            "CREATE TABLE human_requests(request_id TEXT PRIMARY KEY,rex_view_id TEXT NOT NULL,lifecycle TEXT NOT NULL);",
-        ).unwrap();
         store.connection.execute(
-            "INSERT INTO human_requests(request_id,rex_view_id,lifecycle) VALUES ('request-1',?1,'pending')",
-            [view_id.as_str()],
+            "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix) VALUES ('request-1',?2,'ticket_review','ticket_run','run-1',0,?1,?3,?3,?3,?3,?3,'{}','/tmp/request.html','pending',1,9999999999)",
+            rusqlite::params![view_id.as_str(), project.id.as_str(), "a".repeat(64)],
         ).unwrap();
         store
             .connection
