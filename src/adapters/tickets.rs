@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -376,7 +377,92 @@ pub struct TicketCommandAdapter {
     shutdown_grace: Duration,
     stdout_limit: usize,
     stderr_tail_limit: usize,
-    expected_ticket_namespace: String,
+    expected_ticket_namespace: OnceLock<String>,
+}
+
+/// Object-safe boundary used by the controller to dispatch normalized ticket operations.
+pub trait TicketAdapter: Send + Sync {
+    fn describe(&self, request_id: RequestId) -> Result<AdapterDescription, TicketAdapterError>;
+    fn list(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        query: TicketListRequest,
+    ) -> Result<TicketPage, TicketAdapterError>;
+    fn get(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        query: TicketGetRequest,
+    ) -> Result<TicketGetResult, TicketAdapterError>;
+    fn create(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketCreateRequest,
+    ) -> Result<ScopedTicketResult, TicketAdapterError>;
+    fn update(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketUpdateRequest,
+    ) -> Result<ScopedTicketResult, TicketAdapterError>;
+    fn comment(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketCommentRequest,
+    ) -> Result<CommentResult, TicketAdapterError>;
+    fn resolve_duplicate(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: DuplicateResolutionRequest,
+    ) -> Result<DuplicateResolutionResult, TicketAdapterError>;
+    fn find_operation(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        input: OperationFindRequest,
+    ) -> Result<OperationLookup, TicketAdapterError>;
+}
+
+/// Construct the configured normalized ticket adapter. The provider CLI owns its own
+/// authentication; this factory only forwards names explicitly allowlisted in runtime config.
+pub fn build_ticket_adapter(
+    config: &crate::config::Config,
+    environment_snapshot: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+) -> Result<Box<dyn TicketAdapter>, TicketAdapterError> {
+    let adapter = &config.adapters.tickets;
+    let shutdown_grace = Duration::from_secs(config.runtime.shutdown_grace_seconds);
+    match adapter.kind.as_str() {
+        "command" => Ok(Box::new(TicketCommandAdapter::new_discovering_namespace(
+            &adapter.command,
+            environment_snapshot,
+            &adapter.environment_allow,
+            cwd,
+            Duration::from_secs(
+                adapter
+                    .read_timeout_seconds
+                    .max(adapter.write_timeout_seconds),
+            ),
+            shutdown_grace,
+        )?)),
+        "linear_cli" => Ok(Box::new(super::linear_cli::LinearCliAdapter::new(
+            adapter,
+            environment_snapshot,
+            cwd,
+            shutdown_grace,
+        )?)),
+        _ => Err(TicketAdapterError::Invalid(
+            "unsupported ticket adapter kind".into(),
+        )),
+    }
 }
 
 impl TicketCommandAdapter {
@@ -386,6 +472,47 @@ impl TicketCommandAdapter {
         environment_allowlist: &[String],
         cwd: &Path,
         expected_ticket_namespace: String,
+        timeout: Duration,
+        shutdown_grace: Duration,
+    ) -> Result<Self, TicketAdapterError> {
+        Self::new_inner(
+            command,
+            environment_snapshot,
+            environment_allowlist,
+            cwd,
+            Some(expected_ticket_namespace),
+            timeout,
+            shutdown_grace,
+        )
+    }
+
+    /// Construct an adapter whose namespace is learned and pinned by its first successful
+    /// `describe` call. Data operations fail until that call has completed.
+    pub fn new_discovering_namespace(
+        command: &[String],
+        environment_snapshot: &BTreeMap<OsString, OsString>,
+        environment_allowlist: &[String],
+        cwd: &Path,
+        timeout: Duration,
+        shutdown_grace: Duration,
+    ) -> Result<Self, TicketAdapterError> {
+        Self::new_inner(
+            command,
+            environment_snapshot,
+            environment_allowlist,
+            cwd,
+            None,
+            timeout,
+            shutdown_grace,
+        )
+    }
+
+    fn new_inner(
+        command: &[String],
+        environment_snapshot: &BTreeMap<OsString, OsString>,
+        environment_allowlist: &[String],
+        cwd: &Path,
+        expected_ticket_namespace: Option<String>,
         timeout: Duration,
         shutdown_grace: Duration,
     ) -> Result<Self, TicketAdapterError> {
@@ -410,8 +537,9 @@ impl TicketCommandAdapter {
         if !cwd.is_dir()
             || timeout.is_zero()
             || shutdown_grace.is_zero()
-            || expected_ticket_namespace.is_empty()
-            || expected_ticket_namespace.chars().any(char::is_control)
+            || expected_ticket_namespace.as_ref().is_some_and(|namespace| {
+                namespace.is_empty() || namespace.chars().any(char::is_control)
+            })
         {
             return Err(TicketAdapterError::Invalid(
                 "working directory and deadlines must be valid".into(),
@@ -435,7 +563,8 @@ impl TicketCommandAdapter {
             shutdown_grace,
             stdout_limit: 4 * 1024 * 1024,
             stderr_tail_limit: 64 * 1024,
-            expected_ticket_namespace,
+            expected_ticket_namespace: expected_ticket_namespace
+                .map_or_else(OnceLock::new, OnceLock::from),
         })
     }
 
@@ -450,6 +579,7 @@ impl TicketCommandAdapter {
             None,
             serde_json::json!({"schema_version": crate::protocol::SCHEMA_VERSION}),
         )?;
+        self.pin_or_validate_namespace(&description.ticket_namespace)?;
         self.validate_namespace(&description.ticket_namespace)?;
         if !description
             .supported_schema_versions
@@ -832,11 +962,29 @@ impl TicketCommandAdapter {
     }
 
     fn validate_namespace(&self, namespace: &str) -> Result<(), TicketAdapterError> {
-        if namespace == self.expected_ticket_namespace {
+        if self
+            .expected_ticket_namespace
+            .get()
+            .is_some_and(|expected| expected == namespace)
+        {
             Ok(())
+        } else if self.expected_ticket_namespace.get().is_none() {
+            Err(TicketAdapterError::Protocol(
+                "adapter describe must pin the ticket namespace before data operations".into(),
+            ))
         } else {
             Err(TicketAdapterError::Protocol(
                 "adapter response changed the configured ticket namespace".into(),
+            ))
+        }
+    }
+
+    fn ensure_namespace_pinned(&self) -> Result<(), TicketAdapterError> {
+        if self.expected_ticket_namespace.get().is_some() {
+            Ok(())
+        } else {
+            Err(TicketAdapterError::Protocol(
+                "adapter describe must pin the ticket namespace before data operations".into(),
             ))
         }
     }
@@ -868,37 +1016,19 @@ impl TicketCommandAdapter {
         project_id: Option<ProjectId>,
         params: Value,
     ) -> Result<T, TicketAdapterError> {
-        let request = RequestEnvelope {
-            schema_version: crate::protocol::SCHEMA_VERSION,
-            request_id: request_id.clone(),
+        if method != TicketMethod::Describe {
+            self.ensure_namespace_pinned()?;
+        }
+        let request = RequestEnvelope::host(
+            request_id.clone(),
             operation_id,
-            method: MethodName::new(method.as_str()).map_err(TicketAdapterError::Invalid)?,
+            MethodName::new(method.as_str()).map_err(TicketAdapterError::Invalid)?,
             project_id,
-            run_id: None,
-            attempt: None,
-            run_epoch: None,
-            expected_subject_revision: None,
-            role: None,
-            request_type: None,
             params,
-        };
+        );
         request.validate().map_err(TicketAdapterError::Protocol)?;
-        let has_operation_id = request.operation_id.is_some();
-        let has_project_id = request.project_id.is_some();
-        let mut request_value = serde_json::to_value(&request)
+        let request_value = serde_json::to_value(&request)
             .map_err(|_| TicketAdapterError::Protocol("request encoding failed".into()))?;
-        if !has_operation_id {
-            request_value
-                .as_object_mut()
-                .expect("serialized request envelope is an object")
-                .remove("operation_id");
-        }
-        if !has_project_id {
-            request_value
-                .as_object_mut()
-                .expect("serialized request envelope is an object")
-                .remove("project_id");
-        }
         let stdin = serde_json::to_vec(&request_value)
             .map_err(|_| TicketAdapterError::Protocol("request encoding failed".into()))?;
         let output = run(ProcessRequest {
@@ -978,6 +1108,37 @@ impl TicketCommandAdapter {
             TicketAdapterError::Protocol("result did not match the normalized schema".into())
         })
     }
+
+    fn pin_or_validate_namespace(&self, namespace: &str) -> Result<(), TicketAdapterError> {
+        if namespace.is_empty() || namespace.chars().any(char::is_control) {
+            return Err(TicketAdapterError::Protocol(
+                "adapter returned an invalid ticket namespace".into(),
+            ));
+        }
+        if let Some(expected) = self.expected_ticket_namespace.get() {
+            return if expected == namespace {
+                Ok(())
+            } else {
+                Err(TicketAdapterError::Protocol(
+                    "adapter response changed the configured ticket namespace".into(),
+                ))
+            };
+        }
+        match self.expected_ticket_namespace.set(namespace.to_owned()) {
+            Ok(()) => Ok(()),
+            Err(_)
+                if self
+                    .expected_ticket_namespace
+                    .get()
+                    .is_some_and(|expected| expected == namespace) =>
+            {
+                Ok(())
+            }
+            Err(_) => Err(TicketAdapterError::Protocol(
+                "adapter response changed the discovered ticket namespace".into(),
+            )),
+        }
+    }
 }
 
 fn receipt_ticket_id(receipt: &Value) -> Option<&str> {
@@ -989,6 +1150,79 @@ fn receipt_ticket_id(receipt: &Value) -> Option<&str> {
 }
 
 use std::ffi::OsStr;
+
+impl TicketAdapter for TicketCommandAdapter {
+    fn describe(&self, request_id: RequestId) -> Result<AdapterDescription, TicketAdapterError> {
+        TicketCommandAdapter::describe(self, request_id)
+    }
+
+    fn list(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        query: TicketListRequest,
+    ) -> Result<TicketPage, TicketAdapterError> {
+        TicketCommandAdapter::list(self, request_id, project_id, query)
+    }
+
+    fn get(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        query: TicketGetRequest,
+    ) -> Result<TicketGetResult, TicketAdapterError> {
+        TicketCommandAdapter::get(self, request_id, project_id, query)
+    }
+
+    fn create(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketCreateRequest,
+    ) -> Result<ScopedTicketResult, TicketAdapterError> {
+        TicketCommandAdapter::create(self, request_id, operation_id, project_id, input)
+    }
+
+    fn update(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketUpdateRequest,
+    ) -> Result<ScopedTicketResult, TicketAdapterError> {
+        TicketCommandAdapter::update(self, request_id, operation_id, project_id, input)
+    }
+
+    fn comment(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: TicketCommentRequest,
+    ) -> Result<CommentResult, TicketAdapterError> {
+        TicketCommandAdapter::comment(self, request_id, operation_id, project_id, input)
+    }
+
+    fn resolve_duplicate(
+        &self,
+        request_id: RequestId,
+        operation_id: OperationId,
+        project_id: Option<ProjectId>,
+        input: DuplicateResolutionRequest,
+    ) -> Result<DuplicateResolutionResult, TicketAdapterError> {
+        TicketCommandAdapter::resolve_duplicate(self, request_id, operation_id, project_id, input)
+    }
+
+    fn find_operation(
+        &self,
+        request_id: RequestId,
+        project_id: Option<ProjectId>,
+        input: OperationFindRequest,
+    ) -> Result<OperationLookup, TicketAdapterError> {
+        TicketCommandAdapter::find_operation(self, request_id, project_id, input)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1002,9 +1236,70 @@ mod tests {
 
     use super::{
         DuplicateResolutionRequest, NormalizedTicketStatus, OperationFindRequest,
-        ReconciliationOutcome, TicketCommandAdapter, TicketCommentRequest, TicketCreateRequest,
-        TicketGetRequest, TicketListRequest, TicketScope, TicketUpdateRequest,
+        ReconciliationOutcome, TicketAdapter, TicketCommandAdapter, TicketCommentRequest,
+        TicketCreateRequest, TicketGetRequest, TicketListRequest, TicketScope, TicketUpdateRequest,
     };
+
+    #[test]
+    fn discovered_namespace_is_pinned_by_describe_before_data_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tickets/ticket_fixture.py");
+        let command = vec![
+            "python3".into(),
+            fixture.display().to_string(),
+            "--database".into(),
+            dir.path().join("tickets.sqlite").display().to_string(),
+            "--namespace".into(),
+            "fixture/tenant-a".into(),
+            "--visibility-delay-seconds".into(),
+            "0".into(),
+        ];
+        let adapter = TicketCommandAdapter::new_discovering_namespace(
+            &command,
+            &BTreeMap::from([(
+                std::ffi::OsString::from("PATH"),
+                std::env::var_os("PATH").unwrap(),
+            )]),
+            &[],
+            dir.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let project = Some(ProjectId::parse("project-1").unwrap());
+        let create_request = create(scope("external-project"), "key", "Ticket");
+        assert!(matches!(
+            adapter.create(
+                req("before-describe"),
+                op("before-describe"),
+                project.clone(),
+                create_request.clone()
+            ),
+            Err(super::TicketAdapterError::Protocol(_))
+        ));
+
+        let object_safe: &dyn TicketAdapter = &adapter;
+        let description = object_safe.describe(req("describe")).unwrap();
+        assert_eq!(description.ticket_namespace, "fixture/tenant-a");
+        let created = object_safe
+            .create(
+                req("after-describe"),
+                op("after-describe"),
+                project,
+                create_request,
+            )
+            .unwrap();
+        assert_eq!(created.ticket.ticket_namespace, "fixture/tenant-a");
+        let tickets = object_safe
+            .list(
+                req("list-after-describe"),
+                None,
+                list(scope("external-project"), Some(10), None),
+            )
+            .unwrap();
+        assert_eq!(tickets.tickets.len(), 1);
+    }
 
     #[test]
     fn typed_adapter_round_trips_scope_revision_cursor_comments_and_duplicates() {
