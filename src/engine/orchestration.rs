@@ -232,16 +232,45 @@ pub fn resolve_goal_duplicates(
 ) -> DuplicateResolution {
     let mut by_id = BTreeMap::new();
     for item in observations {
-        by_id.entry(item.id.clone()).or_insert(item);
+        by_id
+            .entry(item.id.clone())
+            .and_modify(|existing: &mut AggregatedTicketObservation| {
+                existing.active_run |= item.active_run;
+                existing.substantive_work |= item.substantive_work;
+                existing.created_at_conflicts |=
+                    existing.created_at_unix_millis != item.created_at_unix_millis;
+            })
+            .or_insert_with(|| AggregatedTicketObservation {
+                created_at_unix_millis: item.created_at_unix_millis,
+                active_run: item.active_run,
+                substantive_work: item.substantive_work,
+                created_at_conflicts: false,
+            });
     }
-    let candidates: Vec<_> = by_id.into_values().collect();
+    let candidates: Vec<_> = by_id
+        .iter()
+        .map(|(id, observation)| GoalTicketObservation {
+            id: id.clone(),
+            created_at_unix_millis: observation.created_at_unix_millis,
+            active_run: observation.active_run,
+            substantive_work: observation.substantive_work,
+        })
+        .collect();
     if candidates.is_empty() && previous_canonical.is_none() {
         return DuplicateResolution::NoDuplicates;
+    }
+    if by_id
+        .values()
+        .any(|observation| observation.created_at_conflicts)
+    {
+        return DuplicateResolution::HumanRequired {
+            candidates: candidates.iter().map(|item| item.id.clone()).collect(),
+            reason: "one ticket has conflicting creation timestamps".into(),
+        };
     }
     let canonical_id = previous_canonical.cloned().or_else(|| {
         candidates
             .iter()
-            .copied()
             .min_by(|left, right| {
                 left.created_at_unix_millis
                     .cmp(&right.created_at_unix_millis)
@@ -272,6 +301,14 @@ pub fn resolve_goal_duplicates(
             .map(|item| item.id.clone())
             .collect(),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AggregatedTicketObservation {
+    created_at_unix_millis: i64,
+    active_run: bool,
+    substantive_work: bool,
+    created_at_conflicts: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -423,11 +460,23 @@ pub struct WorkPlan {
 pub struct ValidatedWorkNode {
     pub id: WorkNodeId,
     pub repository: RepositoryId,
-    pub base_commit: String,
+    pub base: WorkBaseSource,
     pub task: String,
     pub depends_on: Vec<WorkDependency>,
     pub required_evidence: Vec<String>,
     pub role: Role,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkBaseSource {
+    ControllerObservedCommit {
+        commit: String,
+    },
+    /// Resolve from the predecessor's accepted exact HEAD after it completes;
+    /// never substitute the repository's controller-observed trunk base.
+    PredecessorWorkNodeHead {
+        node: WorkNodeId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -492,6 +541,12 @@ pub fn validate_work_plan(
                     node.id
                 ));
             }
+            if dependency.kind == WorkDependencyKind::GitBase && predecessor.investigation {
+                return Err(format!(
+                    "git-base dependency for work node {} cannot use a read-only investigation",
+                    node.id
+                ));
+            }
             if dependency.affected_evidence.is_empty()
                 || dependency
                     .affected_evidence
@@ -544,13 +599,33 @@ pub fn validate_work_plan(
     let mut validated = Vec::with_capacity(order.len());
     for id in order {
         let node = nodes.remove(&id).expect("topological node exists");
-        let base = observed_bases.get(&node.repository).ok_or_else(|| {
-            format!(
-                "no controller-observed base for repository {}",
-                node.repository
-            )
-        })?;
-        validate_git_commit(base)?;
+        let git_base_dependencies: Vec<_> = node
+            .depends_on
+            .iter()
+            .filter(|dependency| dependency.kind == WorkDependencyKind::GitBase)
+            .collect();
+        if git_base_dependencies.len() > 1 {
+            return Err(format!(
+                "work node {} has more than one Git base predecessor",
+                node.id
+            ));
+        }
+        let base = if let Some(dependency) = git_base_dependencies.first() {
+            WorkBaseSource::PredecessorWorkNodeHead {
+                node: dependency.node.clone(),
+            }
+        } else {
+            let commit = observed_bases.get(&node.repository).ok_or_else(|| {
+                format!(
+                    "no controller-observed base for repository {}",
+                    node.repository
+                )
+            })?;
+            validate_git_commit(commit)?;
+            WorkBaseSource::ControllerObservedCommit {
+                commit: commit.clone(),
+            }
+        };
         let role = if node.investigation {
             Role::Planner
         } else {
@@ -571,7 +646,7 @@ pub fn validate_work_plan(
         validated.push(ValidatedWorkNode {
             id: node.id,
             repository: node.repository,
-            base_commit: base.clone(),
+            base,
             task: node.task,
             depends_on: node.depends_on,
             required_evidence: node.required_evidence,
@@ -1153,6 +1228,75 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_observations_merge_conservatively_and_ignore_input_order() {
+        let canonical = GoalTicketObservation {
+            id: TicketId::parse("canonical").unwrap(),
+            created_at_unix_millis: 1,
+            active_run: false,
+            substantive_work: false,
+        };
+        let stale_duplicate = GoalTicketObservation {
+            id: TicketId::parse("duplicate").unwrap(),
+            created_at_unix_millis: 2,
+            active_run: false,
+            substantive_work: false,
+        };
+        let current_duplicate = GoalTicketObservation {
+            active_run: true,
+            substantive_work: true,
+            ..stale_duplicate.clone()
+        };
+        let stale_then_current = vec![
+            canonical.clone(),
+            stale_duplicate.clone(),
+            current_duplicate.clone(),
+        ];
+        let current_then_stale = vec![canonical, current_duplicate, stale_duplicate];
+        let forward = resolve_goal_duplicates(&stale_then_current, None);
+        let reverse = resolve_goal_duplicates(&current_then_stale, None);
+        assert_eq!(forward, reverse);
+        assert!(matches!(
+            forward,
+            DuplicateResolution::HumanRequired { candidates, .. }
+                if candidates == vec![
+                    TicketId::parse("canonical").unwrap(),
+                    TicketId::parse("duplicate").unwrap()
+                ]
+        ));
+    }
+
+    #[test]
+    fn conflicting_creation_timestamps_require_human_without_cancellation() {
+        let id = TicketId::parse("duplicate").unwrap();
+        let observations = [
+            GoalTicketObservation {
+                id: id.clone(),
+                created_at_unix_millis: 2,
+                active_run: false,
+                substantive_work: false,
+            },
+            GoalTicketObservation {
+                created_at_unix_millis: 3,
+                ..GoalTicketObservation {
+                    id: id.clone(),
+                    created_at_unix_millis: 2,
+                    active_run: false,
+                    substantive_work: false,
+                }
+            },
+        ];
+        let forward = resolve_goal_duplicates(&observations, None);
+        let reverse =
+            resolve_goal_duplicates(&observations.into_iter().rev().collect::<Vec<_>>(), None);
+        assert_eq!(forward, reverse);
+        assert!(matches!(
+            forward,
+            DuplicateResolution::HumanRequired { candidates, reason }
+                if candidates == vec![id] && reason.contains("creation timestamps")
+        ));
+    }
+
+    #[test]
     fn multi_repository_plan_is_acyclic_and_only_worker_can_implement() {
         let project = goal_project();
         let repo_a = RepositoryId::parse("repo-a").unwrap();
@@ -1182,6 +1326,18 @@ mod tests {
                     required_evidence: vec!["docs check".into()],
                     investigation: false,
                 },
+                PlannedWorkNode {
+                    id: WorkNodeId::parse("api-integration").unwrap(),
+                    repository: repo_a.clone(),
+                    task: "integrate the API branch".into(),
+                    depends_on: vec![WorkDependency {
+                        node: WorkNodeId::parse("api").unwrap(),
+                        kind: WorkDependencyKind::GitBase,
+                        affected_evidence: BTreeSet::from(["tests".into(), "review".into()]),
+                    }],
+                    required_evidence: vec!["integration tests".into()],
+                    investigation: false,
+                },
             ],
             requested_investigation_children: 0,
         };
@@ -1198,7 +1354,17 @@ mod tests {
         .unwrap();
         assert_eq!(result.nodes_in_execution_order[0].id.as_str(), "api");
         assert_eq!(result.nodes_in_execution_order[0].role, Role::Worker);
-        assert_eq!(result.nodes_in_execution_order[1].role, Role::Worker);
+        assert_eq!(
+            result.nodes_in_execution_order[1].id.as_str(),
+            "api-integration"
+        );
+        assert_eq!(
+            result.nodes_in_execution_order[1].base,
+            WorkBaseSource::PredecessorWorkNodeHead {
+                node: WorkNodeId::parse("api").unwrap()
+            }
+        );
+        assert_eq!(result.nodes_in_execution_order[2].role, Role::Worker);
         let mut cyclic = plan;
         cyclic.nodes[0].depends_on.push(WorkDependency {
             node: WorkNodeId::parse("docs").unwrap(),
