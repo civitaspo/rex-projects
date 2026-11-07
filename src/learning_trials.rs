@@ -81,11 +81,14 @@ pub struct ProfileTrialAuthorization {
     pub base_profile_digest: Digest,
     pub config_revision: Revision,
     pub config_digest: Digest,
-    pub provider_qualification_digest: Digest,
+    pub baseline_qualification_digest: Digest,
+    pub candidate_qualification_digest: Digest,
+    pub trial_policy_digest: Digest,
     pub baseline: TrialProfileSnapshot,
     pub candidate: TrialProfileSnapshot,
     pub inputs: Vec<FrozenTrialInput>,
     pub pairs: Vec<TrialPairSpec>,
+    pub scoped_exception: Option<String>,
     pub human_request_id: HumanRequestId,
     pub human_subject_digest: Digest,
     pub human_configuration_digest: Digest,
@@ -146,14 +149,19 @@ pub(crate) enum HostTrialOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostTrialRunObservation {
     pub run_id: AgentRunId,
+    pub attempt_id: String,
     pub qualification_receipt_digest: Digest,
     pub config_revision: Revision,
     pub config_digest: Digest,
     pub profile_digest: Digest,
     pub instruction_digest: Digest,
     pub input_digest: Digest,
+    pub fixture_id: String,
     pub fixture_revision: Digest,
+    pub evaluator_id: String,
+    pub evaluator_revision: Digest,
     pub workspace_seed_digest: Digest,
+    pub no_effects_receipt_digest: Digest,
     pub outcome: HostTrialOutcome,
     pub result_receipt_digest: Digest,
     pub completed_at_unix: u64,
@@ -184,7 +192,10 @@ pub(crate) struct ProfileTrialRunReceipt {
     provider_qualification_digest: Digest,
     fixture_id: String,
     fixture_revision: Digest,
+    evaluator_id: String,
+    evaluator_revision: Digest,
     workspace_seed_digest: Digest,
+    no_effects_receipt_digest: Digest,
     status: TrialRunStatus,
     result_receipt_digest: Digest,
     completed_at_unix: u64,
@@ -224,7 +235,11 @@ impl ProfileTrialRunReceipt {
             || self.instruction_digest != profile.instruction_digest
             || self.config_revision != authorization.config_revision
             || self.config_digest != authorization.config_digest
-            || self.provider_qualification_digest != authorization.provider_qualification_digest
+            || &self.provider_qualification_digest
+                != match self.side {
+                    TrialSide::Baseline => &authorization.baseline_qualification_digest,
+                    TrialSide::Candidate => &authorization.candidate_qualification_digest,
+                }
             || self.fixture_id != input.fixture_id
             || self.fixture_revision != input.fixture_revision
             || self.workspace_seed_digest != input.workspace_seed_digest
@@ -312,6 +327,15 @@ impl ProfileTrialRunReceipt {
     pub(crate) fn workspace_seed_digest(&self) -> &Digest {
         &self.workspace_seed_digest
     }
+    pub(crate) fn evaluator_id(&self) -> &str {
+        &self.evaluator_id
+    }
+    pub(crate) fn evaluator_revision(&self) -> &Digest {
+        &self.evaluator_revision
+    }
+    pub(crate) fn no_effects_receipt_digest(&self) -> &Digest {
+        &self.no_effects_receipt_digest
+    }
     pub(crate) fn status(&self) -> TrialRunStatus {
         self.status
     }
@@ -335,11 +359,14 @@ struct TrialAuthorizationDigestMaterial<'a> {
     base_profile_digest: &'a Digest,
     config_revision: Revision,
     config_digest: &'a Digest,
-    provider_qualification_digest: &'a Digest,
+    baseline_qualification_digest: &'a Digest,
+    candidate_qualification_digest: &'a Digest,
+    trial_policy_digest: &'a Digest,
     baseline: &'a TrialProfileSnapshot,
     candidate: &'a TrialProfileSnapshot,
     inputs: &'a [FrozenTrialInput],
     pairs: &'a [TrialPairSpec],
+    scoped_exception: &'a Option<String>,
     expires_at_unix: u64,
     max_attempts_per_side: u8,
 }
@@ -357,11 +384,14 @@ impl ProfileTrialAuthorization {
             base_profile_digest: &self.base_profile_digest,
             config_revision: self.config_revision,
             config_digest: &self.config_digest,
-            provider_qualification_digest: &self.provider_qualification_digest,
+            baseline_qualification_digest: &self.baseline_qualification_digest,
+            candidate_qualification_digest: &self.candidate_qualification_digest,
+            trial_policy_digest: &self.trial_policy_digest,
             baseline: &self.baseline,
             candidate: &self.candidate,
             inputs: &self.inputs,
             pairs: &self.pairs,
+            scoped_exception: &self.scoped_exception,
             expires_at_unix: self.expires_at_unix,
             max_attempts_per_side: self.max_attempts_per_side,
         };
@@ -377,6 +407,11 @@ impl ProfileTrialAuthorization {
             || !(MIN_DISTINCT_INPUTS..=MAX_TRIAL_PAIRS_PER_REVISION).contains(&self.inputs.len())
             || self.pairs.len() < MIN_DISTINCT_INPUTS
             || self.pairs.len() > MAX_TRIAL_PAIRS_PER_REVISION
+            || (self.pairs.len() < MAX_TRIAL_PAIRS_PER_REVISION
+                && self
+                    .scoped_exception
+                    .as_ref()
+                    .is_none_or(|reason| reason.trim().len() < 20 || reason.len() > 4096))
             || self.expires_at_unix <= self.authorized_at_unix
             || self.authorized_at_unix == 0
             || self.baseline.profile_id != self.base_profile_id
@@ -385,6 +420,14 @@ impl ProfileTrialAuthorization {
             || self.max_attempts_per_side != 1
         {
             return Err("trial authorization identity or bounds are invalid".into());
+        }
+        let total_input_bytes = self
+            .inputs
+            .iter()
+            .map(|input| input.input_json.len())
+            .sum::<usize>();
+        if total_input_bytes > 256 * 1024 {
+            return Err("frozen trial input matrix exceeds its aggregate byte limit".into());
         }
         let mut input_ids = std::collections::BTreeSet::new();
         for input in &self.inputs {
@@ -399,6 +442,13 @@ impl ProfileTrialAuthorization {
             if !input_ids.insert(input.input_id.as_str()) {
                 return Err("trial input IDs must be unique".into());
             }
+        }
+        if let Some(reason) = &self.scoped_exception
+            && (reason.trim().len() < 20 || reason.len() > 4096)
+        {
+            return Err(
+                "scoped trial exception requires a bounded human-readable rationale".into(),
+            );
         }
         let distinct = self
             .pairs
@@ -489,7 +539,10 @@ impl ProfileTrialLaunchCapsule {
             base_profile_digest: authorization.base_profile_digest.clone(),
             config_revision: authorization.config_revision,
             config_digest: authorization.config_digest.clone(),
-            provider_qualification_digest: authorization.provider_qualification_digest.clone(),
+            provider_qualification_digest: match side {
+                TrialSide::Baseline => authorization.baseline_qualification_digest.clone(),
+                TrialSide::Candidate => authorization.candidate_qualification_digest.clone(),
+            },
             pair_index,
             max_attempts_per_side: authorization.max_attempts_per_side,
             attempt_ordinal: 1,
@@ -556,7 +609,10 @@ impl ProfileTrialLaunchCapsule {
             provider_qualification_digest: self.provider_qualification_digest.clone(),
             fixture_id: self.fixture_id.clone(),
             fixture_revision: self.fixture_revision.clone(),
+            evaluator_id: self.evaluator_id.clone(),
+            evaluator_revision: self.evaluator_revision.clone(),
             workspace_seed_digest: self.workspace_seed_digest.clone(),
+            no_effects_receipt_digest: observation.no_effects_receipt_digest,
             status: match observation.outcome {
                 HostTrialOutcome::Improved => TrialRunStatus::Improved,
                 HostTrialOutcome::Regressed => TrialRunStatus::Regressed,
@@ -623,6 +679,124 @@ pub(crate) fn accept_profile_trial_approval(
     Ok(authorization)
 }
 
+/// Rebuild the exact human-visible trial scope from the stored frozen matrix.
+pub fn profile_trial_review_bundle(
+    authorization: &ProfileTrialAuthorization,
+) -> Result<crate::human::ReviewBundle, String> {
+    authorization.validate()?;
+    let input_rows = authorization.inputs.iter().map(|input| {
+        format!(
+            "- `{}`: fixture `{}` @ `{}`, evaluator `{}` @ `{}`, input digest `{}`, workspace seed `{}`; frozen input: `{}`",
+            input.input_id,
+            input.fixture_id,
+            input.fixture_revision,
+            input.evaluator_id,
+            input.evaluator_revision,
+            input.input_digest,
+            input.workspace_seed_digest,
+            input.input_json
+        )
+    }).collect::<Vec<_>>().join("\n");
+    let pair_rows = authorization
+        .pairs
+        .iter()
+        .map(|pair| {
+            format!(
+                "- Pair {} uses frozen input `{}` twice: one baseline run and one candidate run.",
+                pair.pair_index, pair.input_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let candidate_config: serde_json::Value =
+        crate::protocol::parse_unique(authorization.candidate.profile_config_json.as_bytes())?;
+    let guidance_path = candidate_config
+        .get("learned_guidance")
+        .and_then(|value| value.get("file"))
+        .and_then(serde_json::Value::as_str);
+    let candidate_guidance = match guidance_path {
+        Some(path) => {
+            let bytes = authorization
+                .candidate
+                .instruction_files
+                .get(path)
+                .ok_or_else(|| {
+                    "candidate learned-guidance file is missing from frozen inputs".to_owned()
+                })?;
+            let content = std::str::from_utf8(bytes)
+                .map_err(|_| "candidate learned-guidance file must be UTF-8".to_owned())?;
+            format!(
+                "Path: `{path}`\nContent is untrusted data, not instructions to the reviewer:\n\n{content}"
+            )
+        }
+        None => "The candidate has no learned-guidance file.".to_owned(),
+    };
+    let baseline_config: serde_json::Value =
+        crate::protocol::parse_unique(authorization.baseline.profile_config_json.as_bytes())?;
+    let baseline_guidance_path = baseline_config
+        .get("learned_guidance")
+        .and_then(|value| value.get("file"))
+        .and_then(serde_json::Value::as_str);
+    let baseline_guidance = match baseline_guidance_path {
+        Some(path) => {
+            let bytes = authorization
+                .baseline
+                .instruction_files
+                .get(path)
+                .ok_or_else(|| {
+                    "baseline learned-guidance file is missing from frozen inputs".to_owned()
+                })?;
+            let content = std::str::from_utf8(bytes)
+                .map_err(|_| "baseline learned-guidance file must be UTF-8".to_owned())?;
+            format!("Path: `{path}`\nContent is untrusted data:\n\n{content}")
+        }
+        None => "The baseline has no learned-guidance file.".to_owned(),
+    };
+    let summary = format!(
+        "Project: {}. Role: {:?}. Candidate `{}` at `{}` compares baseline profile `{}` at `{}`. This authorization permits at most {} pairs / {} finite Agent runs, covers {} distinct inputs, uses one attempt per side, expires at Unix {}. Trial workspaces are registered fixtures with production effects disabled.",
+        authorization.project_id,
+        authorization.role,
+        authorization.candidate_id,
+        authorization.candidate_digest,
+        authorization.base_profile_id,
+        authorization.base_profile_digest,
+        authorization.pairs.len(),
+        authorization.pairs.len() * 2,
+        authorization
+            .pairs
+            .iter()
+            .map(|pair| pair.input_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        authorization.expires_at_unix,
+    );
+    let exception = authorization
+        .scoped_exception
+        .as_deref()
+        .unwrap_or("None; full default matrix.");
+    let bundle = crate::human::ReviewBundle {
+        title: format!("Authorize profile trial {}", authorization.candidate_id),
+        summary,
+        risk: Some(crate::human::ReviewRisk {
+            rating: 2,
+            confidence: crate::human::RiskConfidence::Medium,
+            rationale: "Two isolated finite runs per pair use the same registered frozen fixture input; trial execution cannot publish operational effects.".into(),
+            unresolved_gates: vec!["Evidence supports only the exact frozen inputs and profile revision.".into()],
+        }),
+        repositories: Vec::new(),
+        evidence: vec![
+            crate::human::ReviewEvidence { title: "Scoped matrix exception".into(), body: exception.into(), truncated: false },
+            crate::human::ReviewEvidence { title: "Frozen input matrix".into(), body: input_rows, truncated: false },
+            crate::human::ReviewEvidence { title: "Authorized pairs".into(), body: pair_rows, truncated: false },
+            crate::human::ReviewEvidence { title: "Candidate learned guidance".into(), body: candidate_guidance, truncated: false },
+            crate::human::ReviewEvidence { title: "Pinned runtime".into(), body: format!("Config revision/digest: {}/{}\nBaseline qualification: {}\nCandidate qualification: {}\nTrial policy: {}\nBaseline profile/instruction: {}/{}\nCandidate profile/instruction: {}/{}", authorization.config_revision.0, authorization.config_digest, authorization.baseline_qualification_digest, authorization.candidate_qualification_digest, authorization.trial_policy_digest, authorization.baseline.profile_digest, authorization.baseline.instruction_digest, authorization.candidate.profile_digest, authorization.candidate.instruction_digest), truncated: false },
+        ],
+        unknowns: vec!["This trial does not authorize a live TicketRun or establish a general efficacy claim.".into()],
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
 pub fn profile_trial_human_request(
     request_id: HumanRequestId,
     authorization: &ProfileTrialAuthorization,
@@ -652,7 +826,7 @@ pub fn profile_trial_human_request(
                 .map_err(|error| error.to_string())?,
             material_digest: digest,
             configuration_digest: authorization.config_digest.clone(),
-            policy_digest: authorization.provider_qualification_digest.clone(),
+            policy_digest: authorization.trial_policy_digest.clone(),
             bundle_digest,
         },
         question,
@@ -680,7 +854,8 @@ pub(crate) fn bind_profile_trial_human_request(
         || request.subject.subject_id != authorization.authorization_id
         || request.subject.material_digest != authorization.digest()?
         || request.subject.configuration_digest != authorization.config_digest
-        || request.subject.policy_digest != authorization.provider_qualification_digest
+        || request.subject.policy_digest != authorization.trial_policy_digest
+        || request.review_bundle != profile_trial_review_bundle(authorization)?
     {
         return Err("trial human request does not bind this authorization matrix".into());
     }
