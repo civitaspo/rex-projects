@@ -2412,8 +2412,9 @@ impl ConfigStore {
                     crate::protocol::parse_unique(manifest_json.as_bytes()).map_err(|error| {
                         format!("stored Postmortem manifest is invalid: {error}")
                     })?;
-                if canonical_json(&manifest)? != manifest_json
-                    || manifest["operation_id"].as_str() != Some(proof.knowledge_operation_id())
+                if manifest["operation_id"].as_str() != Some(proof.knowledge_operation_id())
+                    || manifest["project_id"].as_str() != Some(project_id.as_str())
+                    || manifest["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
                     || content_digest(&manifest_json) != proof.knowledge_manifest_digest().as_str()
                 {
                     return Err(
@@ -2504,9 +2505,13 @@ impl ConfigStore {
                         format!("project:{}:supervisor", project_id.as_str()),
                         "supervisor",
                     ),
-                    WakeTarget::Coordinator => (
-                        format!("ticket_run:{}:coordinator", ticket_run_id.as_str()),
-                        "coordinator",
+                    WakeTarget::TicketRole(role) => (
+                        format!(
+                            "ticket_run:{}:{}",
+                            ticket_run_id.as_str(),
+                            crate::engine::factory_runtime::role_name(*role)
+                        ),
+                        crate::engine::factory_runtime::role_name(*role),
                     ),
                 };
                 let payload = serde_json::json!({
@@ -4881,18 +4886,11 @@ mod tests {
             request_digest: content_digest("{}"),
             expected_revision: Some(1),
         };
-        let effects = [
-            effect(
-                "dispatch-coordinator",
-                "dispatch-coordinator-r1",
-                "start_coordinator",
-            ),
-            effect(
-                "publish-in-progress",
-                "publish-in-progress-r1",
-                "publish_ticket_status",
-            ),
-        ];
+        let effects = [effect(
+            "publish-in-progress",
+            "publish-in-progress-r1",
+            "publish_ticket_status",
+        )];
         let receipt = store
             .commit_ticket_transition(
                 generation,
@@ -4937,7 +4935,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(committed, 2);
+        assert_eq!(committed, 1);
+        let coordinator_wake: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND lifecycle='pending'",
+                rusqlite::params![project.id.as_str(),format!("ticket_run:{}:coordinator",ticket_run.as_str())],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(coordinator_wake, 1);
         assert!(
             store
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &ticket_run, 1)
@@ -5190,20 +5197,7 @@ mod tests {
             .next_due_effect(generation, i64::MAX)
             .unwrap()
             .unwrap();
-        assert_eq!(claimed.operation_id, "dispatch-coordinator");
-        store
-            .finish_effect(
-                "dispatch-coordinator",
-                generation,
-                EffectOutcome::Succeeded,
-                Some("{}"),
-            )
-            .unwrap();
-        let publish_status = store
-            .next_due_effect(generation, i64::MAX)
-            .unwrap()
-            .unwrap();
-        assert_eq!(publish_status.operation_id, "publish-in-progress");
+        assert_eq!(claimed.operation_id, "publish-in-progress");
         store
             .finish_effect(
                 "publish-in-progress",

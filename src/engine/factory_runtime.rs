@@ -746,7 +746,7 @@ pub fn role_session_key(
     }
 }
 
-fn role_name(role: Role) -> &'static str {
+pub(crate) fn role_name(role: Role) -> &'static str {
     match role {
         Role::Supervisor => "supervisor",
         Role::Coordinator => "coordinator",

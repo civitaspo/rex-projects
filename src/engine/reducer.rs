@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::delivery_runtime::ValidatedImplementationPublication;
 use crate::domain::ids::{OperationId, ProjectId, Revision, TicketRunId};
-use crate::domain::types::TicketStatus;
+use crate::domain::types::{Role, TicketStatus};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,19 +83,13 @@ pub enum EffectKind {
     TicketDuplicateComment,
     TicketCancelDuplicate,
     TicketResolveDuplicate,
-    StartSupervisor,
-    StartCoordinator,
     PrepareWorktrees,
     PublishImplementation,
-    StartWorker,
-    StartReviewer,
-    StartMergeDecision,
     RequestHumanReview,
     Merge,
-    StartOperator,
     Operation,
-    StartPostmortem,
     CompleteTicket,
+    StartAgent,
     StopOwnedRuns,
 }
 
@@ -109,7 +103,7 @@ pub struct WakeInput {
 #[serde(rename_all = "snake_case")]
 pub enum WakeTarget {
     Supervisor,
-    Coordinator,
+    TicketRole(Role),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,7 +133,7 @@ pub fn reduce(
         Input::Dispatch if current.phase == Phase::Queued => {
             next.phase = Phase::Planning;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartCoordinator);
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
             if current.external_status != TicketStatus::InProgress {
                 effects.push(EffectKind::PublishTicketStatus);
             }
@@ -152,7 +146,7 @@ pub fn reduce(
         Input::WorktreesPrepared if current.phase == Phase::Preparing => {
             next.phase = Phase::Implementing;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartWorker);
+            wakes.push(WakeTarget::TicketRole(Role::Worker));
         }
         Input::EvidenceSubmitted if current.phase == Phase::Implementing => {
             next.phase = Phase::Publishing;
@@ -164,17 +158,17 @@ pub fn reduce(
         {
             next.phase = Phase::Reviewing;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartReviewer);
+            wakes.push(WakeTarget::TicketRole(Role::Reviewer));
         }
         Input::CorrectionsRemain if current.phase == Phase::Reviewing => {
             next.phase = Phase::Implementing;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartWorker);
+            wakes.push(WakeTarget::TicketRole(Role::Worker));
         }
         Input::ReviewConverged if current.phase == Phase::Reviewing => {
             next.phase = Phase::Assessing;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartMergeDecision);
+            wakes.push(WakeTarget::TicketRole(Role::MergeDecision));
         }
         Input::RequireHumanReview if current.phase == Phase::Assessing => {
             next.phase = Phase::WaitingHuman;
@@ -203,13 +197,13 @@ pub fn reduce(
             next.activity = Activity::Running;
             next.required_review_revision = None;
             next.external_status = TicketStatus::InProgress;
-            effects.push(EffectKind::StartCoordinator);
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
             effects.push(EffectKind::PublishTicketStatus);
         }
         Input::MergeVerified if current.phase == Phase::AwaitingMerge => {
             next.phase = Phase::Operating;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartOperator);
+            wakes.push(WakeTarget::TicketRole(Role::Operator));
         }
         Input::OperationFailed if current.phase == Phase::Operating => {
             next.activity = Activity::Blocked;
@@ -220,7 +214,7 @@ pub fn reduce(
         {
             next.phase = Phase::Postmortem;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartPostmortem);
+            wakes.push(WakeTarget::TicketRole(Role::Postmortem));
         }
         Input::KnowledgePublished if current.phase == Phase::Postmortem => {
             next.phase = Phase::Completing;
@@ -247,7 +241,7 @@ pub fn reduce(
         }
         Input::Resume if current.activity == Activity::Paused => {
             next.activity = Activity::Ready;
-            wakes.push(WakeTarget::Coordinator);
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         _ => return Err("input is not valid in the current ticket run state".into()),
     }
@@ -305,19 +299,13 @@ pub const fn effect_name(kind: &EffectKind) -> &'static str {
         EffectKind::TicketDuplicateComment => "ticket_duplicate_comment",
         EffectKind::TicketCancelDuplicate => "ticket_cancel_duplicate",
         EffectKind::TicketResolveDuplicate => "ticket_resolve_duplicate",
-        EffectKind::StartSupervisor => "start_supervisor",
-        EffectKind::StartCoordinator => "start_coordinator",
         EffectKind::PrepareWorktrees => "prepare_worktrees",
         EffectKind::PublishImplementation => "publish_implementation",
-        EffectKind::StartWorker => "start_worker",
-        EffectKind::StartReviewer => "start_reviewer",
-        EffectKind::StartMergeDecision => "start_merge_decision",
         EffectKind::RequestHumanReview => "request_human_review",
         EffectKind::Merge => "merge",
-        EffectKind::StartOperator => "start_operator",
         EffectKind::Operation => "operation",
-        EffectKind::StartPostmortem => "start_postmortem",
         EffectKind::CompleteTicket => "complete_ticket",
+        EffectKind::StartAgent => "start_agent",
         EffectKind::StopOwnedRuns => "stop_owned_runs",
     }
 }
@@ -335,9 +323,9 @@ pub fn wake_inputs(decision: &Decision) -> Vec<WakeInput> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Activity, EffectKind, Input, Phase, TicketRun, reduce};
+    use super::{Activity, EffectKind, Input, Phase, TicketRun, WakeTarget, reduce};
     use crate::domain::ids::{ProjectId, Revision, TicketRunId};
-    use crate::domain::types::TicketStatus;
+    use crate::domain::types::{Role, TicketStatus};
 
     fn run() -> TicketRun {
         TicketRun {
@@ -380,13 +368,51 @@ mod tests {
         let decision = reduce(&run(), Revision(1), Input::Dispatch).unwrap();
         assert_eq!(decision.ticket_run.phase, Phase::Planning);
         assert_eq!(decision.ticket_run.revision, Revision(2));
+        assert_eq!(decision.effects, [EffectKind::PublishTicketStatus]);
         assert_eq!(
-            decision.effects,
-            [
-                EffectKind::StartCoordinator,
-                EffectKind::PublishTicketStatus
-            ]
+            decision.wakes,
+            [WakeTarget::TicketRole(
+                crate::domain::types::Role::Coordinator
+            )]
         );
+    }
+
+    #[test]
+    fn role_work_is_always_durably_routed_as_a_wake() {
+        let cases = [
+            (Phase::Queued, Input::Dispatch, Role::Coordinator),
+            (Phase::Preparing, Input::WorktreesPrepared, Role::Worker),
+            (
+                Phase::Implementing,
+                Input::EvidenceSubmitted,
+                Role::Reviewer,
+            ),
+            (Phase::Reviewing, Input::CorrectionsRemain, Role::Worker),
+            (
+                Phase::Reviewing,
+                Input::ReviewConverged,
+                Role::MergeDecision,
+            ),
+            (Phase::AwaitingMerge, Input::MergeVerified, Role::Operator),
+            (
+                Phase::Operating,
+                Input::OperationsSucceeded,
+                Role::Postmortem,
+            ),
+        ];
+        for (phase, input, target) in cases {
+            let mut current = run();
+            current.phase = phase;
+            current.activity = Activity::Running;
+            let decision = reduce(&current, current.revision, input).unwrap();
+            assert_eq!(decision.wakes, [WakeTarget::TicketRole(target)]);
+            assert!(
+                decision
+                    .effects
+                    .iter()
+                    .all(|effect| *effect == EffectKind::PublishTicketStatus)
+            );
+        }
     }
 
     #[test]

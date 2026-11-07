@@ -490,8 +490,9 @@ impl ConfigStore {
         let manifest: serde_json::Value =
             crate::protocol::parse_unique(manifest_json.as_bytes())
                 .map_err(|error| format!("stored Postmortem manifest is invalid: {error}"))?;
-        if super::canonical_json(&manifest)? != manifest_json
-            || manifest["operation_id"].as_str() != Some(knowledge_operation_id.as_str())
+        if manifest["operation_id"].as_str() != Some(knowledge_operation_id.as_str())
+            || manifest["project_id"].as_str() != Some(project_id.as_str())
+            || manifest["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
         {
             return Err("stored Postmortem manifest identity or encoding is invalid".into());
         }
