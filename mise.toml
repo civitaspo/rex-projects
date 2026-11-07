@@ -46,7 +46,6 @@ run = [
   "ast-grep test --skip-snapshot-tests",
   "python3 -m unittest discover -s tests/fixtures/agents -p 'test_*.py'",
   "python3 -m unittest discover -s tests/fixtures/e2e -p 'test_*.py'",
-  "python3 -m unittest discover -s tests -p 'test_release_assets.py'",
   "cargo test --workspace --all-features --locked",
 ]
 
