@@ -64,6 +64,15 @@ pub struct EffectRequest {
     pub created_at_unix: i64,
 }
 
+/// Host-owned context for handlers that must persist a domain receipt through
+/// the controller's existing database connection. No second ConfigStore may be
+/// opened while the foreground controller owns the machine lock.
+pub struct EffectContext<'a> {
+    pub store: &'a mut ConfigStore,
+    pub owner_generation: u64,
+    pub now_unix: i64,
+}
+
 impl From<ClaimedEffect> for EffectRequest {
     fn from(claimed: ClaimedEffect) -> Self {
         Self {
@@ -83,6 +92,7 @@ pub trait EffectHandler: Send + Sync {
         &self,
         mode: EffectMode,
         request: &EffectRequest,
+        context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String>;
 }
 
@@ -221,7 +231,14 @@ impl EffectDispatcher {
             .ok_or_else(|| {
                 EffectDispatchError::Store("claimed effect kind has no registered handler".into())
             })?;
-        let observation = handler.handle(mode, &request);
+        let observation = {
+            let mut context = EffectContext {
+                store,
+                owner_generation,
+                now_unix,
+            };
+            handler.handle(mode, &request, &mut context)
+        };
         match observation {
             Ok(EffectObservation::Applied { receipt }) => {
                 store

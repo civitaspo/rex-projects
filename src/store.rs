@@ -3864,6 +3864,7 @@ mod tests {
                 &self,
                 mode: crate::effects::EffectMode,
                 request: &crate::effects::EffectRequest,
+                _context: &mut crate::effects::EffectContext<'_>,
             ) -> Result<crate::effects::EffectObservation, String> {
                 self.seen.lock().unwrap().push((mode, request.clone()));
                 match self.actions.lock().unwrap().pop_front().unwrap() {
