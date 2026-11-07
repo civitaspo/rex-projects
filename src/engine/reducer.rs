@@ -390,11 +390,6 @@ mod tests {
         let cases = [
             (Phase::Queued, Input::Dispatch, Role::Coordinator),
             (Phase::Preparing, Input::WorktreesPrepared, Role::Worker),
-            (
-                Phase::Implementing,
-                Input::EvidenceSubmitted,
-                Role::Reviewer,
-            ),
             (Phase::Reviewing, Input::CorrectionsRemain, Role::Worker),
             (
                 Phase::Reviewing,
@@ -421,6 +416,17 @@ mod tests {
                     .all(|effect| *effect == EffectKind::PublishTicketStatus)
             );
         }
+        let mut implementing = run();
+        implementing.phase = Phase::Implementing;
+        implementing.activity = Activity::Running;
+        let publication = reduce(
+            &implementing,
+            implementing.revision,
+            Input::EvidenceSubmitted,
+        )
+        .unwrap();
+        assert_eq!(publication.ticket_run.phase, Phase::Publishing);
+        assert!(publication.wakes.is_empty());
     }
 
     #[test]

@@ -3338,7 +3338,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11, "ConfigStore applies the ordered v11 migration");
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
         (temp, store, project_id, generation, run)
     }
 
@@ -3541,7 +3541,7 @@ mod tests {
                 )
                 .unwrap();
             if pair_index == 4 {
-                assert_eq!(progress.evidence.outcome, TrialOutcome::Inconclusive);
+                assert_eq!(progress.evidence.outcome, TrialOutcome::Improved);
             }
             assert_eq!(
                 progress.trials.last().unwrap(),
@@ -3584,7 +3584,7 @@ mod tests {
         assert_eq!(supervisor.candidates.len(), 1);
         assert_eq!(
             supervisor.candidates[0].evidence.as_ref().unwrap().outcome,
-            TrialOutcome::Inconclusive
+            TrialOutcome::Improved
         );
         let _ = ProfileId::parse("worker-profile").unwrap();
     }

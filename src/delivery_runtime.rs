@@ -2926,7 +2926,6 @@ mod tests {
         let (bare, base_sha) = seed_local_remote(temp.path(), &executable);
         let repository_id = RepositoryId::parse("demo").unwrap();
         let project_id = ProjectId::parse("project").unwrap();
-        let repository_config = fixture_repository_config(bare.to_string_lossy().into_owned());
         let gh_executable = temp.path().join("gh-fixture");
         std::fs::write(&gh_executable, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&gh_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2949,7 +2948,10 @@ mod tests {
                 gh_environment: BTreeMap::new(),
                 timeout: Duration::from_secs(5),
                 configuration_digest: configuration_digest.clone(),
-                repositories: BTreeMap::from([(repository_id.clone(), repository_config)]),
+                repositories: BTreeMap::from([(
+                    repository_id.clone(),
+                    fixture_repository_config(bare.to_string_lossy().into_owned()),
+                )]),
                 project_repositories: BTreeMap::from([(
                     project_id.clone(),
                     BTreeSet::from([repository_id.clone()]),
@@ -3001,9 +3003,91 @@ mod tests {
         let handler = effects.prepare_worktrees_handler();
         let mut store =
             crate::store::ConfigStore::open_test(&temp.path().join("controller")).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &crate::config::AppliedConfig {
+                    config: serde_json::from_value(serde_json::json!({
+                        "schema_version": 1,
+                        "adapters": {"tickets": {"kind":"command","command":["test"]}},
+                        "projects": {}
+                    }))
+                    .unwrap(),
+                    profiles: BTreeMap::new(),
+                    source_root: temp.path().display().to_string(),
+                    source_files: Vec::new(),
+                    digest: Digest::parse("a".repeat(64)).unwrap(),
+                },
+                crate::store::ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        store
+            .insert_project(&crate::store::ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: applied.digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: crate::domain::ids::Revision(0),
+            })
+            .unwrap();
+        let owner_generation = store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "delivery-test-owner".into(),
+                state_root: temp.path().join("controller").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "delivery-test-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store
+            .create_ticket_run(
+                owner_generation,
+                &project_id,
+                &TicketNamespace::parse("fixture").unwrap(),
+                &TicketId::parse("T-3").unwrap(),
+                &TicketRunId::parse("run-1").unwrap(),
+                1,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+        let work_identity = WorkNodeIdentity {
+            project_id: project_id.clone(),
+            repository_id: RepositoryId::parse("demo").unwrap(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-3").unwrap(),
+            ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+            work_node_id: "api".into(),
+        };
+        store
+            .insert_initial_publication_baseline(
+                owner_generation,
+                &crate::store::publication_monitor::PublicationResource {
+                    project_id: project_id.clone(),
+                    ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+                    repository_id: RepositoryId::parse("demo").unwrap(),
+                    branch: work_identity.branch_name().unwrap(),
+                },
+                "main",
+                &Digest::parse("c".repeat(64)).unwrap(),
+                &RepositoryPublicationObservation {
+                    remote_head: None,
+                    pull_requests: crate::delivery_forge::ObservationCapability::Known(Vec::new()),
+                },
+                1,
+            )
+            .unwrap();
         let mut context = EffectContext {
             store: &mut store,
-            owner_generation: 1,
+            owner_generation,
             now_unix: 1,
         };
         assert!(matches!(
@@ -3030,18 +3114,18 @@ mod tests {
             attempt_count: 0,
             created_at_unix: 1,
         };
-        let first = handler
+        let first = match handler
             .handle(EffectMode::Submit, &request, &mut context)
-            .unwrap();
-        let second = handler
+            .unwrap()
+        {
+            EffectObservation::Applied { receipt } => receipt,
+            other => panic!("worktree preparation result: {other:?}"),
+        };
+        let EffectObservation::Applied { receipt: second } = handler
             .handle(EffectMode::Reconcile, &request, &mut context)
-            .unwrap();
-        let (
-            EffectObservation::Applied { receipt: first },
-            EffectObservation::Applied { receipt: second },
-        ) = (first, second)
+            .unwrap()
         else {
-            panic!("prepare worktrees effect must be replayable");
+            panic!("worktree preparation should replay its durable receipt");
         };
         assert_eq!(first, second);
         let receipt: PreparedWorktreesEffectReceipt = serde_json::from_str(&first).unwrap();

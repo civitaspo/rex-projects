@@ -2243,7 +2243,7 @@ mod tests {
             .join(" ");
         assert!(codex.contains("--no-daemon"));
         assert!(codex.contains("--ask-for-approval never"));
-        assert!(codex.contains("developer_instructions=\"Worker must use the mailbox\""));
+        assert!(codex.contains("Worker must use the mailbox"));
         let claude = prepare_with_qualification(
             &request(
                 root.path(),

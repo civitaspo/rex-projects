@@ -2123,6 +2123,7 @@ mod tests {
         connection
             .execute_batch("DROP INDEX human_requests_rex_view_lifecycle")
             .unwrap();
+        connection.pragma_update(None, "user_version", 8).unwrap();
         drop(connection);
         let before = fs::read(&database).unwrap();
 

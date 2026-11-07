@@ -869,6 +869,10 @@ mod tests {
         }
     }
 
+    fn fixture_invocation_metrics(state_dir: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(state_dir.join("metrics.json")).unwrap()).unwrap()
+    }
+
     #[test]
     fn operation_approval_bundle_is_recomputed_from_bound_config_and_subject() {
         let temp = tempdir().unwrap();
@@ -915,7 +919,11 @@ mod tests {
         };
         let bundle = operation_review_bundle(&applied, &request).unwrap();
         assert!(bundle.summary.contains(SOURCE_SHA));
-        assert!(bundle.evidence[0].body.contains("xtask fixture operations"));
+        assert!(
+            bundle.evidence[0]
+                .body
+                .contains("Configured argv (direct execution, no shell)")
+        );
         assert!(
             bundle.evidence[2]
                 .body
@@ -1017,8 +1025,7 @@ mod tests {
             EffectDispatcher::tick(&mut store, generation, 100, &[&handler], limits).unwrap(),
             DispatchTick::WaitingForReconciliation { .. }
         ));
-        let state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
+        let state = fixture_invocation_metrics(&remote_state);
         assert_eq!(state["invoke_calls"], 1);
         assert_eq!(state["duplicate_invoke_calls"], 0);
 
@@ -1066,8 +1073,7 @@ mod tests {
                 .unwrap(),
             DispatchTick::Completed { .. }
         ));
-        let state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
+        let state = fixture_invocation_metrics(&remote_state);
         assert_eq!(state["invoke_calls"], 1);
         assert_eq!(state["duplicate_invoke_calls"], 0);
 
@@ -1199,8 +1205,7 @@ mod tests {
             .unwrap(),
             DispatchTick::WaitingForReconciliation { .. }
         ));
-        let state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&remote_state).unwrap()).unwrap();
+        let state = fixture_invocation_metrics(&remote_state);
         assert_eq!(state["invoke_calls"], 1);
         assert_eq!(state["duplicate_invoke_calls"], 0);
     }

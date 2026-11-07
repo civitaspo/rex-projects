@@ -761,8 +761,7 @@ mod tests {
         let config = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "adapters": { "tickets": {
-                "kind":"command", "command":["ticket-cli"],
-                "status_values": {"triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"}
+                "kind":"command", "command":["ticket-cli"]
             }},
             "projects": { "project-a": {
                 "mode":"operations", "ticket_adapter":"tickets",

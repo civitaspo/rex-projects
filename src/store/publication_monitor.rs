@@ -589,12 +589,10 @@ mod tests {
         AppliedConfig {
             config: serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
-                "adapters": {"tickets": {"kind":"command","command":["test"],"status_values": {
-                    "triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress",
-                    "in_review":"In Review","done":"Done","canceled":"Canceled"
-                }}},
+                "adapters": {"tickets": {"kind":"command","command":["test"]}},
                 "projects": {}
-            })).unwrap(),
+            }))
+            .unwrap(),
             profiles: BTreeMap::new(),
             source_root: "/tmp/config".into(),
             source_files: vec![SourceFile {
@@ -658,17 +656,10 @@ mod tests {
         )
     }
 
-    fn install_baseline_schema(store: &mut ConfigStore) {
-        let tx = store.connection.unchecked_transaction().unwrap();
-        migrate_v12_publication_baselines(&tx).unwrap();
-        tx.commit().unwrap();
-    }
-
     #[test]
     fn initial_baseline_requires_complete_absence_and_is_immutable() {
         let temp = tempfile::tempdir().unwrap();
         let (mut store, generation, resource) = setup_store(temp.path());
-        install_baseline_schema(&mut store);
         let absent = crate::delivery_runtime::RepositoryPublicationObservation {
             remote_head: None,
             pull_requests: crate::delivery_forge::ObservationCapability::Known(Vec::new()),

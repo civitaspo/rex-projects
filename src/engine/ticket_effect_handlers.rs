@@ -1248,16 +1248,31 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
         let digest = "a".repeat(64);
-        let applied = store.apply_snapshot("factory", &AppliedConfig {
-            config: serde_json::from_value(json!({
-                "schema_version": 1,
-                "adapters": {"tickets": {"kind":"command","command":["test"],"status_values":{"triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"}}},
-                "projects": {}
-            })).unwrap(),
-            profiles: BTreeMap::new(), source_root: "/tmp/config".into(),
-            source_files: vec![SourceFile { kind: SourceKind::File, path: "/tmp/config/config.toml".into(), canonical_path: "/tmp/config/config.toml".into(), sha256: Digest::parse(digest.clone()).unwrap(), bytes: 1, contents: "x".into() }],
-            digest: Digest::parse(digest.clone()).unwrap(),
-        }, ExpectedRevision::Bootstrap).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &AppliedConfig {
+                    config: serde_json::from_value(json!({
+                        "schema_version": 1,
+                        "adapters": {"tickets": {"kind":"command","command":["test"]}},
+                        "projects": {}
+                    }))
+                    .unwrap(),
+                    profiles: BTreeMap::new(),
+                    source_root: "/tmp/config".into(),
+                    source_files: vec![SourceFile {
+                        kind: SourceKind::File,
+                        path: "/tmp/config/config.toml".into(),
+                        canonical_path: "/tmp/config/config.toml".into(),
+                        sha256: Digest::parse(digest.clone()).unwrap(),
+                        bytes: 1,
+                        contents: "x".into(),
+                    }],
+                    digest: Digest::parse(digest.clone()).unwrap(),
+                },
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
         let project = ProjectId::parse("handler-test").unwrap();
         store
             .insert_project(&ProjectRecord {

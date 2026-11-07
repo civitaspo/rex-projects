@@ -880,6 +880,7 @@ mod pool_tests {
             },
         )
         .unwrap();
+        let state_root = state_root.canonicalize().unwrap();
         let repository_id = RepositoryId::parse("repo-a").unwrap();
         let first_worktree = state_root
             .join("worktrees/repo-a/00000000000000000000000000000001")

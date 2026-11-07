@@ -3156,7 +3156,7 @@ impl ConfigStore {
             return Err("configuration command exceeds the 1 MiB limit".into());
         }
         let database = state_root.join("state.sqlite3");
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -3165,7 +3165,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         let tx = connection
-            .unchecked_transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         tx.execute(
@@ -4466,7 +4466,7 @@ mod tests {
 
     fn snapshot(digest: &str) -> AppliedConfig {
         AppliedConfig {
-            config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"],"status_values":{"triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"}}},"projects":{}})).unwrap(),
+            config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"]}},"projects":{}})).unwrap(),
             profiles: BTreeMap::new(), source_root: "/tmp/config".into(), source_files: vec![SourceFile { kind: SourceKind::File, path: "/tmp/config/config.toml".into(), canonical_path: "/tmp/config/config.toml".into(), sha256: Digest::parse("a".repeat(64)).unwrap(), bytes: 1, contents: "x".into() }], digest: Digest::parse(digest).unwrap(),
         }
     }

@@ -491,11 +491,6 @@ mod tests {
             "adapters": {"tickets": {
                 "kind": "command",
                 "command": ["ticket-cli"],
-                "status_values": {
-                    "triage":"Triage", "backlog":"Backlog", "ready":"ToDo",
-                    "in_progress":"In Progress", "in_review":"In Review",
-                    "done":"Done", "canceled":"Canceled"
-                }
             }},
             "repositories": {"repo": {
                 "clone_url": clone_url, "base_branch":"main", "forge":forge

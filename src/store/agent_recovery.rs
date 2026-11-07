@@ -881,18 +881,10 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        let tx = store.connection.transaction().unwrap();
-        migrate_v12_recovery_tables(&tx).unwrap();
-        tx.commit().unwrap();
         let config = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "adapters": {"tickets": {
-                "kind": "command", "command": ["test"],
-                "status_values": {
-                    "triage":"Triage", "backlog":"Backlog", "ready":"Ready",
-                    "in_progress":"In Progress", "in_review":"In Review",
-                    "done":"Done", "canceled":"Canceled"
-                }
+                "kind": "command", "command": ["test"]
             }},
             "projects": {}
         }))
@@ -990,9 +982,11 @@ mod tests {
                 [payload.ticket_run_id.as_str()],
             )
             .unwrap();
-        assert!(store
-            .prepare_stop_owned_runs_intent(generation, &operation_id, &payload, 12)
-            .is_err());
+        assert!(
+            store
+                .prepare_stop_owned_runs_intent(generation, &operation_id, &payload, 12)
+                .is_err()
+        );
     }
 
     #[test]

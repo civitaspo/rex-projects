@@ -43,6 +43,15 @@ pub fn run(state_dir: &Path) -> Result<(), String> {
             let action_id = string(params, "action_id")?;
             let operation_id = string(&request, "operation_id")?;
             let path = state_path(state_dir, operation_id)?;
+            let metrics_path = state_dir.join("metrics.json");
+            let mut metrics = read_json_if_present(&metrics_path)?
+                .unwrap_or_else(|| json!({"invoke_calls": 0, "duplicate_invoke_calls": 0}));
+            metrics["invoke_calls"] = json!(metrics["invoke_calls"].as_u64().unwrap_or(0) + 1);
+            if path.exists() {
+                metrics["duplicate_invoke_calls"] =
+                    json!(metrics["duplicate_invoke_calls"].as_u64().unwrap_or(0) + 1);
+            }
+            write_json(&metrics_path, &metrics)?;
             let stored = json!({
                 "operation_id": operation_id,
                 "correlation_key": params["correlation_key"],

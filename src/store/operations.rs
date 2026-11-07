@@ -179,9 +179,10 @@ impl<'a> OperationsStore<'a> {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        if version != OPERATIONS_SCHEMA_VERSION {
+        if version != crate::store::SCHEMA_VERSION {
             return Err(format!(
-                "operations store requires schema {OPERATIONS_SCHEMA_VERSION}, found {version}"
+                "operations store requires schema {}, found {version}",
+                crate::store::SCHEMA_VERSION
             ));
         }
         Ok(Self { connection })
