@@ -90,6 +90,9 @@ struct PackageInfo {
 fn valid_semver(value: &str) -> bool {
     // Cargo's version is already parsed by Cargo; this checks the release tag
     // shape and excludes whitespace/URL-sensitive values before interpolation.
+    if value.contains('-') {
+        return false;
+    }
     let core = value.split(['-', '+']).next().unwrap_or_default();
     let mut parts = core.split('.');
     let numeric = |part: Option<&str>| {
@@ -1170,6 +1173,12 @@ mod tests {
             .unwrap();
         assert!(validate_floor(target, "glibc 2.38").is_err());
         assert!(validate_floor(target, "glibc 2.39").is_ok());
+    }
+
+    #[test]
+    fn release_pin_requires_a_stable_cargo_version() {
+        assert!(valid_semver("0.1.0"));
+        assert!(!valid_semver("0.1.0-rc.1"));
     }
 
     #[cfg(unix)]
