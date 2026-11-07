@@ -513,15 +513,20 @@ fn write_receipt(path: &Path, receipt: &HookReceipt) -> Result<(), HookError> {
 
 fn receipt_path(root: &Path, hook_id: &str, head: &str, configuration_digest: &Digest) -> PathBuf {
     static NEXT_RECEIPT_ID: AtomicU64 = AtomicU64::new(0);
-    let head_key = hex_bytes(&Sha256::digest(head.as_bytes()));
-    let nonce = SystemTime::now()
+    let mut identity = Sha256::new();
+    identity.update(hook_id.as_bytes());
+    identity.update([0]);
+    identity.update(head.as_bytes());
+    identity.update([0]);
+    identity.update(configuration_digest.as_str().as_bytes());
+    let identity_key = hex_bytes(&identity.finalize());
+    let clock_nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let sequence = NEXT_RECEIPT_ID.fetch_add(1, Ordering::Relaxed);
     root.join(format!(
-        "{hook_id}-{head_key}-{}-{}-{nonce}-{sequence}.json",
-        configuration_digest.as_str(),
+        "{identity_key}-{:x}-{sequence:x}-{clock_nonce:x}.json",
         std::process::id(),
     ))
 }
@@ -684,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn records_success_bound_to_head_configuration_and_source() {
+    fn records_success_bound_to_head_configuration_and_source_with_max_hook_id() {
         let (temp, repo, config_digest) = fixture();
         let head = std::fs::read_to_string(repo.join(".git/HEAD")).unwrap();
         let head = head.trim();
@@ -716,7 +721,14 @@ mod tests {
         );
         let receipts = runner
             .run_required(
-                &[hook(&["sh", "-c", "test -f README.md"])],
+                &[HookConfig {
+                    id: "a".repeat(96),
+                    command: ["sh", "-c", "test -f README.md"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    timeout_seconds: 10,
+                }],
                 HookRunContext {
                     repository_id: &RepositoryId::parse("fixture-repo").unwrap(),
                     worktree: &repo,
@@ -731,6 +743,7 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert!(receipts[0].succeeded);
         assert_eq!(receipts[0].head, expected_head);
+        assert_eq!(receipts[0].hook_id.len(), 96);
         let saved = receipts_for(&temp, "fixture-repo", "run-1");
         assert_eq!(saved, receipts);
         let directory = temp
