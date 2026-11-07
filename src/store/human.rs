@@ -1140,6 +1140,7 @@ mod tests {
     impl HumanSubjectObserver for FixedSubjectObserver {
         fn observe_current_subject(
             &self,
+            _store: &ConfigStore,
             _request: &HumanRuntimeRequest,
         ) -> Result<Option<HumanSubjectBinding>, String> {
             Ok(Some(self.0.clone()))

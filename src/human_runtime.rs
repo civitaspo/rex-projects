@@ -341,7 +341,10 @@ pub fn process_queued_human_responses<F>(
     mut observe: F,
 ) -> Result<Vec<ProcessedHumanResponse>, String>
 where
-    F: FnMut(&HumanRuntimeRequest) -> Result<Option<HumanSubjectBinding>, String>,
+    F: FnMut(
+        &crate::store::ConfigStore,
+        &HumanRuntimeRequest,
+    ) -> Result<Option<HumanSubjectBinding>, String>,
 {
     if limit == 0 || limit > MAX_HUMAN_RESPONSE_BATCH {
         return Err("human response batch limit must be between 1 and 64".into());
@@ -349,7 +352,10 @@ where
     let queued = store.pending_human_decisions(owner_generation, limit)?;
     let mut processed = Vec::with_capacity(queued.len());
     for item in queued {
-        let Some(current_subject) = observe(&item.request)? else {
+        // Re-observation receives the same owner-fenced store connection used by the controller.
+        // Domain resolvers must query current persisted intent and provider state here; they must
+        // never treat the queued request's own subject as evidence of current authority.
+        let Some(current_subject) = observe(store, &item.request)? else {
             continue;
         };
         let result = store.process_human_decision(
@@ -595,6 +601,7 @@ pub fn open_runtime_review_html(
 pub trait HumanSubjectObserver: Send + Sync {
     fn observe_current_subject(
         &self,
+        store: &crate::store::ConfigStore,
         request: &HumanRuntimeRequest,
     ) -> Result<Option<HumanSubjectBinding>, String>;
 }
@@ -773,7 +780,7 @@ impl HumanPresenterEffectHandler {
             context.owner_generation,
             MAX_HUMAN_RESPONSE_BATCH,
             now,
-            |human_request| self.observer.observe_current_subject(human_request),
+            |store, human_request| self.observer.observe_current_subject(store, human_request),
         )?;
         let summary = context
             .store
