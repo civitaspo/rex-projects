@@ -11,6 +11,7 @@ use crate::process::{ProcessRequest, resolve_executable, run};
 
 const SHELL_FLAVOR: &str = "com.superlogical.terminal.shell";
 const OWNED_WINDOW_PREFIX: &str = "rex-projects-ticket-";
+const OWNED_SUPERVISOR_WINDOW_PREFIX: &str = "rex-projects-supervisor-";
 const OWNED_BLOCK_PREFIX: &str = "rex-projects-run-";
 
 #[derive(Clone, Debug)]
@@ -23,7 +24,7 @@ pub struct AgentBlockSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TicketWindow {
+pub struct RexWindow {
     pub server_instance_id: String,
     pub session_id: String,
     pub window_id: String,
@@ -31,6 +32,8 @@ pub struct TicketWindow {
     pub initial_block_id: Option<String>,
     pub disposition: CreateDisposition,
 }
+
+pub type TicketWindow = RexWindow;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CreateDisposition {
@@ -41,6 +44,13 @@ pub enum CreateDisposition {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedBlock {
+    pub block_id: String,
+    pub label: String,
+    pub flavor: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowBlock {
     pub block_id: String,
     pub label: String,
     pub flavor: String,
@@ -367,6 +377,10 @@ impl RexCliTransport {
         &self.capabilities
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     pub fn find_or_create_ticket_window(
         &self,
         ticket_namespace: &str,
@@ -374,8 +388,24 @@ impl RexCliTransport {
         first_agent: &AgentBlockSpec,
     ) -> Result<TicketWindow, RexError> {
         let label = ticket_window_label(ticket_namespace, ticket_id)?;
+        self.find_or_create_window(&label, first_agent)
+    }
+
+    pub fn find_or_create_project_window(
+        &self,
+        project_id: &crate::domain::ids::ProjectId,
+        first_agent: &AgentBlockSpec,
+    ) -> Result<RexWindow, RexError> {
+        self.find_or_create_window(&supervisor_window_label(project_id.as_str()), first_agent)
+    }
+
+    fn find_or_create_window(
+        &self,
+        label: &str,
+        first_agent: &AgentBlockSpec,
+    ) -> Result<RexWindow, RexError> {
         let view = self.session_view()?;
-        let matches = windows_with_label(&view, &label)?;
+        let matches = windows_with_label(&view, label)?;
         if matches.len() > 1 {
             return Err(RexError::Uncertain);
         }
@@ -384,7 +414,7 @@ impl RexCliTransport {
                 server_instance_id: self.capabilities.server_instance_id.clone(),
                 session_id: self.session_id.clone(),
                 window_id,
-                label,
+                label: label.to_owned(),
                 initial_block_id: block_id,
                 disposition: CreateDisposition::Existing,
             });
@@ -411,12 +441,12 @@ impl RexCliTransport {
                     server_instance_id: self.capabilities.server_instance_id.clone(),
                     session_id: self.session_id.clone(),
                     window_id,
-                    label,
+                    label: label.to_owned(),
                     initial_block_id: block_id,
                     disposition: CreateDisposition::Created,
                 })
             }
-            Err(_) => self.reconcile_window(&label),
+            Err(_) => self.reconcile_window(label),
         }
     }
 
@@ -491,7 +521,9 @@ impl RexCliTransport {
             .iter()
             .filter_map(|window| {
                 let label = window.get("label").and_then(Value::as_str)?;
-                label.starts_with(OWNED_WINDOW_PREFIX).then(|| {
+                (label.starts_with(OWNED_WINDOW_PREFIX)
+                    || label.starts_with(OWNED_SUPERVISOR_WINDOW_PREFIX))
+                .then(|| {
                     let window_id = window
                         .get("window_id")
                         .and_then(Value::as_str)
@@ -506,6 +538,35 @@ impl RexCliTransport {
                 })
             })
             .collect()
+    }
+
+    pub fn list_window_blocks(
+        &self,
+        window: &RexWindow,
+        expected_label: &str,
+    ) -> Result<Vec<WindowBlock>, RexError> {
+        self.check_window(window)?;
+        if window.label != expected_label || !is_owned_window_label(expected_label) {
+            return Err(RexError::Invalid(
+                "Rex window label does not match its owner".into(),
+            ));
+        }
+        let view = self.session_view()?;
+        let matches = windows_with_label(&view, expected_label)?;
+        if matches.len() != 1 || matches[0].0 != window.window_id {
+            return Err(RexError::Uncertain);
+        }
+        all_blocks_in_window(&view, &window.window_id)
+    }
+
+    pub fn window_exists(&self, window: &RexWindow) -> Result<bool, RexError> {
+        self.check_window(window)?;
+        let view = self.session_view()?;
+        let matches = windows_with_label(&view, &window.label)?;
+        if matches.len() > 1 {
+            return Err(RexError::Uncertain);
+        }
+        Ok(matches.iter().any(|(id, _)| id == &window.window_id))
     }
 
     /// Verify that a caller-provided current block belongs to the connected
@@ -579,6 +640,41 @@ impl RexCliTransport {
             json!({"session_id": self.session_id, "block_id": block_id}),
         )
         .map(|_| ())
+    }
+
+    pub fn capture_agent_block(
+        &self,
+        window: &TicketWindow,
+        run_id: &str,
+        block_id: &str,
+    ) -> Result<String, RexError> {
+        self.check_window(window)?;
+        let expected_label = owned_block_label(run_id)?;
+        let view = self.session_view()?;
+        if !blocks_in_window(&view, &window.window_id, Some(&expected_label))?
+            .iter()
+            .any(|block| block.block_id == block_id)
+        {
+            return Err(RexError::Uncertain);
+        }
+        self.verify_identity()?;
+        let output = self.command(&[
+            "capture".into(),
+            "--session".into(),
+            self.session_id.clone().into(),
+            "--block".into(),
+            block_id.into(),
+            "--trim".into(),
+            "--unwrap".into(),
+        ])?;
+        self.verify_identity().map_err(|_| RexError::Uncertain)?;
+        if output.stdout.len() > 1_048_576 {
+            return Err(RexError::Invalid(
+                "Rex block archive exceeds the 1 MiB limit".into(),
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| RexError::Protocol("Rex block capture is not UTF-8 text".into()))
     }
 
     /// Observe the verified block-scoped `terminal.process` action. Rex does
@@ -802,6 +898,26 @@ fn ticket_window_label(namespace: &str, ticket_id: &str) -> Result<String, RexEr
     ))
 }
 
+fn supervisor_window_label(project_id: &str) -> String {
+    let digest = Sha256::digest(project_id.as_bytes());
+    format!(
+        "{OWNED_SUPERVISOR_WINDOW_PREFIX}{}",
+        hex_prefix(&digest, 24)
+    )
+}
+
+pub fn owned_ticket_window_label(namespace: &str, ticket_id: &str) -> Result<String, RexError> {
+    ticket_window_label(namespace, ticket_id)
+}
+
+pub fn owned_supervisor_window_label(project_id: &str) -> String {
+    supervisor_window_label(project_id)
+}
+
+fn is_owned_window_label(label: &str) -> bool {
+    label.starts_with(OWNED_WINDOW_PREFIX) || label.starts_with(OWNED_SUPERVISOR_WINDOW_PREFIX)
+}
+
 fn owned_block_label(run_id: &str) -> Result<String, RexError> {
     if run_id.is_empty() || run_id.chars().any(char::is_control) {
         return Err(RexError::Invalid(
@@ -814,6 +930,10 @@ fn owned_block_label(run_id: &str) -> Result<String, RexError> {
         "{OWNED_BLOCK_PREFIX}{}",
         hex_prefix(&hasher.finalize(), 24)
     ))
+}
+
+pub fn owned_agent_block_label(run_id: &str) -> Result<String, RexError> {
+    owned_block_label(run_id)
 }
 
 fn hex_prefix(digest: &[u8], bytes: usize) -> String {
@@ -915,6 +1035,45 @@ fn blocks_in_window(
                         .to_owned(),
                 });
             }
+        }
+    }
+    Ok(result)
+}
+
+fn all_blocks_in_window(view: &Value, window_id: &str) -> Result<Vec<WindowBlock>, RexError> {
+    let windows = view
+        .get("windows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RexError::Protocol("session view has no windows".into()))?;
+    let window = windows
+        .iter()
+        .find(|window| window.get("window_id").and_then(Value::as_str) == Some(window_id))
+        .ok_or_else(|| RexError::Protocol("recorded window is absent from session view".into()))?;
+    let layers = window
+        .get("layers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RexError::Protocol("window has no layers".into()))?;
+    let mut result = Vec::new();
+    for layer in layers {
+        for block in layer
+            .get("blocks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            result.push(WindowBlock {
+                block_id: required_string(block, "block_id")?.to_owned(),
+                label: block
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                flavor: block
+                    .get("flavor")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            });
         }
     }
     Ok(result)
