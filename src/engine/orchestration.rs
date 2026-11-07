@@ -875,7 +875,11 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_payload_artifacts(payload: &RoleResultPayload, role: Role) -> Result<(), String> {
+fn validate_payload_artifacts(
+    payload: &RoleResultPayload,
+    role: Role,
+    declared_claims: &[RoleArtifactReference],
+) -> Result<(), String> {
     let mut references = Vec::new();
     match payload {
         RoleResultPayload::Progress(value) => references.extend(&value.evidence),
@@ -914,6 +918,12 @@ fn validate_payload_artifacts(payload: &RoleResultPayload, role: Role) -> Result
     }
     for reference in references {
         validate_artifact_reference(reference)?;
+        if !declared_claims.contains(reference) {
+            return Err(
+                "nested evidence reference is not declared in the role result artifact claims"
+                    .into(),
+            );
+        }
         if !role_may_submit_artifact(role, reference.kind) {
             return Err(format!(
                 "role {role:?} cannot reference artifact kind {:?}",
@@ -970,6 +980,12 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
             map.insert("pattern".into(), Value::from(pattern));
         }
     }
+    fn require_non_whitespace(value: &mut Value) {
+        if let Some(map) = value.as_object_mut() {
+            map.insert("minLength".into(), Value::from(1));
+            map.insert("pattern".into(), Value::from(r"^.*\S.*$"));
+        }
+    }
     fn visit(value: &mut Value) {
         match value {
             Value::Object(map) => {
@@ -1020,10 +1036,8 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                         rating.insert("maximum".into(), Value::from(4));
                                     }
                                     for field in ["source", "rationale"] {
-                                        if let Some(schema) =
-                                            properties.get_mut(field).and_then(Value::as_object_mut)
-                                        {
-                                            schema.insert("minLength".into(), Value::from(1));
+                                        if let Some(schema) = properties.get_mut(field) {
+                                            require_non_whitespace(schema);
                                         }
                                     }
                                     if let Some(evidence) = properties
@@ -1039,16 +1053,26 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                     .get_mut("properties")
                                     .and_then(Value::as_object_mut)
                                 {
-                                    if let Some(gate_id) =
-                                        properties.get_mut("gate_id").and_then(Value::as_object_mut)
-                                    {
-                                        gate_id.insert("minLength".into(), Value::from(1));
+                                    if let Some(gate_id) = properties.get_mut("gate_id") {
+                                        require_non_whitespace(gate_id);
                                     }
                                     if let Some(evidence) = properties
                                         .get_mut("evidence_references")
                                         .and_then(Value::as_object_mut)
                                     {
                                         evidence.insert("minItems".into(), Value::from(1));
+                                    }
+                                }
+                            }
+                            "MergeProcedureStep" | "PostMergeVerification" => {
+                                if let Some(properties) = definition
+                                    .get_mut("properties")
+                                    .and_then(Value::as_object_mut)
+                                {
+                                    for field in ["instruction_reference", "rationale"] {
+                                        if let Some(text) = properties.get_mut(field) {
+                                            require_non_whitespace(text);
+                                        }
                                     }
                                 }
                             }
@@ -1068,10 +1092,16 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                         }
                     }
                     for field in ["rationale", "disposition"] {
-                        if let Some(text) = properties.get_mut(field).and_then(Value::as_object_mut)
-                        {
-                            text.insert("minLength".into(), Value::from(1));
+                        if let Some(text) = properties.get_mut(field) {
+                            require_non_whitespace(text);
                         }
+                    }
+                    if let Some(items) = properties
+                        .get_mut("pr_references")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|array| array.get_mut("items"))
+                    {
+                        require_non_whitespace(items);
                     }
                     if let Some(ratings) =
                         properties.get_mut("ratings").and_then(Value::as_object_mut)
@@ -1103,11 +1133,31 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                             array.insert("minItems".into(), Value::from(1));
                         }
                     }
-                    if let Some(text) = properties
-                        .get_mut("assessment_id")
+                    if let Some(text) = properties.get_mut("assessment_id") {
+                        require_non_whitespace(text);
+                    }
+                    if let Some(items) = properties
+                        .get_mut("pr_identities")
                         .and_then(Value::as_object_mut)
+                        .and_then(|array| array.get_mut("items"))
                     {
-                        text.insert("minLength".into(), Value::from(1));
+                        require_non_whitespace(items);
+                    }
+                    for field in ["steps", "post_merge_verification"] {
+                        if let Some(item_properties) = properties
+                            .get_mut(field)
+                            .and_then(Value::as_object_mut)
+                            .and_then(|array| array.get_mut("items"))
+                            .and_then(Value::as_object_mut)
+                            .and_then(|item| item.get_mut("properties"))
+                            .and_then(Value::as_object_mut)
+                        {
+                            for field in ["instruction_reference", "rationale"] {
+                                if let Some(text) = item_properties.get_mut(field) {
+                                    require_non_whitespace(text);
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
@@ -1155,7 +1205,7 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                 property,
                                 1,
                                 4096,
-                                r"^(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*)(?:/(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*))*$",
+                                r"^(?![A-Za-z]:)(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*)(?:/(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*))*$",
                             ),
                             _ => {}
                         }
@@ -1197,7 +1247,9 @@ pub struct ValidatedRoleResult {
     pub structured_result: Value,
     pub typed_payload: RoleResultPayload,
     pub result_digest: Digest,
-    pub artifact_refs: Vec<RoleArtifactReference>,
+    /// Agent-declared locators only. The host artifact registrar still has to
+    /// verify the bytes and persist a receipt before consumers may rely on them.
+    pub claimed_artifact_refs: Vec<RoleArtifactReference>,
     /// Derived from the verified parent binding, never from Agent content.
     pub wake_recipients: Vec<WakeSessionKey>,
 }
@@ -1261,7 +1313,11 @@ pub fn validate_role_result(
             return Err("role result repeats an artifact path".into());
         }
     }
-    validate_payload_artifacts(&typed_payload, submission.binding.role)?;
+    validate_payload_artifacts(
+        &typed_payload,
+        submission.binding.role,
+        &submission.artifact_refs,
+    )?;
     let wake_recipients = result_wake_recipients(&submission.binding, submission.kind);
     Ok(ValidatedRoleResult {
         binding: submission.binding,
@@ -1271,7 +1327,7 @@ pub fn validate_role_result(
         structured_result: submission.structured_result,
         typed_payload,
         result_digest: submission.result_digest,
-        artifact_refs: submission.artifact_refs,
+        claimed_artifact_refs: submission.artifact_refs,
         wake_recipients,
     })
 }
@@ -3211,6 +3267,26 @@ mod tests {
     }
 
     #[test]
+    fn nested_artifact_references_must_be_declared_and_remain_unverified_claims() {
+        let artifact = RoleArtifactReference {
+            kind: RoleArtifactKind::General,
+            schema_version: 1,
+            path: "evidence/observation.json".into(),
+            digest: test_digest('f'),
+            bytes: 10,
+        };
+        let mut payload = worker_implementation_ready_payload();
+        payload["irregularity_references"] = json!([artifact]);
+        let mut submission = worker_result_submission(RoleOutputKind::ImplementationReady, payload);
+        let binding = worker_result_binding();
+        assert!(validate_role_result(&binding, submission.clone()).is_err());
+
+        submission.artifact_refs.push(artifact.clone());
+        let validated = validate_role_result(&binding, submission).unwrap();
+        assert_eq!(validated.claimed_artifact_refs, vec![artifact]);
+    }
+
+    #[test]
     fn every_role_output_has_a_bounded_closed_generated_schema() {
         let kinds = [
             RoleOutputKind::Progress,
@@ -3343,6 +3419,11 @@ mod tests {
             RoleOutputKind::ImplementationReady,
             &with_artifact
         ));
+        with_artifact["irregularity_references"][0]["path"] = json!("C:/outside");
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
         with_artifact["irregularity_references"][0]["path"] = json!("evidence/...");
         assert!(schema_accepts(
             RoleOutputKind::ImplementationReady,
@@ -3416,6 +3497,27 @@ mod tests {
             RoleOutputKind::MergeAssessment,
             &incomplete_dimensions
         ));
+        let mut whitespace_pr = valid_merge_assessment_payload();
+        whitespace_pr["pr_references"][0] = json!(" \t ");
+        assert!(!schema_accepts(
+            RoleOutputKind::MergeAssessment,
+            &whitespace_pr
+        ));
+        let typed =
+            RoleResultPayload::parse(RoleOutputKind::MergeAssessment, whitespace_pr).unwrap();
+        assert!(validate_role_payload(&typed).is_err());
+
+        let mut whitespace_step: Value = valid_role_payload_corpus()
+            .into_iter()
+            .find_map(|(kind, value)| (kind == RoleOutputKind::MergeIntent).then_some(value))
+            .unwrap();
+        whitespace_step["steps"][0]["instruction_reference"] = json!("   ");
+        assert!(!schema_accepts(
+            RoleOutputKind::MergeIntent,
+            &whitespace_step
+        ));
+        let typed = RoleResultPayload::parse(RoleOutputKind::MergeIntent, whitespace_step).unwrap();
+        assert!(validate_role_payload(&typed).is_err());
     }
 
     #[test]
