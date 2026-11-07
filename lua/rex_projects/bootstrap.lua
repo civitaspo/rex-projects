@@ -1,11 +1,12 @@
 local M = {}
 local invocation_sequence = 0
 
-local function run(exec, argv, started, budget, options)
+local function run(exec, argv, started, budget, options, cleanup)
   local elapsed = os.time() - started
   local remaining = budget - elapsed
-  if remaining <= 2 then return nil, "bootstrap deadline reached" end
-  local result, err = exec(argv, remaining - 2, options)
+  local reserve = cleanup and 0 or 2
+  if remaining <= reserve then return nil, "bootstrap deadline reached" end
+  local result, err = exec(argv, remaining - reserve, options)
   if not result then return nil, err or ("could not start " .. argv[1]) end
   if result.timed_out then return nil, (argv[1] .. " exceeded its bootstrap timeout") end
   if result.code ~= 0 then
@@ -15,8 +16,8 @@ local function run(exec, argv, started, budget, options)
   return result
 end
 
-local function output(exec, argv, started, budget)
-  local result, err = run(exec, argv, started, budget)
+local function output(exec, argv, started, budget, cleanup)
+  local result, err = run(exec, argv, started, budget, nil, cleanup)
   if not result then return nil, err end
   return (result.stdout or ""):gsub("%s+$", "")
 end
@@ -134,7 +135,7 @@ local function write_owner(lock, owner, encode, exec, started, budget)
   return true
 end
 
-local function acquire_lock(root, key, owner, encode, exec, started, budget)
+local function acquire_lock(root, key, owner, encode, decode, exec, started, budget)
   local lock_root = root .. "/.locks"
   local _, err = run(exec, { "mkdir", "-p", lock_root }, started, budget)
   if err then return nil, err end
@@ -156,15 +157,22 @@ local function acquire_lock(root, key, owner, encode, exec, started, budget)
   end
   local _, lock_chmod_error = run(exec, { "chmod", "700", path }, started, budget)
   if lock_chmod_error then
-    run(exec, { "rmdir", path }, started, budget)
+    -- The successful atomic mkdir is ours; rmdir only removes it if still empty.
+    run(exec, { "rmdir", path }, started, budget, nil, true)
     return nil, lock_chmod_error
   end
   local lock = { path = path, token = invocation_token() }
   owner.invocation_token = lock.token
   local written, receipt_error = write_owner(lock, owner, encode, exec, started, budget)
   if not written then
-    run(exec, { "rm", "-f", path .. "/owner.json" }, started, budget)
-    run(exec, { "rmdir", path }, started, budget)
+    -- Never remove a receipt we cannot prove is ours. An empty lock directory
+    -- can still be safely removed after the atomic mkdir above.
+    local receipt = output(exec, { "cat", path .. "/owner.json" }, started, budget, true)
+    local decoded = receipt and decode(receipt)
+    if type(decoded) == "table" and decoded.invocation_token == lock.token then
+      run(exec, { "rm", path .. "/owner.json" }, started, budget, nil, true)
+    end
+    run(exec, { "rmdir", path }, started, budget, nil, true)
     return nil, receipt_error
   end
   return lock
@@ -193,7 +201,7 @@ local function lock_owner(kind, binary_digest, version, target, protocol, budget
 end
 
 local function release_lock(lock, decode, exec, started, budget)
-  local owner_json, read_error = output(exec, { "cat", lock.path .. "/owner.json" }, started, budget)
+  local owner_json, read_error = output(exec, { "cat", lock.path .. "/owner.json" }, started, budget, true)
   if not owner_json then
     return "cannot verify bootstrap lock owner receipt at " .. lock.path .. ": " .. tostring(read_error)
   end
@@ -204,9 +212,9 @@ local function release_lock(lock, decode, exec, started, budget)
       .. "; preserved it for inspection: "
       .. tostring(decode_error)
   end
-  local _, receipt_error = run(exec, { "rm", lock.path .. "/owner.json" }, started, budget)
+  local _, receipt_error = run(exec, { "rm", lock.path .. "/owner.json" }, started, budget, nil, true)
   if receipt_error then return receipt_error end
-  local _, lock_error = run(exec, { "rmdir", lock.path }, started, budget)
+  local _, lock_error = run(exec, { "rmdir", lock.path }, started, budget, nil, true)
   return lock_error
 end
 
@@ -297,7 +305,7 @@ local function snapshot_developer(cli, protocol, env, decode, encode, exec, budg
   if not root then return nil, root_error end
   local key = "dev-" .. source_digest
   local owner = lock_owner("developer", source_digest, nil, target.triple, protocol, budget, owner_context, started)
-  local lock, lock_error = acquire_lock(root, key, owner, encode, exec, started, budget)
+  local lock, lock_error = acquire_lock(root, key, owner, encode, decode, exec, started, budget)
   if not lock then return nil, lock_error end
   local cache_directory = root .. "/dev/" .. source_digest
   local _, dir_error = run(exec, { "mkdir", "-p", cache_directory }, started, budget)
@@ -350,25 +358,25 @@ local function snapshot_developer(cli, protocol, env, decode, encode, exec, budg
     or after_digest ~= source_digest
     or copied_digest ~= source_digest
   then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, copy_error or before_copy_error or "cli source changed while it was being snapshotted"
   end
   local _, executable_error = run(exec, { "chmod", "700", temporary }, started, budget)
   if executable_error then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, executable_error
   end
   local value, probe_error = probe(temporary, nil, target.triple, protocol, decode, exec, started, budget)
   if not value then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, probe_error
   end
   local _, publish_error = run(exec, { "mv", "-n", temporary, final_path }, started, budget)
   if publish_error then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, publish_error
   end
@@ -426,7 +434,7 @@ local function install_release(pin, env, decode, encode, exec, budget, owner_con
   local key = "release-" .. pin.version .. "-" .. target.name
   local owner =
     lock_owner("release", asset.sha256, pin.version, target.triple, pin.protocol, budget, owner_context, started)
-  local lock, lock_error = acquire_lock(root, key, owner, encode, exec, started, budget)
+  local lock, lock_error = acquire_lock(root, key, owner, encode, decode, exec, started, budget)
   if not lock then return nil, lock_error end
   local folder = root .. "/bin/" .. pin.version .. "/" .. target.name
   local _, dir_error = run(exec, { "mkdir", "-p", folder }, started, budget)
@@ -487,31 +495,31 @@ local function install_release(pin, env, decode, encode, exec, budget, owner_con
     asset.url,
   }, started, budget)
   if download_error then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, download_error
   end
   local actual_digest, digest_error = digest(temporary, exec, started, budget)
   if actual_digest ~= asset.sha256 then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, digest_error or "downloaded release SHA-256 does not match the reviewed Lua pin"
   end
   local _, chmod_error2 = run(exec, { "chmod", "700", temporary }, started, budget)
   if chmod_error2 then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, chmod_error2
   end
   local value, probe_error = probe(temporary, pin.version, target.triple, pin.protocol, decode, exec, started, budget)
   if not value then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, probe_error
   end
   local _, publish_error = run(exec, { "mv", "-n", temporary, final_path }, started, budget)
   if publish_error then
-    run(exec, { "rm", "-f", temporary }, started, budget)
+    run(exec, { "rm", "-f", temporary }, started, budget, nil, true)
     release_lock(lock, decode, exec, started, budget)
     return nil, publish_error
   end

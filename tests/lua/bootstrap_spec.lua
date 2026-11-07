@@ -94,6 +94,7 @@ local function fake_world(options)
       end
       if world.directories[path] or world.files[path] or world.symlinks[path] then return failure("already exists") end
       world.directories[path] = true
+      if options.on_lock_created and path:match("%.lock$") then options.on_lock_created() end
       return success()
     end
     if command == "chmod" then
@@ -264,6 +265,28 @@ check(timeout.source_copy_count == 1, "timed out CLI probe must not publish an u
 check(
   not timeout.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
   "timed out CLI probe must release its owned lock"
+)
+
+local deadline_started = os.time()
+local deadline_world = fake_world({
+  on_lock_created = function()
+    local expire_at = deadline_started + 3
+    while os.time() < expire_at do
+      deadline_started = os.time()
+    end
+  end,
+})
+local expired, expired_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 4)
+check(not expired and expired_error:find("deadline reached", 1, true))
+check(
+  not deadline_world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
+  "normal deadline must release its own lock using the reserved cleanup budget"
+)
+local retried, retry_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(retried, "25-second retry must recover after a 4-second setup deadline: " .. tostring(retry_error))
+check(
+  not deadline_world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
+  "successful retry must release its own lock"
 )
 
 local busy = fake_world()
