@@ -7,11 +7,13 @@ import argparse
 import json
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 FIXTURES = Path(__file__).resolve().parent
 
@@ -131,6 +133,8 @@ def main() -> int:
     parser.add_argument("--artifacts", required=True, type=Path, help="Directory for private receipts")
     parser.add_argument("--source-sha", required=True, help="Git SHA of the source under test")
     parser.add_argument("--expected-instance-id", help="Optional Rex instance ID guard before any mutation")
+    parser.add_argument("--local-pid-namespace-confirmed", action="store_true",
+                        help="Confirm this Rex server shares the local OS PID namespace used by os.kill checks")
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
     parser.add_argument("--ready-timeout-seconds", type=float, default=5.0)
     parser.add_argument("--hold-seconds", type=float, default=0.0, help="Keep the live ticket tab open for visual inspection")
@@ -142,6 +146,19 @@ def main() -> int:
     if not 0 <= args.hold_seconds <= 300:
         parser.error("--hold-seconds must be between 0 and 300")
 
+    if not args.local_pid_namespace_confirmed:
+        parser.error("--local-pid-namespace-confirmed is required because child PID checks use local os.kill")
+    server_uri = urlparse(args.server)
+    if server_uri.scheme != "unix" or not server_uri.path:
+        parser.error("PID lifecycle checks require a local unix:// Rex endpoint")
+    try:
+        endpoint_mode = Path(server_uri.path).lstat().st_mode
+    except OSError as error:
+        parser.error(f"cannot inspect local Rex socket {server_uri.path!r}: {error}")
+    if not stat.S_ISSOCK(endpoint_mode):
+        parser.error("--server must name an existing local Unix socket")
+
+    args.artifacts = args.artifacts.expanduser().resolve()
     args.artifacts.mkdir(parents=True, exist_ok=True)
     transcripts = args.artifacts / "transcript"
     transcripts.mkdir(exist_ok=True)
@@ -152,6 +169,7 @@ def main() -> int:
     receipt: dict[str, Any] = {
         "source_sha": args.source_sha,
         "rex_server_endpoint": args.server,
+        "local_pid_namespace_acknowledged": args.local_pid_namespace_confirmed,
         "observed_at_epoch_seconds": time.time(),
         "scenarios": {},
     }
@@ -172,6 +190,8 @@ def main() -> int:
 
         nonce = secrets.token_hex(8)
         session_label = f"rex-projects-pr0-lifecycle-{nonce}"
+        probe_lifetime = max(20, args.hold_seconds + args.ready_timeout_seconds
+                             + args.timeout_seconds * 10 + 30)
         exact_args = ["space value", 'quote"value', "semi;literal", "dollar$(literal)"]
         argv_receipt = args.artifacts / "argv-receipt.json"
         argv_receipt.unlink(missing_ok=True)
@@ -234,7 +254,7 @@ def main() -> int:
                         "login": False,
                         "command": [sys.executable, str(FIXTURES / "wait_probe.py"),
                                     "--ready-file", str(ready_file), "--stop-file", str(stop_file),
-                                    "--timeout-seconds", str(max(20, args.hold_seconds + args.ready_timeout_seconds + 10))],
+                                    "--timeout-seconds", str(probe_lifetime)],
                         "cwd": str(args.artifacts),
                         "exit": {"on_completion": False},
                     },
@@ -311,7 +331,8 @@ def main() -> int:
                         "login": False,
                         "command": [sys.executable, str(FIXTURES / "wait_probe.py"),
                                     "--ready-file", str(close_ready_file),
-                                    "--stop-file", str(close_stop_file), "--timeout-seconds", "20"],
+                                    "--stop-file", str(close_stop_file),
+                                    "--timeout-seconds", str(probe_lifetime)],
                         "cwd": str(args.artifacts),
                         "exit": {"on_completion": False},
                     },
@@ -375,6 +396,8 @@ def main() -> int:
         session_child = wait_for_file(session_child_ready, args.ready_timeout_seconds)
         session_child_pid = session_child.get("pid")
         require(isinstance(session_child_pid, int), f"session child did not report its PID: {session_child!r}")
+        require(process_alive(session_child_pid),
+                f"session child PID {session_child_pid} exited before session destruction")
 
         rex.call("kill", created_session)
         created_session = None
