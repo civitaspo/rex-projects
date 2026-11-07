@@ -95,6 +95,9 @@ local function fake_world(options)
       if world.directories[path] or world.files[path] or world.symlinks[path] then return failure("already exists") end
       world.directories[path] = true
       if options.on_lock_created and path:match("%.lock$") then options.on_lock_created() end
+      if options.on_temp_directory_created and path:match("%.tmp$") then
+        options.on_temp_directory_created(path, world)
+      end
       return success()
     end
     if command == "chmod" then
@@ -113,7 +116,13 @@ local function fake_world(options)
       return file and success(file.content) or failure("missing receipt")
     end
     if command == "cp" then
-      local source, destination = argv[3], argv[4]
+      local source, destination
+      if argv[2] == "-n" then
+        source, destination = argv[4], argv[5]
+      else
+        source, destination = argv[3], argv[4]
+      end
+      if world.symlinks[destination] and argv[2] == "-n" then return success() end
       local file = world.files[source]
       if not file then return failure("missing source") end
       world.files[destination] = {
@@ -140,6 +149,7 @@ local function fake_world(options)
     end
     if command == "rm" then
       world.files[argv[#argv]] = nil
+      world.symlinks[argv[#argv]] = nil
       return success()
     end
     if command == "rmdir" then
@@ -194,7 +204,7 @@ local function fake_world(options)
     return "owner-json"
   end
 
-  function world.resolve(options_value, pin, budget)
+  function world.resolve(options_value, pin, budget, clock)
     return Bootstrap.resolve(
       options_value,
       pin or { version = "0.1.0", protocol = 1, targets = {} },
@@ -203,7 +213,8 @@ local function fake_world(options)
       world.encode,
       world.exec,
       budget or 25,
-      {}
+      {},
+      clock
     )
   end
 
@@ -242,6 +253,12 @@ local from_path, path_error = path_override.resolve({ cli = "rex-projects" }, ni
 check(from_path, path_error)
 check(from_path.source == "developer")
 
+local trailing_space_path = "/dev/rex-projects "
+local trailing_space = fake_world({ source_path = trailing_space_path })
+local trailing_context, trailing_error = trailing_space.resolve({ cli = trailing_space_path }, nil, 25)
+check(trailing_context, trailing_error)
+check(trailing_context.digest == hash, "realpath output must preserve meaningful trailing spaces in source names")
+
 local not_executable = fake_world({ source_executable = false })
 local rejected_source, executable_error = not_executable.resolve({ cli = "/dev/rex-projects" }, nil, 25)
 check(not rejected_source and executable_error:find("not executable", 1, true))
@@ -258,6 +275,13 @@ check(
   "failed owner receipt creation must release only the newly acquired empty lock"
 )
 
+local missing_stat = fake_world({ missing_command = "stat" })
+local stat_context, stat_error = missing_stat.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(
+  not stat_context and stat_error:find("stat", 1, true),
+  "stat prerequisite errors must identify the missing helper"
+)
+
 local timeout = fake_world({ cli_times_out = true })
 local timed_out, timeout_error = timeout.resolve({ cli = "/dev/rex-projects" }, nil, 25)
 check(not timed_out and timeout_error:find("exceeded its bootstrap timeout", 1, true))
@@ -267,23 +291,18 @@ check(
   "timed out CLI probe must release its owned lock"
 )
 
-local deadline_started = os.time()
-local deadline_world = fake_world({
-  on_lock_created = function()
-    local expire_at = deadline_started + 3
-    while os.time() < expire_at do
-      deadline_started = os.time()
-    end
-  end,
-})
-local expired, expired_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 4)
+local now = 1000
+local function fake_clock() return now end
+local deadline_world = fake_world({ on_lock_created = function() now = 1003 end })
+local expired, expired_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 4, fake_clock)
 check(not expired and expired_error:find("deadline reached", 1, true))
 check(
-  not deadline_world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
-  "normal deadline must release its own lock using the reserved cleanup budget"
+  deadline_world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
+  "an expired setup may preserve its own lock when Rex's termination grace exhausts the budget"
 )
-local retried, retry_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 25)
-check(retried, "25-second retry must recover after a 4-second setup deadline: " .. tostring(retry_error))
+now = 1004
+local retried, retry_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 25, fake_clock)
+check(retried, "25-second retry must clean its own previous lock and recover: " .. tostring(retry_error))
 check(
   not deadline_world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
   "successful retry must release its own lock"
@@ -314,6 +333,24 @@ local corrupt, corrupt_error = corrupt_cache.resolve({ cli = "/dev/rex-projects"
 check(not corrupt and corrupt_error:find("failed digest verification", 1, true))
 check(corrupt_cache.files[corrupt_path .. "/rex-projects"].digest == string.rep("d", 64))
 
+local escaped_dev = fake_world()
+escaped_dev.symlinks["/cache/rex-projects/dev"] = "/outside/dev"
+local escaped, escaped_error = escaped_dev.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(not escaped and escaped_error:find("symlink", 1, true))
+check(
+  not escaped_dev.directories["/outside/dev/" .. hash],
+  "developer setup must validate existing ancestors before creating digest descendants"
+)
+
+local escaped_cache = fake_world()
+escaped_cache.symlinks["/cache/rex-projects"] = "/outside/rex-projects"
+local cache_escape, cache_escape_error = escaped_cache.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(not cache_escape and cache_escape_error:find("symlink", 1, true))
+check(
+  not escaped_cache.directories["/outside/rex-projects/dev"],
+  "setup must reject a symlinked managed cache root before creating descendants"
+)
+
 local unreleased = fake_world()
 local none, unreleased_error = unreleased.resolve({}, { version = "0.1.0", protocol = 1, targets = {} }, 25)
 check(not none and unreleased_error:find("no reviewed release asset", 1, true))
@@ -337,6 +374,29 @@ local installed, install_error = release.resolve({}, pinned, 25)
 check(installed, install_error)
 check(installed.source == "release" and installed.digest == hash)
 assert_no_shell(release)
+local curl_call
+for _, call in ipairs(release.commands) do
+  if call.argv[1] == "curl" then
+    curl_call = call
+    break
+  end
+end
+check(
+  curl_call and curl_call.argv[2] == "--disable",
+  "curl must ignore user configuration before downloading pinned bytes"
+)
+
+local invalid_asset = fake_world()
+local invalid_asset_pin = {
+  version = "0.1.0",
+  protocol = 1,
+  targets = { ["macos-aarch64"] = true },
+}
+local bad_asset, bad_asset_error = invalid_asset.resolve({}, invalid_asset_pin, 25)
+check(
+  not bad_asset and bad_asset_error:find("invalid", 1, true),
+  "non-table release assets must fail as normal setup errors"
+)
 
 local bad_digest = fake_world({ download_digest = string.rep("e", 64) })
 bad_digest.version = version_info({ version = "0.1.0", target = "aarch64-apple-darwin" })
@@ -346,5 +406,26 @@ check(not rejected and digest_error:find("does not match", 1, true))
 local network = fake_world({ curl_fails = true })
 local offline, network_error = network.resolve({}, pinned, 25)
 check(not offline and network_error:find("network unavailable", 1, true))
+
+local symlinked_temp = fake_world({
+  on_temp_directory_created = function(directory, world_value)
+    world_value.symlinks[directory .. "/rex-projects"] = "/outside/marker"
+    world_value.files["/outside/marker"] = { digest = "unchanged", identity = "outside" }
+  end,
+})
+local symlinked_result, symlinked_error = symlinked_temp.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(not symlinked_result and symlinked_error:find("source", 1, true))
+check(
+  symlinked_temp.files["/outside/marker"].digest == "unchanged",
+  "snapshot copying must not overwrite a preexisting symlink target in its exclusive temp directory"
+)
+local temp_mkdir
+for _, call in ipairs(symlinked_temp.commands) do
+  if call.argv[1] == "mkdir" and call.argv[2] == "-m" then
+    temp_mkdir = call
+    break
+  end
+end
+check(temp_mkdir and temp_mkdir.argv[3] == "700", "temporary directories must be private at atomic creation")
 
 print("bootstrap fake-exec contract passed")

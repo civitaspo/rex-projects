@@ -1,6 +1,7 @@
 package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 
 local RuntimeDetails = require("rex_projects.runtime_details")
+local Bootstrap = require("rex_projects.bootstrap")
 local Integration = require("rex_projects.init")
 
 local pin = { status = "unreleased", version = "0.1.0", protocol = 1, targets = {} }
@@ -83,5 +84,54 @@ local action_result = actions.rex_projects_runtime_details.run({}, {})
 assert(action_result.cache_state == "not verified", "runtime details Action must expose failed cache state")
 assert(action_result.expected_cli_protocol == 1, "runtime details Action must expose expected protocol after failure")
 assert(action_result.error == failed_setup.error, "runtime details Action must expose the setup failure")
+
+local original_resolve = Bootstrap.resolve
+local resolve_budgets = {}
+local resolve_count = 0
+local verified_context = {
+  source = "developer",
+  cli_path = "/cache/rex-projects/dev/verified/rex-projects",
+  digest = string.rep("c", 64),
+  version = {
+    version = "0.1.0-dev.7",
+    target = "aarch64-apple-darwin",
+    cli_protocol = 1,
+    database_schema = 4,
+  },
+}
+Bootstrap.resolve = function(_options, _pin, _env, _decode, _encode, _exec, budget)
+  resolve_count = resolve_count + 1
+  resolve_budgets[resolve_count] = budget
+  if resolve_count == 1 then return nil, "simulated initial setup timeout" end
+  return verified_context
+end
+
+local retry_actions = {}
+local retry_api = {
+  action = function(action) retry_actions[action.name] = action end,
+  exec = function() error("mocked retry must not invoke a process") end,
+  json = { decode = function() return nil end, encode = function() return "" end },
+}
+local failed_to_ready = Integration.setup({ cli = "/dev/rex-projects" }, retry_api)
+assert(failed_to_ready.ready == false, "initial mock setup must fail and keep Actions registered")
+assert(resolve_budgets[1] == 4, "config-load setup must use its four-second budget")
+assert(retry_actions.rex_projects_retry_setup ~= nil, "retry Action must be registered after setup failure")
+
+local retried_details = retry_actions.rex_projects_retry_setup.run({ server = "isolated" }, {})
+assert(resolve_budgets[2] == 25, "retry Action must use the 25-second budget")
+assert(retried_details.ready == true, "retry Action must transition a failed runtime to ready")
+assert(
+  retried_details.cli_path == verified_context.cli_path,
+  "retry Action must expose the verified CLI path after recovery"
+)
+local updated_details = retry_actions.rex_projects_runtime_details.run({}, {})
+assert(updated_details.ready == true, "runtime details must expose the updated successful context")
+
+local successful_setup = Integration.setup({ cli = "/dev/rex-projects" }, retry_api)
+assert(
+  successful_setup == verified_context.cli_path,
+  "successful setup must return the absolute CLI path promised by the prototype"
+)
+Bootstrap.resolve = original_resolve
 
 print("runtime details contract passed")

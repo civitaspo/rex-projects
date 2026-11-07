@@ -66,6 +66,7 @@ function M.setup(options, rex_api)
     {}
   )
   register_actions(rex_api)
+  if M.context then return M.context.cli_path end
   return RuntimeDetails.describe(M.options, Pin, M.context, M.error)
 end
 
