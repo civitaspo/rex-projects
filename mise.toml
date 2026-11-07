@@ -51,7 +51,11 @@ run = [
 =======
   "lua tests/lua/bootstrap_version_contract.lua",
   "lua tests/lua/bootstrap_spec.lua",
+<<<<<<< HEAD
 >>>>>>> d0e3345 (feat(lua): bootstrap pinned rex-projects CLI)
+=======
+  "lua tests/lua/runtime_details_spec.lua",
+>>>>>>> 464e230 (fix(lua): expose bootstrap runtime details)
   "cargo test --workspace --all-features --locked",
 ]
 

@@ -1,23 +1,10 @@
 local Bootstrap = require("rex_projects.bootstrap")
 local Pin = require("rex_projects.runtime_version")
+local RuntimeDetails = require("rex_projects.runtime_details")
 
 local M = {}
 
 local function environment(name) return os.getenv(name) end
-
-local function public_context(context)
-  if not context then return { ready = false, error = M.error } end
-  return {
-    ready = true,
-    source = context.source,
-    version = context.version.version,
-    target = context.version.target,
-    cli_protocol = context.version.cli_protocol,
-    database_schema = context.version.database_schema,
-    digest = context.digest,
-    cli_path = context.cli_path,
-  }
-end
 
 local function register_actions(rex_api)
   rex_api.action({
@@ -43,14 +30,14 @@ local function register_actions(rex_api)
       )
       M.context = context
       M.error = err
-      return public_context(context)
+      return RuntimeDetails.describe(M.options, Pin, context, err)
     end,
   })
   rex_api.action({
     name = "rex_projects_runtime_details",
     title = "Show rex-projects Runtime Details",
     category = "rex-projects",
-    run = function() return public_context(M.context) end,
+    run = function() return RuntimeDetails.describe(M.options, Pin, M.context, M.error) end,
   })
 end
 
@@ -79,7 +66,7 @@ function M.setup(options, rex_api)
     {}
   )
   register_actions(rex_api)
-  return public_context(M.context)
+  return RuntimeDetails.describe(M.options, Pin, M.context, M.error)
 end
 
 return M
