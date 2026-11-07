@@ -85,7 +85,7 @@ fn unsupported_invocation_is_reported_as_usage_error() {
 }
 
 #[test]
-fn agent_marker_cannot_submit_human_claim_release() {
+fn factory_agent_marker_rejects_human_mutations_before_state_access() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
     let mutations: &[&[&str]] = &[
@@ -108,6 +108,18 @@ fn agent_marker_cannot_submit_human_claim_release() {
             "cancel and re-triage",
             "--disposition",
             "cancel",
+        ],
+        &["human", "list"],
+        &[
+            "human",
+            "respond",
+            "request-1",
+            "--subject-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--choice",
+            "approve",
+            "--explanation",
+            "reviewed",
         ],
     ];
     for marker in ["REX_PROJECTS_AGENT", "REX_PROJECTS_CONTEXT"] {

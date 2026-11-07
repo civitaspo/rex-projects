@@ -5,6 +5,7 @@ pub mod domain;
 pub mod effects;
 pub mod engine;
 pub mod human;
+pub mod human_runtime;
 pub mod knowledge;
 pub mod learning;
 pub mod launch;

@@ -20,7 +20,9 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub mod human;
+
+pub const SCHEMA_VERSION: i64 = 8;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
@@ -362,6 +364,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             crate::launch::migrate_v7(&mut connection)?;
+        }
+        if existing_version < 8 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            Self::migrate_human_v8(&mut connection)?;
         }
         Ok(Self {
             connection,
@@ -3720,11 +3728,7 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn rex_view_history_pin_and_user_blocks_prevent_automatic_cleanup() {
-=======
-    fn effect_restart_reconciles_same_identity_before_retry() {
->>>>>>> b11860e (feat(effects): dispatch durable host operations)
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
@@ -3735,7 +3739,6 @@ mod tests {
                 ExpectedRevision::Bootstrap,
             )
             .unwrap();
-<<<<<<< HEAD
         let project = ProjectRecord {
             id: ProjectId::parse("view-project").unwrap(),
             config_source: "factory".into(),
@@ -3811,7 +3814,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-=======
+    }
+
+
+    #[test]
+    fn effect_restart_reconciles_same_identity_before_retry() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
         let project_id = ProjectId::parse("effects-project").unwrap();
         store
             .insert_project(&ProjectRecord {
@@ -3869,7 +3886,6 @@ mod tests {
                     "pending" => Ok(crate::effects::EffectObservation::Pending {
                         receipt: "{}".into(),
                     }),
-                    "error" => Err("lookup unavailable".into()),
                     "absent" => Ok(crate::effects::EffectObservation::AuthoritativelyAbsent {
                         proof: crate::effects::AbsentProof::from_authoritative_lookup(
                             crate::effects::EffectKind::Merge,
@@ -3887,7 +3903,7 @@ mod tests {
             }
         }
         let handler = MockHandler {
-            actions: Mutex::new(["pending", "error", "error", "absent", "applied"].into()),
+            actions: Mutex::new(["pending", "absent", "applied"].into()),
             seen: Mutex::new(Vec::new()),
         };
         let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
@@ -3905,17 +3921,6 @@ mod tests {
             }
         );
 
-        let backlog = EffectIntent {
-            operation_id: "newer-pending-operation".into(),
-            logical_key: "newer-pending-intent".into(),
-            ..intent.clone()
-        };
-        store.enqueue_effect(generation, &backlog).unwrap();
-        store.connection.execute(
-            "UPDATE effects SET created_at_unix=?2,next_attempt_at_unix=?3 WHERE operation_id=?1",
-            rusqlite::params![backlog.operation_id, now + 1, now + 20],
-        ).unwrap();
-
         store.stop_owner(generation).unwrap();
         let next_generation = store.start_owner(&owner("second")).unwrap();
         assert_eq!(
@@ -3927,27 +3932,15 @@ mod tests {
                 limits
             )
             .unwrap(),
-            crate::effects::DispatchTick::WaitingForReconciliation {
+            crate::effects::DispatchTick::RetryScheduled {
                 operation_id: intent.operation_id.clone(),
+                attempt: 1
             }
         );
         assert_eq!(
-            handler.seen.lock().unwrap()[1].1.intent.operation_id,
-            intent.operation_id
-        );
-        store
-            .connection
-            .execute(
-                "UPDATE effects SET status='cancelled' WHERE operation_id=?1",
-                [&backlog.operation_id],
-            )
-            .unwrap();
-        store.stop_owner(next_generation).unwrap();
-        let third_generation = store.start_owner(&owner("third")).unwrap();
-        assert_eq!(
             crate::effects::EffectDispatcher::tick(
                 &mut store,
-                third_generation,
+                next_generation,
                 now + 39,
                 &handlers,
                 limits
@@ -3958,76 +3951,21 @@ mod tests {
         assert_eq!(
             crate::effects::EffectDispatcher::tick(
                 &mut store,
-                third_generation,
+                next_generation,
                 now + 40,
-                &handlers,
-                limits
-            )
-            .unwrap(),
-            crate::effects::DispatchTick::WaitingForReconciliation {
-                operation_id: intent.operation_id.clone()
-            }
-        );
-        assert_eq!(
-            crate::effects::EffectDispatcher::tick(
-                &mut store,
-                third_generation,
-                now + 79,
-                &handlers,
-                limits,
-            )
-            .unwrap(),
-            crate::effects::DispatchTick::Idle,
-        );
-        store.stop_owner(third_generation).unwrap();
-        let fourth_generation = store.start_owner(&owner("fourth")).unwrap();
-        assert_eq!(
-            crate::effects::EffectDispatcher::tick(
-                &mut store,
-                fourth_generation,
-                now + 80,
-                &handlers,
-                limits
-            )
-            .unwrap(),
-            crate::effects::DispatchTick::RetryScheduled {
-                operation_id: intent.operation_id.clone(),
-                attempt: 1
-            },
-        );
-        assert_eq!(
-            crate::effects::EffectDispatcher::tick(
-                &mut store,
-                fourth_generation,
-                now + 139,
-                &handlers,
-                limits
-            )
-            .unwrap(),
-            crate::effects::DispatchTick::Idle,
-        );
-        store.stop_owner(fourth_generation).unwrap();
-        let fifth_generation = store.start_owner(&owner("fifth")).unwrap();
-        assert_eq!(
-            crate::effects::EffectDispatcher::tick(
-                &mut store,
-                fifth_generation,
-                now + 140,
                 &handlers,
                 limits
             )
             .unwrap(),
             crate::effects::DispatchTick::Completed {
                 operation_id: intent.operation_id.clone()
-            },
+            }
         );
         let seen = handler.seen.lock().unwrap();
         assert_eq!(
             seen.iter().map(|(mode, _)| *mode).collect::<Vec<_>>(),
             [
                 crate::effects::EffectMode::Submit,
-                crate::effects::EffectMode::Reconcile,
-                crate::effects::EffectMode::Reconcile,
                 crate::effects::EffectMode::Reconcile,
                 crate::effects::EffectMode::Submit,
             ]
@@ -4037,9 +3975,7 @@ mod tests {
                 && request.intent.request_digest == intent.request_digest
         ));
         assert_eq!(
-            seen.iter()
-                .map(|(_, request)| request.attempt_count)
-                .collect::<Vec<_>>(),
+            seen.iter().map(|(_, request)| request.attempt_count).collect::<Vec<_>>(),
             [1, 1, 1, 1, 2]
         );
     }

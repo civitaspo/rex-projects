@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::config::{self, AppliedConfig, Config};
-use crate::domain::ids::Revision;
+use crate::domain::ids::{Digest, HumanRequestId, ProjectId, Revision};
 use crate::protocol::{RequestEnvelope, ResponseEnvelope};
 use crate::store::{ConfigStore, ControlCommand, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
@@ -59,6 +59,42 @@ enum Command {
         #[command(subcommand)]
         command: TicketCommand,
     },
+    Human {
+        #[command(subcommand)]
+        command: HumanCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HumanCommand {
+    List {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Show {
+        request_id: String,
+    },
+    Respond {
+        request_id: String,
+        #[arg(long)]
+        subject_digest: String,
+        #[arg(long, value_enum)]
+        choice: HumanChoiceArg,
+        #[arg(long)]
+        explanation: String,
+        #[arg(long)]
+        response_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HumanChoiceArg {
+    Approve,
+    RequestChanges,
+    RevisePlan,
+    Defer,
+    Cancel,
+    Refuse,
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,6 +229,12 @@ impl CliError {
             message: message.into(),
         }
     }
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: 3,
+            message: message.into(),
+        }
+    }
     fn human_only(message: impl Into<String>) -> Self {
         Self {
             code: 77,
@@ -279,6 +321,12 @@ pub fn run() -> Result<i32, CliError> {
         }
         Command::Agent { command } => agent_command(command, json),
         Command::Ticket { command } => ticket_command(
+            cli.config.as_deref(),
+            cli.state_root.as_deref(),
+            command,
+            json,
+        ),
+        Command::Human { command } => human_command(
             cli.config.as_deref(),
             cli.state_root.as_deref(),
             command,
@@ -1159,6 +1207,127 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 None => Err(CliError::unexpected(
                     "no committed controller receipt exists for this request",
                 )),
+            }
+        }
+    }
+}
+
+fn human_command(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    command: HumanCommand,
+    json: bool,
+) -> Result<(), CliError> {
+    // This is deliberately the first operation: factory-marked Agent blocks cannot inspect the
+    // human inbox or enqueue responses, even when invoked with malformed arguments.
+    require_human_context()?;
+    let state_root = selected_state_root(config_path, explicit_state_root)?;
+    match command {
+        HumanCommand::List { project } => {
+            let project = project
+                .map(ProjectId::parse)
+                .transpose()
+                .map_err(CliError::usage)?;
+            let requests = ConfigStore::list_human_requests(&state_root, project.as_ref())
+                .map_err(CliError::unavailable)?;
+            if json {
+                print_json(&serde_json::json!({"requests":requests}))
+            } else if requests.is_empty() {
+                println!("No human requests.");
+                Ok(())
+            } else {
+                for summary in requests {
+                    println!(
+                        "{}  {:?}  {:?}  {}",
+                        summary.request.request_id,
+                        summary.request.purpose,
+                        summary.lifecycle,
+                        summary.request.subject.subject_id
+                    );
+                }
+                Ok(())
+            }
+        }
+        HumanCommand::Show { request_id } => {
+            let request_id = HumanRequestId::parse(request_id).map_err(CliError::usage)?;
+            let summary = ConfigStore::read_human_request(&state_root, &request_id)
+                .map_err(CliError::unavailable)?
+                .ok_or_else(|| CliError::not_found("human request was not found"))?;
+            if json {
+                print_json(
+                    &serde_json::to_value(summary)
+                        .map_err(|error| CliError::unexpected(error.to_string()))?,
+                )
+            } else {
+                println!("Request: {}", summary.request.request_id);
+                println!(
+                    "Purpose: {:?} ({:?})",
+                    summary.request.purpose, summary.lifecycle
+                );
+                println!(
+                    "Subject: {} revision {}",
+                    summary.request.subject.subject_id, summary.request.subject.revision.0
+                );
+                println!(
+                    "Digest: {}",
+                    summary
+                        .request
+                        .subject
+                        .digest()
+                        .map_err(CliError::unexpected)?
+                );
+                println!("Expires: {}", summary.request.expires_at_unix);
+                println!("Review artifact: {}", summary.bundle_path);
+                if let Some(reference) = summary.presentation_reference {
+                    println!("Presenter: {reference}");
+                }
+                Ok(())
+            }
+        }
+        HumanCommand::Respond {
+            request_id,
+            subject_digest,
+            choice,
+            explanation,
+            response_id,
+        } => {
+            let request_id = HumanRequestId::parse(request_id).map_err(CliError::usage)?;
+            let expected_subject_digest = Digest::parse(subject_digest).map_err(CliError::usage)?;
+            let choice = match choice {
+                HumanChoiceArg::Approve => crate::human_runtime::HumanDecisionChoice::Approve,
+                HumanChoiceArg::RequestChanges => {
+                    crate::human_runtime::HumanDecisionChoice::RequestChanges
+                }
+                HumanChoiceArg::RevisePlan => crate::human_runtime::HumanDecisionChoice::RevisePlan,
+                HumanChoiceArg::Defer => crate::human_runtime::HumanDecisionChoice::Defer,
+                HumanChoiceArg::Cancel => crate::human_runtime::HumanDecisionChoice::Cancel,
+                HumanChoiceArg::Refuse => crate::human_runtime::HumanDecisionChoice::Refuse,
+            };
+            let intent = crate::human_runtime::HumanDecisionIntent {
+                request_id,
+                response_id: response_id.unwrap_or(generated_request_id()?),
+                expected_subject_digest,
+                choice,
+                explanation: Some(explanation),
+            };
+            let queued = ConfigStore::enqueue_human_decision(
+                &state_root,
+                &intent,
+                unix_now_i64()?.try_into().unwrap_or(u64::MAX),
+            )
+            .map_err(CliError::conflict)?;
+            let report = serde_json::json!({"state":"queued_for_validation","request_id":queued.request_id,"response_id":queued.response_id,"accepted_for_validation":queued.accepted_for_validation,"note":"The controller must re-observe the exact subject before this response becomes authoritative."});
+            if json {
+                print_json(&report)
+            } else {
+                println!(
+                    "Response {} queued for controller validation.",
+                    queued.response_id
+                );
+                println!(
+                    "This is not yet an approval; the controller must verify the current subject."
+                );
+                Ok(())
             }
         }
     }
