@@ -453,8 +453,8 @@ fn inspect_linux_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
         };
         processes.push(ProcessIdentity {
             pid,
-            parent_pid: parse_field(fields, 1)?,
-            process_group_id: parse_field(fields, 2)?,
+            parent_pid: parse_field(&fields, 1)?,
+            process_group_id: parse_field(&fields, 2)?,
             start_identity: format!(
                 "linux-start-ticks:{}",
                 fields.get(19).ok_or_else(|| {
