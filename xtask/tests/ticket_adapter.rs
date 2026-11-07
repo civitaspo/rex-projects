@@ -40,7 +40,7 @@ fn adapter(
         OsString::from("PATH"),
         std::env::var_os("PATH").unwrap_or_default(),
     )]);
-    TicketCommandAdapter::new_discovering_namespace(
+    let adapter = TicketCommandAdapter::new_discovering_namespace(
         &command,
         &snapshot,
         &[],
@@ -48,7 +48,9 @@ fn adapter(
         Duration::from_secs(5),
         Duration::from_millis(100),
     )
-    .unwrap()
+    .unwrap();
+    adapter.describe(req("initial-describe")).unwrap();
+    adapter
 }
 fn req(value: &str) -> RequestId {
     RequestId::new(value).unwrap()

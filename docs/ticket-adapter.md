@@ -1,6 +1,6 @@
 # External ticket adapters
 
-rex-projects speaks a versioned JSON protocol to one configured command. A wrapper you own translates that protocol into the commands or SDK calls used by any ticket tracker, applies tracker-specific queries and authentication, and converts the result into normalized ticket JSON. The core has no tracker-specific query, status, API, or credential implementation.
+rex-projects speaks a versioned JSON protocol to one configured command. A wrapper you own translates that protocol into the commands or SDK calls used by any ticket tracker, applies tracker-specific queries and authentication, and converts the result into normalized ticket JSON. You can write that wrapper in any language. The core has no tracker-specific query, status, API, or credential implementation.
 
 ```toml
 [adapters.tickets]

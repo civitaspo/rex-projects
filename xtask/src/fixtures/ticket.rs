@@ -148,7 +148,7 @@ fn handle(
     };
 
     if let Some(mutation) = mutation {
-        mutate(&mut result, mutation);
+        mutate(&mut result, mutation, method);
     }
     Ok(Some(json!({"schema_version":SCHEMA_VERSION,"request_id":request_id,"result":result})))
 }
@@ -278,13 +278,23 @@ fn set_status(native: &mut Value, status: &str, shape: &str) {
     else { native["status"] = status.into(); }
 }
 
-fn mutate(result: &mut Value, mutation: &str) {
-    match mutation {
-        "get-ticket-id" | "update-ticket-id" => result["ticket"]["id"] = "unrelated-ticket".into(),
-        "comment-key" => result["comment"]["key"] = "unrelated-comment-key".into(),
-        "duplicate-key" => result["comment_key"] = "unrelated-duplicate-key".into(),
-        "operation-id" => result["matches"][0]["operation_id"] = "UNRELATED-OP".into(),
-        "operation-ticket-id" => result["matches"][0]["ticket_id"] = "UNRELATED-TICKET".into(),
+fn mutate(result: &mut Value, mutation: &str, method: &str) {
+    match (mutation, method) {
+        ("get-ticket-id", "ticket.get") | ("update-ticket-id", "ticket.update") => {
+            result["ticket"]["id"] = "unrelated-ticket".into()
+        }
+        ("comment-key", "ticket.comment") => {
+            result["comment"]["key"] = "unrelated-comment-key".into()
+        }
+        ("duplicate-key", "ticket.resolve_duplicate") => {
+            result["comment_key"] = "unrelated-duplicate-key".into()
+        }
+        ("operation-id", "operation.find") => {
+            result["matches"][0]["operation_id"] = "UNRELATED-OP".into()
+        }
+        ("operation-ticket-id", "operation.find") => {
+            result["matches"][0]["ticket_id"] = "UNRELATED-TICKET".into()
+        }
         _ => {}
     }
 }
