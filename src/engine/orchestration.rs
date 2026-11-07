@@ -805,7 +805,7 @@ pub enum RoleResultPayload {
 }
 
 impl RoleResultPayload {
-    fn parse(kind: RoleOutputKind, value: Value) -> Result<Self, String> {
+    pub(crate) fn parse(kind: RoleOutputKind, value: Value) -> Result<Self, String> {
         macro_rules! parse_variant {
             ($type:ty, $variant:ident) => {
                 serde_json::from_value::<$type>(value)
@@ -3909,6 +3909,8 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<RoleSessionId>(&format!("{invalid:?}")).is_err());
         }
+        assert!(RoleSessionId::parse("ticket_run:ticket-1:planner").is_ok());
+        assert!(RoleSessionId::parse("ticket_run::planner").is_err());
     }
 
     #[test]

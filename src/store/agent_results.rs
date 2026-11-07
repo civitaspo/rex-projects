@@ -1714,12 +1714,12 @@ pub(crate) mod tests {
             identity_quality: "kernel_birth_token".into(),
         };
         assert!(process_tree_contains_root(
-            &[process.clone()],
+            std::slice::from_ref(&process),
             42,
             "birth-token"
         ));
         assert!(!process_tree_contains_root(
-            &[process.clone()],
+            std::slice::from_ref(&process),
             42,
             "other-token"
         ));
@@ -2083,7 +2083,7 @@ pub(crate) mod tests {
         ).unwrap(), "12:applied");
     }
 }
-
+#[allow(clippy::items_after_test_module)]
 impl ConfigStore {
     pub fn acknowledge_committed_role_result(
         &mut self,
