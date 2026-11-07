@@ -6,17 +6,19 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
 use crate::domain::ids::Digest;
-use crate::domain::types::{MergeExecutor, MergeMethod};
+use crate::domain::types::MergeMethod;
 use crate::forge::{
     BodyUpdateIntent, CommentIntent, DirectMergeIntent, EffectAcknowledgement, EffectCertainty,
-    Forge, ForgeError, ForgeObservation, MergeEffectIntent, MergeEffectOperation, Observed,
-    PullRequestRef, Reconciliation, canonical_digest,
+    Forge, ForgeError, ForgeObservation, MergeEffectIntent, Observed, PullRequestRef,
+    Reconciliation, canonical_digest,
 };
 use crate::merge_policy::{
     MergeAssessment, MergeDisposition, MergeEvidenceSnapshot, MergePolicy, MergeProcedure,
-    MergeProcedureOperation, MergeProcedureStep, digest_merge_evidence, evaluate_merge_policy,
+    MergeProcedureOperation, MergeProcedureStep, build_merge_procedure, digest_merge_evidence,
+    evaluate_merge_policy,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -72,7 +74,8 @@ impl ResolvedMergeAuthority {
                 || !is_single_literal_command(&source.bytes, proof.byte_start, &proof.exact_comment)
             {
                 return Err(MergeExecutionError::Invalid(
-                    "merge request command does not match a trusted literal instruction span".into(),
+                    "merge request command does not match a trusted literal instruction span"
+                        .into(),
                 ));
             }
         }
@@ -180,18 +183,19 @@ impl<F: Forge> MergeProcedureExecutor<F> {
         intent: &StepIntent,
         prior_receipts: &[MergeStepReceipt],
     ) -> Result<StepOutcome, MergeExecutionError> {
-        validate_procedure_policy(policy, procedure)?;
+        validate_procedure_policy(policy, procedure, &approved.subject)?;
         authority.validate(approved)?;
         let procedure_digest = canonical_digest(procedure).map_err(forge_error)?;
-        let current_assessment = evaluate_merge_policy(policy, evidence_now)
-            .map_err(MergeExecutionError::Invalid)?;
+        let current_assessment =
+            evaluate_merge_policy(policy, evidence_now).map_err(MergeExecutionError::Invalid)?;
         if &current_assessment != approved
             || evidence_now.subject != approved.subject
             || digest_merge_evidence(evidence_now).map_err(MergeExecutionError::Invalid)?
                 != approved.evidence_digest
         {
             return Err(MergeExecutionError::Stale(
-                "current policy evidence or risk assessment differs from approved assessment".into(),
+                "current policy evidence or risk assessment differs from approved assessment"
+                    .into(),
             ));
         }
         if approved.disposition == MergeDisposition::Blocked {
@@ -234,12 +238,15 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             .forge
             .observe(pull)
             .map_err(|error| MergeExecutionError::Forge(error.to_string()))?;
-        if matches!(step.operation, MergeProcedureOperation::VerifyMergeCommit { .. }) {
+        if matches!(
+            step.operation,
+            MergeProcedureOperation::VerifyMergeCommit { .. }
+        ) {
             observed.verify_subject_identity_core(pull, &approved.subject)
         } else {
             observed.verify_subject_identity(pull, &approved.subject)
         }
-            .map_err(|error| MergeExecutionError::Stale(error.to_string()))?;
+        .map_err(|error| MergeExecutionError::Stale(error.to_string()))?;
 
         match &step.operation {
             MergeProcedureOperation::UpdatePullRequestBody {
@@ -386,7 +393,9 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             ));
         }
         let merge_sha = pr.merge_commit_sha.as_deref().ok_or_else(|| {
-            MergeExecutionError::VerificationFailed("merged pull request has no merge commit SHA".into())
+            MergeExecutionError::VerificationFailed(
+                "merged pull request has no merge commit SHA".into(),
+            )
         })?;
         let merge_commit = match self
             .forge
@@ -394,9 +403,13 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             .map_err(|error| MergeExecutionError::Forge(error.to_string()))?
         {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => return Err(MergeExecutionError::VerificationFailed(reason)),
+            Observed::Unknown { reason } => {
+                return Err(MergeExecutionError::VerificationFailed(reason));
+            }
         };
-        if merge_commit.sha != merge_sha || !trailers_match(&merge_commit.message, expected_trailers) {
+        if merge_commit.sha != merge_sha
+            || !trailers_match(&merge_commit.message, expected_trailers)
+        {
             return Err(MergeExecutionError::VerificationFailed(
                 "merge commit identity or required trailers do not match".into(),
             ));
@@ -407,7 +420,9 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             .map_err(|error| MergeExecutionError::Forge(error.to_string()))?
         {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => return Err(MergeExecutionError::VerificationFailed(reason)),
+            Observed::Unknown { reason } => {
+                return Err(MergeExecutionError::VerificationFailed(reason));
+            }
         };
         match method {
             MergeMethod::Merge if !merge_commit.parents.contains(&subject.head_sha) => {
@@ -434,7 +449,9 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             merge_commit.parents.first().cloned()
         }
         .ok_or_else(|| {
-            MergeExecutionError::VerificationFailed("merge commit has no verifiable base parent".into())
+            MergeExecutionError::VerificationFailed(
+                "merge commit has no verifiable base parent".into(),
+            )
         })?;
         let comparison = match self
             .forge
@@ -442,7 +459,9 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             .map_err(|error| MergeExecutionError::Forge(error.to_string()))?
         {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => return Err(MergeExecutionError::VerificationFailed(reason)),
+            Observed::Unknown { reason } => {
+                return Err(MergeExecutionError::VerificationFailed(reason));
+            }
         };
         if comparison.base_sha != subject.base_sha
             || comparison.head_sha != base_parent
@@ -465,12 +484,22 @@ impl<F: Forge> MergeProcedureExecutor<F> {
 fn validate_procedure_policy(
     policy: &MergePolicy,
     procedure: &MergeProcedure,
+    subject: &crate::merge_policy::MergeSubject,
 ) -> Result<(), MergeExecutionError> {
     if policy.method != procedure.method || policy.executor != procedure.executor {
         return Err(MergeExecutionError::Stale(
             "merge procedure method/executor differs from resolved repository policy".into(),
         ));
     }
+    build_merge_procedure(
+        procedure.method,
+        procedure.executor,
+        procedure.steps.clone(),
+        subject,
+    )
+    .map_err(|reason| {
+        MergeExecutionError::Invalid(format!("merge procedure failed validation: {reason}"))
+    })?;
     Ok(())
 }
 
@@ -490,7 +519,8 @@ fn validate_approval(
         || &approval.procedure_digest != procedure_digest
     {
         return Err(MergeExecutionError::Stale(
-            "human approval is expired or scoped to a different subject, evidence, or procedure".into(),
+            "human approval is expired or scoped to a different subject, evidence, or procedure"
+                .into(),
         ));
     }
     Ok(true)
@@ -518,9 +548,14 @@ fn verify_prerequisites(
         .position(|step| step.key == selected.key)
         .ok_or_else(|| MergeExecutionError::Invalid("selected step is not in procedure".into()))?;
     for prior in &procedure.steps[..index] {
-        let receipt = receipts.iter().find(|receipt| receipt.step_key == prior.key);
+        let receipt = receipts
+            .iter()
+            .find(|receipt| receipt.step_key == prior.key);
         if !receipt.is_some_and(|receipt| {
-            matches!(receipt.certainty, EffectCertainty::Applied | EffectCertainty::Recovered)
+            matches!(
+                receipt.certainty,
+                EffectCertainty::Applied | EffectCertainty::Recovered
+            )
         }) {
             return Err(MergeExecutionError::Blocked(format!(
                 "earlier procedure step `{}` has no successful durable receipt",
@@ -531,7 +566,10 @@ fn verify_prerequisites(
     for dependency in &selected.prerequisites {
         if !receipts.iter().any(|receipt| {
             receipt.step_key == *dependency
-                && matches!(receipt.certainty, EffectCertainty::Applied | EffectCertainty::Recovered)
+                && matches!(
+                    receipt.certainty,
+                    EffectCertainty::Applied | EffectCertainty::Recovered
+                )
         }) {
             return Err(MergeExecutionError::Blocked(format!(
                 "prerequisite step `{dependency}` has no successful durable receipt"
@@ -590,7 +628,9 @@ fn is_single_literal_command(source: &[u8], start: usize, command: &str) -> bool
 
 fn trailers_match(message: &str, expected: &[String]) -> bool {
     if expected.is_empty()
-        || expected.iter().any(|line| !line.starts_with("Co-authored-by: "))
+        || expected
+            .iter()
+            .any(|line| !line.starts_with("Co-authored-by: "))
     {
         return false;
     }
@@ -612,7 +652,10 @@ fn trailers_match(message: &str, expected: &[String]) -> bool {
 
 fn digest_bytes(bytes: &[u8]) -> Result<Digest, MergeExecutionError> {
     let hash = sha2::Sha256::digest(bytes);
-    let value = hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let value = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     Digest::parse(value).map_err(MergeExecutionError::Invalid)
 }
 
@@ -627,21 +670,103 @@ fn forge_error(error: ForgeError) -> MergeExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::types::{MergeExecutor, MergeMethod};
+    use crate::merge_policy::{MergeProcedureOperation, MergeSubject, RiskWeights};
+
+    fn test_digest(letter: char) -> Digest {
+        Digest::parse(letter.to_string().repeat(64)).unwrap()
+    }
+
+    fn test_subject() -> MergeSubject {
+        MergeSubject {
+            repository_id: "repo".into(),
+            forge: "github".into(),
+            forge_host: "github.com".into(),
+            forge_repository_id: 10,
+            pull_request_id: "1".into(),
+            pull_request_node_id: "PR_1".into(),
+            head_sha: "head".into(),
+            base_ref: "main".into(),
+            base_sha: "base".into(),
+            config_digest: test_digest('a'),
+            instruction_digest: test_digest('b'),
+            hooks_digest: test_digest('c'),
+            remote_checks_digest: test_digest('d'),
+            diff_digest: test_digest('e'),
+            merge_comments_digest: test_digest('f'),
+            base_guard_digest: Some(test_digest('1')),
+            review_digest: test_digest('2'),
+            prepared_body_digest: None,
+        }
+    }
 
     #[test]
     fn instruction_literal_requires_exact_single_line_span() {
         let source = b"Use this command:\n/merge\nthen verify";
-        assert!(is_single_literal_command(source, 19, "/merge"));
-        assert!(!is_single_literal_command(source, 19, "/merge\nextra"));
+        assert!(is_single_literal_command(source, 18, "/merge"));
+        assert!(!is_single_literal_command(source, 18, "/merge\nextra"));
         assert!(!is_single_literal_command(source, 0, "gh pr merge"));
-        assert!(!is_single_literal_command(b"prefix /merge suffix", 7, "/merge"));
+        assert!(!is_single_literal_command(
+            b"prefix /merge suffix",
+            7,
+            "/merge"
+        ));
     }
 
     #[test]
     fn trailers_must_be_the_exact_final_block() {
         let expected = vec!["Co-authored-by: Agent <agent@example.com>".to_owned()];
-        assert!(trailers_match("Merge change\n\nCo-authored-by: Agent <agent@example.com>\n", &expected));
-        assert!(!trailers_match("Merge change\nCo-authored-by: Agent <agent@example.com>\ntext", &expected));
-        assert!(!trailers_match("Merge change\nCo-authored-by: Agent <agent@example.com>\nCo-authored-by: Agent <agent@example.com>", &expected));
+        assert!(trailers_match(
+            "Merge change\n\nCo-authored-by: Agent <agent@example.com>\n",
+            &expected
+        ));
+        assert!(!trailers_match(
+            "Merge change\nCo-authored-by: Agent <agent@example.com>\ntext",
+            &expected
+        ));
+        assert!(!trailers_match(
+            "Merge change\nCo-authored-by: Agent <agent@example.com>\nCo-authored-by: Agent <agent@example.com>",
+            &expected
+        ));
+    }
+
+    #[test]
+    fn executor_rejects_a_request_policy_with_a_direct_merge_step() {
+        let subject = test_subject();
+        let procedure = MergeProcedure {
+            method: MergeMethod::Squash,
+            executor: MergeExecutor::Request,
+            steps: vec![
+                MergeProcedureStep {
+                    key: "request".into(),
+                    prerequisites: vec![],
+                    operation: MergeProcedureOperation::ExecuteMerge {
+                        expected_head_sha: subject.head_sha.clone(),
+                        base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
+                    },
+                    instruction_digest: subject.instruction_digest.clone(),
+                },
+                MergeProcedureStep {
+                    key: "verify".into(),
+                    prerequisites: vec!["request".into()],
+                    operation: MergeProcedureOperation::VerifyMergeCommit {
+                        expected_trailers: vec!["Co-authored-by: Agent <a@b>".into()],
+                    },
+                    instruction_digest: subject.instruction_digest.clone(),
+                },
+            ],
+        };
+        let policy = MergePolicy {
+            auto_merge_enabled: true,
+            minimum_reliability_score: 80,
+            method: MergeMethod::Squash,
+            executor: MergeExecutor::Request,
+            required_checks: vec!["ci".into()],
+            risk_weights: RiskWeights::default(),
+        };
+        assert!(matches!(
+            validate_procedure_policy(&policy, &procedure, &subject),
+            Err(MergeExecutionError::Invalid(_))
+        ));
     }
 }
