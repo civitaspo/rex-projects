@@ -569,13 +569,48 @@ role_payload!(MergeAssessmentPayload {
     rationale: String,
     disposition: String,
 });
+
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeProcedureStepKind {
+    UpdatePullRequestBody,
+    RequestMerge,
+    DirectMerge,
+    VerifyMergeCommit,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeProcedureStep {
+    pub kind: MergeProcedureStepKind,
+    pub instruction_reference: String,
+    pub rationale: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostMergeVerificationKind {
+    MergeCommitRecorded,
+    TargetBranchContainsCommit,
+    RequiredChecksRemainGreen,
+    DeploymentObserved,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostMergeVerification {
+    pub kind: PostMergeVerificationKind,
+    pub instruction_reference: String,
+    pub rationale: String,
+}
+
 role_payload!(MergeIntentPayload {
     assessment_id: String,
     pr_identities: Vec<String>,
     policy_digest: Digest,
     prepared_body_digest: Digest,
-    steps: Vec<String>,
-    post_merge_verification: Vec<String>,
+    steps: Vec<MergeProcedureStep>,
+    post_merge_verification: Vec<PostMergeVerification>,
 });
 role_payload!(OperationActionPayload {
     operation_plan_digest: Digest,
@@ -756,7 +791,18 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
             }
         }
         RoleResultPayload::MergeAssessment(result)
-            if result.ratings.len() != 5
+            if result.pr_references.is_empty()
+                || result
+                    .pr_references
+                    .iter()
+                    .any(|reference| reference.trim().is_empty())
+                || result.deterministic_gate_evidence.is_empty()
+                || result.deterministic_gate_evidence.iter().any(|gate| {
+                    gate.gate_id.trim().is_empty() || gate.evidence_references.is_empty()
+                })
+                || result.rationale.trim().is_empty()
+                || result.disposition.trim().is_empty()
+                || result.ratings.len() != 5
                 || result.ratings.values().any(|factor| {
                     factor.rating > 4
                         || factor.source.trim().is_empty()
@@ -767,6 +813,41 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
             return Err(
                 "merge assessment must provide all five evidenced 0..4 risk factors".into(),
             );
+        }
+        RoleResultPayload::MergeIntent(result) => {
+            let merge_kinds: Vec<_> = result
+                .steps
+                .iter()
+                .filter(|step| {
+                    matches!(
+                        step.kind,
+                        MergeProcedureStepKind::RequestMerge | MergeProcedureStepKind::DirectMerge
+                    )
+                })
+                .collect();
+            if result.assessment_id.trim().is_empty()
+                || result.pr_identities.is_empty()
+                || result
+                    .pr_identities
+                    .iter()
+                    .any(|identity| identity.trim().is_empty())
+                || result.steps.is_empty()
+                || merge_kinds.len() != 1
+                || result.steps.last().map(|step| step.kind)
+                    != Some(MergeProcedureStepKind::VerifyMergeCommit)
+                || result.steps.iter().any(|step| {
+                    step.instruction_reference.trim().is_empty() || step.rationale.trim().is_empty()
+                })
+                || result.post_merge_verification.is_empty()
+                || result.post_merge_verification.iter().any(|check| {
+                    check.instruction_reference.trim().is_empty()
+                        || check.rationale.trim().is_empty()
+                })
+            {
+                return Err(
+                    "merge intent must name PRs, one merge method, a final merge-commit verification, and evidenced post-merge checks".into(),
+                );
+            }
         }
         _ => {}
     }
@@ -829,7 +910,7 @@ pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
                 .expect("role payload JsonSchema serializes")
         };
     }
-    match kind {
+    let mut schema = match kind {
         RoleOutputKind::Progress => schema_for_kind!(ProgressPayload),
         RoleOutputKind::Irregularity => schema_for_kind!(IrregularityPayload),
         RoleOutputKind::HumanRequest => schema_for_kind!(HumanRequestPayload),
@@ -852,7 +933,77 @@ pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
         RoleOutputKind::ProfilePromotionProposal => {
             schema_for_kind!(ProfilePromotionProposalPayload)
         }
+    };
+    constrain_payload_string_schemas(&mut schema);
+    schema
+}
+
+fn constrain_payload_string_schemas(schema: &mut Value) {
+    fn constrain(value: &mut Value, min: usize, max: usize, pattern: &str) {
+        if let Some(map) = value.as_object_mut() {
+            map.insert("minLength".into(), Value::from(min));
+            map.insert("maxLength".into(), Value::from(max));
+            map.insert("pattern".into(), Value::from(pattern));
+        }
     }
+    fn visit(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(defs) = map.get_mut("$defs").and_then(Value::as_object_mut) {
+                    for (name, definition) in defs {
+                        match name.as_str() {
+                            "WorkNodeId" => constrain(definition, 1, 80, r"^[A-Za-z0-9._-]+$"),
+                            "ProjectId" | "RepositoryId" | "ProfileId" | "AdapterId" => {
+                                constrain(definition, 1, 255, r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+                            }
+                            "TicketId" | "TicketNamespace" | "TicketRunId" | "AgentRunId"
+                            | "HumanRequestId" | "OperationId" | "RexBlockId" => {
+                                constrain(definition, 1, 512, r"^[^\x00-\x1F\x7F]*$")
+                            }
+                            "Digest" => constrain(definition, 64, 64, r"^[a-f0-9]{64}$"),
+                            "GitCommitId" => {
+                                constrain(definition, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
+                    for (name, property) in properties {
+                        match name.as_str() {
+                            "digest"
+                            | "subject_digest"
+                            | "batch_digest"
+                            | "candidate_digest"
+                            | "base_digest"
+                            | "policy_digest"
+                            | "prepared_body_digest" => {
+                                constrain(property, 64, 64, r"^[a-f0-9]{64}$")
+                            }
+                            "base_commit" | "previous_head" | "branch_head" | "source_commit" => {
+                                constrain(property, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+                            }
+                            "commit_shas" => {
+                                if let Some(items) = property.get_mut("items") {
+                                    constrain(items, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$");
+                                }
+                            }
+                            "repository" | "project_id" | "project" | "profile_id" => {
+                                constrain(property, 1, 255, r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for child in map.values_mut() {
+                    visit(child);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(visit),
+            _ => {}
+        }
+    }
+    visit(schema);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1010,28 +1161,30 @@ fn role_may_submit_artifact(role: Role, kind: RoleArtifactKind) -> bool {
 }
 
 fn role_may_submit_output(role: Role, kind: RoleOutputKind) -> bool {
+    allowed_role_output_kinds(role).contains(&kind)
+}
+
+pub fn allowed_role_output_kinds(role: Role) -> Vec<RoleOutputKind> {
     use RoleOutputKind as K;
-    if matches!(kind, K::Progress | K::Irregularity | K::HumanRequest) {
-        return true;
-    }
-    match role {
-        Role::Supervisor => matches!(
-            kind,
-            K::TicketProposal
-                | K::DispatchRequest
-                | K::Intervention
-                | K::LearningDecision
-                | K::ProfileTrialResult
-                | K::ProfilePromotionProposal
-        ),
-        Role::Coordinator => matches!(kind, K::SpawnRequest | K::PrepareWorktrees | K::PlanReady),
-        Role::Planner => matches!(kind, K::PlanReady | K::InvestigationRequest),
-        Role::Worker => matches!(kind, K::ImplementationReady),
-        Role::Reviewer => matches!(kind, K::ReviewReady | K::InvestigationRequest),
-        Role::MergeDecision => matches!(kind, K::MergeAssessment | K::MergeIntent),
-        Role::Operator => matches!(kind, K::OperationAction | K::OperationResult),
-        Role::Postmortem => kind == K::PostmortemReady,
-    }
+    let mut kinds = vec![K::Progress, K::Irregularity, K::HumanRequest];
+    kinds.extend(match role {
+        Role::Supervisor => vec![
+            K::TicketProposal,
+            K::DispatchRequest,
+            K::Intervention,
+            K::LearningDecision,
+            K::ProfileTrialResult,
+            K::ProfilePromotionProposal,
+        ],
+        Role::Coordinator => vec![K::SpawnRequest, K::PrepareWorktrees, K::PlanReady],
+        Role::Planner => vec![K::PlanReady, K::InvestigationRequest],
+        Role::Worker => vec![K::ImplementationReady],
+        Role::Reviewer => vec![K::ReviewReady, K::InvestigationRequest],
+        Role::MergeDecision => vec![K::MergeAssessment, K::MergeIntent],
+        Role::Operator => vec![K::OperationAction, K::OperationResult],
+        Role::Postmortem => vec![K::PostmortemReady],
+    });
+    kinds
 }
 
 fn result_wake_recipients(
@@ -2661,6 +2814,102 @@ mod tests {
     }
 
     #[test]
+    fn merge_assessment_requires_actual_pr_gate_and_decision_evidence() {
+        let digest = "a".repeat(64);
+        let reference = json!({
+            "kind": "merge_assessment",
+            "schema_version": 1,
+            "path": "evidence/gate.json",
+            "digest": digest,
+            "bytes": 20
+        });
+        let mut valid = json!({
+            "pr_references": ["https://example.invalid/pr/1"],
+            "subject_digest": "b".repeat(64),
+            "deterministic_gate_evidence": [{
+                "gate_id": "required-checks",
+                "outcome": "pass",
+                "evidence_references": [reference]
+            }],
+            "ratings": {
+                "change_impact": {"rating": 1, "source": "diff", "rationale": "small", "evidence_references": [reference]},
+                "complexity": {"rating": 1, "source": "diff", "rationale": "simple", "evidence_references": [reference]},
+                "verification_gaps": {"rating": 1, "source": "checks", "rationale": "covered", "evidence_references": [reference]},
+                "review_uncertainty": {"rating": 1, "source": "review", "rationale": "clear", "evidence_references": [reference]},
+                "operational_exposure": {"rating": 1, "source": "policy", "rationale": "low", "evidence_references": [reference]}
+            },
+            "confidence": "high",
+            "rationale": "all required evidence is present",
+            "disposition": "merge"
+        });
+        let payload: MergeAssessmentPayload = serde_json::from_value(valid.clone()).unwrap();
+        validate_role_payload(&RoleResultPayload::MergeAssessment(payload)).unwrap();
+
+        for (path, empty) in [
+            ("pr_references", json!([])),
+            ("deterministic_gate_evidence", json!([])),
+            ("rationale", json!("  ")),
+            ("disposition", json!("")),
+        ] {
+            let before = valid[path].clone();
+            valid[path] = empty;
+            let payload: MergeAssessmentPayload = serde_json::from_value(valid.clone()).unwrap();
+            assert!(
+                validate_role_payload(&RoleResultPayload::MergeAssessment(payload)).is_err(),
+                "{path}"
+            );
+            valid[path] = before;
+        }
+    }
+
+    #[test]
+    fn merge_intent_is_a_typed_advisory_procedure_with_a_terminal_verification() {
+        let valid = json!({
+            "assessment_id": "assessment-1",
+            "pr_identities": ["repo-a#42"],
+            "policy_digest": "a".repeat(64),
+            "prepared_body_digest": "b".repeat(64),
+            "steps": [
+                {"kind":"update_pull_request_body", "instruction_reference":"merge.instructions#body", "rationale":"add required trailer"},
+                {"kind":"request_merge", "instruction_reference":"merge.instructions#request", "rationale":"repository requires a merge request"},
+                {"kind":"verify_merge_commit", "instruction_reference":"merge.instructions#verify", "rationale":"confirm resulting commit"}
+            ],
+            "post_merge_verification": [
+                {"kind":"merge_commit_recorded", "instruction_reference":"merge.instructions#verify", "rationale":"ensure remote records the merge commit"}
+            ]
+        });
+        let payload: MergeIntentPayload = serde_json::from_value(valid.clone()).unwrap();
+        validate_role_payload(&RoleResultPayload::MergeIntent(payload)).unwrap();
+
+        let mut invalid = valid;
+        invalid["steps"][1]["kind"] = json!("run_shell_command");
+        assert!(serde_json::from_value::<MergeIntentPayload>(invalid).is_err());
+
+        let mut missing_final_verify: MergeIntentPayload =
+            serde_json::from_value(json!({
+                "assessment_id":"assessment-1",
+                "pr_identities":["repo-a#42"],
+                "policy_digest":"a".repeat(64),
+                "prepared_body_digest":"b".repeat(64),
+                "steps":[{"kind":"direct_merge","instruction_reference":"policy#merge","rationale":"policy"}],
+                "post_merge_verification":[{"kind":"merge_commit_recorded","instruction_reference":"policy#verify","rationale":"check the result"}]
+            })).unwrap();
+        assert!(
+            validate_role_payload(&RoleResultPayload::MergeIntent(
+                missing_final_verify.clone()
+            ))
+            .is_err()
+        );
+
+        missing_final_verify.steps.push(MergeProcedureStep {
+            kind: MergeProcedureStepKind::VerifyMergeCommit,
+            instruction_reference: "policy#verify".into(),
+            rationale: "check the resulting commit".into(),
+        });
+        validate_role_payload(&RoleResultPayload::MergeIntent(missing_final_verify)).unwrap();
+    }
+
+    #[test]
     fn every_role_output_has_a_bounded_closed_generated_schema() {
         let kinds = [
             RoleOutputKind::Progress,
@@ -2697,6 +2946,16 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn generated_payload_schema_constrains_domain_string_identifiers() {
+        let schema = role_result_payload_schema(RoleOutputKind::ImplementationReady);
+        let encoded = schema.to_string();
+        assert!(encoded.contains("WorkNodeId"));
+        assert!(encoded.contains(r"^[A-Za-z0-9._-]+$"));
+        assert!(encoded.contains(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$"));
+        assert!(encoded.contains(r"^[a-f0-9]{64}$"));
     }
 
     #[test]
