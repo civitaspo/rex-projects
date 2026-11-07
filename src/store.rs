@@ -28,6 +28,18 @@ type DueEffectRow = (
     String,
     Option<u64>,
 );
+type ClaimableEffectRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+);
 type PendingControlRow = (
     String,
     String,
@@ -67,6 +79,7 @@ pub struct InputReceipt {
     pub duplicate: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectIntent {
     pub project_id: ProjectId,
     pub subject_type: String,
@@ -77,6 +90,20 @@ pub struct EffectIntent {
     pub request_json: String,
     pub request_digest: String,
     pub expected_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedEffect {
+    pub intent: EffectIntent,
+    pub state: EffectClaimState,
+    pub attempt_count: u32,
+    pub created_at_unix: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectClaimState {
+    Pending,
+    Uncertain,
 }
 
 #[derive(Clone, Copy)]
@@ -571,6 +598,142 @@ impl ConfigStore {
         let inserted = insert_effect(&tx, effect, now_unix()?)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted)
+    }
+
+    pub fn claim_next_due_effect(
+        &mut self,
+        owner_generation: u64,
+        now: i64,
+        supported_kinds: &[String],
+    ) -> Result<Option<ClaimedEffect>, String> {
+        if supported_kinds.is_empty() {
+            return Ok(None);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let kind_placeholders = (0..supported_kinds.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "SELECT status,project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision FROM effects WHERE status IN ('pending','uncertain') AND next_attempt_at_unix<=?1 AND kind IN ({kind_placeholders}) ORDER BY created_at_unix,next_attempt_at_unix,operation_id LIMIT 1"
+        );
+        let mut values = vec![rusqlite::types::Value::Integer(now)];
+        values.extend(
+            supported_kinds
+                .iter()
+                .cloned()
+                .map(rusqlite::types::Value::Text),
+        );
+        let row: Option<ClaimableEffectRow> = tx
+            .query_row(&query, rusqlite::params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((
+            status,
+            project_id,
+            subject_type,
+            subject_id,
+            operation_id,
+            logical_key,
+            kind,
+            request_json,
+            request_digest,
+            expected_revision,
+        )) = row
+        else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        let (attempt_count, created_at_unix): (u32, i64) = tx
+            .query_row(
+                "SELECT attempt_count,created_at_unix FROM effects WHERE operation_id=?1",
+                [&operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let increment = i64::from(status == "pending");
+        let changed = tx.execute(
+            "UPDATE effects SET status='claimed',owner_generation=?2,attempt_count=attempt_count+?3 WHERE operation_id=?1 AND status=?4",
+            params![operation_id, owner_generation, increment, status],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("effect claim changed while acquiring the write lock".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some(ClaimedEffect {
+            intent: EffectIntent {
+                project_id: ProjectId::parse(project_id)?,
+                subject_type,
+                subject_id,
+                operation_id,
+                logical_key,
+                kind,
+                request_json,
+                request_digest,
+                expected_revision,
+            },
+            state: if status == "pending" {
+                EffectClaimState::Pending
+            } else {
+                EffectClaimState::Uncertain
+            },
+            attempt_count: attempt_count + u32::from(status == "pending"),
+            created_at_unix,
+        }))
+    }
+
+    pub fn retry_effect_after_absence(
+        &self,
+        operation_id: &str,
+        owner_generation: u64,
+        request_digest: &str,
+        proof_json: &str,
+        next_attempt_at_unix: i64,
+    ) -> Result<(), String> {
+        let changed = self.connection.execute(
+            "UPDATE effects SET status='pending',owner_generation=NULL,next_attempt_at_unix=?5,receipt_json=?4,last_error='authoritative absence confirmed; retry scheduled' WHERE operation_id=?1 AND owner_generation=?2 AND request_digest=?3 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
+            params![operation_id, owner_generation, request_digest, proof_json, next_attempt_at_unix],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(
+                "effect retry claim is stale, digest-mismatched, or no longer active".into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn defer_effect_reconciliation(
+        &self,
+        operation_id: &str,
+        owner_generation: u64,
+        receipt: Option<&str>,
+        next_reconciliation_at_unix: i64,
+    ) -> Result<(), String> {
+        let changed = self.connection.execute(
+            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
+            params![operation_id, owner_generation, receipt, next_reconciliation_at_unix],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("effect reconciliation claim is stale or no longer active".into());
+        }
+        Ok(())
     }
 
     pub fn next_due_effect(
@@ -2724,6 +2887,250 @@ mod tests {
             config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"],"status_values":{"triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"}}},"projects":{}})).unwrap(),
             profiles: BTreeMap::new(), source_root: "/tmp/config".into(), source_files: vec![SourceFile { kind: SourceKind::File, path: "/tmp/config/config.toml".into(), canonical_path: "/tmp/config/config.toml".into(), sha256: Digest::parse("a".repeat(64)).unwrap(), bytes: 1, contents: "x".into() }], digest: Digest::parse(digest).unwrap(),
         }
+    }
+
+    #[test]
+    fn effect_restart_reconciles_same_identity_before_retry() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("effects-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: nonce.into(),
+            executable_path: "/tmp/rex-projects-test".into(),
+            executable_digest: "f".repeat(64),
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let generation = store.start_owner(&owner("first")).unwrap();
+        let request = r#"{"value":"same"}"#;
+        let intent = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "project".into(),
+            subject_id: project_id.as_str().into(),
+            operation_id: "stable-operation".into(),
+            logical_key: "stable-logical-intent".into(),
+            kind: "merge".into(),
+            request_json: request.into(),
+            request_digest: content_digest(request),
+            expected_revision: Some(0),
+        };
+        store.enqueue_effect(generation, &intent).unwrap();
+        let now = super::now_unix().unwrap();
+        struct MockHandler {
+            actions: Mutex<std::collections::VecDeque<&'static str>>,
+            seen: Mutex<Vec<(crate::effects::EffectMode, crate::effects::EffectRequest)>>,
+        }
+        impl crate::effects::EffectHandler for MockHandler {
+            fn kind(&self) -> crate::effects::EffectKind {
+                crate::effects::EffectKind::Merge
+            }
+            fn handle(
+                &self,
+                mode: crate::effects::EffectMode,
+                request: &crate::effects::EffectRequest,
+            ) -> Result<crate::effects::EffectObservation, String> {
+                self.seen.lock().unwrap().push((mode, request.clone()));
+                match self.actions.lock().unwrap().pop_front().unwrap() {
+                    "pending" => Ok(crate::effects::EffectObservation::Pending {
+                        receipt: "{}".into(),
+                    }),
+                    "error" => Err("lookup unavailable".into()),
+                    "absent" => Ok(crate::effects::EffectObservation::AuthoritativelyAbsent {
+                        proof: crate::effects::AbsentProof::from_authoritative_lookup(
+                            crate::effects::EffectKind::Merge,
+                            request,
+                            "fixture lookup",
+                            "operation ID was not found",
+                        )
+                        .unwrap(),
+                    }),
+                    "applied" => Ok(crate::effects::EffectObservation::Applied {
+                        receipt: "{\"merged\":true}".into(),
+                    }),
+                    other => Err(format!("unexpected test action {other}")),
+                }
+            }
+        }
+        let handler = MockHandler {
+            actions: Mutex::new(["pending", "error", "error", "absent", "applied"].into()),
+            seen: Mutex::new(Vec::new()),
+        };
+        let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(300),
+            retry_base: std::time::Duration::from_secs(20),
+            retry_max: std::time::Duration::from_secs(60),
+        };
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(&mut store, generation, now, &handlers, limits)
+                .unwrap(),
+            crate::effects::DispatchTick::WaitingForReconciliation {
+                operation_id: intent.operation_id.clone()
+            }
+        );
+
+        let backlog = EffectIntent {
+            operation_id: "newer-pending-operation".into(),
+            logical_key: "newer-pending-intent".into(),
+            ..intent.clone()
+        };
+        store.enqueue_effect(generation, &backlog).unwrap();
+        store.connection.execute(
+            "UPDATE effects SET created_at_unix=?2,next_attempt_at_unix=?3 WHERE operation_id=?1",
+            rusqlite::params![backlog.operation_id, now + 1, now + 20],
+        ).unwrap();
+
+        store.stop_owner(generation).unwrap();
+        let next_generation = store.start_owner(&owner("second")).unwrap();
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                next_generation,
+                now + 20,
+                &handlers,
+                limits
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::WaitingForReconciliation {
+                operation_id: intent.operation_id.clone(),
+            }
+        );
+        assert_eq!(
+            handler.seen.lock().unwrap()[1].1.intent.operation_id,
+            intent.operation_id
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET status='cancelled' WHERE operation_id=?1",
+                [&backlog.operation_id],
+            )
+            .unwrap();
+        store.stop_owner(next_generation).unwrap();
+        let third_generation = store.start_owner(&owner("third")).unwrap();
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                third_generation,
+                now + 39,
+                &handlers,
+                limits
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Idle
+        );
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                third_generation,
+                now + 40,
+                &handlers,
+                limits
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::WaitingForReconciliation {
+                operation_id: intent.operation_id.clone()
+            }
+        );
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                third_generation,
+                now + 79,
+                &handlers,
+                limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Idle,
+        );
+        store.stop_owner(third_generation).unwrap();
+        let fourth_generation = store.start_owner(&owner("fourth")).unwrap();
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                fourth_generation,
+                now + 80,
+                &handlers,
+                limits
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::RetryScheduled {
+                operation_id: intent.operation_id.clone(),
+                attempt: 1
+            },
+        );
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                fourth_generation,
+                now + 139,
+                &handlers,
+                limits
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Idle,
+        );
+        store.stop_owner(fourth_generation).unwrap();
+        let fifth_generation = store.start_owner(&owner("fifth")).unwrap();
+        assert_eq!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                fifth_generation,
+                now + 140,
+                &handlers,
+                limits
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Completed {
+                operation_id: intent.operation_id.clone()
+            },
+        );
+        let seen = handler.seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().map(|(mode, _)| *mode).collect::<Vec<_>>(),
+            [
+                crate::effects::EffectMode::Submit,
+                crate::effects::EffectMode::Reconcile,
+                crate::effects::EffectMode::Reconcile,
+                crate::effects::EffectMode::Reconcile,
+                crate::effects::EffectMode::Submit,
+            ]
+        );
+        assert!(seen.iter().all(
+            |(_, request)| request.intent.operation_id == intent.operation_id
+                && request.intent.request_digest == intent.request_digest
+        ));
+        assert_eq!(
+            seen.iter()
+                .map(|(_, request)| request.attempt_count)
+                .collect::<Vec<_>>(),
+            [1, 1, 1, 1, 2]
+        );
     }
 
     #[test]

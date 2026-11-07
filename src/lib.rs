@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod cli;
 pub mod config;
 pub mod domain;
+pub mod effects;
 pub mod engine;
 pub mod hooks;
 pub mod host_commit;
