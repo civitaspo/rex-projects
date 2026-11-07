@@ -21,6 +21,8 @@ const MAX_PROVIDER_STDOUT: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_STDERR_TAIL: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+const QUALIFICATION_CLEANUP_RESERVE_SECONDS: u64 = 7;
+const MAX_QUALIFICATION_SHUTDOWN_GRACE_SECONDS: u64 = 300;
 
 pub trait ProcessObserver {
     type Identity: Clone + std::fmt::Debug + Eq + ProcessIdentityView;
@@ -196,8 +198,38 @@ pub(crate) struct QualificationPermit {
     issued_at: std::time::Instant,
 }
 
-#[allow(dead_code)]
-const MAX_QUALIFICATION_DEADLINE: Duration = Duration::from_secs(30 * 60);
+pub(crate) fn qualification_deadline_seconds(
+    turn_timeout_seconds: u64,
+    shutdown_grace_seconds: u64,
+) -> Result<u64, String> {
+    let deadline = qualification_deadline(
+        turn_timeout_seconds,
+        Duration::from_secs(shutdown_grace_seconds),
+    )?;
+    deadline
+        .as_secs()
+        .checked_add(u64::from(deadline.subsec_nanos() != 0))
+        .ok_or_else(|| "provider qualification deadline overflow".into())
+}
+
+pub(crate) fn qualification_deadline(
+    turn_timeout_seconds: u64,
+    shutdown_grace: Duration,
+) -> Result<Duration, String> {
+    if turn_timeout_seconds == 0
+        || shutdown_grace.is_zero()
+        || shutdown_grace > Duration::from_secs(MAX_QUALIFICATION_SHUTDOWN_GRACE_SECONDS)
+    {
+        return Err("provider qualification timeout is outside the supported bounds".into());
+    }
+    Duration::from_secs(turn_timeout_seconds)
+        .checked_add(shutdown_grace)
+        .and_then(|duration| duration.checked_add(shutdown_grace))
+        .and_then(|duration| {
+            duration.checked_add(Duration::from_secs(QUALIFICATION_CLEANUP_RESERVE_SECONDS))
+        })
+        .ok_or_else(|| "provider qualification deadline overflow".into())
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -381,21 +413,18 @@ pub(crate) fn issue_qualification_permit(
             "qualification bootstrap requires unknown, not persisted provider evidence".into(),
         ));
     }
-    if context.deadline.is_zero() || context.deadline > MAX_QUALIFICATION_DEADLINE {
+    if context.deadline.is_zero() {
         return Err(RunError::Invalid(
-            "disposable qualification deadline must be positive and at most 30 minutes".into(),
+            "disposable qualification deadline must be positive".into(),
         ));
     }
-    let maximum_turn = Duration::from_secs(request.profile.turn_timeout_seconds)
-        .checked_add(request.shutdown_grace)
-        .ok_or_else(|| RunError::Invalid("qualification timeout overflow".into()))?;
-    let cleanup_budget = request
-        .shutdown_grace
-        .checked_add(Duration::from_secs(7))
-        .ok_or_else(|| RunError::Invalid("qualification cleanup budget overflow".into()))?;
-    if maximum_turn
-        .checked_add(cleanup_budget)
-        .is_none_or(|minimum| minimum > context.deadline)
+    let required_deadline =
+        qualification_deadline(request.profile.turn_timeout_seconds, request.shutdown_grace)
+            .map_err(RunError::Invalid)?;
+    if context.deadline < required_deadline
+        || std::time::Instant::now()
+            .checked_add(context.deadline)
+            .is_none()
     {
         return Err(RunError::Invalid(
             "qualification deadline must cover the provider turn and bounded cleanup reserve"
@@ -439,10 +468,14 @@ pub(crate) fn issue_qualification_permit(
         true,
     )?;
     let request_binding = qualification_request_binding(request, &context)?;
+    let issued_at = std::time::Instant::now();
+    issued_at
+        .checked_add(context.deadline)
+        .ok_or_else(|| RunError::Invalid("qualification deadline is not representable".into()))?;
     Ok(QualificationPermit {
         request_binding,
         context,
-        issued_at: std::time::Instant::now(),
+        issued_at,
     })
 }
 
@@ -481,7 +514,14 @@ pub(crate) fn run_qualification_turn<O: ProcessObserver>(
         ));
     }
     let mut prepared = prepare_with_qualification(request, false, true)?;
-    prepared.absolute_deadline = Some(permit.issued_at + context.deadline);
+    prepared.absolute_deadline = Some(
+        permit
+            .issued_at
+            .checked_add(context.deadline)
+            .ok_or_else(|| {
+                RunError::Invalid("qualification deadline is not representable".into())
+            })?,
+    );
     run_prepared(request, prepared, observer)
 }
 
@@ -651,7 +691,7 @@ fn run_prepared<O: ProcessObserver>(
         let remaining = absolute_deadline.saturating_duration_since(std::time::Instant::now());
         let cleanup_budget = prepared
             .shutdown_grace
-            .checked_add(Duration::from_secs(7))
+            .checked_add(Duration::from_secs(QUALIFICATION_CLEANUP_RESERVE_SECONDS))
             .ok_or_else(|| RunError::Invalid("qualification cleanup budget overflow".into()))?;
         if remaining <= cleanup_budget {
             return Err(RunError::Invalid(
@@ -696,7 +736,7 @@ fn run_prepared<O: ProcessObserver>(
         let remaining = absolute_deadline.saturating_duration_since(std::time::Instant::now());
         let cleanup_budget = prepared
             .shutdown_grace
-            .checked_add(Duration::from_secs(7))
+            .checked_add(Duration::from_secs(QUALIFICATION_CLEANUP_RESERVE_SECONDS))
             .ok_or_else(|| RunError::Invalid("qualification cleanup budget overflow".into()))?;
         if remaining <= cleanup_budget {
             return Err(RunError::Invalid(
@@ -2020,6 +2060,24 @@ mod tests {
             ),
             super::ProviderResultFailure::SourceSchemaRejected
         );
+    }
+
+    #[test]
+    fn qualification_deadline_covers_configured_turn_and_both_cleanup_graces() {
+        assert_eq!(
+            super::qualification_deadline_seconds(1800, 30).unwrap(),
+            1867
+        );
+        assert_eq!(
+            super::qualification_deadline_seconds(1800, 300).unwrap(),
+            2407
+        );
+        assert_eq!(
+            super::qualification_deadline_seconds(2700, 30).unwrap(),
+            2767
+        );
+        assert!(super::qualification_deadline_seconds(u64::MAX, 30).is_err());
+        assert!(super::qualification_deadline_seconds(1800, 301).is_err());
     }
 
     fn profile(adapter: AgentAdapter, command: &str) -> Profile {

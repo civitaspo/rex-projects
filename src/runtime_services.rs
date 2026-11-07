@@ -324,6 +324,17 @@ impl RuntimeServices {
             .clamp(1, u32::MAX as usize) as u32;
         match store.claim_provider_qualification(self.owner_generation, capacity, per_project)? {
             crate::store::provider_qualification_runtime::QualificationClaim::Claimed { job, .. } => {
+                if let Err(error) = self.preflight_provider_qualification_deadline(&job) {
+                    store.fail_provider_qualification_before_launch(
+                        self.owner_generation,
+                        &job.request.request_id,
+                        "local_preflight_failed",
+                    )?;
+                    return Err(format!(
+                        "provider qualification {} failed before Rex launch: {error}",
+                        job.request.request_id
+                    ));
+                }
                 if let Err(error) = self.start_provider_qualification(store, &job) {
                     // A possibly-created Rex session is never forgotten or relaunched.
                     let _ = store.mark_provider_qualification_unknown(
@@ -341,6 +352,33 @@ impl RuntimeServices {
         }
         let _ = now_unix;
         Ok(())
+    }
+
+    fn preflight_provider_qualification_deadline(
+        &self,
+        job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
+    ) -> Result<u64, String> {
+        let profile = self
+            .applied_config
+            .profiles
+            .get(&job.request.profile_id)
+            .ok_or("provider qualification profile is absent from applied configuration")?;
+        if digest_serialized(profile)? != job.request.profile_digest
+            || self.applied_config.digest != job.request.config_digest
+        {
+            return Err("provider qualification profile or config changed after request".into());
+        }
+        let shutdown_grace_seconds = self.config.runtime.shutdown_grace_seconds.clamp(1, 300);
+        let deadline_seconds = crate::run_step::qualification_deadline_seconds(
+            profile.turn_timeout_seconds,
+            shutdown_grace_seconds,
+        )?;
+        let deadline = std::time::Duration::from_secs(deadline_seconds);
+        std::time::Instant::now()
+            .checked_add(deadline)
+            .ok_or("provider qualification deadline cannot be represented by this platform")?;
+        crate::run_step::profile_runtime_identity(profile).map_err(|error| error.to_string())?;
+        Ok(deadline_seconds)
     }
 
     fn start_provider_qualification(
@@ -362,6 +400,11 @@ impl RuntimeServices {
         {
             return Err("provider qualification profile or config changed after request".into());
         }
+        let shutdown_grace_seconds = self.config.runtime.shutdown_grace_seconds.clamp(1, 300);
+        let deadline_seconds = crate::run_step::qualification_deadline_seconds(
+            profile.turn_timeout_seconds,
+            shutdown_grace_seconds,
+        )?;
         let identity = crate::run_step::profile_runtime_identity(profile)
             .map_err(|error| error.to_string())?;
         let operation_digest = job.request_digest.as_str();
@@ -487,8 +530,8 @@ impl RuntimeServices {
             rex_cli_path: self.rex_cli_path.clone(),
             rex_search_path: self.rex_search_path.clone(),
             rex_receipt,
-            deadline_seconds: 1800,
-            shutdown_grace_seconds: self.config.runtime.shutdown_grace_seconds.clamp(1, 300),
+            deadline_seconds,
+            shutdown_grace_seconds,
         };
         package.publish_once(&descriptor_path)
     }

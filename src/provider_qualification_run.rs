@@ -327,7 +327,8 @@ mod marker_probe_tests {
     use super::{
         MarkerProbeBinding, MarkerProbeReport, QualificationRunPackage, REQUIRED_AGENT_MARKERS,
         descendant_marker_hashes, digest, new_marker_probe_challenge,
-        run_marker_probe_with_environment, validate_marker_hashes, verify_marker_probe,
+        run_marker_probe_with_environment, validate_marker_hashes, validate_package,
+        verify_marker_probe,
     };
     use crate::adapters::rex::RexQualificationSessionReceipt;
     use crate::config::Profile;
@@ -412,7 +413,7 @@ mod marker_probe_tests {
             description: None,
             model: None,
             effort: None,
-            turn_timeout_seconds: 60,
+            turn_timeout_seconds: 1800,
             instruction_files: Vec::new(),
             skill_paths: Vec::new(),
             commit_mode: CommitMode::Auto,
@@ -420,6 +421,9 @@ mod marker_probe_tests {
             options: None,
         };
         let profile_digest = digest(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let deadline_seconds =
+            crate::run_step::qualification_deadline_seconds(profile.turn_timeout_seconds, 30)
+                .unwrap();
         let project_digest = digest("1".repeat(64).as_bytes()).unwrap();
         let run_id = AgentRunId::parse("qualification-run").unwrap();
         let environment_snapshot_id = digest("2".repeat(64).as_bytes()).unwrap();
@@ -499,8 +503,8 @@ mod marker_probe_tests {
             rex_cli_path: PathBuf::from("/usr/bin/env"),
             rex_search_path: Vec::new(),
             rex_receipt,
-            deadline_seconds: 60,
-            shutdown_grace_seconds: 1,
+            deadline_seconds,
+            shutdown_grace_seconds: 30,
         }
     }
 
@@ -529,6 +533,24 @@ mod marker_probe_tests {
         let mut unbound = report;
         unbound.request_digest = Digest::parse("f".repeat(64)).unwrap();
         assert!(verify_marker_probe(&package, &unbound).is_err());
+    }
+
+    #[test]
+    fn qualification_package_requires_deadline_for_turn_and_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let mut package = package(&root_path);
+        assert_eq!(package.deadline_seconds, 1867);
+        let path = root_path.join("package.json");
+        package.publish_once(&path).unwrap();
+        assert!(validate_package(&package, &path).is_ok());
+
+        package.deadline_seconds -= 1;
+        assert!(
+            validate_package(&package, &path)
+                .unwrap_err()
+                .contains("deadline does not match")
+        );
     }
 }
 
@@ -784,8 +806,6 @@ pub(crate) fn validate_package(
         || package.marker_probe_path != package.descriptor.workspace.join("marker-probe.json")
         || package.marker_probe_challenge.len() != 64
         || !package.runtime_binary_path.is_absolute()
-        || package.deadline_seconds == 0
-        || package.deadline_seconds > 1800
         || package.shutdown_grace_seconds == 0
         || package.shutdown_grace_seconds > 300
         || !package.rex_cli_path.is_absolute()
@@ -796,6 +816,19 @@ pub(crate) fn validate_package(
         digest(&serde_json::to_vec(&package.profile).map_err(|error| error.to_string())?)?;
     if profile_digest != package.profile_digest {
         return Err("qualification package profile digest mismatch".into());
+    }
+    let required_deadline = crate::run_step::qualification_deadline_seconds(
+        package.profile.turn_timeout_seconds,
+        package.shutdown_grace_seconds,
+    )?;
+    let deadline = std::time::Duration::from_secs(package.deadline_seconds);
+    if package.deadline_seconds != required_deadline
+        || std::time::Instant::now().checked_add(deadline).is_none()
+    {
+        return Err(
+            "qualification package deadline does not match its representable turn and cleanup"
+                .into(),
+        );
     }
     Ok(())
 }

@@ -4916,6 +4916,114 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_prelaunch_failure_releases_only_its_unbound_launch_slot() {
+        use crate::config::ProjectConfig;
+        use crate::domain::ids::{ProfileId, RepositoryId};
+        use crate::domain::types::Role;
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationJobStatus, ProviderQualificationRequest,
+        };
+
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut applied = snapshot(&"a".repeat(64));
+        let project_id = ProjectId::parse("preflight-project").unwrap();
+        let repository_id = RepositoryId::parse("preflight-repo").unwrap();
+        applied.config.repositories.insert(
+            repository_id,
+            serde_json::from_value(serde_json::json!({
+                "clone_url": "https://example.com/acme/repo.git",
+                "base_branch": "main",
+                "forge": "github"
+            }))
+            .unwrap(),
+        );
+        applied.config.projects.insert(
+            project_id.clone(),
+            serde_json::from_value::<ProjectConfig>(serde_json::json!({
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "repositories": ["preflight-repo"]
+            }))
+            .unwrap(),
+        );
+        let config_digest = applied.digest.clone();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied_record = store
+            .apply_snapshot("factory", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied_record.revision,
+                config_digest: config_digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "preflight-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "preflight-test".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let request = ProviderQualificationRequest {
+            request_id: "preflight-deadline".into(),
+            project_id,
+            role: Role::Worker,
+            profile_id: ProfileId::parse("codex-worker").unwrap(),
+            profile_digest: Digest::parse("b".repeat(64)).unwrap(),
+            config_revision: applied_record.revision.0,
+            config_digest,
+        };
+        store
+            .enqueue_provider_qualification(generation, &request)
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_provider_qualification(generation, 1, 1)
+                .unwrap(),
+            super::provider_qualification_runtime::QualificationClaim::Claimed { .. }
+        ));
+
+        store
+            .fail_provider_qualification_before_launch(
+                generation,
+                &request.request_id,
+                "local_preflight_failed",
+            )
+            .unwrap();
+        let job = store
+            .provider_qualification_job(&request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, ProviderQualificationJobStatus::Failed);
+        assert!(job.rex_session_id.is_none());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT disposition FROM execution_slots WHERE owner_kind='provider_qualification' AND owner_id=?1",
+                    [request.request_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "released"
+        );
+    }
+
+    #[test]
     fn effect_lookup_reuses_the_exact_request_after_a_result_ack_crash() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();

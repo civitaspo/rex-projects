@@ -112,6 +112,65 @@ impl ProviderQualificationRequest {
 }
 
 impl ConfigStore {
+    /// Terminally fail a claimed job only when its deterministic local preflight
+    /// failed before any Rex session was created. The slot release and job
+    /// receipt are one fenced transaction.
+    pub fn fail_provider_qualification_before_launch(
+        &mut self,
+        owner_generation: u64,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        if reason.is_empty() || reason.len() > 512 || reason.chars().any(char::is_control) {
+            return Err("provider qualification prelaunch failure reason is invalid".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let job = read_job(&tx, request_id)?
+            .ok_or("provider qualification prelaunch job does not exist")?;
+        if job.status != ProviderQualificationJobStatus::Running
+            || job.controller_generation != owner_generation
+            || job.rex_session_id.is_some()
+            || job.rex_window_id.is_some()
+            || job.rex_block_id.is_some()
+        {
+            return Err("provider qualification prelaunch identity is ambiguous".into());
+        }
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "request_id": request_id,
+            "outcome": "failed",
+            "stage": "prelaunch",
+            "reason": reason,
+        });
+        let bounded_result_json =
+            serde_json::to_string(&result).map_err(|error| error.to_string())?;
+        let evidence_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(bounded_result_json.as_bytes())
+        ))?;
+        let changed = tx.execute(
+            "UPDATE provider_qualification_jobs SET status='failed',result_json=?3,evidence_digest=?4,updated_at_unix=?5 WHERE request_id=?1 AND controller_generation=?2 AND status='running' AND rex_session_id IS NULL AND rex_window_id IS NULL AND rex_block_id IS NULL",
+            params![request_id, owner_generation, bounded_result_json, evidence_digest.as_str(), now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("provider qualification changed during prelaunch failure".into());
+        }
+        let released = tx.execute(
+            "UPDATE execution_slots SET disposition='released' WHERE owner_kind='provider_qualification' AND owner_id=?1 AND controller_generation=?2 AND disposition='launch_pending'",
+            params![request_id, owner_generation],
+        ).map_err(|error| error.to_string())?;
+        if released != 1 {
+            return Err(
+                "provider qualification launch-pending slot is missing or ambiguous".into(),
+            );
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     /// Queue an exact, idempotent request through the current machine owner.
     /// This is the only external write to the job table; execution and result
     /// transitions remain fenced to the foreground controller generation.
