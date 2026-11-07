@@ -47,6 +47,16 @@ type ClaimableEffectRow = (
     String,
     Option<u64>,
 );
+type LaunchAgentRunRow = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    u64,
+    String,
+    Option<String>,
+);
 type PendingControlRow = (
     String,
     String,
@@ -668,9 +678,12 @@ impl ConfigStore {
         now_unix: u64,
         retention_seconds: u64,
     ) -> Result<Vec<RexViewCleanupCandidate>, String> {
+        if !self.rex_view_cleanup_schema_ready()? {
+            return Ok(Vec::new());
+        }
         let cutoff = now_unix.saturating_sub(retention_seconds);
         let mut statement=self.connection.prepare(
-            "SELECT v.view_id,v.project_id,v.view_kind,v.ticket_namespace,v.ticket_id,v.view_epoch,v.rex_server_identity,v.rex_session_id,v.rex_window_id,v.updated_at_unix FROM rex_views v WHERE v.lifecycle='active' AND v.pinned=0 AND v.updated_at_unix<=?1 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2))) ORDER BY v.updated_at_unix",
+            "SELECT v.view_id,v.project_id,v.view_kind,v.ticket_namespace,v.ticket_id,v.view_epoch,v.rex_server_identity,v.rex_session_id,v.rex_window_id,v.updated_at_unix FROM rex_views v WHERE v.lifecycle='active' AND v.pinned=0 AND v.updated_at_unix<=?1 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=v.view_id AND h.lifecycle IN ('pending','presented','response_queued')) ORDER BY v.updated_at_unix",
         ).map_err(|error|error.to_string())?;
         let rows = statement
             .query_map(params![cutoff, now_unix], |row| {
@@ -727,6 +740,9 @@ impl ConfigStore {
         if candidate.close_after_unix > now_unix {
             return Err("Rex view retention period has not elapsed".into());
         }
+        if !self.rex_view_cleanup_schema_ready()? {
+            return Err("human review hold state is unavailable; Rex view cannot be closed".into());
+        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -734,13 +750,30 @@ impl ConfigStore {
         validate_active_generation(&tx, owner_generation)?;
         let cutoff = now_unix.saturating_sub(retention_seconds);
         let changed=tx.execute(
-            "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND updated_at_unix<=?3 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2)))",
+            "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND updated_at_unix<=?3 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=rex_views.view_id AND h.lifecycle IN ('pending','presented','response_queued'))",
             params![candidate.view.view_id.as_str(),now_unix,cutoff],
         ).map_err(|error|error.to_string())?;
         if changed != 1 {
             return Err("Rex view is no longer safe to close".into());
         }
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    fn rex_view_cleanup_schema_ready(&self) -> Result<bool, String> {
+        let table_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='human_requests')",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !table_exists {
+            return Ok(false);
+        }
+        let has_view_binding: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('human_requests') WHERE name='rex_view_id')",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        Ok(has_view_binding)
     }
 
     pub fn finish_rex_view_close(
@@ -795,11 +828,11 @@ impl ConfigStore {
                 .agent_run_id
                 .as_ref()
                 .ok_or("factory block requires AgentRun")?;
-            let (view, role): (String, String) = tx
+            let (view, role, block_id): (String, String, String) = tx
                 .query_row(
-                    "SELECT rex_view_id,role FROM agent_launch_authority WHERE agent_run_id=?1",
+                    "SELECT rex_view_id,role,rex_block_id FROM agent_launch_authority WHERE agent_run_id=?1",
                     [run_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(|error| error.to_string())?
@@ -809,7 +842,7 @@ impl ConfigStore {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
-            if view != block.view_id.as_str() || role != role_raw {
+            if view != block.view_id.as_str() || role != role_raw || block_id != block.block_id {
                 return Err("Rex block identity does not match launch authority".into());
             }
         }
@@ -922,10 +955,10 @@ impl ConfigStore {
                 "new launch authority must belong to the active controller generation".into(),
             );
         }
-        let run: Option<(String, String, u64, String, String, String, String)> = tx.query_row(
-            "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source FROM agent_runs WHERE agent_run_id=?1",
+        let run: Option<LaunchAgentRunRow> = tx.query_row(
+            "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source,role_session_id FROM agent_runs WHERE agent_run_id=?1",
             [authority.agent_run_id.as_str()],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
         ).optional().map_err(|error| error.to_string())?;
         let Some((
             project_id,
@@ -935,6 +968,7 @@ impl ConfigStore {
             config_digest,
             config_revision,
             config_source,
+            role_session_id,
         )) = run
         else {
             return Err("launch authority references an unknown AgentRun".into());
@@ -944,9 +978,10 @@ impl ConfigStore {
             || generation != owner_generation
             || operation_id != authority.operation_id.as_str()
             || config_digest != authority.config_digest.as_str()
-            || config_revision != authority.config_revision.0.to_string()
+            || config_revision != authority.config_revision.0
+            || role_session_id.as_deref() != Some(authority.role_session_id.as_str())
         {
-            return Err("AgentRun does not match the proposed launch authority".into());
+            return Err("AgentRun identity does not match the proposed launch authority".into());
         }
         let snapshot: Option<(String, String)> = tx.query_row(
             "SELECT snapshots.digest,snapshots.effective_config_json FROM config_current current JOIN config_snapshots snapshots USING(source_identity,revision) WHERE current.source_identity=?1 AND current.revision=?2",
@@ -970,6 +1005,27 @@ impl ConfigStore {
             .profiles
             .get(&authority.profile_id)
             .ok_or("launch profile is missing from the applied config snapshot")?;
+        let project_roles = crate::config::effective_project_roles(
+            &authority.project_id,
+            &effective.config.projects,
+        )?;
+        let expected_profile = if let Some(recipe_id) = &authority.operation_recipe_id {
+            let recipe = effective
+                .config
+                .operation_recipes
+                .get(recipe_id)
+                .ok_or("launch operation recipe is missing from the applied config snapshot")?;
+            recipe
+                .roles
+                .get(&authority.role)
+                .or_else(|| project_roles.get(&authority.role))
+        } else {
+            project_roles.get(&authority.role)
+        }
+        .ok_or("launch role has no effective profile in project or operation recipe")?;
+        if expected_profile != &authority.profile_id {
+            return Err("launch profile does not match the effective project role profile".into());
+        }
         let profile_json = canonical_json(profile)?;
         let profile_digest =
             Digest::parse(format!("{:x}", Sha256::digest(profile_json.as_bytes())))?;
@@ -996,13 +1052,13 @@ impl ConfigStore {
         } else {
             Some(
                 tx.query_row(
-                    "SELECT namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1",
+                    "SELECT project_id,namespace,ticket_id,revision FROM ticket_runs WHERE ticket_run_id=?1",
                     [authority
                         .ticket_run_id
                         .as_ref()
                         .ok_or("ticket AgentRun is missing TicketRun ID")?
                         .as_str()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u64>(3)?)),
                 )
                 .optional()
                 .map_err(|error| error.to_string())?
@@ -1017,8 +1073,19 @@ impl ConfigStore {
                     } else {
                         kind == "ticket"
                             && ticket_scope.as_ref().is_some_and(
-                                |(expected_namespace, expected_ticket)| {
-                                    namespace.as_deref() == Some(expected_namespace.as_str())
+                                |(
+                                    ticket_project,
+                                    expected_namespace,
+                                    expected_ticket,
+                                    ticket_revision,
+                                )| {
+                                    ticket_project == authority.project_id.as_str()
+                                        && *ticket_revision
+                                            == authority
+                                                .ticket_revision
+                                                .map(|revision| revision.0)
+                                                .unwrap_or_default()
+                                        && namespace.as_deref() == Some(expected_namespace.as_str())
                                         && ticket.as_deref() == Some(expected_ticket.as_str())
                                 },
                             )
@@ -1057,8 +1124,8 @@ impl ConfigStore {
         }
         qualification.validate_for_unattended_launch()?;
         let authority_inserted = tx.execute(
-            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34) ON CONFLICT(agent_run_id) DO NOTHING",
-            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,operation_recipe_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35) ON CONFLICT(agent_run_id) DO NOTHING",
+            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.operation_recipe_id,authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
         ).map_err(|error| error.to_string())?;
         let existing: Option<(String,String)> = tx
             .query_row(
@@ -3709,8 +3776,9 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        ConfigStore, DurableInput, EffectIntent, EffectOutcome, ExpectedRevision,
-        HumanClaimRelease, OwnerMetadata, ProjectRecord, content_digest, durable_input_digest,
+        AgentLaunchAuthority, ConfigStore, DurableInput, EffectIntent, EffectOutcome,
+        ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, content_digest,
+        durable_input_digest,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
@@ -4022,7 +4090,29 @@ mod tests {
         };
         assert!(store.register_rex_view(generation, &view).unwrap());
         assert!(!store.register_rex_view(generation, &view).unwrap());
-        assert_eq!(store.rex_view_history(&project.id).unwrap().len(), 1);
+        let ticket_view = |epoch| RexView {
+            view_id: RexView::derive_id(
+                &project.id,
+                RexViewKind::Ticket,
+                Some("tracker"),
+                Some("T-1"),
+                epoch,
+            )
+            .unwrap(),
+            project_id: project.id.clone(),
+            kind: RexViewKind::Ticket,
+            ticket_namespace: Some("tracker".into()),
+            ticket_id: Some("T-1".into()),
+            view_epoch: epoch,
+            rex_server_identity: "fixture-instance".into(),
+            rex_session_id: "session-1".into(),
+            rex_window_id: format!("ticket-window-{epoch}"),
+        };
+        let ticket_view_1 = ticket_view(1);
+        assert!(store.register_rex_view(generation, &ticket_view_1).unwrap());
+        let ticket_view_2 = ticket_view(2);
+        assert!(store.register_rex_view(generation, &ticket_view_2).is_err());
+        assert_eq!(store.rex_view_history(&project.id).unwrap().len(), 2);
         store.set_rex_view_pin(generation, &view_id, true).unwrap();
         store.set_rex_view_pin(generation, &view_id, false).unwrap();
         assert!(
@@ -4058,6 +4148,187 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM rex_view_blocks WHERE view_id=?1 AND block_id='human-block'",
+                [view_id.as_str()],
+            )
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'factory-block','synthetic-run','supervisor','factory','completed',1,1,1)",
+            [view_id.as_str()],
+        ).unwrap();
+        store.connection.execute_batch(
+            "CREATE TABLE human_requests(request_id TEXT PRIMARY KEY,rex_view_id TEXT NOT NULL,lifecycle TEXT NOT NULL);",
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO human_requests(request_id,rex_view_id,lifecycle) VALUES ('request-1',?1,'pending')",
+            [view_id.as_str()],
+        ).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE rex_views SET updated_at_unix=0 WHERE view_id=?1",
+                [view_id.as_str()],
+            )
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            store
+                .rex_view_cleanup_candidates(now, 0)
+                .unwrap()
+                .is_empty()
+        );
+        let candidate = crate::launch::RexViewCleanupCandidate {
+            view: view.clone(),
+            close_after_unix: now,
+        };
+        assert!(
+            store
+                .begin_rex_view_close(generation, &candidate, now, 0)
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE human_requests SET lifecycle='decided' WHERE request_id='request-1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.rex_view_cleanup_candidates(now, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn launch_authority_block_binding_rejects_different_rex_block() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let project_id = ProjectId::parse("block-binding-project").unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "block-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "block-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let view_id =
+            RexView::derive_id(&project_id, RexViewKind::Supervisor, None, None, 1).unwrap();
+        store
+            .register_rex_view(
+                generation,
+                &RexView {
+                    view_id: view_id.clone(),
+                    project_id: project_id.clone(),
+                    kind: RexViewKind::Supervisor,
+                    ticket_namespace: None,
+                    ticket_id: None,
+                    view_epoch: 1,
+                    rex_server_identity: "fixture-instance".into(),
+                    rex_session_id: "session-1".into(),
+                    rex_window_id: "window-1".into(),
+                },
+            )
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES ('run-1',?1,'factory',?2,?3,'role-session','supervisor',1,'op-1','launch_pending',?4)",
+            rusqlite::params![project_id.as_str(), applied.revision.0, "a".repeat(64), generation],
+        ).unwrap();
+        let mismatched_session_authority = AgentLaunchAuthority {
+            agent_run_id: crate::domain::ids::AgentRunId::parse("run-1").unwrap(),
+            project_id: project_id.clone(),
+            role: crate::domain::types::Role::Supervisor,
+            role_session_id: "forged-session".into(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: generation,
+            operation_id: crate::domain::ids::OperationId::parse("op-1").unwrap(),
+            operation_recipe_id: None,
+            rex_view_id: Digest::parse("b".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("c".repeat(64)).unwrap(),
+            runtime_binary_digest: Digest::parse("d".repeat(64)).unwrap(),
+            descriptor_path: "/tmp/descriptor.json".into(),
+            environment_snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+            profile_id: crate::domain::ids::ProfileId::parse("supervisor").unwrap(),
+            profile_digest: Digest::parse("f".repeat(64)).unwrap(),
+            instruction_digest: Digest::parse("a".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("b".repeat(64)).unwrap(),
+            qualification_receipt_digest: Digest::parse("c".repeat(64)).unwrap(),
+            rex_server_identity: "fixture-instance".into(),
+            rex_session_id: "session-1".into(),
+            rex_window_id: "window-1".into(),
+            rex_block_id: "authorized-block".into(),
+            workspace_path: "/tmp/workspace".into(),
+            control_dir: "/tmp/control".into(),
+            mailbox_capability_digest: Digest::parse("d".repeat(64)).unwrap(),
+        };
+        let mismatch_error = store
+            .register_agent_launch_authority(generation, &mismatched_session_authority)
+            .unwrap_err();
+        assert!(
+            mismatch_error.contains("AgentRun identity"),
+            "{mismatch_error}"
+        );
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES ('run-1',?1,'supervisor','role-session',1,?2,1,1,?3,'op-1',?4,?5,?5,'/tmp/descriptor',?5,'profile',?5,?5,?5,?5,'fixture-instance','session-1','window-1','authorized-block','/tmp/workspace','/tmp/control',?5,'{}',?5,1)",
+            rusqlite::params![project_id.as_str(), "a".repeat(64), generation, view_id.as_str(), "b".repeat(64)],
+        ).unwrap();
+        let result = store.register_rex_view_block(
+            generation,
+            &RexViewBlock {
+                view_id,
+                block_id: "attacker-selected-block".into(),
+                agent_run_id: Some(crate::domain::ids::AgentRunId::parse("run-1").unwrap()),
+                role: Some(crate::domain::types::Role::Supervisor),
+                ownership: RexBlockOwnership::Factory,
+                lifecycle: RexBlockLifecycle::Active,
+                process_absent_confirmed: false,
+                retained_until_unix: None,
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]

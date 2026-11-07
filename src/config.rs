@@ -1287,6 +1287,13 @@ fn resolve_roles<'a>(
     Ok(roles)
 }
 
+pub(crate) fn effective_project_roles(
+    project_id: &ProjectId,
+    projects: &BTreeMap<ProjectId, ProjectConfig>,
+) -> Result<BTreeMap<Role, ProfileId>, String> {
+    resolve_roles(project_id, projects, &mut BTreeSet::new())
+}
+
 fn validate_selector(target_id: &str, selector: &BTreeMap<String, String>) -> Result<(), String> {
     const ALLOWED: &[&str] = &[
         "workflow",

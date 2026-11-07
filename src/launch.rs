@@ -243,10 +243,10 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
             CHECK((view_kind='supervisor' AND ticket_namespace IS NULL AND ticket_id IS NULL) OR
                   (view_kind='ticket' AND ticket_namespace IS NOT NULL AND ticket_id IS NOT NULL))
         );
-        CREATE UNIQUE INDEX rex_views_project_supervisor_epoch
-            ON rex_views(project_id,view_epoch) WHERE view_kind='supervisor';
-        CREATE UNIQUE INDEX rex_views_project_ticket_epoch
-            ON rex_views(project_id,ticket_namespace,ticket_id,view_epoch) WHERE view_kind='ticket';
+        CREATE UNIQUE INDEX rex_views_one_open_supervisor
+            ON rex_views(project_id) WHERE view_kind='supervisor' AND lifecycle IN ('active','close_pending','unknown');
+        CREATE UNIQUE INDEX rex_views_one_open_ticket
+            ON rex_views(project_id,ticket_namespace,ticket_id) WHERE view_kind='ticket' AND lifecycle IN ('active','close_pending','unknown');
         CREATE INDEX rex_views_cleanup ON rex_views(lifecycle,pinned,updated_at_unix);
 
         CREATE TABLE rex_view_blocks (
@@ -290,6 +290,7 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
             run_epoch INTEGER NOT NULL CHECK(run_epoch > 0),
             controller_generation INTEGER NOT NULL CHECK(controller_generation > 0),
             launch_operation_id TEXT NOT NULL UNIQUE,
+            operation_recipe_id TEXT,
             rex_view_id TEXT NOT NULL REFERENCES rex_views(view_id),
             descriptor_digest TEXT NOT NULL CHECK(length(descriptor_digest) = 64),
             runtime_binary_digest TEXT NOT NULL CHECK(length(runtime_binary_digest) = 64),
@@ -595,6 +596,7 @@ pub struct AgentLaunchAuthority {
     pub run_epoch: u64,
     pub controller_generation: u64,
     pub operation_id: OperationId,
+    pub operation_recipe_id: Option<String>,
     pub rex_view_id: ContentDigest,
     pub descriptor_digest: ContentDigest,
     pub runtime_binary_digest: ContentDigest,
@@ -625,6 +627,13 @@ impl AgentLaunchAuthority {
         }
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("parent AgentRun ID and role must be present together".into());
+        }
+        if self
+            .operation_recipe_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        {
+            return Err("Agent launch operation recipe ID is malformed".into());
         }
         if self.role == Role::Supervisor {
             if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {
@@ -988,6 +997,7 @@ mod tests {
             run_epoch: 2,
             controller_generation: 4,
             operation_id: OperationId::parse("op-1").unwrap(),
+            operation_recipe_id: None,
             rex_view_id: digest('b'),
             descriptor_digest: digest('3'),
             runtime_binary_digest: digest('a'),
