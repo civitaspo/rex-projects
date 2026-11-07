@@ -9,7 +9,6 @@ repository = "https://github.com/civitaspo/rex-projects"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 fs2 = "0.4.3"
-libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 schemars = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
