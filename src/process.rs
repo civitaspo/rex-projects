@@ -94,14 +94,22 @@ impl std::error::Error for ProcessError {
 }
 
 pub fn run(request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-    run_with_started_identity(request, |_| {})
+    run_inner(request, |_| {}, false)
 }
 
 /// Run a child while reporting its kernel identity before waiting for completion.
 /// The callback runs on the calling thread and must return promptly.
 pub fn run_with_started_identity(
+    request: ProcessRequest,
+    on_started: impl FnOnce(ProcessIdentity),
+) -> Result<ProcessOutput, ProcessError> {
+    run_inner(request, on_started, true)
+}
+
+fn run_inner(
     mut request: ProcessRequest,
     on_started: impl FnOnce(ProcessIdentity),
+    require_started_identity: bool,
 ) -> Result<ProcessOutput, ProcessError> {
     validate(&request)?;
     let mut command = Command::new(&request.executable);
@@ -125,37 +133,39 @@ pub fn run_with_started_identity(
     let mut child = command.spawn().map_err(ProcessError::Start)?;
     let root_pid = child.id();
     let mut observed_processes = Vec::new();
-    if collect_tree(root_pid, &mut observed_processes).is_err() {
-        let cleaned = cleanup_child_tree(
-            &mut child,
-            root_pid,
-            &mut observed_processes,
-            request.shutdown_grace,
-        );
-        return Err(if cleaned {
-            ProcessError::Inspection("cannot record the started process identity".into())
-        } else {
-            ProcessError::CleanupUnconfirmed
-        });
+    if require_started_identity {
+        if collect_tree(root_pid, &mut observed_processes).is_err() {
+            let cleaned = cleanup_child_tree(
+                &mut child,
+                root_pid,
+                &mut observed_processes,
+                request.shutdown_grace,
+            );
+            return Err(if cleaned {
+                ProcessError::Inspection("cannot record the started process identity".into())
+            } else {
+                ProcessError::CleanupUnconfirmed
+            });
+        }
+        let Some(root_identity) = observed_processes
+            .iter()
+            .find(|identity| identity.pid == root_pid)
+            .cloned()
+        else {
+            let cleaned = cleanup_child_tree(
+                &mut child,
+                root_pid,
+                &mut observed_processes,
+                request.shutdown_grace,
+            );
+            return Err(if cleaned {
+                ProcessError::Inspection("started process is absent from the process table".into())
+            } else {
+                ProcessError::CleanupUnconfirmed
+            });
+        };
+        on_started(root_identity);
     }
-    let Some(root_identity) = observed_processes
-        .iter()
-        .find(|identity| identity.pid == root_pid)
-        .cloned()
-    else {
-        let cleaned = cleanup_child_tree(
-            &mut child,
-            root_pid,
-            &mut observed_processes,
-            request.shutdown_grace,
-        );
-        return Err(if cleaned {
-            ProcessError::Inspection("started process is absent from the process table".into())
-        } else {
-            ProcessError::CleanupUnconfirmed
-        });
-    };
-    on_started(root_identity);
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let mut stdin = child.stdin.take().expect("stdin was piped");
@@ -179,7 +189,8 @@ pub fn run_with_started_identity(
 
     let deadline = Instant::now() + request.timeout;
     let mut timed_out = false;
-    let mut observation_failed = false;
+    let mut observation_failed =
+        !require_started_identity && collect_tree(root_pid, &mut observed_processes).is_err();
     let mut next_process_scan = Instant::now() + Duration::from_millis(20);
     let mut status = loop {
         if Instant::now() >= next_process_scan {
@@ -1032,6 +1043,18 @@ mod tests {
         assert_eq!(output.stderr_tail, b"bcdefghi");
         assert!(output.stderr_truncated);
         assert_eq!(output.status.unwrap().code(), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_true_repeatedly() {
+        for iteration in 0..1000 {
+            let result = run(request("/usr/bin/true", &[]));
+            assert!(
+                result.is_ok(),
+                "fast child run failed at {iteration}: {result:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
