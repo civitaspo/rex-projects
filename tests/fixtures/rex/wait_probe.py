@@ -15,7 +15,9 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     args = parser.parse_args()
 
-    args.ready_file.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    temporary_path = args.ready_file.with_suffix(args.ready_file.suffix + ".tmp")
+    temporary_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    temporary_path.replace(args.ready_file)
     deadline = time.monotonic() + args.timeout_seconds
     while not args.stop_file.exists() and time.monotonic() < deadline:
         time.sleep(0.05)

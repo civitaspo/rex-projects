@@ -60,14 +60,14 @@ def wait_for_tracked_groups_exit(timeout: float, recorder: "ProcessTreeRecorder"
 
 
 def process_table() -> dict[int, dict[str, int | str]]:
-    """Read only PID, PPID, PGID and command name. Never request argv or environment."""
+    """Read process IDs and start time without requesting argv or environment."""
     global process_table_calls
     process_table_calls += 1
     failure_marker = os.environ.get("REX_PR0_FIXTURE_PROCESS_TABLE_FAILURE_MARKER")
     if failure_marker and Path(failure_marker).exists() and process_table_calls > 1:
         raise OSError("injected process-table failure after initial sample")
     run = subprocess.run(
-        ["ps", "-axo", "pid=,ppid=,pgid=,comm="],
+        ["ps", "-axo", "pid=,ppid=,pgid=,lstart=,comm="],
         capture_output=True,
         text=True,
         timeout=3,
@@ -77,14 +77,20 @@ def process_table() -> dict[int, dict[str, int | str]]:
         raise OSError(f"ps process metadata query failed with status {run.returncode}")
     table: dict[int, dict[str, int | str]] = {}
     for line in run.stdout.splitlines():
-        columns = line.strip().split(None, 3)
-        if len(columns) != 4:
+        columns = line.strip().split(None, 8)
+        if len(columns) != 9:
             continue
         try:
             pid, ppid, pgid = (int(value) for value in columns[:3])
         except ValueError:
             continue
-        table[pid] = {"pid": pid, "ppid": ppid, "pgid": pgid, "comm": columns[3]}
+        table[pid] = {
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            "start_identity": " ".join(columns[3:8]),
+            "comm": columns[8],
+        }
     return table
 
 
@@ -115,9 +121,7 @@ class ProcessTreeRecorder:
             items_by_pid = {int(item["pid"]): item for item in process_tree(table, self.root_pid)}
             # Reparented descendants remain attributable while they stay in
             # the provider's private process group.
-            items_by_pid.update(
-                {pid: item for pid, item in table.items() if item["pgid"] == self.root_pid}
-            )
+            items_by_pid.update({pid: item for pid, item in table.items() if item["pgid"] == self.root_pid})
             items = list(items_by_pid.values())
         except (OSError, subprocess.TimeoutExpired) as error:
             self.error = f"{type(error).__name__}: {error}"
@@ -141,7 +145,9 @@ class ProcessTreeRecorder:
         for pid, item in self.processes.items():
             current = table.get(pid)
             item["alive_at_snapshot"] = bool(
-                current is not None and current["comm"] == item["comm"] and current["pgid"] == item["pgid"]
+                current is not None
+                and current["start_identity"] == item["start_identity"]
+                and current["pgid"] == item["pgid"]
             )
         self.write_receipt()
 
@@ -150,7 +156,7 @@ class ProcessTreeRecorder:
             for item in self.processes.values():
                 item["alive_after_provider_exit"] = item.get("alive_at_snapshot", False)
         return {
-            "source": "ps PID/PPID/PGID/comm only; argv and environment were not requested",
+            "source": "ps PID/PPID/PGID/start-time/comm only; argv and environment were not requested",
             "sample_interval_seconds": PROCESS_SAMPLE_INTERVAL,
             "sample_count": self.samples,
             "query_error": self.error,
@@ -171,17 +177,24 @@ class ProcessTreeRecorder:
             if (
                 current is not None
                 and current["pgid"] == item["pgid"]
-                and current["comm"] == item["comm"]
+                and current["start_identity"] == item["start_identity"]
             ):
                 groups.add(int(item["pgid"]))
         return sorted(groups)
 
-    def signal_active_groups(self, signum: int, only: set[int] | None = None) -> list[int]:
+    def signal_active_groups(
+        self,
+        signum: int,
+        only: set[int] | None = None,
+        exclude: set[int] | None = None,
+    ) -> list[int]:
         groups = self.active_process_groups()
         if groups is None:
             return []
         if only is not None:
             groups = [pgid for pgid in groups if pgid in only]
+        if exclude is not None:
+            groups = [pgid for pgid in groups if pgid not in exclude]
         for pgid in groups:
             if not signal_process_group(pgid, signum):
                 self.error = self.error or f"permission denied signalling observed process group {pgid}"
@@ -189,6 +202,9 @@ class ProcessTreeRecorder:
         return groups
 
     def write_receipt(self) -> None:
+        failure_marker = os.environ.get("REX_PR0_FIXTURE_RECEIPT_FAILURE_MARKER")
+        if failure_marker and Path(failure_marker).exists():
+            raise OSError("injected process-tree receipt write failure")
         payload = json.dumps(self.snapshot(), sort_keys=True, indent=2) + "\n"
         temporary = self.receipt_path.with_suffix(".json.tmp")
         temporary.write_text(payload, encoding="utf-8")
@@ -220,6 +236,8 @@ def build_command(args: argparse.Namespace, prompt: str) -> list[str]:
         base = [
             args.cli,
             "--no-daemon",
+            "--config",
+            f"developer_instructions={json.dumps(args.role_contract.read_text(encoding='utf-8'))}",
         ]
         if args.codex_approve_for_me:
             base.append("--approve-for-me")
@@ -227,7 +245,7 @@ def build_command(args: argparse.Namespace, prompt: str) -> list[str]:
         if args.resume:
             base += ["resume", args.resume]
         base += ["--json", "--output-schema", str(args.schema.resolve())]
-        base += [args.role_contract.read_text(encoding="utf-8") + "\n\n" + prompt]
+        base += [prompt]
         return base
     base = [args.cli]
     if args.resume:
@@ -247,6 +265,29 @@ def build_command(args: argparse.Namespace, prompt: str) -> list[str]:
         prompt,
     ]
     return base
+
+
+def stop_after_runner_error(process: subprocess.Popen[bytes], recorder: ProcessTreeRecorder) -> None:
+    try:
+        recorder.observe()
+    except OSError:
+        pass
+    if process.poll() is None:
+        process.send_signal(signal.SIGINT)
+    recorder.signal_active_groups(signal.SIGINT, exclude={process.pid})
+    try:
+        process.wait(timeout=PROCESS_GROUP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        if process.poll() is None:
+            process.terminate()
+        recorder.signal_active_groups(signal.SIGTERM, exclude={process.pid})
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            if process.poll() is None:
+                process.kill()
+            recorder.signal_active_groups(signal.SIGKILL, exclude={process.pid})
+            process.wait(timeout=1)
 
 
 def main() -> int:
@@ -289,7 +330,10 @@ def main() -> int:
     env = os.environ.copy()
     guard_path = str(FIXTURE_DIR / "guards" / "bin")
     env["PATH"] = guard_path + os.pathsep + env.get("PATH", "")
-    env["REX_PROJECTS_PROBE_GUARD_LOG"] = str(artifacts / "guard-events.log")
+    guard_log = workspace / ".rex-projects-guard-events.log"
+    guard_log.unlink(missing_ok=True)
+    guard_log.touch(mode=0o600)
+    env["REX_PROJECTS_PROBE_GUARD_LOG"] = str(guard_log)
 
     started = time.monotonic()
     signal.signal(signal.SIGINT, remember_signal)
@@ -316,58 +360,59 @@ def main() -> int:
             preexec_fn=os.setpgrp,
         )
         recorder = ProcessTreeRecorder(process.pid, started, artifacts / "process-tree.json")
-        recorder.observe()
-        deadline = started + args.timeout_seconds
-        while process.poll() is None:
+        try:
             recorder.observe()
-            if pending_signal is not None:
-                cancelled = True
-                received_signal = pending_signal
-                # Treat block shutdown as an agent interruption. The provider
-                # gets SIGINT first even if Rex stopped this wrapper with HUP
-                # or TERM. Tool processes in distinct groups get fallback
-                # signals only after an identity-checked PID/PGID observation.
-                if process.poll() is None:
-                    process.send_signal(signal.SIGINT)
-                recorder.signal_active_groups(signal.SIGINT, only={process.pid})
-                if not wait_for_tracked_groups_exit(PROCESS_GROUP_GRACE_SECONDS, recorder):
-                    forced_kill = True
+            deadline = started + args.timeout_seconds
+            while process.poll() is None:
+                recorder.observe()
+                if pending_signal is not None:
+                    cancelled = True
+                    received_signal = pending_signal
+                    if process.poll() is None:
+                        process.send_signal(signal.SIGINT)
+                    recorder.signal_active_groups(signal.SIGINT, exclude={process.pid})
+                    if not wait_for_tracked_groups_exit(PROCESS_GROUP_GRACE_SECONDS, recorder):
+                        forced_kill = True
+                        if process.poll() is None:
+                            process.terminate()
+                        recorder.signal_active_groups(signal.SIGTERM, exclude={process.pid})
+                        if not wait_for_tracked_groups_exit(1, recorder):
+                            if process.poll() is None:
+                                process.kill()
+                            recorder.signal_active_groups(signal.SIGKILL, exclude={process.pid})
+                            wait_for_tracked_groups_exit(1, recorder)
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
                     if process.poll() is None:
                         process.terminate()
-                    recorder.signal_active_groups(signal.SIGTERM)
-                    if not wait_for_tracked_groups_exit(1, recorder):
+                    recorder.signal_active_groups(signal.SIGTERM, exclude={process.pid})
+                    if not wait_for_tracked_groups_exit(PROCESS_GROUP_GRACE_SECONDS, recorder):
+                        forced_kill = True
                         if process.poll() is None:
                             process.kill()
-                        recorder.signal_active_groups(signal.SIGKILL)
+                        recorder.signal_active_groups(signal.SIGKILL, exclude={process.pid})
                         wait_for_tracked_groups_exit(1, recorder)
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                if process.poll() is None:
-                    process.terminate()
-                recorder.signal_active_groups(signal.SIGTERM)
+                    break
+                time.sleep(PROCESS_SAMPLE_INTERVAL)
+            process.wait(timeout=1)
+            leftover_groups = recorder.active_process_groups()
+            if leftover_groups:
+                recorder.signal_active_groups(signal.SIGTERM, exclude={process.pid})
                 if not wait_for_tracked_groups_exit(PROCESS_GROUP_GRACE_SECONDS, recorder):
                     forced_kill = True
-                    if process.poll() is None:
-                        process.kill()
-                    recorder.signal_active_groups(signal.SIGKILL)
+                    recorder.signal_active_groups(signal.SIGKILL, exclude={process.pid})
                     wait_for_tracked_groups_exit(1, recorder)
-                break
-            time.sleep(PROCESS_SAMPLE_INTERVAL)
-        process.wait()
-        # A provider can exit while a reparented tool/MCP child remains in the
-        # owned group. A finite turn owns its entire child group.
-        leftover_groups = recorder.active_process_groups()
-        if leftover_groups:
-            recorder.signal_active_groups(signal.SIGTERM)
-            if not wait_for_tracked_groups_exit(PROCESS_GROUP_GRACE_SECONDS, recorder):
-                forced_kill = True
-                recorder.signal_active_groups(signal.SIGKILL)
-                wait_for_tracked_groups_exit(1, recorder)
-        recorder.observe()
-        exit_code = 124 if timed_out else (128 + received_signal if cancelled and received_signal else process.returncode)
+            recorder.observe()
+            exit_code = 124 if timed_out else (128 + received_signal if cancelled and received_signal else process.returncode)
+        except BaseException:
+            stop_after_runner_error(process, recorder)
+            raise
 
     stdout_text = (artifacts / "stdout.raw").read_text(encoding="utf-8", errors="replace")
+    if guard_log.exists():
+        shutil.copyfile(guard_log, artifacts / "guard-events.log")
+        os.chmod(artifacts / "guard-events.log", 0o600)
     session_id = args.resume or find_session_id(args.provider, stdout_text)
     process_groups_after_exit = recorder.active_process_groups() if recorder is not None else None
     process_tree = recorder.snapshot(provider_exited=True) if recorder is not None else None

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -146,6 +147,7 @@ def main() -> int:
     transcripts.mkdir(exist_ok=True)
     rex = Rex(args.server, args.timeout_seconds, transcripts)
     created_session: str | None = None
+    session_label: str | None = None
     cleanup_error: str | None = None
     receipt: dict[str, Any] = {
         "source_sha": args.source_sha,
@@ -168,10 +170,13 @@ def main() -> int:
             require(whoami.get("instance_id") == args.expected_instance_id,
                     "connected Rex instance does not match --expected-instance-id")
 
+        nonce = secrets.token_hex(8)
+        session_label = f"rex-projects-pr0-lifecycle-{nonce}"
         exact_args = ["space value", 'quote"value', "semi;literal", "dollar$(literal)"]
         argv_receipt = args.artifacts / "argv-receipt.json"
+        argv_receipt.unlink(missing_ok=True)
         initial_layout = {
-            "label": "rex-projects-pr0-lifecycle",
+            "label": session_label,
             "initial_windows": [{
                 "window_label": "PR0 lifecycle fixture",
                 "layout": {
@@ -229,7 +234,7 @@ def main() -> int:
                         "login": False,
                         "command": [sys.executable, str(FIXTURES / "wait_probe.py"),
                                     "--ready-file", str(ready_file), "--stop-file", str(stop_file),
-                                    "--timeout-seconds", "20"],
+                                    "--timeout-seconds", str(max(20, args.hold_seconds + args.ready_timeout_seconds + 10))],
                         "cwd": str(args.artifacts),
                         "exit": {"on_completion": False},
                     },
@@ -389,6 +394,20 @@ def main() -> int:
     except (ProbeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
     finally:
+        if created_session is None and session_label is not None:
+            try:
+                listing = json.loads(rex.call("ls", "--json").stdout)
+                sessions = listing.get("sessions", []) if isinstance(listing, dict) else listing
+                matches = [item for item in sessions if item.get("label") == session_label]
+                if len(matches) == 1 and isinstance(matches[0].get("session_id"), str):
+                    created_session = matches[0]["session_id"]
+                    receipt.setdefault("cleanup", {})["reconciled_after_lost_create_reply"] = True
+                elif matches:
+                    cleanup_error = f"ambiguous fixture session label matched {len(matches)} sessions"
+                else:
+                    receipt.setdefault("cleanup", {})["session_absent"] = True
+            except (ProbeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
+                cleanup_error = f"could not reconcile fixture session after create: {type(error).__name__}: {error}"
         if created_session is not None:
             try:
                 rex.call("kill", created_session, check=False)

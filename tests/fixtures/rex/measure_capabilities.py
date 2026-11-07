@@ -35,31 +35,76 @@ def main() -> int:
     if whoami.get("endpoint") != args.server:
         raise SystemExit("refusing to measure a server other than the requested endpoint")
 
-    rows: list[dict[str, Any]] = []
-    for sample in range(1, args.samples + 1):
-        started = time.perf_counter_ns()
-        run = subprocess.run(
-            ["rex", "--server", args.server, "--autostart=false", "api", "describe",
-             "session.new_window", "--json"],
+    expected_identity = (whoami.get("instance_id"), whoami.get("rex_version"))
+    if not all(expected_identity):
+        raise SystemExit("whoami did not report a stable instance ID and Rex version")
+
+    def identity() -> tuple[str | None, str | None]:
+        check = subprocess.run(
+            ["rex", "--server", args.server, "--autostart=false", "whoami", "--json"],
             capture_output=True, text=True, timeout=10, check=False,
         )
+        if check.returncode != 0:
+            raise RuntimeError(f"whoami failed with exit {check.returncode}")
+        value = json.loads(check.stdout)
+        if value.get("endpoint") != args.server:
+            raise RuntimeError("server endpoint changed during measurement")
+        return value.get("instance_id"), value.get("rex_version")
+
+    rows: list[dict[str, Any]] = []
+    identity_stable = True
+    for sample in range(1, args.samples + 1):
+        try:
+            identity_before = identity()
+        except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            identity_stable = False
+            rows.append({"sample": sample, "wall_ms": args.budget_ms * 2,
+                         "exit_code": None, "correct_response": False,
+                         "error": f"pre-sample identity check failed: {type(error).__name__}: {error}"})
+            break
+        if identity_before != expected_identity:
+            identity_stable = False
+            rows.append({"sample": sample, "wall_ms": 0, "exit_code": None,
+                         "correct_response": False, "error": "Rex identity changed before sample"})
+            break
+        started = time.perf_counter_ns()
+        try:
+            run = subprocess.run(
+                ["rex", "--server", args.server, "--autostart=false", "api", "describe",
+                 "session.new_window", "--json"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            stdout, stderr, exit_code = run.stdout, run.stderr, run.returncode
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout or ""
+            stderr = error.stderr.decode(errors="replace") if isinstance(error.stderr, bytes) else error.stderr or ""
+            exit_code = None
         elapsed = (time.perf_counter_ns() - started) / 1_000_000
         try:
-            value = json.loads(run.stdout)
+            value = json.loads(stdout)
             correct = (
-                run.returncode == 0
+                exit_code == 0
                 and value["name"] == "session.new_window"
                 and "session_id" in value["input_schema"]["required"]
             )
         except (json.JSONDecodeError, KeyError, TypeError):
             correct = False
-        rows.append({
+        row = {
             "sample": sample,
             "wall_ms": elapsed,
-            "exit_code": run.returncode,
+            "exit_code": exit_code,
             "correct_response": correct,
-            "stderr": run.stderr.strip(),
-        })
+            "stderr": stderr.strip(),
+        }
+        try:
+            identity_after = identity()
+            if identity_after != expected_identity:
+                identity_stable = False
+                row["identity_error"] = "Rex identity changed during sample"
+        except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            identity_stable = False
+            row["identity_error"] = f"post-sample identity check failed: {type(error).__name__}: {error}"
+        rows.append(row)
 
     times = sorted(row["wall_ms"] for row in rows)
     p95 = times[math.ceil(0.95 * len(times)) - 1]
@@ -70,6 +115,7 @@ def main() -> int:
             "instance_id": whoami.get("instance_id"),
             "rex_version": whoami.get("rex_version"),
         },
+        "server_identity_stable_throughout_sampling": identity_stable,
         "operation": "rex api describe session.new_window --json",
         "samples": rows,
         "sample_count": len(rows),
@@ -79,7 +125,7 @@ def main() -> int:
         "p95_ms": p95,
         "range_ms": [min(times), max(times)],
         "budget_ms": args.budget_ms,
-        "budget_pass": p95 <= args.budget_ms and all(row["correct_response"] for row in rows),
+        "budget_pass": identity_stable and p95 <= args.budget_ms and all(row["correct_response"] for row in rows),
         "machine": {"cpu_count": os.cpu_count(), "load_average": os.getloadavg()},
         "scope": "Read-only local Rex capability query; not factory runtime throughput or an improvement comparison.",
     }

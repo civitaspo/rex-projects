@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import secrets
-import select
+import queue
 import subprocess
 import sys
 import threading
@@ -62,6 +62,57 @@ def first_matching_session(rex: Rex, label: str) -> dict[str, str] | None:
     return matches[0] if matches else None
 
 
+def event_fields(value: Any) -> tuple[str | None, str | None, str | None]:
+    """Return event type, session ID, and label from Rex's JSON event envelope."""
+    found_type = found_session = found_label = None
+
+    def visit(item: Any) -> None:
+        nonlocal found_type, found_session, found_label
+        if isinstance(item, dict):
+            if isinstance(item.get("type"), str) and item["type"] == "session_label_changed":
+                found_type = item["type"]
+            for key in ("session_id", "label"):
+                candidate = item.get(key)
+                if isinstance(candidate, str):
+                    if key == "session_id":
+                        found_session = candidate
+                    else:
+                        found_label = candidate
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return found_type, found_session, found_label
+
+
+def stop_stream(stream: subprocess.Popen[str] | None, reader: threading.Thread | None) -> dict[str, Any]:
+    """Stop and reap the event CLI, even when the scenario fails early."""
+    if stream is None:
+        return {"started": False, "reaped": True, "pipes_closed": True}
+    if stream.poll() is None:
+        stream.terminate()
+        try:
+            stream.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            stream.kill()
+            stream.wait(timeout=2)
+    for pipe in (stream.stdout, stream.stderr):
+        if pipe is not None and not pipe.closed:
+            pipe.close()
+    if reader is not None:
+        reader.join(timeout=2)
+    return {
+        "started": True,
+        "exit_code": stream.returncode,
+        "reaped": stream.poll() is not None,
+        "reader_stopped": reader is None or not reader.is_alive(),
+        "pipes_closed": all(pipe is None or pipe.closed for pipe in (stream.stdout, stream.stderr)),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True, help="Explicit disposable Rex server endpoint")
@@ -79,6 +130,9 @@ def main() -> int:
     lost_reply_label = f"rex-projects-pr0-reply-{nonce}"
     session_id: str | None = None
     client: subprocess.Popen[bytes] | None = None
+    stream: subprocess.Popen[str] | None = None
+    stream_reader: threading.Thread | None = None
+    stream_events: queue.Queue[Any] = queue.Queue(maxsize=256)
     receipt: dict[str, Any] = {"source_sha": args.source_sha, "scenarios": {}}
     try:
         whoami = json.loads(rex.call("whoami", "--json").stdout)
@@ -160,11 +214,56 @@ def main() -> int:
             ["rex", "--server", args.server, "--autostart=false", "--timeout",
              f"{args.timeout_seconds}s", "events", "--session", session_id, "--json"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
         )
-        require(stream.stdout is not None and stream.stderr is not None, "missing event stream pipes")
-        time.sleep(0.2)
+        require(stream.stdout is not None, "missing event stream pipe")
+
+        def read_events() -> None:
+            try:
+                for line in stream.stdout:
+                    try:
+                        stream_events.put(json.loads(line), timeout=args.timeout_seconds)
+                    except json.JSONDecodeError as error:
+                        stream_events.put(error)
+                        return
+                    except queue.Full:
+                        return
+            except (OSError, ValueError) as error:
+                try:
+                    stream_events.put(error, timeout=1)
+                except queue.Full:
+                    pass
+
+        stream_reader = threading.Thread(target=read_events, daemon=True)
+        stream_reader.start()
+
+        # A successful CLI connection is not proof that event delivery is active.
+        # Repeatedly mutate only this fixture-owned session until its uniquely
+        # labelled change is observed on the stream.
+        readiness_label = f"rex-projects-ready-{nonce}"
+        readiness_deadline = time.monotonic() + args.timeout_seconds
+        ready = False
+        attempt = 0
+        while time.monotonic() < readiness_deadline and not ready:
+            attempt += 1
+            candidate = f"{readiness_label}-{attempt}"
+            rex.api("session.set_label", {"session_id": session_id, "label": candidate})
+            attempt_deadline = min(readiness_deadline, time.monotonic() + 0.25)
+            while time.monotonic() < attempt_deadline:
+                try:
+                    item = stream_events.get(timeout=min(0.05, attempt_deadline - time.monotonic()))
+                except queue.Empty:
+                    if stream.poll() is not None:
+                        raise ProbeError("event stream exited before positive readiness")
+                    continue
+                if isinstance(item, BaseException):
+                    raise ProbeError(f"event stream reader failed: {item}")
+                event_kind, event_session, event_label = event_fields(item)
+                if event_kind == "session_label_changed" and event_session == session_id and event_label == candidate:
+                    ready = True
+                    break
+        require(ready, "event stream did not observe a uniquely labelled session rename before timeout")
         require(stream.poll() is None, "event stream exited before the server-side mutation")
 
         added_label = f"after-disconnect-{nonce}"
@@ -187,24 +286,23 @@ def main() -> int:
         event_type = None
         event_deadline = time.monotonic() + args.timeout_seconds
         while time.monotonic() < event_deadline:
-            readable, _, _ = select.select([stream.stdout], [], [], max(0, event_deadline - time.monotonic()))
-            require(readable, "event stream did not receive the created-window event")
-            event_line = stream.stdout.readline()
-            require(event_line, "event stream ended before the created-window event")
             try:
-                event = json.loads(event_line)
-            except json.JSONDecodeError as error:
-                raise ProbeError("event stream produced invalid JSON") from error
+                event = stream_events.get(timeout=min(0.1, event_deadline - time.monotonic()))
+            except queue.Empty:
+                if stream.poll() is not None:
+                    raise ProbeError("event stream ended before the created-window event")
+                continue
+            if isinstance(event, BaseException):
+                raise ProbeError(f"event stream reader failed: {event}")
             identifiers = json.dumps(event)
             if any(identifier and identifier in identifiers for identifier in expected_ids):
                 event_type = event.get("payload", {}).get("event", {}).get("type")
                 break
         require(event_type is not None, "event stream ended without the new resource identity")
         require(stream.poll() is None, "event stream exited before the explicit disconnect")
-        stream.terminate()
-        stream.wait(timeout=3)
-        stream.stdout.close()
-        stream.stderr.close()
+        stream_cleanup = stop_stream(stream, stream_reader)
+        require(stream_cleanup["reaped"] and stream_cleanup["reader_stopped"] and stream_cleanup["pipes_closed"],
+                f"event stream cleanup failed: {stream_cleanup!r}")
 
         fresh_blocks = rex.api("session.list_blocks", {"session_id": session_id}).get("blocks", [])
         matching = [item for item in fresh_blocks if item.get("label") == added_label]
@@ -216,6 +314,7 @@ def main() -> int:
             "created_resource_event_received": True,
             "event_type": event_type,
             "stream_exit_code": stream.returncode,
+            "stream_cleanup": stream_cleanup,
             "fresh_listing_found_block": True,
             "block_id": matching[0]["block_id"],
             "original_session_preserved": True,
@@ -223,6 +322,15 @@ def main() -> int:
     except (ProbeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
     finally:
+        if stream is not None:
+            try:
+                stream_cleanup = stop_stream(stream, stream_reader)
+                receipt.setdefault("cleanup", {})["event_stream"] = stream_cleanup
+            except (OSError, subprocess.TimeoutExpired) as error:
+                receipt.setdefault("cleanup", {})["event_stream"] = {
+                    "error": f"{type(error).__name__}: {error}",
+                    "reaped": stream.poll() is not None,
+                }
         if client is not None and client.poll() is None:
             client.terminate()
             try:
@@ -231,15 +339,32 @@ def main() -> int:
                 client.kill()
                 client.wait(timeout=2)
         if session_id is None:
-            possible = first_matching_session(rex, lost_reply_label)
-            if possible is not None:
-                session_id = possible["session_id"]
+            try:
+                possible = first_matching_session(rex, lost_reply_label)
+                if possible is not None:
+                    session_id = possible["session_id"]
+            except (ProbeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
+                receipt.setdefault("cleanup", {})["session_reconciliation_error"] = (
+                    f"{type(error).__name__}: {error}"
+                )
         if session_id is not None:
-            result = rex.call("kill", session_id, check=False)
-            receipt["cleanup"] = {"session_id": session_id, "exit_code": result.returncode}
-            after = first_matching_session(rex, lost_reply_label)
-            receipt["cleanup"]["session_absent"] = after is None
-        (args.artifacts / "result.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+            try:
+                # The readiness probe temporarily renames the fixture session.
+                # Restore its discoverable label before teardown and verify
+                # absence by that original unique label after the kill.
+                rex.api("session.set_label", {"session_id": session_id, "label": lost_reply_label})
+                result = rex.call("kill", session_id, check=False)
+                receipt.setdefault("cleanup", {}).update({"session_id": session_id, "exit_code": result.returncode})
+                if result.returncode != 0:
+                    receipt["cleanup"]["session_cleanup_error"] = result.stderr.strip()
+                after = first_matching_session(rex, lost_reply_label)
+                receipt["cleanup"]["session_absent"] = after is None
+            except (ProbeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
+                receipt.setdefault("cleanup", {})["session_cleanup_error"] = f"{type(error).__name__}: {error}"
+        try:
+            (args.artifacts / "result.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        except OSError as error:
+            receipt.setdefault("cleanup", {})["receipt_write_error"] = f"{type(error).__name__}: {error}"
 
     print(json.dumps(receipt, indent=2))
     return 0 if "error" not in receipt and receipt.get("cleanup", {}).get("session_absent") is True else 1
