@@ -604,6 +604,17 @@ impl TicketCommandAdapter {
                 "adapter status map must contain exactly seven normalized statuses".into(),
             ));
         }
+        let native_statuses = description.status_values.values().collect::<BTreeSet<_>>();
+        if native_statuses.len() != 7
+            || description
+                .status_values
+                .values()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err(TicketAdapterError::Protocol(
+                "adapter status map must contain seven distinct nonempty native values".into(),
+            ));
+        }
         if !description
             .capabilities
             .visibility_grace_seconds

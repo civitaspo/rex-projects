@@ -49,7 +49,12 @@ fn adapter(
         Duration::from_millis(100),
     )
     .unwrap();
-    adapter.describe(req("initial-describe")).unwrap();
+    if !matches!(
+        mutation,
+        Some("missing-status-map" | "duplicate-status-map")
+    ) {
+        adapter.describe(req("initial-describe")).unwrap();
+    }
     adapter
 }
 fn req(value: &str) -> RequestId {
@@ -130,6 +135,18 @@ fn unrelated_native_shapes_normalize_through_the_external_command() {
         assert_eq!(got.ticket.title, "Normalized title");
         assert_eq!(got.ticket.status.value, NormalizedTicketStatus::Ready);
         assert_eq!(got.ticket.revision.as_deref(), Some("rev-1"));
+    }
+}
+
+#[test]
+fn adapter_describe_rejects_missing_or_duplicate_native_status_mappings() {
+    for mutation in ["missing-status-map", "duplicate-status-map"] {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter(&dir, "record", None, 0, Some(mutation));
+        assert!(matches!(
+            adapter.describe(req("invalid-status-map")),
+            Err(TicketAdapterError::Protocol(_))
+        ));
     }
 }
 

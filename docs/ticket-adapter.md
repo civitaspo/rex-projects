@@ -10,15 +10,6 @@ environment_allow = ["PATH"]
 read_timeout_seconds = 30
 write_timeout_seconds = 120
 
-[adapters.tickets.status_values]
-triage = "Needs sorting"
-backlog = "Queued"
-ready = "Open"
-in_progress = "Doing"
-in_review = "Review"
-done = "Complete"
-canceled = "Dropped"
-
 [projects.example]
 mode = "goal"
 ticket_adapter = "tickets"
@@ -38,9 +29,9 @@ cargo run --example export_ticket_adapter_schema
 
 Every request and response has `schema_version: 1` and the same `request_id`. A response contains exactly one of `result` or `error`. Errors use normalized codes such as `not_found`, `unauthorized`, `forbidden`, `conflict`, `rate_limited`, `unavailable`, `unsupported`, and `invalid_request`. Provider-specific details belong in `extensions` or structured error details.
 
-The wrapper must implement `adapter.describe` and declare its stable `ticket_namespace`, supported schema versions, normalized status mapping, and actual capabilities. rex-projects pins the namespace after the first successful description and rejects results from another namespace. Ticket `scope` values are opaque string key/value pairs. The wrapper interprets them for its tracker and must apply them to every read and write; the core does not assume fields such as team, board, or project.
+The wrapper must implement `adapter.describe` and declare its stable `ticket_namespace`, supported schema versions, native labels for the seven normalized statuses, and actual capabilities. Keep native status mappings in the wrapper's own config or argv; rex-projects does not collect or pass them. rex-projects pins the namespace after the first successful description and rejects results from another namespace. Ticket `scope` values are opaque string key/value pairs. The wrapper interprets them for its tracker and must apply them to every read and write; the core does not assume fields such as team, board, or project.
 
-The protocol's normalized status values are `triage`, `backlog`, `ready`, `in_progress`, `in_review`, `done`, and `canceled`. `status_values` maps these names to the wrapper's native status labels. Unknown native statuses must not be guessed into a normalized state.
+The protocol's normalized status values are `triage`, `backlog`, `ready`, `in_progress`, `in_review`, `done`, and `canceled`. The wrapper maps these names to its native status labels and returns the map from `adapter.describe`. Unknown native statuses must not be guessed into a normalized state.
 
 The wrapper reports revision support and whether writes are conditional. Revisions are opaque strings. If the tracker lacks compare-and-set, the wrapper can re-read before mutation, but must report `conditional_revision_mutation: false`; that read does not prevent a concurrent update.
 

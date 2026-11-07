@@ -4,15 +4,6 @@ schema_version = 1
 kind = "command"
 command = ["/absolute/path/to/ticket-adapter"]
 
-[adapters.tickets.status_values]
-triage = "Triage"
-backlog = "Backlog"
-ready = "ToDo"
-in_progress = "In Progress"
-in_review = "In Review"
-done = "Done"
-canceled = "Canceled"
-
 [repositories.example]
 clone_url = "https://example.invalid/team/example.git"
 base_branch = "main"

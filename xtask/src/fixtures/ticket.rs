@@ -532,6 +532,12 @@ fn mutate(result: &mut Value, mutation: &str, method: &str) {
         ("operation-ticket-id", "operation.find") => {
             result["matches"][0]["ticket_id"] = "UNRELATED-TICKET".into()
         }
+        ("missing-status-map", "adapter.describe") => {
+            result["status_values"].as_object_mut().unwrap().remove("canceled");
+        }
+        ("duplicate-status-map", "adapter.describe") => {
+            result["status_values"]["canceled"] = result["status_values"]["triage"].clone();
+        }
         _ => {}
     }
 }
