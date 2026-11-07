@@ -190,6 +190,15 @@ pub struct PullRequestPublication<'a> {
     pub intent: &'a PullRequestPublicationIntent,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPublicationObservation {
+    pub remote_head: Option<String>,
+    pub pull_requests: crate::delivery_forge::ObservationCapability<
+        Vec<crate::delivery_forge::ObservedPullRequest>,
+    >,
+}
+
 #[derive(Debug)]
 pub enum DeliveryError {
     Invalid(String),
@@ -686,6 +695,31 @@ impl RepositoryDelivery {
         let head = head.trim().to_owned();
         validate_git_sha(&head)?;
         Ok(head)
+    }
+
+    /// Observe the exact owned branch and matching PR timeline through the configured Git and
+    /// `gh` CLI identities. A failed branch read is an error; forge capability gaps stay typed.
+    pub fn observe_publication(
+        &self,
+        publisher: &impl PullRequestPublisher,
+        work: &PreparedRepositoryWork,
+        intent: &PullRequestPublicationIntent,
+    ) -> Result<RepositoryPublicationObservation, DeliveryError> {
+        if work.identity.repository_id != intent.repository_id
+            || work.worktree.branch != intent.source_branch
+        {
+            return Err(DeliveryError::Conflict(
+                "publication observation does not match the owned worktree".into(),
+            ));
+        }
+        let remote_head = self.remote_branch_head(&work.worktree.path, &work.worktree.branch)?;
+        let forge = publisher
+            .observe(intent)
+            .map_err(|error| DeliveryError::Unknown(error.to_string()))?;
+        Ok(RepositoryPublicationObservation {
+            remote_head,
+            pull_requests: forge.pull_requests,
+        })
     }
 
     /// Validate publication identity and gate evidence before delegating to the forge adapter.
@@ -1257,6 +1291,82 @@ impl RepositoryDeliveryEffects {
         }
     }
 
+    /// Resolve one durable publication receipt to its fresh configured PR observation. The
+    /// supplied receipt must be read from the succeeded effects journal by its caller.
+    pub fn resolve_current_pull_request(
+        &self,
+        receipt: &ImplementationPublicationReceipt,
+    ) -> Result<crate::delivery_forge::ObservedPullRequest, String> {
+        let repository = self.repository(&receipt.repository_id)?;
+        if repository.forge != "github"
+            || receipt.pull_request.repository_id != receipt.repository_id
+            || receipt.push.repository_id != receipt.repository_id
+            || receipt.hook_gate.repository_id != receipt.repository_id
+            || receipt.pull_request.source_branch != receipt.push.branch
+            || receipt.pull_request.source_head != receipt.push.pushed_head
+            || receipt.pull_request.source_head != receipt.commit.head()
+            || receipt.pull_request.base_branch != repository.base_branch
+        {
+            return Err(
+                "persisted publication receipt does not match current repository policy".into(),
+            );
+        }
+        let observation = self
+            .publisher
+            .observe_matching(
+                &repository.clone_url,
+                &receipt.pull_request.source_branch,
+                &repository.base_branch,
+            )
+            .map_err(|error| error.to_string())?;
+        let crate::delivery_forge::ObservationCapability::Known(pull_requests) =
+            observation.pull_requests
+        else {
+            return Err("current pull-request observation capability is unknown".into());
+        };
+        let matching = pull_requests
+            .into_iter()
+            .filter(|pull| pull.number == receipt.pull_request.number)
+            .collect::<Vec<_>>();
+        let [pull] = matching.as_slice() else {
+            return Err(
+                "persisted pull request is missing or ambiguous in current observation".into(),
+            );
+        };
+        let body_digest = pull.body.as_deref().map(|body| sha256_hex(body.as_bytes()));
+        if pull.node_id != receipt.pull_request.node_id
+            || pull.source_branch != receipt.pull_request.source_branch
+            || pull.source_head != receipt.pull_request.source_head
+            || pull.base_branch != receipt.pull_request.base_branch
+            || pull.title != receipt.pull_request.title
+            || body_digest.as_deref() != Some(receipt.pull_request.body_digest.as_str())
+        {
+            return Err(
+                "current pull request differs from its succeeded publication receipt".into(),
+            );
+        }
+        Ok(pull.clone())
+    }
+
+    /// Fresh, paginated view used by human review and publication reconciliation.
+    pub fn observe_current_pull_requests(
+        &self,
+        repository_id: &RepositoryId,
+        source_branch: &str,
+    ) -> Result<crate::delivery_forge::GitHubPublicationObservation, String> {
+        let repository = self.repository(repository_id)?;
+        if repository.forge != "github" {
+            return Err("fresh pull-request observation is supported only for GitHub".into());
+        }
+        self.publisher
+            .observe_matching(
+                &repository.clone_url,
+                source_branch,
+                &repository.base_branch,
+            )
+            .map_err(|error| error.to_string())
+    }
+
     fn prepare_worktrees(
         &self,
         request: &EffectRequest,
@@ -1407,6 +1517,7 @@ impl RepositoryDeliveryEffects {
         mode: EffectMode,
         request: &EffectRequest,
         store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
         now_unix: i64,
     ) -> Result<EffectObservation, String> {
         let payload: PublishImplementationEffectPayload = decode_effect_payload(request)?;
@@ -1429,6 +1540,14 @@ impl RepositoryDeliveryEffects {
                 payload.commit_mode,
             )
             .map_err(|error| error.to_string())?;
+        store.assert_publication_unblocked(
+            &crate::store::publication_monitor::PublicationResource {
+                project_id: request.intent.project_id.clone(),
+                ticket_run_id: payload.ticket_run_id.clone(),
+                repository_id: payload.repository_id.clone(),
+                branch: work.worktree.branch.clone(),
+            },
+        )?;
         let commit = match (&payload.commit, payload.commit_mode, mode) {
             (
                 WorkerDeliveryCommit::Native {
@@ -1569,6 +1688,105 @@ impl RepositoryDeliveryEffects {
                 .to_string(),
             });
         };
+        let pr_operation = derived_operation_id(
+            &request.intent.operation_id,
+            &payload.repository_id,
+            payload.work_node_id.as_str(),
+            "pull-request",
+        )?;
+        let publication_intent = PullRequestPublicationIntent {
+            operation_id: pr_operation,
+            repository_id: payload.repository_id.clone(),
+            clone_url: repository_config.clone_url.clone(),
+            source_branch: work.worktree.branch.clone(),
+            source_head: commit.head().to_owned(),
+            base_branch: repository_config.base_branch.clone(),
+            title: payload.pull_request.title.clone(),
+            body: payload.pull_request.body.clone(),
+            update_target: payload.pull_request.update_target.clone(),
+        };
+        let before_publication = self
+            .delivery
+            .observe_publication(&self.publisher, &work, &publication_intent)
+            .map_err(|error| error.to_string())?;
+        let expected_remote = if mode == EffectMode::Reconcile {
+            Some(commit.head())
+        } else {
+            payload.expected_remote_head.as_deref()
+        };
+        let remote_is_reconciled = before_publication.remote_head.as_deref() == expected_remote
+            || (mode == EffectMode::Reconcile
+                && before_publication.remote_head.as_deref()
+                    == payload.expected_remote_head.as_deref());
+        let pull_requests_are_reconciled = match &before_publication.pull_requests {
+            crate::delivery_forge::ObservationCapability::Unknown => {
+                return Err("GitHub PR and timeline observation capability is unknown".into());
+            }
+            crate::delivery_forge::ObservationCapability::Known(pull_requests) => {
+                if mode == EffectMode::Reconcile {
+                    pull_requests.len() <= 1
+                        && pull_requests.first().is_none_or(|pull| {
+                            !pull.merged
+                                && pull.state == "open"
+                                && pull.body.as_deref().is_some_and(|body| {
+                                    body.contains(&format!(
+                                        "<!-- rex-projects-operation:{} -->",
+                                        publication_intent.operation_id
+                                    ))
+                                })
+                                && pull.source_branch == publication_intent.source_branch
+                                && pull.source_head == publication_intent.source_head
+                                && pull.base_branch == publication_intent.base_branch
+                                && pull.title == publication_intent.title
+                                && pull.body.as_deref()
+                                    == Some(marked_body_for_monitor(&publication_intent).as_str())
+                                && matches!(
+                                    &pull.timeline,
+                                    crate::delivery_forge::ObservationCapability::Known(entries)
+                                        if entries.is_empty()
+                                )
+                        })
+                } else if let Some(target) = &publication_intent.update_target {
+                    pull_requests.len() == 1
+                        && pull_requests[0].number == target.number
+                        && !pull_requests[0].merged
+                        && pull_requests[0].state == "open"
+                        && pull_requests[0].source_head == target.expected_head
+                        && pull_requests[0].source_branch == publication_intent.source_branch
+                        && pull_requests[0].base_branch == publication_intent.base_branch
+                } else {
+                    pull_requests.is_empty()
+                }
+            }
+        };
+        if !remote_is_reconciled || !pull_requests_are_reconciled {
+            let facts = serde_json::json!({
+                "observed_remote_head": before_publication.remote_head,
+                "expected_remote_head": expected_remote,
+                "pull_requests": before_publication.pull_requests,
+                "host_effect_operation_id": request.intent.operation_id,
+                "publication_operation_id": publication_intent.operation_id,
+                "work_node_id": payload.work_node_id,
+            });
+            let facts_json = serde_json::to_vec(&facts).map_err(|error| error.to_string())?;
+            store
+                .record_publication_irregularity(
+                    owner_generation,
+                    &crate::store::publication_monitor::PublicationIrregularity {
+                        resource: crate::store::publication_monitor::PublicationResource {
+                            project_id: request.intent.project_id.clone(),
+                            ticket_run_id: payload.ticket_run_id.clone(),
+                            repository_id: payload.repository_id.clone(),
+                            branch: work.worktree.branch.clone(),
+                        },
+                        observation_digest: sha256_hex(&facts_json),
+                        observed_at_unix: now_unix,
+                        facts,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            return Err("unexpected external publication mutation paused this work node".into());
+        }
         if mode == EffectMode::Reconcile {
             let push = self
                 .delivery
@@ -1592,26 +1810,9 @@ impl RepositoryDeliveryEffects {
                     ),
                 );
             };
-            let pr_operation = derived_operation_id(
-                &request.intent.operation_id,
-                &payload.repository_id,
-                payload.work_node_id.as_str(),
-                "pull-request",
-            )?;
-            let intent = PullRequestPublicationIntent {
-                operation_id: pr_operation,
-                repository_id: payload.repository_id.clone(),
-                clone_url: repository_config.clone_url.clone(),
-                source_branch: work.worktree.branch.clone(),
-                source_head: commit.head().to_owned(),
-                base_branch: repository_config.base_branch.clone(),
-                title: payload.pull_request.title.clone(),
-                body: payload.pull_request.body.clone(),
-                update_target: payload.pull_request.update_target.clone(),
-            };
             if let Some(pull_request) = self
                 .publisher
-                .reconcile(&intent)
+                .reconcile(&publication_intent)
                 .map_err(|error| error.to_string())?
             {
                 return Ok(EffectObservation::Applied {
@@ -1637,7 +1838,9 @@ impl RepositoryDeliveryEffects {
                 "github_pull_request_search",
                 format!(
                     "no PR with operation marker {} for {}/{}",
-                    intent.operation_id, intent.source_branch, intent.base_branch
+                    publication_intent.operation_id,
+                    publication_intent.source_branch,
+                    publication_intent.base_branch
                 ),
             );
         }
@@ -1652,23 +1855,6 @@ impl RepositoryDeliveryEffects {
                 &hook_gate,
             )
             .map_err(|error| error.to_string())?;
-        let pr_operation = derived_operation_id(
-            &request.intent.operation_id,
-            &payload.repository_id,
-            payload.work_node_id.as_str(),
-            "pull-request",
-        )?;
-        let intent = PullRequestPublicationIntent {
-            operation_id: pr_operation,
-            repository_id: payload.repository_id.clone(),
-            clone_url: repository_config.clone_url.clone(),
-            source_branch: work.worktree.branch.clone(),
-            source_head: commit.head().to_owned(),
-            base_branch: repository_config.base_branch.clone(),
-            title: payload.pull_request.title.clone(),
-            body: payload.pull_request.body.clone(),
-            update_target: payload.pull_request.update_target.clone(),
-        };
         let pull_request = self
             .delivery
             .publish_pull_request(
@@ -1679,7 +1865,7 @@ impl RepositoryDeliveryEffects {
                     configuration_digest: &self.configuration_digest,
                     expected_head: commit.head(),
                     hook_gate: &hook_gate,
-                    intent: &intent,
+                    intent: &publication_intent,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -2083,6 +2269,14 @@ fn digest_json<T: Serialize>(value: &T) -> Result<String, String> {
     Ok(sha256_hex(&bytes))
 }
 
+fn marked_body_for_monitor(intent: &PullRequestPublicationIntent) -> String {
+    format!(
+        "{}\n\n<!-- rex-projects-operation:{} -->",
+        intent.body.trim_end(),
+        intent.operation_id.as_str()
+    )
+}
+
 pub struct PrepareWorktreesEffectHandler {
     effects: Arc<RepositoryDeliveryEffects>,
 }
@@ -2134,8 +2328,13 @@ impl EffectHandler for PublishImplementationEffectHandler {
         if let Err(error) = self.effects.validate_publish_payload(request, &payload) {
             return Ok(rejected_delivery_effect(error));
         }
-        self.effects
-            .publish_implementation(mode, request, context.store, context.now_unix)
+        self.effects.publish_implementation(
+            mode,
+            request,
+            context.store,
+            context.owner_generation,
+            context.now_unix,
+        )
     }
 }
 

@@ -18,6 +18,7 @@ const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const STDERR_TAIL_LIMIT: usize = 32 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_PR_LIST: usize = 100;
+const MAX_OBSERVATION_PAGES: usize = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +58,47 @@ pub struct PublishedPullRequest {
     pub operation_id: OperationId,
 }
 
+/// A complete current view of one matching PR and its paginated timeline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedPullRequest {
+    pub number: u64,
+    pub node_id: String,
+    pub url: String,
+    pub state: String,
+    pub merged: bool,
+    pub merged_at: Option<String>,
+    pub source_branch: String,
+    pub source_head: String,
+    pub base_branch: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub timeline: ObservationCapability<Vec<ObservedTimelineEntry>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedTimelineEntry {
+    pub event: String,
+    pub reference: String,
+    pub actor: Option<String>,
+    pub created_at: Option<String>,
+    pub body: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum ObservationCapability<T> {
+    Known(T),
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubPublicationObservation {
+    pub pull_requests: ObservationCapability<Vec<ObservedPullRequest>>,
+}
+
 #[derive(Debug)]
 pub enum PublicationError {
     Invalid(String),
@@ -90,6 +132,13 @@ pub trait PullRequestPublisher {
         &self,
         intent: &PullRequestPublicationIntent,
     ) -> Result<Option<PublishedPullRequest>, PublicationError>;
+
+    /// Read all matching PRs and timeline entries. Unsupported or failed read capabilities stay
+    /// explicitly unknown so callers never treat an empty partial response as proof of absence.
+    fn observe(
+        &self,
+        intent: &PullRequestPublicationIntent,
+    ) -> Result<GitHubPublicationObservation, PublicationError>;
 }
 
 pub struct GitHubPullRequestPublisher {
@@ -169,16 +218,88 @@ impl GitHubPullRequestPublisher {
         head: &str,
         base: &str,
     ) -> Result<Vec<ApiPullRequest>, PublicationError> {
-        let endpoint = format!(
-            "repos/{owner}/{repo}/pulls?state=all&head={owner}%3A{head}&base={base}&per_page={MAX_PR_LIST}"
-        );
-        let rows: Vec<ApiPullRequest> = self.api_json("GET", &endpoint, None)?;
-        if rows.len() == MAX_PR_LIST {
-            return Err(PublicationError::Conflict(
-                "GitHub PR search reached its page limit; refusing ambiguous reconciliation".into(),
-            ));
+        let mut result = Vec::new();
+        for page in 1..=MAX_OBSERVATION_PAGES {
+            let endpoint = format!(
+                "repos/{owner}/{repo}/pulls?state=all&head={owner}%3A{head}&base={base}&per_page={MAX_PR_LIST}&page={page}"
+            );
+            let rows: Vec<ApiPullRequest> = self.api_json("GET", &endpoint, None)?;
+            let done = rows.len() < MAX_PR_LIST;
+            result.extend(rows);
+            if done {
+                return Ok(result);
+            }
         }
-        Ok(rows)
+        Err(PublicationError::Conflict(
+            "GitHub PR search reached its page limit; refusing ambiguous reconciliation".into(),
+        ))
+    }
+
+    fn observe_timeline(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> ObservationCapability<Vec<ObservedTimelineEntry>> {
+        let mut result = Vec::new();
+        for page in 1..=MAX_OBSERVATION_PAGES {
+            let endpoint = format!(
+                "repos/{owner}/{repo}/issues/{number}/timeline?per_page={MAX_PR_LIST}&page={page}"
+            );
+            let rows: Vec<ApiTimelineEntry> = match self.api_json("GET", &endpoint, None) {
+                Ok(rows) => rows,
+                Err(_) => return ObservationCapability::Unknown,
+            };
+            let done = rows.len() < MAX_PR_LIST;
+            result.extend(rows.into_iter().map(Into::into));
+            if done {
+                return ObservationCapability::Known(result);
+            }
+        }
+        ObservationCapability::Unknown
+    }
+
+    /// Fresh read of all PRs matching one configured repository branch pair.
+    pub fn observe_matching(
+        &self,
+        clone_url: &str,
+        source_branch: &str,
+        base_branch: &str,
+    ) -> Result<GitHubPublicationObservation, PublicationError> {
+        validate_branch(source_branch)?;
+        validate_branch(base_branch)?;
+        let (owner, repo) = github_repository(clone_url)?;
+        let rows = match self.list_candidates(&owner, &repo, source_branch, base_branch) {
+            Ok(rows) => rows,
+            Err(_) => {
+                return Ok(GitHubPublicationObservation {
+                    pull_requests: ObservationCapability::Unknown,
+                });
+            }
+        };
+        let pull_requests = rows
+            .into_iter()
+            .map(|row| {
+                let merged = row.merged || row.merged_at.is_some();
+                ObservedPullRequest {
+                    number: row.number,
+                    node_id: row.node_id,
+                    url: row.html_url,
+                    state: row.state,
+                    merged,
+                    merged_at: row.merged_at,
+                    source_branch: row.head.ref_name,
+                    source_head: row.head.sha,
+                    base_branch: row.base.ref_name,
+                    title: row.title,
+                    body: row.body,
+                    timeline: self.observe_timeline(&owner, &repo, row.number),
+                }
+            })
+            .collect();
+        Ok(GitHubPublicationObservation {
+            pull_requests: ObservationCapability::Known(pull_requests),
+        })
     }
 }
 
@@ -300,6 +421,18 @@ impl PullRequestPublisher for GitHubPullRequestPublisher {
             operation_id: intent.operation_id.clone(),
         }))
     }
+
+    fn observe(
+        &self,
+        intent: &PullRequestPublicationIntent,
+    ) -> Result<GitHubPublicationObservation, PublicationError> {
+        validate_intent(intent)?;
+        self.observe_matching(
+            &intent.clone_url,
+            &intent.source_branch,
+            &intent.base_branch,
+        )
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -308,10 +441,43 @@ struct ApiPullRequest {
     node_id: String,
     html_url: String,
     state: String,
+    #[serde(default)]
+    merged: bool,
+    #[serde(default)]
+    merged_at: Option<String>,
     title: String,
     body: Option<String>,
     head: ApiBranch,
     base: ApiBranch,
+}
+
+#[derive(Deserialize)]
+struct ApiTimelineEntry {
+    event: String,
+    url: Option<String>,
+    id: Option<u64>,
+    created_at: Option<String>,
+    body: Option<String>,
+    actor: Option<ApiActor>,
+}
+
+#[derive(Deserialize)]
+struct ApiActor {
+    login: String,
+}
+
+impl From<ApiTimelineEntry> for ObservedTimelineEntry {
+    fn from(entry: ApiTimelineEntry) -> Self {
+        Self {
+            event: entry.event,
+            reference: entry
+                .url
+                .unwrap_or_else(|| entry.id.map_or_default(|id| id.to_string())),
+            actor: entry.actor.map(|actor| actor.login),
+            created_at: entry.created_at,
+            body: entry.body,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -470,7 +636,7 @@ mod tests {
         let executable = temp.path().join("gh-fixture");
         let state = temp.path().join("created");
         let script = format!(
-            "#!/bin/sh\nmethod=GET\nendpoint=\nprevious=\nfor arg in \"$@\"; do if [ \"$previous\" = -X ]; then method=$arg; fi; if [ \"$arg\" = -X ]; then previous=-X; else previous=; fi; case $arg in repos/*) endpoint=$arg;; esac; done\ncase \"$method:$endpoint\" in\nGET:repos/acme/demo/pulls?*) if [ -f \"$FIXTURE_STATE\" ]; then cat \"$FIXTURE_STATE\"; else printf '[]'; fi ;;\nGET:repos/acme/demo/pulls/7) cat \"$FIXTURE_STATE\" | sed 's/^\\[//;s/\\]$//' ;;\nPOST:repos/acme/demo/pulls) cat >/dev/null; printf '%s' '{row}' > \"$FIXTURE_STATE\"; exit 1 ;;\n*) exit 90 ;;\nesac\n",
+            "#!/bin/sh\nmethod=GET\nendpoint=\nprevious=\nfor arg in \"$@\"; do if [ \"$previous\" = -X ]; then method=$arg; fi; if [ \"$arg\" = -X ]; then previous=-X; else previous=; fi; case $arg in repos/*) endpoint=$arg;; esac; done\ncase \"$method:$endpoint\" in\nGET:repos/acme/demo/pulls?*) if [ -f \"$FIXTURE_STATE\" ]; then cat \"$FIXTURE_STATE\"; else printf '[]'; fi ;;\nGET:repos/acme/demo/pulls/7) cat \"$FIXTURE_STATE\" | sed 's/^\\[//;s/\\]$//' ;;\nGET:repos/acme/demo/issues/7/timeline?*) if [ \"$TIMELINE_UNKNOWN\" = 1 ]; then exit 1; else printf '[]'; fi ;;\nPOST:repos/acme/demo/pulls) cat >/dev/null; printf '%s' '{row}' > \"$FIXTURE_STATE\"; exit 1 ;;\n*) exit 90 ;;\nesac\n",
             row = r#"[{"number":7,"node_id":"PR_fixture","html_url":"https://github.com/acme/demo/pull/7","state":"open","title":"Ship feature","body":"Details\n\n<!-- rex-projects-operation:publish-1 -->","head":{"ref":"rex-projects/work","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]"#
         );
         std::fs::write(&executable, script).unwrap();
@@ -479,7 +645,10 @@ mod tests {
         std::fs::set_permissions(&executable, permissions).unwrap();
         let publisher = GitHubPullRequestPublisher::new(
             executable,
-            BTreeMap::from([(OsString::from("FIXTURE_STATE"), state.into_os_string())]),
+            BTreeMap::from([
+                (OsString::from("FIXTURE_STATE"), state.into_os_string()),
+                (OsString::from("TIMELINE_UNKNOWN"), OsString::from("0")),
+            ]),
             Duration::from_secs(5),
         )
         .unwrap();
@@ -504,6 +673,35 @@ mod tests {
         let second = publisher.publish(&intent).unwrap();
         assert_eq!(first.number, 7);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn observation_reads_current_pr_and_timeline_through_configured_cli() {
+        let (_temp, publisher, intent) = fixture_publisher();
+        publisher.publish(&intent).unwrap();
+        let observation = publisher.observe(&intent).unwrap();
+        let ObservationCapability::Known(pulls) = observation.pull_requests else {
+            panic!("fixture observation should be complete");
+        };
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(pulls[0].number, 7);
+        assert!(!pulls[0].merged);
+        assert_eq!(pulls[0].source_head, intent.source_head);
+        assert_eq!(pulls[0].timeline, ObservationCapability::Known(Vec::new()));
+    }
+
+    #[test]
+    fn timeline_failure_remains_explicitly_unknown() {
+        let (_temp, mut publisher, intent) = fixture_publisher();
+        publisher.publish(&intent).unwrap();
+        publisher
+            .environment
+            .insert("TIMELINE_UNKNOWN".into(), "1".into());
+        let observation = publisher.observe(&intent).unwrap();
+        let ObservationCapability::Known(pulls) = observation.pull_requests else {
+            panic!("PR query succeeded independently from the timeline query");
+        };
+        assert_eq!(pulls[0].timeline, ObservationCapability::Unknown);
     }
 
     #[test]
