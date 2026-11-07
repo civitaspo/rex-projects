@@ -20,7 +20,7 @@ cargo run -- --config examples/fixture/config.toml config validate
 `${XDG_STATE_HOME:-$HOME/.local/state}/rex-projects/`; subsequent applies use
 `--expected-revision`. Run `rex-projects schema config` for the authoritative
 configuration schema and `rex-projects doctor --json` for read-only executable
-resolution. `rex-projects --version` and `rex-projects <Cargo version>` support
+resolution. `rex-projects --version` reports the Cargo package version for
 release probes.
 
 See [Release assets](docs/release-assets.md) for versioned target builds.

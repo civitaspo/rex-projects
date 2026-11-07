@@ -32,17 +32,6 @@ fn unsupported_invocation_is_reported_as_usage_error() {
 }
 
 #[test]
-fn cargo_version_argument_is_compatible_with_release_probes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
-        .arg(env!("CARGO_PKG_VERSION"))
-        .output()
-        .expect("run rex-projects with a version argument");
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
 fn version_json_is_enabled_when_global_flag_precedes_subcommand() {
     let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
         .args(["--json", "version"])

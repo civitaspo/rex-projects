@@ -111,9 +111,6 @@ impl std::fmt::Display for CliError {
 pub fn run() -> Result<i32, CliError> {
     let args = std::env::args_os().collect::<Vec<_>>();
     let json_requested = args.iter().any(|argument| argument == "--json");
-    if args.len() == 2 && args[1] == env!("CARGO_PKG_VERSION") {
-        return Ok(0);
-    }
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) if error.exit_code() == 0 => {
