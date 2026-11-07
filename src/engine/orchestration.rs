@@ -833,6 +833,27 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
                     .any(|identity| identity.trim().is_empty())
                 || result.steps.is_empty()
                 || merge_kinds.len() != 1
+                || result
+                    .steps
+                    .iter()
+                    .filter(|step| step.kind == MergeProcedureStepKind::VerifyMergeCommit)
+                    .count()
+                    != 1
+                || result.steps.iter().enumerate().any(|(index, step)| {
+                    step.kind == MergeProcedureStepKind::UpdatePullRequestBody
+                        && index
+                            > result
+                                .steps
+                                .iter()
+                                .position(|candidate| {
+                                    matches!(
+                                        candidate.kind,
+                                        MergeProcedureStepKind::RequestMerge
+                                            | MergeProcedureStepKind::DirectMerge
+                                    )
+                                })
+                                .unwrap_or(usize::MAX)
+                })
                 || result.steps.last().map(|step| step.kind)
                     != Some(MergeProcedureStepKind::VerifyMergeCommit)
                 || result.steps.iter().any(|step| {
@@ -938,6 +959,9 @@ pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
     schema
 }
 
+// The provider gets the payload's structural constraints. Cross-field rules
+// such as commit-chain/head equality and procedure ordering stay authoritative
+// in validate_role_payload after typed deserialization.
 fn constrain_payload_string_schemas(schema: &mut Value) {
     fn constrain(value: &mut Value, min: usize, max: usize, pattern: &str) {
         if let Some(map) = value.as_object_mut() {
@@ -958,26 +982,139 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                             }
                             "TicketId" | "TicketNamespace" | "TicketRunId" | "AgentRunId"
                             | "HumanRequestId" | "OperationId" | "RexBlockId" => {
-                                constrain(definition, 1, 512, r"^[^\x00-\x1F\x7F]*$")
+                                constrain(definition, 1, 512, r"^[^\p{Cc}]*$")
                             }
                             "Digest" => constrain(definition, 64, 64, r"^[a-f0-9]{64}$"),
                             "GitCommitId" => {
                                 constrain(definition, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
                             }
+                            "RoleSessionId" => constrain(definition, 1, 255, r"^[A-Za-z0-9._-]+$"),
+                            "RoleArtifactReference" => {
+                                if let Some(version) = definition
+                                    .get_mut("properties")
+                                    .and_then(Value::as_object_mut)
+                                    .and_then(|properties| properties.get_mut("schema_version"))
+                                    .and_then(Value::as_object_mut)
+                                {
+                                    version.insert("minimum".into(), Value::from(1));
+                                }
+                            }
+                            "ChangeReference" => {
+                                if let Some(commits) = definition
+                                    .get_mut("properties")
+                                    .and_then(Value::as_object_mut)
+                                    .and_then(|properties| properties.get_mut("commit_shas"))
+                                    .and_then(Value::as_object_mut)
+                                {
+                                    commits.insert("minItems".into(), Value::from(1));
+                                }
+                            }
+                            "RiskFactorAssessment" => {
+                                if let Some(properties) = definition
+                                    .get_mut("properties")
+                                    .and_then(Value::as_object_mut)
+                                {
+                                    if let Some(rating) =
+                                        properties.get_mut("rating").and_then(Value::as_object_mut)
+                                    {
+                                        rating.insert("maximum".into(), Value::from(4));
+                                    }
+                                    for field in ["source", "rationale"] {
+                                        if let Some(schema) =
+                                            properties.get_mut(field).and_then(Value::as_object_mut)
+                                        {
+                                            schema.insert("minLength".into(), Value::from(1));
+                                        }
+                                    }
+                                    if let Some(evidence) = properties
+                                        .get_mut("evidence_references")
+                                        .and_then(Value::as_object_mut)
+                                    {
+                                        evidence.insert("minItems".into(), Value::from(1));
+                                    }
+                                }
+                            }
+                            "DeterministicGateEvidence" => {
+                                if let Some(properties) = definition
+                                    .get_mut("properties")
+                                    .and_then(Value::as_object_mut)
+                                {
+                                    if let Some(gate_id) =
+                                        properties.get_mut("gate_id").and_then(Value::as_object_mut)
+                                    {
+                                        gate_id.insert("minLength".into(), Value::from(1));
+                                    }
+                                    if let Some(evidence) = properties
+                                        .get_mut("evidence_references")
+                                        .and_then(Value::as_object_mut)
+                                    {
+                                        evidence.insert("minItems".into(), Value::from(1));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
+                    }
+                }
+                if map.get("title").and_then(Value::as_str) == Some("MergeAssessmentPayload")
+                    && let Some(properties) =
+                        map.get_mut("properties").and_then(Value::as_object_mut)
+                {
+                    for field in ["pr_references", "deterministic_gate_evidence"] {
+                        if let Some(array) =
+                            properties.get_mut(field).and_then(Value::as_object_mut)
+                        {
+                            array.insert("minItems".into(), Value::from(1));
+                        }
+                    }
+                    for field in ["rationale", "disposition"] {
+                        if let Some(text) = properties.get_mut(field).and_then(Value::as_object_mut)
+                        {
+                            text.insert("minLength".into(), Value::from(1));
+                        }
+                    }
+                    if let Some(ratings) =
+                        properties.get_mut("ratings").and_then(Value::as_object_mut)
+                    {
+                        ratings.insert("minProperties".into(), Value::from(5));
+                        ratings.insert("maxProperties".into(), Value::from(5));
+                        ratings.insert("propertyNames".into(), serde_json::json!({
+                                "enum": ["change_impact", "complexity", "verification_gaps", "review_uncertainty", "operational_exposure"]
+                            }));
+                    }
+                }
+                if map.get("title").and_then(Value::as_str) == Some("ImplementationReadyPayload")
+                    && let Some(changes) = map
+                        .get_mut("properties")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|properties| properties.get_mut("change_references"))
+                        .and_then(Value::as_object_mut)
+                {
+                    changes.insert("minItems".into(), Value::from(1));
+                }
+                if map.get("title").and_then(Value::as_str) == Some("MergeIntentPayload")
+                    && let Some(properties) =
+                        map.get_mut("properties").and_then(Value::as_object_mut)
+                {
+                    for field in ["pr_identities", "steps", "post_merge_verification"] {
+                        if let Some(array) =
+                            properties.get_mut(field).and_then(Value::as_object_mut)
+                        {
+                            array.insert("minItems".into(), Value::from(1));
+                        }
+                    }
+                    if let Some(text) = properties
+                        .get_mut("assessment_id")
+                        .and_then(Value::as_object_mut)
+                    {
+                        text.insert("minLength".into(), Value::from(1));
                     }
                 }
                 if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
                     for (name, property) in properties {
                         match name.as_str() {
-                            "digest"
-                            | "subject_digest"
-                            | "batch_digest"
-                            | "candidate_digest"
-                            | "base_digest"
-                            | "policy_digest"
-                            | "prepared_body_digest" => {
+                            "digest" => constrain(property, 64, 64, r"^[a-f0-9]{64}$"),
+                            name if name.ends_with("_digest") => {
                                 constrain(property, 64, 64, r"^[a-f0-9]{64}$")
                             }
                             "base_commit" | "previous_head" | "branch_head" | "source_commit" => {
@@ -988,9 +1125,38 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                     constrain(items, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$");
                                 }
                             }
-                            "repository" | "project_id" | "project" | "profile_id" => {
+                            "repository" | "project_id" | "project" | "profile_id"
+                            | "adapter_id" => {
                                 constrain(property, 1, 255, r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
                             }
+                            "coordinator_role_session_id" => {
+                                constrain(property, 1, 255, r"^[A-Za-z0-9._-]+$")
+                            }
+                            "parent" | "ticket_reference" | "ticket_id" | "ticket_namespace"
+                            | "ticket_run_id" | "agent_run_id" | "parent_run_id"
+                            | "human_request_id" | "operation_id" | "rex_block_id"
+                            | "request_id" | "message_id" => {
+                                constrain(property, 1, 512, r"^[^\p{Cc}]*$")
+                            }
+                            "dependencies" => {
+                                if let Some(items) = property.get_mut("items") {
+                                    constrain(items, 1, 512, r"^[^\p{Cc}]*$");
+                                }
+                            }
+                            "worktree_id" | "work_node" | "node_key" => {
+                                constrain(property, 1, 80, r"^[A-Za-z0-9._-]+$")
+                            }
+                            "affected_node_keys" | "worker_nodes" => {
+                                if let Some(items) = property.get_mut("items") {
+                                    constrain(items, 1, 80, r"^[A-Za-z0-9._-]+$");
+                                }
+                            }
+                            "path" => constrain(
+                                property,
+                                1,
+                                4096,
+                                r"^(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*)(?:/(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*))*$",
+                            ),
                             _ => {}
                         }
                     }
@@ -2138,6 +2304,123 @@ mod tests {
         })
     }
 
+    fn valid_merge_assessment_payload() -> Value {
+        let reference = json!({
+            "kind": "merge_assessment",
+            "schema_version": 1,
+            "path": "evidence/gate.json",
+            "digest": "a".repeat(64),
+            "bytes": 20
+        });
+        json!({
+            "pr_references": ["https://example.invalid/pr/1"],
+            "subject_digest": "b".repeat(64),
+            "deterministic_gate_evidence": [{
+                "gate_id": "required-checks",
+                "outcome": "pass",
+                "evidence_references": [reference]
+            }],
+            "ratings": {
+                "change_impact": {"rating": 1, "source": "diff", "rationale": "small", "evidence_references": [reference]},
+                "complexity": {"rating": 1, "source": "diff", "rationale": "simple", "evidence_references": [reference]},
+                "verification_gaps": {"rating": 1, "source": "checks", "rationale": "covered", "evidence_references": [reference]},
+                "review_uncertainty": {"rating": 1, "source": "review", "rationale": "clear", "evidence_references": [reference]},
+                "operational_exposure": {"rating": 1, "source": "policy", "rationale": "low", "evidence_references": [reference]}
+            },
+            "confidence": "high",
+            "rationale": "all required evidence is present",
+            "disposition": "merge"
+        })
+    }
+
+    fn valid_role_payload_corpus() -> Vec<(RoleOutputKind, Value)> {
+        let digest = "a".repeat(64);
+        let commit = "1".repeat(40);
+        let artifact = json!({
+            "kind":"general", "schema_version":1, "path":"evidence/result.json",
+            "digest":digest, "bytes":10
+        });
+        vec![
+            (
+                RoleOutputKind::Progress,
+                json!({"summary":"working", "completed_node_keys":[], "pending_node_keys":[], "evidence":[], "next_observation_at":null}),
+            ),
+            (RoleOutputKind::Irregularity, worker_irregularity_payload()),
+            (
+                RoleOutputKind::HumanRequest,
+                json!({"kind":"clarification", "question":"Which option?", "choices":["a"], "evidence_references":[], "subject_digest":digest, "requested_continuation":null}),
+            ),
+            (
+                RoleOutputKind::TicketProposal,
+                json!({"goal_revision":1, "gap_key":"gap-1", "title":"A ticket", "body":"Details", "acceptance":["condition"], "priority_rationale":"unblocks work", "parent":null, "dependencies":[]}),
+            ),
+            (
+                RoleOutputKind::DispatchRequest,
+                json!({"ticket_reference":"TICKET-1", "expected_ticket_revision":1, "coordinator_profile":"default", "priority":1, "rationale":"unblocks work"}),
+            ),
+            (
+                RoleOutputKind::Intervention,
+                json!({"coordinator_role_session_id":"coord-session_1", "ticket_run_revision":1, "reason":"need a decision", "evidence":[], "proposed_plan_change":"pause the node"}),
+            ),
+            (
+                RoleOutputKind::SpawnRequest,
+                json!({"work_node":"node-a", "role":"worker", "profile_id":"worker-default", "plan_digest":digest, "allowed_repositories":["repo-a"], "artifact_inputs":[], "parent_run_id":null}),
+            ),
+            (
+                RoleOutputKind::InvestigationRequest,
+                json!({"question":"Inspect dependency", "allowed_repositories":["repo-a"], "required_evidence":["read-only findings"], "parent_run_id":null}),
+            ),
+            (
+                RoleOutputKind::PrepareWorktrees,
+                json!({"accepted_plan_digest":digest, "worker_nodes":["node-a"]}),
+            ),
+            (
+                RoleOutputKind::PlanReady,
+                json!({"plan":{"nodes":[{"id":"node-a", "repository":"repo-a", "task":"implement acceptance", "depends_on":[], "required_evidence":[], "investigation":false}], "requested_investigation_children":0}, "unresolved_questions":[]}),
+            ),
+            (
+                RoleOutputKind::ImplementationReady,
+                worker_implementation_ready_payload(),
+            ),
+            (
+                RoleOutputKind::ReviewReady,
+                json!({"subject_kind":"patch", "subject_digest":digest, "findings":[], "evidence_coverage":["all acceptance items"], "disposition":"approved", "unknowns":[]}),
+            ),
+            (
+                RoleOutputKind::MergeAssessment,
+                valid_merge_assessment_payload(),
+            ),
+            (
+                RoleOutputKind::MergeIntent,
+                json!({"assessment_id":"assessment-1", "pr_identities":["repo-a#42"], "policy_digest":digest, "prepared_body_digest":digest, "steps":[{"kind":"direct_merge", "instruction_reference":"merge.instructions#merge", "rationale":"repository policy requires direct merge"}, {"kind":"verify_merge_commit", "instruction_reference":"merge.instructions#verify", "rationale":"confirm resulting commit"}], "post_merge_verification":[{"kind":"merge_commit_recorded", "instruction_reference":"merge.instructions#verify", "rationale":"ensure remote records the merge commit"}]}),
+            ),
+            (
+                RoleOutputKind::OperationAction,
+                json!({"operation_plan_digest":digest, "node_key":"node-a", "action_id":"deploy", "parameters":{}, "preconditions":[], "approval_receipt":"approved"}),
+            ),
+            (
+                RoleOutputKind::OperationResult,
+                json!({"node_key":"node-a", "outcome":"succeeded", "remote_receipt":{}, "source_commit":commit, "environment":"staging", "evidence_references":[]}),
+            ),
+            (
+                RoleOutputKind::PostmortemReady,
+                json!({"candidate_publication_manifest":{}, "findings":["improve test coverage"], "source_references":[artifact], "unresolved_provenance":[]}),
+            ),
+            (
+                RoleOutputKind::LearningDecision,
+                json!({"batch_id":"batch-1", "batch_digest":digest, "config_revision":1, "observations":[], "topic_changes":[], "checkpoint":{}, "improvements":[], "candidate_change":null}),
+            ),
+            (
+                RoleOutputKind::ProfileTrialResult,
+                json!({"candidate_digest":digest, "base_digest":digest, "authorization_receipt":"authorized", "run_ids":[], "frozen_inputs":[], "evidence_references":[artifact], "outcome":"effective"}),
+            ),
+            (
+                RoleOutputKind::ProfilePromotionProposal,
+                json!({"candidate_revision":1, "efficacy_outcome":"effective", "evidence_references":[artifact], "managed_slot":"project/worker", "profile_diff":{}, "expected_target_digests":{}, "uncertain_efficacy_exception":null}),
+            ),
+        ]
+    }
+
     fn goal_project() -> ProjectConfig {
         ProjectConfig {
             mode: ProjectMode::Goal,
@@ -2885,6 +3168,24 @@ mod tests {
         invalid["steps"][1]["kind"] = json!("run_shell_command");
         assert!(serde_json::from_value::<MergeIntentPayload>(invalid).is_err());
 
+        let mut out_of_order: MergeIntentPayload = serde_json::from_value(json!({
+            "assessment_id":"assessment-1",
+            "pr_identities":["repo-a#42"],
+            "policy_digest":"a".repeat(64),
+            "prepared_body_digest":"b".repeat(64),
+            "steps":[
+                {"kind":"direct_merge","instruction_reference":"policy#merge","rationale":"execute"},
+                {"kind":"update_pull_request_body","instruction_reference":"policy#body","rationale":"write trailer"},
+                {"kind":"verify_merge_commit","instruction_reference":"policy#verify","rationale":"check result"}
+            ],
+            "post_merge_verification":[{"kind":"merge_commit_recorded","instruction_reference":"policy#verify","rationale":"check record"}]
+        })).unwrap();
+        assert!(
+            validate_role_payload(&RoleResultPayload::MergeIntent(out_of_order.clone())).is_err()
+        );
+        out_of_order.steps.swap(0, 1);
+        validate_role_payload(&RoleResultPayload::MergeIntent(out_of_order)).unwrap();
+
         let mut missing_final_verify: MergeIntentPayload =
             serde_json::from_value(json!({
                 "assessment_id":"assessment-1",
@@ -2945,6 +3246,40 @@ mod tests {
                 serde_json::to_vec(&schema).unwrap().len() < 256 * 1024,
                 "{kind:?}"
             );
+            jsonschema::options()
+                .offline()
+                .build(&schema)
+                .unwrap_or_else(|error| panic!("{kind:?}: generated schema is invalid: {error}"));
+        }
+        for role in [
+            Role::Supervisor,
+            Role::Coordinator,
+            Role::Planner,
+            Role::Worker,
+            Role::Reviewer,
+            Role::MergeDecision,
+            Role::Operator,
+            Role::Postmortem,
+        ] {
+            for kind in allowed_role_output_kinds(role) {
+                jsonschema::options()
+                    .offline()
+                    .build(&role_result_payload_schema(kind))
+                    .unwrap_or_else(|error| panic!("{role:?}/{kind:?}: {error}"));
+            }
+        }
+        for (kind, value) in valid_role_payload_corpus() {
+            let schema = role_result_payload_schema(kind);
+            let validator = jsonschema::options()
+                .offline()
+                .build(&schema)
+                .unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+            assert!(
+                validator.is_valid(&value),
+                "valid {kind:?} payload: {value}"
+            );
+            let typed = RoleResultPayload::parse(kind, value).unwrap();
+            validate_role_payload(&typed).unwrap();
         }
     }
 
@@ -2956,6 +3291,131 @@ mod tests {
         assert!(encoded.contains(r"^[A-Za-z0-9._-]+$"));
         assert!(encoded.contains(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$"));
         assert!(encoded.contains(r"^[a-f0-9]{64}$"));
+    }
+
+    #[test]
+    fn generated_role_schemas_reject_parser_invalid_values_offline() {
+        fn schema_accepts(kind: RoleOutputKind, value: &Value) -> bool {
+            let schema = role_result_payload_schema(kind);
+            jsonschema::options()
+                .offline()
+                .build(&schema)
+                .expect("generated role payload schema is valid")
+                .is_valid(value)
+        }
+
+        let valid_change = worker_implementation_ready_payload();
+        assert!(schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &valid_change
+        ));
+
+        let mut invalid_commit = valid_change.clone();
+        invalid_commit["change_references"][0]["branch_head"] = json!("not-a-sha");
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &invalid_commit
+        ));
+        let mut invalid_node = valid_change.clone();
+        invalid_node["change_references"][0]["worktree_id"] = json!("../outside");
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &invalid_node
+        ));
+        let mut invalid_repository = valid_change.clone();
+        invalid_repository["change_references"][0]["repository"] = json!("bad/id");
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &invalid_repository
+        ));
+
+        let mut with_artifact = valid_change.clone();
+        with_artifact["irregularity_references"] = json!([{
+            "kind":"general", "schema_version":1, "path":"evidence/change.json",
+            "digest":"a".repeat(64), "bytes":10
+        }]);
+        assert!(schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+        with_artifact["irregularity_references"][0]["path"] = json!("../outside");
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+        with_artifact["irregularity_references"][0]["path"] = json!("evidence/...");
+        assert!(schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+        with_artifact["irregularity_references"][0]["schema_version"] = json!(0);
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+        with_artifact["irregularity_references"][0]["schema_version"] = json!(1);
+        with_artifact["irregularity_references"][0]["path"] = json!("evidence/\u{0085}bad");
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+
+        let mut intervention = json!({
+            "coordinator_role_session_id":"coord-session_1",
+            "ticket_run_revision":1,
+            "reason":"need a decision",
+            "evidence":[],
+            "proposed_plan_change":"pause the dependent node"
+        });
+        assert!(schema_accepts(RoleOutputKind::Intervention, &intervention));
+        intervention["coordinator_role_session_id"] = json!("../session");
+        assert!(!schema_accepts(RoleOutputKind::Intervention, &intervention));
+
+        let mut ticket_proposal = json!({
+            "goal_revision":1,
+            "gap_key":"gap-1",
+            "title":"Complete the requested goal",
+            "body":"Details",
+            "acceptance":["condition"],
+            "priority_rationale":"unblocks work",
+            "parent":null,
+            "dependencies":[]
+        });
+        assert!(schema_accepts(
+            RoleOutputKind::TicketProposal,
+            &ticket_proposal
+        ));
+        ticket_proposal["parent"] = json!("\u{0085}");
+        assert!(!schema_accepts(
+            RoleOutputKind::TicketProposal,
+            &ticket_proposal
+        ));
+
+        let mut merge_assessment = valid_merge_assessment_payload();
+        assert!(schema_accepts(
+            RoleOutputKind::MergeAssessment,
+            &merge_assessment
+        ));
+        merge_assessment["pr_references"] = json!([]);
+        assert!(!schema_accepts(
+            RoleOutputKind::MergeAssessment,
+            &merge_assessment
+        ));
+        let mut over_rating = valid_merge_assessment_payload();
+        over_rating["ratings"]["complexity"]["rating"] = json!(5);
+        assert!(!schema_accepts(
+            RoleOutputKind::MergeAssessment,
+            &over_rating
+        ));
+        let mut incomplete_dimensions = valid_merge_assessment_payload();
+        incomplete_dimensions["ratings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("complexity");
+        assert!(!schema_accepts(
+            RoleOutputKind::MergeAssessment,
+            &incomplete_dimensions
+        ));
     }
 
     #[test]
