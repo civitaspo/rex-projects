@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "name": "goal-and-operations-local-acceptance",
+  "description": "Disposable local dependencies for the rex-projects user-path acceptance story.",
+  "required_cli": {
+    "config validate": {"argv": ["config", "validate"], "options": []},
+    "config apply": {"argv": ["config", "apply"], "options": ["--bootstrap"]},
+    "runtime run": {"argv": ["runtime", "run"], "options": ["--rex-server"]},
+    "project start": {"argv": ["project", "start"], "options": []},
+    "project status": {"argv": ["project", "status"], "options": ["--json"]},
+    "human list": {"argv": ["human", "list"], "options": []},
+    "human show": {"argv": ["human", "show"], "options": []},
+    "human respond": {"argv": ["human", "respond"], "options": []},
+    "dashboard JSON": {"argv": ["dashboard"], "options": ["--json"]}
+  },
+  "runtime_context": {
+    "rex_server": "explicit --rex-server URL",
+    "session_id": "REX_SESSION supplied by the owned Rex block",
+    "block_id": "REX_BLOCK supplied by the owned Rex block"
+  },
+  "required_runtime_capabilities": [
+    "one foreground machine controller",
+    "ticket adapter command protocol v1",
+    "forge adapter command protocol v1",
+    "Rex-owned deterministic Agent block",
+    "durable human request and response",
+    "operator operation adapter command protocol v1",
+    "knowledge publication and ticket completion"
+  ],
+  "fixtures": {
+    "tickets": "../tickets/ticket_fixture.py",
+    "forge": "forge_fixture.py",
+    "operations": "operations_fixture.py",
+    "agent": "deterministic_agent.py",
+    "rex_agent_runner": "run_rex_agent.py",
+    "local_git": "create_local_git.py"
+  },
+  "fault_controls": {
+    "ticket_create_reply": "--drop-create-response-once OPERATION_ID",
+    "forge_reply": "--drop-response-once OPERATION_ID",
+    "forge_check_state": "--check-conclusion success|failure|cancelled|timed_out",
+    "operation_reply": "--drop-response-once OPERATION_ID"
+  },
+  "forge_policy_fixture": {
+    "required_checks": ["required-tests"],
+    "required_approval_count": 1,
+    "merge_strategy": "fast_forward"
+  },
+  "safety": {
+    "network_services": false,
+    "production_credentials_required": false,
+    "rex_server_must_be_explicit": true,
+    "paths_are_caller_supplied": true,
+    "test_runs_use_temporary_fixture_root": true
+  }
+}
