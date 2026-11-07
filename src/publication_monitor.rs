@@ -187,6 +187,7 @@ mod tests {
             source_branch: "rex-projects/work".into(),
             source_head: "a".repeat(40),
             base_branch: "main".into(),
+            base_sha: "b".repeat(40),
             title: "Change".into(),
             body: Some("Body".into()),
             timeline: ObservationCapability::Known(comments),

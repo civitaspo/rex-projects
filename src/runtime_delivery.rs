@@ -46,6 +46,10 @@ impl RuntimeDelivery {
         &self.effects
     }
 
+    pub fn shared_effects(&self) -> std::sync::Arc<RepositoryDeliveryEffects> {
+        std::sync::Arc::clone(&self.effects)
+    }
+
     fn observe_snapshot(
         &self,
         repository_id: &RepositoryId,

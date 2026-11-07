@@ -71,6 +71,7 @@ pub struct ObservedPullRequest {
     pub source_branch: String,
     pub source_head: String,
     pub base_branch: String,
+    pub base_sha: String,
     pub title: String,
     pub body: Option<String>,
     pub timeline: ObservationCapability<Vec<ObservedTimelineEntry>>,
@@ -84,6 +85,15 @@ pub struct ObservedTimelineEntry {
     pub actor: Option<String>,
     pub created_at: Option<String>,
     pub body: Option<String>,
+}
+
+/// Bounded, current content shown in a human code review. The diff and gate rows are read from
+/// GitHub for the exact observed head; the caller must first resolve and validate that PR.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PullRequestReviewMaterial {
+    pub patch: String,
+    pub checks: Vec<String>,
+    pub reviews: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,8 +217,119 @@ impl GitHubPullRequestPublisher {
                 "GitHub API command failed or its outcome is uncertain".into(),
             ));
         }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|_| PublicationError::Unknown("GitHub returned invalid JSON".into()))
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            PublicationError::Unknown(format!(
+                "GitHub returned invalid JSON for `{endpoint}`: {error}"
+            ))
+        })
+    }
+
+    /// Read the bounded diff, check runs, and submitted review states for one exact PR revision.
+    /// Any incomplete API result fails closed instead of producing a partial review bundle.
+    pub fn review_material(
+        &self,
+        clone_url: &str,
+        number: u64,
+        head_sha: &str,
+    ) -> Result<PullRequestReviewMaterial, PublicationError> {
+        validate_sha(head_sha)?;
+        let (owner, repo) = github_repository(clone_url)?;
+        let patch = self.api_text(
+            &format!("repos/{owner}/{repo}/pulls/{number}"),
+            "application/vnd.github.diff",
+        )?;
+        if patch.len() > 1_048_576 {
+            return Err(PublicationError::Unknown(
+                "pull request diff exceeds the human review size limit".into(),
+            ));
+        }
+        let mut checks = Vec::new();
+        for page in 1..=MAX_OBSERVATION_PAGES {
+            let endpoint = format!(
+                "repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page={MAX_PR_LIST}&page={page}"
+            );
+            let response: ApiCheckRuns = self.api_json("GET", &endpoint, None)?;
+            let done = response.check_runs.len() < MAX_PR_LIST;
+            checks.extend(response.check_runs.into_iter().map(|check| {
+                format!(
+                    "{}: {} ({})",
+                    check.name,
+                    check.status,
+                    check.conclusion.unwrap_or_else(|| "no conclusion".into())
+                )
+            }));
+            if done {
+                break;
+            }
+            if page == MAX_OBSERVATION_PAGES {
+                return Err(PublicationError::Unknown(
+                    "GitHub check-run results reached the pagination limit".into(),
+                ));
+            }
+        }
+        let mut reviews = Vec::new();
+        for page in 1..=MAX_OBSERVATION_PAGES {
+            let endpoint = format!(
+                "repos/{owner}/{repo}/pulls/{number}/reviews?per_page={MAX_PR_LIST}&page={page}"
+            );
+            let response: Vec<ApiReview> = self.api_json("GET", &endpoint, None)?;
+            let done = response.len() < MAX_PR_LIST;
+            reviews.extend(response.into_iter().map(|review| {
+                format!(
+                    "{}: {}{}",
+                    review.user.login,
+                    review.state,
+                    review
+                        .submitted_at
+                        .map_or_else(String::new, |time| format!(" at {time}"))
+                )
+            }));
+            if done {
+                break;
+            }
+            if page == MAX_OBSERVATION_PAGES {
+                return Err(PublicationError::Unknown(
+                    "GitHub review results reached the pagination limit".into(),
+                ));
+            }
+        }
+        Ok(PullRequestReviewMaterial {
+            patch,
+            checks,
+            reviews,
+        })
+    }
+
+    fn api_text(&self, endpoint: &str, accept: &str) -> Result<String, PublicationError> {
+        let output = process::run(ProcessRequest {
+            executable: self.executable.clone(),
+            args: vec![
+                OsString::from("api"),
+                OsString::from(endpoint),
+                OsString::from("-H"),
+                OsString::from(format!("Accept: {accept}")),
+            ],
+            stdin: Vec::new(),
+            cwd: None,
+            clear_environment: true,
+            environment: self.environment.clone(),
+            timeout: self.timeout,
+            shutdown_grace: SHUTDOWN_GRACE,
+            stdout_limit: OUTPUT_LIMIT,
+            stderr_tail_limit: STDERR_TAIL_LIMIT,
+        })
+        .map_err(|error| PublicationError::Process(error.to_string()))?;
+        if !output.status.is_some_and(|status| status.success())
+            || output.timed_out
+            || !output.cleanup_confirmed
+            || output.stdout_truncated
+        {
+            return Err(PublicationError::Unknown(
+                "GitHub diff command failed or its outcome is uncertain".into(),
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| PublicationError::Unknown("GitHub returned a non-UTF-8 diff".into()))
     }
 
     fn list_candidates(
@@ -291,6 +412,7 @@ impl GitHubPullRequestPublisher {
                     source_branch: row.head.ref_name,
                     source_head: row.head.sha,
                     base_branch: row.base.ref_name,
+                    base_sha: row.base.sha,
                     title: row.title,
                     body: row.body,
                     timeline: self.observe_timeline(&owner, &repo, row.number),
@@ -466,6 +588,25 @@ struct ApiActor {
     login: String,
 }
 
+#[derive(Deserialize)]
+struct ApiCheckRuns {
+    check_runs: Vec<ApiCheckRun>,
+}
+
+#[derive(Deserialize)]
+struct ApiCheckRun {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiReview {
+    user: ApiActor,
+    state: String,
+    submitted_at: Option<String>,
+}
+
 impl From<ApiTimelineEntry> for ObservedTimelineEntry {
     fn from(entry: ApiTimelineEntry) -> Self {
         Self {
@@ -636,7 +777,7 @@ mod tests {
         let executable = temp.path().join("gh-fixture");
         let state = temp.path().join("created");
         let script = format!(
-            "#!/bin/sh\nmethod=GET\nendpoint=\nprevious=\nfor arg in \"$@\"; do if [ \"$previous\" = -X ]; then method=$arg; fi; if [ \"$arg\" = -X ]; then previous=-X; else previous=; fi; case $arg in repos/*) endpoint=$arg;; esac; done\ncase \"$method:$endpoint\" in\nGET:repos/acme/demo/pulls?*) if [ -f \"$FIXTURE_STATE\" ]; then cat \"$FIXTURE_STATE\"; else printf '[]'; fi ;;\nGET:repos/acme/demo/pulls/7) cat \"$FIXTURE_STATE\" | sed 's/^\\[//;s/\\]$//' ;;\nGET:repos/acme/demo/issues/7/timeline?*) if [ \"$TIMELINE_UNKNOWN\" = 1 ]; then exit 1; else printf '[]'; fi ;;\nPOST:repos/acme/demo/pulls) cat >/dev/null; printf '%s' '{row}' > \"$FIXTURE_STATE\"; exit 1 ;;\n*) exit 90 ;;\nesac\n",
+            "#!/bin/sh\nmethod=GET\nendpoint=\nprevious=\naccept=\nfor arg in \"$@\"; do if [ \"$previous\" = -X ]; then method=$arg; fi; if [ \"$arg\" = -X ]; then previous=-X; else previous=; fi; case $arg in repos/*) endpoint=$arg;; 'Accept: application/vnd.github.diff') accept=diff;; esac; done\ncase \"$method:$endpoint:$accept\" in\nGET:repos/acme/demo/pulls/7/reviews?*:*) printf '[{{\"user\":{{\"login\":\"alice\"}},\"state\":\"APPROVED\",\"submitted_at\":\"2026-11-07T00:00:00Z\"}}]' ;;\nGET:repos/acme/demo/commits/*/check-runs?*:*) printf '{{\"check_runs\":[{{\"name\":\"lint\",\"status\":\"completed\",\"conclusion\":\"success\"}}]}}' ;;\nGET:repos/acme/demo/issues/7/timeline?*:*) if [ \"$TIMELINE_UNKNOWN\" = 1 ]; then exit 1; else printf '[]'; fi ;;\nGET:repos/acme/demo/pulls/7?*:diff) printf 'diff --git a/a b/a\\n+safe' ;;\nGET:repos/acme/demo/pulls/7:diff) printf 'diff --git a/a b/a\\n+safe' ;;\nGET:repos/acme/demo/pulls/7:) cat \"$FIXTURE_STATE\" | sed 's/^\\[//;s/\\]$//' ;;\nGET:repos/acme/demo/pulls?*:*) if [ -f \"$FIXTURE_STATE\" ]; then cat \"$FIXTURE_STATE\"; else printf '[]'; fi ;;\nPOST:repos/acme/demo/pulls:*) cat >/dev/null; printf '%s' '{row}' > \"$FIXTURE_STATE\"; exit 1 ;;\n*) exit 90 ;;\nesac\n",
             row = r#"[{"number":7,"node_id":"PR_fixture","html_url":"https://github.com/acme/demo/pull/7","state":"open","title":"Ship feature","body":"Details\n\n<!-- rex-projects-operation:publish-1 -->","head":{"ref":"rex-projects/work","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]"#
         );
         std::fs::write(&executable, script).unwrap();
@@ -688,6 +829,21 @@ mod tests {
         assert!(!pulls[0].merged);
         assert_eq!(pulls[0].source_head, intent.source_head);
         assert_eq!(pulls[0].timeline, ObservationCapability::Known(Vec::new()));
+    }
+
+    #[test]
+    fn review_material_reads_diff_checks_and_reviews_for_the_pinned_head() {
+        let (_temp, publisher, intent) = fixture_publisher();
+        let pull = publisher.publish(&intent).unwrap();
+        let material = publisher
+            .review_material(&intent.clone_url, pull.number, &intent.source_head)
+            .unwrap();
+        assert!(material.patch.contains("diff --git"));
+        assert_eq!(material.checks, vec!["lint: completed (success)"]);
+        assert_eq!(
+            material.reviews,
+            vec!["alice: APPROVED at 2026-11-07T00:00:00Z"]
+        );
     }
 
     #[test]

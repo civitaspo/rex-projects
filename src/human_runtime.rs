@@ -632,6 +632,8 @@ pub enum HumanSubjectObservation {
 /// here until that adapter is supplied by the runtime composition.
 pub struct DurableHumanSubjectObserver {
     declarative_root: PathBuf,
+    delivery_effects: Option<std::sync::Arc<crate::delivery_runtime::RepositoryDeliveryEffects>>,
+    owner_generation: Option<u64>,
 }
 
 impl DurableHumanSubjectObserver {
@@ -639,7 +641,26 @@ impl DurableHumanSubjectObserver {
         if !declarative_root.is_absolute() {
             return Err("profile declarative root must be absolute".into());
         }
-        Ok(Self { declarative_root })
+        Ok(Self {
+            declarative_root,
+            delivery_effects: None,
+            owner_generation: None,
+        })
+    }
+
+    pub fn with_delivery(
+        declarative_root: PathBuf,
+        owner_generation: u64,
+        delivery_effects: std::sync::Arc<crate::delivery_runtime::RepositoryDeliveryEffects>,
+    ) -> Result<Self, String> {
+        if !declarative_root.is_absolute() || owner_generation == 0 {
+            return Err("human observer requires an absolute config root and active owner".into());
+        }
+        Ok(Self {
+            declarative_root,
+            delivery_effects: Some(delivery_effects),
+            owner_generation: Some(owner_generation),
+        })
     }
 }
 
@@ -654,17 +675,306 @@ impl HumanSubjectObserver for DurableHumanSubjectObserver {
             HumanPurpose::ProfilePromotion => {
                 observe_profile_subject(store, request, &self.declarative_root)
             }
+            HumanPurpose::ProfileTrial => observe_profile_trial_subject(store, request),
             HumanPurpose::PlanDecision | HumanPurpose::GoalCompletion => {
                 observe_typed_role_authority(store, request)
             }
-            HumanPurpose::TicketReview => Err(
-                "ticket review freshness requires a configured forge observer; decision remains queued".into(),
-            ),
+            HumanPurpose::TicketReview => match (&self.delivery_effects, self.owner_generation) {
+                (Some(effects), Some(generation)) => {
+                    observe_ticket_review_subject(store, request, effects, generation)
+                }
+                _ => {
+                    Err("ticket review requires the configured repository delivery observer".into())
+                }
+            },
             purpose => Err(format!(
                 "no authoritative host observer is configured for {purpose:?}; decision remains queued"
             )),
         }
     }
+}
+
+fn observe_profile_trial_subject(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+) -> Result<HumanSubjectObservation, String> {
+    let Some(authorization) =
+        store.pending_profile_trial_authorization_for_request(&request.request_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the profile trial authorization is no longer pending".into(),
+        ));
+    };
+    if authorization.project_id != request.subject.project_id
+        || authorization.authorization_id != request.subject.subject_id
+        || authorization.human_request_id != request.request_id
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the profile trial request no longer matches its durable authorization".into(),
+        ));
+    }
+    let bundle = crate::learning_trials::profile_trial_review_bundle(&authorization)?;
+    let expected = crate::learning_trials::profile_trial_human_request(
+        request.request_id.clone(),
+        &authorization,
+        bundle,
+        request.question.clone(),
+        authorization.expires_at_unix,
+    )?;
+    if expected != *request {
+        return Ok(HumanSubjectObservation::Gone(
+            "the profile trial review scope, evidence, or choices changed".into(),
+        ));
+    }
+    Ok(HumanSubjectObservation::Current(expected.subject))
+}
+
+fn human_digest_json<T: Serialize>(value: &T) -> Result<Digest, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn observe_ticket_review_subject(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+    delivery: &crate::delivery_runtime::RepositoryDeliveryEffects,
+    owner_generation: u64,
+) -> Result<HumanSubjectObservation, String> {
+    let Some(ticket_run_id) = request.subject.ticket_run_id.as_ref() else {
+        return Ok(HumanSubjectObservation::Gone(
+            "ticket review is missing its TicketRun binding".into(),
+        ));
+    };
+    let Some((project_id, revision, phase, required_review_revision)) =
+        store.current_ticket_human_scope(ticket_run_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the reviewed TicketRun no longer exists".into(),
+        ));
+    };
+    if project_id != request.subject.project_id
+        || phase != "waiting_human"
+        || required_review_revision != Some(revision)
+        || request.subject.revision.0 != revision
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the TicketRun is no longer waiting for review at this exact revision".into(),
+        ));
+    }
+    let Some(project) = store.project(&project_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project for this TicketRun no longer exists".into(),
+        ));
+    };
+    let Some(snapshot) = store.load_snapshot(&project.config_source)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if snapshot.revision != project.config_revision
+        || snapshot.config.digest != project.config_digest
+        || snapshot.config.digest != request.subject.configuration_digest
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project configuration changed after the review was prepared".into(),
+        ));
+    }
+    let Some(accepted) = store.latest_accepted_work_plan(&project_id, ticket_run_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the TicketRun no longer has an accepted implementation plan".into(),
+        ));
+    };
+    if accepted.configuration_digest != snapshot.config.digest {
+        return Ok(HumanSubjectObservation::Gone(
+            "the accepted plan was created under another configuration".into(),
+        ));
+    }
+    let effects = store.list_succeeded_effect_receipts(
+        owner_generation,
+        &project_id,
+        "ticket_run",
+        ticket_run_id.as_str(),
+        256,
+    )?;
+    let mut prepared: Option<crate::delivery_runtime::PreparedWorktreesEffectReceipt> = None;
+    let mut publications = Vec::new();
+    for effect in effects {
+        match effect.intent().kind.as_str() {
+            "prepare_worktrees" => {
+                let receipt = crate::protocol::parse_unique(effect.receipt_json().as_bytes())?;
+                if prepared.replace(receipt).is_some() {
+                    return Ok(HumanSubjectObservation::Gone(
+                        "multiple worktree preparations exist for the review scope".into(),
+                    ));
+                }
+            }
+            "publish_implementation" => publications.push(effect),
+            _ => {}
+        }
+    }
+    let Some(prepared) = prepared else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the TicketRun has no durable prepared-worktree receipt".into(),
+        ));
+    };
+    let work_plan = crate::engine::orchestration::WorkPlan {
+        nodes: accepted
+            .plan
+            .nodes_in_execution_order
+            .iter()
+            .map(|node| crate::engine::orchestration::PlannedWorkNode {
+                id: node.id.clone(),
+                repository: node.repository.clone(),
+                task: node.task.clone(),
+                depends_on: node.depends_on.clone(),
+                required_evidence: node.required_evidence.clone(),
+                investigation: node.role != crate::domain::types::Role::Worker,
+            })
+            .collect(),
+        requested_investigation_children: accepted.plan.spawned_investigation_children,
+    };
+    let repositories = snapshot
+        .config
+        .config
+        .repositories
+        .iter()
+        .map(|(id, config)| (id.clone(), config.clone()))
+        .collect();
+    let publication_proof = crate::delivery_runtime::validate_implementation_publication_receipt(
+        &work_plan,
+        &prepared,
+        &project_id,
+        &repositories,
+        &publications,
+    )?;
+    let _validated_publication_set = publication_proof;
+
+    let mut repositories_review = Vec::new();
+    let mut evidence = vec![ReviewEvidence {
+        title: "Accepted implementation plan".into(),
+        body: serde_json::to_string_pretty(&accepted.plan).map_err(|error| error.to_string())?,
+        truncated: false,
+    }];
+    let mut publication_bindings = Vec::new();
+    let mut policy_rows = Vec::new();
+    let mut aggregate_patch_bytes = 0usize;
+    for publication in &publications {
+        let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+            crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+        let (pull, material) = delivery.resolve_current_pull_request_review(&receipt)?;
+        let observed_review_digest = human_digest_json(&(&pull, &material))?;
+        aggregate_patch_bytes = aggregate_patch_bytes.saturating_add(material.patch.len());
+        if aggregate_patch_bytes > 768 * 1024 {
+            return Err("combined PR diff exceeds the human review artifact size limit".into());
+        }
+        let repository = snapshot
+            .config
+            .config
+            .repositories
+            .get(&receipt.repository_id)
+            .ok_or("published repository is no longer configured")?;
+        let mut merge_steps = Vec::new();
+        if let Some(instructions) = &repository.merge.instructions {
+            merge_steps.push(instructions.clone());
+        }
+        if !repository.merge.instruction_files.is_empty() {
+            merge_steps.extend(
+                repository
+                    .merge
+                    .instruction_files
+                    .iter()
+                    .map(|path| format!("Configured merge instruction file: {path}")),
+            );
+        }
+        if merge_steps.is_empty() {
+            merge_steps.push(format!(
+                "Configured merge method: {:?}; executor: {:?}",
+                repository.merge.method, repository.merge.executor
+            ));
+        }
+        repositories_review.push(crate::human::RepositoryReview {
+            repository: receipt.repository_id.as_str().to_owned(),
+            pull_request: format!("#{}", pull.number),
+            url: Some(pull.url.clone()),
+            base_ref: pull.base_branch.clone(),
+            base_sha: pull.base_sha.clone(),
+            head_ref: pull.source_branch.clone(),
+            head_sha: pull.source_head.clone(),
+            checks: material.checks.clone(),
+            review_receipts: material.reviews.clone(),
+            merge_steps,
+        });
+        evidence.push(ReviewEvidence {
+            title: format!("{} pull request diff", receipt.repository_id),
+            body: material.patch,
+            truncated: false,
+        });
+        evidence.push(ReviewEvidence {
+            title: format!("{} current checks and reviews", receipt.repository_id),
+            body: format!(
+                "Checks:\n{}\n\nReviews:\n{}\n\nPR state: {}; merged: {}",
+                material.checks.join("\n"),
+                material.reviews.join("\n"),
+                pull.state,
+                pull.merged
+            ),
+            truncated: false,
+        });
+        publication_bindings.push((
+            receipt.repository_id.clone(),
+            receipt.work_node_id,
+            receipt.commit.head().to_owned(),
+            pull.base_sha.clone(),
+            publication.intent().request_digest.clone(),
+            observed_review_digest,
+        ));
+        policy_rows.push((receipt.repository_id, repository.merge.clone()));
+    }
+    publication_bindings.sort_by(|left, right| left.0.cmp(&right.0));
+    policy_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let bundle = ReviewBundle {
+        title: "Human review of implementation changes".into(),
+        summary: format!(
+            "Review {} current pull request(s) for TicketRun {} at revision {}.",
+            repositories_review.len(),
+            ticket_run_id,
+            revision
+        ),
+        risk: None,
+        repositories: repositories_review,
+        evidence,
+        unknowns: Vec::new(),
+    };
+    bundle.validate()?;
+    let material_digest = human_digest_json(&(
+        ticket_run_id,
+        revision,
+        accepted.plan_digest,
+        publication_bindings,
+    ))?;
+    let policy_digest = human_digest_json(&policy_rows)?;
+    let binding = HumanSubjectBinding {
+        project_id,
+        kind: HumanSubjectKind::TicketRun,
+        subject_id: ticket_run_id.as_str().to_owned(),
+        ticket_run_id: Some(ticket_run_id.clone()),
+        revision: Revision(revision),
+        material_digest,
+        configuration_digest: snapshot.config.digest,
+        policy_digest,
+        bundle_digest: review_bundle_digest(&bundle)?,
+    };
+    if request.purpose != HumanPurpose::TicketReview
+        || request.subject != binding
+        || request.review_bundle != bundle
+        || !request
+            .choices
+            .iter()
+            .all(|choice| request.purpose.allows(*choice))
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the current PRs, checks, reviews, merge policy, or review evidence changed".into(),
+        ));
+    }
+    Ok(HumanSubjectObservation::Current(binding))
 }
 
 fn observe_operation_subject(
@@ -1204,8 +1514,13 @@ impl HumanPresenterEffectHandler {
             .map_err(|_| "controller time is before the Unix epoch".to_owned())?;
         let effect: HumanPresentationEffect = parse_unique(request.intent.request_json.as_bytes())?;
         let review = &effect.request;
+        let subject_scope_matches = effect_subject_matches(
+            &request.intent.subject_type,
+            &request.intent.subject_id,
+            review,
+        );
         if request.intent.project_id != review.subject.project_id
-            || request.intent.subject_id != review.subject.subject_id
+            || !subject_scope_matches
             || request.intent.expected_revision != Some(review.subject.revision.0)
         {
             return Err(
@@ -1355,6 +1670,24 @@ impl HumanPresenterEffectHandler {
             return self.present(request, context);
         }
         observation_for_lifecycle(summary.lifecycle, &effect.request.request_id)
+    }
+}
+
+fn effect_subject_matches(
+    effect_subject_type: &str,
+    effect_subject_id: &str,
+    request: &HumanRuntimeRequest,
+) -> bool {
+    match request.purpose {
+        HumanPurpose::OperationApproval => {
+            effect_subject_type == "ticket_run"
+                && request
+                    .subject
+                    .ticket_run_id
+                    .as_ref()
+                    .is_some_and(|ticket_run_id| effect_subject_id == ticket_run_id.as_str())
+        }
+        _ => effect_subject_id == request.subject.subject_id,
     }
 }
 
@@ -1758,6 +2091,15 @@ mod presenter_tests {
         assert_ne!(first, changed.digest().unwrap());
         changed.ticket_run_id = None;
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn operation_presentation_uses_ticket_scope_but_keeps_operation_subject_id() {
+        let request = sample_request();
+        assert_eq!(request.subject.subject_id, "deploy-1");
+        assert!(effect_subject_matches("ticket_run", "run-1", &request));
+        assert!(!effect_subject_matches("operation", "deploy-1", &request));
+        assert!(!effect_subject_matches("ticket_run", "other-run", &request));
     }
 
     #[test]

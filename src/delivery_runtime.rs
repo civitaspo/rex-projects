@@ -1421,6 +1421,31 @@ impl RepositoryDeliveryEffects {
         Ok(pull.clone())
     }
 
+    /// Resolve a durable publication receipt and fetch the human-readable diff, checks, and
+    /// reviews for the same PR. The receipt is checked before any detail is returned.
+    pub fn resolve_current_pull_request_review(
+        &self,
+        receipt: &ImplementationPublicationReceipt,
+    ) -> Result<
+        (
+            crate::delivery_forge::ObservedPullRequest,
+            crate::delivery_forge::PullRequestReviewMaterial,
+        ),
+        String,
+    > {
+        let pull = self.resolve_current_pull_request(receipt)?;
+        let repository = self.repository(&receipt.repository_id)?;
+        let material = self
+            .publisher
+            .review_material(
+                &repository.clone_url,
+                receipt.pull_request.number,
+                &receipt.commit.head(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok((pull, material))
+    }
+
     /// Fresh, paginated view used by human review and publication reconciliation.
     pub fn observe_current_pull_requests(
         &self,

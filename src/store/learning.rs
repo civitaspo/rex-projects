@@ -365,6 +365,35 @@ pub(crate) fn validate_v10_schema(connection: &Connection) -> Result<(), String>
 }
 
 impl ConfigStore {
+    /// Resolve the exact immutable profile-trial authorization for a pending human request.
+    /// The table is created by the coordinated v12 learning migration.
+    pub(crate) fn pending_profile_trial_authorization_for_request(
+        &self,
+        request_id: &HumanRequestId,
+    ) -> Result<Option<crate::learning_trials::ProfileTrialAuthorization>, String> {
+        let row: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT authorization_json,authorization_digest FROM profile_trial_authorizations WHERE human_request_id=?1 AND lifecycle='pending'",
+                [request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((json, stored_digest)) = row else {
+            return Ok(None);
+        };
+        let authorization: crate::learning_trials::ProfileTrialAuthorization =
+            crate::protocol::parse_unique(json.as_bytes())?;
+        if authorization.human_request_id != *request_id
+            || authorization.digest()?.as_str() != stored_digest
+        {
+            return Err("stored pending profile trial authorization is invalid".into());
+        }
+        authorization.validate()?;
+        Ok(Some(authorization))
+    }
+
     pub(crate) fn ensure_postmortem_published(
         &self,
         ticket_run_id: &TicketRunId,
