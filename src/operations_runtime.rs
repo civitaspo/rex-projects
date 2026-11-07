@@ -113,6 +113,7 @@ pub struct OperationEffectHandler {
     database_path: PathBuf,
     snapshots: BTreeMap<String, AppliedConfig>,
     process_shutdown_grace: Duration,
+    owner_generation: u64,
 }
 
 impl OperationEffectHandler {
@@ -120,9 +121,13 @@ impl OperationEffectHandler {
         database_path: impl Into<PathBuf>,
         snapshots: impl IntoIterator<Item = AppliedConfig>,
         process_shutdown_grace: Duration,
+        owner_generation: u64,
     ) -> Result<Self, String> {
         if process_shutdown_grace.is_zero() {
             return Err("process shutdown grace must be non-zero".into());
+        }
+        if owner_generation == 0 {
+            return Err("controller owner generation must be non-zero".into());
         }
         let mut by_digest = BTreeMap::new();
         for snapshot in snapshots {
@@ -138,6 +143,7 @@ impl OperationEffectHandler {
             database_path: database_path.into(),
             snapshots: by_digest,
             process_shutdown_grace,
+            owner_generation,
         })
     }
 
@@ -289,7 +295,7 @@ impl OperationEffectHandler {
             if record.state == DurableOperationState::Unknown && attempt_count < 2 {
                 return Err("unknown operation requires reconciliation before retry".into());
             }
-            store.record_invoking(operation_id, now)?;
+            store.record_invoking(self.owner_generation, operation_id, now)?;
         }
 
         let mut runner = ProcessCommandRunner::new(self.process_shutdown_grace)?;
@@ -304,12 +310,12 @@ impl OperationEffectHandler {
         match call {
             Ok(AdapterCall::Uncertain(reason)) => {
                 let mut store = OperationsStore::new(connection)?;
-                store.record_unknown(operation_id, unix_now()?)?;
+                store.record_unknown(self.owner_generation, operation_id, unix_now()?)?;
                 Ok(pending_receipt(operation_id, "invoke_uncertain", &reason))
             }
             Err(error) => {
                 let mut store = OperationsStore::new(connection)?;
-                store.record_handler_failure(operation_id, unix_now()?)?;
+                store.record_handler_failure(self.owner_generation, operation_id, unix_now()?)?;
                 Ok(pending_receipt(
                     operation_id,
                     "invoke_unknown",
@@ -319,7 +325,7 @@ impl OperationEffectHandler {
             Ok(AdapterCall::Response(response)) => {
                 let Some(value) = response.result else {
                     let mut store = OperationsStore::new(connection)?;
-                    store.record_unknown(operation_id, unix_now()?)?;
+                    store.record_unknown(self.owner_generation, operation_id, unix_now()?)?;
                     return Ok(pending_receipt(
                         operation_id,
                         "invoke_unknown",
@@ -337,6 +343,7 @@ impl OperationEffectHandler {
                         let terminal_receipt = store_terminal_receipt(effect, &outcome)?;
                         let mut store = OperationsStore::new(connection)?;
                         store.record_observation(
+                            self.owner_generation,
                             operation_id,
                             &receipt,
                             Some(&terminal_receipt),
@@ -348,7 +355,11 @@ impl OperationEffectHandler {
                     InvokeOutcome::Accepted | InvokeOutcome::Completed => {
                         let Some(external_reference) = result.external_reference else {
                             let mut store = OperationsStore::new(connection)?;
-                            store.record_unknown(operation_id, unix_now()?)?;
+                            store.record_unknown(
+                                self.owner_generation,
+                                operation_id,
+                                unix_now()?,
+                            )?;
                             return Ok(pending_receipt(
                                 operation_id,
                                 "invoke_missing_reference",
@@ -356,6 +367,7 @@ impl OperationEffectHandler {
                             ));
                         };
                         OperationsStore::new(connection)?.record_running(
+                            self.owner_generation,
                             operation_id,
                             &external_reference,
                             unix_now()?,
@@ -481,6 +493,7 @@ impl OperationEffectHandler {
                     .external_reference
                     .ok_or_else(|| "found operation omitted its external reference".to_owned())?;
                 OperationsStore::new(connection)?.record_running(
+                    self.owner_generation,
                     &request.subject.operation_id,
                     &reference,
                     unix_now()?,
@@ -609,6 +622,7 @@ impl OperationEffectHandler {
             Some(store_terminal_receipt(effect, &outcome)?)
         };
         OperationsStore::new(connection)?.record_observation(
+            self.owner_generation,
             &request.subject.operation_id,
             &observation_json,
             terminal_receipt.as_deref(),
@@ -838,7 +852,22 @@ mod tests {
                 request_json: row.get(6)?, request_digest: row.get(7)?, expected_revision: row.get(8)?,
             }),
         ).unwrap();
-        let handler = OperationEffectHandler::new(&db, [applied], Duration::from_secs(2)).unwrap();
+        let old_handler =
+            OperationEffectHandler::new(&db, [applied.clone()], Duration::from_secs(2), 1).unwrap();
+        connection
+            .execute(
+                "UPDATE controller_owners SET generation=2 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            old_handler
+                .handle(OperationExecutionMode::Submit, &effect, 1)
+                .is_err()
+        );
+        assert!(!remote_state.exists());
+        let handler =
+            OperationEffectHandler::new(&db, [applied], Duration::from_secs(2), 2).unwrap();
 
         let first = handler
             .handle(OperationExecutionMode::Submit, &effect, 1)
@@ -862,6 +891,7 @@ mod tests {
             &db,
             [applied_config(&remote_state)],
             Duration::from_secs(2),
+            2,
         )
         .unwrap();
         let replayed = restarted
@@ -880,10 +910,51 @@ mod tests {
                 .unwrap(),
             CompletionGate::WaitingForPostmortem
         );
+        // A former controller may still hold this handler after a restart.
+        // Its terminal read is harmless, but every attempted state write must
+        // fail under the replacement owner's generation.
+        assert!(
+            OperationsStore::new(&mut connection)
+                .unwrap()
+                .record_postmortem_receipt(
+                    1,
+                    &project_id,
+                    &ticket_run_id,
+                    &Digest::parse("c".repeat(64)).unwrap(),
+                    101
+                )
+                .is_err()
+        );
+        assert!(
+            OperationsStore::new(&mut connection)
+                .unwrap()
+                .record_observation(
+                    1,
+                    &operation_id,
+                    "{}",
+                    None,
+                    DurableOperationState::Succeeded,
+                    101
+                )
+                .is_err()
+        );
+        assert!(
+            OperationsStore::new(&mut connection)
+                .unwrap()
+                .record_unknown(1, &operation_id, 101)
+                .is_err()
+        );
+        assert_eq!(
+            OperationsStore::new(&mut connection)
+                .unwrap()
+                .completion_gate(&project_id, &ticket_run_id)
+                .unwrap(),
+            CompletionGate::WaitingForPostmortem
+        );
         let receipt = Digest::parse("b".repeat(64)).unwrap();
         OperationsStore::new(&mut connection)
             .unwrap()
-            .record_postmortem_receipt(&project_id, &ticket_run_id, &receipt, 101)
+            .record_postmortem_receipt(2, &project_id, &ticket_run_id, &receipt, 101)
             .unwrap();
         assert_eq!(
             OperationsStore::new(&mut connection)
