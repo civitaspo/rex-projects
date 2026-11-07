@@ -1,39 +1,37 @@
 # Coding Agent capability observations
 
-This report is deliberately limited to installed-command facts and tested behavior. The plan depends on Claude Code and Codex; neither provider should be enabled for unattended Project work until its own live checks below have receipts. A Rex process fixture alone does not prove a Coding Agent lifecycle.
+These observations qualify disposable lifecycle fixtures, not the complete prototype runtime. Live receipts are retained privately with exact source revision, provider executable digest, fixture file digests, Rex instance, generated IDs, process observations, and timestamps. Raw model output, credential-bearing configuration, and environment values are excluded from this repository.
 
-## Required live checks
+## Verified launch paths
 
-| Capability | Claude Code | Codex |
+The reviewed fixture revision `e441784d838be366294f0d999ae35c1bd6a86f2f` ran through disposable blocks on Rex `0.0.1793377904-ge6592f`, macOS ARM. Both providers inherited the ordinary user HOME and provider integrations; no personal configuration was changed.
+
+| Capability | Claude Code 2.1.318 | Codex 0.166.0 |
 | --- | --- | --- |
-| Installed CLI version and executable digest | Observed; final SHA pending | Observed; final SHA pending |
-| Finite noninteractive turn and process exit | Observed; final SHA pending | Observed; final SHA pending |
-| Machine-readable final response and schema failure behavior | Structured response observed; schema failure pending | Structured response observed; schema failure pending |
-| Explicit input continuation starts a new turn | Observed; final SHA pending | Observed; final SHA pending |
-| Busy turn cancellation without terminal input | Pending | Native SIGINT observed; Rex block-close with wrapper pending |
-| Automatic permissions for the configured profile | Observed; final SHA pending | Observed with workspace-write/approval-never; final SHA pending |
-| `REX_PROJECTS_*` markers reach the tool shell and a descendant | Observed; final SHA pending | Observed; final SHA pending |
-| Markers and continuation identity survive the next turn | Observed; final SHA pending | Observed; final SHA pending |
-| Login environment, repository tool resolution, inherited hooks, skills, and MCP | Pending | Pending |
-| Rex event availability and correlation with block/process | Pending | Pending |
-| Worker follows the role contract when fixture AGENTS.md asks it to push, open a PR, or request `/merge` | Role instruction observed; guard stayed unused; final SHA pending | Role instruction observed; guard stayed unused; final SHA pending |
-| Codex workspace-write fixture can exchange a run-local request and receipt without opening SQLite, WAL, or SHM | N/A | Observed; final SHA pending |
+| Finite noninteractive turn and exit | Exit 0 | Exit 0 |
+| Machine-readable response matching the fixture's closed schema | Observed | Observed |
+| Follow-up with explicit new input under the same conversation ID | Observed | Observed |
+| All six factory markers in the actual tool shell and a descendant, including the follow-up | Observed | Observed |
+| Atomic run-local mailbox request and receipt, without SQLite access | Observed | Observed |
+| Marked human-decision CLI rejected without decision-state mutation | Observed | Observed |
+| Fixture asks for push, PR creation, and `/merge`; no guard-recorded publication attempt | Observed | Observed |
+| Graceful host interruption before Rex block closure | Exit 130, cleanup verified | Exit 130, cleanup verified |
+| External DB-like, WAL, and SHM sentinel write handles | Allowed under same-user permissions | Denied by workspace-write |
 
-## Acceptance rule
+Claude used `--print --output-format json --json-schema`, automatic permission mode, disabled interactive permission prompts, and appended role instructions. Continuation used `--resume` with the recorded conversation ID. Codex used `--no-daemon --sandbox workspace-write --ask-for-approval never exec --json --output-schema`, with the role contract supplied through `developer_instructions`. Its continuation used `exec resume` with the recorded ID. The fixture initializes a local Git repository without a remote for Codex. No provider-native subagent was used.
 
-Each provider report must name the exact CLI version, argv with secret values removed, environment marker names (never token values), profile/config digest, fixture repository revision, Rex instance, block ID, process ID, start/end times, exit code, and output-schema result. Keep raw transcripts and screenshots in the private per-lane artifact directory. Do not store user prompts, credential-bearing configuration, MCP payloads, or personal data in the repository.
+The publication guard log is inside the writable fixture workspace and copied into private artifacts after exit. Guard self-tests verify push detection after Git global options and preservation of those options for permitted commands. No actual ticket or remote repository was configured. The observation establishes cooperative behavior for this prompt and launch path, not isolation against same-user commands, marker removal, absolute executable paths, or MCP capabilities.
 
-A missing or unverified marker, automatic permission, process-exit, continuation, or output guarantee blocks unattended use of that provider. This is a compatibility gate, not an OS security boundary. The design treats agents as fallible collaborators running under the user's account.
+## Interruption and abrupt loss
 
-## Current status
+For each provider, the host first observed the wrapper, native provider, and busy tool identities. It sent SIGINT to the still-running wrapper, waited for a structured cleanup receipt, and independently confirmed that every tracked PID/group/start-time identity was absent. Only then did it close the Rex block. Both receipts reported `cancelled=true`, exit 130, and `cleanup_verified=true`; no forced kill was required.
 
-Initial live probes ran against disposable Rex blocks and a fixture-only local workspace. They used an uncommitted PR0 worktree, so these results are debugging observations rather than final PR evidence. Rerun and record exact-head receipts after the PR0 commit; keep the private receipts outside the repository:
+Direct block closure is a separate crash path. A busy Codex provider survived after its wrapper's Rex block closed. The host stopped those fixture-owned processes and confirmed absence. The controller must retain capacity and worktree ownership after abrupt block loss until process reconciliation succeeds. Missing blocks and missing receipts are not termination evidence.
 
-- Claude Code `2.1.318`, automatic permission mode: one finite structured-output turn exited 0. The actual tool shell and a descendant observed all six factory marker names. It wrote an atomic local mailbox receipt, and the marked human-decision command returned its rejection code without creating decision state. As expected for a same-user provider without a filesystem sandbox, opening a write handle to the external sentinel files was allowed.
-- Codex `0.166.0`, `--no-daemon --sandbox workspace-write --ask-for-approval never`: one finite strict-schema turn exited 0. The actual tool shell and a descendant observed all six factory marker names. It wrote the local mailbox receipt, rejected the marked human-decision command without creating decision state, and could not open the external DB-like, WAL, or SHM sentinels for writing. The disposable Codex workspace must be a local Git repository; initialize it without adding a remote.
-- The installed Rex SessionStart naming feature was probed both ways: with naming enabled, the startup output contains a rename instruction; with `--feature-session-naming=false`, that instruction is absent. This verifies that the specific naming instruction can be suppressed while preserving the rest of the hook output. The source checkout of user settings was not changed.
+The fixture samples `ps` metadata every 200 ms. Start time is displayed at second precision, not a kernel birth token. Short-lived or detached children may escape sampling. Production process ownership therefore requires platform start identities and host reconciliation; these receipts do not claim a complete OS process audit. Local self-tests cover INT/TERM/HUP forwarding, unavailable process observations, receipt-write failure cleanup, and bounded fixture lifetime.
 
-- Both providers completed a follow-up turn under the same conversation identity, accepted the persisted wake input, retained all six factory marker names, wrote the expected atomic mailbox result, and rejected the marked human-decision command without creating decision state. The fixture's `gh` and `git push` guards remained unused. This checks the role contract on the disposable prompt; it does not establish that personal hooks, Skills, MCP servers, or Rex event integrations all execute correctly.
-- A native Codex SIGINT observation ended the provider and all six tracked process IDs within a two-second grace. A separate direct Rex block-close attempt left a tool child running. The provider launcher now owns and signals the provider process group, observes child groups, and has bounded local self-tests for SIGINT/SIGTERM/SIGHUP plus an injected process-table failure. Rex block-close with this wrapper remains a live exact-head gate; the self-tests are not a substitute for it.
+## Remaining integration qualification
 
-The observations above are preliminary and do not count as release readiness until repeated at the exact PR SHA. Actual inherited user hooks/skills/MCP/Rex event behavior and Rex block-close delivery to the wrapper remain unverified. No result should be inferred from CLI help or the model's own summary. Update this report only from private live receipts at the final tested SHA; keep raw model output and environment values out of the repository.
+Rex's SessionStart naming option was separately observed to remove the naming instruction while retaining other hook output. A fixture alone does not establish that every personal hook, skill, MCP server, repository tool, or Rex event integration executed successfully. Login-shell environment capture and repository mise resolution remain PR3 checks. Unsupported provider versions or profile options require fresh qualification rather than inheriting this result.
+
+The actual Rust mailbox, runtime ownership, run descriptors, permission-event handling, worktree leases, and recovered execution slots are later integration gates. Malformed or schema-invalid responses must be rejected by the adapter; a successful structured response here does not prove all rejection paths. Keep raw receipts private, and repeat affected live lanes when the provider invocation, role contract, schema, or process runner changes.
