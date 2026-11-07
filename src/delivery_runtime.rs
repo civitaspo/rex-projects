@@ -53,6 +53,20 @@ pub struct WorkNodeIdentity {
 }
 
 impl WorkNodeIdentity {
+    /// The stable branch identity used by the managed worktree layer, without creating or
+    /// fetching a worktree. Used to capture the external-resource baseline before mutation.
+    pub fn branch_name(&self) -> Result<String, DeliveryError> {
+        let key = self.ticket_key()?;
+        let mut digest = Sha256::new();
+        digest.update(key.namespace.as_str());
+        digest.update([0]);
+        digest.update(key.ticket_id.as_str());
+        Ok(format!(
+            "rex-projects/{}",
+            hex_lower(&digest.finalize()[..16])
+        ))
+    }
+
     fn ticket_key(&self) -> Result<TicketKey, DeliveryError> {
         if self.work_node_id.is_empty()
             || self.work_node_id.len() > 255
@@ -298,6 +312,65 @@ impl RepositoryDelivery {
             expected_base_sha: expected_base_sha.to_owned(),
             commit_mode,
         })
+    }
+
+    /// Read one exact remote branch without initializing the managed clone.
+    pub fn observe_configured_remote_branch(
+        &self,
+        repository_config: &RepositoryConfig,
+        branch: &str,
+    ) -> Result<Option<String>, DeliveryError> {
+        let reference = format!("refs/heads/{branch}");
+        let output = process::run(ProcessRequest {
+            executable: self.git.executable.clone(),
+            args: vec![
+                "ls-remote".into(),
+                "--heads".into(),
+                repository_config.clone_url.clone().into(),
+                reference.clone().into(),
+            ],
+            stdin: Vec::new(),
+            cwd: None,
+            clear_environment: true,
+            environment: self.git.environment.clone(),
+            timeout: self.git.timeout,
+            shutdown_grace: DELIVERY_SHUTDOWN_GRACE,
+            stdout_limit: 64 * 1024,
+            stderr_tail_limit: DELIVERY_STDERR_LIMIT,
+        })
+        .map_err(|_| {
+            DeliveryError::Unknown("could not observe the configured remote branch".into())
+        })?;
+        if !output.status.is_some_and(|status| status.success())
+            || output.timed_out
+            || !output.cleanup_confirmed
+            || output.stdout_truncated
+        {
+            return Err(DeliveryError::Unknown(
+                "could not establish the configured remote branch state".into(),
+            ));
+        }
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|_| DeliveryError::Unknown("remote branch response is not UTF-8".into()))?;
+        let mut rows = text.lines();
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        if rows.next().is_some() {
+            return Err(DeliveryError::Unknown(
+                "remote returned multiple rows for an exact branch ref".into(),
+            ));
+        }
+        let (sha, refname) = row.split_once('\t').ok_or_else(|| {
+            DeliveryError::Unknown("remote returned a malformed branch ref".into())
+        })?;
+        validate_git_sha(sha)?;
+        if refname != reference {
+            return Err(DeliveryError::Unknown(
+                "remote returned a different branch ref".into(),
+            ));
+        }
+        Ok(Some(sha.to_owned()))
     }
 
     /// Inspect actual refs and objects for native commits, or execute/reconcile the host manifest.
@@ -1367,6 +1440,75 @@ impl RepositoryDeliveryEffects {
             .map_err(|error| error.to_string())
     }
 
+    pub fn observe_remote_branch(
+        &self,
+        repository_id: &RepositoryId,
+        branch: &str,
+    ) -> Result<Option<String>, String> {
+        self.delivery
+            .observe_configured_remote_branch(self.repository(repository_id)?, branch)
+            .map_err(|error| error.to_string())
+    }
+
+    fn ensure_initial_publication_baseline(
+        &self,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        request: &EffectRequest,
+        payload: &PrepareWorktreesEffectPayload,
+        node: &PreparedWorktreeNodeRequest,
+        now_unix: i64,
+    ) -> Result<(), String> {
+        let identity = WorkNodeIdentity {
+            project_id: request.intent.project_id.clone(),
+            repository_id: node.repository_id.clone(),
+            ticket_namespace: payload.ticket_namespace.clone(),
+            ticket_id: payload.ticket_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            work_node_id: node.work_node_id.to_string(),
+        };
+        let branch = identity.branch_name().map_err(|error| error.to_string())?;
+        let resource = crate::store::publication_monitor::PublicationResource {
+            project_id: request.intent.project_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            repository_id: node.repository_id.clone(),
+            branch: branch.clone(),
+        };
+        if let Some(baseline) = store.load_publication_baseline(&resource)? {
+            if baseline.base_branch != self.repository(&node.repository_id)?.base_branch {
+                return Err(
+                    "stored publication baseline does not match current repository base branch"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        let repository = self.repository(&node.repository_id)?;
+        let remote_head = self
+            .delivery
+            .observe_configured_remote_branch(repository, &branch)
+            .map_err(|error| error.to_string())?;
+        let observed = self.observe_current_pull_requests(&node.repository_id, &branch)?;
+        let observation = RepositoryPublicationObservation {
+            remote_head,
+            pull_requests: observed.pull_requests,
+        };
+        if observation.remote_head.is_some()
+            || observation.pull_requests
+                != crate::delivery_forge::ObservationCapability::Known(Vec::new())
+        {
+            return Err("managed branch or pull request already exists without a trusted initial baseline; human reconciliation is required".into());
+        }
+        store.insert_initial_publication_baseline(
+            owner_generation,
+            &resource,
+            &repository.base_branch,
+            &observation,
+            now_unix,
+        )?;
+        Ok(())
+    }
+
     fn prepare_worktrees(
         &self,
         request: &EffectRequest,
@@ -2290,7 +2432,7 @@ impl EffectHandler for PrepareWorktreesEffectHandler {
         &self,
         _mode: EffectMode,
         request: &EffectRequest,
-        _context: &mut EffectContext<'_>,
+        context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String> {
         let payload: PrepareWorktreesEffectPayload = match decode_effect_payload(request) {
             Ok(payload) => payload,
@@ -2298,6 +2440,18 @@ impl EffectHandler for PrepareWorktreesEffectHandler {
         };
         if let Err(error) = self.effects.validate_prepare_payload(request, &payload) {
             return Ok(rejected_delivery_effect(error));
+        }
+        for node in &payload.work_nodes {
+            if let Err(error) = self.effects.ensure_initial_publication_baseline(
+                context.store,
+                context.owner_generation,
+                request,
+                &payload,
+                node,
+                context.now_unix,
+            ) {
+                return Ok(rejected_delivery_effect(error));
+            }
         }
         let receipt = self.effects.prepare_worktrees(request)?;
         Ok(EffectObservation::Applied {
@@ -2407,6 +2561,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(TABLE[(byte >> 4) as usize]));
+        output.push(char::from(TABLE[(byte & 0x0f) as usize]));
+    }
+    output
 }
 
 fn validate_git_sha(value: &str) -> Result<(), DeliveryError> {

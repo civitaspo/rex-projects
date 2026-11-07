@@ -24,6 +24,17 @@ pub struct RuntimeDelivery {
     git_executable: PathBuf,
     git_environment: BTreeMap<OsString, OsString>,
     repositories: BTreeMap<RepositoryId, RepositoryConfig>,
+    publication_cursor: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationMonitorTick {
+    Idle,
+    EffectReconciling,
+    Unknown,
+    Unchanged,
+    BaselineAdvanced { revision: u64 },
+    IrregularityRecorded { revision: u64 },
 }
 
 impl RuntimeDelivery {
@@ -33,6 +44,201 @@ impl RuntimeDelivery {
 
     pub fn effects(&self) -> &RepositoryDeliveryEffects {
         &self.effects
+    }
+
+    fn observe_snapshot(
+        &self,
+        repository_id: &RepositoryId,
+        branch: &str,
+    ) -> Result<crate::delivery_runtime::RepositoryPublicationObservation, String> {
+        self.repositories
+            .get(repository_id)
+            .ok_or_else(|| format!("unknown repository `{repository_id}`"))?;
+        let remote_head = self.effects.observe_remote_branch(repository_id, branch)?;
+        let pulls = self
+            .effects
+            .observe_current_pull_requests(repository_id, branch)?;
+        Ok(crate::delivery_runtime::RepositoryPublicationObservation {
+            remote_head,
+            pull_requests: pulls.pull_requests,
+        })
+    }
+
+    /// Inspect at most one accepted work node per call. The durable snapshot cursor advances
+    /// round-robin so a large queue cannot starve later repositories.
+    pub fn observe_publications(
+        &self,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<PublicationMonitorTick, String> {
+        let active = store.active_ticket_runs(owner_generation, 256)?;
+        let mut candidates = Vec::new();
+        for run in active {
+            let Some(plan) =
+                store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
+            else {
+                continue;
+            };
+            let receipts = store.list_succeeded_effect_receipts(
+                owner_generation,
+                &run.project_id,
+                "ticket_run",
+                run.ticket_run_id.as_str(),
+                256,
+            )?;
+            for receipt in receipts
+                .iter()
+                .filter(|entry| entry.intent().kind == "prepare_worktrees")
+            {
+                let prepared: crate::delivery_runtime::PreparedWorktreesEffectReceipt =
+                    crate::protocol::parse_unique(receipt.receipt_json().as_bytes())
+                        .map_err(|error| error.to_string())?;
+                if prepared.ticket_run_id != run.ticket_run_id {
+                    continue;
+                }
+                for node in prepared.work_nodes {
+                    if plan.plan.nodes_in_execution_order.iter().any(|planned| {
+                        planned.id == node.work_node_id
+                            && planned.repository == node.repository_id
+                            && planned.role == crate::domain::types::Role::Worker
+                    }) && store
+                        .prepared_worker_launch(
+                            owner_generation,
+                            plan.accepted_revision,
+                            &node.work_node_id,
+                            receipt,
+                        )?
+                        .is_some()
+                    {
+                        let resource = crate::store::publication_monitor::PublicationResource {
+                            project_id: run.project_id.clone(),
+                            ticket_run_id: run.ticket_run_id.clone(),
+                            repository_id: node.repository_id.clone(),
+                            branch: node.branch.clone(),
+                        };
+                        candidates.push((resource, receipts.clone()));
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(PublicationMonitorTick::Idle);
+        }
+        let index = self
+            .publication_cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % candidates.len();
+        let (resource, receipts) = candidates.swap_remove(index);
+        if store.publication_effect_in_flight(
+            &resource.project_id,
+            &resource.ticket_run_id,
+            &resource.repository_id,
+            &resource.branch,
+        )? {
+            return Ok(PublicationMonitorTick::EffectReconciling);
+        }
+        let Some(mut baseline) = store.load_publication_baseline(&resource)? else {
+            let observation = self.observe_snapshot(&resource.repository_id, &resource.branch)?;
+            let digest = canonical_observation_digest(&observation)?;
+            let saved = store.record_publication_irregularity(owner_generation, &crate::store::publication_monitor::PublicationIrregularity {
+                resource, observation_digest: digest, observed_at_unix: now_unix, facts: serde_json::json!({"reason":"prepared work node has no trusted pre-mutation baseline","observed_remote_head":observation.remote_head,"pull_requests":observation.pull_requests}),
+            })?;
+            return Ok(PublicationMonitorTick::IrregularityRecorded {
+                revision: saved.revision,
+            });
+        };
+        let observation = self.observe_snapshot(&resource.repository_id, &resource.branch)?;
+        let expected = crate::publication_monitor::ExpectedPublicationState {
+            remote_head: baseline.observation.remote_head.clone(),
+            pull_requests: match &baseline.observation.pull_requests {
+                crate::delivery_forge::ObservationCapability::Known(pulls) => pulls.clone(),
+                crate::delivery_forge::ObservationCapability::Unknown => {
+                    return Ok(PublicationMonitorTick::Unknown);
+                }
+            },
+        };
+        let publication = receipts
+            .iter()
+            .filter(|entry| entry.intent().kind == "publish_implementation")
+            .filter_map(|entry| {
+                let payload: crate::delivery_runtime::PublishImplementationEffectPayload =
+                    crate::protocol::parse_unique(entry.intent().request_json.as_bytes()).ok()?;
+                if payload.repository_id != resource.repository_id {
+                    return None;
+                }
+                let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+                    crate::protocol::parse_unique(entry.receipt_json().as_bytes()).ok()?;
+                (payload.ticket_run_id == resource.ticket_run_id
+                    && receipt.push.branch == resource.branch)
+                    .then_some((entry, receipt))
+            })
+            .last();
+        let mut host = crate::publication_monitor::ReconciledHostEffects::default();
+        if let Some((_, receipt)) = publication.as_ref() {
+            if observation.remote_head.as_deref() == Some(receipt.push.pushed_head.as_str()) {
+                host.confirmed_push_head = Some(receipt.push.pushed_head.clone());
+            }
+            if let crate::delivery_forge::ObservationCapability::Known(pulls) =
+                &observation.pull_requests
+            {
+                if let Some(pull) = pulls
+                    .iter()
+                    .find(|pull| pull.number == receipt.pull_request.number)
+                {
+                    if pull.node_id == receipt.pull_request.node_id
+                        && pull.source_head == receipt.pull_request.source_head
+                        && pull.source_branch == receipt.pull_request.source_branch
+                        && pull.base_branch == receipt.pull_request.base_branch
+                        && pull.title == receipt.pull_request.title
+                        && pull.body.as_deref().map(|body| sha256(body.as_bytes()))
+                            == Some(receipt.pull_request.body_digest.clone())
+                    {
+                        host.confirmed_pull_request = Some(pull.clone());
+                    }
+                }
+            }
+        }
+        match crate::publication_monitor::classify(&expected, &observation, &host) {
+            crate::publication_monitor::PublicationClassification::Unchanged => {
+                Ok(PublicationMonitorTick::Unchanged)
+            }
+            crate::publication_monitor::PublicationClassification::UnknownCapability => {
+                Ok(PublicationMonitorTick::Unknown)
+            }
+            crate::publication_monitor::PublicationClassification::Unexpected { reason } => {
+                let digest = canonical_observation_digest(&observation)?;
+                let saved = store.record_publication_irregularity(owner_generation, &crate::store::publication_monitor::PublicationIrregularity { resource, observation_digest: digest, observed_at_unix: now_unix, facts: serde_json::json!({"reason":reason,"observed_remote_head":observation.remote_head,"pull_requests":observation.pull_requests}) })?;
+                Ok(PublicationMonitorTick::IrregularityRecorded {
+                    revision: saved.revision,
+                })
+            }
+            crate::publication_monitor::PublicationClassification::HostEffectConfirmed => {
+                let Some((succeeded, _)) = publication else {
+                    return Err(
+                        "monitor classified a host effect without a succeeded durable receipt"
+                            .into(),
+                    );
+                };
+                if host.confirmed_pull_request.is_none() || host.confirmed_push_head.is_none() {
+                    let digest = canonical_observation_digest(&observation)?;
+                    let saved = store.record_publication_irregularity(owner_generation, &crate::store::publication_monitor::PublicationIrregularity { resource, observation_digest: digest, observed_at_unix: now_unix, facts: serde_json::json!({"reason":"remote state changed but does not match a complete succeeded publication receipt","observed_remote_head":observation.remote_head,"pull_requests":observation.pull_requests}) })?;
+                    return Ok(PublicationMonitorTick::IrregularityRecorded {
+                        revision: saved.revision,
+                    });
+                }
+                baseline = store.advance_publication_baseline(
+                    owner_generation,
+                    &baseline,
+                    &observation,
+                    succeeded,
+                    now_unix,
+                )?;
+                Ok(PublicationMonitorTick::BaselineAdvanced {
+                    revision: baseline.revision,
+                })
+            }
+        }
     }
 
     /// Resolve each configured base branch to its current remote commit without cloning or
@@ -170,11 +376,34 @@ pub fn build(
         git_executable: git,
         git_environment: captured_host_env.clone(),
         repositories,
+        publication_cursor: std::sync::atomic::AtomicUsize::new(0),
     })
 }
 
 fn valid_git_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn canonical_observation_digest(
+    observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+) -> Result<String, String> {
+    let mut normalized = observation.clone();
+    if let crate::delivery_forge::ObservationCapability::Known(pulls) =
+        &mut normalized.pull_requests
+    {
+        pulls.sort_by_key(|pull| pull.number);
+    }
+    let json = serde_json::to_value(normalized).map_err(|error| error.to_string())?;
+    let canonical = serde_json::to_string(&json).map_err(|error| error.to_string())?;
+    Ok(sha256(canonical.as_bytes()))
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn maximum_project_hook_attempts(config: &crate::config::Config) -> Result<u32, String> {

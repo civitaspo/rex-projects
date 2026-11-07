@@ -1,11 +1,239 @@
 //! Durable publication irregularities and exact-resource human resolution.
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{ConfigStore, validate_active_generation};
 use crate::domain::ids::{ProjectId, RepositoryId, TicketRunId};
+
+/// Install the publication-baseline journal as part of the shared v12 migration.
+pub fn migrate_v12_publication_baselines(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE publication_baselines (
+            project_id TEXT NOT NULL,
+            ticket_run_id TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            base_branch TEXT NOT NULL,
+            initial_snapshot_json TEXT NOT NULL,
+            initial_digest TEXT NOT NULL,
+            current_snapshot_json TEXT NOT NULL,
+            current_digest TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            last_effect_operation_id TEXT,
+            updated_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(project_id,ticket_run_id,repository_id,branch)
+        );
+        CREATE INDEX publication_baselines_run ON publication_baselines(project_id,ticket_run_id);",
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationBaseline {
+    pub resource: PublicationResource,
+    pub base_branch: String,
+    pub observation: crate::delivery_runtime::RepositoryPublicationObservation,
+    pub revision: u64,
+    pub digest: String,
+    pub last_effect_operation_id: Option<String>,
+}
+
+impl ConfigStore {
+    /// A branch is not compared while a matching publication intent is still being reconciled.
+    pub fn publication_effect_in_flight(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        repository_id: &RepositoryId,
+        _branch: &str,
+    ) -> Result<bool, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT request_json,request_digest FROM effects WHERE project_id=?1 AND subject_type='ticket_run' AND subject_id=?2 AND kind='publish_implementation' AND status IN ('pending','claimed','uncertain') ORDER BY created_at_unix,operation_id LIMIT 64",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (json, stored_digest) = row.map_err(|error| error.to_string())?;
+            if super::content_digest(&json) != stored_digest {
+                return Err("pending publication effect request digest is invalid".into());
+            }
+            let payload: crate::delivery_runtime::PublishImplementationEffectPayload =
+                crate::protocol::parse_unique(json.as_bytes())
+                    .map_err(|error| error.to_string())?;
+            if payload.repository_id == *repository_id && payload.ticket_run_id == *ticket_run_id {
+                // Branch names encode the entire immutable work identity; exact comparison is
+                // performed by the caller against the prepared worktree receipt.
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Persist the only acceptable initial baseline: a fresh, complete observation proving the
+    /// managed branch and matching pull-request set were absent before worktree preparation.
+    pub fn insert_initial_publication_baseline(
+        &mut self,
+        owner_generation: u64,
+        resource: &PublicationResource,
+        base_branch: &str,
+        observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+        now_unix: i64,
+    ) -> Result<PublicationBaseline, String> {
+        if observation.remote_head.is_some()
+            || observation.pull_requests
+                != crate::delivery_forge::ObservationCapability::Known(Vec::new())
+            || base_branch.trim().is_empty()
+        {
+            return Err(
+                "initial publication baseline is not a complete absent-resource observation".into(),
+            );
+        }
+        let snapshot_json = super::canonical_json(observation)?;
+        let snapshot_digest = baseline_digest(snapshot_json.as_bytes());
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let run_project: Option<String> = tx
+            .query_row(
+                "SELECT project_id FROM ticket_runs WHERE ticket_run_id=?1",
+                [resource.ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if run_project.as_deref() != Some(resource.project_id.as_str()) {
+            return Err("publication baseline does not match its durable TicketRun".into());
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO publication_baselines(project_id,ticket_run_id,repository_id,branch,base_branch,initial_snapshot_json,initial_digest,current_snapshot_json,current_digest,revision,last_effect_operation_id,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?7,1,NULL,?8)",
+            params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch,base_branch,snapshot_json,snapshot_digest,now_unix],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        let row = self
+            .load_publication_baseline(resource)?
+            .ok_or("publication baseline insert disappeared")?;
+        if row.base_branch != base_branch || row.digest != snapshot_digest {
+            return Err(
+                "initial publication baseline conflicts with a previously captured observation"
+                    .into(),
+            );
+        }
+        let _ = inserted;
+        Ok(row)
+    }
+
+    pub fn load_publication_baseline(
+        &self,
+        resource: &PublicationResource,
+    ) -> Result<Option<PublicationBaseline>, String> {
+        let row: Option<(String,String,String,u64,Option<String>)> = self.connection.query_row(
+            "SELECT base_branch,current_snapshot_json,current_digest,revision,last_effect_operation_id FROM publication_baselines WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4",
+            params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((base_branch, json, digest, revision, last_effect_operation_id)) = row else {
+            return Ok(None);
+        };
+        if baseline_digest(json.as_bytes()) != digest {
+            return Err("stored publication baseline digest is invalid".into());
+        }
+        let observation =
+            crate::protocol::parse_unique(json.as_bytes()).map_err(|error| error.to_string())?;
+        Ok(Some(PublicationBaseline {
+            resource: resource.clone(),
+            base_branch,
+            observation,
+            revision,
+            digest,
+            last_effect_operation_id,
+        }))
+    }
+
+    /// Advance only from a succeeded, exact publication effect whose receipt matches the new
+    /// remote snapshot. The caller cannot supply a boolean or an operation ID as proof.
+    pub fn advance_publication_baseline(
+        &mut self,
+        owner_generation: u64,
+        expected: &PublicationBaseline,
+        next: &crate::delivery_runtime::RepositoryPublicationObservation,
+        succeeded: &super::SucceededEffectReceipt,
+        now_unix: i64,
+    ) -> Result<PublicationBaseline, String> {
+        let intent = succeeded.intent();
+        if intent.kind != "publish_implementation"
+            || intent.project_id != expected.resource.project_id
+            || intent.subject_type != "ticket_run"
+            || intent.subject_id != expected.resource.ticket_run_id.as_str()
+        {
+            return Err("publication baseline advance lacks a matching succeeded effect".into());
+        }
+        let payload: crate::delivery_runtime::PublishImplementationEffectPayload =
+            crate::protocol::parse_unique(intent.request_json.as_bytes())
+                .map_err(|e| e.to_string())?;
+        let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+            crate::protocol::parse_unique(succeeded.receipt_json().as_bytes())
+                .map_err(|e| e.to_string())?;
+        if payload.repository_id != expected.resource.repository_id
+            || receipt.repository_id != expected.resource.repository_id
+            || receipt.effect_operation_id != intent.operation_id
+            || payload.ticket_run_id != expected.resource.ticket_run_id
+            || receipt.push.branch != expected.resource.branch
+            || receipt.pull_request.source_branch != expected.resource.branch
+            || next.remote_head.as_deref() != Some(receipt.push.pushed_head.as_str())
+        {
+            return Err(
+                "publication receipt does not authorize the observed baseline update".into(),
+            );
+        }
+        let crate::delivery_forge::ObservationCapability::Known(pulls) = &next.pull_requests else {
+            return Err("cannot advance baseline from incomplete PR observation".into());
+        };
+        let Some(pull) = pulls
+            .iter()
+            .find(|pull| pull.number == receipt.pull_request.number)
+        else {
+            return Err("published PR is absent from fresh observation".into());
+        };
+        if pull.node_id != receipt.pull_request.node_id
+            || pull.source_head != receipt.pull_request.source_head
+            || pull.source_branch != expected.resource.branch
+            || pull.base_branch != expected.base_branch
+            || pull.title != receipt.pull_request.title
+        {
+            return Err("fresh PR observation does not match succeeded publication receipt".into());
+        }
+        let json = super::canonical_json(next)?;
+        let digest = baseline_digest(json.as_bytes());
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute("UPDATE publication_baselines SET current_snapshot_json=?5,current_digest=?6,revision=revision+1,last_effect_operation_id=?7,updated_at_unix=?8 WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4 AND revision=?9 AND current_digest=?10 AND (last_effect_operation_id IS NULL OR last_effect_operation_id<>?7)", params![expected.resource.project_id.as_str(),expected.resource.ticket_run_id.as_str(),expected.resource.repository_id.as_str(),expected.resource.branch,json,digest,intent.operation_id,now_unix,expected.revision,expected.digest]).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("publication baseline changed before compare-and-swap".into());
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        self.load_publication_baseline(&expected.resource)?
+            .ok_or_else(|| "advanced publication baseline disappeared".into())
+    }
+}
+
+fn baseline_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -363,6 +591,76 @@ mod tests {
                 branch: "rex-projects/work".into(),
             },
         )
+    }
+
+    fn install_baseline_schema(store: &mut ConfigStore) {
+        let tx = store.connection.unchecked_transaction().unwrap();
+        migrate_v12_publication_baselines(&tx).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn initial_baseline_requires_complete_absence_and_is_immutable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, generation, resource) = setup_store(temp.path());
+        install_baseline_schema(&mut store);
+        let absent = crate::delivery_runtime::RepositoryPublicationObservation {
+            remote_head: None,
+            pull_requests: crate::delivery_forge::ObservationCapability::Known(Vec::new()),
+        };
+        assert!(
+            store
+                .insert_initial_publication_baseline(
+                    generation,
+                    &resource,
+                    "main",
+                    &crate::delivery_runtime::RepositoryPublicationObservation {
+                        remote_head: Some("a".repeat(40)),
+                        ..absent.clone()
+                    },
+                    10
+                )
+                .is_err()
+        );
+        let saved = store
+            .insert_initial_publication_baseline(generation, &resource, "main", &absent, 11)
+            .unwrap();
+        assert_eq!(saved.revision, 1);
+        assert!(
+            store
+                .insert_initial_publication_baseline(
+                    generation,
+                    &resource,
+                    "main",
+                    &crate::delivery_runtime::RepositoryPublicationObservation {
+                        remote_head: None,
+                        pull_requests: crate::delivery_forge::ObservationCapability::Known(vec![
+                            crate::delivery_forge::ObservedPullRequest {
+                                number: 1,
+                                node_id: "node".into(),
+                                url: "https://github.com/acme/demo/pull/1".into(),
+                                state: "open".into(),
+                                merged: false,
+                                merged_at: None,
+                                source_branch: resource.branch.clone(),
+                                source_head: "a".repeat(40),
+                                base_branch: "main".into(),
+                                title: "change".into(),
+                                body: None,
+                                timeline: crate::delivery_forge::ObservationCapability::Known(
+                                    Vec::new()
+                                ),
+                            }
+                        ]),
+                    },
+                    12
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.load_publication_baseline(&resource).unwrap(),
+            Some(saved)
+        );
     }
 
     #[test]
