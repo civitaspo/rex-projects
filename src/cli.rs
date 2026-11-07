@@ -600,11 +600,14 @@ fn runtime_command(
     json: bool,
 ) -> Result<(), CliError> {
     match command {
-        RuntimeCommand::Run { once, rex_server } => run_controller(
+        RuntimeCommand::Run {
+            once,
+            rex_server: command_rex_server,
+        } => run_controller(
             config_path,
             explicit_state_root,
             once,
-            rex_server.as_deref(),
+            command_rex_server.as_deref().or(rex_server),
         ),
         RuntimeCommand::Stop { request_id } => {
             let state_root = selected_state_root(config_path, explicit_state_root)?;
