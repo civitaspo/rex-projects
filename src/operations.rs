@@ -1536,7 +1536,17 @@ pub trait BoundedCommandRunner {
         timeout: Duration,
         stdout_limit: usize,
         stderr_tail_limit: usize,
-    ) -> Result<CommandCompletion, String>;
+    ) -> Result<CommandRunResult, String>;
+}
+
+/// A host command may still be running when the controller polls its durable
+/// operation effect. `Pending` keeps the operation in its invoking state; it
+/// must not be interpreted as proof that the remote action is absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandRunResult {
+    Completed(CommandCompletion),
+    Pending,
+    ProcessAbsent,
 }
 
 /// Concrete adapter over the shared process owner. It inherits the
@@ -1564,7 +1574,7 @@ impl BoundedCommandRunner for ProcessCommandRunner {
         timeout: Duration,
         stdout_limit: usize,
         stderr_tail_limit: usize,
-    ) -> Result<CommandCompletion, String> {
+    ) -> Result<CommandRunResult, String> {
         let Some((executable, arguments)) = command.split_first() else {
             return Err("configured command is empty".into());
         };
@@ -1589,7 +1599,7 @@ impl BoundedCommandRunner for ProcessCommandRunner {
             stderr_tail_limit,
         };
         let output = crate::process::run(request).map_err(|error| error.to_string())?;
-        Ok(CommandCompletion {
+        Ok(CommandRunResult::Completed(CommandCompletion {
             exit_code: output.status.and_then(|status| status.code()),
             timed_out: output.timed_out,
             cleanup_confirmed: output.cleanup_confirmed,
@@ -1597,7 +1607,7 @@ impl BoundedCommandRunner for ProcessCommandRunner {
             stdout_truncated: output.stdout_truncated,
             stderr_tail: output.stderr_tail,
             stderr_truncated: output.stderr_truncated,
-        })
+        }))
     }
 }
 
@@ -1605,6 +1615,8 @@ impl BoundedCommandRunner for ProcessCommandRunner {
 pub enum AdapterCall {
     Response(ResponseEnvelope<Value>),
     Uncertain(String),
+    Pending(String),
+    ProcessAbsent(String),
 }
 
 #[derive(Clone, Debug)]
@@ -1671,7 +1683,7 @@ pub fn call_command_adapter<R: BoundedCommandRunner, P: Serialize>(
     let mut stdin =
         serde_json::to_vec(request).map_err(|error| AdapterError::Invalid(error.to_string()))?;
     stdin.push(b'\n');
-    let completion = runner
+    let run_result = runner
         .run_argv(
             command,
             &stdin,
@@ -1686,6 +1698,11 @@ pub fn call_command_adapter<R: BoundedCommandRunner, P: Serialize>(
                 AdapterError::Execution(error)
             }
         })?;
+    let completion = match run_result {
+        CommandRunResult::Completed(completion) => completion,
+        CommandRunResult::Pending => return Ok(AdapterCall::Pending("host operation command is still running".into())),
+        CommandRunResult::ProcessAbsent => return Ok(AdapterCall::ProcessAbsent("host operation process is confirmed absent; remote state still requires reconciliation".into())),
+    };
     if !completion.cleanup_confirmed {
         return if method == "operation.invoke" {
             Ok(AdapterCall::Uncertain(
@@ -1946,7 +1963,8 @@ fn validate_success_payload(method: &str, result: &Value) -> Result<(), String> 
 
 pub fn classify_invoke(call: &AdapterCall) -> OperationOutcome {
     match call {
-        AdapterCall::Uncertain(_) => OperationOutcome::Unknown,
+        AdapterCall::Uncertain(_) | AdapterCall::ProcessAbsent(_) => OperationOutcome::Unknown,
+        AdapterCall::Pending(_) => OperationOutcome::Pending,
         AdapterCall::Response(response) => match response
             .result
             .as_ref()
@@ -2602,10 +2620,12 @@ mod tests {
             _timeout: Duration,
             _stdout_limit: usize,
             _stderr_tail_limit: usize,
-        ) -> Result<CommandCompletion, String> {
+        ) -> Result<CommandRunResult, String> {
             self.command = command.to_vec();
             self.stdin = stdin.to_vec();
-            Ok(self.completion.take().expect("completion set by test"))
+            Ok(CommandRunResult::Completed(
+                self.completion.take().expect("completion set by test"),
+            ))
         }
     }
 

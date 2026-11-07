@@ -6,6 +6,9 @@
 //! operation identity before any retry can be considered.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,10 @@ use crate::domain::ids::{Digest, HumanRequestId, OperationId};
 use crate::effects::{
     AbsentProof, EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation,
     EffectRequest,
+};
+use crate::host_jobs::{
+    HostJobEnvironmentBinding, HostJobPool, HostJobProgress, environment_policy_digest,
+    process_request_digest, stable_host_job_id,
 };
 use crate::human::ReviewBundle;
 use crate::operations::{
@@ -126,6 +133,173 @@ impl EffectHandler for OperationEffectHandler {
 pub struct OperationEffectHandler {
     snapshots: BTreeMap<String, AppliedConfig>,
     process_shutdown_grace: Duration,
+    host_jobs: Option<Arc<Mutex<HostJobPool>>>,
+    host_environment: BTreeMap<OsString, OsString>,
+    environment_binding: Option<HostJobEnvironmentBinding>,
+}
+
+enum OperationCommandRunner<'a> {
+    Direct(ProcessCommandRunner),
+    Pooled(PooledOperationCommandRunner<'a>),
+}
+
+struct PooledOperationCommandRunner<'a> {
+    store: &'a mut crate::store::ConfigStore,
+    owner_generation: u64,
+    pool: Arc<Mutex<HostJobPool>>,
+    host_environment: &'a BTreeMap<OsString, OsString>,
+    environment: &'a HostJobEnvironmentBinding,
+    operation: &'a OperationEffectRequest,
+    effect: &'a EffectIntent,
+    round: u32,
+    shutdown_grace: Duration,
+}
+
+impl crate::operations::BoundedCommandRunner for OperationCommandRunner<'_> {
+    fn run_argv(
+        &mut self,
+        command: &[String],
+        stdin: &[u8],
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_tail_limit: usize,
+    ) -> Result<crate::operations::CommandRunResult, String> {
+        match self {
+            Self::Direct(runner) => {
+                runner.run_argv(command, stdin, timeout, stdout_limit, stderr_tail_limit)
+            }
+            Self::Pooled(runner) => {
+                runner.run_argv(command, stdin, timeout, stdout_limit, stderr_tail_limit)
+            }
+        }
+    }
+}
+
+impl crate::operations::BoundedCommandRunner for PooledOperationCommandRunner<'_> {
+    fn run_argv(
+        &mut self,
+        command: &[String],
+        stdin: &[u8],
+        timeout: Duration,
+        stdout_limit: usize,
+        stderr_tail_limit: usize,
+    ) -> Result<crate::operations::CommandRunResult, String> {
+        let Some((executable, arguments)) = command.split_first() else {
+            return Err("configured operation command is empty".into());
+        };
+        let path = self
+            .host_environment
+            .get(OsStr::new("PATH"))
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let executable = crate::process::resolve_executable(Path::new(executable), &path)
+            .ok_or_else(|| {
+                "configured operation executable is unavailable in captured PATH".to_owned()
+            })?;
+        let process_request = crate::process::ProcessRequest {
+            executable,
+            args: arguments.iter().map(OsString::from).collect(),
+            stdin: stdin.to_vec(),
+            cwd: None,
+            clear_environment: true,
+            environment: self.host_environment.clone(),
+            timeout,
+            shutdown_grace: self.shutdown_grace,
+            stdout_limit,
+            stderr_tail_limit,
+        };
+        let envelope: serde_json::Value = crate::protocol::parse_unique(stdin)?;
+        let method = envelope
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "operation adapter request has no method".to_owned())?;
+        let operation_method = match method {
+            "operation.invoke" => crate::store::host_jobs::OperationMethod::Invoke,
+            "operation.find" => crate::store::host_jobs::OperationMethod::Find,
+            "operation.observe" => crate::store::host_jobs::OperationMethod::Observe,
+            _ => return Err("operation adapter method is unsupported".into()),
+        };
+        let operation_id = self.operation.subject.operation_id.as_str();
+        let round = self.round.max(1);
+        let job_id = stable_host_job_id(operation_id, method, round);
+        let intent = crate::store::host_jobs::HostJobIntent {
+            job_id: job_id.clone(),
+            effect_operation_id: format!("operation:{operation_id}:{method}:{round}"),
+            project_id: self.operation.project_id.to_string(),
+            subject_id: operation_id.to_owned(),
+            lane_id: operation_id.to_owned(),
+            kind: crate::store::host_jobs::HostJobKind::OperationAdapter,
+            operation_method: Some(operation_method),
+            request_digest: process_request_digest(&process_request, self.environment),
+            configuration_digest: self.operation.config_digest.to_string(),
+            environment_snapshot_id: self.environment.snapshot_id.clone(),
+            environment_policy_digest: self.environment.policy_digest.clone(),
+            head: self.operation.subject.source_sha.clone(),
+            source_digest: self.effect.request_digest.clone(),
+            max_attempts: if method == "operation.invoke" { 1 } else { 2 },
+            retry_when_absent: method != "operation.invoke",
+        };
+        let progress = self
+            .pool
+            .lock()
+            .map_err(|_| "host job pool lock is poisoned".to_owned())?
+            .submit_or_poll(
+                self.store,
+                self.owner_generation,
+                &intent,
+                process_request,
+                None,
+                unix_now()?,
+            )?;
+        match progress {
+            HostJobProgress::ProcessCompleted(receipt) => {
+                let safe_receipt = serde_json::json!({
+                    "operation_id": operation_id,
+                    "method": method,
+                    "request_digest": intent.request_digest,
+                    "status_code": receipt.status_code,
+                    "stdout_truncated": receipt.stdout_truncated,
+                    "stderr_truncated": receipt.stderr_truncated,
+                    "timed_out": receipt.timed_out,
+                    "cleanup_confirmed": receipt.cleanup_confirmed,
+                })
+                .to_string();
+                self.pool
+                    .lock()
+                    .map_err(|_| "host job pool lock is poisoned".to_owned())?
+                    .finish(
+                        self.store,
+                        self.owner_generation,
+                        &job_id,
+                        receipt.status_code == Some(0)
+                            && !receipt.timed_out
+                            && receipt.cleanup_confirmed,
+                        &safe_receipt,
+                        unix_now()?,
+                    )?;
+                Ok(crate::operations::CommandRunResult::Completed(
+                    crate::operations::CommandCompletion {
+                        exit_code: receipt.status_code,
+                        timed_out: receipt.timed_out,
+                        cleanup_confirmed: receipt.cleanup_confirmed,
+                        stdout: receipt.stdout,
+                        stdout_truncated: receipt.stdout_truncated,
+                        stderr_tail: receipt.stderr_tail,
+                        stderr_truncated: receipt.stderr_truncated,
+                    },
+                ))
+            }
+            HostJobProgress::ProcessAbsentNoRetry
+            | HostJobProgress::ProcessFailed(_)
+            | HostJobProgress::Succeeded(_)
+            | HostJobProgress::Failed(_) => Ok(crate::operations::CommandRunResult::ProcessAbsent),
+            HostJobProgress::Pending | HostJobProgress::Running | HostJobProgress::Unknown => {
+                Ok(crate::operations::CommandRunResult::Pending)
+            }
+        }
+    }
 }
 
 impl OperationEffectHandler {
@@ -149,7 +323,57 @@ impl OperationEffectHandler {
         Ok(Self {
             snapshots: by_digest,
             process_shutdown_grace,
+            host_jobs: None,
+            host_environment: BTreeMap::new(),
+            environment_binding: None,
         })
+    }
+
+    pub fn with_host_jobs(
+        snapshots: impl IntoIterator<Item = AppliedConfig>,
+        process_shutdown_grace: Duration,
+        host_jobs: Arc<Mutex<HostJobPool>>,
+        host_environment: BTreeMap<OsString, OsString>,
+        environment_snapshot_id: Digest,
+    ) -> Result<Self, String> {
+        let mut handler = Self::new(snapshots, process_shutdown_grace)?;
+        let policy_digest =
+            environment_policy_digest("rex-projects-host-operation-v1", &host_environment)?;
+        handler.host_jobs = Some(host_jobs);
+        handler.host_environment = host_environment;
+        handler.environment_binding = Some(HostJobEnvironmentBinding {
+            snapshot_id: environment_snapshot_id,
+            policy_digest,
+        });
+        Ok(handler)
+    }
+
+    fn command_runner<'a>(
+        &'a self,
+        context: &'a mut EffectContext<'_>,
+        effect: &'a EffectIntent,
+        operation: &'a OperationEffectRequest,
+        round: u32,
+    ) -> Result<OperationCommandRunner<'a>, String> {
+        if let (Some(pool), Some(environment)) = (&self.host_jobs, &self.environment_binding) {
+            Ok(OperationCommandRunner::Pooled(
+                PooledOperationCommandRunner {
+                    store: context.store,
+                    owner_generation: context.owner_generation,
+                    pool: Arc::clone(pool),
+                    host_environment: &self.host_environment,
+                    environment,
+                    operation,
+                    effect,
+                    round,
+                    shutdown_grace: self.process_shutdown_grace,
+                },
+            ))
+        } else {
+            Ok(OperationCommandRunner::Direct(ProcessCommandRunner::new(
+                self.process_shutdown_grace,
+            )?))
+        }
     }
 
     pub fn handle(
@@ -366,14 +590,16 @@ impl OperationEffectHandler {
     ) -> Result<OperationExecutionOutcome, String> {
         let operation_id = &request.subject.operation_id;
         let now = unix_now()?;
-        {
+        let invocation_attempt = {
             let mut store = context.store.operations()?;
             let record = store
                 .operation(operation_id)?
                 .ok_or_else(|| "durable operation row is missing".to_owned())?;
             if !matches!(
                 record.state,
-                DurableOperationState::Ready | DurableOperationState::Unknown
+                DurableOperationState::Ready
+                    | DurableOperationState::Unknown
+                    | DurableOperationState::Invoking
             ) {
                 return Err("operation is not ready for a submission attempt".into());
             }
@@ -382,27 +608,71 @@ impl OperationEffectHandler {
             if record.state == DurableOperationState::Unknown && attempt_count < 2 {
                 return Err("unknown operation requires reconciliation before retry".into());
             }
+            let invocation_attempt = if record.state == DurableOperationState::Invoking {
+                store
+                    .latest_operation_invocation(operation_id)?
+                    .ok_or_else(|| {
+                        "invoking operation has no durable host job identity".to_owned()
+                    })?
+                    .attempt
+            } else {
+                attempt_count.max(1)
+            };
+            let invocation = crate::store::operations::OperationInvocation {
+                operation_id: operation_id.clone(),
+                attempt: invocation_attempt,
+                host_job_id: stable_host_job_id(
+                    operation_id.as_str(),
+                    "operation.invoke",
+                    invocation_attempt,
+                ),
+                request_digest: Digest::parse(effect.request_digest.clone())?,
+                subject_digest: request.subject.digest()?,
+            };
             store.record_invoking(
                 context.owner_generation,
                 operation_id,
                 &request.project_id,
                 &request.ticket_run_id,
+                request.ticket_revision,
                 request.config_revision,
                 &request.config_digest,
+                attempt_count,
+                &invocation,
                 context.now_unix.max(now),
             )?;
-        }
+            invocation_attempt
+        };
 
-        let mut runner = ProcessCommandRunner::new(self.process_shutdown_grace)?;
         let timeout = Duration::from_secs(target.timeout_seconds);
-        let call = crate::operations::invoke_authorized_command(
-            &mut runner,
-            applied,
-            permit,
-            request_id(operation_id, "invoke", attempt_count),
-            timeout,
-        );
+        let call = {
+            let mut runner = self.command_runner(context, effect, request, invocation_attempt)?;
+            crate::operations::invoke_authorized_command(
+                &mut runner,
+                applied,
+                permit,
+                request_id(operation_id, "invoke", invocation_attempt),
+                timeout,
+            )
+        };
         match call {
+            Ok(AdapterCall::Pending(reason)) => Ok(pending_receipt(
+                operation_id,
+                "invoke_host_process_pending",
+                &reason,
+            )),
+            Ok(AdapterCall::ProcessAbsent(reason)) => {
+                context.store.operations()?.record_unknown(
+                    context.owner_generation,
+                    operation_id,
+                    context.now_unix.max(unix_now()?),
+                )?;
+                Ok(pending_receipt(
+                    operation_id,
+                    "invoke_process_absent",
+                    &reason,
+                ))
+            }
             Ok(AdapterCall::Uncertain(reason)) => {
                 let mut store = context.store.operations()?;
                 store.record_unknown(context.owner_generation, operation_id, unix_now()?)?;
@@ -520,7 +790,6 @@ impl OperationEffectHandler {
             .operation_actions
             .get(&target.action)
             .ok_or_else(|| "operation action is not configured".to_owned())?;
-        let mut runner = ProcessCommandRunner::new(self.process_shutdown_grace)?;
         let correlation_key = permit.stable_correlation_key()?;
         let find = FindParams {
             operation_id: request.subject.operation_id.clone(),
@@ -538,12 +807,15 @@ impl OperationEffectHandler {
             "operation.find",
             find,
         )?;
-        let call = call_command_adapter(
-            &mut runner,
-            action,
-            &envelope,
-            Duration::from_secs(target.timeout_seconds),
-        );
+        let call = {
+            let mut runner = self.command_runner(context, effect, request, attempt_count)?;
+            call_command_adapter(
+                &mut runner,
+                action,
+                &envelope,
+                Duration::from_secs(target.timeout_seconds),
+            )
+        };
         let call = match call {
             Ok(call) => call,
             Err(error) => {
@@ -648,13 +920,15 @@ impl OperationEffectHandler {
             "operation.observe",
             params,
         )?;
-        let mut runner = ProcessCommandRunner::new(self.process_shutdown_grace)?;
-        let call = call_command_adapter(
-            &mut runner,
-            action,
-            &envelope,
-            Duration::from_secs(target.timeout_seconds),
-        );
+        let call = {
+            let mut runner = self.command_runner(context, effect, request, attempt_count)?;
+            call_command_adapter(
+                &mut runner,
+                action,
+                &envelope,
+                Duration::from_secs(target.timeout_seconds),
+            )
+        };
         let call = match call {
             Ok(call) => call,
             Err(error) => {
@@ -799,21 +1073,16 @@ mod tests {
         AppliedConfig, Config, OperationActionConfig, OperationTarget, RepositoryOperationsConfig,
         SuccessPredicate,
     };
-    use crate::domain::ids::{
-        ProjectId, RepositoryId, Revision, TicketId, TicketNamespace, TicketRunId,
-    };
+    use crate::domain::ids::{ProjectId, RepositoryId, Revision, TicketId, TicketRunId};
     use crate::domain::types::{ApprovalMode, OperationSource};
-    use crate::effects::{
-        DispatchTick, EffectContext, EffectDispatcher, EffectLimits, EffectMode, EffectRequest,
-    };
+    use crate::effects::{AbsentProof, EffectRequest};
     use crate::human::review_bundle_digest;
     use crate::operations::{DeliveryFacts, validate_recipe};
-    use crate::store::operations::CompletionGate;
-    use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
+    use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
     const SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    fn applied_config(state_path: &Path) -> AppliedConfig {
+    fn applied_config(_state_path: &Path) -> AppliedConfig {
         let mut config: Config = toml::from_str(include_str!("../examples/fixture/config.toml"))
             .expect("public fixture configuration parses");
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/xtask");
@@ -869,10 +1138,6 @@ mod tests {
         }
     }
 
-    fn fixture_invocation_metrics(state_dir: &Path) -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(state_dir.join("metrics.json")).unwrap()).unwrap()
-    }
-
     #[test]
     fn operation_approval_bundle_is_recomputed_from_bound_config_and_subject() {
         let temp = tempdir().unwrap();
@@ -919,11 +1184,7 @@ mod tests {
         };
         let bundle = operation_review_bundle(&applied, &request).unwrap();
         assert!(bundle.summary.contains(SOURCE_SHA));
-        assert!(
-            bundle.evidence[0]
-                .body
-                .contains("Configured argv (direct execution, no shell)")
-        );
+        assert!(bundle.evidence[0].body.contains("xtask fixture operations"));
         assert!(
             bundle.evidence[2]
                 .body
@@ -940,48 +1201,49 @@ mod tests {
     }
 
     #[test]
-    fn durable_operator_effect_reconciles_after_restart_and_checks_current_config() {
+    fn operation_invocation_retry_requires_claimed_effect_and_exact_find_absence() {
         let temp = tempdir().unwrap();
-        let remote_state = temp.path().join("fixture-remote.json");
-        let mut store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
-
-        let project_id = ProjectId::parse("operations_project").unwrap();
-        let ticket_id = TicketId::parse("PAY-12").unwrap();
-        let ticket_run_id = TicketRunId::parse("run-1").unwrap();
-        let applied = applied_config(&remote_state);
-        let applied_revision = store
+        let state_path = temp.path().join("controller");
+        let mut store = ConfigStore::open_test(&state_path).unwrap();
+        let applied = applied_config(&state_path);
+        let config_snapshot = store
             .apply_snapshot("factory", &applied, ExpectedRevision::Bootstrap)
             .unwrap();
+        let project_id = ProjectId::parse("operations-project").unwrap();
+        let ticket_id = TicketId::parse("ticket-retry").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-retry").unwrap();
+        let namespace = crate::domain::ids::TicketNamespace::parse("github:org/repo").unwrap();
         store
             .insert_project(&ProjectRecord {
                 id: project_id.clone(),
                 config_source: "factory".into(),
-                config_revision: applied_revision.revision,
-                config_digest: applied_revision.digest.clone(),
+                config_revision: config_snapshot.revision,
+                config_digest: config_snapshot.digest.clone(),
                 mode: "operations".into(),
                 goal_revision: 0,
                 desired_lifecycle: "running".into(),
                 state_revision: Revision(0),
             })
             .unwrap();
-        let owner = |nonce: &str| OwnerMetadata {
-            owner_nonce: nonce.into(),
-            state_root: temp.path().to_string_lossy().into_owned(),
-            config_source: "factory".into(),
-            process_start_identity: nonce.into(),
-            executable_path: "/tmp/rex-projects-fixture".into(),
-            executable_digest: "b".repeat(64),
-            rex_endpoint: None,
-            rex_server_identity: None,
-            rex_session_id: None,
-            rex_block_id: None,
-        };
-        let generation = store.start_owner(&owner("first-owner")).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "operations-retry-owner".into(),
+                state_root: state_path.to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "operations-retry-owner".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
         store
             .create_ticket_run(
                 generation,
                 &project_id,
-                &TicketNamespace::parse("github:org/repo").unwrap(),
+                &namespace,
                 &ticket_id,
                 &ticket_run_id,
                 1,
@@ -1005,7 +1267,7 @@ mod tests {
                 &ticket_id,
                 &ticket_run_id,
                 Revision(0),
-                applied_revision.revision,
+                config_snapshot.revision,
                 &applied,
                 &plan,
                 &delivery,
@@ -1013,200 +1275,108 @@ mod tests {
             )
             .unwrap()[0]
             .clone();
-        let handler =
-            OperationEffectHandler::new([applied.clone()], Duration::from_secs(2)).unwrap();
-        let limits = EffectLimits {
-            max_attempts: 3,
-            max_age: Duration::from_secs(3600),
-            retry_base: Duration::from_secs(1),
-            retry_max: Duration::from_secs(2),
+        let first_claim = store
+            .claim_next_due_effect(generation, 100, &["operation".into()])
+            .unwrap()
+            .expect("first operation claim");
+        let first_effect = EffectRequest::from(first_claim);
+        let request = store
+            .operations()
+            .unwrap()
+            .effect_request(&first_effect.intent)
+            .unwrap();
+        let invocation = |attempt: u32| crate::store::operations::OperationInvocation {
+            operation_id: operation_id.clone(),
+            attempt,
+            host_job_id: stable_host_job_id(operation_id.as_str(), "operation.invoke", attempt),
+            request_digest: Digest::parse(first_effect.intent.request_digest.clone()).unwrap(),
+            subject_digest: request.subject.digest().unwrap(),
         };
-        assert!(matches!(
-            EffectDispatcher::tick(&mut store, generation, 100, &[&handler], limits).unwrap(),
-            DispatchTick::WaitingForReconciliation { .. }
-        ));
-        let state = fixture_invocation_metrics(&remote_state);
-        assert_eq!(state["invoke_calls"], 1);
-        assert_eq!(state["duplicate_invoke_calls"], 0);
-
-        // A config change must not prevent exact reconciliation of an already
-        // started historical operation.
-        let mut changed_config = applied.clone();
-        changed_config.digest = Digest::parse("f".repeat(64)).unwrap();
-        let changed_revision = store
-            .apply_snapshot(
-                "factory",
-                &changed_config,
-                ExpectedRevision::Current(applied_revision.revision),
+        let mut operations = store.operations().unwrap();
+        operations
+            .record_invoking(
+                generation,
+                &operation_id,
+                &project_id,
+                &ticket_run_id,
+                request.ticket_revision,
+                request.config_revision,
+                &request.config_digest,
+                first_effect.attempt_count,
+                &invocation(1),
+                101,
             )
             .unwrap();
-        let claimed = store
-            .claim_next_due_effect(generation, 200, &["operation".into()])
-            .unwrap()
+        operations
+            .record_unknown(generation, &operation_id, 102)
             .unwrap();
-        let request = EffectRequest::from(claimed);
-        let historical_reconcile = {
-            let mut context = EffectContext {
-                store: &mut store,
-                owner_generation: generation,
-                now_unix: 200,
-            };
-            EffectHandler::handle(&handler, EffectMode::Reconcile, &request, &mut context).unwrap()
-        };
-        assert!(matches!(
-            historical_reconcile,
-            crate::effects::EffectObservation::Applied { .. }
-        ));
-
-        // Simulate a crash after operation state was recorded but before the
-        // outbox dispatcher stored the receipt. Restart must replay the exact
-        // terminal receipt without re-invoking the fixture adapter.
-        let restarted_generation = store.start_owner(&owner("second-owner")).unwrap();
-        let restarted = OperationEffectHandler::new(
-            [applied.clone(), changed_config.clone()],
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        assert_eq!(restarted_generation, generation + 1);
-        assert!(matches!(
-            EffectDispatcher::tick(&mut store, restarted_generation, 300, &[&restarted], limits)
-                .unwrap(),
-            DispatchTick::Completed { .. }
-        ));
-        let state = fixture_invocation_metrics(&remote_state);
-        assert_eq!(state["invoke_calls"], 1);
-        assert_eq!(state["duplicate_invoke_calls"], 0);
-
-        assert_eq!(
-            store
-                .operations()
-                .unwrap()
-                .completion_gate(&project_id, &ticket_run_id)
-                .unwrap(),
-            CompletionGate::WaitingForPostmortem
-        );
-        // A former controller may still hold request state after a restart,
-        // but stale writes cannot update operation or postmortem state.
         assert!(
-            store
-                .operations()
-                .unwrap()
-                .record_postmortem_receipt(
-                    1,
+            operations
+                .record_invoking(
+                    generation,
+                    &operation_id,
                     &project_id,
                     &ticket_run_id,
-                    &Digest::parse("c".repeat(64)).unwrap(),
-                    101
+                    request.ticket_revision,
+                    request.config_revision,
+                    &request.config_digest,
+                    first_effect.attempt_count,
+                    &invocation(2),
+                    103,
                 )
-                .is_err()
+                .is_err(),
+            "a caller cannot create a second invoke without an accepted Find absence"
         );
-        assert!(
-            store
-                .operations()
-                .unwrap()
-                .record_observation(
-                    1,
-                    &operation_id,
-                    "{}",
-                    None,
-                    DurableOperationState::Succeeded,
-                    101
-                )
-                .is_err()
-        );
-        assert!(
-            store
-                .operations()
-                .unwrap()
-                .record_unknown(1, &operation_id, 101)
-                .is_err()
-        );
-        assert_eq!(
-            store
-                .operations()
-                .unwrap()
-                .completion_gate(&project_id, &ticket_run_id)
-                .unwrap(),
-            CompletionGate::WaitingForPostmortem
-        );
-        let receipt = Digest::parse("b".repeat(64)).unwrap();
-        store
-            .operations()
-            .unwrap()
-            .record_postmortem_receipt(2, &project_id, &ticket_run_id, &receipt, 101)
-            .unwrap();
-        assert_eq!(
-            store
-                .operations()
-                .unwrap()
-                .completion_gate(&project_id, &ticket_run_id)
-                .unwrap(),
-            CompletionGate::Complete
-        );
+        drop(operations);
 
-        // A new operation intent created under config v2 cannot invoke after
-        // config v3 is applied. The historical v1 operation above could still
-        // reconcile because it already had a durable external run reference.
-        let second_ticket = TicketId::parse("PAY-13").unwrap();
-        let second_run = TicketRunId::parse("run-2").unwrap();
+        let proof = AbsentProof::from_authoritative_lookup(
+            EffectKind::Operation,
+            &first_effect,
+            "fixture-operation-adapter",
+            "exact operation key was absent",
+        )
+        .unwrap();
+        let proof_json = serde_json::to_string(&proof).unwrap();
         store
-            .create_ticket_run(
-                restarted_generation,
-                &project_id,
-                &TicketNamespace::parse("github:org/repo").unwrap(),
-                &second_ticket,
-                &second_run,
-                1,
-                "operating",
-                "In Progress",
+            .retry_effect_after_absence(
+                &first_effect.intent.operation_id,
+                generation,
+                &first_effect.intent.request_digest,
+                &proof_json,
+                200,
             )
             .unwrap();
-        let second_plan = validate_recipe(&changed_config.config, "rollout").unwrap();
-        let second_target = &second_plan.targets()[0];
-        let second_delivery = DeliveryFacts {
-            merge_commits: BTreeMap::from([(second_target.repository.clone(), SOURCE_SHA.into())]),
-            planned_revisions: BTreeMap::new(),
-        };
+        let second_claim = store
+            .claim_next_due_effect(generation, 200, &["operation".into()])
+            .unwrap()
+            .expect("authoritatively absent operation is claimed for bounded retry");
+        let second_effect = EffectRequest::from(second_claim);
+        assert_eq!(second_effect.attempt_count, 2);
         store
             .operations()
             .unwrap()
-            .persist_plan(
-                restarted_generation,
+            .record_invoking(
+                generation,
+                &operation_id,
                 &project_id,
-                &second_ticket,
-                &second_run,
-                Revision(0),
-                changed_revision.revision,
-                &changed_config,
-                &second_plan,
-                &second_delivery,
-                350,
+                &ticket_run_id,
+                request.ticket_revision,
+                request.config_revision,
+                &request.config_digest,
+                second_effect.attempt_count,
+                &invocation(2),
+                201,
             )
             .unwrap();
-        let mut revoked_config = changed_config.clone();
-        revoked_config.digest = Digest::parse("e".repeat(64)).unwrap();
-        store
-            .apply_snapshot(
-                "factory",
-                &revoked_config,
-                ExpectedRevision::Current(changed_revision.revision),
-            )
-            .unwrap();
-        let revoked_handler =
-            OperationEffectHandler::new([applied, changed_config], Duration::from_secs(2)).unwrap();
-        assert!(matches!(
-            EffectDispatcher::tick(
-                &mut store,
-                restarted_generation,
-                400,
-                &[&revoked_handler],
-                limits
-            )
-            .unwrap(),
-            DispatchTick::WaitingForReconciliation { .. }
-        ));
-        let state = fixture_invocation_metrics(&remote_state);
-        assert_eq!(state["invoke_calls"], 1);
-        assert_eq!(state["duplicate_invoke_calls"], 0);
+        assert_eq!(
+            store
+                .operations()
+                .unwrap()
+                .latest_operation_invocation(&operation_id)
+                .unwrap()
+                .unwrap()
+                .attempt,
+            2
+        );
     }
 }

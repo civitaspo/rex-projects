@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub use crate::engine::reducer::EffectKind;
 use crate::engine::reducer::effect_name;
@@ -12,7 +12,8 @@ pub enum EffectMode {
     Reconcile,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbsentProof {
     handler_kind: String,
     operation_id: String,
@@ -46,6 +47,17 @@ impl AbsentProof {
             authority,
             evidence,
         })
+    }
+
+    pub(crate) fn matches_effect(&self, kind: EffectKind, intent: &EffectIntent) -> bool {
+        self.handler_kind == effect_name(&kind)
+            && self.operation_id == intent.operation_id
+            && self.request_digest == intent.request_digest
+            && self.project_id == intent.project_id.as_str()
+            && self.subject_type == intent.subject_type
+            && self.subject_id == intent.subject_id
+            && !self.authority.trim().is_empty()
+            && !self.evidence.trim().is_empty()
     }
 }
 

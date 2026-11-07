@@ -91,6 +91,15 @@ pub struct OperationRecord {
     pub approval_json: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationInvocation {
+    pub operation_id: OperationId,
+    pub attempt: u32,
+    pub host_job_id: String,
+    pub request_digest: Digest,
+    pub subject_digest: Digest,
+}
+
 /// Apply migration 11 only to a database whose predecessor migrations have
 /// reached version 10. This lets each feature branch own its migration without
 /// skipping migrations owned by the controller, human, pipeline, or learning
@@ -149,6 +158,16 @@ pub fn migrate_v11(connection: &Connection) -> Result<(), String> {
             FOREIGN KEY(project_id,ticket_run_id) REFERENCES operation_plans(project_id,ticket_run_id) ON DELETE CASCADE
         );
         CREATE INDEX operation_runs_by_ticket ON operation_runs(project_id,ticket_run_id,state,target_id);
+        CREATE TABLE operation_invocations (
+            operation_id TEXT NOT NULL REFERENCES operation_runs(operation_id) ON DELETE CASCADE,
+            attempt INTEGER NOT NULL CHECK(attempt > 0),
+            host_job_id TEXT NOT NULL UNIQUE,
+            method TEXT NOT NULL CHECK(method='operation.invoke'),
+            request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+            subject_digest TEXT NOT NULL CHECK(length(subject_digest)=64),
+            created_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(operation_id,attempt)
+        );
         CREATE TABLE operation_postmortems (
             project_id TEXT NOT NULL,
             ticket_run_id TEXT NOT NULL,
@@ -410,8 +429,11 @@ impl<'a> OperationsStore<'a> {
         operation_id: &OperationId,
         project_id: &ProjectId,
         ticket_run_id: &TicketRunId,
+        ticket_revision: Revision,
         config_revision: Revision,
         config_digest: &Digest,
+        attempt_count: u32,
+        invocation: &OperationInvocation,
         now: i64,
     ) -> Result<(), String> {
         let tx = self
@@ -419,27 +441,176 @@ impl<'a> OperationsStore<'a> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_owner(&tx, owner_generation)?;
+        let effect_row: Option<(String,String,String,String,String,String,String,Option<u64>,Option<u64>,String,u32,Option<String>)> = tx.query_row(
+            "SELECT project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,owner_generation,status,attempt_count,receipt_json FROM effects WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((
+            effect_project,
+            effect_subject_type,
+            effect_subject_id,
+            effect_key,
+            effect_kind,
+            effect_request_json,
+            effect_digest,
+            effect_revision,
+            effect_owner,
+            effect_status,
+            effect_attempt,
+            effect_receipt,
+        )) = effect_row
+        else {
+            return Err("operation has no durable outbox claim".into());
+        };
+        if effect_project != project_id.as_str()
+            || effect_subject_type != "ticket_run"
+            || effect_subject_id != ticket_run_id.as_str()
+            || effect_kind != "operation"
+            || effect_owner != Some(owner_generation)
+            || effect_status != "claimed"
+            || effect_attempt != attempt_count
+            || effect_digest != invocation.request_digest.as_str()
+            || attempt_count == 0
+        {
+            return Err(
+                "operation invocation is not authorized by the exact active outbox claim".into(),
+            );
+        }
         let config_is_current: bool = tx
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM operation_runs r
                     JOIN operation_plans op ON op.project_id=r.project_id AND op.ticket_run_id=r.ticket_run_id
                     JOIN projects p ON p.project_id=op.project_id
+                    JOIN ticket_runs t ON t.project_id=p.project_id AND t.ticket_run_id=r.ticket_run_id
                     JOIN config_current current ON current.source_identity=p.config_source
                     JOIN config_snapshots snapshot ON snapshot.source_identity=current.source_identity AND snapshot.revision=current.revision
                     WHERE r.operation_id=?1 AND r.project_id=?2 AND r.ticket_run_id=?3
                       AND op.config_revision=?4 AND op.config_digest=?5
                       AND current.revision=?4 AND snapshot.digest=?5
+                      AND t.revision=?6
                 )",
-                params![operation_id.as_str(), project_id.as_str(), ticket_run_id.as_str(), config_revision.0, config_digest.as_str()],
+                params![operation_id.as_str(), project_id.as_str(), ticket_run_id.as_str(), config_revision.0, config_digest.as_str(), ticket_revision.0],
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if !config_is_current {
-            return Err("operation config is no longer the applied project revision".into());
+        if invocation.operation_id != *operation_id
+            || invocation.attempt == 0
+            || invocation.host_job_id.trim().is_empty()
+        {
+            return Err("operation invocation identity is invalid".into());
         }
-        update_state_in_transaction(&tx, operation_id, &["ready", "unknown"], "invoking", now)?;
+        let row: (String, String, String) = tx.query_row(
+            "SELECT request_digest,subject_digest,state FROM operation_runs WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|error| error.to_string())?;
+        if row.0 != invocation.request_digest.as_str()
+            || row.1 != invocation.subject_digest.as_str()
+        {
+            return Err("invocation ledger does not match immutable operation request".into());
+        }
+        let existing: Option<(String, String, String)> = tx.query_row(
+            "SELECT host_job_id,request_digest,subject_digest FROM operation_invocations WHERE operation_id=?1 AND attempt=?2",
+            params![operation_id.as_str(), invocation.attempt],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if !config_is_current
+            && !(row.2 == "invoking"
+                && existing
+                    .as_ref()
+                    .is_some_and(|(job_id, request_digest, subject_digest)| {
+                        job_id == &invocation.host_job_id
+                            && request_digest == invocation.request_digest.as_str()
+                            && subject_digest == invocation.subject_digest.as_str()
+                    }))
+        {
+            return Err("operation config or ticket revision changed before invocation".into());
+        }
+        if let Some((job_id, request_digest, subject_digest)) = existing {
+            if job_id != invocation.host_job_id
+                || request_digest != invocation.request_digest.as_str()
+                || subject_digest != invocation.subject_digest.as_str()
+            {
+                return Err(
+                    "operation invocation attempt was rebound to a different host job".into(),
+                );
+            }
+            if row.2 != "invoking" {
+                return Err("persisted operation invocation is no longer active".into());
+            }
+        } else {
+            let previous_attempt: Option<u32> = tx
+                .query_row(
+                    "SELECT MAX(attempt) FROM operation_invocations WHERE operation_id=?1",
+                    [operation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let intent = crate::store::EffectIntent {
+                project_id: ProjectId::parse(effect_project.clone())?,
+                subject_type: effect_subject_type.clone(),
+                subject_id: effect_subject_id.clone(),
+                operation_id: operation_id.as_str().to_owned(),
+                logical_key: effect_key.clone(),
+                kind: effect_kind.clone(),
+                request_json: effect_request_json.clone(),
+                request_digest: effect_digest.clone(),
+                expected_revision: effect_revision,
+            };
+            validate_new_invocation_authority(
+                &row.2,
+                previous_attempt,
+                attempt_count,
+                invocation.attempt,
+                effect_receipt.as_deref(),
+                &intent,
+            )?;
+            tx.execute(
+                "INSERT INTO operation_invocations(operation_id,attempt,host_job_id,method,request_digest,subject_digest,created_at_unix) VALUES (?1,?2,?3,'operation.invoke',?4,?5,?6)",
+                params![operation_id.as_str(),invocation.attempt,invocation.host_job_id,invocation.request_digest.as_str(),invocation.subject_digest.as_str(),now],
+            ).map_err(|error| error.to_string())?;
+        }
+        if row.2 != "invoking" {
+            update_state_in_transaction(&tx, operation_id, &["ready", "unknown"], "invoking", now)?;
+        }
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn operation_invocation(
+        &self,
+        operation_id: &OperationId,
+        attempt: u32,
+    ) -> Result<Option<OperationInvocation>, String> {
+        self.connection.query_row(
+            "SELECT host_job_id,request_digest,subject_digest FROM operation_invocations WHERE operation_id=?1 AND attempt=?2",
+            params![operation_id.as_str(),attempt],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)),
+        ).optional().map_err(|error| error.to_string())?.map(|(host_job_id,request_digest,subject_digest)| Ok(OperationInvocation {
+            operation_id: operation_id.clone(), attempt, host_job_id,
+            request_digest: Digest::parse(request_digest)?, subject_digest: Digest::parse(subject_digest)?,
+        })).transpose()
+    }
+
+    pub fn latest_operation_invocation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<OperationInvocation>, String> {
+        let attempt: Option<u32> = self
+            .connection
+            .query_row(
+                "SELECT MAX(attempt) FROM operation_invocations WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        attempt
+            .map(|attempt| self.operation_invocation(operation_id, attempt))
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn record_unknown(
@@ -1068,4 +1239,110 @@ fn unix_now() -> Result<i64, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_secs() as i64)
+}
+
+fn validate_new_invocation_authority(
+    operation_state: &str,
+    previous_attempt: Option<u32>,
+    claimed_effect_attempt: u32,
+    invocation_attempt: u32,
+    effect_receipt: Option<&str>,
+    intent: &crate::store::EffectIntent,
+) -> Result<(), String> {
+    match operation_state {
+        "ready"
+            if previous_attempt.is_none()
+                && claimed_effect_attempt == 1
+                && invocation_attempt == 1 =>
+        {
+            Ok(())
+        }
+        "unknown" => {
+            let previous_attempt = previous_attempt.ok_or_else(|| {
+                "unknown operation has no prior invocation to reconcile".to_owned()
+            })?;
+            if invocation_attempt != previous_attempt.saturating_add(1)
+                || claimed_effect_attempt <= previous_attempt
+            {
+                return Err("retry attempt is not the next monotonic operation invocation".into());
+            }
+            let receipt = effect_receipt.ok_or_else(|| {
+                "retry lacks a durable authoritative Find absent receipt".to_owned()
+            })?;
+            let proof: crate::effects::AbsentProof =
+                crate::protocol::parse_unique(receipt.as_bytes())?;
+            if !proof.matches_effect(crate::effects::EffectKind::Operation, intent) {
+                return Err(
+                    "persisted retry absence proof does not match this operation intent".into(),
+                );
+            }
+            Ok(())
+        }
+        "ready" => Err("operation invocation attempt is not the initial attempt".into()),
+        _ => Err("operation invocation attempt cannot start from its current durable state".into()),
+    }
+}
+
+#[cfg(test)]
+mod invocation_authority_tests {
+    use super::*;
+    use crate::effects::{AbsentProof, EffectRequest};
+
+    fn intent() -> crate::store::EffectIntent {
+        let request_json = r#"{"operation":"deploy"}"#.to_owned();
+        crate::store::EffectIntent {
+            project_id: ProjectId::parse("project-a").unwrap(),
+            subject_type: "ticket_run".into(),
+            subject_id: "run-a".into(),
+            operation_id: "operation-a".into(),
+            logical_key: "operation:operation-a".into(),
+            kind: "operation".into(),
+            request_digest: crate::store::content_digest(&request_json),
+            request_json,
+            expected_revision: Some(3),
+        }
+    }
+
+    fn absence_receipt(intent: &crate::store::EffectIntent) -> String {
+        let request = EffectRequest {
+            intent: intent.clone(),
+            attempt_count: 1,
+            created_at_unix: 10,
+        };
+        serde_json::to_string(
+            &AbsentProof::from_authoritative_lookup(
+                crate::effects::EffectKind::Operation,
+                &request,
+                "fixture-adapter",
+                "exact-key-absent",
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_exact_authoritative_find_absence_can_authorize_next_invoke_attempt() {
+        let intent = intent();
+        assert!(validate_new_invocation_authority("ready", None, 1, 1, None, &intent).is_ok());
+        assert!(
+            validate_new_invocation_authority("unknown", Some(1), 2, 2, None, &intent).is_err()
+        );
+        let receipt = absence_receipt(&intent);
+        assert!(
+            validate_new_invocation_authority("unknown", Some(1), 3, 2, Some(&receipt), &intent)
+                .is_ok()
+        );
+        assert!(
+            validate_new_invocation_authority("unknown", Some(1), 3, 3, Some(&receipt), &intent)
+                .is_err()
+        );
+
+        let mut unrelated = intent.clone();
+        unrelated.operation_id = OperationId::parse("operation-b").unwrap().to_string();
+        assert!(
+            validate_new_invocation_authority("unknown", Some(1), 3, 2, Some(&receipt), &unrelated)
+                .is_err()
+        );
+    }
 }
