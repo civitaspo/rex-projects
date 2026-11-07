@@ -1780,21 +1780,15 @@ fn factory_environment(
                         | "GIT_COMMON_DIR"
                         | "GIT_OBJECT_DIRECTORY"
                         | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
-                        | "GIT_CONFIG_GLOBAL"
-                        | "GIT_CONFIG_SYSTEM"
-                        | "GIT_CONFIG_COUNT"
-                        | "GIT_CONFIG_PARAMETERS"
+                        | "GIT_CEILING_DIRECTORIES"
+                        | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+                        | "GIT_PREFIX"
+                        | "GIT_IMPLICIT_WORK_TREE"
                 )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
-    for (key, value) in [
-        ("GIT_CONFIG_GLOBAL", "/dev/null"),
-        ("GIT_CONFIG_SYSTEM", "/dev/null"),
-        ("GIT_TERMINAL_PROMPT", "0"),
-    ] {
-        environment.insert(OsString::from(key), OsString::from(value));
-    }
+    environment.insert(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"));
     for (key, value) in [
         ("REX_PROJECTS_CONTEXT", "agent"),
         ("REX_PROJECTS_AGENT", "1"),
@@ -2392,6 +2386,162 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn factory_environment_preserves_git_configuration_but_clears_repository_routing() {
+        let root = tempdir().unwrap();
+        let global = root.path().join("global.gitconfig");
+        let system = root.path().join("system.gitconfig");
+        fs::write(
+            &global,
+            "[user]\n\tsigningkey = dummy-signing-key\n[credential]\n\thelper = dummy-credential-helper\n[core]\n\thooksPath = /tmp/dummy-hooks\n",
+        )
+        .unwrap();
+        fs::write(&system, "[fixture]\n\tsystem = retained\n").unwrap();
+        let mut snapshot = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                global.as_os_str().into(),
+            ),
+            (
+                OsString::from("GIT_CONFIG_SYSTEM"),
+                system.as_os_str().into(),
+            ),
+            (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
+            (
+                OsString::from("GIT_CONFIG_KEY_0"),
+                OsString::from("fixture.count"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_VALUE_0"),
+                OsString::from("retained"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_PARAMETERS"),
+                OsString::from("'fixture.parameters=retained'"),
+            ),
+            (
+                OsString::from("GIT_DIR"),
+                OsString::from("/user/repository/.git"),
+            ),
+            (
+                OsString::from("GIT_WORK_TREE"),
+                OsString::from("/user/repository"),
+            ),
+            (
+                OsString::from("GIT_INDEX_FILE"),
+                OsString::from("/user/repository/.git/index"),
+            ),
+            (
+                OsString::from("GIT_COMMON_DIR"),
+                OsString::from("/user/repository/.git"),
+            ),
+            (
+                OsString::from("GIT_OBJECT_DIRECTORY"),
+                OsString::from("/user/repository/.git/objects"),
+            ),
+            (
+                OsString::from("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+                OsString::from("/user/objects"),
+            ),
+            (
+                OsString::from("GIT_CEILING_DIRECTORIES"),
+                OsString::from("/user"),
+            ),
+            (OsString::from("GIT_PREFIX"), OsString::from("user-prefix/")),
+            (
+                OsString::from("GIT_IMPLICIT_WORK_TREE"),
+                OsString::from("0"),
+            ),
+            (
+                OsString::from("REX_PROJECTS_AGENT"),
+                OsString::from("stale"),
+            ),
+        ]);
+        snapshot.insert(
+            OsString::from("REX_PROJECTS_CONTEXT"),
+            OsString::from("stale"),
+        );
+        let env = factory_environment(
+            &snapshot,
+            &descriptor(root.path(), &profile(AgentAdapter::Codex, "/bin/sh")),
+        )
+        .unwrap();
+        for key in [
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            assert_eq!(
+                env.get(OsStr::new(key)),
+                snapshot.get(OsStr::new(key)),
+                "{key}"
+            );
+        }
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_PREFIX",
+            "GIT_IMPLICIT_WORK_TREE",
+        ] {
+            assert!(!env.contains_key(OsStr::new(key)), "{key}");
+        }
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let git = process::resolve_executable(
+            Path::new("git"),
+            &[PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+        )
+        .unwrap();
+        let config = |key: &str| {
+            let output = process::run(process::ProcessRequest {
+                executable: git.clone(),
+                args: vec!["config".into(), "--get".into(), key.into()],
+                stdin: Vec::new(),
+                cwd: Some(workspace.clone()),
+                clear_environment: true,
+                environment: env.clone(),
+                timeout: Duration::from_secs(5),
+                shutdown_grace: Duration::from_secs(1),
+                stdout_limit: 4096,
+                stderr_tail_limit: 4096,
+            })
+            .unwrap();
+            assert_eq!(
+                output.status.unwrap().code(),
+                Some(0),
+                "git config {key}: {}",
+                String::from_utf8_lossy(&output.stderr_tail)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(config("user.signingkey"), "dummy-signing-key");
+        assert_eq!(config("credential.helper"), "dummy-credential-helper");
+        assert_eq!(config("core.hooksPath"), "/tmp/dummy-hooks");
+        assert_eq!(config("fixture.system"), "retained");
+        assert_eq!(config("fixture.count"), "retained");
+        assert_eq!(config("fixture.parameters"), "retained");
+        assert_eq!(
+            env.get(OsStr::new("REX_PROJECTS_AGENT"))
+                .and_then(|v| v.to_str()),
+            Some("1")
+        );
+        assert_eq!(
+            env.get(OsStr::new("REX_PROJECTS_CONTEXT"))
+                .and_then(|v| v.to_str()),
+            Some("agent")
+        );
+    }
+
     #[test]
     fn codex_and_claude_commands_use_verified_automatic_modes_and_contracts() {
         let root = tempdir().unwrap();
@@ -2858,5 +3008,107 @@ mod tests {
                 .unwrap()
                 .contains(&ProcessSignal::Kill)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_exit_still_cleans_observed_descendants_by_kernel_identity() {
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let executable = root.path().join("wrapper-exits-with-child");
+        let child_pid_path = root.path().join("child.pid");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n(trap '' INT; while :; do /bin/sleep 1; done) &\nchild=$!\necho \"$child\" > '{}'\nwait\n",
+                child_pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        turn.shutdown_grace = Duration::from_millis(50);
+        struct CancelAfterChildObserved {
+            system: SystemProcessObserver,
+            child_pid_path: PathBuf,
+            cancellation_sent: bool,
+        }
+        impl ProcessObserver for CancelAfterChildObserved {
+            type Identity = process::ProcessIdentity;
+            fn inspect(&mut self) -> Result<Vec<Self::Identity>, String> {
+                let table = self.system.inspect()?;
+                let child_pid = fs::read_to_string(&self.child_pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if !self.cancellation_sent
+                    && child_pid.is_some_and(|pid| table.iter().any(|identity| identity.pid == pid))
+                {
+                    super::PENDING_SIGNAL
+                        .store(libc::SIGTERM, std::sync::atomic::Ordering::Relaxed);
+                    self.cancellation_sent = true;
+                }
+                Ok(table)
+            }
+            fn try_wait(
+                &mut self,
+                child: &mut std::process::Child,
+            ) -> std::io::Result<Option<ExitStatus>> {
+                self.system.try_wait(child)
+            }
+            fn pid(identity: &Self::Identity) -> u32 {
+                SystemProcessObserver::pid(identity)
+            }
+            fn group(identity: &Self::Identity) -> u32 {
+                SystemProcessObserver::group(identity)
+            }
+            fn capture_tree(&self, root_pid: u32, table: &[Self::Identity]) -> Vec<Self::Identity> {
+                self.system.capture_tree(root_pid, table)
+            }
+            fn matching(
+                &self,
+                observed: &[Self::Identity],
+                current: &[Self::Identity],
+            ) -> Vec<Self::Identity> {
+                self.system.matching(observed, current)
+            }
+            fn signal_group_if_observed(
+                &self,
+                group: u32,
+                observed: &[Self::Identity],
+                current: &[Self::Identity],
+                signal: ProcessSignal,
+            ) -> Result<bool, String> {
+                self.system
+                    .signal_group_if_observed(group, observed, current, signal)
+            }
+        }
+        let mut observer = CancelAfterChildObserved {
+            system: SystemProcessObserver,
+            child_pid_path: child_pid_path.clone(),
+            cancellation_sent: false,
+        };
+        let result = run_fixture_turn(&turn, &mut observer).unwrap();
+        assert!(matches!(result.receipt.outcome, TurnOutcome::Cancelled));
+        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+        let child_pid: u32 = fs::read_to_string(child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let remaining = process::inspect_process_table().unwrap();
+        assert!(
+            !remaining.iter().any(|identity| identity.pid == child_pid),
+            "the observed child must be gone after confirmed cleanup"
+        );
+        assert!(result.receipt.processes.iter().any(|identity| {
+            identity.pid == child_pid
+                && identity.identity_quality == "kernel_birth_token"
+                && !identity.start_identity.is_empty()
+        }));
     }
 }
