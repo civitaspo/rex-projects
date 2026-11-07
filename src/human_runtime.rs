@@ -288,20 +288,6 @@ impl HumanRuntimeRequest {
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HumanApprovalReceipt {
-    pub request_id: HumanRequestId,
-    pub response_id: String,
-    pub subject_digest: Digest,
-    pub configuration_digest: Digest,
-    pub policy_digest: Digest,
-    pub choice: HumanDecisionChoice,
-    pub approved: bool,
-    pub decided_at_unix: u64,
-    pub request_expires_at_unix: u64,
-}
-
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HumanRequestSummary {
     pub request: HumanRuntimeRequest,
     pub lifecycle: HumanRequestLifecycle,

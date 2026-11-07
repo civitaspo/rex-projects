@@ -10,9 +10,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{Digest, HumanRequestId, ProjectId, TicketRunId};
 use crate::human_runtime::{
-    HumanApprovalReceipt, HumanDecisionChoice, HumanDecisionIntent, HumanPurpose,
-    HumanRequestLifecycle, HumanRequestSummary, HumanRuntimeRequest, HumanSubjectBinding,
-    HumanSubjectKind, HumanWakeTarget,
+    HumanDecisionChoice, HumanDecisionIntent, HumanPurpose, HumanRequestLifecycle,
+    HumanRequestSummary, HumanRuntimeRequest, HumanSubjectBinding, HumanSubjectKind,
+    HumanWakeTarget,
 };
 
 use super::{ConfigStore, validate_active_generation};
@@ -23,9 +23,68 @@ const MAX_PENDING_DECISIONS: usize = 256;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "detail")]
 pub enum HumanDecisionResult {
-    Applied(HumanApprovalReceipt),
+    Applied,
     Stale { reason: String },
     Expired,
+}
+
+/// Opaque authority returned only by `accepted_human_approval` after durable validation.
+/// It intentionally cannot be deserialized or constructed outside this module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanApprovalReceipt {
+    request_id: HumanRequestId,
+    response_id: String,
+    subject_digest: Digest,
+    configuration_digest: Digest,
+    policy_digest: Digest,
+    choice: HumanDecisionChoice,
+    approved: bool,
+    decided_at_unix: u64,
+    request_expires_at_unix: u64,
+}
+
+impl HumanApprovalReceipt {
+    pub fn request_id(&self) -> &HumanRequestId {
+        &self.request_id
+    }
+    pub fn response_id(&self) -> &str {
+        &self.response_id
+    }
+    pub fn subject_digest(&self) -> &Digest {
+        &self.subject_digest
+    }
+    pub fn configuration_digest(&self) -> &Digest {
+        &self.configuration_digest
+    }
+    pub fn policy_digest(&self) -> &Digest {
+        &self.policy_digest
+    }
+    pub fn choice(&self) -> HumanDecisionChoice {
+        self.choice
+    }
+    pub fn approved(&self) -> bool {
+        self.approved
+    }
+    pub fn decided_at_unix(&self) -> u64 {
+        self.decided_at_unix
+    }
+    pub fn request_expires_at_unix(&self) -> u64 {
+        self.request_expires_at_unix
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedApprovalReceipt {
+    request_id: HumanRequestId,
+    response_id: String,
+    subject_digest: Digest,
+    configuration_digest: Digest,
+    policy_digest: Digest,
+    choice: HumanDecisionChoice,
+    approved: bool,
+    decided_at_unix: u64,
+    request_expires_at_unix: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -444,7 +503,7 @@ impl ConfigStore {
             Err(TicketValidationError::Storage(error)) => return Err(error),
         }
         let approved = intent.choice == HumanDecisionChoice::Approve;
-        let receipt = HumanApprovalReceipt {
+        let receipt = PersistedApprovalReceipt {
             request_id: request_id.clone(),
             response_id: intent.response_id.clone(),
             subject_digest: intent.expected_subject_digest.clone(),
@@ -455,11 +514,11 @@ impl ConfigStore {
             decided_at_unix: now,
             request_expires_at_unix: request.expires_at_unix,
         };
-        let result = HumanDecisionResult::Applied(receipt.clone());
-        let receipt_json = serde_json::to_string(&result).map_err(|error| error.to_string())?;
+        let result = HumanDecisionResult::Applied;
+        let result_json = serde_json::to_string(&result).map_err(|error| error.to_string())?;
         tx.execute("INSERT INTO human_decisions(response_id,request_id,subject_digest,configuration_digest,policy_digest,choice,approved,explanation,decided_at_unix,receipt_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![intent.response_id,request_id.as_str(),receipt.subject_digest.as_str(),receipt.configuration_digest.as_str(),receipt.policy_digest.as_str(),choice_name(intent.choice),approved,intent.explanation,now,serde_json::to_string(&receipt).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
         tx.execute("UPDATE human_requests SET lifecycle='decided',decided_at_unix=?2 WHERE request_id=?1 AND lifecycle='response_queued'", params![request_id.as_str(), now]).map_err(|error| error.to_string())?;
-        tx.execute("UPDATE human_decision_intents SET lifecycle='applied',processed_at_unix=?2,result_json=?3 WHERE response_id=?1 AND lifecycle='queued'", params![intent.response_id, now, receipt_json]).map_err(|error| error.to_string())?;
+        tx.execute("UPDATE human_decision_intents SET lifecycle='applied',processed_at_unix=?2,result_json=?3 WHERE response_id=?1 AND lifecycle='queued'", params![intent.response_id, now, result_json]).map_err(|error| error.to_string())?;
         insert_role_wake(&tx, &request, &receipt, now)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(result)
@@ -486,7 +545,8 @@ impl ConfigStore {
         if lifecycle != "decided" || stored_digest != subject_digest.as_str() || now >= expires_at {
             return Ok(None);
         }
-        let receipt: HumanApprovalReceipt = crate::protocol::parse_unique(receipt_json.as_bytes())?;
+        let receipt: PersistedApprovalReceipt =
+            crate::protocol::parse_unique(receipt_json.as_bytes())?;
         if receipt.request_id != *request_id
             || receipt.subject_digest != *subject_digest
             || receipt.configuration_digest != *configuration_digest
@@ -497,7 +557,17 @@ impl ConfigStore {
         {
             return Ok(None);
         }
-        Ok(Some(receipt))
+        Ok(Some(HumanApprovalReceipt {
+            request_id: receipt.request_id,
+            response_id: receipt.response_id,
+            subject_digest: receipt.subject_digest,
+            configuration_digest: receipt.configuration_digest,
+            policy_digest: receipt.policy_digest,
+            choice: receipt.choice,
+            approved: receipt.approved,
+            decided_at_unix: receipt.decided_at_unix,
+            request_expires_at_unix: receipt.request_expires_at_unix,
+        }))
     }
 }
 
@@ -541,7 +611,7 @@ fn validate_current_ticket(
 fn insert_role_wake(
     tx: &rusqlite::Transaction<'_>,
     request: &HumanRuntimeRequest,
-    receipt: &HumanApprovalReceipt,
+    receipt: &PersistedApprovalReceipt,
     now: u64,
 ) -> Result<(), String> {
     let (role_session_id, role_name) = match request.wake_target() {
@@ -902,7 +972,7 @@ mod tests {
         let result = store
             .process_human_decision(generation, &intent.response_id, &request.subject, 12)
             .unwrap();
-        let HumanDecisionResult::Applied(receipt) = result else {
+        let HumanDecisionResult::Applied = result else {
             panic!("fresh approval should be applied: {result:?}");
         };
         let decisions_after: u64 = store
@@ -936,7 +1006,11 @@ mod tests {
                 13,
             )
             .unwrap();
-        assert_eq!(accepted, Some(receipt.clone()));
+        assert!(
+            accepted
+                .as_ref()
+                .is_some_and(HumanApprovalReceipt::approved)
+        );
         assert!(
             store
                 .accepted_human_approval(
