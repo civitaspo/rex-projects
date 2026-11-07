@@ -20,6 +20,9 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
+#[path = "store/dashboard_projection.rs"]
+pub mod dashboard_projection;
+
 pub const SCHEMA_VERSION: i64 = 10;
 pub mod human;
 #[path = "store/learning.rs"]

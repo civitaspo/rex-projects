@@ -1,0 +1,827 @@
+//! Local terminal dashboard. The UI depends on a narrow host port so it never
+//! writes SQLite, injects text into a provider terminal, or interprets a key as
+//! an authorization decision without an exact human-request binding.
+
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::Path;
+
+use crossterm::cursor;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{self, ClearType};
+use serde::{Deserialize, Serialize};
+
+use crate::domain::ids::{HumanRequestId, TicketRunId};
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DashboardSnapshot {
+    pub observed_at_unix: i64,
+    pub projects: Vec<ProjectRow>,
+    pub tickets: Vec<TicketRow>,
+    pub agents: Vec<AgentRow>,
+    pub waits: Vec<WaitRow>,
+    pub human_requests: Vec<HumanInboxRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectRow {
+    pub project_id: String,
+    pub mode: String,
+    pub lifecycle: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TicketRow {
+    pub ticket_run_id: TicketRunId,
+    pub project_id: String,
+    pub namespace: String,
+    pub ticket_id: String,
+    pub phase: String,
+    pub activity: String,
+    pub external_status: String,
+    pub revision: u64,
+    pub pinned: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentRow {
+    pub agent_run_id: String,
+    pub project_id: String,
+    pub ticket_run_id: Option<TicketRunId>,
+    pub role: String,
+    pub state: String,
+    pub rex_session_id: Option<String>,
+    pub rex_window_id: Option<String>,
+    pub rex_block_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WaitRow {
+    pub project_id: String,
+    pub ticket_run_id: Option<TicketRunId>,
+    pub kind: String,
+    pub detail: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HumanInboxRow {
+    pub request_id: HumanRequestId,
+    pub project_id: String,
+    pub question: String,
+    pub choices: Vec<String>,
+    pub subject_digest: String,
+    pub expires_at_unix: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FocusTarget {
+    pub rex_server_identity: String,
+    pub session_id: String,
+    pub window_id: String,
+    pub block_id: String,
+}
+
+/// Commands cross this host-owned boundary. Implementations persist the
+/// request and let the controller validate and apply it; the TUI has no DB API.
+pub trait DashboardBackend {
+    fn snapshot(&mut self) -> Result<DashboardSnapshot, String>;
+    fn focus_and_zoom(&mut self, target: &FocusTarget) -> Result<(), String>;
+    fn set_pin(
+        &mut self,
+        ticket_run: &TicketRunId,
+        expected_revision: u64,
+        pinned: bool,
+    ) -> Result<(), String>;
+    fn instruct_coordinator(
+        &mut self,
+        ticket_run: &TicketRunId,
+        expected_revision: u64,
+        message: &str,
+    ) -> Result<String, String>;
+    fn respond(
+        &mut self,
+        request_id: &HumanRequestId,
+        exact_subject_digest: &str,
+        exact_expiry: i64,
+        choice: &str,
+    ) -> Result<String, String>;
+    fn focus_target(&mut self, agent_run_id: &str) -> Result<Option<FocusTarget>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DashboardError {
+    pub exit_code: i32,
+    pub message: String,
+}
+
+impl From<String> for DashboardError {
+    fn from(message: String) -> Self {
+        Self {
+            exit_code: 1,
+            message,
+        }
+    }
+}
+impl From<&str> for DashboardError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_owned())
+    }
+}
+
+impl DashboardError {
+    fn denied() -> Self {
+        Self {
+            exit_code: 77,
+            message: "factory Agent context is read-only".into(),
+        }
+    }
+}
+
+/// Marked factory children may inspect/focus but cannot issue human decisions,
+/// pin views, or submit instructions. Return the CLI's documented denial code.
+pub fn ensure_human_mutation_allowed() -> Result<(), i32> {
+    ensure_human_mutation_allowed_for(
+        std::env::var_os("REX_PROJECTS_AGENT").is_some(),
+        std::env::var_os("REX_PROJECTS_CONTEXT").is_some(),
+    )
+}
+
+fn ensure_human_mutation_allowed_for(agent: bool, context: bool) -> Result<(), i32> {
+    if agent || context { Err(77) } else { Ok(()) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Selection {
+    Ticket(usize),
+    Agent(usize),
+    Human(usize),
+}
+
+/// Run a compact keyboard dashboard. Non-terminal callers should use
+/// `snapshot_json`; they never get raw mode or a blocking event loop.
+pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("dashboard requires a terminal; use --json for a snapshot".into());
+    }
+    let _terminal_guard =
+        TerminalGuard::enter().map_err(|e| format!("cannot initialize dashboard terminal: {e}"))?;
+    let mut selected = Selection::Ticket(0);
+    loop {
+        let snapshot = backend.snapshot()?;
+        render(&snapshot, selected)?;
+        if !event::poll(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())? {
+            continue;
+        }
+        match event::read().map_err(|e| e.to_string())? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let row_count = match selected {
+                    Selection::Ticket(_) => snapshot.tickets.len(),
+                    Selection::Agent(_) => snapshot.agents.len(),
+                    Selection::Human(_) => snapshot.human_requests.len(),
+                };
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Tab => selected = next_selection(selected, &snapshot),
+                    KeyCode::Down | KeyCode::Char('j') if row_count > 0 => {
+                        selected = move_selection(selected, 1, row_count)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if row_count > 0 => {
+                        selected = move_selection(selected, -1, row_count)
+                    }
+                    KeyCode::Enter => match selected {
+                        Selection::Agent(i) => {
+                            if let Some(agent) = snapshot.agents.get(i)
+                                && let Some(target) = backend.focus_target(&agent.agent_run_id)?
+                            {
+                                backend.focus_and_zoom(&target)?;
+                            }
+                        }
+                        Selection::Ticket(i) => {
+                            if let Some(ticket) = snapshot.tickets.get(i)
+                                && let Some(agent) = snapshot.agents.iter().find(|a| {
+                                    a.ticket_run_id.as_ref() == Some(&ticket.ticket_run_id)
+                                        && a.rex_block_id.is_some()
+                                })
+                                && let Some(target) = backend.focus_target(&agent.agent_run_id)?
+                            {
+                                backend.focus_and_zoom(&target)?;
+                            }
+                        }
+                        Selection::Human(_) => {}
+                    },
+                    KeyCode::Char('p') => {
+                        ensure_human_mutation_allowed().map_err(|_| DashboardError::denied())?;
+                        if let Selection::Ticket(i) = selected
+                            && let Some(t) = snapshot.tickets.get(i)
+                        {
+                            backend.set_pin(&t.ticket_run_id, t.revision, !t.pinned)?;
+                        }
+                    }
+                    KeyCode::Char('i') => {
+                        ensure_human_mutation_allowed().map_err(|_| DashboardError::denied())?;
+                        if let Selection::Ticket(i) = selected
+                            && let Some(t) = snapshot.tickets.get(i)
+                        {
+                            let path = prompt_line("Instruction file path (empty cancels): ")?;
+                            if !path.is_empty() {
+                                let mut bytes = Vec::new();
+                                std::fs::File::open(&path)
+                                    .and_then(|file| file.take(65_537).read_to_end(&mut bytes))
+                                    .map_err(|e| format!("{path}: {e}"))?;
+                                if bytes.len() > 65_536 {
+                                    return Err("instruction file exceeds 65536 bytes".into());
+                                }
+                                let msg = String::from_utf8(bytes)
+                                    .map_err(|_| "instruction file must be UTF-8")?;
+                                if msg.trim().is_empty() {
+                                    return Err("instruction file is empty".into());
+                                }
+                                backend.instruct_coordinator(&t.ticket_run_id, t.revision, &msg)?;
+                            }
+                        }
+                    }
+                    KeyCode::Char('h') => {
+                        ensure_human_mutation_allowed().map_err(|_| DashboardError::denied())?;
+                        if let Selection::Human(i) = selected
+                            && let Some(h) = snapshot.human_requests.get(i)
+                        {
+                            let choice = prompt_line(&format!(
+                                "Choice [{}] (empty cancels): ",
+                                h.choices.join("/")
+                            ))?;
+                            if h.choices.iter().any(|c| c == &choice) {
+                                backend.respond(
+                                    &h.request_id,
+                                    &h.subject_digest,
+                                    h.expires_at_unix,
+                                    &choice,
+                                )?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn snapshot_json<B: DashboardBackend>(backend: &mut B) -> Result<String, String> {
+    serde_json::to_string_pretty(&backend.snapshot()?).map_err(|e| e.to_string())
+}
+
+fn next_selection(current: Selection, s: &DashboardSnapshot) -> Selection {
+    match current {
+        Selection::Ticket(_) if !s.agents.is_empty() => Selection::Agent(0),
+        Selection::Ticket(_) if !s.human_requests.is_empty() => Selection::Human(0),
+        Selection::Agent(_) if !s.human_requests.is_empty() => Selection::Human(0),
+        _ if !s.tickets.is_empty() => Selection::Ticket(0),
+        _ if !s.agents.is_empty() => Selection::Agent(0),
+        _ => Selection::Human(0),
+    }
+}
+fn move_selection(s: Selection, delta: isize, len: usize) -> Selection {
+    let idx = match s {
+        Selection::Ticket(i) | Selection::Agent(i) | Selection::Human(i) => i,
+    };
+    let next = (idx as isize + delta).rem_euclid(len as isize) as usize;
+    match s {
+        Selection::Ticket(_) => Selection::Ticket(next),
+        Selection::Agent(_) => Selection::Agent(next),
+        Selection::Human(_) => Selection::Human(next),
+    }
+}
+fn render(snapshot: &DashboardSnapshot, selected: Selection) -> Result<(), String> {
+    let mut out = io::stdout();
+    execute!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))
+        .map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "rex-projects dashboard  Projects:{} Tickets:{} Agents:{} Waits:{} Human requests:{}",
+        snapshot.projects.len(),
+        snapshot.tickets.len(),
+        snapshot.agents.len(),
+        snapshot.waits.len(),
+        snapshot.human_requests.len()
+    )
+    .map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "↑/↓ select · Tab section · Enter focus/zoom · p pin · i instruct · h respond · q quit\n"
+    )
+    .map_err(|e| e.to_string())?;
+    for p in &snapshot.projects {
+        writeln!(
+            out,
+            "PROJECT {} [{}] {}",
+            terminal_text(&p.project_id),
+            terminal_text(&p.mode),
+            terminal_text(&p.lifecycle)
+        )
+        .map_err(|e| e.to_string())?;
+        for (ticket_index, t) in snapshot
+            .tickets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.project_id == p.project_id)
+        {
+            marker(selected == Selection::Ticket(ticket_index), &mut out)?;
+            writeln!(
+                out,
+                "{} {}/{} {} · {} · {}",
+                if t.pinned { "📌" } else { "  " },
+                terminal_text(&t.namespace),
+                terminal_text(&t.ticket_id),
+                terminal_text(&t.phase),
+                terminal_text(&t.activity),
+                terminal_text(&t.external_status)
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    writeln!(out, "\nAGENTS").map_err(|e| e.to_string())?;
+    for (i, a) in snapshot.agents.iter().enumerate() {
+        marker(selected == Selection::Agent(i), &mut out)?;
+        writeln!(
+            out,
+            "{} {} [{}] project={} ticket={}",
+            terminal_text(&a.role),
+            terminal_text(&a.state),
+            terminal_text(&a.agent_run_id),
+            terminal_text(&a.project_id),
+            a.ticket_run_id
+                .as_ref()
+                .map(|id| terminal_text(&id.to_string()))
+                .unwrap_or_else(|| "—".into())
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(out, "\nWAITS").map_err(|e| e.to_string())?;
+    for w in &snapshot.waits {
+        writeln!(
+            out,
+            "{} {} {}",
+            terminal_text(&w.project_id),
+            terminal_text(&w.kind),
+            terminal_text(&w.detail)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(out, "\nHUMAN INBOX").map_err(|e| e.to_string())?;
+    for (i, h) in snapshot.human_requests.iter().enumerate() {
+        marker(selected == Selection::Human(i), &mut out)?;
+        writeln!(
+            out,
+            "{} {} [{}] choices={:?} expires={} digest={}",
+            terminal_text(&h.project_id),
+            terminal_text(&h.request_id.to_string()),
+            terminal_text(&h.question),
+            h.choices
+                .iter()
+                .map(|choice| terminal_text(choice))
+                .collect::<Vec<_>>(),
+            h.expires_at_unix,
+            terminal_text(&h.subject_digest)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    out.flush().map_err(|e| e.to_string())
+}
+fn marker<W: Write>(selected: bool, out: &mut W) -> Result<(), String> {
+    write!(out, "{} ", if selected { ">" } else { " " }).map_err(|e| e.to_string())
+}
+fn terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() {
+                format!("\\u{{{:04x}}}", ch as u32)
+            } else {
+                ch.to_string()
+            }
+        })
+        .collect()
+}
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    terminal::disable_raw_mode().map_err(|e| e.to_string())?;
+    let mut out = io::stdout();
+    write!(out, "\r\n{prompt}")
+        .and_then(|_| out.flush())
+        .map_err(|e| e.to_string())?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|e| e.to_string())?;
+    terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+    let value = value.trim_end_matches(['\r', '\n']).to_owned();
+    if value.len() > 4096 {
+        return Err("input exceeds 4096 bytes".into());
+    }
+    Ok(value)
+}
+struct TerminalGuard;
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+        Ok(Self)
+    }
+}
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
+    }
+}
+
+/// Portable read-only projection from the existing machine database. It does
+/// not acquire the controller lock and opens SQLite read-only (no WAL writes).
+pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
+    crate::store::dashboard_projection::read_projection(state_root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    #[test]
+    fn selection_wraps_and_moves_within_section() {
+        assert_eq!(
+            move_selection(Selection::Ticket(0), -1, 3),
+            Selection::Ticket(2)
+        );
+        assert_eq!(
+            next_selection(
+                Selection::Ticket(0),
+                &DashboardSnapshot {
+                    observed_at_unix: 0,
+                    projects: vec![],
+                    tickets: vec![],
+                    agents: vec![agent()],
+                    waits: vec![],
+                    human_requests: vec![]
+                }
+            ),
+            Selection::Agent(0)
+        );
+    }
+    #[test]
+    fn marked_factory_context_cannot_mutate() {
+        assert_eq!(ensure_human_mutation_allowed_for(false, false), Ok(()));
+        assert_eq!(ensure_human_mutation_allowed_for(true, false), Err(77));
+        assert_eq!(ensure_human_mutation_allowed_for(false, true), Err(77));
+    }
+    #[test]
+    fn terminal_projection_escapes_control_sequences() {
+        assert_eq!(
+            terminal_text("safe\u{1b}[31munsafe"),
+            "safe\\u{001b}[31munsafe"
+        );
+    }
+    #[test]
+    fn noninteractive_json_snapshot_is_complete() {
+        let mut backend = FixtureBackend::default();
+        let json: serde_json::Value =
+            serde_json::from_str(&snapshot_json(&mut backend).unwrap()).unwrap();
+        assert_eq!(json["projects"][0]["project_id"], "demo");
+        assert_eq!(json["human_requests"][0]["subject_digest"], "a".repeat(64));
+    }
+    fn agent() -> AgentRow {
+        AgentRow {
+            agent_run_id: "run".into(),
+            project_id: "p".into(),
+            ticket_run_id: None,
+            role: "worker".into(),
+            state: "running".into(),
+            rex_session_id: None,
+            rex_window_id: None,
+            rex_block_id: None,
+        }
+    }
+
+    #[derive(Default)]
+    struct FixtureBackend {
+        calls: Vec<String>,
+    }
+    impl DashboardBackend for FixtureBackend {
+        fn snapshot(&mut self) -> Result<DashboardSnapshot, String> {
+            Ok(fixture_snapshot())
+        }
+        fn focus_and_zoom(&mut self, target: &FocusTarget) -> Result<(), String> {
+            self.calls.push(format!(
+                "focus:{}:{}:{}:{}",
+                target.rex_server_identity, target.session_id, target.window_id, target.block_id
+            ));
+            Ok(())
+        }
+        fn set_pin(&mut self, id: &TicketRunId, revision: u64, pinned: bool) -> Result<(), String> {
+            self.calls.push(format!("pin:{id}:{revision}:{pinned}"));
+            Ok(())
+        }
+        fn instruct_coordinator(
+            &mut self,
+            id: &TicketRunId,
+            revision: u64,
+            msg: &str,
+        ) -> Result<String, String> {
+            self.calls.push(format!("instruct:{id}:{revision}:{msg}"));
+            Ok("queued".into())
+        }
+        fn respond(
+            &mut self,
+            id: &HumanRequestId,
+            digest: &str,
+            expiry: i64,
+            choice: &str,
+        ) -> Result<String, String> {
+            self.calls
+                .push(format!("respond:{id}:{digest}:{expiry}:{choice}"));
+            Ok("queued".into())
+        }
+        fn focus_target(&mut self, _id: &str) -> Result<Option<FocusTarget>, String> {
+            Ok(Some(FocusTarget {
+                rex_server_identity: "rex-fixture".into(),
+                session_id: "session-1".into(),
+                window_id: "ticket-window".into(),
+                block_id: "worker-block".into(),
+            }))
+        }
+    }
+    fn fixture_snapshot() -> DashboardSnapshot {
+        DashboardSnapshot {
+            observed_at_unix: 100,
+            projects: vec![ProjectRow {
+                project_id: "demo".into(),
+                mode: "goal".into(),
+                lifecycle: "running".into(),
+            }],
+            tickets: vec![TicketRow {
+                ticket_run_id: TicketRunId::parse("tr-1").unwrap(),
+                project_id: "demo".into(),
+                namespace: "fixture".into(),
+                ticket_id: "T-1".into(),
+                phase: "implementing".into(),
+                activity: "worker_running".into(),
+                external_status: "in_progress".into(),
+                revision: 8,
+                pinned: false,
+            }],
+            agents: vec![AgentRow {
+                agent_run_id: "run-1".into(),
+                project_id: "demo".into(),
+                ticket_run_id: Some(TicketRunId::parse("tr-1").unwrap()),
+                role: "worker".into(),
+                state: "running".into(),
+                rex_session_id: Some("session-1".into()),
+                rex_window_id: Some("ticket-window".into()),
+                rex_block_id: Some("worker-block".into()),
+            }],
+            waits: vec![WaitRow {
+                project_id: "demo".into(),
+                ticket_run_id: None,
+                kind: "check".into(),
+                detail: "pending".into(),
+            }],
+            human_requests: vec![HumanInboxRow {
+                request_id: HumanRequestId::parse("human-1").unwrap(),
+                project_id: "demo".into(),
+                question: "Approve the exact review bundle?".into(),
+                choices: vec!["approve".into(), "reject".into()],
+                subject_digest: "a".repeat(64),
+                expires_at_unix: 500,
+            }],
+        }
+    }
+
+    /// Child entry point used by the PTY fixture below.
+    #[test]
+    fn pty_child() {
+        let Ok(log_path) = std::env::var("REX_PROJECTS_DASHBOARD_PTY_LOG") else {
+            return;
+        };
+        let mut backend = FixtureBackend::default();
+        let result = run(&mut backend);
+        let payload = serde_json::json!({"exit":result.as_ref().err().map(|e|e.exit_code).unwrap_or(0),"calls":backend.calls});
+        std::fs::write(log_path, payload.to_string()).unwrap();
+        if let Err(e) = result {
+            eprintln!("{}", e.message);
+            if e.exit_code != 77 {
+                std::process::exit(e.exit_code);
+            }
+        }
+    }
+
+    #[test]
+    fn pty_keyboard_focuses_and_queues_exact_human_decision() {
+        run_pty_fixture(false);
+    }
+    #[test]
+    fn pty_marked_agent_is_read_only_and_terminal_is_restored() {
+        run_pty_fixture(true);
+    }
+
+    fn run_pty_fixture(marked: bool) {
+        let mut master_fd = 0;
+        let mut slave_fd = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let observer = slave.try_clone().unwrap();
+        let mut baseline: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut baseline) },
+            0
+        );
+        unsafe {
+            libc::fcntl(master_fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let instruction = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            instruction.path(),
+            "Please stop and re-plan before continuing.\n",
+        )
+        .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "dashboard::tests::pty_child", "--nocapture"])
+            .env("REX_PROJECTS_DASHBOARD_PTY_LOG", log.path())
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        if marked {
+            command.env("REX_PROJECTS_AGENT", "1");
+        }
+        let mut child = command.spawn().unwrap();
+        let mut captured = Vec::new();
+        wait_for_pty_text(
+            &mut master,
+            &mut captured,
+            b"Human requests",
+            Duration::from_secs(5),
+            log.path(),
+        );
+        // Send individual keys as the app acknowledges each selection change.
+        if marked {
+            master.write_all(b"\t").unwrap();
+            wait_for_pty_text(
+                &mut master,
+                &mut captured,
+                b"> worker running",
+                Duration::from_secs(5),
+                log.path(),
+            );
+            master.write_all(b"\t").unwrap();
+            wait_for_pty_text(
+                &mut master,
+                &mut captured,
+                b"> demo human-1",
+                Duration::from_secs(5),
+                log.path(),
+            );
+            master.write_all(b"h").unwrap();
+        } else {
+            master.write_all(b"p").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            master.write_all(b"i").unwrap();
+            wait_for_pty_text(
+                &mut master,
+                &mut captured,
+                b"Instruction file path",
+                Duration::from_secs(5),
+                log.path(),
+            );
+            master
+                .write_all(format!("{}\n", instruction.path().display()).as_bytes())
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            master.write_all(b"\t").unwrap();
+            wait_for_pty_text(
+                &mut master,
+                &mut captured,
+                b"> worker running",
+                Duration::from_secs(5),
+                log.path(),
+            );
+            master.write_all(b"\r").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            master.write_all(b"\t").unwrap();
+            wait_for_pty_text(
+                &mut master,
+                &mut captured,
+                b"> demo human-1",
+                Duration::from_secs(5),
+                log.path(),
+            );
+            master.write_all(b"h").unwrap();
+            wait_for_pty_text(
+                &mut master,
+                &mut captured,
+                b"Choice [approve/reject]",
+                Duration::from_secs(5),
+                log.path(),
+            );
+            master.write_all(b"approve\n").unwrap();
+            wait_for_pty_text(
+                &mut master,
+                &mut captured,
+                b"approve",
+                Duration::from_secs(5),
+                log.path(),
+            );
+            master.write_all(b"q").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            drain(&mut master, &mut captured);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "PTY child failed: {status}; child log={}; output={}",
+            std::fs::read_to_string(log.path()).unwrap_or_default(),
+            String::from_utf8_lossy(&captured)
+        );
+        let out: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(log.path()).unwrap()).unwrap();
+        if marked {
+            assert_eq!(out["exit"], 77);
+            assert!(out["calls"].as_array().unwrap().is_empty());
+        } else {
+            let calls = out["calls"].as_array().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == "focus:rex-fixture:session-1:ticket-window:worker-block")
+            );
+            assert!(calls.iter().any(|c| c == "pin:tr-1:8:true"));
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == "instruct:tr-1:8:Please stop and re-plan before continuing.\n")
+            );
+            assert!(
+                calls.iter().any(
+                    |c| c == format!("respond:human-1:{}:500:approve", "a".repeat(64)).as_str()
+                )
+            );
+        }
+        // TerminalGuard must restore the flags altered by crossterm raw mode.
+        let mut after: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut after) },
+            0
+        );
+        assert_eq!(
+            after.c_lflag & (libc::ICANON | libc::ECHO),
+            baseline.c_lflag & (libc::ICANON | libc::ECHO)
+        );
+    }
+    fn drain(master: &mut File, captured: &mut Vec<u8>) {
+        let mut buf = [0u8; 4096];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => captured.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+    fn wait_for_pty_text(
+        master: &mut File,
+        captured: &mut Vec<u8>,
+        needle: &[u8],
+        timeout: Duration,
+        log_path: &std::path::Path,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            drain(master, captured);
+            if captured.windows(needle.len()).any(|w| w == needle) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for {:?}; child log={}; captured={}",
+            String::from_utf8_lossy(needle),
+            std::fs::read_to_string(log_path).unwrap_or_default(),
+            String::from_utf8_lossy(captured)
+        );
+    }
+}
