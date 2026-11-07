@@ -25,6 +25,7 @@ pub struct RuntimeDelivery {
     git_executable: PathBuf,
     git_environment: BTreeMap<OsString, OsString>,
     repositories: BTreeMap<RepositoryId, RepositoryConfig>,
+    configuration_digest: crate::domain::ids::Digest,
     publication_cursor: std::sync::atomic::AtomicUsize,
 }
 
@@ -166,6 +167,12 @@ impl RuntimeDelivery {
                 revision: saved.revision,
             });
         };
+        if baseline.configuration_digest != accepted_configuration_digest {
+            return Ok(PublicationMonitorTick::Unknown);
+        }
+        if baseline.configuration_digest != self.configuration_digest {
+            return Ok(PublicationMonitorTick::Unknown);
+        }
         let observation = self.observe_snapshot(&resource.repository_id, &resource.branch)?;
         let expected = crate::publication_monitor::ExpectedPublicationState {
             remote_head: baseline.observation.remote_head.clone(),
@@ -395,6 +402,7 @@ pub fn build(
         git_executable: git,
         git_environment: captured_host_env.clone(),
         repositories,
+        configuration_digest: applied_config.digest.clone(),
         publication_cursor: std::sync::atomic::AtomicUsize::new(0),
     })
 }

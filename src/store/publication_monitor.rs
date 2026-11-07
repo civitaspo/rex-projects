@@ -262,6 +262,14 @@ pub struct PublicationIrregularityReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnresolvedPublicationIrregularity {
+    pub event_id: String,
+    pub revision: u64,
+    pub observation_digest: crate::domain::ids::Digest,
+    pub facts: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationResolution {
     pub owner_generation: u64,
     pub resource: PublicationResource,
@@ -274,6 +282,48 @@ pub struct PublicationResolution {
 }
 
 impl ConfigStore {
+    /// Re-read the latest unresolved exact resource before preparing a human adoption request.
+    pub fn latest_unresolved_publication(
+        &self,
+        resource: &PublicationResource,
+    ) -> Result<Option<UnresolvedPublicationIrregularity>, String> {
+        let entity_id = publication_entity_id(resource)?;
+        let row: Option<(u64, String, String)> = self.connection.query_row(
+            "SELECT new_revision,input_id,evidence_json FROM transitions WHERE project_id=?1 AND entity_type='external_publication' AND entity_id=?2 ORDER BY new_revision DESC LIMIT 1",
+            params![resource.project_id.as_str(),entity_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((revision, event_id, evidence_json)) = row else {
+            return Ok(None);
+        };
+        if event_id != format!("{entity_id}:{revision}") {
+            return Err("unresolved publication event identity is invalid".into());
+        }
+        let evidence: serde_json::Value = crate::protocol::parse_unique(evidence_json.as_bytes())
+            .map_err(|error| error.to_string())?;
+        if evidence["state"] != "unresolved" {
+            return Ok(None);
+        }
+        let observation_digest = crate::domain::ids::Digest::parse(
+            evidence["observation_digest"]
+                .as_str()
+                .ok_or("unresolved publication record has no observation digest")?
+                .to_owned(),
+        )?;
+        let facts = evidence["facts"]["facts"].clone();
+        if facts["resource"] != serde_json::to_value(resource).map_err(|error| error.to_string())?
+            || facts["observation_digest"] != observation_digest.as_str()
+        {
+            return Err("unresolved publication record scope is invalid".into());
+        }
+        Ok(Some(UnresolvedPublicationIrregularity {
+            event_id,
+            revision,
+            observation_digest,
+            facts,
+        }))
+    }
+
     /// Persist an unexpected remote mutation and its durable Coordinator wake together.
     pub fn record_publication_irregularity(
         &mut self,
