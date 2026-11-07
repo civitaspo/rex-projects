@@ -1667,23 +1667,11 @@ impl FactoryRuntimeServices for RuntimeServices {
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
-        let policy = crate::agent_recovery::RecoveryPolicy {
-            rex_session_id: self.rex_identity.session_id.clone(),
-            turn_timeout_seconds: self
-                .applied_config
-                .profiles
-                .iter()
-                .map(|(profile_id, profile)| (profile_id.clone(), profile.turn_timeout_seconds))
-                .collect(),
-            heartbeat_stale_after_seconds: 30,
-            max_observations_per_tick: 8,
-            now_unix,
-        };
-        crate::agent_recovery::AgentRecoveryRuntime::tick(
+        crate::engine::factory_runtime::FactoryRuntimeObservationServices::recover_agents(
+            self,
             store,
             owner_generation,
-            &self.rex,
-            &policy,
+            now_unix,
         )
     }
 
@@ -2117,8 +2105,12 @@ impl FactoryRuntimeServices for RuntimeServices {
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String> {
-        self.delivery
-            .observe_publications(store, owner_generation, now_unix)
+        crate::engine::factory_runtime::FactoryRuntimeObservationServices::observe_publications(
+            self,
+            store,
+            owner_generation,
+            now_unix,
+        )
     }
 
     fn list_ticket_page(
@@ -2432,6 +2424,44 @@ impl FactoryRuntimeServices for RuntimeServices {
         let mut handlers = self.delivery.handlers();
         handlers.extend(self.handlers.iter().map(Box::as_ref));
         handlers
+    }
+}
+
+impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for RuntimeServices {
+    fn recover_agents(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
+        let policy = crate::agent_recovery::RecoveryPolicy {
+            rex_session_id: self.rex_identity.session_id.clone(),
+            turn_timeout_seconds: self
+                .applied_config
+                .profiles
+                .iter()
+                .map(|(profile_id, profile)| (profile_id.clone(), profile.turn_timeout_seconds))
+                .collect(),
+            heartbeat_stale_after_seconds: 30,
+            max_observations_per_tick: 8,
+            now_unix,
+        };
+        crate::agent_recovery::AgentRecoveryRuntime::tick(
+            store,
+            owner_generation,
+            &self.rex,
+            &policy,
+        )
+    }
+
+    fn observe_publications(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String> {
+        self.delivery
+            .observe_publications(store, owner_generation, now_unix)
     }
 }
 

@@ -107,6 +107,7 @@ pub trait FactoryRuntimeServices {
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<AgentRecoveryReport, String>;
+
     /// Reconcile one persisted Rex view before launch decisions. Implementations must bound
     /// external work so this does not make a controller iteration unbounded.
     fn maintain_rex_views(
@@ -219,6 +220,24 @@ pub trait FactoryRuntimeServices {
     fn effect_handlers(&self) -> Vec<&dyn EffectHandler>;
 }
 
+/// The only external capabilities permitted during `runtime run --once`.
+/// Implementations observe existing state and may record recovery evidence locally.
+pub trait FactoryRuntimeObservationServices {
+    fn recover_agents(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<AgentRecoveryReport, String>;
+
+    fn observe_publications(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactoryTickReport {
     pub ingested_agent_result: bool,
@@ -240,6 +259,20 @@ pub struct FactoryTickReport {
 pub struct FactoryRuntime;
 
 impl FactoryRuntime {
+    /// Reconcile bounded observations and existing Agent recovery evidence without
+    /// dispatching effects, starting provider work, maintaining Rex views, or scanning tickets.
+    pub fn tick_once(
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        services: &mut impl FactoryRuntimeObservationServices,
+    ) -> Result<(), String> {
+        store.activate_starting_projects(owner_generation)?;
+        services.observe_publications(store, owner_generation, now_unix)?;
+        services.recover_agents(store, owner_generation, now_unix)?;
+        Ok(())
+    }
+
     pub fn tick(
         store: &mut ConfigStore,
         owner_generation: u64,

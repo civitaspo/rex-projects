@@ -1533,18 +1533,26 @@ fn run_controller(
             .heartbeat_owner(generation)
             .map_err(CliError::unavailable)?;
         let tick_now = unix_now_i64()?;
-        if let Err(error) = services.tick_provider_qualification_jobs(&mut store, tick_now) {
-            eprintln!("rex-projects provider qualification: {error}");
-        }
-        let tick = crate::engine::factory_runtime::FactoryRuntime::tick(
-            &mut store,
-            generation,
-            tick_now,
-            &snapshot.config.config,
-            &mut services,
-        )
-        .map_err(CliError::unavailable)?;
-        if !tick.external_errors.is_empty() {
+        if once {
+            crate::engine::factory_runtime::FactoryRuntime::tick_once(
+                &mut store,
+                generation,
+                tick_now,
+                &mut services,
+            )
+            .map_err(CliError::unavailable)?;
+        } else {
+            if let Err(error) = services.tick_provider_qualification_jobs(&mut store, tick_now) {
+                eprintln!("rex-projects provider qualification: {error}");
+            }
+            let tick = crate::engine::factory_runtime::FactoryRuntime::tick(
+                &mut store,
+                generation,
+                tick_now,
+                &snapshot.config.config,
+                &mut services,
+            )
+            .map_err(CliError::unavailable)?;
             for error in tick.external_errors {
                 eprintln!("rex-projects runtime: {error}");
             }

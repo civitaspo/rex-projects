@@ -96,7 +96,16 @@ fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::
         )
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_STATE_HOME", home.join("state"));
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env_remove("REX_SESSION")
+        .env_remove("REX_BLOCK")
+        .env_remove("REX_BLOCK_ID")
+        .env_remove("REX_BIN_DIR")
+        .env_remove("REX_SERVER")
+        .env("REX_SESSION", "fixture-session")
+        .env("REX_BLOCK", "fixture-block")
+        .env("REX_CALL_LOG", home.join("rex-calls.log"))
+        .env("REX_FORBIDDEN_MARKER", home.join("rex-mutation-attempted"));
     command
 }
 
@@ -173,6 +182,25 @@ fn fixture(
     #[cfg(unix)]
     std::os::unix::fs::symlink(&xtask, fixture_bin.join("gh"))
         .expect("provide the Rust fixture executable as the unused gh tool path");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let rex = fixture_bin.join("rex");
+        std::fs::write(
+            &rex,
+            r##"#!/bin/sh
+printf '%s\n' "$*" >> "$REX_CALL_LOG"
+case "$*" in
+  *whoami*) printf '%s\n' '{"endpoint":"http://fixture","instance_id":"fixture-server","host_id":"fixture-host","rex_version":"test"}' ;;
+  *"api list"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*) printf '%s\n' '{"windows":[{"layers":[{"blocks":[{"block_id":"fixture-block"}]}]}]}' ;;
+  *) touch "$REX_FORBIDDEN_MARKER"; exit 91 ;;
+esac
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     (config, state, home)
 }
 
@@ -407,6 +435,143 @@ fn controller_once_publishes_local_project_status_then_releases_ownership() {
     assert_eq!(report["owner"]["active"], false);
     assert_eq!(report["freshness"], "local_snapshot");
     assert_eq!(report["projects"].as_array().unwrap().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn controller_once_leaves_queued_qualification_and_never_uses_mutating_transports() {
+    use rex_projects::domain::ids::{Digest, ProfileId, ProjectId};
+    use rex_projects::domain::types::Role;
+    use rex_projects::store::provider_qualification_runtime::{
+        ProviderQualificationRequest, request_digest,
+    };
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let mut source = std::fs::read_to_string(&config).unwrap();
+    source = source.replace(
+        "\n[adapters.tickets]",
+        "\n[runtime.environment]\nsource = \"inherit\"\n\n[adapters.tickets]",
+    );
+    std::fs::write(&config, source).unwrap();
+
+    let call_log = temp.path().join("rex-calls.log");
+    let forbidden_call = temp.path().join("rex-mutation-attempted");
+    let provider_marker = temp.path().join("provider-started");
+    let provider_stub = home.join("bin/provider-marker");
+    std::fs::write(
+        &provider_stub,
+        "#!/bin/sh\ntouch \"$PROVIDER_MARKER\"\nexit 87\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&provider_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profile_config = config
+        .parent()
+        .unwrap()
+        .join("profiles/judgment_claude/config.toml");
+    let profile = std::fs::read_to_string(&profile_config).unwrap().replace(
+        "/absolute/path/to/claude",
+        &provider_stub.display().to_string(),
+    );
+    std::fs::write(profile_config, profile).unwrap();
+
+    let apply = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let loaded = rex_projects::config::load(&config).unwrap();
+    let project_id = ProjectId::parse("goal_project").unwrap();
+    let profile_id = ProfileId::parse("judgment_claude").unwrap();
+    let profile_bytes = serde_json::to_vec(&loaded.profiles[&profile_id]).unwrap();
+    let profile_digest = Digest::parse(format!("{:x}", Sha256::digest(profile_bytes))).unwrap();
+    let request = ProviderQualificationRequest {
+        request_id: "once-queued-qualification".into(),
+        project_id,
+        role: Role::Supervisor,
+        profile_id,
+        profile_digest,
+        config_revision: 1,
+        config_digest: loaded.digest,
+    };
+    let request_digest = request_digest(&request).unwrap();
+    let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO provider_qualification_jobs(request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',1,1,1)",
+            rusqlite::params![
+                request.request_id,
+                request.project_id.as_str(),
+                serde_json::to_value(request.role).unwrap().as_str().unwrap(),
+                request.profile_id.as_str(),
+                request.profile_digest.as_str(),
+                request.config_revision,
+                request.config_digest.as_str(),
+                request_digest.as_str(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut once_command = command(&config, &state, &home);
+    once_command
+        .args(["runtime", "run", "--once"])
+        .env("REX_SESSION", "fixture-session")
+        .env("REX_BLOCK", "fixture-block")
+        .env("REX_CALL_LOG", &call_log)
+        .env("REX_FORBIDDEN_MARKER", &forbidden_call)
+        .env("PROVIDER_MARKER", &provider_marker);
+    let mut once = ForegroundOwner::spawn(once_command).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if once.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            once.terminate();
+            panic!("runtime run --once did not exit within 20 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let run_status = once.wait().unwrap();
+    let run_stderr = once.stderr_tail();
+    assert!(
+        run_status.success(),
+        "runtime run --once failed: {run_stderr}"
+    );
+    assert!(!forbidden_call.exists(), "a Rex mutation was attempted");
+    assert!(!provider_marker.exists(), "a provider command was launched");
+    let rex_calls = std::fs::read_to_string(&call_log).unwrap();
+    assert!(rex_calls.contains("whoami"));
+    assert!(rex_calls.contains("api list"));
+    assert!(rex_calls.contains("api call session.view"));
+    assert!(!state.join("runtime-owner.json").exists());
+
+    let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
+    let queued: String = connection
+        .query_row(
+            "SELECT status FROM provider_qualification_jobs WHERE request_id=?1",
+            [&request.request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queued, "queued");
+
+    let status = command(&config, &state, &home)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["owner"]["active"], false);
+    assert_eq!(report["freshness"], "local_snapshot");
 }
 
 #[test]
