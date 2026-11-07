@@ -126,6 +126,19 @@ pub trait FactoryRuntimeServices {
         role: Role,
     ) -> Result<crate::domain::types::CommitMode, String>;
 
+    /// Build a typed publication intent from a completed Worker result plus the
+    /// accepted plan and host-minted prepared-worktree authority.
+    fn worker_publication_effect(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        run: &crate::store::scheduler::ActiveTicketRun,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        effect_revision: u64,
+    ) -> Result<Option<EffectIntent>, String>;
+
     /// Accept at most one due profile-trial approval or queue its next run/side.
     /// Implementations reserve from the same bounded execution-slot pool as Agent launches.
     fn tick_profile_trials(
@@ -420,6 +433,12 @@ fn apply_agent_result(
     use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload, WorkBaseSource};
 
     let binding = &result.validated.binding;
+    if result.validated.kind == RoleOutputKind::ImplementationReady
+        && binding.role == Role::Worker
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return apply_worker_result(store, owner_generation, now_unix, config, services, result);
+    }
     if result.validated.kind != RoleOutputKind::PlanReady
         || binding.role != Role::Coordinator
         || binding.ticket_run_id.is_none()
@@ -574,6 +593,101 @@ fn apply_agent_result(
         crate::store::agent_results::ResultDisposition::Applied,
     )?;
     let _ = now_unix;
+    Ok(true)
+}
+
+fn apply_worker_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::RoleResultPayload;
+
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Worker ImplementationReady result lacks TicketRun scope")?;
+    let expected_revision = binding
+        .ticket_revision
+        .ok_or("Worker ImplementationReady result lacks TicketRun revision")?;
+    let run = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("Worker result references no active TicketRun")?;
+    if run.project_id != binding.project_id
+        || run.revision != expected_revision.0
+        || run.phase != Phase::Implementing
+    {
+        return Err("Worker ImplementationReady result is stale or outside Implementing".into());
+    }
+    let project_record = store
+        .project(&binding.project_id)?
+        .ok_or("Worker result Project has no durable configuration record")?;
+    let configuration_digest = services.configuration_digest().clone();
+    if project_record.config_digest != configuration_digest
+        || binding.config_digest != configuration_digest
+        || binding.config_revision != project_record.config_revision
+    {
+        return Err("Worker result belongs to a stale configuration snapshot".into());
+    }
+    let RoleResultPayload::ImplementationReady(_claim) = &result.validated.typed_payload else {
+        return Err("validated ImplementationReady kind has a different typed payload".into());
+    };
+    let effect_revision = run
+        .revision
+        .checked_add(1)
+        .ok_or("TicketRun revision overflow")?;
+    let effect = services.worker_publication_effect(
+        store,
+        owner_generation,
+        now_unix,
+        config,
+        &run,
+        result,
+        effect_revision,
+    )?;
+    let Some(effect) = effect else {
+        // An external observation can be temporarily unavailable. Keep the
+        // result durable and unacknowledged so a later foreground tick retries.
+        return Ok(false);
+    };
+    let input_payload = serde_json::json!({
+        "schema_version": 1,
+        "kind": "worker_implementation_ready",
+        "evidence_id": result.receipt.evidence_id(),
+        "result_digest": result.validated.result_digest,
+        "source_revision": run.revision,
+        "publication_operation_id": effect.operation_id,
+    })
+    .to_string();
+    let durable = DurableInput {
+        producer_id: "rex-projects-agent-result".into(),
+        message_id: format!("implementation-ready:{}", result.receipt.evidence_id()),
+        content_digest: durable_input_digest("ticket_run", &input_payload),
+        recipient: "ticket_run".into(),
+        payload: input_payload.clone(),
+    };
+    store.commit_ticket_transition(
+        owner_generation,
+        ticket_run_id,
+        Revision(run.revision),
+        &durable,
+        Input::EvidenceSubmitted,
+        "host bound Worker output to its accepted work node and prepared repository before publication",
+        &input_payload,
+        &[effect],
+    )?;
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        effect_revision,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
     Ok(true)
 }
 

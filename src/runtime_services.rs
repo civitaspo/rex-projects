@@ -850,6 +850,249 @@ impl FactoryRuntimeServices for RuntimeServices {
             .ok_or_else(|| "configured role profile is missing".into())
     }
 
+    fn worker_publication_effect(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        run: &crate::store::scheduler::ActiveTicketRun,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        effect_revision: u64,
+    ) -> Result<Option<crate::store::EffectIntent>, String> {
+        use crate::delivery_runtime::{
+            PublishImplementationEffectPayload, PullRequestContent, WorkerDeliveryCommit,
+            canonical_delivery_payload,
+        };
+        use crate::domain::ids::OperationId;
+        use crate::domain::types::CommitMode;
+        use crate::engine::orchestration::{RoleArtifactKind, RoleResultPayload};
+
+        let binding = &result.validated.binding;
+        let claimed = match &result.validated.typed_payload {
+            RoleResultPayload::ImplementationReady(value) => value,
+            _ => return Err("Worker result is not an ImplementationReady payload".into()),
+        };
+        let ticket_run_id = binding
+            .ticket_run_id
+            .as_ref()
+            .ok_or("Worker result has no TicketRun")?;
+        let plan = store
+            .latest_accepted_work_plan(&run.project_id, ticket_run_id)?
+            .ok_or("Worker result has no accepted WorkPlan")?;
+        let project_config = self
+            .applied_config
+            .config
+            .projects
+            .get(&run.project_id)
+            .ok_or("Worker Project is absent from applied configuration")?;
+        let validated_plan = plan.validate_for(project_config, &self.configuration_digest)?;
+        let node_id = binding
+            .role_session_id
+            .as_str()
+            .strip_prefix(&format!("ticket:{}:worker:", ticket_run_id.as_str()))
+            .ok_or("Worker result has a noncanonical per-node role session")?;
+        let node_id = crate::engine::orchestration::WorkNodeId::parse(node_id)?;
+        let node = validated_plan
+            .nodes_in_execution_order
+            .iter()
+            .find(|node| node.id == node_id && node.role == Role::Worker)
+            .ok_or("Worker role session is not an accepted implementation node")?;
+        let succeeded = store.list_succeeded_effect_receipts(
+            owner_generation,
+            &run.project_id,
+            "ticket_run",
+            run.ticket_run_id.as_str(),
+            256,
+        )?;
+        let prepared_receipt = succeeded
+            .iter()
+            .find(|receipt| receipt.intent().kind == "prepare_worktrees")
+            .ok_or("Worker has no succeeded PrepareWorktrees receipt")?;
+        let prepared = store
+            .prepared_worker_launch(
+                owner_generation,
+                plan.accepted_revision,
+                &node_id,
+                prepared_receipt,
+                project_config,
+                &self.configuration_digest,
+            )?
+            .ok_or("Worker launch authority is no longer valid")?;
+        if prepared.project_id() != &run.project_id
+            || prepared.ticket_run_id() != ticket_run_id
+            || prepared.ticket_revision() != run.revision
+            || prepared.repository_id() != &node.repository
+            || prepared.configuration_digest() != &binding.config_digest
+        {
+            return Err("Worker result does not match its prepared node authority".into());
+        }
+        let change = claimed
+            .change_references
+            .iter()
+            .filter(|reference| reference.worktree_id == node_id)
+            .collect::<Vec<_>>();
+        if change.len() != 1 || change[0].repository != node.repository {
+            return Err("Worker result must identify exactly its assigned repository node".into());
+        }
+        if claimed.change_references.len() != 1 {
+            return Err(
+                "Worker result must contain exactly one change for its assigned node".into(),
+            );
+        }
+        let change = change[0];
+        let commit_mode = prepared.commit_mode();
+        if change.commit_mode != commit_mode || change.base_commit.as_str() != prepared.base_sha() {
+            return Err("Worker commit claim differs from the host-prepared worktree".into());
+        }
+        let commit = match commit_mode {
+            CommitMode::Native => {
+                if change.commit_shas.is_empty() {
+                    return Err("native Worker result has no exact commit IDs".into());
+                }
+                let profile_id = project_config
+                    .roles
+                    .get(&Role::Worker)
+                    .ok_or("Worker profile is not configured")?;
+                let profile = self
+                    .applied_config
+                    .profiles
+                    .get(profile_id)
+                    .ok_or("Worker profile is unavailable")?;
+                let trailer = match profile.adapter {
+                    crate::domain::types::AgentAdapter::Codex => {
+                        "Co-authored-by: Codex <noreply@openai.com>"
+                    }
+                    crate::domain::types::AgentAdapter::ClaudeCode => {
+                        "Co-authored-by: Claude <noreply@anthropic.com>"
+                    }
+                };
+                WorkerDeliveryCommit::Native {
+                    previous_accepted_head: change.previous_head.as_str().to_owned(),
+                    worker_reported_head: change.branch_head.as_str().to_owned(),
+                    required_trailer: trailer.to_owned(),
+                }
+            }
+            CommitMode::Host => {
+                let source = result
+                    .validated
+                    .claimed_artifact_refs
+                    .iter()
+                    .filter(|reference| reference.kind == RoleArtifactKind::Change)
+                    .collect::<Vec<_>>();
+                if source.len() != 1 {
+                    return Err(
+                        "host-commit Worker must provide exactly one registered Change artifact"
+                            .into(),
+                    );
+                }
+                let authority = store
+                    .agent_launch_authority(&binding.agent_run_id)?
+                    .ok_or("Worker launch authority is missing")?;
+                let verified = store
+                    .lookup_verified_artifact(&self.artifacts, &authority, source[0])?
+                    .ok_or("Worker Change artifact is not registered to its launch")?;
+                let manifest: crate::host_commit::ChangeManifest =
+                    crate::protocol::parse_unique(&verified.read_bytes(&self.artifacts)?)
+                        .map_err(|error| error.to_string())?;
+                if manifest.schema_version != 1 || manifest.entries.is_empty() {
+                    return Err(
+                        "Worker Change manifest is empty or has an unsupported schema".into(),
+                    );
+                }
+                WorkerDeliveryCommit::HostManifest {
+                    expected_head: prepared.base_sha().to_owned(),
+                    manifest,
+                    message: format!(
+                        "Implement {}",
+                        node.task.lines().next().unwrap_or("planned work")
+                    ),
+                }
+            }
+            CommitMode::Auto => {
+                return Err("Worker commit mode must be resolved before publication".into());
+            }
+        };
+        let repository = config
+            .repositories
+            .get(&node.repository)
+            .ok_or("accepted Worker repository is no longer configured")?;
+        let expected_remote_head = match self
+            .delivery
+            .effects()
+            .observe_remote_branch(&node.repository, prepared.branch())
+        {
+            Ok(head) => head,
+            Err(_) => return Ok(None),
+        };
+        let title = node
+            .task
+            .lines()
+            .next()
+            .unwrap_or("Implement planned work")
+            .trim();
+        if title.is_empty() || title.len() > 200 {
+            return Err("accepted work node has an invalid pull request title".into());
+        }
+        let body = format!(
+            "Ticket: {}\n\nWork node: {}\n\nTask:\n{}\n\nCompleted acceptance items:\n{}\n\nUnresolved items:\n{}\n\nRex-Projects-Run: {}\nRex-Projects-Node: {}",
+            run.ticket_id,
+            node_id,
+            node.task,
+            claimed
+                .completed_acceptance_items
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            claimed
+                .unresolved_items
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            run.ticket_run_id,
+            node_id,
+        );
+        let payload = PublishImplementationEffectPayload {
+            schema_version: 1,
+            source_revision: effect_revision,
+            configuration_digest: self.configuration_digest.clone(),
+            ticket_namespace: run.namespace.clone(),
+            ticket_id: run.ticket_id.clone(),
+            ticket_run_id: run.ticket_run_id.clone(),
+            work_node_id: node_id.clone(),
+            repository_id: node.repository.clone(),
+            expected_base_sha: prepared.base_sha().to_owned(),
+            base_branch: repository.base_branch.clone(),
+            commit_mode,
+            commit,
+            expected_remote_head,
+            pull_request: PullRequestContent {
+                title: title.to_owned(),
+                body,
+                update_target: None,
+            },
+        };
+        let (request_json, request_digest) = canonical_delivery_payload(&payload)?;
+        let operation_id = OperationId::parse(format!("publish-{}", result.receipt.evidence_id()))?;
+        let _ = now_unix;
+        Ok(Some(crate::store::EffectIntent {
+            project_id: run.project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: run.ticket_run_id.as_str().into(),
+            operation_id: operation_id.as_str().to_owned(),
+            logical_key: format!("{}:publish:{}", run.ticket_run_id, node_id),
+            kind: crate::engine::reducer::effect_name(
+                &crate::engine::reducer::EffectKind::PublishImplementation,
+            )
+            .into(),
+            request_json,
+            request_digest,
+            expected_revision: Some(effect_revision),
+        }))
+    }
+
     fn tick_profile_trials(
         &mut self,
         store: &mut ConfigStore,
