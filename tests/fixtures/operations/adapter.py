@@ -51,6 +51,8 @@ def main():
         result = {
             "provider_instance": "fixture-local",
             "external_run_id": params.get("external_reference") or "fixture-run",
+            "operation_id": request.get("operation_id"),
+            "correlation_key": params["correlation_key"],
             "action_id": params["action_id"],
             "target_id": params["target_id"],
             "repository_id": params["repository_id"],

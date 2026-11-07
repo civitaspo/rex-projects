@@ -1024,6 +1024,8 @@ impl FindResult {
 pub struct OperationObservation {
     pub provider_instance: String,
     pub external_run_id: String,
+    pub operation_id: OperationId,
+    pub correlation_key: String,
     pub action_id: String,
     pub target_id: String,
     pub repository_id: RepositoryId,
@@ -1064,6 +1066,63 @@ impl OperationObservation {
         }
         if !valid_git_sha(&self.source_sha) {
             return Err("operation observation source must be a full Git object ID".into());
+        }
+        let mut evidence_ids = BTreeSet::new();
+        if self
+            .evidence
+            .iter()
+            .any(|evidence| !valid_identifier(&evidence.id) || !evidence_ids.insert(&evidence.id))
+        {
+            return Err("operation evidence IDs must be valid and unique".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_request(&self, request: &ObserveParams) -> Result<(), String> {
+        if self.operation_id != request.operation_id
+            || self.correlation_key != request.correlation_key
+        {
+            return Err(
+                "operation.observe result does not match the exact operation correlation".into(),
+            );
+        }
+        if request
+            .external_reference
+            .as_deref()
+            .is_some_and(|reference| reference != self.external_run_id)
+        {
+            return Err(
+                "operation.observe result does not match the requested external run".into(),
+            );
+        }
+        if request.correlation_key.trim().is_empty() {
+            return Err("operation.observe request correlation key is empty".into());
+        }
+        if self.target_id != request.target_id
+            || self.action_id != request.action_id
+            || self.repository_id != request.repository_id
+            || self.environment != request.environment
+            || self.source_sha != request.source_sha
+        {
+            return Err(
+                "operation.observe result does not match the exact requested target and source"
+                    .into(),
+            );
+        }
+        self.validate_for_source(&request.source_sha)
+    }
+
+    fn validate_for_source(&self, source_sha: &str) -> Result<(), String> {
+        if self.provider_instance.trim().is_empty()
+            || self.external_run_id.trim().is_empty()
+            || self.observed_at.trim().is_empty()
+            || !valid_git_sha(&self.source_sha)
+            || self.source_sha != source_sha
+        {
+            return Err(
+                "operation observation is missing valid provider, run, source, or time identity"
+                    .into(),
+            );
         }
         let mut evidence_ids = BTreeSet::new();
         if self
@@ -1547,18 +1606,7 @@ fn validate_success_for(method: &str, params: &Value, result: &Value) -> Result<
                 .map_err(|error| format!("invalid operation.observe request params: {error}"))?;
             let response: OperationObservation = serde_json::from_value(result.clone())
                 .map_err(|error| format!("invalid operation.observe result: {error}"))?;
-            if response.action_id != request.action_id
-                || response.target_id != request.target_id
-                || response.repository_id != request.repository_id
-                || response.environment != request.environment
-                || response.source_sha != request.source_sha
-            {
-                return Err(
-                    "operation.observe result does not match the exact requested target and source"
-                        .into(),
-                );
-            }
-            Ok(())
+            response.validate_for_request(&request)
         }
         _ => Ok(()),
     }
@@ -2123,6 +2171,8 @@ mod tests {
         let mut observation = OperationObservation {
             provider_instance: "fixture".into(),
             external_run_id: "run-4".into(),
+            operation_id: OperationId::parse("op-4").unwrap(),
+            correlation_key: "corr-4".into(),
             action_id: target.action.clone(),
             target_id: target.id.clone(),
             repository_id: target.repository.clone(),
@@ -2145,6 +2195,51 @@ mod tests {
             observation.satisfies(&predicate),
             PredicateResult::Satisfied
         );
+    }
+
+    #[test]
+    fn observation_must_match_exact_operation_correlation_and_external_run() {
+        let target = target("deploy", vec![], ApprovalMode::Always);
+        let request = ObserveParams {
+            operation_id: OperationId::parse("op-4").unwrap(),
+            correlation_key: "corr-4".into(),
+            action_id: target.action.clone(),
+            target_id: target.id.clone(),
+            repository_id: target.repository.clone(),
+            environment: target.environment.clone(),
+            source_sha: SHA.into(),
+            external_reference: Some("run-4".into()),
+            cursor: None,
+        };
+        let observation = OperationObservation {
+            provider_instance: "fixture".into(),
+            external_run_id: "run-4".into(),
+            operation_id: request.operation_id.clone(),
+            correlation_key: request.correlation_key.clone(),
+            action_id: request.action_id.clone(),
+            target_id: request.target_id.clone(),
+            repository_id: request.repository_id.clone(),
+            environment: request.environment.clone(),
+            source_sha: request.source_sha.clone(),
+            observed_at: "2026-11-07T00:00:00Z".into(),
+            status: OperationStatus::Succeeded,
+            evidence: vec![],
+            jobs: BTreeMap::new(),
+            external_url: None,
+        };
+        assert!(observation.validate_for_request(&request).is_ok());
+
+        let mut stale = observation.clone();
+        stale.operation_id = OperationId::parse("op-other").unwrap();
+        assert!(stale.validate_for_request(&request).is_err());
+
+        let mut stale = observation.clone();
+        stale.correlation_key = "corr-other".into();
+        assert!(stale.validate_for_request(&request).is_err());
+
+        let mut stale = observation;
+        stale.external_run_id = "run-other".into();
+        assert!(stale.validate_for_request(&request).is_err());
     }
 
     #[test]
