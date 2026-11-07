@@ -228,6 +228,12 @@ pub(super) fn migrate_v9(connection: &Connection) -> Result<(), String> {
             PRIMARY KEY(project_id,goal_revision,request_key,namespace,ticket_id),
             FOREIGN KEY(project_id,goal_revision,request_key) REFERENCES goal_ticket_requests(project_id,goal_revision,request_key)
         );
+        CREATE TABLE effect_progress (
+            operation_id TEXT PRIMARY KEY REFERENCES effects(operation_id) ON DELETE CASCADE,
+            request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+            progress_json TEXT NOT NULL CHECK(length(progress_json) <= 262144),
+            updated_at_unix INTEGER NOT NULL
+        );
         INSERT INTO schema_migrations(version,applied_at_unix) VALUES (9,unixepoch());
         PRAGMA user_version=9;"
     ).map_err(|error| error.to_string())?;

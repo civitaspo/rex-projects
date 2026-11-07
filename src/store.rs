@@ -1564,6 +1564,68 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Read handler-owned progress only while this controller still owns the
+    /// exact claimed effect request. Progress survives retries and restarts.
+    pub fn load_effect_progress(
+        &self,
+        operation_id: &str,
+        owner_generation: u64,
+        request_digest: &str,
+    ) -> Result<Option<String>, String> {
+        Digest::parse(request_digest.to_owned())?;
+        self.connection
+            .query_row(
+                "SELECT p.progress_json FROM effect_progress p JOIN effects e ON e.operation_id=p.operation_id WHERE p.operation_id=?1 AND p.request_digest=?2 AND e.request_digest=?2 AND e.status='claimed' AND e.owner_generation=?3 AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?3 AND stopped_at_unix IS NULL)",
+                params![operation_id, request_digest, owner_generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persist a bounded canonical JSON checkpoint for the currently claimed
+    /// effect. The external operation must be performed outside this transaction.
+    pub fn save_effect_progress(
+        &mut self,
+        operation_id: &str,
+        owner_generation: u64,
+        request_digest: &str,
+        progress_json: &str,
+        now_unix: i64,
+    ) -> Result<(), String> {
+        const MAX_PROGRESS_BYTES: usize = 262_144;
+        Digest::parse(request_digest.to_owned())?;
+        if progress_json.len() > MAX_PROGRESS_BYTES {
+            return Err("effect progress exceeds 262144 bytes".into());
+        }
+        let value: serde_json::Value = serde_json::from_str(progress_json)
+            .map_err(|_| "effect progress must be valid JSON".to_owned())?;
+        if serde_json::to_string(&value).map_err(|error| error.to_string())? != progress_json {
+            return Err("effect progress JSON must use canonical serialization".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let claimed: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM effects WHERE operation_id=?1 AND request_digest=?2 AND status='claimed' AND owner_generation=?3)",
+                params![operation_id, request_digest, owner_generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !claimed {
+            return Err("effect progress claim is stale or request digest mismatched".into());
+        }
+        tx.execute(
+            "INSERT INTO effect_progress(operation_id,request_digest,progress_json,updated_at_unix) VALUES (?1,?2,?3,?4) ON CONFLICT(operation_id) DO UPDATE SET progress_json=excluded.progress_json,updated_at_unix=excluded.updated_at_unix WHERE effect_progress.request_digest=excluded.request_digest",
+            params![operation_id, request_digest, progress_json, now_unix],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     pub fn claim_ticket(
         &mut self,
         owner_generation: u64,
@@ -3870,9 +3932,32 @@ mod tests {
                 &self,
                 mode: crate::effects::EffectMode,
                 request: &crate::effects::EffectRequest,
-                _context: &mut crate::effects::EffectContext<'_>,
+                context: &mut crate::effects::EffectContext<'_>,
             ) -> Result<crate::effects::EffectObservation, String> {
                 self.seen.lock().unwrap().push((mode, request.clone()));
+                let progress = serde_json::to_string(&serde_json::json!({
+                    "attempt": request.attempt_count,
+                }))
+                .unwrap();
+                context.store.save_effect_progress(
+                    &request.intent.operation_id,
+                    context.owner_generation,
+                    &request.intent.request_digest,
+                    &progress,
+                    context.now_unix,
+                )?;
+                assert_eq!(
+                    context
+                        .store
+                        .load_effect_progress(
+                            &request.intent.operation_id,
+                            context.owner_generation,
+                            &request.intent.request_digest,
+                        )
+                        .unwrap()
+                        .as_deref(),
+                    Some(progress.as_str())
+                );
                 match self.actions.lock().unwrap().pop_front().unwrap() {
                     "pending" => Ok(crate::effects::EffectObservation::Pending {
                         receipt: "{}".into(),
