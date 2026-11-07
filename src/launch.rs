@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{
-    AgentRunId, Digest as ContentDigest, OperationId, ProfileId, ProjectId, Revision, TicketId,
-    TicketNamespace, TicketRunId,
+    AgentRunId, Digest as ContentDigest, OperationId, ProfileId, ProjectId, RepositoryId, Revision,
+    TicketId, TicketNamespace, TicketRunId,
 };
 use crate::domain::types::{AgentAdapter, CommitMode, Role};
+use crate::engine::orchestration::WorkNodeId;
 
 pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_SCHEMA_VERSION: u32 = 1;
@@ -61,6 +62,9 @@ pub struct AgentLaunchReservation {
     pub project_epoch: u64,
     pub operation_id: OperationId,
     pub operation_recipe_id: Option<String>,
+    /// Required for Worker launches; Store validates this against a host-minted
+    /// PreparedWorkerLaunch inside the reservation transaction.
+    pub worker_assignment: Option<WorkerLaunchBinding>,
     pub rex_view_id: ContentDigest,
     pub runtime_binary_digest: ContentDigest,
     pub environment_snapshot_id: ContentDigest,
@@ -84,6 +88,53 @@ pub struct AgentLaunchReservation {
     pub project_capacity: u32,
 }
 
+/// Immutable work-plan and prepared-worktree provenance for a Worker run.
+/// Deserialization never grants authority; Store requires an opaque host token
+/// and revalidates every field against current SQLite state before reservation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchBinding {
+    pub schema_version: u32,
+    pub accepted_revision: u64,
+    pub ticket_revision: u64,
+    pub configuration_digest: ContentDigest,
+    pub plan_digest: ContentDigest,
+    pub node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub commit_mode: CommitMode,
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub base_sha: String,
+    pub prepare_operation_id: String,
+    pub prepare_receipt_digest: ContentDigest,
+    pub source_evidence_id: String,
+    pub source_agent_run_id: AgentRunId,
+    pub source_message_id: String,
+    pub source_result_digest: ContentDigest,
+    pub coordinator_agent_run_id: AgentRunId,
+    pub coordinator_role_session_id: String,
+    pub coordinator_authority_digest: ContentDigest,
+}
+
+impl WorkerLaunchBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.accepted_revision == 0
+            || self.ticket_revision == 0
+            || !self.worktree_path.is_absolute()
+            || self.branch.trim().is_empty()
+            || self.base_sha.trim().is_empty()
+            || self.prepare_operation_id.trim().is_empty()
+            || self.source_evidence_id.trim().is_empty()
+            || self.source_message_id.trim().is_empty()
+            || self.coordinator_role_session_id.trim().is_empty()
+        {
+            return Err("Worker launch binding has invalid plan or worktree provenance".into());
+        }
+        Ok(())
+    }
+}
+
 impl AgentLaunchReservation {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != LAUNCH_SCHEMA_VERSION
@@ -102,6 +153,16 @@ impl AgentLaunchReservation {
         }
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("reservation parent AgentRun ID and role must be present together".into());
+        }
+        match (self.role, self.worker_assignment.as_ref()) {
+            (Role::Worker, Some(assignment)) => assignment.validate()?,
+            (Role::Worker, None) => {
+                return Err("Worker reservation requires prepared plan/worktree provenance".into());
+            }
+            (_, Some(_)) => {
+                return Err("non-Worker reservation cannot carry Worker launch provenance".into());
+            }
+            (_, None) => {}
         }
         if self.role == Role::Supervisor {
             if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {

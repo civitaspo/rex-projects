@@ -627,6 +627,41 @@ impl ConfigStore {
         &mut self,
         reservation: &AgentLaunchReservation,
     ) -> Result<LaunchPreparationOutcome, String> {
+        if reservation.role == Role::Worker {
+            return Err(
+                "Worker launches require an opaque accepted-plan and prepared-worktree token"
+                    .into(),
+            );
+        }
+        if reservation.worker_assignment.is_some() {
+            return Err("non-Worker launch cannot carry Worker plan provenance".into());
+        }
+        self.prepare_role_launch_inner(reservation, None)
+    }
+
+    /// Reserve a Worker only with the opaque Store token minted after the accepted
+    /// Coordinator plan and its exact prepared-worktree effect have been verified.
+    pub fn prepare_worker_role_launch(
+        &mut self,
+        reservation: &AgentLaunchReservation,
+        prepared: &crate::store::accepted_plans::PreparedWorkerLaunch,
+    ) -> Result<LaunchPreparationOutcome, String> {
+        if reservation.role != Role::Worker {
+            return Err("prepared worktree token can only authorize a Worker launch".into());
+        }
+        if reservation.worker_assignment.as_ref() != Some(&prepared.reservation_binding()) {
+            return Err(
+                "Worker reservation does not exactly match its host-minted plan token".into(),
+            );
+        }
+        self.prepare_role_launch_inner(reservation, Some(prepared))
+    }
+
+    fn prepare_role_launch_inner(
+        &mut self,
+        reservation: &AgentLaunchReservation,
+        prepared_worker: Option<&crate::store::accepted_plans::PreparedWorkerLaunch>,
+    ) -> Result<LaunchPreparationOutcome, String> {
         reservation.validate()?;
         let reservation_digest = reservation.digest()?;
         let control_dir = std::fs::canonicalize(&reservation.control_dir)
@@ -646,6 +681,17 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, reservation.controller_generation)?;
+        if let Some(prepared) = prepared_worker {
+            crate::store::accepted_plans::revalidate_prepared_worker_launch(
+                &tx,
+                reservation,
+                prepared,
+            )?;
+        } else if reservation.role == Role::Worker || reservation.worker_assignment.is_some() {
+            return Err(
+                "Worker launch lacks transactionally verified prepared-worktree authority".into(),
+            );
+        }
         let project: Option<(String, u64, String, String, String, u64, String)> = tx
             .query_row(
                 "SELECT p.config_source,p.config_revision,p.config_digest,p.mode,p.desired_lifecycle,r.project_epoch,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
@@ -1333,6 +1379,7 @@ mod tests {
             project_epoch: 1,
             operation_id: OperationId::parse("op-run-1").unwrap(),
             operation_recipe_id: None,
+            worker_assignment: None,
             rex_view_id: view.view_id.clone(),
             runtime_binary_digest: digest('4'),
             environment_snapshot_id: digest('5'),
@@ -1369,6 +1416,17 @@ mod tests {
                 1,
                 "operations".into()
             )
+        );
+        let mut worker_without_provenance = reservation.clone();
+        worker_without_provenance.role = Role::Worker;
+        worker_without_provenance.ticket_run_id =
+            Some(crate::domain::ids::TicketRunId::parse("ticket-run-a").unwrap());
+        worker_without_provenance.ticket_revision = Some(Revision(1));
+        assert!(
+            store
+                .prepare_role_launch(&worker_without_provenance)
+                .unwrap_err()
+                .contains("opaque accepted-plan")
         );
         assert!(matches!(
             store.prepare_role_launch(&reservation).unwrap(),

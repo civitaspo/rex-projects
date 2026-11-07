@@ -1111,6 +1111,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             project_epoch: runnable.project_epoch,
             operation_id,
             operation_recipe_id: None,
+            worker_assignment: None,
             rex_view_id: view.view_id.clone(),
             runtime_binary_digest: self.runtime_binary_digest.clone(),
             environment_snapshot_id: self.environment.metadata().id.clone(),
