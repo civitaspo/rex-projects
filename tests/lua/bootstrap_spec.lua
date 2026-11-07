@@ -41,8 +41,8 @@ local function fake_world(options)
     symlinks = {},
     commands = {},
     version = version_info(options.version_overrides),
-    encoded_owner = nil,
     source_copy_count = 0,
+    temporary_sequence = 0,
   }
 
   local function exists(path)
@@ -86,6 +86,15 @@ local function fake_world(options)
       local file = world.files[argv[#argv]]
       return file and success(file.digest .. "  " .. argv[#argv] .. "\n") or failure("missing file")
     end
+    if command == "mktemp" then
+      world.temporary_sequence = world.temporary_sequence + 1
+      local template = argv[3]
+      local directory = template:gsub("XXXXXXXX", string.format("%08d", world.temporary_sequence))
+      world.directories[directory] = true
+      world.directories[directory .. "#mode"] = "700"
+      if options.on_temp_directory_created then options.on_temp_directory_created(directory, world) end
+      return success(directory .. "\n")
+    end
     if command == "mkdir" then
       local path = argv[#argv]
       if argv[2] == "-p" then
@@ -94,10 +103,6 @@ local function fake_world(options)
       end
       if world.directories[path] or world.files[path] or world.symlinks[path] then return failure("already exists") end
       world.directories[path] = true
-      if options.on_lock_created and path:match("%.lock$") then options.on_lock_created() end
-      if options.on_temp_directory_created and path:match("%.tmp$") then
-        options.on_temp_directory_created(path, world)
-      end
       return success()
     end
     if command == "chmod" then
@@ -139,12 +144,12 @@ local function fake_world(options)
       end
       return success()
     end
-    if command == "mv" then
-      local source, destination = argv[3], argv[4]
-      if exists(destination) then return success() end
+    if command == "link" then
+      local source, destination = argv[2], argv[3]
+      if options.on_link then options.on_link(destination, world) end
+      if exists(destination) then return failure("destination exists") end
       if not world.files[source] then return failure("missing source") end
       world.files[destination] = world.files[source]
-      world.files[source] = nil
       return success()
     end
     if command == "rm" then
@@ -192,16 +197,7 @@ local function fake_world(options)
 
   function world.decode(text)
     if text == "version-json" then return world.version end
-    if text == "owner-json" then return world.encoded_owner end
-    for _, file in pairs(world.files) do
-      if file.content == text and text == "owner-json" then return world.encoded_owner end
-    end
     return nil, "unknown fixture JSON"
-  end
-
-  function world.encode(value)
-    world.encoded_owner = value
-    return "owner-json"
   end
 
   function world.resolve(options_value, pin, budget, clock)
@@ -210,10 +206,8 @@ local function fake_world(options)
       pin or { version = "0.1.0", protocol = 1, targets = {} },
       world.environment,
       world.decode,
-      world.encode,
       world.exec,
       budget or 25,
-      {},
       clock
     )
   end
@@ -233,11 +227,7 @@ local context, err = world.resolve({ cli = "/dev/rex-projects" }, nil, 25)
 check(context, err)
 check(context.source == "developer" and context.digest == hash)
 check(world.files[context.cli_path] and world.files[context.cli_path].binary)
-check(world.encoded_owner.invocation_token and world.encoded_owner.source_digest == hash)
-check(world.encoded_owner.deadline_epoch > world.encoded_owner.created_epoch)
-check(world.encoded_owner.rex_process_identity:find("unknown", 1, true))
-check(world.encoded_owner.cli_protocol == 1)
-check(not world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"])
+check(not world.directories["/cache/rex-projects/.locks"], "immutable publication must not create a shared lock tree")
 local copy_count = world.source_copy_count
 local warm = world.resolve({ cli = "/dev/rex-projects" }, nil, 25)
 check(warm and warm.cli_path == context.cli_path)
@@ -267,13 +257,10 @@ local changing = fake_world({ mutate_source_after_copy = true })
 local changed, changed_error = changing.resolve({ cli = "/dev/rex-projects" }, nil, 25)
 check(not changed and changed_error:find("changed while it was being snapshotted", 1, true))
 
-local missing_helper = fake_world({ missing_command = "tee" })
-local no_receipt, receipt_error = missing_helper.resolve({ cli = "/dev/rex-projects" }, nil, 25)
-check(not no_receipt and receipt_error:find("missing helper tee", 1, true))
-check(
-  not missing_helper.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
-  "failed owner receipt creation must release only the newly acquired empty lock"
-)
+local missing_helper = fake_world({ missing_command = "link" })
+local no_publication, publication_error = missing_helper.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(not no_publication and publication_error:find("missing helper link", 1, true))
+check(not missing_helper.directories["/cache/rex-projects/.locks"], "a failed publish must not strand a lock")
 
 local missing_stat = fake_world({ missing_command = "stat" })
 local stat_context, stat_error = missing_stat.resolve({ cli = "/dev/rex-projects" }, nil, 25)
@@ -286,38 +273,101 @@ local timeout = fake_world({ cli_times_out = true })
 local timed_out, timeout_error = timeout.resolve({ cli = "/dev/rex-projects" }, nil, 25)
 check(not timed_out and timeout_error:find("exceeded its bootstrap timeout", 1, true))
 check(timeout.source_copy_count == 1, "timed out CLI probe must not publish an unverified snapshot")
-check(
-  not timeout.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
-  "timed out CLI probe must release its owned lock"
-)
+check(not timeout.directories["/cache/rex-projects/.locks"], "timed out setup must not require lock cleanup")
 
 local now = 1000
 local function fake_clock() return now end
-local deadline_world = fake_world({ on_lock_created = function() now = 1003 end })
+local deadline_world = fake_world({ on_temp_directory_created = function() now = 1003 end })
 local expired, expired_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 4, fake_clock)
 check(not expired and expired_error:find("deadline reached", 1, true))
+local setup_timeout
+for _, command in ipairs(deadline_world.commands) do
+  if command.argv[1] == "mktemp" then setup_timeout = command.timeout end
+end
+check(setup_timeout == 1, "a 4-second setup retains one second plus Rex's two-second termination grace")
 check(
-  deadline_world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
-  "an expired setup may preserve its own lock when Rex's termination grace exhausts the budget"
+  not deadline_world.directories["/cache/rex-projects/.locks"],
+  "deadline exhaustion must not leave shared lock state"
 )
 now = 1004
 local retried, retry_error = deadline_world.resolve({ cli = "/dev/rex-projects" }, nil, 25, fake_clock)
-check(retried, "25-second retry must clean its own previous lock and recover: " .. tostring(retry_error))
+check(retried, "25-second retry must publish despite an abandoned staging directory: " .. tostring(retry_error))
 check(
-  not deadline_world.directories["/cache/rex-projects/.locks/dev-" .. hash .. ".lock"],
-  "successful retry must release its own lock"
+  deadline_world.directories["/cache/rex-projects/dev/" .. hash],
+  "a previous abandoned staging directory must not block immutable publication"
 )
 
-local busy = fake_world()
-local lock_path = "/cache/rex-projects/.locks/dev-" .. hash .. ".lock"
-busy.directories["/cache/rex-projects"] = true
-busy.directories["/cache/rex-projects/.locks"] = true
-busy.directories[lock_path] = true
-busy.files[lock_path .. "/owner.json"] = { content = "owner-json", digest = "receipt" }
-busy.encoded_owner = { invocation_token = "another-owner" }
-local busy_context, busy_error = busy.resolve({ cli = "/dev/rex-projects" }, nil, 25)
-check(not busy_context and busy_error:find(lock_path .. "/owner.json", 1, true))
-check(busy.files[lock_path .. "/owner.json"].content == "owner-json", "a busy owner receipt must be preserved")
+local simultaneous = fake_world({
+  on_temp_directory_created = function(directory, world_value)
+    local final_path = directory:gsub("/%.rex%-projects%.%d+$", "/rex-projects")
+    world_value.files[final_path] = {
+      digest = hash,
+      identity = "winner:1:1:1",
+      binary = true,
+      executable = true,
+    }
+  end,
+})
+local concurrent_winner, winner_error = simultaneous.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(concurrent_winner, "a competing publisher's valid immutable winner must be reused: " .. tostring(winner_error))
+check(concurrent_winner.digest == hash)
+check(
+  not simultaneous.directories["/cache/rex-projects/.locks"],
+  "simultaneous publishers must not require shared lock state"
+)
+
+local invalid_winner = fake_world({
+  on_temp_directory_created = function(directory, world_value)
+    local final_path = directory:gsub("/%.rex%-projects%.%d+$", "/rex-projects")
+    world_value.files[final_path] = {
+      digest = string.rep("f", 64),
+      identity = "winner:1:1:1",
+      binary = true,
+      executable = true,
+    }
+  end,
+})
+local rejected_winner, rejected_winner_error = invalid_winner.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(
+  not rejected_winner and rejected_winner_error:find("winner failed digest verification", 1, true),
+  "a concurrent publisher must preserve and reject a winner with the wrong digest"
+)
+check(
+  invalid_winner.files["/cache/rex-projects/dev/" .. hash .. "/rex-projects"].digest == string.rep("f", 64),
+  "publication must never replace an existing immutable cache entry"
+)
+
+local directory_winner = fake_world({
+  on_temp_directory_created = function(directory, world_value)
+    local final_path = directory:gsub("/%.rex%-projects%.%d+$", "/rex-projects")
+    world_value.directories[final_path] = true
+  end,
+})
+local rejected_directory, directory_error = directory_winner.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(
+  not rejected_directory and directory_error:find("winner failed digest verification", 1, true),
+  "publication must reject and preserve a directory at the immutable file path"
+)
+check(
+  directory_winner.directories["/cache/rex-projects/dev/" .. hash .. "/rex-projects"],
+  "publication must never replace a directory at the cache file path"
+)
+
+local symlink_winner = fake_world({
+  on_link = function(final_path, world_value)
+    world_value.symlinks[final_path] = "/outside/marker"
+    world_value.files["/outside/marker"] = { digest = "outside", identity = "outside" }
+  end,
+})
+local rejected_symlink, symlink_error = symlink_winner.resolve({ cli = "/dev/rex-projects" }, nil, 25)
+check(
+  not rejected_symlink and symlink_error:find("became a symlink", 1, true),
+  "publication must reject a symlink introduced between initial validation and atomic link"
+)
+check(
+  symlink_winner.files["/outside/marker"].digest == "outside",
+  "atomic publication must not follow a competing symlink to overwrite its target"
+)
 
 local corrupt_cache = fake_world()
 local corrupt_path = "/cache/rex-projects/dev/" .. hash
@@ -421,11 +471,16 @@ check(
 )
 local temp_mkdir
 for _, call in ipairs(symlinked_temp.commands) do
-  if call.argv[1] == "mkdir" and call.argv[2] == "-m" then
+  if call.argv[1] == "mktemp" then
     temp_mkdir = call
     break
   end
 end
-check(temp_mkdir and temp_mkdir.argv[3] == "700", "temporary directories must be private at atomic creation")
+check(
+  temp_mkdir
+    and temp_mkdir.argv[2] == "-d"
+    and symlinked_temp.directories[temp_mkdir.argv[3]:gsub("XXXXXXXX", "00000001") .. "#mode"] == "700",
+  "temporary directories must be created exclusively with the platform mktemp utility"
+)
 
 print("bootstrap fake-exec contract passed")

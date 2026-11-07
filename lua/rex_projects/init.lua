@@ -11,13 +11,12 @@ local function register_actions(rex_api)
     name = "rex_projects_retry_setup",
     title = "Retry rex-projects Setup",
     category = "rex-projects",
-    run = function(ctx)
+    run = function()
       local context, err = Bootstrap.resolve(
         M.options,
         Pin,
         environment,
         function(text) return rex_api.json.decode(text) end,
-        function(value) return rex_api.json.encode(value) end,
         function(argv, timeout, extra_options)
           local exec_options = { timeout = timeout, text = true }
           for key, value in pairs(extra_options or {}) do
@@ -25,8 +24,7 @@ local function register_actions(rex_api)
           end
           return rex_api.exec(argv, exec_options)
         end,
-        25,
-        { server = ctx and ctx.server }
+        25
       )
       M.context = context
       M.error = err
@@ -54,7 +52,6 @@ function M.setup(options, rex_api)
     Pin,
     environment,
     function(text) return rex_api.json.decode(text) end,
-    function(value) return rex_api.json.encode(value) end,
     function(argv, timeout, extra_options)
       local exec_options = { timeout = timeout, text = true }
       for key, value in pairs(extra_options or {}) do
@@ -62,8 +59,7 @@ function M.setup(options, rex_api)
       end
       return rex_api.exec(argv, exec_options)
     end,
-    4,
-    {}
+    4
   )
   register_actions(rex_api)
   if M.context then return M.context.cli_path end

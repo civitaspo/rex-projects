@@ -99,7 +99,7 @@ local verified_context = {
     database_schema = 4,
   },
 }
-Bootstrap.resolve = function(_options, _pin, _env, _decode, _encode, _exec, budget)
+Bootstrap.resolve = function(_options, _pin, _env, _decode, _exec, budget)
   resolve_count = resolve_count + 1
   resolve_budgets[resolve_count] = budget
   if resolve_count == 1 then return nil, "simulated initial setup timeout" end

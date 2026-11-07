@@ -47,8 +47,13 @@ run = [
   "ast-grep test --skip-snapshot-tests",
   "python3 -m unittest discover -s tests/fixtures/agents -p 'test_*.py'",
 <<<<<<< HEAD
+<<<<<<< HEAD
   "python3 -m unittest discover -s tests -p 'test_release_assets.py'",
 =======
+=======
+  "python3 tests/fixtures/rex/bootstrap/verify-link-publication.py",
+  "python3 tests/fixtures/rex/bootstrap/verify-mock-override.py",
+>>>>>>> 9d083d7 (fix(lua): publish bootstrap cache without shared locks)
   "lua tests/lua/bootstrap_version_contract.lua",
   "lua tests/lua/bootstrap_spec.lua",
 <<<<<<< HEAD
