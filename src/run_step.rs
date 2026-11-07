@@ -1740,7 +1740,7 @@ mod tests {
     use std::process::ExitStatus;
     use std::time::Duration;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tempfile::tempdir;
 
     use crate::config::{ClaudeCodeOptions, CodexOptions, Profile};
@@ -1766,6 +1766,9 @@ mod tests {
             conversation_id: Some("conversation-a".into()),
             provider_version: None,
             capability_receipt_digest: None,
+            schema_projection: crate::providers::project_result_schema(&json!({"type":"object"}))
+                .unwrap()
+                .identity,
             launch_pid_hint: Some(42),
             exit_code: Some(0),
             timed_out: false,

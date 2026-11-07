@@ -806,6 +806,7 @@ mod tests {
             process_start_identity: nonce.into(),
             executable_path: "/tmp/rex-projects-fixture".into(),
             executable_digest: "b".repeat(64),
+            rex_endpoint: None,
             rex_server_identity: None,
             rex_session_id: None,
             rex_block_id: None,

@@ -893,6 +893,7 @@ mod tests {
                 .unwrap(),
                 executable_path: std::env::current_exe().unwrap().display().to_string(),
                 executable_digest: "b".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,

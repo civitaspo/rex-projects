@@ -4890,6 +4890,7 @@ mod tests {
             profile_digest: Digest::parse("f".repeat(64)).unwrap(),
             instruction_digest: Digest::parse("a".repeat(64)).unwrap(),
             result_schema_digest: Digest::parse("b".repeat(64)).unwrap(),
+            wake_snapshot_digest: Digest::parse("c".repeat(64)).unwrap(),
             qualification_receipt_digest: Digest::parse("c".repeat(64)).unwrap(),
             rex_server_identity: "fixture-instance".into(),
             rex_session_id: "session-1".into(),

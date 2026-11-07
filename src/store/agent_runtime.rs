@@ -743,7 +743,7 @@ mod tests {
     use sha2::Digest as _;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{ConfigStore, LaunchPreparationOutcome};
+    use super::{ConfigStore, LaunchPreparationOutcome, MAX_PROFILE_QUALIFICATION_CANDIDATES};
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
@@ -878,6 +878,7 @@ mod tests {
                 process_start_identity: "owner-start".into(),
                 executable_path: "/tmp/rex-projects".into(),
                 executable_digest: digest('9').as_str().into(),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,

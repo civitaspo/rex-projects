@@ -1122,6 +1122,7 @@ mod tests {
             profile_digest: digest('a'),
             instruction_digest: digest('7'),
             result_schema_digest: digest('8'),
+            wake_snapshot_digest: digest('d'),
             qualification_receipt_digest: digest('5'),
             rex_server_identity: "rex-instance-1".into(),
             rex_session_id: "session-1".into(),

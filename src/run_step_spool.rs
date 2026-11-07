@@ -469,6 +469,11 @@ mod tests {
                 conversation_id: None,
                 provider_version: Some("test-version".into()),
                 capability_receipt_digest: Some(request.qualification_receipt_digest.clone()),
+                schema_projection: crate::providers::project_result_schema(
+                    &serde_json::json!({"type":"object"}),
+                )
+                .unwrap()
+                .identity,
                 launch_pid_hint: Some(100),
                 exit_code: Some(0),
                 timed_out: false,

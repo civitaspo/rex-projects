@@ -2016,6 +2016,7 @@ mod tests {
 
     use super::{PendingRoleWakeSession, TicketScanCursor, TicketScanKey, migrate_v9, status_key};
     use crate::domain::types::{Role, TicketStatus};
+    use crate::engine::orchestration::WorkNodeId;
 
     #[test]
     fn scan_keys_are_namespaced_by_status_and_digests_are_validated() {

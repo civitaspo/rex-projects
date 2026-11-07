@@ -235,6 +235,11 @@ mod tests {
                     permission_mode: "workspace_write".into(),
                     invocation_options_digest: digest('e'),
                     commit_mode: CommitMode::Native,
+                    schema_projection: crate::providers::project_result_schema(
+                        &serde_json::json!({"type":"object"}),
+                    )
+                    .unwrap()
+                    .identity,
                     receipt_digest: digest('f'),
                     status: ProviderQualificationStatus::Verified,
                 },
