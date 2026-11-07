@@ -680,19 +680,78 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn returns_bounded_unknown_when_a_setsid_child_keeps_inherited_pipes_open() {
+        use super::{
+            ProcessIdentity, ProcessSignal, inspect_process_table, matching_processes,
+            signal_process_group_if_observed,
+        };
+        use std::thread;
         use std::time::Instant;
+
+        struct EscapedChildGuard {
+            release: PathBuf,
+            observed: Option<ProcessIdentity>,
+        }
+
+        impl EscapedChildGuard {
+            fn release_and_reap(&mut self) -> bool {
+                // The fixture also exits itself after five seconds. This marker
+                // releases it immediately on success and during panic cleanup.
+                let _ = std::fs::write(&self.release, b"release");
+                let Some(observed) = self.observed.as_ref() else {
+                    return true;
+                };
+                let deadline = Instant::now() + Duration::from_millis(500);
+                let mut sent_kill = false;
+                while Instant::now() < deadline {
+                    let Ok(current) = inspect_process_table() else {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    let still_matches =
+                        !matching_processes(std::slice::from_ref(observed), &current).is_empty();
+                    if !still_matches {
+                        return true;
+                    }
+                    let signal = if sent_kill {
+                        ProcessSignal::Kill
+                    } else {
+                        ProcessSignal::Terminate
+                    };
+                    let signalled = signal_process_group_if_observed(
+                        observed.process_group_id,
+                        std::slice::from_ref(observed),
+                        &current,
+                        signal,
+                    )
+                    .unwrap_or(false);
+                    sent_kill |= !signalled || signal == ProcessSignal::Terminate;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                false
+            }
+        }
+
+        impl Drop for EscapedChildGuard {
+            fn drop(&mut self) {
+                let _ = self.release_and_reap();
+            }
+        }
 
         let temp = tempfile::tempdir().unwrap();
         let ready = temp.path().join("child-ready");
         let release = temp.path().join("release-child");
+        let mut child_guard = EscapedChildGuard {
+            release: release.clone(),
+            observed: None,
+        };
         let python = resolve_executable(
             Path::new("python3"),
             &std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>(),
         )
         .unwrap();
         let program = format!(
-            "import os,time,pathlib; pid=os.fork();\nif pid: raise SystemExit(0)\nos.setsid(); pathlib.Path({:?}).touch();\nwhile not pathlib.Path({:?}).exists(): time.sleep(0.01)",
-            ready, release
+            "import os,time,pathlib; ready=pathlib.Path({:?}); release=pathlib.Path({:?}); pid=os.fork();\nif pid:\n deadline=time.monotonic()+3\n while not ready.exists() and time.monotonic()<deadline: time.sleep(0.005)\n raise SystemExit(0 if ready.exists() else 2)\nos.setsid(); ready.write_text(str(os.getpid())); deadline=time.monotonic()+5\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)",
+            ready, release,
         );
         let mut req = request(python.to_str().unwrap(), &["-c", &program]);
         req.executable = python;
@@ -700,13 +759,32 @@ mod tests {
         req.shutdown_grace = Duration::from_millis(100);
         let started = Instant::now();
         let result = run(req);
+        let ready_pid = std::fs::read_to_string(&ready)
+            .expect("child startup barrier must publish its PID")
+            .parse::<u32>()
+            .unwrap();
+        let process_table = inspect_process_table().unwrap();
+        child_guard.observed = process_table
+            .iter()
+            .find(|process| process.pid == ready_pid)
+            .cloned();
+        let observed = child_guard
+            .observed
+            .as_ref()
+            .expect("detached child must be observable after its readiness barrier");
+        assert_eq!(observed.process_group_id, ready_pid);
+        assert!(!observed.start_identity.is_empty());
+        assert!(observed.quality == super::ProcessIdentityQuality::KernelBirthToken);
         assert!(matches!(
             result,
             Err(super::ProcessError::CleanupUnconfirmed)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(ready.exists());
-        std::fs::write(&release, b"release").unwrap();
+        assert!(
+            child_guard.release_and_reap(),
+            "escaped fixture must be reaped"
+        );
     }
 
     #[test]
