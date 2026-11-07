@@ -2593,6 +2593,84 @@ impl ConfigStore {
                     "validated work plan is not bound to the PlanAccepted transition".into(),
                 );
             }
+            let source_claim: crate::engine::orchestration::WorkPlan =
+                crate::protocol::parse_unique(plan.source_claim_plan_json.as_bytes()).map_err(
+                    |error| format!("stored Coordinator plan claim is invalid: {error}"),
+                )?;
+            let accepted: crate::store::accepted_plans::PersistedWorkPlan =
+                crate::protocol::parse_unique(plan.plan_json.as_bytes())
+                    .map_err(|error| format!("persisted work plan is invalid: {error}"))?;
+            if accepted.schema_version != 1
+                || accepted.proposal != source_claim
+                || plan.validated_plan.ticket_run_id != *ticket_run_id
+                || !crate::store::accepted_plans::validated_plan_matches_claim(
+                    &plan.validated_plan,
+                    &accepted.proposal,
+                )
+            {
+                return Err("validated work plan differs from Coordinator result evidence".into());
+            }
+            let source_row: Option<(String,String,String,Option<String>,Option<u64>,String,String,String,String,String)> = tx.query_row(
+                "SELECT e.agent_run_id,e.project_id,e.role,e.ticket_run_id,a.ticket_revision,a.role_session_id,a.config_digest,a.authority_digest,a.role,a.parent_role FROM agent_result_evidence e JOIN agent_launch_authority a USING(agent_run_id) WHERE e.evidence_id=?1 AND e.message_id=?2 AND e.result_digest=?3",
+                params![plan.source_evidence_id,plan.source_message_id,plan.source_result_digest.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let Some((
+                source_run,
+                source_project,
+                source_role,
+                source_ticket,
+                source_ticket_revision,
+                source_session,
+                source_config,
+                authority_digest,
+                authority_role,
+                parent_role,
+            )) = source_row
+            else {
+                return Err(
+                    "accepted plan has no matching persisted Coordinator result evidence".into(),
+                );
+            };
+            if source_run != plan.source_agent_run_id.as_str()
+                || source_run != plan.coordinator_agent_run_id.as_str()
+                || source_project != project_id.as_str()
+                || source_role != "coordinator"
+                || authority_role != "coordinator"
+                || parent_role != "supervisor"
+                || source_ticket.as_deref() != Some(ticket_run_id.as_str())
+                || source_ticket_revision != Some(current.revision.0)
+                || source_session != plan.coordinator_role_session_id
+                || source_config != plan.configuration_digest.as_str()
+                || source_session != format!("ticket:{}:coordinator", ticket_run_id.as_str())
+            {
+                return Err("accepted plan Coordinator provenance is stale or out of scope".into());
+            }
+            let source_submission: crate::engine::orchestration::RoleResultSubmission = tx
+                .query_row(
+                    "SELECT result_json FROM agent_result_evidence WHERE evidence_id=?1",
+                    [&plan.source_evidence_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|raw| {
+                    crate::protocol::parse_unique(raw.as_bytes()).map_err(|error| error.to_string())
+                })?;
+            let source_binding = source_submission.binding.clone();
+            let source_validated = crate::engine::orchestration::validate_role_result(
+                &source_binding,
+                source_submission,
+            )?;
+            let source_claim_matches = matches!(
+                source_validated.typed_payload,
+                crate::engine::orchestration::RoleResultPayload::PlanReady(ref payload)
+                    if serde_json::to_string(&payload.plan).is_ok_and(|json| json == plan.source_claim_plan_json)
+            );
+            if !source_claim_matches {
+                return Err(
+                    "persisted Coordinator result differs from accepted plan source".into(),
+                );
+            }
             tx.execute(
                 "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![project_id.as_str(),ticket_run_id.as_str(),decision_run.revision.0,plan.configuration_digest.as_str(),plan.plan_digest.as_str(),plan.plan_json,now_unix()?],
@@ -2644,16 +2722,16 @@ impl ConfigStore {
             if content_digest(&plan_json) != plan_digest {
                 return Err("accepted work plan digest is invalid".into());
             }
-            let plan: crate::engine::orchestration::ValidatedPlan =
-                serde_json::from_str(&plan_json)
+            let persisted: crate::store::accepted_plans::PersistedWorkPlan =
+                crate::protocol::parse_unique(plan_json.as_bytes())
                     .map_err(|error| format!("accepted work plan is invalid: {error}"))?;
-            if plan.ticket_run_id != *ticket_run_id {
+            if persisted.schema_version != 1 {
                 return Err("accepted work plan is bound to another TicketRun".into());
             }
-            plan.nodes_in_execution_order
+            persisted.proposal.nodes
                 .iter()
                 .filter(|node| {
-                    node.role == Role::Worker
+                    !node.investigation
                         && (!initial_worktree_wake || node.depends_on.is_empty())
                 })
                 .map(|node| {

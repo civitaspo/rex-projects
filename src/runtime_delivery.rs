@@ -19,6 +19,7 @@ const TOOL_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Repository effect handlers and the observer used to detect out-of-band publication.
 pub struct RuntimeDelivery {
+    applied_config: AppliedConfig,
     handlers: Vec<Box<dyn EffectHandler>>,
     effects: std::sync::Arc<RepositoryDeliveryEffects>,
     git_executable: PathBuf,
@@ -84,6 +85,13 @@ impl RuntimeDelivery {
             else {
                 continue;
             };
+            let project_config = self
+                .applied_config
+                .config
+                .projects
+                .get(&run.project_id)
+                .ok_or("accepted plan references an unconfigured Project")?;
+            let validated_plan = plan.validate_for(project_config, &self.applied_config.digest)?;
             let receipts = store.list_succeeded_effect_receipts(
                 owner_generation,
                 &run.project_id,
@@ -102,18 +110,24 @@ impl RuntimeDelivery {
                     continue;
                 }
                 for node in prepared.work_nodes {
-                    if plan.plan.nodes_in_execution_order.iter().any(|planned| {
-                        planned.id == node.work_node_id
-                            && planned.repository == node.repository_id
-                            && planned.role == crate::domain::types::Role::Worker
-                    }) && store
-                        .prepared_worker_launch(
-                            owner_generation,
-                            plan.accepted_revision,
-                            &node.work_node_id,
-                            receipt,
-                        )?
-                        .is_some()
+                    if validated_plan
+                        .nodes_in_execution_order
+                        .iter()
+                        .any(|planned| {
+                            planned.id == node.work_node_id
+                                && planned.repository == node.repository_id
+                                && planned.role == crate::domain::types::Role::Worker
+                        })
+                        && store
+                            .prepared_worker_launch(
+                                owner_generation,
+                                plan.accepted_revision,
+                                &node.work_node_id,
+                                receipt,
+                                project_config,
+                                &self.applied_config.digest,
+                            )?
+                            .is_some()
                     {
                         let resource = crate::store::publication_monitor::PublicationResource {
                             project_id: run.project_id.clone(),
@@ -375,6 +389,7 @@ pub fn build(
         Box::new(effects.publish_implementation_handler()),
     ];
     Ok(RuntimeDelivery {
+        applied_config: applied_config.clone(),
         handlers,
         effects,
         git_executable: git,

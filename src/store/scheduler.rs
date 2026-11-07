@@ -108,6 +108,8 @@ pub struct ActiveTicketRun {
     pub revision: u64,
     pub phase: Phase,
     pub activity: Activity,
+    pub external_status: TicketStatus,
+    pub required_review_revision: Option<u64>,
     pub project_epoch: u64,
     pub recipe_id: Option<String>,
 }
@@ -351,7 +353,7 @@ impl ConfigStore {
             return Err("controller owner generation is stale".into());
         }
         let mut statement = self.connection.prepare(
-            "SELECT t.project_id,t.ticket_run_id,t.namespace,t.ticket_id,t.revision,t.internal_phase,t.activity,c.project_epoch,c.recipe_id FROM ticket_runs t LEFT JOIN ticket_run_context c USING(ticket_run_id) WHERE t.internal_phase NOT IN ('done','canceled') ORDER BY t.project_id,t.ticket_run_id LIMIT ?1",
+            "SELECT t.project_id,t.ticket_run_id,t.namespace,t.ticket_id,t.revision,t.internal_phase,t.activity,t.external_status,t.required_review_revision,c.project_epoch,c.recipe_id FROM ticket_runs t LEFT JOIN ticket_run_context c USING(ticket_run_id) WHERE t.internal_phase NOT IN ('done','canceled') ORDER BY t.project_id,t.ticket_run_id LIMIT ?1",
         ).map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([limit as u64], |row| {
@@ -363,8 +365,10 @@ impl ConfigStore {
                     row.get::<_, u64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, u64>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<u64>>(8)?,
+                    row.get::<_, u64>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
             .map_err(|error| error.to_string())?;
@@ -377,6 +381,8 @@ impl ConfigStore {
                 revision,
                 phase,
                 activity,
+                external_status,
+                required_review_revision,
                 project_epoch,
                 recipe_id,
             ) = row.map_err(|error| error.to_string())?;
@@ -390,6 +396,9 @@ impl ConfigStore {
                     .map_err(|error| format!("stored TicketRun phase is invalid: {error}"))?,
                 activity: serde_json::from_str(&format!("\"{activity}\""))
                     .map_err(|error| format!("stored TicketRun activity is invalid: {error}"))?,
+                external_status: serde_json::from_str(&format!("\"{external_status}\""))
+                    .map_err(|error| format!("stored TicketRun status is invalid: {error}"))?,
+                required_review_revision,
                 project_epoch,
                 recipe_id,
             })

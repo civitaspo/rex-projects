@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::agent_recovery::AgentRecoveryReport;
 use crate::config::{Config, ProjectConfig};
 use crate::domain::ids::{ProjectId, TicketNamespace, TicketRunId};
 use crate::domain::types::{ProjectMode, Role, TicketStatus};
@@ -89,6 +90,12 @@ pub struct ExternalTicketPage {
 /// Host adapters implement this port with the configured ticket CLI and a
 /// pinned namespace. No authentication state is supplied by rex-projects.
 pub trait FactoryRuntimeServices {
+    fn recover_agents(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<AgentRecoveryReport, String>;
     /// Import and validate at most one completed mailbox result, then commit
     /// its typed reducer transition through the runtime's durable boundary.
     fn ingest_one_agent_result(
@@ -110,6 +117,16 @@ pub trait FactoryRuntimeServices {
         limit: usize,
     ) -> Result<ExternalTicketPage, String>;
 
+    /// Reconcile a bounded number of externally published pull requests against
+    /// their persisted host receipts. Unknown observations must remain durable
+    /// and must not fail the foreground loop.
+    fn observe_publications(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String>;
+
     /// Build and durably prepare at most one finite-turn launch for this exact
     /// pending role session. The Store implementation must recheck the wake
     /// set, project epoch, active-run state, and slot capacity atomically.
@@ -130,6 +147,8 @@ pub trait FactoryRuntimeServices {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactoryTickReport {
     pub ingested_agent_result: bool,
+    pub agent_recovery: AgentRecoveryReport,
+    pub publication_monitor: crate::runtime_delivery::PublicationMonitorTick,
     pub effect: DispatchTick,
     pub role_run_started: bool,
     pub supervisor_learning_project: Option<ProjectId>,
@@ -155,6 +174,19 @@ impl FactoryRuntime {
     ) -> Result<FactoryTickReport, String> {
         let ingested_agent_result =
             services.ingest_one_agent_result(store, owner_generation, now_unix)?;
+        let publication_monitor =
+            services.observe_publications(store, owner_generation, now_unix)?;
+        let agent_recovery = services.recover_agents(store, owner_generation, now_unix)?;
+        let learning_now_unix =
+            u64::try_from(now_unix).map_err(|_| "controller clock is before the Unix epoch")?;
+        let profile_trial_capacity = u32::try_from(config.runtime.max_agent_runs)
+            .map_err(|_| "runtime.max_agent_runs exceeds the supported slot count")?;
+        let _queued_profile_trial = store.tick_profile_trials(
+            owner_generation,
+            learning_now_unix,
+            profile_trial_capacity,
+            profile_trial_capacity,
+        )?;
         let handlers = services.effect_handlers();
         let limits = EffectLimits {
             max_attempts: 100,
@@ -251,6 +283,8 @@ impl FactoryRuntime {
                 store.mark_ticket_scan_served(owner_generation, &key)?;
                 return Ok(FactoryTickReport {
                     ingested_agent_result,
+                    agent_recovery,
+                    publication_monitor,
                     effect,
                     role_run_started,
                     supervisor_learning_project,
@@ -264,6 +298,8 @@ impl FactoryRuntime {
         let Some((key, cursor)) = store.next_due_ticket_scan(&keys, now_unix)? else {
             return Ok(FactoryTickReport {
                 ingested_agent_result,
+                agent_recovery,
+                publication_monitor,
                 effect,
                 role_run_started,
                 supervisor_learning_project,
@@ -287,6 +323,8 @@ impl FactoryRuntime {
                 external_errors.push(error);
                 return Ok(FactoryTickReport {
                     ingested_agent_result,
+                    agent_recovery,
+                    publication_monitor,
                     effect,
                     role_run_started,
                     supervisor_learning_project,
@@ -320,6 +358,8 @@ impl FactoryRuntime {
         )?;
         Ok(FactoryTickReport {
             ingested_agent_result,
+            agent_recovery,
+            publication_monitor,
             effect,
             role_run_started,
             supervisor_learning_project,

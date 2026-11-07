@@ -490,6 +490,15 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             return Err("Agent profile changed after launch reservation".into());
         }
         let operation_recipe = reservation.operation_recipe_id.clone();
+        let accepted_plan = if let Some(run) = active_run.as_ref() {
+            let accepted = store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?;
+            if let Some(plan) = &accepted {
+                plan.validate_for(project, &self.applied_config.digest)?;
+            }
+            accepted
+        } else {
+            None
+        };
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
@@ -500,15 +509,11 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 repositories: project.repositories.clone(),
                 ticket,
                 recovery_summary: None,
-                accepted_plan: active_run
+                accepted_plan: accepted_plan
                     .as_ref()
-                    .and_then(|run| {
-                        store
-                            .latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)
-                            .ok()
-                            .flatten()
-                    })
-                    .map(|plan| serde_json::to_string(&plan.plan).unwrap_or_default()),
+                    .map(|plan| serde_json::to_string(&plan.proposal))
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
                 previous_decisions: Vec::new(),
                 required_evidence: Vec::new(),
                 stop_conditions: Vec::new(),
@@ -575,15 +580,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             rex_block_id,
             profile_digest: reservation.profile_digest.clone(),
             instruction_digest: reservation.instruction_digest.clone(),
-            plan_digest: active_run
-                .as_ref()
-                .and_then(|run| {
-                    store
-                        .latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)
-                        .ok()
-                        .flatten()
-                })
-                .map(|plan| plan.plan_digest),
+            plan_digest: accepted_plan.as_ref().map(|plan| plan.plan_digest.clone()),
             environment_snapshot_id: reservation.environment_snapshot_id.clone(),
             wake_snapshot_digest: reservation.wake_snapshot.digest.clone(),
             provider_capability: capability,
@@ -656,6 +653,32 @@ impl RuntimeAgentMaterializer {
 }
 
 impl FactoryRuntimeServices for RuntimeServices {
+    fn recover_agents(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
+        let policy = crate::agent_recovery::RecoveryPolicy {
+            rex_session_id: self.rex_identity.session_id.clone(),
+            turn_timeout_seconds: self
+                .applied_config
+                .profiles
+                .iter()
+                .map(|(profile_id, profile)| (profile_id.clone(), profile.turn_timeout_seconds))
+                .collect(),
+            heartbeat_stale_after_seconds: 30,
+            max_observations_per_tick: 8,
+            now_unix,
+        };
+        crate::agent_recovery::AgentRecoveryRuntime::tick(
+            store,
+            owner_generation,
+            &self.rex,
+            &policy,
+        )
+    }
+
     fn ingest_one_agent_result(
         &mut self,
         _store: &mut ConfigStore,
@@ -680,6 +703,16 @@ impl FactoryRuntimeServices for RuntimeServices {
         let namespace = TicketNamespace::parse(description.ticket_namespace)?;
         self.namespaces.insert(adapter.clone(), namespace.clone());
         Ok(namespace)
+    }
+
+    fn observe_publications(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String> {
+        self.delivery
+            .observe_publications(store, owner_generation, now_unix)
     }
 
     fn list_ticket_page(
@@ -1125,6 +1158,9 @@ impl RuntimeServices {
         )?;
         let accepted_plan =
             store.latest_accepted_work_plan(&candidate.project_id, ticket_run_id)?;
+        if let Some(plan) = &accepted_plan {
+            plan.validate_for(&project, &self.configuration_digest)?;
+        }
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
@@ -1143,7 +1179,7 @@ impl RuntimeServices {
                 recovery_summary: None,
                 accepted_plan: accepted_plan
                     .as_ref()
-                    .map(|plan| serde_json::to_string(&plan.plan))
+                    .map(|plan| serde_json::to_string(&plan.proposal))
                     .transpose()
                     .map_err(|error| error.to_string())?,
                 previous_decisions: Vec::new(),
