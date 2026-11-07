@@ -271,6 +271,120 @@ fn controller_once_publishes_local_project_status_then_releases_ownership() {
 }
 
 #[test]
+fn dashboard_json_uses_the_typed_local_projection_without_a_terminal() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let apply = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let run = command(&config, &state, &home)
+        .args(["runtime", "run", "--once"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let dashboard = command(&config, &state, &home)
+        .args(["--json", "dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        dashboard.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dashboard.stderr)
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(&dashboard.stdout).unwrap();
+    assert_eq!(snapshot["projects"].as_array().unwrap().len(), 2);
+    assert!(snapshot["tickets"].as_array().is_some());
+    assert!(snapshot["agents"].as_array().is_some());
+    assert!(snapshot["human_requests"].as_array().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_pins_the_verified_rex_endpoint_and_context_in_owner_projection() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let rex = temp.path().join("rex-fixture");
+    let script = "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{\"endpoint\":\"unix:///tmp/rex-fixture.sock\",\"instance_id\":\"rex-fixture\",\"host_id\":\"host\",\"rex_version\":\"1\"}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{\"methods\":{\"session.view\":{},\"session.new_window\":{},\"session.new_split\":{},\"session.focus_block\":{},\"session.zoom_block\":{},\"block.close\":{}}}' ;;\n  *\"session.view\"*) printf '%s\\n' '{\"windows\":[{\"window_id\":\"w1\",\"layers\":[{\"blocks\":[{\"block_id\":\"b1\",\"label\":\"rex-projects-run-fixture\",\"flavor\":\"com.superlogical.terminal.shell\"}]}]}]}' ;;\n  *) exit 3 ;;\nesac\n";
+    std::fs::write(&rex, script).unwrap();
+    std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config_contents = std::fs::read_to_string(&config).unwrap();
+    let config_contents = config_contents.replacen(
+        "state_root =",
+        &format!("runtime.rex_binary = \"{}\"\nstate_root =", rex.display()),
+        1,
+    );
+    std::fs::write(&config, config_contents).unwrap();
+    let apply = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let mut owner = command(&config, &state, &home)
+        .args([
+            "runtime",
+            "run",
+            "--rex-server",
+            "unix:///tmp/rex-fixture.sock",
+        ])
+        .env("REX_SESSION", "session-fixture")
+        .env("REX_BLOCK", "b1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let projection = state.join("runtime-owner.json");
+    let mut observed = None;
+    for _ in 0..150 {
+        if let Ok(bytes) = std::fs::read(&projection) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if value["rex_endpoint"] == "unix:///tmp/rex-fixture.sock" {
+                    observed = Some(value);
+                    break;
+                }
+            }
+        }
+        if owner.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let value = observed.expect("controller should publish its validated Rex binding");
+    assert_eq!(value["rex_server_identity"], "rex-fixture");
+    assert_eq!(value["rex_session_id"], "session-fixture");
+    assert_eq!(value["rex_block_id"], "b1");
+
+    let stop = command(&config, &state, &home)
+        .args(["runtime", "stop", "--request-id", "stop-dashboard-fixture"])
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(owner.wait().unwrap().success());
+}
+
+#[test]
 fn project_start_queues_only_to_the_active_foreground_owner() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);

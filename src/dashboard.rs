@@ -16,7 +16,228 @@ use serde::{Deserialize, Serialize};
 static SHUTDOWN_REQUESTED: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
+use crate::adapters::rex::RexCliTransport;
 use crate::domain::ids::{HumanRequestId, TicketRunId};
+use crate::human_runtime::{HumanDecisionIntent, HumanRequestLifecycle};
+use crate::store::{ConfigStore, dashboard_projection};
+
+/// Concrete local backend used by `rex-projects dashboard`. It performs data
+/// access and durable human intents outside the terminal rendering loop.
+pub struct RuntimeDashboardBackend {
+    state_root: std::path::PathBuf,
+    rex_binary: std::path::PathBuf,
+    rex_endpoint: Option<String>,
+}
+
+impl RuntimeDashboardBackend {
+    pub fn new(
+        state_root: impl Into<std::path::PathBuf>,
+        rex_binary: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            state_root: state_root.into(),
+            rex_binary: rex_binary.into(),
+            rex_endpoint: None,
+        }
+    }
+
+    pub fn with_endpoint(
+        state_root: impl Into<std::path::PathBuf>,
+        rex_binary: impl Into<std::path::PathBuf>,
+        rex_endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            state_root: state_root.into(),
+            rex_binary: rex_binary.into(),
+            rex_endpoint: Some(rex_endpoint.into()),
+        }
+    }
+
+    fn owner_generation(&self) -> Result<u64, String> {
+        dashboard_projection::active_owner_generation(&self.state_root)?
+            .ok_or_else(|| "machine controller is not running".to_owned())
+    }
+
+    fn rex_transport(&self, target: &FocusTarget) -> Result<RexCliTransport, String> {
+        let pinned = read_owner_rex_binding(&self.state_root)?;
+        if pinned.1 != target.rex_server_identity {
+            return Err(
+                "focus target belongs to a different Rex instance than the active owner".into(),
+            );
+        }
+        let endpoint = self.rex_endpoint.clone().unwrap_or(pinned.0);
+        let environment = std::env::vars_os().collect();
+        let search_path = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default();
+        RexCliTransport::connect(
+            &self.rex_binary,
+            &search_path,
+            endpoint,
+            target.rex_server_identity.clone(),
+            target.session_id.clone(),
+            environment,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn read_owner_rex_binding(state_root: &Path) -> Result<(String, String), String> {
+    let path = state_root.join("runtime-owner.json");
+    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let owner: serde_json::Value = crate::protocol::parse_unique(&bytes)
+        .map_err(|_| "runtime owner projection is invalid".to_owned())?;
+    let endpoint = owner
+        .get("rex_endpoint")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            value.starts_with("unix://")
+                || value.starts_with("http://")
+                || value.starts_with("https://")
+        })
+        .ok_or_else(|| "runtime owner has no validated Rex endpoint".to_owned())?;
+    let instance = owner
+        .get("rex_server_identity")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "runtime owner has no validated Rex instance identity".to_owned())?;
+    Ok((endpoint.to_owned(), instance.to_owned()))
+}
+
+impl DashboardBackend for RuntimeDashboardBackend {
+    fn snapshot(&mut self) -> Result<DashboardSnapshot, String> {
+        read_projection(&self.state_root)
+    }
+
+    fn focus_and_zoom(&mut self, target: &FocusTarget) -> Result<(), String> {
+        let transport = self.rex_transport(target)?;
+        transport
+            .focus_block(&target.block_id)
+            .and_then(|_| transport.zoom_block(&target.block_id, true))
+            .map_err(|error| error.to_string())
+    }
+
+    fn focus_ticket(&mut self, ticket_run: &TicketRunId) -> Result<(), String> {
+        let snapshot = self.snapshot()?;
+        let ticket = snapshot
+            .tickets
+            .iter()
+            .find(|ticket| &ticket.ticket_run_id == ticket_run)
+            .ok_or_else(|| "TicketRun is no longer in the dashboard snapshot".to_owned())?;
+        let agent = snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.ticket_run_id.as_ref() == Some(ticket_run))
+            .min_by_key(|agent| if agent.role == "coordinator" { 0 } else { 1 })
+            .ok_or_else(|| {
+                format!(
+                    "no active Agent block for {}/{}",
+                    ticket.namespace, ticket.ticket_id
+                )
+            })?;
+        let target = self
+            .focus_target(&agent.agent_run_id)?
+            .ok_or_else(|| "Agent has no active Rex block".to_owned())?;
+        self.focus_and_zoom(&target)
+    }
+
+    fn set_pin(
+        &mut self,
+        ticket_run: &TicketRunId,
+        expected_revision: u64,
+        pinned: bool,
+    ) -> Result<(), String> {
+        dashboard_projection::set_ticket_pin(
+            &self.state_root,
+            self.owner_generation()?,
+            ticket_run,
+            expected_revision,
+            pinned,
+        )
+    }
+
+    fn instruct_coordinator(
+        &mut self,
+        _ticket_run: &TicketRunId,
+        _expected_revision: u64,
+        _message: &str,
+    ) -> Result<String, String> {
+        Err("durable Coordinator instruction intake is not available in this runtime build".into())
+    }
+
+    fn respond(
+        &mut self,
+        request_id: &HumanRequestId,
+        exact_subject_digest: &str,
+        exact_expiry: i64,
+        choice: &str,
+    ) -> Result<String, String> {
+        use crate::human_runtime::HumanDecisionChoice;
+        let request = ConfigStore::read_human_request(&self.state_root, request_id)?
+            .ok_or_else(|| "human request was removed".to_owned())?;
+        if !matches!(
+            request.lifecycle,
+            HumanRequestLifecycle::Pending | HumanRequestLifecycle::Presented
+        ) {
+            return Err("human request is no longer awaiting a response".into());
+        }
+        let digest = request.request.subject.digest()?;
+        if digest.as_str() != exact_subject_digest
+            || request.request.expires_at_unix as i64 != exact_expiry
+        {
+            return Err("human request subject or expiry changed; refresh the dashboard".into());
+        }
+        let selected: HumanDecisionChoice =
+            serde_json::from_value(serde_json::Value::String(choice.to_owned()))
+                .map_err(|_| "choice is not a valid human decision".to_owned())?;
+        if !request.request.choices.contains(&selected) {
+            return Err("choice is not offered for this request".into());
+        }
+        let now = unix_now() as u64;
+        let response_id = format!(
+            "dashboard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let receipt = ConfigStore::enqueue_human_decision(
+            &self.state_root,
+            &HumanDecisionIntent {
+                response_id,
+                request_id: request_id.clone(),
+                expected_subject_digest: digest,
+                choice: selected,
+                explanation: None,
+            },
+            now,
+        )?;
+        Ok(format!(
+            "queued for controller validation: {}",
+            receipt.response_id
+        ))
+    }
+
+    fn focus_target(&mut self, agent_run_id: &str) -> Result<Option<FocusTarget>, String> {
+        let agent_run_id = crate::domain::ids::AgentRunId::parse(agent_run_id.to_owned())?;
+        dashboard_projection::read_focus_target(
+            &self.state_root,
+            self.owner_generation()?,
+            &agent_run_id,
+        )
+        .map(Some)
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DashboardSnapshot {
@@ -46,6 +267,8 @@ pub struct TicketRow {
     pub revision: u64,
     /// Unknown when the active host adapter has no v7 view-history observation.
     pub pinned: Option<bool>,
+    /// The current Rex ticket view, when the host has registered one.
+    pub rex_view_id: Option<crate::domain::ids::Digest>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentRow {
@@ -57,6 +280,7 @@ pub struct AgentRow {
     pub rex_session_id: Option<String>,
     pub rex_window_id: Option<String>,
     pub rex_block_id: Option<String>,
+    pub rex_view_id: Option<crate::domain::ids::Digest>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WaitRow {
@@ -73,10 +297,12 @@ pub struct HumanInboxRow {
     pub choices: Vec<String>,
     pub subject_digest: String,
     pub expires_at_unix: i64,
+    pub lifecycle: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocusTarget {
+    pub view_id: crate::domain::ids::Digest,
     pub rex_server_identity: String,
     pub session_id: String,
     pub window_id: String,
@@ -170,9 +396,10 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
     let _terminal_guard =
         TerminalGuard::enter().map_err(|e| format!("cannot initialize dashboard terminal: {e}"))?;
     let mut selected = Selection::Ticket(0);
+    let mut status_message: Option<String> = None;
     loop {
         let snapshot = backend.snapshot()?;
-        render(&snapshot, selected)?;
+        render(&snapshot, selected, status_message.as_deref())?;
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
             break;
         }
@@ -205,15 +432,35 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                     }
                     KeyCode::Enter => match selected {
                         Selection::Agent(i) => {
-                            if let Some(agent) = snapshot.agents.get(i)
-                                && let Some(target) = backend.focus_target(&agent.agent_run_id)?
-                            {
-                                backend.focus_and_zoom(&target)?;
+                            if let Some(agent) = snapshot.agents.get(i) {
+                                status_message = Some(
+                                    match backend
+                                        .focus_target(&agent.agent_run_id)
+                                        .and_then(|target| {
+                                            target.ok_or_else(|| {
+                                                "Agent has no active Rex block".to_owned()
+                                            })
+                                        })
+                                        .and_then(|target| backend.focus_and_zoom(&target))
+                                    {
+                                        Ok(()) => {
+                                            format!("Focused and zoomed {}", agent.agent_run_id)
+                                        }
+                                        Err(error) => format!("Focus blocked: {error}"),
+                                    },
+                                );
                             }
                         }
                         Selection::Ticket(i) => {
                             if let Some(ticket) = snapshot.tickets.get(i) {
-                                backend.focus_ticket(&ticket.ticket_run_id)?;
+                                status_message =
+                                    Some(match backend.focus_ticket(&ticket.ticket_run_id) {
+                                        Ok(()) => format!(
+                                            "Focused {}/{}",
+                                            ticket.namespace, ticket.ticket_id
+                                        ),
+                                        Err(error) => format!("Focus blocked: {error}"),
+                                    });
                             }
                         }
                         Selection::Human(_) => {}
@@ -223,11 +470,22 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                         if let Selection::Ticket(i) = selected
                             && let Some(t) = snapshot.tickets.get(i)
                         {
-                            backend.set_pin(
-                                &t.ticket_run_id,
-                                t.revision,
-                                !t.pinned.unwrap_or(false),
-                            )?;
+                            status_message = Some(
+                                match backend.set_pin(
+                                    &t.ticket_run_id,
+                                    t.revision,
+                                    !t.pinned.unwrap_or(false),
+                                ) {
+                                    Ok(()) => {
+                                        if t.pinned == Some(true) {
+                                            "Unpinned ticket view".into()
+                                        } else {
+                                            "Pinned ticket view".into()
+                                        }
+                                    }
+                                    Err(error) => format!("Pin failed: {error}"),
+                                },
+                            );
                         }
                     }
                     KeyCode::Char('i') => {
@@ -249,7 +507,16 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                                 if msg.trim().is_empty() {
                                     return Err("instruction file is empty".into());
                                 }
-                                backend.instruct_coordinator(&t.ticket_run_id, t.revision, &msg)?;
+                                status_message = Some(
+                                    match backend.instruct_coordinator(
+                                        &t.ticket_run_id,
+                                        t.revision,
+                                        &msg,
+                                    ) {
+                                        Ok(receipt) => receipt,
+                                        Err(error) => format!("Instruction not queued: {error}"),
+                                    },
+                                );
                             }
                         }
                     }
@@ -263,12 +530,17 @@ pub fn run<B: DashboardBackend>(backend: &mut B) -> Result<(), DashboardError> {
                                 h.choices.join("/")
                             ))?;
                             if h.choices.iter().any(|c| c == &choice) {
-                                backend.respond(
-                                    &h.request_id,
-                                    &h.subject_digest,
-                                    h.expires_at_unix,
-                                    &choice,
-                                )?;
+                                status_message = Some(
+                                    match backend.respond(
+                                        &h.request_id,
+                                        &h.subject_digest,
+                                        h.expires_at_unix,
+                                        &choice,
+                                    ) {
+                                        Ok(receipt) => receipt,
+                                        Err(error) => format!("Response not queued: {error}"),
+                                    },
+                                );
                             }
                         }
                     }
@@ -307,7 +579,11 @@ fn move_selection(s: Selection, delta: isize, len: usize) -> Selection {
         Selection::Human(_) => Selection::Human(next),
     }
 }
-fn render(snapshot: &DashboardSnapshot, selected: Selection) -> Result<(), String> {
+fn render(
+    snapshot: &DashboardSnapshot,
+    selected: Selection,
+    status_message: Option<&str>,
+) -> Result<(), String> {
     let mut out = io::stdout();
     execute!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))
         .map_err(|e| e.to_string())?;
@@ -321,6 +597,9 @@ fn render(snapshot: &DashboardSnapshot, selected: Selection) -> Result<(), Strin
         snapshot.human_requests.len()
     )
     .map_err(|e| e.to_string())?;
+    if let Some(message) = status_message {
+        writeln!(out, "{message}\n").map_err(|e| e.to_string())?;
+    }
     writeln!(
         out,
         "↑/↓ select · Tab section · Enter focus/zoom · p pin · i instruct · h respond · q quit\n"
@@ -392,10 +671,11 @@ fn render(snapshot: &DashboardSnapshot, selected: Selection) -> Result<(), Strin
         marker(selected == Selection::Human(i), &mut out)?;
         writeln!(
             out,
-            "{} {} [{}] choices={:?} expires={} digest={}",
+            "{} {} [{}] lifecycle={} choices={:?} expires={} digest={}",
             terminal_text(&h.project_id),
             terminal_text(&h.request_id.to_string()),
             terminal_text(&h.question),
+            terminal_text(&h.lifecycle),
             h.choices
                 .iter()
                 .map(|choice| terminal_text(choice))
@@ -548,6 +828,49 @@ mod tests {
         assert_eq!(json["projects"][0]["project_id"], "demo");
         assert_eq!(json["human_requests"][0]["subject_digest"], "a".repeat(64));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_backend_focuses_and_zooms_the_validated_rex_block() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rex = dir.path().join("rex-fixture");
+        let log = dir.path().join("calls.log");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"unix:///tmp/rex-fixture.sock\",\"instance_id\":\"rex-fixture\",\"host_id\":\"host\",\"rex_version\":\"1\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.focus_block\"*|*\"api call session.zoom_block\"*) printf '%s\\n' \"$*\" >> '{}' ; printf '%s\\n' '{{}}' ;;\n  *) exit 3 ;;\nesac\n",
+            log.display()
+        );
+        std::fs::write(&rex, script).unwrap();
+        std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut backend = RuntimeDashboardBackend::with_endpoint(
+            dir.path(),
+            &rex,
+            "unix:///tmp/rex-fixture.sock",
+        );
+        std::fs::write(
+            dir.path().join("runtime-owner.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "rex_endpoint": "unix:///tmp/rex-fixture.sock",
+                "rex_server_identity": "rex-fixture"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let target = FocusTarget {
+            view_id: crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
+            rex_server_identity: "rex-fixture".into(),
+            session_id: "session-9".into(),
+            window_id: "window-9".into(),
+            block_id: "block-9".into(),
+        };
+        backend.focus_and_zoom(&target).unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(calls.contains("session.focus_block"));
+        assert!(calls.contains("block-9"));
+        assert!(calls.contains("session.zoom_block"));
+    }
     fn agent() -> AgentRow {
         AgentRow {
             agent_run_id: "run".into(),
@@ -558,6 +881,7 @@ mod tests {
             rex_session_id: None,
             rex_window_id: None,
             rex_block_id: None,
+            rex_view_id: None,
         }
     }
 
@@ -606,6 +930,7 @@ mod tests {
         }
         fn focus_target(&mut self, _id: &str) -> Result<Option<FocusTarget>, String> {
             Ok(Some(FocusTarget {
+                view_id: crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
                 rex_server_identity: "rex-fixture".into(),
                 session_id: "session-1".into(),
                 window_id: "ticket-window".into(),
@@ -631,6 +956,7 @@ mod tests {
                 external_status: "in_progress".into(),
                 revision: 8,
                 pinned: Some(false),
+                rex_view_id: Some(crate::domain::ids::Digest::parse("a".repeat(64)).unwrap()),
             }],
             agents: vec![AgentRow {
                 agent_run_id: "run-1".into(),
@@ -641,6 +967,7 @@ mod tests {
                 rex_session_id: Some("session-1".into()),
                 rex_window_id: Some("ticket-window".into()),
                 rex_block_id: Some("worker-block".into()),
+                rex_view_id: Some(crate::domain::ids::Digest::parse("a".repeat(64)).unwrap()),
             }],
             waits: vec![WaitRow {
                 project_id: "demo".into(),
@@ -655,6 +982,7 @@ mod tests {
                 choices: vec!["approve".into(), "reject".into()],
                 subject_digest: "a".repeat(64),
                 expires_at_unix: 500,
+                lifecycle: "pending".into(),
             }],
         }
     }

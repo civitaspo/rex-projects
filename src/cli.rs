@@ -2,10 +2,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::adapters::rex::RexCliTransport;
 use crate::config::{self, AppliedConfig, Config};
+use crate::dashboard::RuntimeDashboardBackend;
 use crate::domain::ids::{Digest, HumanRequestId, ProjectId, Revision};
+use crate::process::{
+    ProcessRequest, resolve_executable as resolve_process_executable, run as run_process,
+};
 use crate::protocol::{RequestEnvelope, ResponseEnvelope};
 use crate::store::{ConfigStore, ControlCommand, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
@@ -22,6 +27,8 @@ struct Cli {
     state_root: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
+    #[arg(long, global = true, value_name = "URL")]
+    rex_server: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -307,6 +314,7 @@ pub fn run() -> Result<i32, CliError> {
             cli.config.as_deref(),
             cli.state_root.as_deref(),
             command,
+            cli.rex_server.as_deref(),
             json,
         ),
         Command::Project { command } => project_command(
@@ -579,6 +587,7 @@ fn runtime_command(
     config_path: Option<&Path>,
     explicit_state_root: Option<&Path>,
     command: RuntimeCommand,
+    rex_server: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
     match command {
@@ -855,15 +864,20 @@ fn runtime_dashboard(
     explicit_state_root: Option<&Path>,
     json: bool,
 ) -> Result<(), CliError> {
+    let (_, loaded) = load_config(config_path)?;
+    let state_root =
+        config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)?;
+    let mut backend = RuntimeDashboardBackend::new(state_root, loaded.config.runtime.rex_binary);
     if json {
-        return runtime_status(config_path, explicit_state_root, None, true);
+        let snapshot =
+            crate::dashboard::snapshot_json(&mut backend).map_err(CliError::unavailable)?;
+        println!("{snapshot}");
+        return Ok(());
     }
-    println!("rex-projects dashboard — local durable state");
-    println!("───────────────────────────────────────────");
-    runtime_status(config_path, explicit_state_root, None, false)?;
-    println!("\nCommands: `rex-projects project start|pause|resume|stop <id>`, `runtime stop`");
-    println!("Agent screens and Rex focus are attached in the Rex runtime integration.");
-    Ok(())
+    crate::dashboard::run(&mut backend).map_err(|error| CliError {
+        code: if error.exit_code == 77 { 77 } else { 5 },
+        message: error.message,
+    })
 }
 
 fn selected_state_root(
@@ -872,6 +886,102 @@ fn selected_state_root(
 ) -> Result<PathBuf, CliError> {
     let (_, loaded) = load_config(config_path)?;
     config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)
+}
+
+#[derive(Clone, Debug)]
+struct RexConnectionBinding {
+    endpoint: String,
+    instance_id: String,
+    session_id: Option<String>,
+    block_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RexWhoAmI {
+    endpoint: String,
+    instance_id: String,
+}
+
+fn discover_rex_binding(
+    configured_binary: &str,
+    explicit_server: Option<&str>,
+) -> Result<Option<RexConnectionBinding>, CliError> {
+    let session_id = std::env::var("REX_SESSION").ok();
+    let block_id = std::env::var("REX_BLOCK").ok();
+    if block_id.is_some() && session_id.is_none() {
+        return Err(CliError::conflict(
+            "REX_BLOCK is set without REX_SESSION; cannot validate the Rex context",
+        ));
+    }
+    // Direct CLI development outside Rex remains supported. A Rex-owned
+    // runtime always carries REX_SESSION; an explicit server also opts in.
+    if session_id.is_none() && explicit_server.is_none() {
+        return Ok(None);
+    }
+    let search_path = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let rex = resolve_process_executable(Path::new(configured_binary), &search_path)
+        .ok_or_else(|| CliError::unavailable("configured Rex CLI executable is unavailable"))?;
+    let mut args = Vec::new();
+    if let Some(server) = explicit_server {
+        if server.is_empty() || server.chars().any(char::is_control) {
+            return Err(CliError::usage("--rex-server must be a nonempty URL"));
+        }
+        args.extend(["--server".into(), server.into()]);
+    }
+    args.extend(["--autostart=false".into(), "whoami".into(), "--json".into()]);
+    let output = run_process(ProcessRequest {
+        executable: rex.clone(),
+        args,
+        stdin: Vec::new(),
+        cwd: None,
+        clear_environment: false,
+        environment: std::env::vars_os().collect(),
+        timeout: Duration::from_secs(10),
+        shutdown_grace: Duration::from_secs(2),
+        stdout_limit: 64 * 1024,
+        stderr_tail_limit: 8 * 1024,
+    })
+    .map_err(|_| CliError::unavailable("Rex whoami could not be started"))?;
+    if output.timed_out
+        || !output.cleanup_confirmed
+        || !output.status.is_some_and(|status| status.success())
+        || output.stdout_truncated
+    {
+        return Err(CliError::unavailable("Rex whoami failed"));
+    }
+    let who: RexWhoAmI = crate::protocol::parse_unique(&output.stdout)
+        .map_err(|_| CliError::unavailable("Rex whoami returned an invalid identity"))?;
+    if who.endpoint.trim().is_empty() || who.instance_id.trim().is_empty() {
+        return Err(CliError::unavailable(
+            "Rex whoami returned an incomplete endpoint or instance ID",
+        ));
+    }
+    if let Some(session_id) = &session_id {
+        let transport = RexCliTransport::connect(
+            &rex,
+            &search_path,
+            who.endpoint.clone(),
+            who.instance_id.clone(),
+            session_id.clone(),
+            std::env::vars_os().collect(),
+        )
+        .map_err(|_| {
+            CliError::unavailable("configured Rex server or session could not be verified")
+        })?;
+        if let Some(block_id) = &block_id {
+            transport
+                .validate_session_block(block_id)
+                .map_err(|_| CliError::unavailable("REX_BLOCK is not present in REX_SESSION"))?;
+        }
+    }
+    Ok(Some(RexConnectionBinding {
+        endpoint: who.endpoint,
+        instance_id: who.instance_id,
+        session_id,
+        block_id,
+    }))
 }
 
 fn run_controller(
@@ -888,6 +998,9 @@ fn run_controller(
     let config_source = canonical_source.display().to_string();
     let state_root =
         config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)?;
+    // Resolve and validate Rex before acquiring the machine state lock. The
+    // owner projection pins this connection for later dashboard calls.
+    let rex_binding = discover_rex_binding(&loaded.config.runtime.rex_binary, rex_server_override)?;
     let mut store = ConfigStore::open(&state_root).map_err(CliError::unavailable)?;
     let current = store
         .current_revision(&config_source)
@@ -961,6 +1074,7 @@ fn run_controller(
         &projection,
         generation,
         &owner,
+        rex_binding.as_ref(),
         snapshot.revision.0,
         snapshot.config.digest.as_str(),
     )
@@ -999,6 +1113,7 @@ fn run_controller(
             &projection,
             generation,
             &owner,
+            rex_binding.as_ref(),
             snapshot.revision.0,
             snapshot.config.digest.as_str(),
         )
@@ -1055,7 +1170,7 @@ fn process_start_identity() -> Result<String, CliError> {
 }
 
 impl crate::store::RuntimeStatus {
-    fn owner_is_live(&self) -> bool {
+    pub(crate) fn owner_is_live(&self) -> bool {
         let (Some(pid), Some(expected)) =
             (self.owner_pid, self.owner_process_start_identity.as_deref())
         else {
@@ -1105,6 +1220,7 @@ fn publish_owner_projection(
     path: &Path,
     generation: u64,
     owner: &OwnerMetadata,
+    _rex_binding: Option<&RexConnectionBinding>,
     config_revision: u64,
     config_digest: &str,
 ) -> Result<(), String> {

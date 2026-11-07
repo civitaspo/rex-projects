@@ -459,6 +459,39 @@ impl RexCliTransport {
             .collect()
     }
 
+    /// Verify that a caller-provided current block belongs to the connected
+    /// session. The RPC is a read and must happen before any state write.
+    pub fn validate_session_block(&self, block_id: &str) -> Result<(), RexError> {
+        if block_id.is_empty() || block_id.chars().any(char::is_control) {
+            return Err(RexError::Invalid("Rex block ID is malformed".into()));
+        }
+        let view = self.session_view()?;
+        let windows = view
+            .get("windows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session view has no windows".into()))?;
+        let found = windows
+            .iter()
+            .flat_map(|window| {
+                window
+                    .get("layers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|layer| layer.get("blocks").and_then(Value::as_array))
+                    .flatten()
+            })
+            .filter(|block| block.get("block_id").and_then(Value::as_str) == Some(block_id))
+            .count();
+        match found {
+            1 => Ok(()),
+            0 => Err(RexError::Invalid(
+                "current Rex block is absent from the session".into(),
+            )),
+            _ => Err(RexError::Uncertain),
+        }
+    }
+
     pub fn focus_block(&self, block_id: &str) -> Result<(), RexError> {
         self.invoke_mutating(
             "session.focus_block",
@@ -954,6 +987,8 @@ mod tests {
             BTreeMap::<OsString, OsString>::new(),
         )
         .unwrap();
+        transport.validate_session_block("block-1").unwrap();
+        assert!(transport.validate_session_block("other-block").is_err());
         let window = TicketWindow {
             server_instance_id: "instance-1".into(),
             session_id: "session-1".into(),

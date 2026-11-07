@@ -1,36 +1,28 @@
-# Dashboard implementation sketch
+# Dashboard
 
 ## User flow
 
-`rex-projects dashboard` reads one controller-owned projection, then stays in a raw-mode terminal view. Arrow keys move selection; Enter focuses and zooms the selected owned Rex block; `p` pins or unpins a selected ticket view; `i` reads a bounded message file and submits a revision-bound Coordinator instruction; `h` submits only a choice offered by the selected, unexpired HumanRequest using its exact subject digest. `q` exits. `--json` and non-TTY output return a read-only snapshot and never enter raw mode.
+`rex-projects dashboard` reads a local runtime snapshot and stays in a raw-mode terminal view. Arrow keys move the selection; Tab switches among tickets, Agents, and human requests. Enter focuses and zooms the selected Agent block. On a ticket it focuses the Coordinator block, or the first available Agent block. `p` pins or unpins the active ticket view; `i` reads a bounded UTF-8 instruction file and queues a Coordinator instruction; `h` submits only a choice offered by the selected, unexpired human request using its exact subject digest and expiry. `q` exits. `--json` works without a TTY and returns the same read-only snapshot.
+
+Action failures stay in the dashboard status line. A stale TicketRun revision, missing Rex target, unavailable controller, or expired human request does not close the view. The terminal guard restores raw mode and the alternate screen on normal exit, I/O failure, Ctrl-C, SIGTERM, and unwind.
+
+## Rex connection
+
+When a runtime starts inside a Rex block, it reads `REX_SESSION` and `REX_BLOCK`. It resolves the current Rex endpoint and instance with bounded `rex --autostart=false whoami --json`, unless `runtime run --rex-server <URL>` supplies an explicit server. The controller validates the selected session and block before claiming machine ownership, then writes endpoint, instance, session, and block to the mode-0600 `runtime-owner.json` projection. Dashboard focus uses that pinned endpoint and the selected target's persisted session/window/block IDs; it rejects a target whose instance differs from the owner projection. It never guesses the endpoint from an environment variable.
+
+Running the CLI directly outside Rex remains supported for local runtime tests; in that case it has no pinned Rex connection and cannot focus a Rex block. A `REX_BLOCK` without `REX_SESSION` is rejected.
 
 ## Boundaries
 
-`dashboard` owns display, keyboard dispatch, selection and validated action intent. It never opens SQLite, builds a shell command, types into a provider terminal, or interprets display text as authority.
+`dashboard` owns rendering, keyboard dispatch, selection, and host action routing. It does not open SQLite, build shell commands, type into a provider terminal, or treat display text as authorization. Marked Agent contexts can inspect and focus but cannot pin views, send instructions, or respond to human requests; mutation keys return exit code 77 before calling the backend.
 
-`store::dashboard_projection` opens the local state database read-only and projects the stable Project, TicketRun, AgentRun and pending-effect fields that exist in its schema. It does not inspect guessed pin or HumanRequest tables. The host adapter adds v7 data using `ConfigStore::rex_view_history`, `ConfigStore::rex_focus_target`, and immutable `agent_launch_authority` bindings; it adds human rows through `ConfigStore::list_human_requests` and responds with `ConfigStore::enqueue_human_decision`. Missing pin or authority observations remain explicitly unknown.
+SQL remains inside `store::dashboard_projection`, which checks the expected schema version and emits typed Project, TicketRun, AgentRun, wait, and human-inbox rows. Agent focus is resolved through validated immutable `AgentLaunchAuthority` and the active Rex view/block binding. Pin updates use a bounded transaction fenced by active controller generation and exact TicketRun revision, then update the active view. Human rows use `ConfigStore::list_human_requests`; responses use the v8 `ConfigStore::enqueue_human_decision` queue and remain pending until controller validation.
 
-`DashboardBackend` is the narrow host port for snapshot, Rex focus/zoom, ticket-view pin, revision-bound instruction submission, and exact-subject human response. Agent selection resolves a persisted `RexViewRecord`/launch-authority binding, then uses PR3 `RexCliTransport::focus_block` and `zoom_block`. Ticket selection delegates to the host's exact TicketRun-to-block resolver. Instructions go through the PR4 durable input path, which wakes Coordinator and Supervisor without terminal injection. Human responses use the v8 queue API and remain queued until the controller validates them. Tests use a fixture backend for UI dispatch; production wiring must test the real adapters before the dashboard is called integrated.
+`DashboardBackend` is the terminal's host port for snapshot, Rex focus/zoom, pin, durable Coordinator instruction, and exact-subject human response. The real Rex path uses `RexCliTransport`; the instruction path uses the PR4 host-owned durable input API and never injects text into a Rex TUI. The dashboard receives queued receipts, not claims that a controller has already accepted an instruction or human decision.
 
-## Core types
+## Verification lanes
 
-```rust
-pub struct DashboardSnapshot { pub observed_at_unix: i64, pub projects: Vec<ProjectRow>, pub tickets: Vec<TicketRow>, pub agents: Vec<AgentRow>, pub waits: Vec<WaitRow>, pub human_requests: Vec<HumanInboxRow> }
-pub struct FocusTarget { pub server_identity: String, pub session_id: String, pub window_id: String, pub block_id: Option<String> }
-pub struct HumanInboxRow { pub request_id: HumanRequestId, pub subject_digest: Digest, pub expires_at_unix: i64, pub choices: Vec<HumanChoice>, pub question: String }
-pub trait DashboardBackend {
-    fn snapshot(&mut self) -> Result<DashboardSnapshot, DashboardError>;
-    fn focus(&mut self, target: &FocusTarget) -> Result<FocusReceipt, DashboardError>;
-    fn set_ticket_pinned(&mut self, ticket_run: &TicketRunId, expected_revision: Revision, pinned: bool) -> Result<(), DashboardError>;
-    fn instruct_coordinator(&mut self, ticket_run: &TicketRunId, expected_revision: Revision, message: &[u8]) -> Result<QueuedInputReceipt, DashboardError>;
-    fn respond(&mut self, request_id: &HumanRequestId, subject_digest: &Digest, expires_at_unix: i64, choice: HumanChoice) -> Result<QueuedDecisionReceipt, DashboardError>;
-}
-```
-
-## Integration sequence
-
-1. Implement and test DTO validation, projection read, deterministic rendering and keyboard-to-intent mapping.
-2. Add raw-mode RAII guard and event loop. Restore terminal state on `q`, I/O error, SIGTERM, Ctrl-C and panic unwind.
-3. Implement the host adapter after the PR3 Rex and PR4/PR5 input APIs are available; keep unsupported mutation visibly unavailable until then.
-4. Wire CLI and verify JSON/non-TTY snapshots, `REX_PROJECTS_AGENT`/`REX_PROJECTS_CONTEXT` mutation rejection, focus IDs and exact request digest/expiry at the service boundary.
-5. Run a real isolated Rex dashboard lane for one persisted ticket and one human request; verify actual window/block focus and terminal restoration.
+- PTY tests exercise navigation, focus, zoom, pin, instruction, human response, marked-Agent rejection, Ctrl-C, SIGTERM, alternate-screen setup failure, and terminal restoration.
+- The Rex adapter lane uses a fixture CLI that returns `whoami`, API capabilities, and session view responses, then checks that focus and zoom target the selected block.
+- The CLI lane starts a controller with a fixture Rex CLI, validates `REX_SESSION`/`REX_BLOCK`, and checks that the endpoint/instance/session binding is persisted. A separate non-TTY lane runs `--json dashboard` after applying config and starting the foreground controller.
+- A live Rex run remains necessary at release qualification to verify the deployed Rex version's `whoami` and session-view response shapes against the actual server.

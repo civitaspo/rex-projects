@@ -1,147 +1,361 @@
+//! Typed dashboard reads and write intents. SQL for the dashboard stays behind
+//! this store boundary; consumers receive validated IDs and immutable runtime
+//! authority instead of inspecting or guessing at schema details.
+
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-use crate::dashboard::{AgentRow, DashboardSnapshot, ProjectRow, TicketRow, WaitRow};
-use crate::domain::ids::TicketRunId;
+use crate::dashboard::{
+    AgentRow, DashboardSnapshot, FocusTarget, HumanInboxRow, ProjectRow, TicketRow, WaitRow,
+};
+use crate::domain::ids::{AgentRunId, Digest, TicketRunId};
+use crate::launch::{AgentLaunchAuthority, RexFocusTarget};
+use crate::store::ConfigStore;
 
-/// Read-only, lock-free dashboard projection. Older schemas return the rows
-/// they can represent and an empty human inbox; the human runtime adapter
-/// supplies requests when its versioned table is present.
+/// Build one schema-versioned snapshot without acquiring the machine-owner
+/// lock. The projection uses the v8 schema directly and does not migrate it.
 pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
     let path = state_root.join("state.sqlite3");
     let db = Connection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| format!("{}: {e}", path.display()))?;
+    .map_err(|error| format!("{}: {error}", path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(2))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     let version: i64 = db
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    if version < 6 {
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version < 8 {
         return Err(format!(
-            "dashboard requires runtime schema version 6 or newer (found {version})"
+            "dashboard requires runtime schema version 8 or newer (found {version})"
         ));
     }
-    let mut projects = Vec::new();
-    {
-        let mut q = db.prepare("SELECT p.project_id,p.mode,r.observed_lifecycle FROM projects p LEFT JOIN project_runtimes r USING(project_id) ORDER BY p.project_id").map_err(|e| e.to_string())?;
-        for row in q
-            .query_map([], |r| {
+
+    let projects = {
+        let mut statement = db.prepare("SELECT p.project_id,p.mode,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) ORDER BY p.project_id").map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
                 Ok(ProjectRow {
-                    project_id: r.get(0)?,
-                    mode: r.get(1)?,
-                    lifecycle: r
-                        .get::<_, Option<String>>(2)?
-                        .unwrap_or_else(|| "unknown".into()),
+                    project_id: row.get(0)?,
+                    mode: row.get(1)?,
+                    lifecycle: row.get(2)?,
                 })
             })
-            .map_err(|e| e.to_string())?
-        {
-            projects.push(row.map_err(|e| e.to_string())?);
-        }
-    }
-    let mut tickets = Vec::new();
-    {
-        let mut q = db.prepare("SELECT ticket_run_id,project_id,namespace,ticket_id,internal_phase,activity,external_status,revision FROM ticket_runs ORDER BY project_id,ticket_id,generation DESC").map_err(|e| e.to_string())?;
-        for row in q
-            .query_map([], |r| {
-                let id: String = r.get(0)?;
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    let tickets = {
+        let mut statement = db.prepare("SELECT t.ticket_run_id,t.project_id,t.namespace,t.ticket_id,t.internal_phase,t.activity,t.external_status,t.revision FROM ticket_runs t WHERE t.generation=(SELECT MAX(latest.generation) FROM ticket_runs latest WHERE latest.project_id=t.project_id AND latest.namespace=t.namespace AND latest.ticket_id=t.ticket_id) ORDER BY t.project_id,t.ticket_id").map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
                 Ok((
-                    id,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, u64>(7)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, u64>(7)?,
                 ))
             })
-            .map_err(|e| e.to_string())?
-        {
-            let (id, p, n, t, phase, activity, status, revision) =
-                row.map_err(|e| e.to_string())?;
-            tickets.push(TicketRow {
-                ticket_run_id: TicketRunId::parse(id)?,
-                project_id: p,
-                namespace: n,
-                ticket_id: t,
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (run_id, project_id, namespace, ticket_id, phase, activity, status, revision) =
+                row.map_err(|error| error.to_string())?;
+            let view: Option<(String, bool)> = db
+                .query_row(
+                    "SELECT view_id,pinned FROM rex_views WHERE project_id=?1 AND view_kind='ticket' AND ticket_namespace=?2 AND ticket_id=?3 AND lifecycle='active' ORDER BY view_epoch DESC LIMIT 1",
+                    params![project_id, namespace, ticket_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            Ok(TicketRow {
+                ticket_run_id: TicketRunId::parse(run_id)?,
+                project_id,
+                namespace,
+                ticket_id,
                 phase,
                 activity,
                 external_status: status,
                 revision,
-                pinned: None,
-            });
-        }
-    }
-    let mut agents = Vec::new();
-    {
-        let mut q=db.prepare("SELECT agent_run_id,project_id,role_session_id,logical_owner,state,rex_session_id,rex_window_id,rex_block_id FROM agent_runs ORDER BY started_at_unix DESC,agent_run_id").map_err(|e|e.to_string())?;
-        for row in q
-            .query_map([], |r| {
+                pinned: view.as_ref().map(|(_, pinned)| *pinned),
+                rex_view_id: view.map(|(id, _)| Digest::parse(id)).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+    };
+
+    let agents = {
+        let mut statement = db.prepare("SELECT agent_run_id,project_id,logical_owner,state,rex_session_id,rex_window_id,rex_block_id FROM agent_runs ORDER BY started_at_unix DESC,agent_run_id").map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
                 Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                    r.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
-            .map_err(|e| e.to_string())?
-        {
-            let (id, p, _role_session, owner, state, session, window, block) =
-                row.map_err(|e| e.to_string())?;
-            let ticket_run_id = None;
-            let role = owner;
-            agents.push(AgentRow {
-                agent_run_id: id,
-                project_id: p,
-                ticket_run_id,
-                role,
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (raw_id, project_id, logical_owner, state, session, window, block) =
+                row.map_err(|error| error.to_string())?;
+            let run_id = AgentRunId::parse(raw_id)?;
+            let authority = read_authority(&db, &run_id)?;
+            Ok(AgentRow {
+                agent_run_id: run_id.to_string(),
+                project_id,
+                ticket_run_id: authority
+                    .as_ref()
+                    .and_then(|authority| authority.ticket_run_id.clone()),
+                role: authority
+                    .as_ref()
+                    .map(|authority| format!("{:?}", authority.role).to_lowercase())
+                    .unwrap_or(logical_owner),
                 state,
                 rex_session_id: session,
                 rex_window_id: window,
                 rex_block_id: block,
-            });
-        }
-    }
-    let mut waits = Vec::new();
-    {
-        let mut q=db.prepare("SELECT project_id,subject_id,kind,status,last_error FROM effects WHERE status IN ('pending','claimed','uncertain','failed') ORDER BY created_at_unix").map_err(|e|e.to_string())?;
-        for row in q
-            .query_map([], |r| {
+                rex_view_id: authority.map(|authority| authority.rex_view_id),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+    };
+
+    let waits = {
+        let mut statement = db.prepare("SELECT project_id,subject_type,subject_id,kind,status,last_error FROM effects WHERE status IN ('pending','claimed','uncertain','failed') ORDER BY created_at_unix").map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
+                let ticket = match (row.get::<_, String>(1)?.as_str(), row.get::<_, String>(2)?) {
+                    ("ticket_run", id) => TicketRunId::parse(id).ok(),
+                    _ => None,
+                };
                 Ok(WaitRow {
-                    project_id: r.get(0)?,
-                    ticket_run_id: None,
-                    kind: r.get(2)?,
+                    project_id: row.get(0)?,
+                    ticket_run_id: ticket,
+                    kind: row.get(3)?,
                     detail: format!(
                         "{} {}",
-                        r.get::<_, String>(3)?,
-                        r.get::<_, Option<String>>(4)?.unwrap_or_default()
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?.unwrap_or_default()
                     ),
                 })
             })
-            .map_err(|e| e.to_string())?
-        {
-            waits.push(row.map_err(|e| e.to_string())?);
-        }
-    }
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    let human_requests = ConfigStore::list_human_requests(state_root, None)?
+        .into_iter()
+        .map(|summary| {
+            let lifecycle = serde_json::to_value(summary.lifecycle)
+                .map_err(|error| error.to_string())?
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned();
+            let request = summary.request;
+            let choices = request
+                .choices
+                .iter()
+                .map(|choice| {
+                    serde_json::to_value(choice)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| format!("{choice:?}").to_lowercase())
+                })
+                .collect();
+            Ok(HumanInboxRow {
+                request_id: request.request_id,
+                project_id: request.subject.project_id.to_string(),
+                question: request.question,
+                choices,
+                subject_digest: request.subject.digest()?.to_string(),
+                expires_at_unix: request.expires_at_unix as i64,
+                lifecycle,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     Ok(DashboardSnapshot {
         observed_at_unix: unix_now(),
         projects,
         tickets,
         agents,
         waits,
-        // The host adapter fills this from ConfigStore::list_human_requests.
-        human_requests: Vec::new(),
+        human_requests,
     })
 }
+
+/// Resolve a focus request through immutable Agent launch authority and the
+/// active Rex view/block tables. A caller cannot choose an unrelated block.
+pub fn read_focus_target(
+    state_root: &Path,
+    owner_generation: u64,
+    agent_run_id: &AgentRunId,
+) -> Result<FocusTarget, String> {
+    let path = state_root.join("state.sqlite3");
+    let db = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    db.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let authority = read_authority(&db, agent_run_id)?
+        .ok_or_else(|| "AgentRun has no launch authority".to_owned())?;
+    if authority.controller_generation != owner_generation {
+        return Err("Agent launch authority belongs to a stale controller generation".into());
+    }
+    let target = read_authorized_focus_target(&db, &authority)?;
+    Ok(FocusTarget {
+        view_id: target.view_id,
+        rex_server_identity: target.rex_server_identity,
+        session_id: target.rex_session_id,
+        window_id: target.rex_window_id,
+        block_id: target.rex_block_id,
+    })
+}
+
+/// Return the currently active owner generation, if a controller is running.
+pub fn active_owner_generation(state_root: &Path) -> Result<Option<u64>, String> {
+    let status = ConfigStore::status(state_root)?;
+    Ok(status
+        .owner_is_live()
+        .then_some(status.owner_generation)
+        .flatten())
+}
+
+/// Pin the active Rex view for an exact TicketRun revision. This write is a
+/// small controller-fenced state update; the UI never receives a DB handle.
+pub fn set_ticket_pin(
+    state_root: &Path,
+    owner_generation: u64,
+    ticket_run_id: &TicketRunId,
+    expected_revision: u64,
+    pinned: bool,
+) -> Result<(), String> {
+    let path = state_root.join("state.sqlite3");
+    let mut db = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    db.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let current_generation: Option<u64> = tx
+        .query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_generation != Some(owner_generation) {
+        return Err("pin request is fenced to a stale controller generation".into());
+    }
+    let ticket: Option<(String, String, String, u64)> = tx
+        .query_row(
+            "SELECT project_id,namespace,ticket_id,revision FROM ticket_runs WHERE ticket_run_id=?1",
+            [ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((project_id, namespace, ticket_id, revision)) = ticket else {
+        return Err("TicketRun not found".into());
+    };
+    if revision != expected_revision {
+        return Err("TicketRun revision changed; refresh the dashboard".into());
+    }
+    let view_id: String = tx
+        .query_row(
+            "SELECT view_id FROM rex_views WHERE project_id=?1 AND view_kind='ticket' AND ticket_namespace=?2 AND ticket_id=?3 AND lifecycle='active' ORDER BY view_epoch DESC LIMIT 1",
+            params![project_id, namespace, ticket_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "active Rex ticket view not found".to_owned())?;
+    let changed = tx
+        .execute(
+            "UPDATE rex_views SET pinned=?2,updated_at_unix=?3 WHERE view_id=?1 AND lifecycle='active'",
+            params![view_id, pinned, unix_now()],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("active Rex ticket view not found".into());
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn read_authority(
+    db: &Connection,
+    agent_run_id: &AgentRunId,
+) -> Result<Option<AgentLaunchAuthority>, String> {
+    let stored: Option<(String, String, String)> = db
+        .query_row(
+            "SELECT authority_json,descriptor_digest,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+            [agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    stored
+        .map(|(json, descriptor_digest, authority_digest)| {
+            let authority: AgentLaunchAuthority = crate::protocol::parse_unique(json.as_bytes())
+                .map_err(|error| format!("stored Agent launch authority is invalid: {error}"))?;
+            authority.validate()?;
+            if authority.agent_run_id != *agent_run_id
+                || authority.descriptor_digest.as_str() != descriptor_digest
+                || authority.digest()?.as_str() != authority_digest
+            {
+                return Err("stored Agent launch authority digest fields do not match".into());
+            }
+            Ok(authority)
+        })
+        .transpose()
+}
+
+fn read_authorized_focus_target(
+    db: &Connection,
+    authority: &AgentLaunchAuthority,
+) -> Result<RexFocusTarget, String> {
+    let target: Option<(String, String, String)> = db
+        .query_row(
+            "SELECT v.rex_server_identity,v.rex_session_id,v.rex_window_id FROM rex_views v JOIN rex_view_blocks b USING(view_id) WHERE v.view_id=?1 AND b.block_id=?2 AND v.lifecycle='active' AND b.lifecycle!='closed'",
+            params![authority.rex_view_id.as_str(), authority.rex_block_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let (server, session, window) =
+        target.ok_or_else(|| "active Rex focus target not found".to_owned())?;
+    if server != authority.rex_server_identity
+        || session != authority.rex_session_id
+        || window != authority.rex_window_id
+    {
+        return Err("Rex focus target differs from immutable launch authority".into());
+    }
+    Ok(RexFocusTarget {
+        view_id: authority.rex_view_id.clone(),
+        rex_server_identity: server,
+        rex_session_id: session,
+        rex_window_id: window,
+        rex_block_id: authority.rex_block_id.clone(),
+    })
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -152,43 +366,33 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
-    fn empty_runtime_projection_is_read_only_and_complete() {
-        let root = tempdir().unwrap();
-        let store = crate::store::ConfigStore::open_test(root.path()).unwrap();
-        drop(store);
-        let before = std::fs::metadata(root.path().join("state.sqlite3"))
-            .unwrap()
-            .len();
-        let view = read_projection(root.path()).unwrap();
-        let after = std::fs::metadata(root.path().join("state.sqlite3"))
-            .unwrap()
-            .len();
+    fn typed_snapshot_reads_the_current_schema_without_migrating() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(ConfigStore::open_test(temp.path()).unwrap());
+        let path = temp.path().join("state.sqlite3");
+        let before = std::fs::metadata(&path).unwrap().len();
+        let snapshot = read_projection(temp.path()).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
         assert_eq!(before, after);
-        assert!(view.projects.is_empty());
-        assert!(view.tickets.is_empty());
-        assert!(view.agents.is_empty());
-        assert!(view.waits.is_empty());
-        assert!(view.human_requests.is_empty());
+        assert!(snapshot.projects.is_empty());
+        assert!(snapshot.tickets.is_empty());
+        assert!(snapshot.agents.is_empty());
+        assert!(snapshot.waits.is_empty());
+        assert!(snapshot.human_requests.is_empty());
     }
 
     #[test]
-    fn stale_schema_is_reported_without_migration() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("state.sqlite3");
+    fn stale_database_is_rejected_without_schema_probing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite3");
         let db = Connection::open(&path).unwrap();
-        db.pragma_update(None, "user_version", 5).unwrap();
+        db.pragma_update(None, "user_version", 7).unwrap();
         drop(db);
         assert_eq!(
-            read_projection(root.path()).unwrap_err(),
-            "dashboard requires runtime schema version 6 or newer (found 5)"
+            read_projection(temp.path()).unwrap_err(),
+            "dashboard requires runtime schema version 8 or newer (found 7)"
         );
-        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let version: i64 = db
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, 5);
     }
 }
