@@ -1673,16 +1673,46 @@ pub struct ImplementationPublicationReceipt {
     pub pull_request: PublishedPullRequest,
 }
 
+/// Opaque proof that the dispatcher’s durable Applied output matches its typed request.
+/// Only this module can mint the capability; callers cannot fabricate a reviewer wake.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedImplementationPublication {
+    project_id: ProjectId,
+    ticket_run_id: TicketRunId,
+    source_revision: u64,
+    receipt_digest: String,
+}
+
+impl ValidatedImplementationPublication {
+    pub(crate) fn matches(&self, run: &crate::engine::reducer::TicketRun) -> bool {
+        self.project_id == run.project_id
+            && self.ticket_run_id == run.ticket_run_id
+            && self.source_revision == run.revision.0
+            && self.receipt_digest.len() == 64
+    }
+}
+
 /// Validate the persisted Applied receipt against the original effect and prepared worktree.
 /// Caller code must invoke this on the durable dispatcher receipt before releasing Reviewer.
 pub fn validate_implementation_publication_receipt(
     request: &EffectRequest,
     prepared_worktree: &PreparedWorktreeReceiptNode,
+    project_id: &ProjectId,
+    repository_config: &RepositoryConfig,
     receipt_json: &str,
-) -> Result<ImplementationPublicationReceipt, String> {
+) -> Result<ValidatedImplementationPublication, String> {
     let payload: PublishImplementationEffectPayload = decode_effect_payload(request)?;
     validate_effect_kind(request, EffectKind::PublishImplementation)?;
     validate_source_revision(request, payload.source_revision)?;
+    if request.intent.project_id != *project_id
+        || request.intent.subject_type != "ticket_run"
+        || request.intent.subject_id != payload.ticket_run_id.as_str()
+        || payload.repository_id.as_str().is_empty()
+    {
+        return Err(
+            "implementation receipt effect subject does not match its project and run".into(),
+        );
+    }
     let receipt: ImplementationPublicationReceipt = serde_json::from_str(receipt_json)
         .map_err(|error| format!("invalid implementation receipt JSON: {error}"))?;
     if receipt.schema_version != 1
@@ -1696,6 +1726,7 @@ pub fn validate_implementation_publication_receipt(
         || prepared_worktree.work_node_id != payload.work_node_id
         || prepared_worktree.commit_mode != payload.commit_mode
         || prepared_worktree.base_sha != payload.expected_base_sha
+        || repository_config.base_branch != payload.base_branch
     {
         return Err(
             "implementation receipt does not match its effect and worktree identities".into(),
@@ -1722,6 +1753,13 @@ pub fn validate_implementation_publication_receipt(
                 ..
             },
         ) if payload.commit_mode == CommitMode::Host
+            && commit.operation_id
+                == derived_operation_id(
+                    &request.intent.operation_id,
+                    &payload.repository_id,
+                    payload.work_node_id.as_str(),
+                    "commit",
+                )?
             && commit.repository_id == payload.repository_id
             && commit.expected_head == *expected_head
             && commit.observed_head == *head
@@ -1737,6 +1775,16 @@ pub fn validate_implementation_publication_receipt(
     if receipt.hook_gate.repository_id != payload.repository_id
         || receipt.hook_gate.head != head
         || receipt.hook_gate.configuration_digest != payload.configuration_digest
+        || receipt.hook_gate.hook_receipts.len() != repository_config.rex_projects_hooks.len()
+        || repository_config.rex_projects_hooks.iter().any(|expected| {
+            receipt
+                .hook_gate
+                .hook_receipts
+                .iter()
+                .filter(|observed| observed.hook_id == expected.id)
+                .count()
+                != 1
+        })
         || receipt.hook_gate.hook_receipts.iter().any(|hook| {
             !hook.succeeded
                 || hook.timed_out
@@ -1785,7 +1833,12 @@ pub fn validate_implementation_publication_receipt(
             "implementation receipt pull request does not match the delivery intent".into(),
         );
     }
-    Ok(receipt)
+    Ok(ValidatedImplementationPublication {
+        project_id: project_id.clone(),
+        ticket_run_id: payload.ticket_run_id,
+        source_revision: payload.source_revision,
+        receipt_digest: sha256_hex(receipt_json.as_bytes()),
+    })
 }
 
 fn digest_json<T: Serialize>(value: &T) -> Result<String, String> {
@@ -2301,7 +2354,7 @@ mod tests {
         let (request_json, request_digest) = canonical_delivery_payload(&payload).unwrap();
         let request = EffectRequest {
             intent: crate::store::EffectIntent {
-                project_id,
+                project_id: project_id.clone(),
                 subject_type: "ticket_run".into(),
                 subject_id: "run-1".into(),
                 operation_id: "prepare-1".into(),
@@ -2393,7 +2446,7 @@ mod tests {
         let (request_json, request_digest) = canonical_delivery_payload(&payload).unwrap();
         let request = EffectRequest {
             intent: crate::store::EffectIntent {
-                project_id,
+                project_id: project_id.clone(),
                 subject_type: "ticket_run".into(),
                 subject_id: "run-4".into(),
                 operation_id: "publish-4".into(),
@@ -2455,7 +2508,7 @@ mod tests {
         let (request_json, request_digest) = canonical_delivery_payload(&payload).unwrap();
         let request = EffectRequest {
             intent: crate::store::EffectIntent {
-                project_id,
+                project_id: project_id.clone(),
                 subject_type: "ticket_run".into(),
                 subject_id: ticket_run_id.to_string(),
                 operation_id: "publish-op".into(),
@@ -2517,7 +2570,7 @@ mod tests {
                 force_with_lease: false,
             },
             pull_request: PublishedPullRequest {
-                repository_id,
+                repository_id: repository_id.clone(),
                 number: 42,
                 node_id: "PR_fixture".into(),
                 url: "https://github.com/acme/demo/pull/42".into(),
@@ -2532,9 +2585,45 @@ mod tests {
         };
 
         let json = serde_json::to_string(&receipt).unwrap();
+        let repository_config = fixture_repository_config("git@github.com:acme/demo.git".into());
+        let validated = validate_implementation_publication_receipt(
+            &request,
+            &prepared,
+            &project_id,
+            &repository_config,
+            &json,
+        )
+        .unwrap();
+        assert_eq!(validated.source_revision, 7);
+        let mut ticket_run = crate::engine::reducer::TicketRun {
+            project_id,
+            ticket_run_id,
+            revision: crate::domain::ids::Revision(7),
+            phase: crate::engine::reducer::Phase::Publishing,
+            activity: crate::engine::reducer::Activity::Running,
+            external_status: crate::domain::types::TicketStatus::InProgress,
+            required_review_revision: None,
+        };
+        let decision = crate::engine::reducer::reduce(
+            &ticket_run,
+            ticket_run.revision,
+            crate::engine::reducer::Input::ImplementationPublished(validated),
+        )
+        .unwrap();
         assert_eq!(
-            validate_implementation_publication_receipt(&request, &prepared, &json).unwrap(),
-            receipt
+            decision.ticket_run.phase,
+            crate::engine::reducer::Phase::Reviewing
+        );
+        ticket_run.phase = crate::engine::reducer::Phase::Implementing;
+        assert!(
+            crate::engine::reducer::reduce(
+                &ticket_run,
+                ticket_run.revision,
+                crate::engine::reducer::Input::EvidenceSubmitted,
+            )
+            .unwrap()
+            .effects
+            .contains(&EffectKind::PublishImplementation)
         );
         let mut tampered = receipt;
         tampered.push.pushed_head = "c".repeat(40);
@@ -2542,6 +2631,8 @@ mod tests {
             validate_implementation_publication_receipt(
                 &request,
                 &prepared,
+                &ProjectId::parse("project").unwrap(),
+                &repository_config,
                 &serde_json::to_string(&tampered).unwrap()
             )
             .is_err()

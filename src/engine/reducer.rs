@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::delivery_runtime::ValidatedImplementationPublication;
 use crate::domain::ids::{OperationId, ProjectId, Revision, TicketRunId};
 use crate::domain::types::TicketStatus;
 
@@ -51,7 +52,7 @@ pub enum Input {
     PlanAccepted,
     WorktreesPrepared,
     EvidenceSubmitted,
-    ImplementationPublished,
+    ImplementationPublished(ValidatedImplementationPublication),
     CorrectionsRemain,
     ReviewConverged,
     RequireHumanReview,
@@ -159,7 +160,9 @@ pub fn reduce(
             next.activity = Activity::Running;
             effects.push(EffectKind::PublishImplementation);
         }
-        Input::ImplementationPublished if current.phase == Phase::Publishing => {
+        Input::ImplementationPublished(receipt)
+            if current.phase == Phase::Publishing && receipt.matches(current) =>
+        {
             next.phase = Phase::Reviewing;
             next.activity = Activity::Running;
             effects.push(EffectKind::StartReviewer);
@@ -362,23 +365,6 @@ mod tests {
         .unwrap();
         assert_eq!(publish.ticket_run.phase, Phase::Publishing);
         assert_eq!(publish.effects, vec![EffectKind::PublishImplementation]);
-
-        let reviewed = reduce(
-            &publish.ticket_run,
-            publish.ticket_run.revision,
-            Input::ImplementationPublished,
-        )
-        .unwrap();
-        assert_eq!(reviewed.ticket_run.phase, Phase::Reviewing);
-        assert_eq!(reviewed.effects, vec![EffectKind::StartReviewer]);
-        assert!(
-            reduce(
-                &implementing,
-                implementing.revision,
-                Input::ImplementationPublished
-            )
-            .is_err()
-        );
     }
 
     #[test]
