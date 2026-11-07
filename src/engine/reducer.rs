@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::ids::{OperationId, ProjectId, Revision, TicketRunId};
 use crate::domain::types::TicketStatus;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Queued,
@@ -73,7 +73,7 @@ pub struct EffectIntent {
     pub logical_key: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectKind {
     PublishTicketStatus,
@@ -86,6 +86,7 @@ pub enum EffectKind {
     RequestHumanReview,
     Merge,
     StartOperator,
+    Operation,
     StartPostmortem,
     CompleteTicket,
     StopOwnedRuns,
@@ -283,7 +284,7 @@ pub fn bind_effects(decision: &Decision, ids: &[OperationId]) -> Result<Vec<Effe
         .collect())
 }
 
-fn effect_name(kind: &EffectKind) -> &'static str {
+pub const fn effect_name(kind: &EffectKind) -> &'static str {
     match kind {
         EffectKind::PublishTicketStatus => "publish_ticket_status",
         EffectKind::StartSupervisor => "start_supervisor",
@@ -295,6 +296,7 @@ fn effect_name(kind: &EffectKind) -> &'static str {
         EffectKind::RequestHumanReview => "request_human_review",
         EffectKind::Merge => "merge",
         EffectKind::StartOperator => "start_operator",
+        EffectKind::Operation => "operation",
         EffectKind::StartPostmortem => "start_postmortem",
         EffectKind::CompleteTicket => "complete_ticket",
         EffectKind::StopOwnedRuns => "stop_owned_runs",
