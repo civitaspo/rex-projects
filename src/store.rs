@@ -20,7 +20,9 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
+mod agent_runtime;
+pub use agent_runtime::{LaunchPreparationOutcome, PendingRoleWakeInput};
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
@@ -373,6 +375,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             crate::launch::migrate_v7(&mut connection)?;
+        }
+        if existing_version < 8 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            crate::launch::migrate_v8(&mut connection)?;
         }
         Ok(Self {
             connection,
@@ -951,7 +959,7 @@ impl ConfigStore {
         authority: &AgentLaunchAuthority,
     ) -> Result<bool, String> {
         authority.validate()?;
-        let authority_json = serde_json::to_string(authority).map_err(|error| error.to_string())?;
+        let authority_json = authority.storage_json()?;
         let authority_digest = authority.digest()?;
         let tx = self
             .connection
@@ -1042,6 +1050,39 @@ impl ConfigStore {
         let effective: EffectiveConfig =
             crate::protocol::parse_unique(effective_json.as_bytes())
                 .map_err(|error| format!("applied config snapshot is invalid: {error}"))?;
+        if let Some(project_config) = effective.config.projects.get(&authority.project_id) {
+            let project_roles = crate::config::effective_project_roles(
+                &authority.project_id,
+                &effective.config.projects,
+            )?;
+            let expected_profile = if let Some(recipe_id) = &authority.operation_recipe_id {
+                if !project_config
+                    .operation_matches
+                    .iter()
+                    .any(|operation| &operation.recipe == recipe_id)
+                {
+                    return Err("operation recipe is not selected by this Project".into());
+                }
+                effective
+                    .config
+                    .operation_recipes
+                    .get(recipe_id)
+                    .ok_or("launch operation recipe is missing from applied configuration")?
+                    .roles
+                    .get(&authority.role)
+                    .or_else(|| project_roles.get(&authority.role))
+            } else {
+                project_roles.get(&authority.role)
+            }
+            .ok_or("launch role has no effective profile")?;
+            if expected_profile != &authority.profile_id {
+                return Err(
+                    "launch profile does not match the Project's effective role profile".into(),
+                );
+            }
+        } else if authority.operation_recipe_id.is_some() {
+            return Err("launch Project is missing from the applied config snapshot".into());
+        }
         let profile = effective
             .profiles
             .get(&authority.profile_id)
@@ -1115,8 +1156,8 @@ impl ConfigStore {
         }
         qualification.validate_for_unattended_launch()?;
         let authority_inserted = tx.execute(
-            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34) ON CONFLICT(agent_run_id) DO NOTHING",
-            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,operation_recipe_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,wake_snapshot_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36) ON CONFLICT(agent_run_id) DO NOTHING",
+            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.operation_recipe_id,authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.wake_snapshot_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
         ).map_err(|error| error.to_string())?;
         let existing: Option<(String,String)> = tx
             .query_row(
@@ -3324,6 +3365,40 @@ impl ConfigStore {
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
         authority.validate()?;
+        let reservation_lifecycle: Option<String> = tx
+            .query_row(
+                "SELECT lifecycle FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if reservation_lifecycle
+            .as_deref()
+            .is_some_and(|state| state != "authorized")
+        {
+            return Err("Agent launch reservation has not been finalized".into());
+        }
+        if reservation_lifecycle.is_some() {
+            let block_is_active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2 AND agent_run_id=?3 AND ownership='factory' AND lifecycle='active')",
+                params![authority.rex_view_id.as_str(),authority.rex_block_id,request.agent_run_id.as_str()],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            let wake_digest: Option<String> = tx
+                .query_row(
+                    "SELECT snapshot_digest FROM agent_wake_context WHERE agent_run_id=?1",
+                    [request.agent_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if !block_is_active
+                || wake_digest.as_deref() != Some(authority.wake_snapshot_digest.as_str())
+            {
+                return Err("Agent launch reservation lacks its finalized active Rex block and wake context".into());
+            }
+        }
         let qualification_json: String = tx
             .query_row(
                 "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
@@ -4360,6 +4435,7 @@ mod tests {
             run_epoch: 1,
             controller_generation: generation,
             operation_id,
+            operation_recipe_id: None,
             rex_view_id: view_id,
             descriptor_digest: Digest::parse("c".repeat(64)).unwrap(),
             runtime_binary_digest: Digest::parse("d".repeat(64)).unwrap(),
@@ -4369,6 +4445,7 @@ mod tests {
             profile_digest,
             instruction_digest: Digest::parse("3".repeat(64)).unwrap(),
             result_schema_digest: Digest::parse("4".repeat(64)).unwrap(),
+            wake_snapshot_digest: Digest::parse("7".repeat(64)).unwrap(),
             qualification_receipt_digest: qualification_digest,
             rex_server_identity: "rex-instance".into(),
             rex_session_id: "session".into(),
@@ -4523,6 +4600,121 @@ mod tests {
             store
                 .register_agent_launch_authority(generation, &authority)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn populated_v7_authority_and_start_receipt_survive_v8_migration() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        assert!(
+            store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
+        );
+        let request = AgentStartRequest {
+            schema_version: 1,
+            operation_id: authority.operation_id.clone(),
+            agent_run_id: authority.agent_run_id.clone(),
+            project_id: authority.project_id.clone(),
+            controller_generation: generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            wrapper_pid: 456,
+            wrapper_start_identity: "v7-wrapper".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+        };
+        let observed = ObservedWrapperIdentity {
+            pid: request.wrapper_pid,
+            start_identity: request.wrapper_start_identity.clone(),
+            rex_session_id: request.rex_session_id.clone(),
+            rex_block_id: request.rex_block_id.clone(),
+            runtime_binary_digest: request.runtime_binary_digest.clone(),
+        };
+        let receipt = store
+            .authorize_agent_start(generation, &request, &observed)
+            .unwrap();
+
+        // Recreate the serialized authority format written by schema v7, before either field
+        // existed. Keep the struct's original field order so its historical digest is exact.
+        let legacy_json = serde_json::to_string(&authority)
+            .unwrap()
+            .replacen(",\"operation_recipe_id\":null", "", 1)
+            .replacen(
+                &format!(
+                    ",\"wake_snapshot_digest\":\"{}\"",
+                    authority.wake_snapshot_digest
+                ),
+                "",
+                1,
+            );
+        assert!(!legacy_json.contains("operation_recipe_id"));
+        assert!(!legacy_json.contains("wake_snapshot_digest"));
+        let legacy_digest = format!("{:x}", sha2::Sha256::digest(legacy_json.as_bytes()));
+        store
+            .connection
+            .execute_batch(
+                "DROP TRIGGER agent_launch_authority_immutable_update;
+             DROP TRIGGER agent_launch_authority_immutable_delete;",
+            )
+            .unwrap();
+        store.connection.execute(
+            "UPDATE agent_launch_authority SET authority_json=?2,authority_digest=?3 WHERE agent_run_id=?1",
+            rusqlite::params![authority.agent_run_id.as_str(), legacy_json, legacy_digest],
+        ).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX agent_launch_reservations_project;
+             DROP TRIGGER agent_launch_reservation_identity_guard;
+             DROP TRIGGER agent_launch_reservation_no_delete;
+             DROP TRIGGER agent_wake_context_immutable_update;
+             DROP TRIGGER agent_wake_context_immutable_delete;
+             DROP TABLE agent_launch_reservations;
+             DROP TABLE agent_wake_context;
+             ALTER TABLE agent_launch_authority DROP COLUMN operation_recipe_id;
+             ALTER TABLE agent_launch_authority DROP COLUMN wake_snapshot_digest;
+             DELETE FROM schema_migrations WHERE version=8;
+             PRAGMA user_version=7;",
+            )
+            .unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let mut expected_legacy_authority = authority.clone();
+        expected_legacy_authority.wake_snapshot_digest = Digest::parse("0".repeat(64)).unwrap();
+        assert_eq!(
+            store
+                .agent_launch_authority(&authority.agent_run_id)
+                .unwrap(),
+            Some(expected_legacy_authority.clone())
+        );
+        assert!(
+            !store
+                .register_agent_launch_authority(generation, &expected_legacy_authority)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .authorize_agent_start(generation, &request, &observed)
+                .unwrap(),
+            receipt
+        );
+        let mut changed_request = request.clone();
+        changed_request.wrapper_pid += 1;
+        let changed_observation = ObservedWrapperIdentity {
+            pid: changed_request.wrapper_pid,
+            ..observed
+        };
+        assert!(
+            store
+                .authorize_agent_start(generation, &changed_request, &changed_observation)
+                .unwrap_err()
+                .contains("different persisted start acknowledgement")
         );
     }
 

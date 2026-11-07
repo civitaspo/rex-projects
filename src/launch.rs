@@ -7,20 +7,192 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::agent_api::AgentWakeSnapshot;
 use crate::domain::ids::{
     AgentRunId, Digest as ContentDigest, OperationId, ProfileId, ProjectId, Revision, TicketId,
     TicketNamespace, TicketRunId,
 };
 use crate::domain::types::{AgentAdapter, CommitMode, Role};
+use crate::engine::orchestration::WorkNodeId;
 
 pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_DATABASE_SCHEMA_VERSION: i64 = 7;
+
+/// Minimal durable StartAgent effect. The controller reloads its authority from SQLite.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartAgentEffectPayload {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub launch_reservation_digest: ContentDigest,
+}
+
+impl StartAgentEffectPayload {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != LAUNCH_SCHEMA_VERSION {
+            return Err("unsupported StartAgent effect payload schema".into());
+        }
+        Ok(())
+    }
+}
+
+/// Host-owned phase-one launch identity. The Rex block is bound only after observation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLaunchReservation {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub project_id: ProjectId,
+    pub role: Role,
+    pub role_session_id: String,
+    pub parent_run_id: Option<AgentRunId>,
+    pub parent_role: Option<Role>,
+    pub ticket_run_id: Option<TicketRunId>,
+    pub ticket_revision: Option<Revision>,
+    pub config_revision: Revision,
+    pub config_digest: ContentDigest,
+    pub attempt: u32,
+    pub run_epoch: u64,
+    pub controller_generation: u64,
+    pub project_epoch: u64,
+    pub operation_id: OperationId,
+    pub operation_recipe_id: Option<String>,
+    pub worker_assignment: Option<WorkerLaunchBinding>,
+    pub rex_view_id: ContentDigest,
+    pub runtime_binary_digest: ContentDigest,
+    pub environment_snapshot_id: ContentDigest,
+    pub profile_id: ProfileId,
+    pub profile_digest: ContentDigest,
+    pub instruction_digest: ContentDigest,
+    pub result_schema_digest: ContentDigest,
+    pub wake_snapshot: AgentWakeSnapshot,
+    pub qualification_receipt_digest: ContentDigest,
+    pub descriptor_path: PathBuf,
+    pub workspace_path: PathBuf,
+    pub control_dir: PathBuf,
+    pub mailbox_directory: PathBuf,
+    pub mailbox_capability_digest: ContentDigest,
+    pub mailbox_expires_at_unix: u64,
+    pub mailbox_max_request_bytes: u64,
+    pub mailbox_max_pending_requests: u32,
+    pub pool: String,
+    pub slot_index: u32,
+    pub global_capacity: u32,
+    pub project_capacity: u32,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchBinding {
+    pub schema_version: u32,
+    pub accepted_revision: u64,
+    pub ticket_revision: u64,
+    pub configuration_digest: ContentDigest,
+    pub plan_digest: ContentDigest,
+    pub node_id: WorkNodeId,
+    pub repository_id: crate::domain::ids::RepositoryId,
+    pub commit_mode: CommitMode,
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub base_sha: String,
+    pub prepare_operation_id: String,
+    pub prepare_receipt_digest: ContentDigest,
+    pub source_evidence_id: String,
+    pub source_agent_run_id: AgentRunId,
+    pub source_message_id: String,
+    pub source_result_digest: ContentDigest,
+    pub coordinator_agent_run_id: AgentRunId,
+    pub coordinator_role_session_id: String,
+    pub coordinator_authority_digest: ContentDigest,
+}
+
+impl WorkerLaunchBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.accepted_revision == 0
+            || self.ticket_revision == 0
+            || !self.worktree_path.is_absolute()
+            || self.branch.trim().is_empty()
+            || self.base_sha.trim().is_empty()
+            || self.prepare_operation_id.trim().is_empty()
+            || self.source_evidence_id.trim().is_empty()
+            || self.source_message_id.trim().is_empty()
+            || self.coordinator_role_session_id.trim().is_empty()
+        {
+            return Err("Worker launch binding has invalid plan or worktree provenance".into());
+        }
+        Ok(())
+    }
+}
+
+impl AgentLaunchReservation {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != LAUNCH_SCHEMA_VERSION
+            || self.attempt == 0
+            || self.run_epoch == 0
+            || self.controller_generation == 0
+            || self.project_epoch == 0
+            || self.mailbox_expires_at_unix == 0
+            || self.mailbox_max_request_bytes == 0
+            || self.mailbox_max_pending_requests == 0
+            || self.global_capacity == 0
+            || self.project_capacity == 0
+            || !matches!(self.pool.as_str(), "agent" | "rex_projects_hook")
+        {
+            return Err("Agent launch reservation has an invalid schema, counter, or limit".into());
+        }
+        if self.parent_run_id.is_some() != self.parent_role.is_some() {
+            return Err("reservation parent AgentRun ID and role must be present together".into());
+        }
+        validate_launch_parent_role(self.role, self.parent_role)?;
+        match (self.role, self.worker_assignment.as_ref()) {
+            (Role::Worker, Some(assignment)) => assignment.validate()?,
+            (Role::Worker, None) => {
+                return Err("Worker reservation requires prepared plan/worktree provenance".into());
+            }
+            (_, Some(_)) => {
+                return Err("non-Worker reservation cannot carry Worker launch provenance".into());
+            }
+            (_, None) => {}
+        }
+        if self.role == Role::Supervisor {
+            if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {
+                return Err("Project Supervisor reservation cannot have a TicketRun".into());
+            }
+        } else if self.ticket_run_id.is_none() || self.ticket_revision.is_none() {
+            return Err("ticket role reservation requires a TicketRun and revision".into());
+        }
+        for path in [
+            &self.descriptor_path,
+            &self.workspace_path,
+            &self.control_dir,
+            &self.mailbox_directory,
+        ] {
+            if !path.is_absolute() {
+                return Err("reservation paths must be absolute".into());
+            }
+        }
+        if self.wake_snapshot.project_id != self.project_id
+            || self.wake_snapshot.agent_run_id != self.agent_run_id.as_str()
+            || self.wake_snapshot.role_session_id != self.role_session_id
+        {
+            return Err("wake snapshot scope does not match launch reservation".into());
+        }
+        self.wake_snapshot.validate()
+    }
+
+    pub fn digest(&self) -> Result<ContentDigest, String> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        ContentDigest::parse(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -403,6 +575,68 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
     tx.commit().map_err(|error| error.to_string())
 }
 
+/// Add durable launch reservations and host-owned wake snapshots to a v7 database.
+pub fn migrate_v8(connection: &mut Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version == 8 {
+        return Ok(());
+    }
+    if version != 7 {
+        return Err(format!(
+            "launch reservation migration requires schema 7, found {version}"
+        ));
+    }
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    migrate_launch_reservation_tables(&tx)?;
+    tx.execute_batch(
+        "ALTER TABLE agent_launch_authority ADD COLUMN operation_recipe_id TEXT;
+         ALTER TABLE agent_launch_authority ADD COLUMN wake_snapshot_digest TEXT CHECK(wake_snapshot_digest IS NULL OR length(wake_snapshot_digest)=64);"
+    ).map_err(|error| error.to_string())?;
+    tx.execute_batch("INSERT INTO schema_migrations(version,applied_at_unix) VALUES (8,unixepoch()); PRAGMA user_version=8;")
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_launch_reservation_tables(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE agent_launch_reservations (
+            agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            operation_id TEXT NOT NULL UNIQUE,
+            controller_generation INTEGER NOT NULL CHECK(controller_generation > 0),
+            project_epoch INTEGER NOT NULL CHECK(project_epoch > 0),
+            reservation_digest TEXT NOT NULL CHECK(length(reservation_digest)=64),
+            reservation_json TEXT NOT NULL CHECK(length(reservation_json)<=1048576),
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN ('reserved','block_created','authorized','unknown','cancelled')),
+            created_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL
+         );
+         CREATE INDEX agent_launch_reservations_project ON agent_launch_reservations(project_id,lifecycle,created_at_unix);
+         CREATE TRIGGER agent_launch_reservation_identity_guard BEFORE UPDATE ON agent_launch_reservations
+         WHEN OLD.agent_run_id IS NOT NEW.agent_run_id OR OLD.project_id IS NOT NEW.project_id
+           OR OLD.operation_id IS NOT NEW.operation_id OR OLD.controller_generation IS NOT NEW.controller_generation
+           OR OLD.project_epoch IS NOT NEW.project_epoch OR OLD.reservation_digest IS NOT NEW.reservation_digest
+           OR OLD.reservation_json IS NOT NEW.reservation_json OR OLD.created_at_unix IS NOT NEW.created_at_unix
+         BEGIN SELECT RAISE(ABORT,'Agent launch reservation identity is immutable'); END;
+         CREATE TRIGGER agent_launch_reservation_no_delete BEFORE DELETE ON agent_launch_reservations
+         BEGIN SELECT RAISE(ABORT,'Agent launch reservations are retained'); END;
+         CREATE TABLE agent_wake_context (
+            agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
+            snapshot_digest TEXT NOT NULL CHECK(length(snapshot_digest)=64),
+            snapshot_json TEXT NOT NULL CHECK(length(snapshot_json)<=1048576),
+            created_at_unix INTEGER NOT NULL
+         );
+         CREATE TRIGGER agent_wake_context_immutable_update BEFORE UPDATE ON agent_wake_context
+         BEGIN SELECT RAISE(ABORT,'Agent wake context is immutable'); END;
+         CREATE TRIGGER agent_wake_context_immutable_delete BEFORE DELETE ON agent_wake_context
+         BEGIN SELECT RAISE(ABORT,'Agent wake context is retained'); END;"
+    ).map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationStatus {
@@ -601,6 +835,7 @@ pub struct AgentLaunchAuthority {
     pub run_epoch: u64,
     pub controller_generation: u64,
     pub operation_id: OperationId,
+    pub operation_recipe_id: Option<String>,
     pub rex_view_id: ContentDigest,
     pub descriptor_digest: ContentDigest,
     pub runtime_binary_digest: ContentDigest,
@@ -610,6 +845,8 @@ pub struct AgentLaunchAuthority {
     pub profile_digest: ContentDigest,
     pub instruction_digest: ContentDigest,
     pub result_schema_digest: ContentDigest,
+    #[serde(default = "empty_wake_snapshot_digest")]
+    pub wake_snapshot_digest: ContentDigest,
     pub qualification_receipt_digest: ContentDigest,
     pub rex_server_identity: String,
     pub rex_session_id: String,
@@ -632,6 +869,7 @@ impl AgentLaunchAuthority {
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("parent AgentRun ID and role must be present together".into());
         }
+        validate_launch_parent_role(self.role, self.parent_role)?;
         if self.role == Role::Supervisor {
             if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {
                 return Err("Project Supervisor launch authority cannot have a TicketRun".into());
@@ -665,8 +903,35 @@ impl AgentLaunchAuthority {
     }
 
     pub fn digest(&self) -> Result<ContentDigest, String> {
-        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        ContentDigest::parse(format!("{:x}", Sha256::digest(bytes)))
+        let json = self.storage_json()?;
+        ContentDigest::parse(format!("{:x}", Sha256::digest(json.as_bytes())))
+    }
+
+    /// Serialize the immutable authority as stored. Schema-v7 records predate both optional
+    /// fields and were digested without them; preserve those bytes only when both fields have
+    /// their v7 defaults. Non-default schema-v8 authorities keep the current serialization.
+    pub(crate) fn storage_json(&self) -> Result<String, String> {
+        let mut json = serde_json::to_string(self).map_err(|error| error.to_string())?;
+        if self.operation_recipe_id.is_none()
+            && self.wake_snapshot_digest == empty_wake_snapshot_digest()
+        {
+            let fields = [
+                String::from(",\"operation_recipe_id\":null"),
+                format!(
+                    ",\"wake_snapshot_digest\":\"{}\"",
+                    self.wake_snapshot_digest
+                ),
+            ];
+            for field in fields {
+                if !json.contains(&field) {
+                    return Err(
+                        "Agent launch authority JSON omitted an expected default field".into(),
+                    );
+                }
+                json = json.replacen(&field, "", 1);
+            }
+        }
+        Ok(json)
     }
 
     pub fn expectation(&self, qualification: &ProviderQualification) -> LaunchExpectation {
@@ -695,6 +960,34 @@ impl AgentLaunchAuthority {
             },
         }
     }
+}
+
+fn empty_wake_snapshot_digest() -> ContentDigest {
+    ContentDigest::parse("0".repeat(64)).expect("fixed digest is valid")
+}
+
+fn validate_launch_parent_role(child_role: Role, parent_role: Option<Role>) -> Result<(), String> {
+    let Some(parent_role) = parent_role else {
+        return Ok(());
+    };
+    let expected = match child_role {
+        Role::Supervisor => {
+            return Err("Project Supervisor cannot have a parent AgentRun".into());
+        }
+        Role::Coordinator => Role::Supervisor,
+        Role::Planner
+        | Role::Worker
+        | Role::Reviewer
+        | Role::MergeDecision
+        | Role::Operator
+        | Role::Postmortem => Role::Coordinator,
+    };
+    if parent_role != expected {
+        return Err(format!(
+            "{child_role:?} launch parent role must be {expected:?}, got {parent_role:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// The process wrapper's start observation. It contains identity facts only, never environment
@@ -915,6 +1208,7 @@ mod tests {
         AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, LaunchDecision,
         LaunchExpectation, ObservedProviderStart, ProviderQualification, QualificationIdentity,
         QualificationProof, QualificationStatus, authorize_start, migrate_v7,
+        validate_launch_parent_role,
     };
     use crate::domain::ids::{
         AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketRunId,
@@ -923,6 +1217,26 @@ mod tests {
 
     fn digest(byte: char) -> Digest {
         Digest::parse(byte.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn parent_role_topology_is_closed_when_a_parent_is_declared() {
+        assert!(validate_launch_parent_role(Role::Supervisor, None).is_ok());
+        assert!(validate_launch_parent_role(Role::Coordinator, Some(Role::Supervisor)).is_ok());
+        for child in [
+            Role::Planner,
+            Role::Worker,
+            Role::Reviewer,
+            Role::MergeDecision,
+            Role::Operator,
+            Role::Postmortem,
+        ] {
+            assert!(validate_launch_parent_role(child, Some(Role::Coordinator)).is_ok());
+            assert!(validate_launch_parent_role(child, None).is_ok());
+            assert!(validate_launch_parent_role(child, Some(Role::Planner)).is_err());
+        }
+        assert!(validate_launch_parent_role(Role::Supervisor, Some(Role::Coordinator)).is_err());
+        assert!(validate_launch_parent_role(Role::Coordinator, Some(Role::Planner)).is_err());
     }
 
     fn qualification(status: QualificationStatus) -> ProviderQualification {
@@ -994,6 +1308,7 @@ mod tests {
             run_epoch: 2,
             controller_generation: 4,
             operation_id: OperationId::parse("op-1").unwrap(),
+            operation_recipe_id: None,
             rex_view_id: digest('b'),
             descriptor_digest: digest('3'),
             runtime_binary_digest: digest('a'),
@@ -1003,6 +1318,7 @@ mod tests {
             profile_digest: digest('a'),
             instruction_digest: digest('7'),
             result_schema_digest: digest('8'),
+            wake_snapshot_digest: digest('f'),
             qualification_receipt_digest: digest('5'),
             rex_server_identity: "rex-instance-1".into(),
             rex_session_id: "session-1".into(),
