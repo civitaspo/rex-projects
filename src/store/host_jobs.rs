@@ -1,7 +1,7 @@
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use super::ConfigStore;
+use super::{ConfigStore, validate_active_generation};
 use crate::domain::ids::Digest;
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 
@@ -10,6 +10,14 @@ use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 pub enum HostJobKind {
     RepositoryHook,
     OperationAdapter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationMethod {
+    Invoke,
+    Find,
+    Observe,
 }
 
 impl HostJobKind {
@@ -35,6 +43,8 @@ pub struct HostJobIntent {
     /// A repository path for hooks or the operation ID for adapter calls.
     pub lane_id: String,
     pub kind: HostJobKind,
+    #[serde(default)]
+    pub operation_method: Option<OperationMethod>,
     pub request_digest: String,
     pub configuration_digest: String,
     pub environment_snapshot_id: Digest,
@@ -43,6 +53,38 @@ pub struct HostJobIntent {
     pub source_digest: String,
     pub max_attempts: u32,
     pub retry_when_absent: bool,
+}
+
+impl HostJobIntent {
+    /// Process absence may retry read-only operation calls and repository hooks.
+    /// An invoke is never automatically retried, regardless of producer flags.
+    pub fn permits_absence_retry(&self) -> bool {
+        self.retry_when_absent
+            && match self.kind {
+                HostJobKind::RepositoryHook => true,
+                HostJobKind::OperationAdapter => {
+                    matches!(
+                        self.operation_method,
+                        Some(OperationMethod::Find | OperationMethod::Observe)
+                    )
+                }
+            }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "$host_job_state",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum HostJobSystemReceipt {
+    ProcessAbsentNoRetry {
+        schema_version: u32,
+        intent: HostJobIntent,
+        process_identity: ProcessIdentity,
+        attempt_count: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,13 +133,18 @@ pub(crate) fn migrate_v12_host_jobs_tables(tx: &Transaction<'_>) -> Result<(), S
 impl ConfigStore {
     pub fn enqueue_host_job(
         &mut self,
+        owner_generation: u64,
         intent: &HostJobIntent,
         now_unix: i64,
     ) -> Result<HostJobRecord, String> {
         validate_intent(intent)?;
         let intent_json = serde_json::to_string(intent).map_err(|error| error.to_string())?;
-        let existing = self
+        let tx = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let existing = tx
             .query_row(
                 "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
                  FROM host_effect_jobs WHERE effect_operation_id = ?1",
@@ -113,17 +160,24 @@ impl ConfigStore {
                         .into(),
                 );
             }
+            tx.commit().map_err(|error| error.to_string())?;
             return Ok(existing);
         }
-        self.connection
-            .execute(
+        tx.execute(
                 "INSERT INTO host_effect_jobs(job_id, effect_operation_id, project_id, worktree_id, intent_json, state, attempt_count, updated_at_unix)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
                 params![intent.job_id, intent.effect_operation_id, intent.project_id, intent.lane_id, intent_json, now_unix],
             )
             .map_err(|error| error.to_string())?;
-        self.host_job(&intent.job_id)?
-            .ok_or_else(|| "inserted host job disappeared".into())
+        let record = tx.query_row(
+                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+                 FROM host_effect_jobs WHERE job_id = ?1",
+                [&intent.job_id],
+                row_to_host_job,
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(record)
     }
 
     pub fn host_job(&self, job_id: &str) -> Result<Option<HostJobRecord>, String> {
@@ -164,30 +218,49 @@ impl ConfigStore {
             .collect()
     }
 
-    pub fn start_host_job(&mut self, job_id: &str, now_unix: i64) -> Result<bool, String> {
-        let changed = self.connection
-            .execute(
+    pub fn start_host_job(
+        &mut self,
+        owner_generation: u64,
+        job_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
                 "UPDATE host_effect_jobs SET state = 'starting', attempt_count = attempt_count + 1, updated_at_unix = ?2
                  WHERE job_id = ?1 AND state = 'pending' AND attempt_count < json_extract(intent_json, '$.max_attempts')",
                 params![job_id, now_unix],
-            )
-            .map_err(|error| error.to_string())?;
+            ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
 
-    pub fn revert_host_job_start(&mut self, job_id: &str, now_unix: i64) -> Result<bool, String> {
-        let changed = self.connection
-            .execute(
+    pub fn revert_host_job_start(
+        &mut self,
+        owner_generation: u64,
+        job_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
                 "UPDATE host_effect_jobs SET state = 'pending', attempt_count = attempt_count - 1, updated_at_unix = ?2
                  WHERE job_id = ?1 AND state = 'starting' AND process_identity_json IS NULL AND attempt_count > 0",
                 params![job_id, now_unix],
-            )
-            .map_err(|error| error.to_string())?;
+            ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
 
     pub fn mark_host_job_running(
         &mut self,
+        owner_generation: u64,
         job_id: &str,
         identity: &ProcessIdentity,
         now_unix: i64,
@@ -202,17 +275,26 @@ impl ConfigStore {
             );
         }
         let identity_json = serde_json::to_string(identity).map_err(|error| error.to_string())?;
-        let changed = self.connection
-            .execute(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
                 "UPDATE host_effect_jobs SET state = 'running', process_identity_json = ?2, updated_at_unix = ?3
                  WHERE job_id = ?1 AND state = 'starting'",
                 params![job_id, identity_json, now_unix],
-            )
-            .map_err(|error| error.to_string())?;
+            ).map_err(|error| error.to_string())?;
         if changed == 1 {
+            tx.commit().map_err(|error| error.to_string())?;
             return Ok(true);
         }
-        let existing = self.host_job(job_id)?;
+        let existing = tx.query_row(
+            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+             FROM host_effect_jobs WHERE job_id = ?1",
+            [job_id], row_to_host_job,
+        ).optional().map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(existing.is_some_and(|record| {
             record.state == super::host_jobs::HostJobState::Running
                 && record.process_identity.as_ref() == Some(identity)
@@ -221,6 +303,7 @@ impl ConfigStore {
 
     pub fn mark_host_job_unknown(
         &mut self,
+        owner_generation: u64,
         job_id: &str,
         reason: &str,
         now_unix: i64,
@@ -228,44 +311,116 @@ impl ConfigStore {
         if reason.trim().is_empty() {
             return Err("unknown host job requires a reason".into());
         }
-        let changed = self.connection
-            .execute(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
                 "UPDATE host_effect_jobs SET state = 'unknown', unknown_reason = ?2, updated_at_unix = ?3
                  WHERE job_id = ?1 AND state IN ('starting','running')",
                 params![job_id, reason, now_unix],
-            )
-            .map_err(|error| error.to_string())?;
+            ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
 
-    pub fn retry_absent_host_job(&mut self, job_id: &str, now_unix: i64) -> Result<bool, String> {
-        let changed = self.connection
-            .execute(
+    pub fn retry_absent_host_job(
+        &mut self,
+        owner_generation: u64,
+        job_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let record = tx.query_row(
+            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+             FROM host_effect_jobs WHERE job_id = ?1",
+            [job_id], row_to_host_job,
+        ).optional().map_err(|error| error.to_string())?;
+        if !record.is_some_and(|record| record.intent.permits_absence_retry()) {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
                 "UPDATE host_effect_jobs SET state = 'pending', process_identity_json = NULL, unknown_reason = NULL, receipt_json = NULL, updated_at_unix = ?2
                  WHERE job_id = ?1 AND state = 'unknown'
                    AND json_extract(intent_json, '$.retry_when_absent') = 1
                    AND attempt_count < json_extract(intent_json, '$.max_attempts')",
                 params![job_id, now_unix],
-            )
+            ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn mark_host_job_process_absent(
+        &mut self,
+        owner_generation: u64,
+        job_id: &str,
+        expected_intent: &HostJobIntent,
+        expected_identity: &ProcessIdentity,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let record = tx.query_row(
+            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+             FROM host_effect_jobs WHERE job_id = ?1",
+            [job_id], row_to_host_job,
+        ).optional().map_err(|error| error.to_string())?;
+        let Some(record) = record else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        };
+        if record.intent != *expected_intent
+            || record.process_identity.as_ref() != Some(expected_identity)
+            || !matches!(record.state, HostJobState::Unknown { .. })
+        {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        let receipt = HostJobSystemReceipt::ProcessAbsentNoRetry {
+            schema_version: 1,
+            intent: record.intent,
+            process_identity: expected_identity.clone(),
+            attempt_count: record.attempt_count,
+        };
+        let receipt_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        let changed = tx.execute(
+            "UPDATE host_effect_jobs SET state='failed', receipt_json=?2, unknown_reason=NULL, updated_at_unix=?3
+             WHERE job_id=?1 AND state='unknown'",
+            params![job_id, receipt_json, now_unix],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
 
     pub fn finish_host_job(
         &mut self,
+        owner_generation: u64,
         job_id: &str,
         succeeded: bool,
         receipt_json: &str,
         now_unix: i64,
     ) -> Result<bool, String> {
         let state = if succeeded { "succeeded" } else { "failed" };
-        let changed = self.connection
-            .execute(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
                 "UPDATE host_effect_jobs SET state = ?2, receipt_json = ?3, unknown_reason = NULL, updated_at_unix = ?4
                  WHERE job_id = ?1 AND state IN ('running','starting')",
                 params![job_id, state, receipt_json, now_unix],
-            )
-            .map_err(|error| error.to_string())?;
+            ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
 }
@@ -289,6 +444,22 @@ fn validate_intent(intent: &HostJobIntent) -> Result<(), String> {
     }
     if intent.max_attempts == 0 {
         return Err("host job max_attempts must be positive".into());
+    }
+    match (intent.kind, intent.operation_method) {
+        (HostJobKind::RepositoryHook, None) => {}
+        (HostJobKind::OperationAdapter, Some(OperationMethod::Invoke)) => {
+            if intent.max_attempts != 1 {
+                return Err("operation.invoke host jobs must have exactly one host attempt".into());
+            }
+        }
+        (HostJobKind::OperationAdapter, Some(OperationMethod::Find | OperationMethod::Observe)) => {
+            if intent.max_attempts > 2 {
+                return Err(
+                    "read-only operation host jobs may have at most two host attempts".into(),
+                );
+            }
+        }
+        _ => return Err("host job kind and operation method do not match".into()),
     }
     Ok(())
 }
@@ -349,6 +520,15 @@ pub(crate) fn in_memory_test_store() -> super::ConfigStore {
     let mut connection = rusqlite::Connection::open_in_memory().unwrap();
     let tx = connection.transaction().unwrap();
     migrate_v12_host_jobs_tables(&tx).unwrap();
+    tx.execute_batch(
+        "CREATE TABLE controller_owners (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            generation INTEGER NOT NULL,
+            stopped_at_unix INTEGER
+         );
+         INSERT INTO controller_owners(singleton,generation,stopped_at_unix) VALUES (1,1,NULL);",
+    )
+    .unwrap();
     tx.commit().unwrap();
     super::ConfigStore {
         connection,
@@ -369,6 +549,7 @@ mod tests {
             subject_id: "hook-a".into(),
             lane_id: "/worktree/a".into(),
             kind: HostJobKind::RepositoryHook,
+            operation_method: None,
             request_digest: "request-digest".into(),
             configuration_digest: "config-digest".into(),
             environment_snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
@@ -396,63 +577,151 @@ mod tests {
         let mut store = in_memory_test_store();
         let job = intent();
         assert_eq!(
-            store.enqueue_host_job(&job, 10).unwrap().state,
+            store.enqueue_host_job(1, &job, 10).unwrap().state,
             HostJobState::Pending
         );
-        assert_eq!(store.enqueue_host_job(&job, 11).unwrap().attempt_count, 0);
+        assert_eq!(
+            store.enqueue_host_job(1, &job, 11).unwrap().attempt_count,
+            0
+        );
         let mut changed = job.clone();
         changed.head = "different-head".into();
-        assert!(store.enqueue_host_job(&changed, 12).is_err());
+        assert!(store.enqueue_host_job(1, &changed, 12).is_err());
 
-        assert!(store.start_host_job(&job.job_id, 13).unwrap());
+        assert!(store.start_host_job(1, &job.job_id, 13).unwrap());
         assert!(
             store
-                .mark_host_job_running(&job.job_id, &identity(), 14)
+                .mark_host_job_running(1, &job.job_id, &identity(), 14)
                 .unwrap()
         );
         assert!(
             store
-                .mark_host_job_unknown(&job.job_id, "controller stopped", 15)
+                .mark_host_job_unknown(1, &job.job_id, "controller stopped", 15)
                 .unwrap()
         );
-        assert!(store.retry_absent_host_job(&job.job_id, 16).unwrap());
+        assert!(store.retry_absent_host_job(1, &job.job_id, 16).unwrap());
         assert_eq!(
             store.host_job(&job.job_id).unwrap().unwrap().attempt_count,
             1
         );
 
-        assert!(store.start_host_job(&job.job_id, 17).unwrap());
+        assert!(store.start_host_job(1, &job.job_id, 17).unwrap());
         assert!(
             store
-                .mark_host_job_running(&job.job_id, &identity(), 18)
+                .mark_host_job_running(1, &job.job_id, &identity(), 18)
                 .unwrap()
         );
         assert!(
             store
-                .mark_host_job_unknown(&job.job_id, "controller stopped again", 19)
+                .mark_host_job_unknown(1, &job.job_id, "controller stopped again", 19)
                 .unwrap()
         );
-        assert!(!store.retry_absent_host_job(&job.job_id, 20).unwrap());
+        assert!(!store.retry_absent_host_job(1, &job.job_id, 20).unwrap());
     }
 
     #[test]
     fn refuses_weak_or_unbound_process_identity() {
         let mut store = in_memory_test_store();
         let job = intent();
-        store.enqueue_host_job(&job, 10).unwrap();
-        store.start_host_job(&job.job_id, 11).unwrap();
+        store.enqueue_host_job(1, &job, 10).unwrap();
+        store.start_host_job(1, &job.job_id, 11).unwrap();
         let mut weak = identity();
         weak.quality = ProcessIdentityQuality::SecondPrecision;
-        assert!(store.mark_host_job_running(&job.job_id, &weak, 12).is_err());
         assert!(
             store
-                .mark_host_job_running(&job.job_id, &identity(), 12)
+                .mark_host_job_running(1, &job.job_id, &weak, 12)
+                .is_err()
+        );
+        assert!(
+            store
+                .mark_host_job_running(1, &job.job_id, &identity(), 12)
                 .unwrap()
         );
         assert!(
             store
-                .mark_host_job_running(&job.job_id, &identity(), 13)
+                .mark_host_job_running(1, &job.job_id, &identity(), 13)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn invoke_cannot_retry_after_process_absence_even_when_retry_flag_is_true() {
+        let mut store = in_memory_test_store();
+        let mut job = intent();
+        job.kind = HostJobKind::OperationAdapter;
+        job.operation_method = Some(OperationMethod::Invoke);
+        job.max_attempts = 1;
+        job.retry_when_absent = true;
+        job.lane_id = "operation-1".into();
+        job.effect_operation_id = "operation-1:invoke:1".into();
+        job.job_id = "invoke-job".into();
+        store.enqueue_host_job(1, &job, 10).unwrap();
+        store.start_host_job(1, &job.job_id, 11).unwrap();
+        store
+            .mark_host_job_running(1, &job.job_id, &identity(), 12)
+            .unwrap();
+        store
+            .mark_host_job_unknown(1, &job.job_id, "lost reply", 13)
+            .unwrap();
+
+        assert!(!store.retry_absent_host_job(1, &job.job_id, 14).unwrap());
+        let record = store.host_job(&job.job_id).unwrap().unwrap();
+        assert_eq!(record.attempt_count, 1);
+        assert!(matches!(record.state, HostJobState::Unknown { .. }));
+    }
+
+    #[test]
+    fn read_only_operation_retries_only_within_its_immutable_budget() {
+        let mut store = in_memory_test_store();
+        let mut job = intent();
+        job.kind = HostJobKind::OperationAdapter;
+        job.operation_method = Some(OperationMethod::Find);
+        job.max_attempts = 2;
+        job.retry_when_absent = true;
+        job.lane_id = "operation-1".into();
+        job.effect_operation_id = "operation-1:find:1".into();
+        job.job_id = "find-job".into();
+        store.enqueue_host_job(1, &job, 10).unwrap();
+        store.start_host_job(1, &job.job_id, 11).unwrap();
+        store
+            .mark_host_job_running(1, &job.job_id, &identity(), 12)
+            .unwrap();
+        store
+            .mark_host_job_unknown(1, &job.job_id, "lost reply", 13)
+            .unwrap();
+
+        assert!(store.retry_absent_host_job(1, &job.job_id, 14).unwrap());
+        let record = store.host_job(&job.job_id).unwrap().unwrap();
+        assert_eq!(record.attempt_count, 1);
+        assert_eq!(record.state, HostJobState::Pending);
+        store.start_host_job(1, &job.job_id, 15).unwrap();
+        store
+            .mark_host_job_running(1, &job.job_id, &identity(), 16)
+            .unwrap();
+        store
+            .mark_host_job_unknown(1, &job.job_id, "second lost reply", 17)
+            .unwrap();
+
+        assert!(!store.retry_absent_host_job(1, &job.job_id, 18).unwrap());
+        assert_eq!(
+            store.host_job(&job.job_id).unwrap().unwrap().attempt_count,
+            2
+        );
+    }
+
+    #[test]
+    fn stale_owner_generation_cannot_mutate_host_jobs() {
+        let mut store = in_memory_test_store();
+        let job = intent();
+        store
+            .connection
+            .execute(
+                "UPDATE controller_owners SET generation=2 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+
+        assert!(store.enqueue_host_job(1, &job, 10).is_err());
+        assert!(store.host_job(&job.job_id).unwrap().is_none());
     }
 }

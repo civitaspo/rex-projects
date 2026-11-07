@@ -577,6 +577,7 @@ impl RepositoryDelivery {
         verified_commit: &VerifiedCommit,
         store: &mut crate::store::ConfigStore,
         pool: &mut HostJobPool,
+        owner_generation: u64,
         effect_operation_id: &str,
         now_unix: i64,
         max_attempts: u32,
@@ -598,6 +599,7 @@ impl RepositoryDelivery {
                 },
                 store,
                 pool,
+                owner_generation,
                 effect_operation_id,
                 max_attempts,
                 now_unix,
@@ -1841,7 +1843,7 @@ impl RepositoryDeliveryEffects {
             .host_jobs
             .lock()
             .map_err(|_| "host job pool lock is poisoned".to_owned())?;
-        host_jobs.poll(store, now_unix)?;
+        host_jobs.poll(store, owner_generation, now_unix)?;
         let Some(hook_gate) = self
             .delivery
             .run_required_hooks_managed(
@@ -1851,6 +1853,7 @@ impl RepositoryDeliveryEffects {
                 &commit,
                 store,
                 &mut host_jobs,
+                owner_generation,
                 &request.intent.operation_id,
                 now_unix,
                 self.max_hook_attempts,

@@ -9,7 +9,9 @@ use sha2::{Digest as _, Sha256};
 use crate::domain::ids::Digest as ContentDigest;
 use crate::process::{self, ProcessError, ProcessIdentity, ProcessRequest};
 use crate::store::ConfigStore;
-use crate::store::host_jobs::{HostJobIntent, HostJobKind, HostJobRecord, HostJobState};
+use crate::store::host_jobs::{
+    HostJobIntent, HostJobKind, HostJobRecord, HostJobState, HostJobSystemReceipt,
+};
 use crate::worktrees::WorktreeLease;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,13 +181,14 @@ impl HostJobPool {
     pub fn submit_or_poll(
         &mut self,
         store: &mut ConfigStore,
+        owner_generation: u64,
         intent: &HostJobIntent,
         process_request: ProcessRequest,
         worktree_lease: Option<WorktreeLease>,
         now_unix: i64,
     ) -> Result<HostJobProgress, String> {
-        self.drain_events(store, now_unix)?;
-        let mut record = store.enqueue_host_job(intent, now_unix)?;
+        self.drain_events(store, owner_generation, now_unix)?;
+        let mut record = store.enqueue_host_job(owner_generation, intent, now_unix)?;
         if matches!(record.state, HostJobState::Succeeded | HostJobState::Failed) {
             return terminal_progress(&record);
         }
@@ -203,19 +206,26 @@ impl HostJobPool {
             match reconcile_record(&record)? {
                 Recovery::Alive => return Ok(HostJobProgress::Unknown),
                 Recovery::Unverifiable(reason) => {
-                    store.mark_host_job_unknown(&intent.job_id, &reason, now_unix)?;
+                    store.mark_host_job_unknown(
+                        owner_generation,
+                        &intent.job_id,
+                        &reason,
+                        now_unix,
+                    )?;
                     return Ok(HostJobProgress::Unknown);
                 }
                 Recovery::Absent => {
-                    if store.retry_absent_host_job(&intent.job_id, now_unix)? {
+                    if store.retry_absent_host_job(owner_generation, &intent.job_id, now_unix)? {
                         record = store.host_job(&intent.job_id)?.expect("job just read");
                     } else {
-                        store.mark_host_job_unknown(
-                            &intent.job_id,
-                            "process absence is established but the immutable retry budget forbids another run",
+                        return self.process_absent_without_retry(
+                            store,
+                            owner_generation,
+                            intent,
+                            &record,
+                            worktree_lease,
                             now_unix,
-                        )?;
-                        return Ok(HostJobProgress::ProcessAbsentNoRetry);
+                        );
                     }
                 }
                 Recovery::NoIdentity => return Ok(HostJobProgress::Unknown),
@@ -224,6 +234,7 @@ impl HostJobPool {
         if !self.active.contains_key(&intent.job_id) {
             if matches!(record.state, HostJobState::Starting) {
                 store.mark_host_job_unknown(
+                    owner_generation,
                     &intent.job_id,
                     "controller restarted before the process identity was recorded",
                     now_unix,
@@ -246,6 +257,7 @@ impl HostJobPool {
                 match reconcile_record(&record)? {
                     Recovery::Alive => {
                         store.mark_host_job_unknown(
+                            owner_generation,
                             &intent.job_id,
                             "the exact process identity is still present after controller restart",
                             now_unix,
@@ -262,7 +274,12 @@ impl HostJobPool {
                         return Ok(HostJobProgress::Unknown);
                     }
                     Recovery::Unverifiable(reason) => {
-                        store.mark_host_job_unknown(&intent.job_id, &reason, now_unix)?;
+                        store.mark_host_job_unknown(
+                            owner_generation,
+                            &intent.job_id,
+                            &reason,
+                            now_unix,
+                        )?;
                         self.active.insert(
                             intent.job_id.clone(),
                             ActiveJob {
@@ -275,28 +292,26 @@ impl HostJobPool {
                         return Ok(HostJobProgress::Unknown);
                     }
                     Recovery::Absent => {
-                        if store.retry_absent_host_job(&intent.job_id, now_unix)? {
+                        if store.retry_absent_host_job(
+                            owner_generation,
+                            &intent.job_id,
+                            now_unix,
+                        )? {
                             record = store.host_job(&intent.job_id)?.expect("job just read");
                         } else {
-                            store.mark_host_job_unknown(
-                                &intent.job_id,
-                                "process absence is established but the immutable retry budget forbids another run",
+                            return self.process_absent_without_retry(
+                                store,
+                                owner_generation,
+                                intent,
+                                &record,
+                                worktree_lease,
                                 now_unix,
-                            )?;
-                            self.active.insert(
-                                intent.job_id.clone(),
-                                ActiveJob {
-                                    lane_id: intent.lane_id.clone(),
-                                    worker: None,
-                                    recovered: true,
-                                    _worktree_lease: worktree_lease,
-                                },
                             );
-                            return Ok(HostJobProgress::ProcessAbsentNoRetry);
                         }
                     }
                     Recovery::NoIdentity => {
                         store.mark_host_job_unknown(
+                            owner_generation,
                             &intent.job_id,
                             "no exact process identity is available for restart reconciliation",
                             now_unix,
@@ -337,16 +352,74 @@ impl HostJobPool {
         if !intent.kind.requires_worktree_lease() && lease.is_some() {
             return Err("operation adapter jobs must not acquire a Git worktree lease".into());
         }
-        if !store.start_host_job(&intent.job_id, now_unix)? {
+        if !store.start_host_job(owner_generation, &intent.job_id, now_unix)? {
             return Ok(HostJobProgress::Pending);
         }
         if let Err(error) = self.start_worker(intent, process_request, lease) {
-            if !store.revert_host_job_start(&intent.job_id, now_unix)? {
+            if !store.revert_host_job_start(owner_generation, &intent.job_id, now_unix)? {
                 return Err("failed worker creation left an unreconciled host job".into());
             }
             return Err(error);
         }
         Ok(HostJobProgress::Running)
+    }
+
+    fn process_absent_without_retry(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        intent: &HostJobIntent,
+        record: &HostJobRecord,
+        worktree_lease: Option<WorktreeLease>,
+        now_unix: i64,
+    ) -> Result<HostJobProgress, String> {
+        if intent.kind == HostJobKind::OperationAdapter {
+            let Some(identity) = record.process_identity.as_ref() else {
+                return Ok(HostJobProgress::Unknown);
+            };
+            if !matches!(record.state, HostJobState::Unknown { .. })
+                && !store.mark_host_job_unknown(
+                    owner_generation,
+                    &intent.job_id,
+                    "process identity was observed absent during recovery",
+                    now_unix,
+                )?
+            {
+                return Err("host job was not unknown after process absence observation".into());
+            }
+            if !store.mark_host_job_process_absent(
+                owner_generation,
+                &intent.job_id,
+                intent,
+                identity,
+                now_unix,
+            )? {
+                return Err("host job process absence did not match its immutable identity".into());
+            }
+            self.finish_worker(&intent.job_id);
+            let terminal = store
+                .host_job(&intent.job_id)?
+                .ok_or_else(|| "host job disappeared after process absence".to_owned())?;
+            return terminal_progress(&terminal);
+        }
+
+        if !matches!(record.state, HostJobState::Unknown { .. }) {
+            store.mark_host_job_unknown(
+                owner_generation,
+                &intent.job_id,
+                "process absence is established but the hook retry budget forbids another run",
+                now_unix,
+            )?;
+        }
+        self.active
+            .entry(intent.job_id.clone())
+            .or_insert(ActiveJob {
+                lane_id: intent.lane_id.clone(),
+                worker: None,
+                recovered: true,
+                _worktree_lease: worktree_lease,
+            });
+        Ok(HostJobProgress::Unknown)
     }
 
     pub fn holds_worktree_lease(&self, job_id: &str) -> bool {
@@ -362,8 +435,13 @@ impl HostJobPool {
     }
 
     /// Drain worker reports on the controller thread. Call once per controller tick.
-    pub fn poll(&mut self, store: &mut ConfigStore, now_unix: i64) -> Result<(), String> {
-        self.drain_events(store, now_unix)
+    pub fn poll(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<(), String> {
+        self.drain_events(store, owner_generation, now_unix)
     }
 
     fn slot_available(&self, store: &ConfigStore, intent: &HostJobIntent) -> Result<bool, String> {
@@ -457,11 +535,21 @@ impl HostJobPool {
         Ok(())
     }
 
-    fn drain_events(&mut self, store: &mut ConfigStore, now_unix: i64) -> Result<(), String> {
+    fn drain_events(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<(), String> {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 WorkerEvent::Started { job_id, identity } => {
-                    if !store.mark_host_job_running(&job_id, &identity, now_unix)? {
+                    if !store.mark_host_job_running(
+                        owner_generation,
+                        &job_id,
+                        &identity,
+                        now_unix,
+                    )? {
                         return Err(
                             "host job start report does not match its durable Starting state"
                                 .into(),
@@ -472,7 +560,9 @@ impl HostJobPool {
                     self.completed.insert(job_id, result);
                 }
                 WorkerEvent::Unknown { job_id, reason } => {
-                    if let Err(error) = store.mark_host_job_unknown(&job_id, &reason, now_unix) {
+                    if let Err(error) =
+                        store.mark_host_job_unknown(owner_generation, &job_id, &reason, now_unix)
+                    {
                         let _ = self.sender.send(WorkerEvent::Unknown { job_id, reason });
                         return Err(error);
                     }
@@ -495,12 +585,13 @@ impl HostJobPool {
     pub fn finish(
         &mut self,
         store: &mut ConfigStore,
+        owner_generation: u64,
         job_id: &str,
         succeeded: bool,
         receipt_json: &str,
         now_unix: i64,
     ) -> Result<(), String> {
-        if !store.finish_host_job(job_id, succeeded, receipt_json, now_unix)? {
+        if !store.finish_host_job(owner_generation, job_id, succeeded, receipt_json, now_unix)? {
             let record = store
                 .host_job(job_id)?
                 .ok_or_else(|| "host job disappeared".to_owned())?;
@@ -580,6 +671,28 @@ fn terminal_progress(record: &HostJobRecord) -> Result<HostJobProgress, String> 
         .receipt_json
         .clone()
         .ok_or_else(|| "terminal host job is missing its receipt".to_owned())?;
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&receipt)
+        && value.get("$host_job_state").is_some()
+    {
+        let system_receipt: HostJobSystemReceipt =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        return match system_receipt {
+            HostJobSystemReceipt::ProcessAbsentNoRetry {
+                schema_version,
+                intent,
+                process_identity,
+                attempt_count,
+            } if schema_version == 1
+                && intent == record.intent
+                && record.process_identity.as_ref() == Some(&process_identity)
+                && attempt_count == record.attempt_count
+                && matches!(record.state, HostJobState::Failed) =>
+            {
+                Ok(HostJobProgress::ProcessAbsentNoRetry)
+            }
+            _ => Err("host job process-absence receipt does not match its immutable record".into()),
+        };
+    }
     Ok(match record.state {
         HostJobState::Succeeded => HostJobProgress::Succeeded(receipt),
         HostJobState::Failed => HostJobProgress::Failed(receipt),
@@ -721,6 +834,7 @@ mod tests {
             subject_id: "operation-1".into(),
             lane_id: "operation-1".into(),
             kind: HostJobKind::OperationAdapter,
+            operation_method: Some(crate::store::host_jobs::OperationMethod::Observe),
             request_digest: digest,
             configuration_digest: "configuration-digest".into(),
             environment_snapshot_id: binding.snapshot_id,
@@ -743,6 +857,7 @@ mod tests {
             subject_id: "operation-1".into(),
             lane_id: "operation-1".into(),
             kind: HostJobKind::OperationAdapter,
+            operation_method: Some(crate::store::host_jobs::OperationMethod::Invoke),
             request_digest: "request-digest".into(),
             configuration_digest: "configuration-digest".into(),
             environment_snapshot_id: ContentDigest::parse("e".repeat(64)).unwrap(),
@@ -750,13 +865,14 @@ mod tests {
             head: "source-sha".into(),
             source_digest: "subject-digest".into(),
             max_attempts: 1,
-            retry_when_absent: false,
+            retry_when_absent: true,
         };
-        store.enqueue_host_job(&job, 1).unwrap();
-        assert!(store.start_host_job(&job.job_id, 2).unwrap());
+        store.enqueue_host_job(1, &job, 1).unwrap();
+        assert!(store.start_host_job(1, &job.job_id, 2).unwrap());
         assert!(
             store
                 .mark_host_job_running(
+                    1,
                     &job.job_id,
                     &ProcessIdentity {
                         pid: u32::MAX,
@@ -774,6 +890,7 @@ mod tests {
         assert_eq!(
             pool.submit_or_poll(
                 &mut store,
+                1,
                 &job,
                 request(std::env::current_exe().unwrap(), &["--version"]),
                 None,
@@ -784,8 +901,34 @@ mod tests {
         );
         assert!(matches!(
             store.host_job(&job.job_id).unwrap().unwrap().state,
-            HostJobState::Unknown { .. }
+            HostJobState::Failed
         ));
+        assert_eq!(
+            store.host_job(&job.job_id).unwrap().unwrap().attempt_count,
+            1
+        );
+
+        let mut find = job.clone();
+        find.job_id = "operation-find-job".into();
+        find.effect_operation_id = "operation-1:operation.find:1".into();
+        find.operation_method = Some(crate::store::host_jobs::OperationMethod::Find);
+        find.max_attempts = 2;
+        assert_eq!(
+            pool.submit_or_poll(
+                &mut store,
+                1,
+                &find,
+                request(std::env::current_exe().unwrap(), &["--version"]),
+                None,
+                5,
+            )
+            .unwrap(),
+            HostJobProgress::Running
+        );
+        assert_eq!(
+            store.host_job(&find.job_id).unwrap().unwrap().attempt_count,
+            1
+        );
     }
 }
 
@@ -834,6 +977,7 @@ mod pool_tests {
             subject_id: "hook".into(),
             lane_id: worktree.into(),
             kind: HostJobKind::RepositoryHook,
+            operation_method: None,
             request_digest: format!("request:{job_id}"),
             configuration_digest: "config".into(),
             environment_snapshot_id: ContentDigest::parse("e".repeat(64)).unwrap(),
@@ -899,6 +1043,7 @@ mod pool_tests {
         assert_eq!(
             pool.submit_or_poll(
                 &mut store,
+                1,
                 &first,
                 request(),
                 Some(lease_for(&manager, &state_root, &repository_id, 1)),
@@ -910,6 +1055,7 @@ mod pool_tests {
         assert_eq!(
             pool.submit_or_poll(
                 &mut store,
+                1,
                 &second,
                 request(),
                 Some(lease_for(&manager, &state_root, &repository_id, 2)),
@@ -919,7 +1065,7 @@ mod pool_tests {
             HostJobProgress::Running
         );
         assert_eq!(
-            pool.submit_or_poll(&mut store, &same_worktree_waiter, request(), None, 1)
+            pool.submit_or_poll(&mut store, 1, &same_worktree_waiter, request(), None, 1)
                 .unwrap(),
             HostJobProgress::Pending
         );
@@ -934,19 +1080,19 @@ mod pool_tests {
 
         let mut completed = HashMap::new();
         while completed.len() < 2 {
-            pool.poll(&mut store, 2).unwrap();
+            pool.poll(&mut store, 1, 2).unwrap();
             for job in [&first, &second] {
                 if completed.contains_key(&job.job_id) {
                     continue;
                 }
                 match pool
-                    .submit_or_poll(&mut store, job, request(), None, 2)
+                    .submit_or_poll(&mut store, 1, job, request(), None, 2)
                     .unwrap()
                 {
                     HostJobProgress::ProcessCompleted(receipt) => {
                         assert_eq!(receipt.status_code, Some(0));
                         let receipt_json = serde_json::to_string(&receipt).unwrap();
-                        pool.finish(&mut store, &job.job_id, true, &receipt_json, 2)
+                        pool.finish(&mut store, 1, &job.job_id, true, &receipt_json, 2)
                             .unwrap();
                         completed.insert(job.job_id.clone(), receipt);
                     }
@@ -993,9 +1139,11 @@ mod pool_tests {
 
         let mut operation = intent("operation-job", "project-1", "operation-1");
         operation.kind = HostJobKind::OperationAdapter;
+        operation.operation_method = Some(crate::store::host_jobs::OperationMethod::Invoke);
+        operation.max_attempts = 1;
         operation.retry_when_absent = false;
         assert_eq!(
-            pool.submit_or_poll(&mut store, &operation, request(), None, 1)
+            pool.submit_or_poll(&mut store, 1, &operation, request(), None, 1)
                 .unwrap(),
             HostJobProgress::Running
         );
@@ -1008,6 +1156,7 @@ mod pool_tests {
         assert_eq!(
             pool.submit_or_poll(
                 &mut store,
+                1,
                 &first_hook,
                 request(),
                 Some(lease_for(&manager, &state_root, &repository_id, 1)),
@@ -1023,7 +1172,7 @@ mod pool_tests {
             .into_owned();
         let second_hook = intent("hook-2", "project-3", &second_hook_worktree);
         assert_eq!(
-            pool.submit_or_poll(&mut store, &second_hook, request(), None, 1)
+            pool.submit_or_poll(&mut store, 1, &second_hook, request(), None, 1)
                 .unwrap(),
             HostJobProgress::Pending
         );
@@ -1031,9 +1180,11 @@ mod pool_tests {
         let second_operation = intent("operation-job-2", "project-4", "operation-2");
         let mut second_operation = second_operation;
         second_operation.kind = HostJobKind::OperationAdapter;
+        second_operation.operation_method = Some(crate::store::host_jobs::OperationMethod::Invoke);
+        second_operation.max_attempts = 1;
         second_operation.retry_when_absent = false;
         assert_eq!(
-            pool.submit_or_poll(&mut store, &second_operation, request(), None, 1)
+            pool.submit_or_poll(&mut store, 1, &second_operation, request(), None, 1)
                 .unwrap(),
             HostJobProgress::Pending
         );

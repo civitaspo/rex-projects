@@ -125,6 +125,7 @@ impl HookRunner {
         context: HookRunContext<'_>,
         store: &mut ConfigStore,
         pool: &mut HostJobPool,
+        owner_generation: u64,
         effect_operation_id: &str,
         max_attempts: u32,
         now_unix: i64,
@@ -247,6 +248,7 @@ impl HookRunner {
                 subject_id: hook.id.clone(),
                 lane_id: repo.to_string_lossy().into_owned(),
                 kind: HostJobKind::RepositoryHook,
+                operation_method: None,
                 request_digest: command_digest,
                 configuration_digest: configuration_digest.to_string(),
                 environment_snapshot_id: self.environment_binding.snapshot_id.clone(),
@@ -262,7 +264,7 @@ impl HookRunner {
                 Some(acquire_worktree_lease().map_err(HookError::Process)?)
             };
             match pool
-                .submit_or_poll(store, &intent, request, lease, now_unix)
+                .submit_or_poll(store, owner_generation, &intent, request, lease, now_unix)
                 .map_err(HookError::Process)?
             {
                 HostJobProgress::Pending
@@ -332,8 +334,15 @@ impl HookRunner {
                         ),
                         &receipt,
                     )?;
-                    pool.finish(store, &job_id, succeeded, &receipt_json, now_unix)
-                        .map_err(HookError::Process)?;
+                    pool.finish(
+                        store,
+                        owner_generation,
+                        &job_id,
+                        succeeded,
+                        &receipt_json,
+                        now_unix,
+                    )
+                    .map_err(HookError::Process)?;
                     if after_head.trim() != expected_head || source_changed {
                         return Err(HookError::SourceChanged {
                             hook_id: hook.id.clone(),
@@ -379,8 +388,15 @@ impl HookRunner {
                         ),
                         &receipt,
                     )?;
-                    pool.finish(store, &job_id, false, &receipt_json, now_unix)
-                        .map_err(HookError::Process)?;
+                    pool.finish(
+                        store,
+                        owner_generation,
+                        &job_id,
+                        false,
+                        &receipt_json,
+                        now_unix,
+                    )
+                    .map_err(HookError::Process)?;
                     let _ = error;
                     return Err(HookError::Failed(Box::new(receipt)));
                 }
@@ -1199,6 +1215,7 @@ mod tests {
                     },
                     &mut store,
                     &mut pool,
+                    1,
                     "effect-blocked",
                     1,
                     10,
@@ -1234,6 +1251,7 @@ mod tests {
                     },
                     &mut store,
                     &mut pool,
+                    1,
                     "effect-same-worktree",
                     1,
                     11,
@@ -1286,6 +1304,7 @@ mod tests {
                     },
                     &mut store,
                     &mut pool,
+                    1,
                     "effect-quick",
                     1,
                     12,
@@ -1326,6 +1345,7 @@ mod tests {
                     },
                     &mut store,
                     &mut pool,
+                    1,
                     "effect-blocked",
                     1,
                     13,
