@@ -1989,6 +1989,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ack_count, 1);
+
+        // Worker replay uses the exact durable payload builder from the production producer.
+        let worker_evidence_id = "worker-evidence-1";
+        let worker_digest =
+            Digest::parse("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .unwrap();
+        let worker_payload = crate::engine::factory_runtime::worker_result_transition_payload(
+            worker_evidence_id,
+            &worker_digest,
+            11,
+            "publication-operation-1",
+            12,
+        );
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES ('worker-run','project-a','worker','ticket_run:ticket-run:worker','ticket-run',11,1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,1,7,'worker-operation','worker-view','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','/tmp/package','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','worker','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','fixture','session','window','block','/tmp/workspace','/tmp/control','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','{}','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',1)",
+            [],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_result_evidence(evidence_id,agent_run_id,project_id,role,ticket_run_id,attempt,run_epoch,message_id,content_digest,outcome,result_digest,result_json,artifact_refs_json,received_at_unix) VALUES (?1,'worker-run','project-a','worker','ticket-run',1,1,'worker-message','dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','completed',?2,'{}','[]',1)",
+            rusqlite::params![worker_evidence_id, worker_digest.as_str()],
+        ).unwrap();
+        let worker_message_id = format!("implementation-ready:{worker_evidence_id}");
+        store.connection.execute(
+            "INSERT INTO inbox(producer_id,message_id,content_digest,recipient,payload_json,receipt_json,received_at_unix,processed_at_unix) VALUES ('rex-projects-agent-result',?1,?2,'ticket_run',?3,?4,1,1)",
+            rusqlite::params![worker_message_id, crate::store::durable_input_digest("ticket_run", &worker_payload), worker_payload, serde_json::json!({"project_id":"project-a","ticket_run_id":"ticket-run","revision":12,"effects":["publication-operation-1"]}).to_string()],
+        ).unwrap();
+        assert!(
+            store
+                .acknowledge_committed_role_result(
+                    7,
+                    "worker_implementation_ready",
+                    worker_evidence_id,
+                    &worker_digest,
+                    &project,
+                    &ticket_run,
+                )
+                .unwrap()
+        );
+        assert_eq!(store.connection.query_row(
+            "SELECT reducer_revision || ':' || disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+            [worker_evidence_id], |row| row.get::<_, String>(0),
+        ).unwrap(), "12:applied");
     }
 }
 

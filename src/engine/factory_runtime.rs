@@ -1584,16 +1584,13 @@ fn apply_worker_result(
         // result durable and unacknowledged so a later foreground tick retries.
         return Ok(false);
     };
-    let input_payload = serde_json::json!({
-        "schema_version": 1,
-        "kind": "worker_implementation_ready",
-        "evidence_id": result.receipt.evidence_id(),
-        "result_digest": result.validated.result_digest,
-        "source_revision": run.revision,
-        "publication_operation_id": effect.operation_id,
-        "transition": "worker_implementation_ready",
-    })
-    .to_string();
+    let input_payload = worker_result_transition_payload(
+        result.receipt.evidence_id(),
+        &result.validated.result_digest,
+        run.revision,
+        &effect.operation_id,
+        effect_revision,
+    );
     let durable = DurableInput {
         producer_id: "rex-projects-agent-result".into(),
         message_id: format!("implementation-ready:{}", result.receipt.evidence_id()),
@@ -1618,6 +1615,26 @@ fn apply_worker_result(
         crate::store::agent_results::ResultDisposition::Applied,
     )?;
     Ok(true)
+}
+
+pub(crate) fn worker_result_transition_payload(
+    evidence_id: &str,
+    result_digest: &Digest,
+    source_revision: u64,
+    publication_operation_id: &str,
+    accepted_revision: u64,
+) -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "worker_implementation_ready",
+        "evidence_id": evidence_id,
+        "result_digest": result_digest,
+        "source_revision": source_revision,
+        "accepted_revision": accepted_revision,
+        "publication_operation_id": publication_operation_id,
+        "transition": "worker_implementation_ready",
+    })
+    .to_string()
 }
 
 fn build_scan_keys(
