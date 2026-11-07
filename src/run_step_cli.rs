@@ -4,13 +4,14 @@ use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::adapters::rex::RexContextBlock;
+use crate::adapters::rex::{CreateDisposition, RexCliTransport, RexContextBlock, TicketWindow};
 use crate::domain::ids::Digest;
 use crate::domain::types::Role;
 use crate::launch::{
     AgentLaunchAuthority, AgentLaunchReservation, LaunchDecision, ObservedWrapperIdentity,
     RexBlockLifecycle, RexBlockOwnership, RexViewBlock,
 };
+use crate::process::{ProcessIdentityQuality, inspect_process_table};
 use crate::run_step_package::RunStepPackage;
 use crate::run_step_spool::RunStepSpool;
 use crate::store::ConfigStore;
@@ -23,6 +24,7 @@ pub fn finalize_and_ack_start(
     reservation: &AgentLaunchReservation,
     package: &RunStepPackage,
     observed_block: &RexContextBlock,
+    rex: &RexCliTransport,
 ) -> Result<AgentLaunchAuthority, String> {
     reservation.validate()?;
     package.validate()?;
@@ -130,17 +132,58 @@ pub fn finalize_and_ack_start(
     {
         return Err("wrapper start request does not match the finalized host launch".into());
     }
-    let receipt = store.authorize_agent_start(
-        owner_generation,
-        request,
-        &ObservedWrapperIdentity {
-            pid: request.wrapper_pid,
-            start_identity: request.wrapper_start_identity.clone(),
-            rex_session_id: request.rex_session_id.clone(),
-            rex_block_id: request.rex_block_id.clone(),
-            runtime_binary_digest: request.runtime_binary_digest.clone(),
-        },
+    if let Some(receipt) = store.persisted_start_receipt(request)? {
+        spool.publish_start_receipt(&start, receipt)?;
+        return Ok(authority);
+    }
+    let fresh_block = rex
+        .validate_context_block(&observed_block.block_id)
+        .map_err(|error| format!("revalidate Rex block before start ACK: {error}"))?;
+    if fresh_block != *observed_block
+        || fresh_block.session_id != authority.rex_session_id
+        || fresh_block.window_id != authority.rex_window_id
+        || fresh_block.server_instance_id != authority.rex_server_identity
+    {
+        return Err("Rex block identity changed before host start acknowledgement".into());
+    }
+    let rex_window = TicketWindow {
+        server_instance_id: authority.rex_server_identity.clone(),
+        session_id: authority.rex_session_id.clone(),
+        window_id: authority.rex_window_id.clone(),
+        label: String::new(),
+        initial_block_id: None,
+        disposition: CreateDisposition::Existing,
+    };
+    let rex_process = rex
+        .observe_process(
+            &rex_window,
+            authority.agent_run_id.as_str(),
+            &authority.rex_block_id,
+        )
+        .map_err(|error| format!("observe Rex wrapper process before ACK: {error}"))?;
+    let expected_executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let rex_reports_wrapper = rex_process
+        .child
+        .iter()
+        .chain(rex_process.foreground.iter())
+        .chain(rex_process.ancestors.iter().flatten())
+        .any(|process| {
+            process.pid == request.wrapper_pid
+                && process.path.as_deref().is_some_and(|path| {
+                    std::fs::canonicalize(path).ok() == Some(expected_executable.clone())
+                })
+        });
+    if !rex_reports_wrapper {
+        return Err("Rex process observation does not identify the requested wrapper".into());
+    }
+    let observed = observe_wrapper_process(
+        request.wrapper_pid,
+        &request.wrapper_start_identity,
+        &request.runtime_binary_digest,
+        &authority.rex_session_id,
+        &authority.rex_block_id,
     )?;
+    let receipt = store.authorize_agent_start(owner_generation, request, &observed)?;
     if receipt.decision != LaunchDecision::Accepted {
         return Err("host did not accept the exact wrapper start request".into());
     }
@@ -393,26 +436,59 @@ fn observed_process_start_identity(pid: u32) -> Option<String> {
         }
         let info = unsafe { info.assume_init() };
         Some(format!(
-            "{}:{}",
+            "macos-start:{}:{}",
             info.pbi_start_tvsec, info.pbi_start_tvusec
         ))
     }
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        Some(
-            stat.rsplit_once(')')?
-                .1
-                .split_whitespace()
-                .nth(19)?
-                .to_owned(),
-        )
+        Some(format!(
+            "linux-start-ticks:{}",
+            stat.rsplit_once(')')?.1.split_whitespace().nth(19)?
+        ))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
     }
+}
+
+fn observe_wrapper_process(
+    pid: u32,
+    claimed_start_identity: &str,
+    expected_executable_digest: &Digest,
+    rex_session_id: &str,
+    rex_block_id: &str,
+) -> Result<ObservedWrapperIdentity, String> {
+    let current = inspect_process_table().map_err(|error| error.to_string())?;
+    let identity = current
+        .iter()
+        .find(|process| process.pid == pid)
+        .ok_or_else(|| "wrapper PID is not present in the host process table".to_owned())?;
+    if identity.quality != ProcessIdentityQuality::KernelBirthToken
+        || identity.start_identity != claimed_start_identity
+    {
+        return Err("wrapper PID birth identity does not match the host observation".into());
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    if digest_file(&executable)? != *expected_executable_digest
+        || identity.command
+            != executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+    {
+        return Err("wrapper process does not match the pinned rex-projects executable".into());
+    }
+    Ok(ObservedWrapperIdentity {
+        pid,
+        start_identity: identity.start_identity.clone(),
+        rex_session_id: rex_session_id.to_owned(),
+        rex_block_id: rex_block_id.to_owned(),
+        runtime_binary_digest: expected_executable_digest.clone(),
+    })
 }
 
 fn role_name(role: Role) -> &'static str {
@@ -430,13 +506,33 @@ fn role_name(role: Role) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::observed_process_start_identity;
+    use super::{observe_wrapper_process, observed_process_start_identity};
+    use crate::domain::ids::Digest;
 
     #[test]
     fn current_wrapper_start_identity_is_observable() {
+        let pid = std::process::id();
+        let identity = observed_process_start_identity(pid).unwrap();
+        let process = crate::process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .unwrap();
+        assert_eq!(identity, process.start_identity);
+    }
+
+    #[test]
+    fn host_process_observation_rejects_a_stale_pid_birth_token() {
+        let stale = Digest::parse("a".repeat(64)).unwrap();
         assert!(
-            observed_process_start_identity(std::process::id())
-                .is_some_and(|identity| !identity.is_empty())
+            observe_wrapper_process(
+                std::process::id(),
+                "stale-birth-token",
+                &stale,
+                "session",
+                "block",
+            )
+            .is_err()
         );
     }
 }

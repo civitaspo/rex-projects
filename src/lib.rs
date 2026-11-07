@@ -31,5 +31,6 @@ pub mod run_step_cli;
 pub mod run_step_package;
 pub mod run_step_spool;
 pub mod runtime_services;
+pub mod start_agent;
 pub mod store;
 pub mod worktrees;

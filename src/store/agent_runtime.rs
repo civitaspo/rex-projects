@@ -128,6 +128,39 @@ impl ConfigStore {
         Ok(qualifications)
     }
 
+    /// Return a previously committed exact start ACK for an identical request. This is the
+    /// crash-recovery path after the wrapper consumed its one-use environment and the provider
+    /// has already exited; it never authorizes a new request.
+    pub fn persisted_start_receipt(
+        &self,
+        request: &crate::launch::AgentStartRequest,
+    ) -> Result<Option<crate::launch::AgentLaunchReceipt>, String> {
+        request.validate()?;
+        let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
+        let request_digest =
+            Digest::parse(format!("{:x}", Sha256::digest(request_json.as_bytes())))?;
+        let stored: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((stored_digest, receipt_json)) = stored else {
+            return Ok(None);
+        };
+        if stored_digest != request_digest.as_str() {
+            return Err("AgentRun already has a different committed start request".into());
+        }
+        let receipt: crate::launch::AgentLaunchReceipt =
+            crate::protocol::parse_unique(receipt_json.as_bytes())
+                .map_err(|error| format!("stored Agent launch receipt is invalid: {error}"))?;
+        receipt.validate_for(request)?;
+        Ok(Some(receipt))
+    }
+
     /// Load the exact host-owned phase-one reservation for a claimed StartAgent effect.
     /// The digest is checked again so a caller cannot substitute a serialized reservation.
     pub fn agent_launch_reservation(

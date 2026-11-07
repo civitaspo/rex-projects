@@ -148,6 +148,75 @@ impl EnvironmentSnapshot {
             operation_id: operation_id.to_owned(),
             nonce,
             consumed: false,
+            retained: false,
+        })
+    }
+
+    /// Create or reopen the same operation-scoped handoff across an uncertain launch retry.
+    /// The durable `.claim` marker prevents re-creating the environment after consumption.
+    pub fn create_handoff_for_operation(
+        &self,
+        state_root: &Path,
+        operation_id: &str,
+    ) -> Result<EnvironmentHandoff, EnvironmentError> {
+        if operation_id.is_empty() || operation_id.len() > 128 || operation_id.contains('\0') {
+            return Err(EnvironmentError::Invalid(
+                "invalid launch operation identity",
+            ));
+        }
+        let directory = state_root.join("environment-handoffs");
+        create_private_directory(&directory)?;
+        let identity = [
+            self.metadata.id.as_str().as_bytes(),
+            b"\0",
+            operation_id.as_bytes(),
+        ]
+        .concat();
+        let path = directory.join(format!("{:x}.env", Sha256::digest(identity)));
+        let claim_path = path.with_extension("env.claim");
+        if claim_path.exists() {
+            return Err(EnvironmentError::Handoff);
+        }
+        if path.exists() {
+            let bytes = read_handoff_bytes(&path)?;
+            let nonce = handoff_nonce(&bytes, &self.metadata.id, operation_id)?;
+            let existing = read_handoff(&path, &self.metadata.id, operation_id, &nonce)?;
+            if existing != *self.variables {
+                return Err(EnvironmentError::Handoff);
+            }
+            return Ok(EnvironmentHandoff {
+                path,
+                snapshot_id: self.metadata.id.clone(),
+                operation_id: operation_id.to_owned(),
+                nonce,
+                consumed: false,
+                retained: true,
+            });
+        }
+        let nonce = fresh_nonce();
+        let mut file = private_create_new(&path)?;
+        use std::io::Write;
+        let result = file
+            .write_all(HANDOFF_MAGIC)
+            .and_then(|()| file.write_all(self.metadata.id.as_str().as_bytes()))
+            .and_then(|()| file.write_all(&[0]))
+            .and_then(|()| file.write_all(operation_id.as_bytes()))
+            .and_then(|()| file.write_all(&[0]))
+            .and_then(|()| file.write_all(nonce.as_str().as_bytes()))
+            .and_then(|()| file.write_all(&[0]))
+            .and_then(|()| write_variables(&mut file, &self.variables))
+            .and_then(|()| file.sync_all());
+        if result.is_err() {
+            let _ = std::fs::remove_file(&path);
+            return Err(EnvironmentError::Handoff);
+        }
+        Ok(EnvironmentHandoff {
+            path,
+            snapshot_id: self.metadata.id.clone(),
+            operation_id: operation_id.to_owned(),
+            nonce,
+            consumed: false,
+            retained: true,
         })
     }
 }
@@ -159,6 +228,7 @@ pub struct EnvironmentHandoff {
     operation_id: String,
     nonce: Digest,
     consumed: bool,
+    retained: bool,
 }
 
 impl EnvironmentHandoff {
@@ -181,6 +251,8 @@ impl EnvironmentHandoff {
     /// Read and remove the handoff before provider launch. The file is tied to the exact launch
     /// operation and snapshot; it cannot silently supply an empty or different environment.
     pub fn consume(mut self) -> Result<BTreeMap<OsString, OsString>, EnvironmentError> {
+        let claim_path = self.path.with_extension("env.claim");
+        let _claim = private_create_new(&claim_path)?;
         let result = read_handoff(
             &self.path,
             &self.snapshot_id,
@@ -230,7 +302,6 @@ impl EnvironmentHandoff {
             read_handoff(path, expected_snapshot, expected_operation, &nonce)
         })();
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(claim_path);
         result
     }
 }
@@ -246,7 +317,7 @@ impl std::fmt::Debug for EnvironmentHandoff {
 
 impl Drop for EnvironmentHandoff {
     fn drop(&mut self) {
-        if !self.consumed {
+        if !self.consumed && !self.retained {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -832,6 +903,26 @@ fn read_handoff_bytes(path: &Path) -> Result<Vec<u8>, EnvironmentError> {
     Ok(bytes)
 }
 
+fn handoff_nonce(
+    bytes: &[u8],
+    expected_snapshot: &Digest,
+    expected_operation: &str,
+) -> Result<Digest, EnvironmentError> {
+    let frame = bytes
+        .strip_prefix(HANDOFF_MAGIC)
+        .ok_or(EnvironmentError::Handoff)?;
+    let (snapshot, rest) = take_nul_terminated(frame).map_err(|_| EnvironmentError::Handoff)?;
+    let (operation, rest) = take_nul_terminated(rest).map_err(|_| EnvironmentError::Handoff)?;
+    let (nonce, _) = take_nul_terminated(rest).map_err(|_| EnvironmentError::Handoff)?;
+    if snapshot != expected_snapshot.as_str().as_bytes()
+        || operation != expected_operation.as_bytes()
+    {
+        return Err(EnvironmentError::Handoff);
+    }
+    let nonce = std::str::from_utf8(nonce).map_err(|_| EnvironmentError::Handoff)?;
+    Digest::parse(nonce.to_owned()).map_err(|_| EnvironmentError::Handoff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -952,6 +1043,54 @@ mod tests {
             assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
         }
         assert!(!original.exists());
+    }
+
+    #[test]
+    fn cli_consumes_handoff_once_and_binds_snapshot_and_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut values = BTreeMap::new();
+        values.insert("PATH".into(), "/usr/bin".into());
+        values.insert("TOKEN".into(), "ephemeral".into());
+        let snapshot = snapshot_from_variables(EnvironmentSource::Inherit, None, values).unwrap();
+        let id = snapshot.metadata().id.clone();
+        let handoff = snapshot.create_handoff(root.path(), "run-3").unwrap();
+        let path = handoff.path().to_path_buf();
+
+        let consumed = EnvironmentHandoff::consume_file(&path, &id, "run-3").unwrap();
+        assert_eq!(get(&consumed, "TOKEN").unwrap(), "ephemeral");
+        assert!(!path.exists());
+        assert!(EnvironmentHandoff::consume_file(&path, &id, "run-3").is_err());
+    }
+
+    #[test]
+    fn operation_handoff_is_stable_until_consumed_and_never_recreated() {
+        let root = tempfile::tempdir().unwrap();
+        let mut values = BTreeMap::new();
+        values.insert("PATH".into(), "/usr/bin".into());
+        values.insert("TOKEN".into(), "operation-bound".into());
+        let snapshot = snapshot_from_variables(EnvironmentSource::Inherit, None, values).unwrap();
+        let id = snapshot.metadata().id.clone();
+
+        let first = snapshot
+            .create_handoff_for_operation(root.path(), "operation-9")
+            .unwrap();
+        let path = first.path().to_path_buf();
+        let second = snapshot
+            .create_handoff_for_operation(root.path(), "operation-9")
+            .unwrap();
+        assert_eq!(second.path(), path);
+        drop(first);
+        drop(second);
+        assert!(path.exists());
+
+        let consumed = EnvironmentHandoff::consume_file(&path, &id, "operation-9").unwrap();
+        assert_eq!(get(&consumed, "TOKEN").unwrap(), "operation-bound");
+        assert!(!path.exists());
+        assert!(path.with_extension("env.claim").exists());
+        assert!(matches!(
+            snapshot.create_handoff_for_operation(root.path(), "operation-9"),
+            Err(EnvironmentError::Handoff)
+        ));
     }
 
     #[test]
