@@ -14,7 +14,7 @@ use super::{
 use crate::domain::ids::{
     AdapterId, Digest, OperationId, ProjectId, TicketId, TicketNamespace, TicketRunId,
 };
-use crate::domain::types::TicketStatus;
+use crate::domain::types::{Role, TicketStatus};
 use crate::engine::reducer::{Activity, Input, Phase, TicketRun, bind_effects, reduce};
 
 /// Cursor and timing information for one Project/status scan.
@@ -115,6 +115,8 @@ pub struct AgentWakeSnapshot {
 pub struct PendingRoleWakeSession {
     pub project_id: ProjectId,
     pub role_session_id: String,
+    pub role: Role,
+    pub ticket_run_id: Option<TicketRunId>,
     pub highest_priority: i64,
     pub oldest_created_at_unix: i64,
     pub pending_count: u64,
@@ -349,9 +351,12 @@ impl ConfigStore {
         rows.map(|row| {
             let (project, role_session_id, highest_priority, oldest_created_at_unix, pending_count) =
                 row.map_err(|error| error.to_string())?;
+            let (role, ticket_run_id) = parse_role_session_id(&role_session_id)?;
             Ok(PendingRoleWakeSession {
                 project_id: ProjectId::parse(project)?,
                 role_session_id,
+                role,
+                ticket_run_id,
                 highest_priority,
                 oldest_created_at_unix,
                 pending_count,
@@ -1709,6 +1714,32 @@ impl ConfigStore {
     }
 }
 
+fn parse_role_session_id(value: &str) -> Result<(Role, Option<TicketRunId>), String> {
+    if let Some(project) = value.strip_prefix("project:")
+        && project.ends_with(":supervisor")
+    {
+        return Ok((Role::Supervisor, None));
+    }
+    let ticket = value
+        .strip_prefix("ticket_run:")
+        .ok_or_else(|| "pending wake session has an unknown scope".to_owned())?;
+    const ROLES: [(Role, &str); 7] = [
+        (Role::Coordinator, "coordinator"),
+        (Role::Planner, "planner"),
+        (Role::Worker, "worker"),
+        (Role::Reviewer, "reviewer"),
+        (Role::MergeDecision, "merge_decision"),
+        (Role::Operator, "operator"),
+        (Role::Postmortem, "postmortem"),
+    ];
+    for (role, name) in ROLES {
+        if let Some(ticket_run_id) = ticket.strip_suffix(&format!(":{name}")) {
+            return Ok((role, Some(TicketRunId::parse(ticket_run_id.to_owned())?)));
+        }
+    }
+    Err("pending wake session has an unknown ticket role".into())
+}
+
 fn stable_ticket_run_id(
     project: &ProjectId,
     namespace: &TicketNamespace,
@@ -1815,7 +1846,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{PendingRoleWakeSession, TicketScanCursor, TicketScanKey, migrate_v9, status_key};
-    use crate::domain::types::TicketStatus;
+    use crate::domain::types::{Role, TicketStatus};
 
     #[test]
     fn scan_keys_are_namespaced_by_status_and_digests_are_validated() {
@@ -1902,11 +1933,33 @@ mod tests {
             PendingRoleWakeSession {
                 project_id: crate::domain::ids::ProjectId::parse("p-a").unwrap(),
                 role_session_id: "ticket_run:r-a:coordinator".into(),
+                role: Role::Coordinator,
+                ticket_run_id: Some(crate::domain::ids::TicketRunId::parse("r-a").unwrap()),
                 highest_priority: 8,
                 oldest_created_at_unix: 10,
                 pending_count: 2,
             }
         );
         assert!(store.pending_role_wake_sessions(8, 10).is_err());
+    }
+
+    #[test]
+    fn role_session_ids_bind_their_project_or_ticket_scope() {
+        use super::parse_role_session_id;
+        use crate::domain::types::Role;
+
+        assert_eq!(
+            parse_role_session_id("project:p-a:supervisor").unwrap(),
+            (Role::Supervisor, None)
+        );
+        assert_eq!(
+            parse_role_session_id("ticket_run:run:with:colon:merge_decision").unwrap(),
+            (
+                Role::MergeDecision,
+                Some(crate::domain::ids::TicketRunId::parse("run:with:colon").unwrap())
+            )
+        );
+        assert!(parse_role_session_id("project:p-a:worker").is_err());
+        assert!(parse_role_session_id("ticket_run:run:unknown").is_err());
     }
 }
