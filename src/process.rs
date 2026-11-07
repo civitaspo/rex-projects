@@ -25,6 +25,23 @@ pub struct ProcessRequest {
     pub stderr_tail_limit: usize,
 }
 
+pub(crate) fn clear_git_repository_environment(environment: &mut BTreeMap<OsString, OsString>) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_PREFIX",
+        "GIT_IMPLICIT_WORK_TREE",
+    ] {
+        environment.remove(std::ffi::OsStr::new(key));
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessOutput {
     pub status: Option<ExitStatus>,

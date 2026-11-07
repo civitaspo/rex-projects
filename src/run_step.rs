@@ -1769,25 +1769,10 @@ fn factory_environment(
 ) -> Result<BTreeMap<OsString, OsString>, RunError> {
     let mut environment = snapshot
         .iter()
-        .filter(|(key, _)| {
-            let key = key.to_string_lossy();
-            !key.starts_with("REX_PROJECTS_")
-                && !matches!(
-                    key.as_ref(),
-                    "GIT_DIR"
-                        | "GIT_WORK_TREE"
-                        | "GIT_INDEX_FILE"
-                        | "GIT_COMMON_DIR"
-                        | "GIT_OBJECT_DIRECTORY"
-                        | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
-                        | "GIT_CEILING_DIRECTORIES"
-                        | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
-                        | "GIT_PREFIX"
-                        | "GIT_IMPLICIT_WORK_TREE"
-                )
-        })
+        .filter(|(key, _)| !key.to_string_lossy().starts_with("REX_PROJECTS_"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
+    process::clear_git_repository_environment(&mut environment);
     environment.insert(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"));
     for (key, value) in [
         ("REX_PROJECTS_CONTEXT", "agent"),

@@ -575,12 +575,7 @@ impl RepositoryDelivery {
         repository_config: &RepositoryConfig,
         configuration_digest: &Digest,
         verified_commit: &VerifiedCommit,
-        store: &mut crate::store::ConfigStore,
-        pool: &mut HostJobPool,
-        owner_generation: u64,
-        effect_operation_id: &str,
-        now_unix: i64,
-        max_attempts: u32,
+        execution: crate::hooks::ManagedHookExecution<'_>,
     ) -> Result<Option<HookGateReceipt>, DeliveryError> {
         let accepted_head = verified_commit.head();
         validate_git_sha(accepted_head)?;
@@ -597,12 +592,7 @@ impl RepositoryDelivery {
                     configuration_digest,
                     state_root: &self.state_root,
                 },
-                store,
-                pool,
-                owner_generation,
-                effect_operation_id,
-                max_attempts,
-                now_unix,
+                execution,
                 || {
                     self.worktrees
                         .acquire_writer_lease(work.worktree.clone())
@@ -1184,9 +1174,7 @@ impl RepositoryDelivery {
         args: [&str; N],
     ) -> Result<ProcessOutput, DeliveryError> {
         let mut environment = self.git.environment.clone();
-        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
-            environment.remove(std::ffi::OsStr::new(key));
-        }
+        process::clear_git_repository_environment(&mut environment);
         environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
         process::run(ProcessRequest {
             executable: self.git.executable.clone(),
@@ -1886,12 +1874,14 @@ impl RepositoryDeliveryEffects {
                 repository_config,
                 &self.configuration_digest,
                 &commit,
-                store,
-                &mut host_jobs,
-                owner_generation,
-                &request.intent.operation_id,
-                now_unix,
-                self.max_hook_attempts,
+                crate::hooks::ManagedHookExecution {
+                    store,
+                    pool: &mut host_jobs,
+                    owner_generation,
+                    effect_operation_id: &request.intent.operation_id,
+                    max_attempts: self.max_hook_attempts,
+                    now_unix,
+                },
             )
             .map_err(|error| error.to_string())?
         else {

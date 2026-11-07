@@ -95,6 +95,15 @@ pub struct HookRunContext<'a> {
     pub state_root: &'a Path,
 }
 
+pub struct ManagedHookExecution<'a> {
+    pub store: &'a mut ConfigStore,
+    pub pool: &'a mut HostJobPool,
+    pub owner_generation: u64,
+    pub effect_operation_id: &'a str,
+    pub max_attempts: u32,
+    pub now_unix: i64,
+}
+
 impl HookRunner {
     pub fn new(
         git: GitOptions,
@@ -123,14 +132,17 @@ impl HookRunner {
         &self,
         hooks: &[HookConfig],
         context: HookRunContext<'_>,
-        store: &mut ConfigStore,
-        pool: &mut HostJobPool,
-        owner_generation: u64,
-        effect_operation_id: &str,
-        max_attempts: u32,
-        now_unix: i64,
+        execution: ManagedHookExecution<'_>,
         mut acquire_worktree_lease: impl FnMut() -> Result<WorktreeLease, String>,
     ) -> Result<Option<Vec<HookReceipt>>, HookError> {
+        let ManagedHookExecution {
+            store,
+            pool,
+            owner_generation,
+            effect_operation_id,
+            max_attempts,
+            now_unix,
+        } = execution;
         if hooks.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -199,17 +211,17 @@ impl HookRunner {
             let mut environment = self.inherited_environment.clone();
             environment.retain(|key, _| {
                 let key = key.to_string_lossy();
-                !key.starts_with("GIT_")
-                    && !matches!(
-                        key.as_ref(),
-                        "REX_PROJECTS_CONTEXT"
-                            | "REX_PROJECTS_AGENT"
-                            | "REX_PROJECTS_PROJECT_ID"
-                            | "REX_PROJECTS_ROLE"
-                            | "REX_PROJECTS_RUN_ID"
-                            | "REX_PROJECTS_TICKET_RUN_ID"
-                    )
+                !matches!(
+                    key.as_ref(),
+                    "REX_PROJECTS_CONTEXT"
+                        | "REX_PROJECTS_AGENT"
+                        | "REX_PROJECTS_PROJECT_ID"
+                        | "REX_PROJECTS_ROLE"
+                        | "REX_PROJECTS_RUN_ID"
+                        | "REX_PROJECTS_TICKET_RUN_ID"
+                )
             });
+            process::clear_git_repository_environment(&mut environment);
             environment.insert("REX_PROJECTS_CONTEXT".into(), "rex_projects_hook".into());
             environment.insert("REX_PROJECTS_AGENT".into(), "1".into());
             environment.insert("REX_PROJECTS_PROJECT_ID".into(), project_id.as_str().into());
@@ -473,17 +485,17 @@ impl HookRunner {
             let mut environment = self.inherited_environment.clone();
             environment.retain(|key, _| {
                 let key = key.to_string_lossy();
-                !key.starts_with("GIT_")
-                    && !matches!(
-                        key.as_ref(),
-                        "REX_PROJECTS_CONTEXT"
-                            | "REX_PROJECTS_AGENT"
-                            | "REX_PROJECTS_PROJECT_ID"
-                            | "REX_PROJECTS_ROLE"
-                            | "REX_PROJECTS_RUN_ID"
-                            | "REX_PROJECTS_TICKET_RUN_ID"
-                    )
+                !matches!(
+                    key.as_ref(),
+                    "REX_PROJECTS_CONTEXT"
+                        | "REX_PROJECTS_AGENT"
+                        | "REX_PROJECTS_PROJECT_ID"
+                        | "REX_PROJECTS_ROLE"
+                        | "REX_PROJECTS_RUN_ID"
+                        | "REX_PROJECTS_TICKET_RUN_ID"
+                )
             });
+            process::clear_git_repository_environment(&mut environment);
             environment.insert("REX_PROJECTS_CONTEXT".into(), "rex_projects_hook".into());
             environment.insert("REX_PROJECTS_AGENT".into(), "1".into());
             environment.insert("REX_PROJECTS_PROJECT_ID".into(), project_id.as_str().into());
@@ -626,9 +638,7 @@ impl HookRunner {
 
     fn git_text<const N: usize>(&self, cwd: &Path, args: [&str; N]) -> Result<String, HookError> {
         let mut environment = self.git.environment.clone();
-        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
-            environment.remove(OsStr::new(key));
-        }
+        process::clear_git_repository_environment(&mut environment);
         environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
         let output = process::run(ProcessRequest {
             executable: self.git.executable.clone(),
@@ -1148,6 +1158,18 @@ mod tests {
         let blocked_ready = temp.path().join("blocked.ready");
         let blocked_release = temp.path().join("blocked.release");
         let quick_done = temp.path().join("quick.done");
+        let quick_config_result = temp.path().join("quick.config");
+        let quick_root_result = temp.path().join("quick.root");
+        let global_config = temp.path().join("managed-gitconfig");
+        fs::write(
+            &global_config,
+            "[user]\n\tsigningkey = managed-fixture-key\n",
+        )
+        .unwrap();
+        let foreign = temp.path().join("managed-foreign-repository");
+        fs::create_dir(&foreign).unwrap();
+        fixture_git(&foreign, &["init", "-b", "main"]);
+        let foreign_git = foreign.join(".git");
         let mut environment =
             BTreeMap::from([(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))]);
         environment.insert(
@@ -1161,6 +1183,31 @@ mod tests {
         environment.insert(
             OsString::from("QUICK_DONE"),
             quick_done.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_CONFIG_RESULT"),
+            quick_config_result.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_ROOT_RESULT"),
+            quick_root_result.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_EXPECTED_ROOT"),
+            second_repo.canonicalize().unwrap().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            global_config.into_os_string(),
+        );
+        environment.insert(
+            OsString::from("GIT_DIR"),
+            foreign_git.clone().into_os_string(),
+        );
+        environment.insert(OsString::from("GIT_WORK_TREE"), foreign.into_os_string());
+        environment.insert(
+            OsString::from("GIT_INDEX_FILE"),
+            foreign_git.join("index").into_os_string(),
         );
         let runner = HookRunner::new(
             GitOptions {
@@ -1212,12 +1259,14 @@ mod tests {
                         configuration_digest: &config_digest,
                         state_root: temp.path(),
                     },
-                    &mut store,
-                    &mut pool,
-                    1,
-                    "effect-blocked",
-                    1,
-                    10,
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-blocked",
+                        max_attempts: 1,
+                        now_unix: 10,
+                    },
                     first_lease,
                 )
                 .unwrap()
@@ -1248,12 +1297,14 @@ mod tests {
                         configuration_digest: &config_digest,
                         state_root: temp.path(),
                     },
-                    &mut store,
-                    &mut pool,
-                    1,
-                    "effect-same-worktree",
-                    1,
-                    11,
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-same-worktree",
+                        max_attempts: 1,
+                        now_unix: 11,
+                    },
                     first_lease,
                 )
                 .unwrap()
@@ -1271,7 +1322,11 @@ mod tests {
         let quick_ticket = TicketRunId::parse("quick-run").unwrap();
         let quick = HookConfig {
             id: "quick".into(),
-            command: ["/bin/sh", "-c", "printf done > \"$QUICK_DONE\""]
+            command: [
+                "/bin/sh",
+                "-c",
+                "test \"$(git config --global --get user.signingkey)\" = managed-fixture-key && git rev-parse --show-toplevel > \"$QUICK_ROOT_RESULT\" && test \"$(cat \"$QUICK_ROOT_RESULT\")\" = \"$QUICK_EXPECTED_ROOT\" && git config --global --get user.signingkey > \"$QUICK_CONFIG_RESULT\" && printf done > \"$QUICK_DONE\"",
+            ]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
@@ -1301,12 +1356,14 @@ mod tests {
                         configuration_digest: &config_digest,
                         state_root: temp.path(),
                     },
-                    &mut store,
-                    &mut pool,
-                    1,
-                    "effect-quick",
-                    1,
-                    12,
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-quick",
+                        max_attempts: 1,
+                        now_unix: 12,
+                    },
                     second_lease,
                 )
                 .unwrap()
@@ -1320,6 +1377,14 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(fs::read_to_string(&quick_done).unwrap(), "done");
+        assert_eq!(
+            fs::read_to_string(&quick_config_result).unwrap().trim(),
+            "managed-fixture-key"
+        );
+        assert_eq!(
+            fs::read_to_string(&quick_root_result).unwrap().trim(),
+            second_repo.canonicalize().unwrap().to_string_lossy()
+        );
         assert_eq!(quick_receipts.len(), 1);
         assert!(quick_receipts[0].succeeded);
         assert!(
@@ -1342,12 +1407,14 @@ mod tests {
                         configuration_digest: &config_digest,
                         state_root: temp.path(),
                     },
-                    &mut store,
-                    &mut pool,
-                    1,
-                    "effect-blocked",
-                    1,
-                    13,
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-blocked",
+                        max_attempts: 1,
+                        now_unix: 13,
+                    },
                     first_lease,
                 )
                 .unwrap()
@@ -1450,6 +1517,104 @@ mod tests {
         );
         assert!(first_receipts.iter().all(|receipt| receipt.succeeded));
         assert!(second_receipts[0].succeeded);
+    }
+
+    #[test]
+    fn direct_hook_reads_git_config_without_inheriting_repository_routing() {
+        let (temp, repo, config_digest) = fixture();
+        let foreign = temp.path().join("foreign-repository");
+        fs::create_dir(&foreign).unwrap();
+        fixture_git(&foreign, &["init", "-b", "main"]);
+        let global_config = temp.path().join("gitconfig");
+        fs::write(
+            &global_config,
+            "[user]\n\tsigningkey = fixture-signing-key\n",
+        )
+        .unwrap();
+        let config_result = temp.path().join("git-config-result");
+        let root_result = temp.path().join("git-root-result");
+        let foreign_git = foreign.join(".git");
+        let mut environment = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/bin:/usr/bin")),
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                global_config.clone().into_os_string(),
+            ),
+            (
+                OsString::from("GIT_DIR"),
+                foreign_git.clone().into_os_string(),
+            ),
+            (
+                OsString::from("GIT_WORK_TREE"),
+                foreign.clone().into_os_string(),
+            ),
+            (
+                OsString::from("GIT_INDEX_FILE"),
+                foreign_git.join("index").into_os_string(),
+            ),
+            (
+                OsString::from("CONFIG_RESULT"),
+                config_result.clone().into_os_string(),
+            ),
+            (
+                OsString::from("ROOT_RESULT"),
+                root_result.clone().into_os_string(),
+            ),
+        ]);
+        let runner = HookRunner::new(
+            GitOptions {
+                executable: PathBuf::from("/usr/bin/git"),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+            },
+            std::mem::take(&mut environment),
+            test_environment_binding(),
+        );
+        let expected_head = {
+            let output = process::run(ProcessRequest {
+                executable: PathBuf::from("/usr/bin/git"),
+                args: ["rev-parse", "HEAD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.clone()),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+                shutdown_grace: Duration::from_secs(2),
+                stdout_limit: 1024,
+                stderr_tail_limit: 1024,
+            })
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        runner
+            .run_required(
+                &[hook(&[
+                    "/bin/sh",
+                    "-c",
+                    "git config --global --get user.signingkey > \"$CONFIG_RESULT\" && git rev-parse --show-toplevel > \"$ROOT_RESULT\"",
+                ])],
+                HookRunContext {
+                    repository_id: &RepositoryId::parse("fixture-repo").unwrap(),
+                    worktree: &repo,
+                    expected_head: &expected_head,
+                    project_id: &ProjectId::parse("fixture-project").unwrap(),
+                    ticket_run_id: &TicketRunId::parse("direct-git-environment").unwrap(),
+                    configuration_digest: &config_digest,
+                    state_root: temp.path(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(config_result).unwrap().trim(),
+            "fixture-signing-key"
+        );
+        assert_eq!(
+            fs::read_to_string(root_result).unwrap().trim(),
+            repo.canonicalize().unwrap().to_string_lossy()
+        );
     }
 
     #[test]
