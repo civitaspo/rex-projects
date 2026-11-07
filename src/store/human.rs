@@ -508,10 +508,12 @@ impl ConfigStore {
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let mut statement = tx.prepare(
-            "SELECT request_id FROM human_requests WHERE lifecycle IN ('pending','presented','response_queued') AND expires_at_unix<=?1 ORDER BY expires_at_unix,request_id",
+            "SELECT request_id,request_json FROM human_requests WHERE lifecycle IN ('pending','presented','response_queued') AND expires_at_unix<=?1 ORDER BY expires_at_unix,request_id",
         ).map_err(|error| error.to_string())?;
         let request_ids = statement
-            .query_map([now], |row| row.get::<_, String>(0))
+            .query_map([now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
@@ -519,7 +521,9 @@ impl ConfigStore {
         let result_json = serde_json::to_string(&HumanDecisionResult::Expired)
             .map_err(|error| error.to_string())?;
         let mut expired = 0;
-        for request_id in request_ids {
+        for (request_id, request_json) in request_ids {
+            let request: HumanRuntimeRequest =
+                crate::protocol::parse_unique(request_json.as_bytes())?;
             let changed = tx.execute(
                 "UPDATE human_requests SET lifecycle='expired',decided_at_unix=?2 WHERE request_id=?1 AND lifecycle IN ('pending','presented','response_queued') AND expires_at_unix<=?2",
                 params![request_id,now],
@@ -531,6 +535,14 @@ impl ConfigStore {
                 "UPDATE human_decision_intents SET lifecycle='expired',processed_at_unix=?2,result_json=?3 WHERE request_id=?1 AND lifecycle='queued'",
                 params![request_id,now,result_json],
             ).map_err(|error| error.to_string())?;
+            insert_human_resolution_wake(
+                &tx,
+                &request,
+                &format!("expiry:{}", request_id),
+                "expired",
+                "human request expired before a decision was applied",
+                now,
+            )?;
             expired += changed;
         }
         tx.commit().map_err(|error| error.to_string())?;
@@ -577,7 +589,15 @@ impl ConfigStore {
         let request: HumanRuntimeRequest = crate::protocol::parse_unique(request_json.as_bytes())?;
         if request.subject != *current_subject {
             let result = HumanDecisionResult::Stale { reason: "current subject digest, revision, policy, configuration, or evidence differs from the presented request".into() };
-            persist_rejected(&tx, response_id, request_id.as_str(), &result, "stale", now)?;
+            persist_rejected(
+                &tx,
+                response_id,
+                request_id.as_str(),
+                &request,
+                &result,
+                "stale",
+                now,
+            )?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(result);
         }
@@ -587,7 +607,15 @@ impl ConfigStore {
             let result = HumanDecisionResult::Stale {
                 reason: "response subject digest does not match the fresh observed subject".into(),
             };
-            persist_rejected(&tx, response_id, request_id.as_str(), &result, "stale", now)?;
+            persist_rejected(
+                &tx,
+                response_id,
+                request_id.as_str(),
+                &request,
+                &result,
+                "stale",
+                now,
+            )?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(result);
         }
@@ -597,6 +625,7 @@ impl ConfigStore {
                 &tx,
                 response_id,
                 request_id.as_str(),
+                &request,
                 &result,
                 "expired",
                 now,
@@ -608,7 +637,15 @@ impl ConfigStore {
             let result = HumanDecisionResult::Stale {
                 reason: "response choice is not permitted by the request".into(),
             };
-            persist_rejected(&tx, response_id, request_id.as_str(), &result, "stale", now)?;
+            persist_rejected(
+                &tx,
+                response_id,
+                request_id.as_str(),
+                &request,
+                &result,
+                "stale",
+                now,
+            )?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(result);
         }
@@ -616,7 +653,15 @@ impl ConfigStore {
             Ok(()) => {}
             Err(TicketValidationError::Stale(reason)) => {
                 let result = HumanDecisionResult::Stale { reason };
-                persist_rejected(&tx, response_id, request_id.as_str(), &result, "stale", now)?;
+                persist_rejected(
+                    &tx,
+                    response_id,
+                    request_id.as_str(),
+                    &request,
+                    &result,
+                    "stale",
+                    now,
+                )?;
                 tx.commit().map_err(|error| error.to_string())?;
                 return Ok(result);
             }
@@ -641,6 +686,70 @@ impl ConfigStore {
         tx.execute("UPDATE human_requests SET lifecycle='decided',decided_at_unix=?2 WHERE request_id=?1 AND lifecycle='response_queued'", params![request_id.as_str(), now]).map_err(|error| error.to_string())?;
         tx.execute("UPDATE human_decision_intents SET lifecycle='applied',processed_at_unix=?2,result_json=?3 WHERE response_id=?1 AND lifecycle='queued'", params![intent.response_id, now, result_json]).map_err(|error| error.to_string())?;
         insert_role_wake(&tx, &request, &receipt, now)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    /// Mark a queued decision stale when the authoritative subject has been removed and cannot
+    /// produce a replacement binding. Persist the terminal response and wake its owner atomically.
+    pub fn reject_human_decision_stale(
+        &mut self,
+        owner_generation: u64,
+        response_id: &str,
+        reason: &str,
+        now: u64,
+    ) -> Result<HumanDecisionResult, String> {
+        if reason.trim().is_empty() || reason.len() > 4096 {
+            return Err("stale human decision needs a bounded explanation".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let row: Option<(String, String, String, Option<String>)> = tx
+            .query_row(
+                "SELECT i.intent_json,i.lifecycle,i.request_id,i.result_json FROM human_decision_intents i WHERE i.response_id=?1",
+                [response_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((intent_json, lifecycle, request_id_raw, result_json)) = row else {
+            return Err("queued human response was not found".into());
+        };
+        if matches!(lifecycle.as_str(), "applied" | "stale" | "expired") {
+            let result: HumanDecisionResult = crate::protocol::parse_unique(
+                result_json.as_deref().unwrap_or_default().as_bytes(),
+            )?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(result);
+        }
+        if lifecycle != "queued" {
+            return Err("human response is not queued".into());
+        }
+        let _intent: HumanDecisionIntent = crate::protocol::parse_unique(intent_json.as_bytes())?;
+        let request_id = HumanRequestId::parse(request_id_raw)?;
+        let request_json: String = tx
+            .query_row(
+                "SELECT request_json FROM human_requests WHERE request_id=?1",
+                [request_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let request: HumanRuntimeRequest = crate::protocol::parse_unique(request_json.as_bytes())?;
+        let result = HumanDecisionResult::Stale {
+            reason: reason.to_owned(),
+        };
+        persist_rejected(
+            &tx,
+            response_id,
+            request_id.as_str(),
+            &request,
+            &result,
+            "stale",
+            now,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
@@ -837,6 +946,7 @@ fn persist_rejected(
     tx: &rusqlite::Transaction<'_>,
     response_id: &str,
     request_id: &str,
+    request: &HumanRuntimeRequest,
     result: &HumanDecisionResult,
     lifecycle: &str,
     now: u64,
@@ -844,6 +954,50 @@ fn persist_rejected(
     let result_json = serde_json::to_string(result).map_err(|error| error.to_string())?;
     tx.execute("UPDATE human_decision_intents SET lifecycle=?2,processed_at_unix=?3,result_json=?4 WHERE response_id=?1 AND lifecycle='queued'", params![response_id,lifecycle,now,result_json]).map_err(|error| error.to_string())?;
     tx.execute("UPDATE human_requests SET lifecycle=?2,decided_at_unix=?3 WHERE request_id=?1 AND lifecycle='response_queued'", params![request_id,lifecycle,now]).map_err(|error| error.to_string())?;
+    insert_human_resolution_wake(tx, request, response_id, lifecycle, &result_json, now)?;
+    Ok(())
+}
+
+fn insert_human_resolution_wake(
+    tx: &rusqlite::Transaction<'_>,
+    request: &HumanRuntimeRequest,
+    source_id: &str,
+    lifecycle: &str,
+    detail: &str,
+    now: u64,
+) -> Result<(), String> {
+    let (role_session_id, target) = match request.wake_target() {
+        HumanWakeTarget::Supervisor => (
+            format!("project:{}:supervisor", request.subject.project_id),
+            "supervisor",
+        ),
+        HumanWakeTarget::Operator => (
+            format!("project:{}:operator", request.subject.project_id),
+            "operator",
+        ),
+        HumanWakeTarget::Coordinator if request.subject.kind == HumanSubjectKind::TicketRun => (
+            format!("ticket_run:{}:coordinator", request.subject.subject_id),
+            "coordinator",
+        ),
+        HumanWakeTarget::Coordinator => (
+            format!("project:{}:supervisor", request.subject.project_id),
+            "supervisor",
+        ),
+    };
+    let payload = serde_json::json!({
+        "request_id": request.request_id.as_str(),
+        "response_id": source_id,
+        "outcome": lifecycle,
+        "detail": detail,
+        "subject_digest": request.subject.digest()?,
+        "revision": request.subject.revision.0,
+        "target": target,
+    });
+    tx.execute(
+        "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'human_resolution',?3,?4,10,?5,'pending',?6) ON CONFLICT(role_session_id,source_type,source_id,source_revision) DO NOTHING",
+        params![request.subject.project_id.as_str(), role_session_id, source_id, request.subject.revision.0, payload.to_string(), now],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1142,8 +1296,10 @@ mod tests {
             &self,
             _store: &ConfigStore,
             _request: &HumanRuntimeRequest,
-        ) -> Result<Option<HumanSubjectBinding>, String> {
-            Ok(Some(self.0.clone()))
+        ) -> Result<crate::human_runtime::HumanSubjectObservation, String> {
+            Ok(crate::human_runtime::HumanSubjectObservation::Current(
+                self.0.clone(),
+            ))
         }
     }
 
@@ -1416,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_sweep_terminalizes_a_queued_response_without_waking_a_role() {
+    fn expiry_sweep_terminalizes_and_wakes_the_responsible_role() {
         let (temp, mut store, generation, request, artifact) = runtime_fixture();
         register_request(&mut store, generation, &request, &artifact, 10).unwrap();
         let intent = HumanDecisionIntent {
@@ -1449,15 +1605,16 @@ mod tests {
                 .unwrap(),
             HumanDecisionResult::Expired
         ));
-        let wake_count: u64 = store
+        let (wake_count, payload): (u64, String) = store
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='human_decision'",
+                "SELECT COUNT(*),COALESCE(MAX(payload_json),'') FROM role_wake_inputs WHERE source_type='human_resolution'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(wake_count, 0);
+        assert_eq!(wake_count, 1);
+        assert!(payload.contains("expired"));
     }
 
     #[test]
@@ -1655,7 +1812,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_subject_is_terminal_and_never_wakes_a_role() {
+    fn stale_subject_is_terminal_and_wakes_its_owner_without_approval() {
         let (temp, mut store, generation, request, artifact) = runtime_fixture();
         register_request(&mut store, generation, &request, &artifact, 10).unwrap();
         let intent = HumanDecisionIntent {
@@ -1676,15 +1833,16 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM human_decisions", [], |row| row.get(0))
             .unwrap();
-        let wakes: u64 = store
+        let (wakes, payload): (u64, String) = store
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='human_decision'",
+                "SELECT COUNT(*),COALESCE(MAX(payload_json),'') FROM role_wake_inputs WHERE source_type='human_resolution'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((decisions, wakes), (0, 0));
+        assert_eq!((decisions, wakes), (0, 1));
+        assert!(payload.contains("stale"));
         assert!(
             store
                 .accepted_human_approval(

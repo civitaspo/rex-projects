@@ -344,7 +344,7 @@ where
     F: FnMut(
         &crate::store::ConfigStore,
         &HumanRuntimeRequest,
-    ) -> Result<Option<HumanSubjectBinding>, String>,
+    ) -> Result<HumanSubjectObservation, String>,
 {
     if limit == 0 || limit > MAX_HUMAN_RESPONSE_BATCH {
         return Err("human response batch limit must be between 1 and 64".into());
@@ -355,15 +355,21 @@ where
         // Re-observation receives the same owner-fenced store connection used by the controller.
         // Domain resolvers must query current persisted intent and provider state here; they must
         // never treat the queued request's own subject as evidence of current authority.
-        let Some(current_subject) = observe(store, &item.request)? else {
-            continue;
+        let result = match observe(store, &item.request)? {
+            HumanSubjectObservation::Current(current_subject) => store.process_human_decision(
+                owner_generation,
+                &item.intent.response_id,
+                &current_subject,
+                now,
+            )?,
+            HumanSubjectObservation::Gone(reason) => store.reject_human_decision_stale(
+                owner_generation,
+                &item.intent.response_id,
+                &reason,
+                now,
+            )?,
+            HumanSubjectObservation::TemporarilyUnavailable => continue,
         };
-        let result = store.process_human_decision(
-            owner_generation,
-            &item.intent.response_id,
-            &current_subject,
-            now,
-        )?;
         processed.push(ProcessedHumanResponse {
             response_id: item.intent.response_id,
             result,
@@ -596,14 +602,169 @@ pub fn open_runtime_review_html(
 }
 
 /// Provider-facing host adapter used to re-observe the complete authority behind a human
-/// decision. Errors leave the response queued for retry; `None` means the current authority is
-/// temporarily unavailable and also leaves it queued.
+/// decision. Provider errors and `TemporarilyUnavailable` leave the response queued for retry;
+/// `Gone` terminalizes it as stale and wakes the responsible role.
 pub trait HumanSubjectObserver: Send + Sync {
     fn observe_current_subject(
         &self,
         store: &crate::store::ConfigStore,
         request: &HumanRuntimeRequest,
-    ) -> Result<Option<HumanSubjectBinding>, String>;
+    ) -> Result<HumanSubjectObservation, String>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HumanSubjectObservation {
+    Current(HumanSubjectBinding),
+    Gone(String),
+    TemporarilyUnavailable,
+}
+
+/// Host observer for approval subjects whose authority is already represented by durable,
+/// immutable controller records. It reconstructs the subject from those records and the current
+/// applied configuration; queued request fields are used only as lookup keys and are never copied
+/// into the returned binding.
+///
+/// Ticket reviews require a configured forge observation adapter and are deliberately rejected
+/// here until that adapter is supplied by the runtime composition.
+pub struct DurableHumanSubjectObserver {
+    declarative_root: PathBuf,
+}
+
+impl DurableHumanSubjectObserver {
+    pub fn new(declarative_root: PathBuf) -> Result<Self, String> {
+        if !declarative_root.is_absolute() {
+            return Err("profile declarative root must be absolute".into());
+        }
+        Ok(Self { declarative_root })
+    }
+}
+
+impl HumanSubjectObserver for DurableHumanSubjectObserver {
+    fn observe_current_subject(
+        &self,
+        store: &crate::store::ConfigStore,
+        request: &HumanRuntimeRequest,
+    ) -> Result<HumanSubjectObservation, String> {
+        match request.purpose {
+            HumanPurpose::OperationApproval => observe_operation_subject(store, request),
+            HumanPurpose::ProfilePromotion => {
+                observe_profile_subject(store, request, &self.declarative_root)
+            }
+            HumanPurpose::TicketReview => Err(
+                "ticket review freshness requires a configured forge observer; decision remains queued".into(),
+            ),
+            purpose => Err(format!(
+                "no authoritative host observer is configured for {purpose:?}; decision remains queued"
+            )),
+        }
+    }
+}
+
+fn observe_operation_subject(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+) -> Result<HumanSubjectObservation, String> {
+    let operation_id = crate::domain::ids::OperationId::parse(request.subject.subject_id.clone())?;
+    let Some(intent) = store.operation_approval_intent(&operation_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the operation approval intent no longer exists or is no longer awaiting approval"
+                .into(),
+        ));
+    };
+    let Some(project) = store.project(&intent.project_id)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    let Some(snapshot) = store.load_snapshot(&project.config_source)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if snapshot.revision != project.config_revision
+        || snapshot.config.digest != project.config_digest
+    {
+        return Err("current operation configuration snapshot is inconsistent".into());
+    }
+    let bundle = crate::operations_runtime::operation_review_bundle(&snapshot.config, &intent)?;
+    let policy_digest =
+        crate::operations::operation_policy_digest(&snapshot.config.config, &intent.subject)?;
+    let binding = HumanSubjectBinding {
+        project_id: intent.project_id,
+        kind: HumanSubjectKind::Operation,
+        subject_id: operation_id.to_string(),
+        ticket_run_id: Some(intent.ticket_run_id),
+        revision: intent.ticket_revision,
+        material_digest: intent.subject.digest().map_err(|error| error.to_string())?,
+        configuration_digest: snapshot.config.digest,
+        policy_digest,
+        bundle_digest: review_bundle_digest(&bundle)?,
+    };
+    Ok(HumanSubjectObservation::Current(binding))
+}
+
+fn observe_profile_subject(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+    declarative_root: &Path,
+) -> Result<HumanSubjectObservation, String> {
+    let Some(project) = store.project(&request.subject.project_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the project for this profile approval no longer exists".into(),
+        ));
+    };
+    let Some(snapshot) = store.load_snapshot(&project.config_source)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if snapshot.revision != project.config_revision
+        || snapshot.config.digest != project.config_digest
+    {
+        return Err("current profile configuration snapshot is inconsistent".into());
+    }
+    let Some(candidate) =
+        store.current_learning_candidate_package(&project.id, &request.subject.subject_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the profile candidate is no longer awaiting approval".into(),
+        ));
+    };
+    let Some(evidence) = candidate.evidence.as_ref() else {
+        return Err("profile candidate has no completed trial evidence".into());
+    };
+    let config_file = declarative_root.join("config.toml");
+    let declarative_profile_root = declarative_root.join("profiles");
+    let expected_config_revision =
+        crate::learning::config_revision(&config_file, &declarative_profile_root)
+            .map_err(|error| error.to_string())?;
+    let material_digest = crate::learning::profile_approval_subject_digest(
+        &project.id,
+        candidate.revision.role,
+        &candidate.profile_id,
+        &candidate.revision.digest,
+        &candidate.files,
+        evidence,
+        &expected_config_revision,
+    )
+    .map_err(|error| error.to_string())?;
+    let bundle = crate::learning::profile_candidate_review_bundle(&candidate)
+        .map_err(|error| error.to_string())?;
+    let policy_digest = profile_policy_digest(&snapshot.config.config.learning)?;
+    let binding = HumanSubjectBinding {
+        project_id: project.id,
+        kind: HumanSubjectKind::Profile,
+        subject_id: candidate.revision.candidate_id,
+        ticket_run_id: None,
+        revision: crate::learning::profile_candidate_revision(&candidate.revision.digest)
+            .map_err(|error| error.to_string())?,
+        material_digest,
+        configuration_digest: snapshot.config.digest,
+        policy_digest,
+        bundle_digest: review_bundle_digest(&bundle)?,
+    };
+    Ok(HumanSubjectObservation::Current(binding))
+}
+
+pub fn profile_policy_digest(policy: &crate::config::LearningConfig) -> Result<Digest, String> {
+    let bytes = serde_json::to_vec(policy).map_err(|error| error.to_string())?;
+    let mut material = b"rex-projects-profile-policy-v1\0".to_vec();
+    material.extend(bytes);
+    Digest::parse(hex(&Sha256::digest(material)))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
