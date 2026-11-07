@@ -1180,7 +1180,7 @@ impl crate::store::RuntimeStatus {
     }
 }
 
-fn observed_process_start_identity(pid: u32) -> Option<String> {
+pub(crate) fn observed_process_start_identity(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();

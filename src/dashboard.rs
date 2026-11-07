@@ -17,7 +17,7 @@ static SHUTDOWN_REQUESTED: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 use crate::adapters::rex::RexCliTransport;
-use crate::domain::ids::{HumanRequestId, TicketRunId};
+use crate::domain::ids::{HumanRequestId, ProjectId, TicketId, TicketNamespace, TicketRunId};
 use crate::human_runtime::{HumanDecisionIntent, HumanRequestLifecycle};
 use crate::store::{ConfigStore, dashboard_projection};
 
@@ -158,11 +158,50 @@ impl DashboardBackend for RuntimeDashboardBackend {
 
     fn instruct_coordinator(
         &mut self,
-        _ticket_run: &TicketRunId,
-        _expected_revision: u64,
-        _message: &str,
+        ticket_run_id: &TicketRunId,
+        expected_revision: u64,
+        message: &str,
     ) -> Result<String, String> {
-        Err("durable Coordinator instruction intake is not available in this runtime build".into())
+        let snapshot = self.snapshot()?;
+        let ticket = snapshot
+            .tickets
+            .iter()
+            .find(|ticket| &ticket.ticket_run_id == ticket_run_id)
+            .ok_or_else(|| "TicketRun is no longer in the dashboard snapshot".to_owned())?;
+        if ticket.revision != expected_revision {
+            return Err("TicketRun revision changed; refresh the dashboard".into());
+        }
+        let project_id = ProjectId::parse(ticket.project_id.clone())?;
+        let namespace = TicketNamespace::parse(ticket.namespace.clone())?;
+        let ticket_id = TicketId::parse(ticket.ticket_id.clone())?;
+        let request_id = format!(
+            "dashboard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let mut store = ConfigStore::open_control(&self.state_root)?;
+        let receipt = store.enqueue_coordinator_instruction(
+            self.owner_generation()?,
+            &project_id,
+            ticket_run_id,
+            &namespace,
+            &ticket_id,
+            expected_revision,
+            &request_id,
+            message,
+            unix_now(),
+        )?;
+        Ok(format!(
+            "queued Coordinator wake {} for {}/{} at revision {}{}",
+            receipt.wake_input_id,
+            namespace,
+            ticket_id,
+            receipt.revision,
+            if receipt.replayed { " (replayed)" } else { "" }
+        ))
     }
 
     fn respond(
@@ -786,6 +825,111 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    #[test]
+    fn runtime_backend_queues_coordinator_instruction_through_host_api() {
+        use crate::config::{AppliedConfig, SourceFile, SourceKind};
+        use crate::domain::ids::{
+            Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
+        };
+        use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
+        use std::collections::BTreeMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../examples/fixture/config.toml")).unwrap();
+        let config_digest = Digest::parse("a".repeat(64)).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &AppliedConfig {
+                    config,
+                    profiles: BTreeMap::new(),
+                    source_root: temp.path().display().to_string(),
+                    source_files: vec![SourceFile {
+                        kind: SourceKind::File,
+                        path: temp.path().join("factory.toml").display().to_string(),
+                        canonical_path: temp.path().join("factory.toml").display().to_string(),
+                        sha256: config_digest.clone(),
+                        bytes: 0,
+                        contents: String::new(),
+                    }],
+                    digest: config_digest.clone(),
+                },
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("goal_project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest,
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "dashboard-test-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: crate::cli::observed_process_start_identity(
+                    std::process::id(),
+                )
+                .unwrap(),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "b".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store
+            .set_project_lifecycle(generation, &project_id, "running")
+            .unwrap();
+        let namespace = TicketNamespace::parse("github:org/repo").unwrap();
+        let ticket_id = TicketId::parse("PAY-1").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-dashboard-test").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &namespace,
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "queued",
+                "ToDo",
+            )
+            .unwrap();
+        drop(store);
+
+        let mut backend = RuntimeDashboardBackend::new(temp.path(), "rex");
+        let receipt = backend
+            .instruct_coordinator(&ticket_run_id, 0, "Please clarify the acceptance criteria.")
+            .unwrap();
+        assert!(receipt.contains("queued Coordinator wake"));
+
+        let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        let (source_type, source_revision, payload_json): (String, u64, String) = db
+            .query_row(
+                "SELECT source_type,source_revision,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 ORDER BY wake_input_id DESC LIMIT 1",
+                rusqlite::params![project_id.as_str(), format!("ticket_run:{}:coordinator", ticket_run_id.as_str())],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(source_type, "human_instruction");
+        assert_eq!(source_revision, 0);
+        assert_eq!(payload["body"], "Please clarify the acceptance criteria.");
+        assert_eq!(payload["ticket_run_id"], ticket_run_id.as_str());
+        assert_eq!(payload["expected_revision"], 0);
+    }
+
     #[test]
     fn selection_wraps_and_moves_within_section() {
         assert_eq!(
