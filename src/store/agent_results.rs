@@ -705,6 +705,169 @@ pub fn acknowledge_agent_result(
     tx.commit().map_err(|error| error.to_string())
 }
 
+/// Recover the ACK when a role transition committed but the process stopped before its separate
+/// result acknowledgement. The persisted transition inbox and source evidence bind the replay.
+pub fn acknowledge_committed_role_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    result_kind: &str,
+    evidence_id: &str,
+    result_digest: &Digest,
+    project_id: &ProjectId,
+    ticket_run_id: &TicketRunId,
+) -> Result<bool, String> {
+    let (message_prefix, role, transitions): (&str, &str, &[&str]) = match result_kind {
+        "plan_accepted" => ("plan-ready:", "coordinator", &["plan_accepted"]),
+        "worker_implementation_ready" => (
+            "implementation-ready:",
+            "worker",
+            &["worker_implementation_ready"],
+        ),
+        "review_assessment" => (
+            "review-ready:",
+            "reviewer",
+            &[
+                "corrections_remain",
+                "review_converged",
+                "review_round_limit_reached",
+            ],
+        ),
+        _ => return Err("unsupported committed Agent result transition kind".into()),
+    };
+    let message_id = format!("{message_prefix}{evidence_id}");
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    super::validate_active_generation(&tx, owner_generation)?;
+    let committed: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT content_digest,payload_json,receipt_json FROM inbox WHERE producer_id='rex-projects-agent-result' AND message_id=?1",
+            [&message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((content_digest, payload, receipt)) = committed else {
+        return Ok(false);
+    };
+    if crate::store::durable_input_digest("ticket_run", &payload) != content_digest {
+        return Err("committed Agent transition has an invalid durable input digest".into());
+    }
+    let payload_value: serde_json::Value = crate::protocol::parse_unique(payload.as_bytes())?;
+    let source_revision = payload_value["source_revision"]
+        .as_u64()
+        .ok_or("committed Agent transition has no source revision")?;
+    let accepted_revision = payload_value["accepted_revision"]
+        .as_u64()
+        .ok_or("committed Agent transition has no accepted revision")?;
+    if payload_value["schema_version"].as_u64() != Some(1)
+        || payload_value["kind"].as_str() != Some(result_kind)
+        || payload_value["evidence_id"].as_str() != Some(evidence_id)
+        || payload_value["result_digest"].as_str() != Some(result_digest.as_str())
+        || source_revision.checked_add(1) != Some(accepted_revision)
+        || !payload_value["transition"]
+            .as_str()
+            .is_some_and(|transition| transitions.contains(&transition))
+    {
+        return Err("committed Agent result transition does not match the pending result".into());
+    }
+    let receipt_value: serde_json::Value = crate::protocol::parse_unique(receipt.as_bytes())?;
+    if receipt_value["project_id"].as_str() != Some(project_id.as_str())
+        || receipt_value["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
+        || receipt_value["revision"].as_u64() != Some(accepted_revision)
+    {
+        return Err(
+            "committed Agent result transition receipt has a different subject or revision".into(),
+        );
+    }
+    let source: Option<(String, String, Option<String>, Option<u64>, String)> = tx
+        .query_row(
+            "SELECT e.project_id,e.role,e.ticket_run_id,a.ticket_revision,e.result_digest FROM agent_result_evidence e JOIN agent_launch_authority a USING(agent_run_id) WHERE e.evidence_id=?1",
+            [evidence_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((source_project, source_role, source_ticket, evidence_revision, source_digest)) =
+        source
+    else {
+        return Err("committed Agent result transition has no persisted source evidence".into());
+    };
+    if source_project != project_id.as_str()
+        || source_role != role
+        || source_ticket.as_deref() != Some(ticket_run_id.as_str())
+        || evidence_revision != Some(source_revision)
+        || source_digest != result_digest.as_str()
+    {
+        return Err(
+            "committed Agent result transition differs from its immutable source evidence".into(),
+        );
+    }
+    if result_kind == "plan_accepted" {
+        let accepted: Option<String> = tx
+            .query_row(
+                "SELECT source_evidence_id FROM accepted_work_plans WHERE project_id=?1 AND ticket_run_id=?2 AND accepted_revision=?3",
+                params![project_id.as_str(),ticket_run_id.as_str(),accepted_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if accepted.as_deref() != Some(evidence_id) {
+            return Err("committed PlanAccepted transition has no matching accepted plan".into());
+        }
+        let operation_id = format!("prepare-{evidence_id}");
+        let effect_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM effects WHERE operation_id=?1 AND project_id=?2 AND subject_type='ticket_run' AND subject_id=?3 AND kind='prepare_worktrees' AND expected_revision=?4)",
+                params![operation_id,project_id.as_str(),ticket_run_id.as_str(),accepted_revision],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !effect_exists {
+            return Err("committed PlanAccepted transition has no matching prepare effect".into());
+        }
+    } else if result_kind == "worker_implementation_ready" {
+        let operation_id = payload_value["publication_operation_id"]
+            .as_str()
+            .ok_or("committed Worker transition has no publication operation")?;
+        let receipt_effects = receipt_value["effects"]
+            .as_array()
+            .ok_or("committed Worker transition receipt has no effect list")?;
+        if !receipt_effects
+            .iter()
+            .any(|effect| effect.as_str() == Some(operation_id))
+        {
+            return Err("committed Worker transition receipt omits its publication effect".into());
+        }
+    }
+    let existing: Option<(u64, String)> = tx
+        .query_row(
+            "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+            [evidence_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((revision, disposition)) = existing {
+        if revision != accepted_revision || disposition != "applied" {
+            return Err("Agent result already has a different reducer acknowledgement".into());
+        }
+    } else {
+        let changed = tx
+            .execute(
+                "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) SELECT evidence_id,?2,'applied',?3 FROM agent_result_evidence WHERE evidence_id=?1",
+                params![evidence_id, accepted_revision, unix_now()?],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("cannot acknowledge missing Reviewer result evidence".into());
+        }
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
 pub(crate) fn migrate_v12_tables(tx: &Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "ALTER TABLE agent_result_wakes RENAME TO agent_result_wakes_v7;
@@ -1659,9 +1822,197 @@ mod tests {
             stable_evidence_id(&run, "message-1", &changed)
         );
     }
+
+    #[test]
+    fn reviewer_ack_replay_uses_committed_transition_after_ticket_phase_advanced() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        // The fixture models a crash after the transition transaction committed but before
+        // the separate result ACK transaction. This call must not depend on current phase.
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO controller_owners(singleton,owner_nonce,generation,state_root,config_source,pid,process_start_identity,executable_path,executable_digest,started_at_unix,heartbeat_at_unix) VALUES (1,'owner',7,'/tmp','factory',1,'owner-start','/tmp/rex','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,1)",
+            [],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision) VALUES ('ticket-run','project-a','factory',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','fixture','T-1',1,'assessing','running','In Progress','In Progress',11)",
+            [],
+        ).unwrap();
+
+        let evidence_id = "review-evidence-1";
+        let result_digest =
+            Digest::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+        let source_revision = 10;
+        let accepted_revision = source_revision + 1;
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES ('reviewer-run','project-a','reviewer','ticket_run:ticket-run:reviewer','ticket-run',?1,1,?2,1,1,7,'review-operation','review-view',?3,?3,'/tmp/package',?3,'reviewer',?3,?3,?3,?3,'fixture','session','window','block','/tmp/workspace','/tmp/control',?3,'{}',?3,1)",
+            rusqlite::params![source_revision, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_result_evidence(evidence_id,agent_run_id,project_id,role,ticket_run_id,attempt,run_epoch,message_id,content_digest,outcome,result_digest,result_json,artifact_refs_json,received_at_unix) VALUES (?1,'reviewer-run','project-a','reviewer','ticket-run',1,1,'review-message',?2,'completed',?3,'{}','[]',1)",
+            rusqlite::params![evidence_id, "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", result_digest.as_str()],
+        ).unwrap();
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review_assessment",
+            "evidence_id": evidence_id,
+            "result_digest": result_digest.as_str(),
+            "source_revision": source_revision,
+            "accepted_revision": accepted_revision,
+            "transition": "review_converged"
+        })
+        .to_string();
+        let message_id = format!("review-ready:{evidence_id}");
+        store.connection.execute(
+            "INSERT INTO inbox(producer_id,message_id,content_digest,recipient,payload_json,receipt_json,received_at_unix,processed_at_unix) VALUES ('rex-projects-agent-result',?1,?2,'ticket_run',?3,?4,1,1)",
+            rusqlite::params![message_id, crate::store::durable_input_digest("ticket_run", &payload), payload, serde_json::json!({"project_id":"project-a","ticket_run_id":"ticket-run","revision":accepted_revision}).to_string()],
+        ).unwrap();
+
+        let project = ProjectId::parse("project-a").unwrap();
+        let ticket_run = TicketRunId::parse("ticket-run").unwrap();
+        assert!(
+            store
+                .acknowledge_committed_role_result(
+                    7,
+                    "review_assessment",
+                    evidence_id,
+                    &result_digest,
+                    &project,
+                    &ticket_run,
+                )
+                .unwrap()
+        );
+        assert_eq!(store.connection.query_row(
+            "SELECT reducer_revision || ':' || disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+            [evidence_id], |row| row.get::<_, String>(0),
+        ).unwrap(), "11:applied");
+        assert!(
+            store
+                .acknowledge_committed_role_result(
+                    7,
+                    "review_assessment",
+                    evidence_id,
+                    &result_digest,
+                    &project,
+                    &ticket_run,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .acknowledge_committed_role_result(
+                    7,
+                    "review_assessment",
+                    evidence_id,
+                    &result_digest,
+                    &ProjectId::parse("other-project").unwrap(),
+                    &ticket_run,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .acknowledge_committed_role_result(
+                    7,
+                    "review_assessment",
+                    evidence_id,
+                    &result_digest,
+                    &project,
+                    &TicketRunId::parse("other-ticket").unwrap(),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .acknowledge_committed_role_result(
+                    7,
+                    "review_assessment",
+                    evidence_id,
+                    &Digest::parse(
+                        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    )
+                    .unwrap(),
+                    &project,
+                    &ticket_run,
+                )
+                .is_err()
+        );
+        let wrong_revision_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review_assessment",
+            "evidence_id": evidence_id,
+            "result_digest": result_digest.as_str(),
+            "source_revision": source_revision,
+            "accepted_revision": accepted_revision + 1,
+            "transition": "review_converged"
+        })
+        .to_string();
+        store.connection.execute(
+            "UPDATE inbox SET content_digest=?2,payload_json=?3 WHERE producer_id='rex-projects-agent-result' AND message_id=?1",
+            rusqlite::params![message_id, crate::store::durable_input_digest("ticket_run", &wrong_revision_payload), wrong_revision_payload],
+        ).unwrap();
+        assert!(
+            store
+                .acknowledge_committed_role_result(
+                    7,
+                    "review_assessment",
+                    evidence_id,
+                    &result_digest,
+                    &project,
+                    &ticket_run,
+                )
+                .is_err()
+        );
+        store.connection.execute(
+            "UPDATE inbox SET content_digest=?2,payload_json=?3 WHERE producer_id='rex-projects-agent-result' AND message_id=?1",
+            rusqlite::params![message_id, crate::store::durable_input_digest("ticket_run", &payload), payload],
+        ).unwrap();
+        let transition_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM transitions", [], |row| row.get(0))
+            .unwrap();
+        let effect_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((transition_count, effect_count), (0, 0));
+        let ack_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [evidence_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ack_count, 1);
+    }
 }
 
 impl ConfigStore {
+    pub fn acknowledge_committed_role_result(
+        &mut self,
+        owner_generation: u64,
+        result_kind: &str,
+        evidence_id: &str,
+        result_digest: &Digest,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<bool, String> {
+        acknowledge_committed_role_result(
+            self,
+            owner_generation,
+            result_kind,
+            evidence_id,
+            result_digest,
+            project_id,
+            ticket_run_id,
+        )
+    }
+
     pub fn applied_reviewer_correction_round_count(
         &self,
         project_id: &ProjectId,

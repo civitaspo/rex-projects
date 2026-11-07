@@ -555,6 +555,16 @@ fn apply_agent_result(
     let source_revision = binding
         .ticket_revision
         .ok_or("Coordinator PlanReady result lacks TicketRun revision")?;
+    if store.acknowledge_committed_role_result(
+        owner_generation,
+        "plan_accepted",
+        result.receipt.evidence_id(),
+        &result.validated.result_digest,
+        &binding.project_id,
+        ticket_run_id,
+    )? {
+        return Ok(true);
+    }
     let current = store
         .active_ticket_runs(owner_generation, 128)?
         .into_iter()
@@ -641,6 +651,7 @@ fn apply_agent_result(
         "result_digest": result.validated.result_digest,
         "source_revision": source_revision.0,
         "accepted_revision": accepted_revision,
+        "transition": "plan_accepted",
     })
     .to_string();
     let durable = DurableInput {
@@ -1277,6 +1288,16 @@ fn apply_reviewer_result(
     let source_revision = binding
         .ticket_revision
         .ok_or("Reviewer ReviewReady result lacks TicketRun revision")?;
+    if store.acknowledge_committed_role_result(
+        owner_generation,
+        "review_assessment",
+        result.receipt.evidence_id(),
+        &result.validated.result_digest,
+        &binding.project_id,
+        ticket_run_id,
+    )? {
+        return Ok(true);
+    }
     let run = store
         .active_ticket_runs(owner_generation, 128)?
         .into_iter()
@@ -1511,6 +1532,16 @@ fn apply_worker_result(
     let expected_revision = binding
         .ticket_revision
         .ok_or("Worker ImplementationReady result lacks TicketRun revision")?;
+    if store.acknowledge_committed_role_result(
+        owner_generation,
+        "worker_implementation_ready",
+        result.receipt.evidence_id(),
+        &result.validated.result_digest,
+        &binding.project_id,
+        ticket_run_id,
+    )? {
+        return Ok(true);
+    }
     let run = store
         .active_ticket_runs(owner_generation, 128)?
         .into_iter()
@@ -1560,6 +1591,7 @@ fn apply_worker_result(
         "result_digest": result.validated.result_digest,
         "source_revision": run.revision,
         "publication_operation_id": effect.operation_id,
+        "transition": "worker_implementation_ready",
     })
     .to_string();
     let durable = DurableInput {
