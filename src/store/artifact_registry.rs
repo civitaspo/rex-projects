@@ -22,7 +22,7 @@ use crate::protocol::{RequestId, ResponseEnvelope};
 
 /// A registration receipt whose private fields can only be created after the host has re-read
 /// and hashed the immutable object named by a durable registry row.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VerifiedArtifact {
     registration: ArtifactRegistration,
 }

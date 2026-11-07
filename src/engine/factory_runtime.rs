@@ -515,6 +515,18 @@ fn apply_agent_result(
     {
         return apply_reviewer_result(store, owner_generation, now_unix, config, services, result);
     }
+    if result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+        && binding.role == Role::Postmortem
+        && result.validated.kind == RoleOutputKind::PostmortemReady
+    {
+        return apply_postmortem_result(store, owner_generation, now_unix, services, result);
+    }
+    if result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+        && binding.role == Role::Operator
+        && result.validated.kind == RoleOutputKind::OperationResult
+    {
+        return apply_operator_result(store, owner_generation, now_unix, services, result);
+    }
     if result.validated.kind != RoleOutputKind::PlanReady
         || binding.role != Role::Coordinator
         || binding.ticket_run_id.is_none()
@@ -1512,6 +1524,204 @@ fn review_transition(
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
     format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn apply_operator_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    services: &impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Operator result lacks TicketRun scope")?;
+    let revision = binding
+        .ticket_revision
+        .ok_or("Operator result lacks TicketRun revision")?;
+    let run = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("Operator result references no active TicketRun")?;
+    if run.project_id != binding.project_id
+        || run.revision != revision.0
+        || run.phase != Phase::Operating
+    {
+        return Err("Operator result is stale or outside Operating".into());
+    }
+    validate_result_configuration(store, services.configuration_digest(), binding)?;
+    let gate = store
+        .operations()?
+        .completion_gate(&run.project_id, ticket_run_id)?;
+    if gate != crate::store::operations::CompletionGate::WaitingForPostmortem {
+        return Ok(false);
+    }
+    let crate::engine::orchestration::RoleResultPayload::OperationResult(_) =
+        &result.validated.typed_payload
+    else {
+        return Err("validated OperationResult kind has a different typed payload".into());
+    };
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        revision.0,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    let _ = now_unix;
+    Ok(true)
+}
+
+fn apply_postmortem_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    services: &impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::RoleResultPayload;
+
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Postmortem result lacks TicketRun scope")?;
+    let revision = binding
+        .ticket_revision
+        .ok_or("Postmortem result lacks TicketRun revision")?;
+    let run = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("Postmortem result references no active TicketRun")?;
+    if run.project_id != binding.project_id
+        || run.revision != revision.0
+        || run.phase != Phase::Postmortem
+    {
+        return Err("Postmortem result is stale or outside Postmortem".into());
+    }
+    validate_result_configuration(store, services.configuration_digest(), binding)?;
+    let RoleResultPayload::PostmortemReady(payload) = &result.validated.typed_payload else {
+        return Err("validated PostmortemReady kind has a different typed payload".into());
+    };
+    if payload.findings.is_empty()
+        || payload.source_references.is_empty()
+        || !payload.unresolved_provenance.is_empty()
+        || payload.source_references.len() != result.verified_artifacts.len()
+    {
+        return Err("Postmortem result lacks resolved, registered source artifacts".into());
+    }
+    let title = payload
+        .candidate_publication_manifest
+        .get("title")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("Postmortem manifest lacks title")?
+        .clone();
+    let summary = payload
+        .candidate_publication_manifest
+        .get("summary")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("Postmortem manifest lacks summary")?
+        .clone();
+    let sources = payload
+        .source_references
+        .iter()
+        .zip(&result.verified_artifacts)
+        .map(|(reference, verified)| {
+            if verified.reference() != reference
+                || reference.kind != crate::engine::orchestration::RoleArtifactKind::Postmortem
+            {
+                return Err("Postmortem source is not the matching registered artifact".to_owned());
+            }
+            Ok(crate::knowledge::KnowledgeSource {
+                id: reference.artifact_id.as_str().to_owned(),
+                title: "Registered Postmortem source".into(),
+                resource: format!("rex-artifact://{}", reference.artifact_id),
+                content: format!(
+                    "Registered immutable source artifact {}; curated findings are listed separately.",
+                    reference.artifact_id
+                ),
+                digest: reference.digest.clone(),
+                trusted: false,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let operation_id = OperationId::parse(format!("knowledge-{}", result.receipt.evidence_id()))?;
+    let input = crate::knowledge::PostmortemInput {
+        operation_id: operation_id.clone(),
+        project_id: run.project_id.clone(),
+        ticket_run_id: ticket_run_id.clone(),
+        title,
+        summary,
+        findings: payload.findings.clone(),
+        sources,
+        generated_at: format_utc_timestamp(now_unix)?,
+        max_source_bytes: crate::knowledge::DEFAULT_MAX_ARTICLE_BYTES,
+    };
+    let request_json = serde_json::to_string(&input).map_err(|error| error.to_string())?;
+    use sha2::Digest as _;
+    let request_digest = Digest::parse(format!(
+        "{:x}",
+        sha2::Sha256::digest(request_json.as_bytes())
+    ))?;
+    let intent = crate::store::KnowledgePublicationIntent {
+        operation_id,
+        project_id: run.project_id,
+        ticket_run_id: ticket_run_id.clone(),
+        request_digest,
+        request_json,
+    };
+    store.prepare_knowledge_publication(owner_generation, &intent)?;
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        revision.0,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    Ok(true)
+}
+
+fn validate_result_configuration(
+    store: &ConfigStore,
+    current_digest: &Digest,
+    binding: &crate::engine::orchestration::RoleResultBinding,
+) -> Result<(), String> {
+    let project = store
+        .project(&binding.project_id)?
+        .ok_or("role result Project has no durable configuration record")?;
+    if project.config_digest != *current_digest
+        || binding.config_digest != *current_digest
+        || binding.config_revision != project.config_revision
+    {
+        return Err("role result belongs to a stale configuration snapshot".into());
+    }
+    Ok(())
+}
+
+fn format_utc_timestamp(unix: i64) -> Result<String, String> {
+    let days = unix.div_euclid(86_400);
+    let seconds = unix.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    if !(0..=9999).contains(&year) {
+        return Err("timestamp is outside supported UTC years".into());
+    }
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    ))
 }
 
 fn apply_worker_result(

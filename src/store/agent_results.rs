@@ -89,6 +89,8 @@ impl StoredRoleResultReceipt {
 pub struct IngestedAgentResult {
     pub validated: ValidatedRoleResult,
     pub receipt: StoredRoleResultReceipt,
+    /// Host-verified immutable objects for this exact result binding.
+    pub verified_artifacts: Vec<crate::store::artifact_registry::VerifiedArtifact>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,7 +424,7 @@ pub fn ingest_agent_result(
         }
         let receipt = load_stored_receipt(&tx, &evidence_id, &content_digest, &terminal.terminal_digest)?;
         tx.commit().map_err(|error| error.to_string())?;
-        return Ok(IngestedAgentResult { validated, receipt });
+        return Ok(IngestedAgentResult { validated, receipt, verified_artifacts });
     }
 
     let persisted_submission = RoleResultSubmission {
@@ -461,7 +463,11 @@ pub fn ingest_agent_result(
         wake_input_ids,
     };
     tx.commit().map_err(|error| error.to_string())?;
-    Ok(IngestedAgentResult { validated, receipt })
+    Ok(IngestedAgentResult {
+        validated,
+        receipt,
+        verified_artifacts,
+    })
 }
 
 /// Replay result evidence that the FactoryRuntime has not acknowledged after its semantic
