@@ -466,6 +466,13 @@ fn apply_agent_result(
     use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload, WorkBaseSource};
 
     let binding = &result.validated.binding;
+    if result.validated.kind == RoleOutputKind::SpawnRequest
+        && binding.role == Role::Coordinator
+        && binding.ticket_run_id.is_some()
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return apply_coordinator_spawn_request(store, owner_generation, config, services, result);
+    }
     if binding.role == Role::Supervisor
         && result.validated.kind == RoleOutputKind::TicketProposal
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
@@ -2730,7 +2737,9 @@ pub(crate) mod tests {
             _: &mut crate::store::ConfigStore,
             _: u64,
             _: i64,
-        ) -> Result<bool, String> { Ok(false) }
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
 
         fn recover_agents(
             &mut self,
@@ -2738,7 +2747,11 @@ pub(crate) mod tests {
             _: u64,
             _: i64,
         ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
-            Ok(crate::agent_recovery::AgentRecoveryReport { examined: 0, observations: Vec::new(), more_pending: false })
+            Ok(crate::agent_recovery::AgentRecoveryReport {
+                examined: 0,
+                observations: Vec::new(),
+                more_pending: false,
+            })
         }
 
         fn ingest_one_agent_result(
@@ -2746,11 +2759,19 @@ pub(crate) mod tests {
             _: &mut crate::store::ConfigStore,
             _: u64,
             _: i64,
-        ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> { Ok(None) }
+        ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> {
+            Ok(None)
+        }
 
-        fn observe_base_heads(&mut self) -> Result<BTreeMap<crate::domain::ids::RepositoryId, String>, String> { Ok(BTreeMap::new()) }
+        fn observe_base_heads(
+            &mut self,
+        ) -> Result<BTreeMap<crate::domain::ids::RepositoryId, String>, String> {
+            Ok(BTreeMap::new())
+        }
 
-        fn configuration_digest(&self) -> &Digest { &self.configuration_digest }
+        fn configuration_digest(&self) -> &Digest {
+            &self.configuration_digest
+        }
 
         fn read_verified_artifact(
             &self,
@@ -2763,7 +2784,9 @@ pub(crate) mod tests {
             &self,
             _: &ProjectId,
             _: Role,
-        ) -> Result<crate::domain::types::CommitMode, String> { Ok(crate::domain::types::CommitMode::Native) }
+        ) -> Result<crate::domain::types::CommitMode, String> {
+            Ok(crate::domain::types::CommitMode::Native)
+        }
 
         fn worker_publication_effect(
             &mut self,
@@ -2791,18 +2814,44 @@ pub(crate) mod tests {
             Ok(Some(effect))
         }
 
-        fn tick_profile_trials(&mut self, _: &mut crate::store::ConfigStore, _: u64, _: i64, _: u32, _: u32) -> Result<(), String> { Ok(()) }
+        fn tick_profile_trials(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+            _: u32,
+            _: u32,
+        ) -> Result<(), String> {
+            Ok(())
+        }
 
-        fn ticket_namespace(&mut self, _: &crate::domain::ids::AdapterId) -> Result<TicketNamespace, String> { TicketNamespace::parse("fixture") }
+        fn ticket_namespace(
+            &mut self,
+            _: &crate::domain::ids::AdapterId,
+        ) -> Result<TicketNamespace, String> {
+            TicketNamespace::parse("fixture")
+        }
 
-        fn list_ticket_page(&mut self, _: &super::TicketScanKey, _: Option<&str>, _: usize) -> Result<super::ExternalTicketPage, String> { Ok(super::ExternalTicketPage { tickets: Vec::new(), next_cursor: None }) }
+        fn list_ticket_page(
+            &mut self,
+            _: &super::TicketScanKey,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<super::ExternalTicketPage, String> {
+            Ok(super::ExternalTicketPage {
+                tickets: Vec::new(),
+                next_cursor: None,
+            })
+        }
 
         fn observe_publications(
             &mut self,
             _: &mut crate::store::ConfigStore,
             _: u64,
             _: i64,
-        ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String> { Ok(crate::runtime_delivery::PublicationMonitorTick::Idle) }
+        ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String> {
+            Ok(crate::runtime_delivery::PublicationMonitorTick::Idle)
+        }
 
         fn prepare_role_launch(
             &mut self,
@@ -2811,9 +2860,13 @@ pub(crate) mod tests {
             _: &Config,
             _: &crate::store::scheduler::PendingRoleWakeSession,
             _: i64,
-        ) -> Result<bool, String> { Ok(false) }
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
 
-        fn effect_handlers(&self) -> Vec<&dyn crate::effects::EffectHandler> { Vec::new() }
+        fn effect_handlers(&self) -> Vec<&dyn crate::effects::EffectHandler> {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -2837,59 +2890,103 @@ pub(crate) mod tests {
             "unresolved_items": [],
             "irregularity_references": []
         });
-        let result_digest = Digest::parse(format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap()))).unwrap();
-        let mut fixture = crate::store::agent_results::host_validation_fixture::host_validated_result(
-            Role::Worker,
-            RoleResultMessage {
-                schema_version: 1,
-                message_id: "worker-message-1".into(),
-                kind: RoleOutputKind::ImplementationReady,
-                assertion: AgentAssertion::Succeeded,
-                structured_result,
-                result_digest,
-                artifact_refs: Vec::new(),
-            },
-        ).unwrap();
-        let config: Config = toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Worker,
+                RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "worker-message-1".into(),
+                    kind: RoleOutputKind::ImplementationReady,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result,
+                    result_digest,
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let config: Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
             published_effect: None,
         };
 
-        assert!(super::apply_agent_result(
-            &mut fixture.store,
-            fixture.owner_generation,
-            10,
-            &config,
-            &mut services,
-            &fixture.ingested,
-        ).unwrap());
+        assert!(
+            super::apply_agent_result(
+                &mut fixture.store,
+                fixture.owner_generation,
+                10,
+                &config,
+                &mut services,
+                &fixture.ingested,
+            )
+            .unwrap()
+        );
 
-        let run = fixture.store.active_ticket_runs(fixture.owner_generation, 1).unwrap().remove(0);
+        let run = fixture
+            .store
+            .active_ticket_runs(fixture.owner_generation, 1)
+            .unwrap()
+            .remove(0);
         assert_eq!(run.phase, Phase::Publishing);
         assert_eq!(run.revision, 5);
         let intended = services.published_effect.unwrap();
-        assert_eq!(fixture.store.effect_by_logical_key(&intended.logical_key).unwrap(), Some(intended.clone()));
+        assert_eq!(
+            fixture
+                .store
+                .effect_by_logical_key(&intended.logical_key)
+                .unwrap(),
+            Some(intended.clone())
+        );
         let acknowledgement = crate::store::agent_results::host_validation_fixture::result_ack(
             &fixture.store,
             fixture.ingested.receipt.evidence_id(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(acknowledgement, Some((5, "applied".into())));
-        assert!(fixture.store.pending_validated_agent_results(&fixture.artifacts, fixture.owner_generation, 8).unwrap().is_empty());
+        assert!(
+            fixture
+                .store
+                .pending_validated_agent_results(&fixture.artifacts, fixture.owner_generation, 8)
+                .unwrap()
+                .is_empty()
+        );
 
         let state_root = fixture._temp.path().to_path_buf();
         drop(fixture.store);
         let mut reopened = crate::store::ConfigStore::open_test(&state_root).unwrap();
-        assert_eq!(reopened.active_ticket_runs(fixture.owner_generation, 1).unwrap()[0].phase, Phase::Publishing);
-        assert_eq!(reopened.effect_by_logical_key(&intended.logical_key).unwrap(), Some(intended));
+        assert_eq!(
+            reopened
+                .active_ticket_runs(fixture.owner_generation, 1)
+                .unwrap()[0]
+                .phase,
+            Phase::Publishing
+        );
+        assert_eq!(
+            reopened
+                .effect_by_logical_key(&intended.logical_key)
+                .unwrap(),
+            Some(intended)
+        );
         assert_eq!(
             crate::store::agent_results::host_validation_fixture::result_ack(
                 &reopened,
                 fixture.ingested.receipt.evidence_id(),
-            ).unwrap(),
+            )
+            .unwrap(),
             Some((5, "applied".into())),
         );
-        assert!(reopened.pending_validated_agent_results(&fixture.artifacts, fixture.owner_generation, 8).unwrap().is_empty());
+        assert!(
+            reopened
+                .pending_validated_agent_results(&fixture.artifacts, fixture.owner_generation, 8)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3568,4 +3665,125 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(status, "in_progress");
     }
+}
+fn apply_coordinator_spawn_request(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    config: &Config,
+    services: &impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Coordinator SpawnRequest lacks TicketRun scope")?;
+    let crate::engine::orchestration::RoleResultPayload::SpawnRequest(request) =
+        &result.validated.typed_payload
+    else {
+        return Err("validated SpawnRequest kind has a different typed payload".into());
+    };
+    if matches!(
+        request.role,
+        Role::Worker | Role::Supervisor | Role::Coordinator
+    ) {
+        return Err("Coordinator SpawnRequest targets a role without a generic launch path".into());
+    }
+    let project_record = store
+        .project(&binding.project_id)?
+        .ok_or("Coordinator SpawnRequest Project has no durable configuration record")?;
+    let configuration_digest = services.configuration_digest();
+    if project_record.config_digest != *configuration_digest
+        || binding.config_digest != *configuration_digest
+        || binding.config_revision != project_record.config_revision
+    {
+        return Err("Coordinator SpawnRequest belongs to a stale configuration snapshot".into());
+    }
+    let source_revision = binding
+        .ticket_revision
+        .ok_or("Coordinator SpawnRequest lacks TicketRun revision")?;
+    let current = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("Coordinator SpawnRequest references no active TicketRun")?;
+    if current.project_id != binding.project_id
+        || current.revision != source_revision.0
+        || !crate::runtime_services::role_allowed_in_phase(request.role, current.phase)
+    {
+        return Err("Coordinator SpawnRequest is stale or outside its TicketRun".into());
+    }
+    if !config
+        .projects
+        .get(&binding.project_id)
+        .is_some_and(|project| {
+            request
+                .allowed_repositories
+                .iter()
+                .all(|id| project.repositories.contains(id))
+        })
+    {
+        return Err(
+            "Coordinator SpawnRequest references a repository outside Project policy".into(),
+        );
+    }
+    let accepted = store.latest_accepted_work_plan(&binding.project_id, ticket_run_id)?;
+    if request.role == Role::Planner {
+        if accepted.as_ref().is_some_and(|plan| {
+            plan.plan_digest != request.plan_digest
+                || !plan
+                    .proposal
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == request.work_node && node.investigation)
+        }) {
+            return Err(
+                "Coordinator Planner SpawnRequest differs from the accepted investigation node"
+                    .into(),
+            );
+        }
+    } else {
+        let accepted = accepted.ok_or("Coordinator SpawnRequest has no accepted plan")?;
+        if accepted.plan_digest != request.plan_digest
+            || !accepted
+                .proposal
+                .nodes
+                .iter()
+                .any(|node| node.id == request.work_node)
+        {
+            return Err("Coordinator SpawnRequest does not match an accepted plan node".into());
+        }
+    }
+    let mut expected_profile =
+        crate::config::effective_project_roles(&binding.project_id, &config.projects)?
+            .get(&request.role)
+            .cloned()
+            .ok_or("Project has no profile for the requested child role")?;
+    if let Some(recipe_id) = &current.recipe_id {
+        if let Some(recipe_profile) = config
+            .operation_recipes
+            .get(recipe_id)
+            .and_then(|recipe| recipe.roles.get(&request.role))
+        {
+            expected_profile = recipe_profile.clone();
+        }
+    }
+    if expected_profile != request.profile_id {
+        return Err("Coordinator SpawnRequest profile differs from current Project policy".into());
+    }
+    let session = format!("ticket_run:{ticket_run_id}:{}", role_name(request.role));
+    let payload = serde_json::json!({
+        "kind": "coordinator_spawn",
+        "request": request,
+        "source_evidence_id": result.receipt.evidence_id(),
+    });
+    store.persist_coordinator_child_wake(
+        owner_generation,
+        result,
+        request.role,
+        &session,
+        source_revision.0,
+        &payload,
+    )?;
+    Ok(true)
 }

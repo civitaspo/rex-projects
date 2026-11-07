@@ -1492,6 +1492,306 @@ pub(crate) mod tests {
     use crate::domain::types::Role;
     use std::path::PathBuf;
 
+    fn coordinator_spawn_result(child_role: Role) -> IngestedAgentResult {
+        let digest = || Digest::parse("a".repeat(64)).unwrap();
+        let binding = RoleResultBinding {
+            agent_run_id: AgentRunId::parse("coordinator-run").unwrap(),
+            operation_id: OperationId::parse("coordinator-operation").unwrap(),
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role_session_id: crate::engine::orchestration::RoleSessionId::parse(
+                "ticket_run:ticket-run:coordinator",
+            )
+            .unwrap(),
+            role: Role::Coordinator,
+            parent_run_id: Some(AgentRunId::parse("supervisor-run").unwrap()),
+            parent_role: Some(Role::Supervisor),
+            ticket_run_id: Some(TicketRunId::parse("ticket-run").unwrap()),
+            ticket_revision: Some(Revision(3)),
+            config_revision: Revision(2),
+            config_digest: digest(),
+            profile_digest: digest(),
+            instruction_digest: digest(),
+            provider_capability_receipt_digest: digest(),
+            result_schema_digest: digest(),
+            controller_generation: 7,
+            run_epoch: 3,
+            attempt: 1,
+        };
+        let request = crate::engine::orchestration::SpawnRequestPayload {
+            work_node: crate::engine::orchestration::WorkNodeId::parse("plan-node").unwrap(),
+            role: child_role,
+            profile_id: ProfileId::parse("planner").unwrap(),
+            plan_digest: digest(),
+            allowed_repositories: Vec::new(),
+            artifact_inputs: Vec::new(),
+            parent_run_id: Some(AgentRunId::parse("agent-chosen-parent").unwrap()),
+        };
+        IngestedAgentResult {
+            validated: crate::engine::orchestration::ValidatedRoleResult {
+                binding,
+                message_id: "message-1".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::SpawnRequest,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                structured_result: serde_json::to_value(&request).unwrap(),
+                typed_payload: crate::engine::orchestration::RoleResultPayload::SpawnRequest(
+                    request,
+                ),
+                result_digest: digest(),
+                claimed_artifact_refs: Vec::new(),
+                wake_recipients: Vec::new(),
+            },
+            receipt: StoredRoleResultReceipt {
+                evidence_id: "evidence-spawn".into(),
+                message_id: "message-1".into(),
+                content_digest: digest(),
+                terminal_digest: digest(),
+                wake_input_ids: Vec::new(),
+            },
+            verified_artifacts: Vec::new(),
+        }
+    }
+
+    fn spawn_test_store() -> ConfigStore {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let mut authority = test_authority();
+        authority.agent_run_id = AgentRunId::parse("coordinator-run").unwrap();
+        authority.role = Role::Coordinator;
+        authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        authority.parent_role = Some(Role::Supervisor);
+        authority.operation_id = OperationId::parse("coordinator-operation").unwrap();
+        authority.run_epoch = 3;
+        let authority_json = serde_json::to_string(&authority).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE controller_owners(singleton INTEGER, generation INTEGER, stopped_at_unix INTEGER);
+                 INSERT INTO controller_owners VALUES (1,7,NULL);
+                 CREATE TABLE projects(project_id TEXT, config_revision INTEGER, config_digest TEXT);
+                 INSERT INTO projects VALUES ('project-a',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+                 CREATE TABLE ticket_runs(ticket_run_id TEXT, project_id TEXT, revision INTEGER, internal_phase TEXT, config_revision INTEGER, config_digest TEXT);
+                 INSERT INTO ticket_runs VALUES ('ticket-run','project-a',3,'planning',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+                 CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT);
+                 CREATE TABLE agent_result_evidence(evidence_id TEXT, agent_run_id TEXT, project_id TEXT, role TEXT, outcome TEXT, ticket_run_id TEXT, run_epoch INTEGER);
+                 INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed','ticket-run',3);
+                 CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, source_revision INTEGER, priority INTEGER, payload_json TEXT, lifecycle TEXT, created_at_unix INTEGER, UNIQUE(role_session_id,source_type,source_id,source_revision));
+                 CREATE TABLE agent_result_reducer_ack(evidence_id TEXT PRIMARY KEY, reducer_revision INTEGER, disposition TEXT, acknowledged_at_unix INTEGER);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run',?1)",
+                [&authority_json],
+            )
+            .unwrap();
+        ConfigStore {
+            connection,
+            _machine_lock: crate::store::MachineLock { _file: None },
+        }
+    }
+
+    #[test]
+    fn coordinator_spawn_wake_is_durable_idempotent_and_rejects_worker_generic_launch() {
+        let mut store = spawn_test_store();
+        let result = coordinator_spawn_result(Role::Planner);
+        let payload = serde_json::json!({"request":result.validated.structured_result});
+        store
+            .persist_coordinator_child_wake(
+                7,
+                &result,
+                Role::Planner,
+                "ticket_run:ticket-run:planner",
+                3,
+                &payload,
+            )
+            .unwrap();
+        store
+            .persist_coordinator_child_wake(
+                7,
+                &result,
+                Role::Planner,
+                "ticket_run:ticket-run:planner",
+                3,
+                &payload,
+            )
+            .unwrap();
+        let wake_count: u32 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(wake_count, 1);
+        let wake: (String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT source_type,source_id,role_session_id FROM role_wake_inputs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            wake,
+            (
+                "coordinator_child".into(),
+                "evidence-spawn".into(),
+                "ticket_run:ticket-run:planner".into()
+            )
+        );
+        let ack: (u64, String) = store
+            .connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id='evidence-spawn'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ack, (3, "applied".into()));
+        let error = store
+            .persist_coordinator_child_wake(
+                7,
+                &coordinator_spawn_result(Role::Worker),
+                Role::Worker,
+                "ticket_run:ticket-run:worker",
+                3,
+                &payload,
+            )
+            .unwrap_err();
+        assert!(error.contains("generic ticket role"));
+        store
+            .connection
+            .execute("UPDATE ticket_runs SET revision=4", [])
+            .unwrap();
+        assert!(
+            store
+                .persist_coordinator_child_wake(
+                    7,
+                    &result,
+                    Role::Planner,
+                    "ticket_run:ticket-run:planner",
+                    3,
+                    &payload,
+                )
+                .unwrap_err()
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn child_parent_resolves_from_source_evidence_and_host_authority() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT);
+                 INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:planner','coordinator_child','evidence-spawn');
+                 CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,project_id TEXT,role TEXT,outcome TEXT);
+                 INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed');
+                 CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT);",
+            )
+            .unwrap();
+        let mut authority = test_authority();
+        authority.agent_run_id = AgentRunId::parse("coordinator-run").unwrap();
+        authority.role = Role::Coordinator;
+        authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        let authority_json = serde_json::to_string(&authority).unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    authority.agent_run_id.as_str(),
+                    authority_json,
+                    authority.descriptor_digest.as_str(),
+                    authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        let store = ConfigStore {
+            connection,
+            _machine_lock: crate::store::MachineLock { _file: None },
+        };
+        let parent = store
+            .coordinator_child_parent(
+                &ProjectId::parse("project-a").unwrap(),
+                "ticket_run:ticket-run:planner",
+            )
+            .unwrap();
+        assert_eq!(parent.agent_run_id.as_str(), "coordinator-run");
+        assert_eq!(parent.role, Role::Coordinator);
+    }
+
+    #[test]
+    fn coordinator_parent_resolves_the_exact_supervisor_dispatch_evidence() {
+        let digest = || Digest::parse("a".repeat(64)).unwrap();
+        let mut authority = test_authority();
+        authority.agent_run_id = AgentRunId::parse("supervisor-run").unwrap();
+        authority.role = Role::Supervisor;
+        authority.role_session_id = "project:project-a:supervisor".into();
+        authority.parent_run_id = None;
+        authority.parent_role = None;
+        authority.ticket_run_id = None;
+        authority.ticket_revision = None;
+        authority.operation_id = OperationId::parse("supervisor-operation").unwrap();
+        authority.run_epoch = 1;
+        let dispatch = crate::engine::orchestration::DispatchRequestPayload {
+            ticket_reference: crate::domain::ids::TicketId::parse("ticket-42").unwrap(),
+            expected_ticket_revision: Revision(8),
+            coordinator_profile: ProfileId::parse("planner").unwrap(),
+            priority: 1,
+            rationale: "matches dispatch policy".into(),
+        };
+        let structured_result = serde_json::to_value(&dispatch).unwrap();
+        let submission = crate::engine::orchestration::RoleResultSubmission {
+            schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "dispatch-message".into(),
+            binding: binding_for(&authority).unwrap(),
+            kind: crate::engine::orchestration::RoleOutputKind::DispatchRequest,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            result_digest: digest(),
+            artifact_refs: Vec::new(),
+            structured_result,
+        };
+        let authority_json = serde_json::to_string(&authority).unwrap();
+        let submission_json = serde_json::to_string(&submission).unwrap();
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, payload_json TEXT);
+                 INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:coordinator','ticket_run_dispatch','ticket-run','{\"supervisor_evidence_id\":\"dispatch-evidence\"}');
+                 CREATE TABLE ticket_runs(ticket_run_id TEXT, project_id TEXT, ticket_id TEXT, external_revision TEXT);
+                 INSERT INTO ticket_runs VALUES ('ticket-run','project-a','ticket-42','8');
+                 CREATE TABLE agent_result_evidence(evidence_id TEXT, agent_run_id TEXT, project_id TEXT, role TEXT, ticket_run_id TEXT, outcome TEXT, result_json TEXT);
+                 CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT, descriptor_digest TEXT, authority_digest TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_result_evidence VALUES ('dispatch-evidence','supervisor-run','project-a','supervisor',NULL,'completed',?1)",
+                [&submission_json],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('supervisor-run',?1,?2,?3)",
+                rusqlite::params![
+                    authority_json,
+                    authority.descriptor_digest.as_str(),
+                    authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        let store = ConfigStore {
+            connection,
+            _machine_lock: crate::store::MachineLock { _file: None },
+        };
+        let parent = store
+            .supervisor_parent_for_ticket_run(
+                &ProjectId::parse("project-a").unwrap(),
+                &TicketRunId::parse("ticket-run").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(parent.agent_run_id.as_str(), "supervisor-run");
+        assert_eq!(parent.role, Role::Supervisor);
+    }
+
     pub(super) fn test_authority() -> AgentLaunchAuthority {
         let digest = || Digest::parse("a".repeat(64)).unwrap();
         AgentLaunchAuthority {
@@ -1611,7 +1911,9 @@ pub(crate) mod tests {
         }
     }
 
-    pub(super) fn reviewer_qualification(authority: &AgentLaunchAuthority) -> ProviderQualification {
+    pub(super) fn reviewer_qualification(
+        authority: &AgentLaunchAuthority,
+    ) -> ProviderQualification {
         use crate::domain::types::{AgentAdapter, CommitMode};
         use crate::launch::{ProviderQualification, QualificationProof, QualificationStatus};
 
@@ -2320,7 +2622,11 @@ pub(crate) mod host_validation_fixture {
             Role::Worker => "worker-v1.json",
             Role::Reviewer => "reviewer-v1.json",
             Role::Postmortem => "postmortem-v1.json",
-            _ => return Err("fixture currently supports Worker, Reviewer, and Postmortem roles".into()),
+            _ => {
+                return Err(
+                    "fixture currently supports Worker, Reviewer, and Postmortem roles".into(),
+                );
+            }
         };
         let schema_bytes = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2578,5 +2884,298 @@ pub(crate) mod host_validation_fixture {
             )
             .optional()
             .map_err(|error| error.to_string())
+    }
+}
+#[allow(clippy::items_after_test_module)]
+impl ConfigStore {
+    /// Persist a typed Coordinator child wake and acknowledge its source evidence atomically.
+    pub fn persist_coordinator_child_wake(
+        &mut self,
+        owner_generation: u64,
+        result: &IngestedAgentResult,
+        child_role: Role,
+        role_session_id: &str,
+        source_revision: u64,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        let binding = &result.validated.binding;
+        if binding.role != Role::Coordinator
+            || result.validated.kind != crate::engine::orchestration::RoleOutputKind::SpawnRequest
+            || result.validated.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+            || matches!(
+                child_role,
+                Role::Worker | Role::Coordinator | Role::Supervisor
+            )
+            || !matches!(&result.validated.typed_payload, crate::engine::orchestration::RoleResultPayload::SpawnRequest(request) if request.role == child_role)
+        {
+            return Err("Coordinator child wake requires a succeeded SpawnRequest for a generic ticket role".into());
+        }
+        let ticket_run_id = binding
+            .ticket_run_id
+            .as_ref()
+            .ok_or("Coordinator child wake requires TicketRun scope")?;
+        let evidence_id = result.receipt.evidence_id();
+        let payload_json = crate::store::canonical_json(payload)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::validate_active_generation(&tx, owner_generation)?;
+        let evidence: Option<(String, String, String, String, Option<String>, u64)> = tx
+            .query_row(
+                "SELECT agent_run_id,project_id,role,outcome,ticket_run_id,run_epoch FROM agent_result_evidence WHERE evidence_id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((run_id, project_id, role, outcome, evidence_ticket, evidence_epoch)) = evidence
+        else {
+            return Err("Coordinator child wake source evidence is missing".into());
+        };
+        if run_id != binding.agent_run_id.as_str()
+            || project_id != binding.project_id.as_str()
+            || role != "coordinator"
+            || outcome != "completed"
+            || evidence_ticket.as_deref() != Some(ticket_run_id.as_str())
+            || evidence_epoch != binding.run_epoch
+            || result.validated.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+        {
+            return Err(
+                "Coordinator child wake source is not a succeeded Coordinator result".into(),
+            );
+        }
+        let source_authority_json: String = tx
+            .query_row(
+                "SELECT authority_json FROM agent_launch_authority WHERE agent_run_id=?1",
+                [binding.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let source_authority: AgentLaunchAuthority =
+            crate::protocol::parse_unique(source_authority_json.as_bytes())?;
+        if binding_for(&source_authority)? != *binding {
+            return Err(
+                "Coordinator child source binding differs from registered launch authority".into(),
+            );
+        }
+        let run: Option<(u64, String, u64, String)> = tx
+            .query_row(
+                "SELECT revision,internal_phase,config_revision,config_digest FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                rusqlite::params![ticket_run_id.as_str(), binding.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let project_config: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [binding.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if run.is_none_or(|(revision, _, config_revision, config_digest)| {
+            revision != source_revision
+                || config_revision != binding.config_revision.0
+                || config_digest != binding.config_digest.as_str()
+        }) || project_config
+            != Some((
+                binding.config_revision.0,
+                binding.config_digest.as_str().to_owned(),
+            ))
+            || binding.ticket_revision.map(|revision| revision.0) != Some(source_revision)
+            || child_role == Role::Worker
+            || child_role == Role::Supervisor
+            || child_role == Role::Coordinator
+            || role_session_id != format!("ticket_run:{ticket_run_id}:{}", role_name(child_role))
+        {
+            return Err("Coordinator child wake source is stale or has an invalid session".into());
+        }
+        let prior_source: Option<(String, String)> = tx
+            .query_row(
+                "SELECT role_session_id,source_id FROM role_wake_inputs WHERE source_type='coordinator_child' AND source_id=?1 ORDER BY wake_input_id LIMIT 1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if prior_source
+            .as_ref()
+            .is_some_and(|(session, source)| session != role_session_id || source != evidence_id)
+        {
+            return Err(
+                "Coordinator evidence already targets a different child role session".into(),
+            );
+        }
+        let session_source: Option<String> = tx
+            .query_row(
+                "SELECT source_id FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='coordinator_child' ORDER BY wake_input_id LIMIT 1",
+                [role_session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if session_source
+            .as_deref()
+            .is_some_and(|source| source != evidence_id)
+        {
+            return Err(
+                "canonical child role session already has a different Coordinator parent".into(),
+            );
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='coordinator_child' AND source_id=?2 AND source_revision=?3",
+                rusqlite::params![role_session_id, evidence_id, source_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if existing
+            .as_ref()
+            .is_some_and(|stored| stored != &payload_json)
+        {
+            return Err("Coordinator source evidence already has a different child wake".into());
+        }
+        if existing.is_none() {
+            tx.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'coordinator_child',?3,?4,10,?5,'pending',?6)",
+                rusqlite::params![binding.project_id.as_str(), role_session_id, evidence_id, source_revision, payload_json, super::now_unix()?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let prior_ack: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if prior_ack.as_ref().is_some_and(|(revision, disposition)| {
+            *revision != source_revision || disposition != "applied"
+        }) {
+            return Err("Coordinator source evidence was acknowledged differently".into());
+        }
+        if prior_ack.is_none() {
+            tx.execute(
+                "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'applied',?3)",
+                rusqlite::params![evidence_id, source_revision, super::now_unix()?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Resolve a child wake's parent from immutable host-validated result evidence.
+    pub fn coordinator_child_parent(
+        &self,
+        project_id: &crate::domain::ids::ProjectId,
+        role_session_id: &str,
+    ) -> Result<crate::launch::AgentLaunchAuthority, String> {
+        let evidence_id: String = self
+            .connection
+            .query_row(
+                "SELECT w.source_id FROM role_wake_inputs w JOIN agent_result_evidence e ON e.evidence_id=w.source_id WHERE w.project_id=?1 AND w.role_session_id=?2 AND w.source_type='coordinator_child' ORDER BY w.wake_input_id LIMIT 1",
+                rusqlite::params![project_id.as_str(), role_session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let parent_run: String = self
+            .connection
+            .query_row(
+                "SELECT agent_run_id FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND role='coordinator' AND outcome='completed'",
+                rusqlite::params![evidence_id, project_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let authority = self
+            .agent_launch_authority(&crate::domain::ids::AgentRunId::parse(parent_run)?)?
+            .ok_or("Coordinator child source has no host launch authority")?;
+        if authority.role != crate::domain::types::Role::Coordinator
+            || authority.project_id != *project_id
+        {
+            return Err("Coordinator child source authority has the wrong role or Project".into());
+        }
+        Ok(authority)
+    }
+
+    /// Resolve a TicketRun Coordinator's Supervisor from its immutable dispatch source.
+    pub fn supervisor_parent_for_ticket_run(
+        &self,
+        project_id: &crate::domain::ids::ProjectId,
+        ticket_run_id: &crate::domain::ids::TicketRunId,
+    ) -> Result<crate::launch::AgentLaunchAuthority, String> {
+        let payload: String = self
+            .connection
+            .query_row(
+                "SELECT payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='ticket_run_dispatch' AND source_id=?3 ORDER BY wake_input_id LIMIT 1",
+                rusqlite::params![project_id.as_str(), format!("ticket_run:{ticket_run_id}:coordinator"), ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let payload: serde_json::Value = crate::protocol::parse_unique(payload.as_bytes())?;
+        let evidence_id = payload
+            .get("supervisor_evidence_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("TicketRun dispatch has no Supervisor source evidence")?;
+        let ticket: (String, Option<String>) = self
+            .connection
+            .query_row(
+                "SELECT ticket_id,external_revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let (run_id, result_json): (String, String) = self
+            .connection
+            .query_row(
+                "SELECT agent_run_id,result_json FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND role='supervisor' AND ticket_run_id IS NULL AND outcome='completed'",
+                rusqlite::params![evidence_id, project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let submission: crate::engine::orchestration::RoleResultSubmission =
+            crate::protocol::parse_unique(result_json.as_bytes())?;
+        if submission.kind != crate::engine::orchestration::RoleOutputKind::DispatchRequest
+            || submission.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+        {
+            return Err(
+                "TicketRun dispatch source is not a succeeded Supervisor DispatchRequest".into(),
+            );
+        }
+        let authority = self
+            .agent_launch_authority(&crate::domain::ids::AgentRunId::parse(run_id)?)?
+            .ok_or("TicketRun dispatch Supervisor has no host launch authority")?;
+        if binding_for(&authority)? != submission.binding {
+            return Err(
+                "TicketRun dispatch source differs from Supervisor launch authority".into(),
+            );
+        }
+        let crate::engine::orchestration::RoleResultPayload::DispatchRequest(request) =
+            crate::engine::orchestration::RoleResultPayload::parse(
+                submission.kind,
+                submission.structured_result,
+            )?
+        else {
+            return Err("Supervisor dispatch evidence has a different typed payload".into());
+        };
+        let expected_revision = request.expected_ticket_revision.0.to_string();
+        if request.ticket_reference.as_str() != ticket.0
+            || ticket.1.as_deref() != Some(expected_revision.as_str())
+        {
+            return Err(
+                "TicketRun dispatch does not match its Supervisor's exact ticket observation"
+                    .into(),
+            );
+        }
+        if authority.role != Role::Supervisor
+            || authority.project_id != *project_id
+            || authority.ticket_run_id.is_some()
+        {
+            return Err("TicketRun dispatch source authority is not a Project Supervisor".into());
+        }
+        Ok(authority)
     }
 }
