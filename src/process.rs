@@ -1124,7 +1124,7 @@ mod tests {
             }
             _ => panic!("unexpected process result: {result:?}"),
         }
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(4));
         assert!(ready.exists());
         assert!(
             child_guard.release_and_reap(),

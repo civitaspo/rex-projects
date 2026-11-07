@@ -480,6 +480,9 @@ def dispatch(db, namespace, delay, request):
             candidates = [row for row in matching_method if row["external_key"] == subject["creation_key"]]
             if exact_operation and exact_operation[0]["external_key"] != subject["creation_key"]:
                 fail("conflict", "operation_id identifies a different creation key")
+        match_basis = "operation_id" if exact_operation else "stable_external_key"
+        if exact_operation:
+            candidates = [exact_operation[0]]
         if candidates:
             invisible = [] if exact_operation else [row for row in candidates if row["visible_at"] > time.time()]
             if invisible:
@@ -487,7 +490,8 @@ def dispatch(db, namespace, delay, request):
             matches = [{"operation_id": row["operation_id"], "method": row["method"],
                         "ticket_id": row["ticket_id"], "stable_external_key": row["external_key"],
                         "receipt": json.loads(row["result_json"])} for row in candidates]
-            return {"ticket_namespace": namespace, "outcome": "found", "matches": matches}
+            return {"ticket_namespace": namespace, "outcome": "found", "match_basis": match_basis,
+                    "matches": matches}
         return {"ticket_namespace": namespace, "outcome": "absent",
                 "proof": {"kind": "fixture-operation-ledger", "scope": json.loads(scope), "observed_at": now()}}
     fail("unsupported", f"unsupported method: {method}", details={"supported_methods": [

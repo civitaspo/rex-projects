@@ -190,6 +190,13 @@ pub enum ReconciliationOutcome {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationMatchBasis {
+    OperationId,
+    StableExternalKey,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OperationMatch {
     pub operation_id: String,
@@ -205,6 +212,8 @@ pub struct OperationMatch {
 pub struct OperationLookup {
     pub ticket_namespace: String,
     pub outcome: ReconciliationOutcome,
+    #[serde(default)]
+    pub match_basis: Option<OperationMatchBasis>,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -784,6 +793,11 @@ impl TicketCommandAdapter {
                 "unknown reconciliation must explain why absence is not proven".into(),
             ));
         }
+        if matches!(result.outcome, ReconciliationOutcome::Found) != result.match_basis.is_some() {
+            return Err(TicketAdapterError::Protocol(
+                "found reconciliation must declare its match basis".into(),
+            ));
+        }
         for matched in &result.matches {
             let subject_matches = if let Some(ticket_id) = requested_subject.get("ticket_id") {
                 matched.ticket_id.as_deref() == Some(ticket_id)
@@ -798,10 +812,17 @@ impl TicketCommandAdapter {
             } else {
                 false
             };
-            if matched.method != requested_method
-                || matched.operation_id != requested_operation_id
-                || !subject_matches
-            {
+            let operation_id_matches = match result.match_basis {
+                Some(OperationMatchBasis::OperationId) => {
+                    matched.operation_id == requested_operation_id
+                }
+                Some(OperationMatchBasis::StableExternalKey) => {
+                    !matched.operation_id.is_empty()
+                        && matched.stable_external_key.as_deref() == Some(&requested_external_key)
+                }
+                None => false,
+            };
+            if matched.method != requested_method || !operation_id_matches || !subject_matches {
                 return Err(TicketAdapterError::Protocol(
                     "operation receipt does not bind the requested operation and subject".into(),
                 ));
@@ -1121,6 +1142,55 @@ mod tests {
             .unwrap();
         assert!(matches!(lookup.outcome, ReconciliationOutcome::Found));
         assert_eq!(lookup.matches.len(), 1);
+    }
+
+    #[test]
+    fn stable_creation_key_lookup_preserves_ambiguous_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = fixture_adapter(&dir, None);
+        let project = Some(ProjectId::parse("project-1").unwrap());
+        let ticket_scope = scope("external-project");
+        adapter
+            .create(
+                req("create-candidate-a"),
+                op("create-candidate-a"),
+                project.clone(),
+                create(ticket_scope.clone(), "shared-key", "Candidate A"),
+            )
+            .unwrap();
+        adapter
+            .create(
+                req("create-candidate-b"),
+                op("create-candidate-b"),
+                project.clone(),
+                create(ticket_scope.clone(), "shared-key", "Candidate B"),
+            )
+            .unwrap();
+
+        let lookup = adapter
+            .find_operation(
+                req("find-candidates"),
+                project,
+                OperationFindRequest {
+                    scope: ticket_scope,
+                    operation_id: "not-indexed-yet".into(),
+                    method: "ticket.create".into(),
+                    stable_external_key: "shared-key".into(),
+                    subject: BTreeMap::from([("creation_key".into(), "shared-key".into())]),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(lookup.outcome, ReconciliationOutcome::Found));
+        assert_eq!(
+            lookup.match_basis,
+            Some(super::OperationMatchBasis::StableExternalKey)
+        );
+        assert_eq!(lookup.matches.len(), 2);
+        assert!(lookup.matches.iter().all(|matched| {
+            matched.operation_id != "not-indexed-yet"
+                && matched.stable_external_key.as_deref() == Some("shared-key")
+        }));
     }
 
     #[test]
