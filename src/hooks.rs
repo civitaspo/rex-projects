@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -127,10 +128,17 @@ impl HookRunner {
         let receipts_root = root
             .join("hook-receipts")
             .join(project_id.as_str())
+            .join(repository_id.as_str())
             .join(ticket_run_id.as_str());
         create_private_directory(&root)?;
         create_private_directory(&root.join("hook-receipts"))?;
         create_private_directory(&root.join("hook-receipts").join(project_id.as_str()))?;
+        create_private_directory(
+            &root
+                .join("hook-receipts")
+                .join(project_id.as_str())
+                .join(repository_id.as_str()),
+        )?;
         create_private_directory(&receipts_root)?;
         let repo = worktree.canonicalize().map_err(io_error)?;
         ensure_real_directory(&repo)?;
@@ -231,7 +239,15 @@ impl HookRunner {
                             .unwrap_or_default()
                             .as_secs(),
                     };
-                    write_receipt(&receipts_root.join(format!("{}.json", hook.id)), &receipt)?;
+                    write_receipt(
+                        &receipt_path(
+                            &receipts_root,
+                            &hook.id,
+                            expected_head,
+                            configuration_digest,
+                        ),
+                        &receipt,
+                    )?;
                     if after_head.trim() != expected_head
                         || receipt.source_before != receipt.source_after
                     {
@@ -277,7 +293,15 @@ impl HookRunner {
                     .unwrap_or_default()
                     .as_secs(),
             };
-            write_receipt(&receipts_root.join(format!("{}.json", hook.id)), &receipt)?;
+            write_receipt(
+                &receipt_path(
+                    &receipts_root,
+                    &hook.id,
+                    expected_head,
+                    configuration_digest,
+                ),
+                &receipt,
+            )?;
             if after_head.trim() != expected_head || source_changed {
                 return Err(HookError::SourceChanged {
                     hook_id: hook.id.clone(),
@@ -460,8 +484,46 @@ fn write_receipt(path: &Path, receipt: &HookReceipt) -> Result<(), HookError> {
     }
     file.write_all(&bytes).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
-    fs::rename(&temporary, path).map_err(io_error)?;
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => fs::remove_file(&temporary).map_err(io_error)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                let _ = fs::remove_file(&temporary);
+                return Err(HookError::Invalid(
+                    "existing hook receipt is not a regular file".into(),
+                ));
+            }
+            let existing: HookReceipt = serde_json::from_slice(&fs::read(path).map_err(io_error)?)
+                .map_err(|_| HookError::Invalid("existing hook receipt is malformed".into()))?;
+            let _ = fs::remove_file(&temporary);
+            if existing != *receipt {
+                return Err(HookError::Invalid(
+                    "refusing to overwrite a different hook receipt".into(),
+                ));
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(io_error(error));
+        }
+    }
     Ok(())
+}
+
+fn receipt_path(root: &Path, hook_id: &str, head: &str, configuration_digest: &Digest) -> PathBuf {
+    static NEXT_RECEIPT_ID: AtomicU64 = AtomicU64::new(0);
+    let head_key = hex_bytes(&Sha256::digest(head.as_bytes()));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_RECEIPT_ID.fetch_add(1, Ordering::Relaxed);
+    root.join(format!(
+        "{hook_id}-{head_key}-{}-{}-{nonce}-{sequence}.json",
+        configuration_digest.as_str(),
+        std::process::id(),
+    ))
 }
 
 fn create_private_directory(path: &Path) -> Result<(), HookError> {
@@ -605,6 +667,22 @@ mod tests {
         }
     }
 
+    fn receipts_for(
+        temp: &tempfile::TempDir,
+        repository_id: &str,
+        ticket_run_id: &str,
+    ) -> Vec<HookReceipt> {
+        let directory = temp
+            .path()
+            .join("hook-receipts/fixture-project")
+            .join(repository_id)
+            .join(ticket_run_id);
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap())
+            .collect()
+    }
+
     #[test]
     fn records_success_bound_to_head_configuration_and_source() {
         let (temp, repo, config_digest) = fixture();
@@ -653,11 +731,107 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert!(receipts[0].succeeded);
         assert_eq!(receipts[0].head, expected_head);
-        assert!(
-            temp.path()
-                .join("hook-receipts/fixture-project/run-1/check.json")
-                .is_file()
+        let saved = receipts_for(&temp, "fixture-repo", "run-1");
+        assert_eq!(saved, receipts);
+        let directory = temp
+            .path()
+            .join("hook-receipts/fixture-project/fixture-repo/run-1");
+        let receipt_path = fs::read_dir(directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original_bytes = fs::read(&receipt_path).unwrap();
+        let mut conflicting_receipt = receipts[0].clone();
+        conflicting_receipt.succeeded = false;
+        assert!(write_receipt(&receipt_path, &conflicting_receipt).is_err());
+        assert_eq!(fs::read(&receipt_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn keeps_receipts_separate_for_repositories_with_same_project_ticket_and_hook() {
+        let (temp, first_repo, config_digest) = fixture();
+        let second_repo = temp.path().join("worktrees/second-repo/shared");
+        fs::create_dir_all(second_repo.parent().unwrap()).unwrap();
+        fixture_git(
+            temp.path(),
+            &[
+                "clone",
+                "--shared",
+                "--quiet",
+                first_repo.to_str().unwrap(),
+                second_repo.to_str().unwrap(),
+            ],
         );
+        let head = |repo: &Path| {
+            let output = process::run(ProcessRequest {
+                executable: PathBuf::from("/usr/bin/git"),
+                args: ["rev-parse", "HEAD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.to_owned()),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+                shutdown_grace: Duration::from_secs(2),
+                stdout_limit: 1024,
+                stderr_tail_limit: 1024,
+            })
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let runner = HookRunner::new(
+            GitOptions {
+                executable: PathBuf::from("/usr/bin/git"),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+            },
+            [(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))].into(),
+        );
+        let project = ProjectId::parse("fixture-project").unwrap();
+        let ticket_run = TicketRunId::parse("same-run").unwrap();
+        let first_repository = RepositoryId::parse("first-repo").unwrap();
+        let second_repository = RepositoryId::parse("second-repo").unwrap();
+        for (repository_id, worktree, repeats) in [
+            (&first_repository, &first_repo, 2),
+            (&second_repository, &second_repo, 1),
+        ] {
+            for _ in 0..repeats {
+                runner
+                    .run_required(
+                        &[hook(&["sh", "-c", "test -f README.md"])],
+                        HookRunContext {
+                            repository_id,
+                            worktree,
+                            expected_head: &head(worktree),
+                            project_id: &project,
+                            ticket_run_id: &ticket_run,
+                            configuration_digest: &config_digest,
+                            state_root: temp.path(),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let first_receipts = receipts_for(&temp, "first-repo", "same-run");
+        let second_receipts = receipts_for(&temp, "second-repo", "same-run");
+        assert_eq!(first_receipts.len(), 2);
+        assert_eq!(second_receipts.len(), 1);
+        assert!(
+            first_receipts
+                .iter()
+                .all(|receipt| receipt.hook_id == second_receipts[0].hook_id)
+        );
+        assert!(
+            first_receipts
+                .iter()
+                .all(|receipt| receipt.repository_id != second_receipts[0].repository_id)
+        );
+        assert!(first_receipts.iter().all(|receipt| receipt.succeeded));
+        assert!(second_receipts[0].succeeded);
     }
 
     #[test]
@@ -701,11 +875,8 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(HookError::SourceChanged { .. })));
-        let receipt = fs::read_to_string(
-            temp.path()
-                .join("hook-receipts/fixture-project/run-2/check.json"),
-        )
-        .unwrap();
-        assert!(receipt.contains("\"succeeded\": false"));
+        let receipts = receipts_for(&temp, "fixture-repo", "run-2");
+        assert_eq!(receipts.len(), 1);
+        assert!(!receipts[0].succeeded);
     }
 }
