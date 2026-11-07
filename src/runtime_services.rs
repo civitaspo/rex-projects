@@ -1886,19 +1886,22 @@ impl FactoryRuntimeServices for RuntimeServices {
             &profile_digest,
             32,
         )?;
-        let qualification = qualifications
-            .into_iter()
-            .find(|qualification| {
-                qualification.adapter == runtime_identity.adapter
-                    && qualification.executable_path
-                        == runtime_identity.executable_path.display().to_string()
-                    && qualification.executable_digest == runtime_identity.executable_digest
-                    && qualification.commit_mode == runtime_identity.commit_mode
-                    && qualification.invocation_options_digest
-                        == runtime_identity.invocation_options_digest
-                    && qualification.permission_mode == runtime_identity.effective_permission_mode
-            })
-            .ok_or("Supervisor profile has no exact verified unattended qualification")?;
+        let Some(qualification) = qualifications.into_iter().find(|qualification| {
+            qualification.adapter == runtime_identity.adapter
+                && qualification.executable_path
+                    == runtime_identity.executable_path.display().to_string()
+                && qualification.executable_digest == runtime_identity.executable_digest
+                && qualification.commit_mode == runtime_identity.commit_mode
+                && qualification.invocation_options_digest
+                    == runtime_identity.invocation_options_digest
+                && qualification.permission_mode == runtime_identity.effective_permission_mode
+        }) else {
+            eprintln!(
+                "rex-projects: parked Supervisor launch for Project {}: profile {} has no exact verified provider qualification; run `rex-projects provider qualify --project {} --role supervisor`",
+                candidate.project_id, profile_id, candidate.project_id
+            );
+            return Ok(false);
+        };
         let qualification_digest = qualification.canonical_digest()?;
         let wake_inputs = store.pending_role_wake_inputs(
             &candidate.project_id,
