@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod cli;
 pub mod config;
 pub mod domain;
@@ -6,5 +7,6 @@ pub mod human;
 pub mod knowledge;
 pub mod learning;
 pub mod mailbox;
+pub mod process;
 pub mod protocol;
 pub mod store;
