@@ -38,10 +38,19 @@ fn cargo_version_argument_is_compatible_with_release_probes() {
         .output()
         .expect("run rex-projects with a version argument");
     assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("rex-projects {}\n", env!("CARGO_PKG_VERSION"))
-    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn version_json_is_enabled_when_global_flag_precedes_subcommand() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .args(["--json", "version"])
+        .output()
+        .expect("run rex-projects --json version");
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

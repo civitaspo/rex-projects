@@ -112,7 +112,6 @@ pub fn run() -> Result<i32, CliError> {
     let args = std::env::args_os().collect::<Vec<_>>();
     let json_requested = args.iter().any(|argument| argument == "--json");
     if args.len() == 2 && args[1] == env!("CARGO_PKG_VERSION") {
-        println!("rex-projects {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
     let cli = match Cli::try_parse_from(args) {
@@ -137,7 +136,7 @@ pub fn run() -> Result<i32, CliError> {
     };
     let json = cli.json || matches!(&cli.command, Command::Version { json: true });
     let result = match cli.command {
-        Command::Version { json: version_json } => version(version_json),
+        Command::Version { json: version_json } => version(version_json || json),
         Command::Schema { kind } => schema(kind),
         Command::Config(ConfigCommand::Validate) => validate_config(cli.config.as_deref(), json),
         Command::Config(ConfigCommand::Apply(args)) => {
