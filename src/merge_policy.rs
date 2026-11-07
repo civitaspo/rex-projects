@@ -89,7 +89,7 @@ pub struct MergeEvidenceSnapshot {
     pub execution_time_base_guard: EvidenceState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RiskWeights {
     pub change_impact: u8,
     pub complexity: u8,
@@ -134,7 +134,7 @@ impl RiskWeights {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MergePolicy {
     pub auto_merge_enabled: bool,
     pub minimum_reliability_score: u8,

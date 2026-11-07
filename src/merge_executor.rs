@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
-use crate::domain::ids::Digest;
+use crate::domain::ids::{Digest, HumanRequestId};
 use crate::domain::types::MergeMethod;
 use crate::forge::{
     BodyUpdateIntent, DirectMergeIntent, EffectAcknowledgement, EffectCertainty, Forge, ForgeError,
@@ -51,8 +51,7 @@ pub struct ResolvedMergeAuthority {
 
 impl ResolvedMergeAuthority {
     fn validate(&self, assessment: &MergeAssessment) -> Result<(), MergeExecutionError> {
-        if self.policy_digest != assessment.subject.config_digest
-            || self.instruction_digest != assessment.subject.instruction_digest
+        if self.instruction_digest != assessment.subject.instruction_digest
             || self.base_guard_digest != assessment.subject.base_guard_digest
         {
             return Err(MergeExecutionError::Stale(
@@ -85,15 +84,92 @@ impl ResolvedMergeAuthority {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Host-validated, exact-scope approval. It has no public constructor or Serde implementation,
+/// so a CLI or Agent payload cannot mint approval by deserializing these fields.
+///
+/// ```compile_fail
+/// let _: rex_projects::merge_executor::HumanMergeApproval =
+///     serde_json::from_str(r#"{"approved":true}"#).unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanMergeApproval {
-    pub subject: crate::merge_policy::MergeSubject,
-    pub evidence_digest: Digest,
-    pub procedure_digest: Digest,
-    pub actor_id: String,
-    pub expires_at_unix: u64,
+    request_id: HumanRequestId,
+    subject: crate::merge_policy::MergeSubject,
+    configuration_digest: Digest,
+    policy_digest: Digest,
+    evidence_digest: Digest,
+    procedure_digest: Digest,
+    response_id: String,
+    expires_at_unix: u64,
     /// Exact request bytes separately approved when they were not literal trusted instructions.
-    pub exact_request_comment: Option<String>,
+    exact_request_comment: Option<String>,
+}
+
+/// Implemented only by the host store adapter for the exact-scope approval lookup. This trait is
+/// crate-private; protocol types supplied by an Agent cannot provide a receipt to the constructor.
+pub(crate) trait HostValidatedHumanApprovalReceipt {
+    fn request_id(&self) -> &HumanRequestId;
+    fn response_id(&self) -> &str;
+    fn subject_digest(&self) -> &Digest;
+    fn configuration_digest(&self) -> &Digest;
+    fn policy_digest(&self) -> &Digest;
+    fn is_explicit_approval(&self) -> bool;
+    fn decided_at_unix(&self) -> u64;
+    fn expires_at_unix(&self) -> u64;
+}
+
+impl HumanMergeApproval {
+    /// Mint an approval only from a host store receipt. `expected_subject_digest` must be the
+    /// persisted HumanSubjectBinding digest whose material/bundle digests cover this assessment and
+    /// exact procedure.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Called by the durable human-approval handler introduced in PR5 runtime.
+    pub(crate) fn from_host_validated_receipt(
+        receipt: &impl HostValidatedHumanApprovalReceipt,
+        expected_request_id: &HumanRequestId,
+        expected_subject_digest: &Digest,
+        policy: &MergePolicy,
+        assessment: &MergeAssessment,
+        procedure: &MergeProcedure,
+        now_unix: u64,
+    ) -> Result<Self, MergeExecutionError> {
+        let configuration_digest = assessment.subject.config_digest.clone();
+        let policy_digest = canonical_digest(policy).map_err(forge_error)?;
+        let evidence_digest = assessment.evidence_digest.clone();
+        let procedure_digest = canonical_digest(procedure).map_err(forge_error)?;
+        let exact_request_comment = procedure.steps.iter().find_map(|step| {
+            if let MergeProcedureOperation::RequestMerge { exact_comment } = &step.operation {
+                Some(exact_comment.clone())
+            } else {
+                None
+            }
+        });
+        if receipt.request_id() != expected_request_id
+            || receipt.subject_digest() != expected_subject_digest
+            || receipt.configuration_digest() != &configuration_digest
+            || receipt.policy_digest() != &policy_digest
+            || !receipt.is_explicit_approval()
+            || receipt.response_id().trim().is_empty()
+            || receipt.decided_at_unix() >= receipt.expires_at_unix()
+            || now_unix >= receipt.expires_at_unix()
+        {
+            return Err(MergeExecutionError::HumanApprovalRequired(
+                "host approval receipt is stale, unapproved, or bound to a different request"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            request_id: expected_request_id.clone(),
+            subject: assessment.subject.clone(),
+            configuration_digest,
+            policy_digest,
+            evidence_digest,
+            procedure_digest,
+            response_id: receipt.response_id().to_owned(),
+            expires_at_unix: receipt.expires_at_unix(),
+            exact_request_comment,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,6 +257,12 @@ impl<F: Forge> MergeProcedureExecutor<F> {
     ) -> Result<StepOutcome, MergeExecutionError> {
         validate_procedure_policy(policy, procedure, &approved.subject)?;
         authority.validate(approved)?;
+        let policy_digest = canonical_digest(policy).map_err(forge_error)?;
+        if authority.policy_digest != policy_digest {
+            return Err(MergeExecutionError::Stale(
+                "resolved merge policy digest differs from the current repository policy".into(),
+            ));
+        }
         let procedure_digest = canonical_digest(procedure).map_err(forge_error)?;
         let current_assessment =
             evaluate_merge_policy(policy, evidence_now).map_err(MergeExecutionError::Invalid)?;
@@ -203,6 +285,7 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             approved,
             approval,
             &procedure_digest,
+            &policy_digest,
             intent.attempt_started_unix,
         )?;
         if approved.disposition == MergeDisposition::HumanRequired && !human_approved {
@@ -485,14 +568,18 @@ fn validate_approval(
     assessment: &MergeAssessment,
     approval: Option<&HumanMergeApproval>,
     procedure_digest: &Digest,
+    policy_digest: &Digest,
     now_unix: u64,
 ) -> Result<bool, MergeExecutionError> {
     let Some(approval) = approval else {
         return Ok(false);
     };
-    if approval.actor_id.is_empty()
+    if approval.response_id.is_empty()
+        || approval.request_id.as_str().trim().is_empty()
         || approval.expires_at_unix <= now_unix
         || approval.subject != assessment.subject
+        || approval.configuration_digest != assessment.subject.config_digest
+        || &approval.policy_digest != policy_digest
         || approval.evidence_digest != assessment.evidence_digest
         || &approval.procedure_digest != procedure_digest
     {
@@ -648,7 +735,9 @@ fn forge_error(error: ForgeError) -> MergeExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ids::HumanRequestId;
     use crate::domain::types::{MergeExecutor, MergeMethod};
+    use crate::merge_executor::HostValidatedHumanApprovalReceipt;
     use crate::merge_policy::{MergeProcedureOperation, MergeSubject, RiskWeights};
 
     fn test_digest(letter: char) -> Digest {
@@ -676,6 +765,194 @@ mod tests {
             review_digest: test_digest('2'),
             prepared_body_digest: None,
         }
+    }
+
+    struct AcceptedReceipt {
+        request_id: HumanRequestId,
+        response_id: String,
+        subject_digest: Digest,
+        configuration_digest: Digest,
+        policy_digest: Digest,
+        approved: bool,
+        decided_at_unix: u64,
+        expires_at_unix: u64,
+    }
+
+    impl HostValidatedHumanApprovalReceipt for AcceptedReceipt {
+        fn request_id(&self) -> &HumanRequestId {
+            &self.request_id
+        }
+        fn response_id(&self) -> &str {
+            &self.response_id
+        }
+        fn subject_digest(&self) -> &Digest {
+            &self.subject_digest
+        }
+        fn configuration_digest(&self) -> &Digest {
+            &self.configuration_digest
+        }
+        fn policy_digest(&self) -> &Digest {
+            &self.policy_digest
+        }
+        fn is_explicit_approval(&self) -> bool {
+            self.approved
+        }
+        fn decided_at_unix(&self) -> u64 {
+            self.decided_at_unix
+        }
+        fn expires_at_unix(&self) -> u64 {
+            self.expires_at_unix
+        }
+    }
+
+    fn human_approval_inputs() -> (
+        AcceptedReceipt,
+        HumanRequestId,
+        Digest,
+        MergePolicy,
+        MergeAssessment,
+        MergeProcedure,
+    ) {
+        let subject = test_subject();
+        let policy = MergePolicy {
+            auto_merge_enabled: false,
+            minimum_reliability_score: 90,
+            method: MergeMethod::Squash,
+            executor: MergeExecutor::Direct,
+            required_checks: vec!["ci".into()],
+            required_approving_reviews: None,
+            risk_weights: RiskWeights::default(),
+        };
+        let procedure = MergeProcedure {
+            method: MergeMethod::Squash,
+            executor: MergeExecutor::Direct,
+            steps: vec![
+                MergeProcedureStep {
+                    key: "merge".into(),
+                    prerequisites: vec![],
+                    operation: MergeProcedureOperation::ExecuteMerge {
+                        expected_head_sha: subject.head_sha.clone(),
+                        base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
+                    },
+                    instruction_digest: subject.instruction_digest.clone(),
+                },
+                MergeProcedureStep {
+                    key: "verify".into(),
+                    prerequisites: vec!["merge".into()],
+                    operation: MergeProcedureOperation::VerifyMergeCommit {
+                        expected_trailers: vec!["Co-authored-by: Agent <a@b>".into()],
+                    },
+                    instruction_digest: subject.instruction_digest.clone(),
+                },
+            ],
+        };
+        let assessment = MergeAssessment {
+            subject: subject.clone(),
+            evidence_digest: test_digest('7'),
+            disposition: MergeDisposition::HumanRequired,
+            risk_index: Some(0),
+            reliability_score: Some(100),
+            reasons: vec!["automatic merge disabled".into()],
+        };
+        let request_id = HumanRequestId::parse("human-approval-7").unwrap();
+        let expected_subject_digest = test_digest('8');
+        let policy_digest = canonical_digest(&policy).unwrap();
+        let receipt = AcceptedReceipt {
+            request_id: request_id.clone(),
+            response_id: "human-response-7".into(),
+            subject_digest: expected_subject_digest.clone(),
+            configuration_digest: subject.config_digest.clone(),
+            policy_digest,
+            approved: true,
+            decided_at_unix: 100,
+            expires_at_unix: 200,
+        };
+        (
+            receipt,
+            request_id,
+            expected_subject_digest,
+            policy,
+            assessment,
+            procedure,
+        )
+    }
+
+    #[test]
+    fn approval_is_minted_only_from_a_current_exact_host_receipt() {
+        let (receipt, request_id, subject_digest, policy, assessment, procedure) =
+            human_approval_inputs();
+        let approval = HumanMergeApproval::from_host_validated_receipt(
+            &receipt,
+            &request_id,
+            &subject_digest,
+            &policy,
+            &assessment,
+            &procedure,
+            150,
+        )
+        .unwrap();
+        let procedure_digest = canonical_digest(&procedure).unwrap();
+        let policy_digest = canonical_digest(&policy).unwrap();
+        assert!(
+            validate_approval(
+                &assessment,
+                Some(&approval),
+                &procedure_digest,
+                &policy_digest,
+                150,
+            )
+            .unwrap()
+        );
+        assert!(
+            HumanMergeApproval::from_host_validated_receipt(
+                &receipt,
+                &HumanRequestId::parse("another-request").unwrap(),
+                &subject_digest,
+                &policy,
+                &assessment,
+                &procedure,
+                150,
+            )
+            .is_err()
+        );
+        assert!(
+            HumanMergeApproval::from_host_validated_receipt(
+                &receipt,
+                &request_id,
+                &test_digest('9'),
+                &policy,
+                &assessment,
+                &procedure,
+                150,
+            )
+            .is_err()
+        );
+        assert!(
+            HumanMergeApproval::from_host_validated_receipt(
+                &receipt,
+                &request_id,
+                &subject_digest,
+                &policy,
+                &assessment,
+                &procedure,
+                200,
+            )
+            .is_err()
+        );
+        let mut denied = receipt;
+        denied.approved = false;
+        assert!(
+            HumanMergeApproval::from_host_validated_receipt(
+                &denied,
+                &request_id,
+                &subject_digest,
+                &policy,
+                &assessment,
+                &procedure,
+                150,
+            )
+            .is_err()
+        );
     }
 
     #[test]
