@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+if [ "${1-}" = push ]; then
+	printf '%s\n' 'git push denied by PR0 disposable fixture' >> "${REX_PROJECTS_PROBE_GUARD_LOG:?}"
+	exit 125
+fi
+exec /usr/bin/git "$@"
