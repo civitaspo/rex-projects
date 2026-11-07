@@ -536,6 +536,73 @@ pub fn pending_agent_results(
     Ok(results)
 }
 
+/// Resolve a pending wake to its persisted source result, revalidating the host terminal receipt,
+/// immutable launch authority, and every registered artifact before returning typed material.
+/// The wake's payload is intentionally not used as authority.
+pub fn agent_result_for_wake(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    wake_input_id: i64,
+) -> Result<Option<IngestedAgentResult>, String> {
+    if wake_input_id <= 0 {
+        return Err("Agent result wake ID must be positive".into());
+    }
+    let source = store
+        .connection
+        .query_row(
+            "SELECT e.evidence_id,e.agent_run_id,e.message_id,e.result_json \
+         FROM role_wake_inputs w \
+         JOIN agent_result_wakes aw ON aw.wake_input_id=w.wake_input_id \
+         JOIN agent_result_evidence e ON e.evidence_id=aw.evidence_id \
+         WHERE w.wake_input_id=?1 AND w.source_type='agent_result' \
+           AND w.lifecycle IN ('pending','assigned')",
+            [wake_input_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((evidence_id, run_id, message_id, json)) = source else {
+        return Ok(None);
+    };
+    let run_id = AgentRunId::parse(run_id)?;
+    let submission: RoleResultSubmission = crate::protocol::parse_unique(json.as_bytes())?;
+    if submission.message_id != message_id {
+        return Err("stored role result message ID differs from wake source evidence".into());
+    }
+    let authority = store
+        .agent_launch_authority(&run_id)?
+        .ok_or("Agent result wake source has no launch authority")?;
+    if authority.controller_generation != owner_generation
+        || binding_for(&authority)? != submission.binding
+    {
+        return Err("Agent result wake source no longer matches its launch authority".into());
+    }
+    let terminal = verify_agent_terminal(store, owner_generation, &run_id)?;
+    let message = RoleResultMessage {
+        schema_version: submission.schema_version,
+        message_id: submission.message_id,
+        kind: submission.kind,
+        assertion: submission.assertion,
+        structured_result: submission.structured_result,
+        result_digest: submission.result_digest,
+        artifact_refs: submission.artifact_refs,
+    };
+    let replayed =
+        ingest_agent_result(store, artifact_store, owner_generation, &terminal, message)?;
+    if replayed.receipt.evidence_id != evidence_id {
+        return Err("Agent result wake resolved to different immutable evidence".into());
+    }
+    Ok(Some(replayed))
+}
+
 /// Poll a bounded set of launched Agent control directories and ingest at most one new result.
 /// Existing unacknowledged evidence is replayed first so the semantic consumer can finish after a
 /// crash without waiting for the Agent to publish again.
@@ -1339,6 +1406,15 @@ mod tests {
 }
 
 impl ConfigStore {
+    pub fn validated_agent_result_for_wake(
+        &mut self,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+        wake_input_id: i64,
+    ) -> Result<Option<IngestedAgentResult>, String> {
+        agent_result_for_wake(self, artifact_store, owner_generation, wake_input_id)
+    }
+
     pub fn ingest_next_spooled_agent_result(
         &mut self,
         artifact_store: &crate::artifacts::ArtifactStore,
