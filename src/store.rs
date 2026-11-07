@@ -725,6 +725,43 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
+        let persisted: Option<RexViewIdentityRow> = tx
+            .query_row(
+                "SELECT project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id FROM rex_views WHERE view_id=?1",
+                [candidate.view.view_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let expected_kind = serde_json::to_value(candidate.view.kind)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or("Rex view kind did not serialize as a string")?
+            .to_owned();
+        let expected = (
+            candidate.view.project_id.as_str().to_owned(),
+            expected_kind,
+            candidate.view.ticket_namespace.clone(),
+            candidate.view.ticket_id.clone(),
+            candidate.view.view_epoch,
+            candidate.view.rex_server_identity.clone(),
+            candidate.view.rex_session_id.clone(),
+            candidate.view.rex_window_id.clone(),
+        );
+        if persisted.as_ref() != Some(&expected) {
+            return Err("cleanup candidate does not match persisted Rex view identity".into());
+        }
         let cutoff = now_unix.saturating_sub(retention_seconds);
         let changed=tx.execute(
             "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND updated_at_unix<=?3 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2)))",
@@ -915,7 +952,7 @@ impl ConfigStore {
                 "new launch authority must belong to the active controller generation".into(),
             );
         }
-        let run: Option<(String, String, u64, String, String, String, String)> = tx.query_row(
+        let run: Option<(String, String, u64, String, String, u64, String)> = tx.query_row(
             "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source FROM agent_runs WHERE agent_run_id=?1",
             [authority.agent_run_id.as_str()],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
@@ -937,10 +974,33 @@ impl ConfigStore {
             || generation != owner_generation
             || operation_id != authority.operation_id.as_str()
             || config_digest != authority.config_digest.as_str()
-            || config_revision != authority.config_revision.0.to_string()
+            || config_revision != authority.config_revision.0
         {
             return Err("AgentRun does not match the proposed launch authority".into());
         }
+        let ticket_scope = if authority.role == Role::Supervisor {
+            None
+        } else {
+            let ticket_run_id = authority
+                .ticket_run_id
+                .as_ref()
+                .ok_or("ticket AgentRun is missing TicketRun ID")?;
+            let ticket: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT project_id,namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1",
+                    [ticket_run_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((ticket_project, namespace, ticket_id)) = ticket else {
+                return Err("launch TicketRun does not exist".into());
+            };
+            if ticket_project != authority.project_id.as_str() {
+                return Err("launch TicketRun belongs to another Project".into());
+            }
+            Some((namespace, ticket_id))
+        };
         let snapshot: Option<(String, String)> = tx.query_row(
             "SELECT snapshots.digest,snapshots.effective_config_json FROM config_current current JOIN config_snapshots snapshots USING(source_identity,revision) WHERE current.source_identity=?1 AND current.revision=?2",
             params![config_source,authority.config_revision.0],
@@ -984,24 +1044,6 @@ impl ConfigStore {
             "SELECT project_id,rex_server_identity,rex_session_id,rex_window_id,view_kind,ticket_namespace,ticket_id FROM rex_views WHERE view_id=?1 AND lifecycle='active'",
             [authority.rex_view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let ticket_scope = if authority.role == Role::Supervisor {
-            None
-        } else {
-            Some(
-                tx.query_row(
-                    "SELECT namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1",
-                    [authority
-                        .ticket_run_id
-                        .as_ref()
-                        .ok_or("ticket AgentRun is missing TicketRun ID")?
-                        .as_str()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?
-                .ok_or("launch TicketRun does not exist")?,
-            )
-        };
         let view_ticket_scope_matches =
             view.as_ref()
                 .is_some_and(|(_, _, _, _, kind, namespace, ticket)| {
@@ -3706,9 +3748,17 @@ mod tests {
         HumanClaimRelease, OwnerMetadata, ProjectRecord, content_digest, durable_input_digest,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
-    use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
+    use crate::domain::ids::{
+        AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketId, TicketNamespace,
+        TicketRunId,
+    };
+    use crate::domain::types::{AgentAdapter, CommitMode, Role};
     use crate::engine::reducer::Input;
-    use crate::launch::{RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind};
+    use crate::launch::{
+        AgentLaunchAuthority, ProviderQualification, QualificationProof, QualificationStatus,
+        RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind,
+    };
+    use sha2::Digest as _;
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -4106,6 +4156,282 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn launch_authority_rejects_ticket_run_from_another_project() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let mut config_snapshot = snapshot(&"a".repeat(64));
+        let profile_id = ProfileId::parse("worker").unwrap();
+        let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
+            "adapter": "codex",
+            "command": ["/usr/bin/codex"],
+            "commit_mode": "host"
+        }))
+        .unwrap();
+        let profile_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(super::canonical_json(&profile).unwrap().as_bytes())
+        ))
+        .unwrap();
+        config_snapshot.profiles.insert(profile_id.clone(), profile);
+        let applied = store
+            .apply_snapshot("factory", &config_snapshot, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let project_a = ProjectId::parse("project-a").unwrap();
+        let project_b = ProjectId::parse("project-b").unwrap();
+        for project_id in [&project_a, &project_b] {
+            store
+                .insert_project(&ProjectRecord {
+                    id: project_id.clone(),
+                    config_source: "factory".into(),
+                    config_revision: applied.revision,
+                    config_digest: applied.digest.clone(),
+                    mode: "operations".into(),
+                    goal_revision: 0,
+                    desired_lifecycle: "running".into(),
+                    state_revision: Revision(0),
+                })
+                .unwrap();
+        }
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "cross-project-ticket-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let agent_run_id = AgentRunId::parse("run-a").unwrap();
+        let operation_id = OperationId::parse("op-run-a").unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,'worker-session','test',1,?5,'launch_pending',?6)",
+                rusqlite::params![agent_run_id.as_str(), project_a.as_str(), applied.revision.0, applied.digest.as_str(), operation_id.as_str(), generation],
+            )
+            .unwrap();
+        let ticket_run_id = TicketRunId::parse("ticket-run-b").unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status) VALUES (?1,?2,'factory',?3,?4,'shared','T-1',1,'implementing','working','In Progress','In Progress')",
+                rusqlite::params![ticket_run_id.as_str(), project_b.as_str(), applied.revision.0, applied.digest.as_str()],
+            )
+            .unwrap();
+        let view_id = RexView::derive_id(
+            &project_a,
+            RexViewKind::Ticket,
+            Some("shared"),
+            Some("T-1"),
+            1,
+        )
+        .unwrap();
+        store
+            .register_rex_view(
+                generation,
+                &RexView {
+                    view_id: view_id.clone(),
+                    project_id: project_a.clone(),
+                    kind: RexViewKind::Ticket,
+                    ticket_namespace: Some("shared".into()),
+                    ticket_id: Some("T-1".into()),
+                    view_epoch: 1,
+                    rex_server_identity: "rex-instance".into(),
+                    rex_session_id: "session".into(),
+                    rex_window_id: "window".into(),
+                },
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,'/state/mailbox',?2,9999999999,1048576,32)",
+                rusqlite::params![agent_run_id.as_str(), "6".repeat(64)],
+            )
+            .unwrap();
+        let markers = [
+            "REX_PROJECTS_AGENT",
+            "REX_PROJECTS_CONTEXT",
+            "REX_PROJECTS_PROJECT_ID",
+            "REX_PROJECTS_ROLE",
+            "REX_PROJECTS_RUN_ID",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+        let qualification = ProviderQualification {
+            schema_version: 1,
+            project_id: project_a.clone(),
+            profile_id: profile_id.clone(),
+            profile_digest: profile_digest.clone(),
+            adapter: AgentAdapter::Codex,
+            executable_path: "/usr/bin/codex".into(),
+            executable_digest: Digest::parse("7".repeat(64)).unwrap(),
+            provider_version: "fixture".into(),
+            permission_mode: "workspace_write".into(),
+            invocation_options_digest: Digest::parse("8".repeat(64)).unwrap(),
+            commit_mode: CommitMode::Host,
+            proof: QualificationProof {
+                schema_version: 1,
+                probe_id: "probe".into(),
+                fixture_digest: Digest::parse("9".repeat(64)).unwrap(),
+                rex_instance_id: "rex-instance".into(),
+                tool_shell_marker_digest: Digest::parse("1".repeat(64)).unwrap(),
+                tool_shell_markers_present: markers.clone(),
+                descendant_marker_digest: Digest::parse("2".repeat(64)).unwrap(),
+                descendant_markers_present: markers,
+                automatic_turn_result_digest: Digest::parse("3".repeat(64)).unwrap(),
+                automatic_turn_completed: true,
+                structured_result_valid: true,
+                observed_permission_mode: "workspace_write".into(),
+                permission_prompt_count: 0,
+                cleanup_process_tree_digest: Digest::parse("4".repeat(64)).unwrap(),
+                process_tree_absent: true,
+                cleanup_confirmed: true,
+            },
+            status: QualificationStatus::Verified,
+        };
+        let qualification_digest = store
+            .store_provider_qualification(generation, &qualification)
+            .unwrap();
+
+        let authority = AgentLaunchAuthority {
+            agent_run_id,
+            project_id: project_a,
+            role: Role::Worker,
+            role_session_id: "worker-session".into(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: Some(ticket_run_id),
+            ticket_revision: Some(Revision(0)),
+            config_revision: applied.revision,
+            config_digest: applied.digest,
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: generation,
+            operation_id,
+            rex_view_id: view_id,
+            descriptor_digest: Digest::parse("c".repeat(64)).unwrap(),
+            runtime_binary_digest: Digest::parse("d".repeat(64)).unwrap(),
+            descriptor_path: "/state/descriptor.json".into(),
+            environment_snapshot_id: Digest::parse("1".repeat(64)).unwrap(),
+            profile_id,
+            profile_digest,
+            instruction_digest: Digest::parse("3".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("4".repeat(64)).unwrap(),
+            qualification_receipt_digest: qualification_digest,
+            rex_server_identity: "rex-instance".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+            rex_block_id: "block".into(),
+            workspace_path: "/state/worktree".into(),
+            control_dir: "/state/control".into(),
+            mailbox_capability_digest: Digest::parse("6".repeat(64)).unwrap(),
+        };
+
+        let error = store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap_err();
+        assert!(
+            error.contains("TicketRun belongs to another Project"),
+            "unexpected launch rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn begin_rex_view_close_rejects_substituted_persisted_identity() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("close-project").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: applied.digest.clone(),
+            mode: "operations".into(),
+            goal_revision: 0,
+            desired_lifecycle: "running".into(),
+            state_revision: Revision(0),
+        };
+        store.insert_project(&project).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "close-view-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let view_id =
+            RexView::derive_id(&project.id, RexViewKind::Supervisor, None, None, 1).unwrap();
+        let view = RexView {
+            view_id: view_id.clone(),
+            project_id: project.id.clone(),
+            kind: RexViewKind::Supervisor,
+            ticket_namespace: None,
+            ticket_id: None,
+            view_epoch: 1,
+            rex_server_identity: "rex-instance".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+        };
+        store.register_rex_view(generation, &view).unwrap();
+        let cleanup_run = AgentRunId::parse("cleanup-run").unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,'test',1,'cleanup-op','completed',?5)",
+                rusqlite::params![cleanup_run.as_str(), project.id.as_str(), applied.revision.0, applied.digest.as_str(), generation],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'completed-block',?2,'supervisor','factory','completed',1,1,1)",
+                rusqlite::params![view_id.as_str(), cleanup_run.as_str()],
+            )
+            .unwrap();
+        let now = super::now_unix().unwrap() as u64 + 10;
+        let mut candidate = store
+            .rex_view_cleanup_candidates(now, 1)
+            .unwrap()
+            .pop()
+            .expect("completed, process-absent view should be eligible for cleanup");
+        candidate.view.rex_session_id = "attacker-session".into();
+
+        let error = store
+            .begin_rex_view_close(generation, &candidate, now, 1)
+            .unwrap_err();
+        assert!(error.contains("does not match persisted Rex view identity"));
+        let lifecycle: String = store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM rex_views WHERE view_id=?1",
+                [view_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "active");
     }
 
     #[test]
