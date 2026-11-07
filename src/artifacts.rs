@@ -23,7 +23,7 @@ fn read_regular_nofollow(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let file = options
         .open(path)
         .map_err(|error| format!("open existing artifact: {error}"))?;
@@ -118,32 +118,7 @@ impl ArtifactStore {
         {
             return Err("artifact object directory escaped the immutable store".into());
         }
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&object_path)
-        {
-            Ok(mut output) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    output
-                        .set_permissions(fs::Permissions::from_mode(0o400))
-                        .map_err(|error| error.to_string())?;
-                }
-                output
-                    .write_all(&bytes)
-                    .map_err(|error| error.to_string())?;
-                output.sync_all().map_err(|error| error.to_string())?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = read_regular_nofollow(&object_path, MAX_ARTIFACT_BYTES)?;
-                if existing != bytes {
-                    return Err("content-addressed artifact object has conflicting bytes".into());
-                }
-            }
-            Err(error) => return Err(format!("publish immutable artifact object: {error}")),
-        }
+        publish_immutable_object(parent, &object_path, &bytes)?;
         let reference = RoleArtifactReference {
             kind,
             schema_version,
@@ -213,11 +188,12 @@ fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, Stri
         };
         let name = std::ffi::CString::new(name.as_encoded_bytes())
             .map_err(|_| "Artifact path contains NUL")?;
+        // O_NONBLOCK prevents a malicious FIFO from hanging the host before fstat can reject it.
         let fd = unsafe {
             libc::openat(
                 parent_fd,
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -254,6 +230,78 @@ fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, Stri
     }
 }
 
+fn publish_immutable_object(parent: &Path, destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before Unix epoch")?
+        .as_nanos();
+    let stage = parent.join(format!(".stage-{}-{nonce:x}", std::process::id()));
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage)
+            .map_err(|error| format!("create staged Artifact object: {error}"))?;
+        output
+            .write_all(bytes)
+            .map_err(|error| format!("write staged Artifact object: {error}"))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("sync staged Artifact object: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            output
+                .set_permissions(fs::Permissions::from_mode(0o400))
+                .map_err(|error| format!("make staged Artifact object immutable: {error}"))?;
+            output
+                .sync_all()
+                .map_err(|error| format!("sync immutable Artifact object: {error}"))?;
+        }
+        drop(output);
+
+        match fs::hard_link(&stage, destination) {
+            Ok(()) => sync_directory(parent)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = read_regular_nofollow(destination, MAX_ARTIFACT_BYTES)?;
+                if existing != bytes {
+                    return Err("content-addressed Artifact object has conflicting bytes".into());
+                }
+            }
+            Err(error) => return Err(format!("publish staged Artifact object: {error}")),
+        }
+        Ok(())
+    })();
+
+    match fs::remove_file(&stage) {
+        Ok(()) => {
+            if result.is_ok() {
+                sync_directory(parent)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if result.is_ok() => {
+            return Err(format!("remove staged Artifact object: {error}"));
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync Artifact object directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn validate_contents(
     kind: RoleArtifactKind,
     schema_version: u32,
@@ -285,4 +333,55 @@ fn validate_contents(
         return Err("evidence Artifact may not be empty".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_ARTIFACT_BYTES, publish_immutable_object, read_workspace_file};
+    use std::fs;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn retry_after_abandoned_partial_stage_publishes_complete_object() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("object");
+        fs::write(root.path().join(".stage-crashed-partway"), b"partial").unwrap();
+        publish_immutable_object(root.path(), &destination, b"complete artifact").unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"complete artifact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("artifact.fifo");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let status = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(status, 0);
+
+        let started = Instant::now();
+        let result = std::thread::spawn({
+            let root = root.path().to_path_buf();
+            move || read_workspace_file(&root, "artifact.fifo")
+        })
+        .join()
+        .unwrap();
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn existing_object_must_be_regular_and_within_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let object = root.path().join("object");
+        fs::write(&object, vec![0; MAX_ARTIFACT_BYTES as usize + 1]).unwrap();
+        let mut file = fs::File::open(&object).unwrap();
+        let mut sample = [0; 1];
+        file.read_exact(&mut sample).unwrap();
+        assert!(super::read_regular_nofollow(&object, MAX_ARTIFACT_BYTES).is_err());
+    }
 }
