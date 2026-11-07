@@ -2620,8 +2620,143 @@ impl FilterRotation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+
+    pub(crate) struct PostmortemTestServices {
+        pub(crate) digest: crate::domain::ids::Digest,
+        pub(crate) artifacts: crate::artifacts::ArtifactStore,
+    }
+
+    impl super::FactoryRuntimeServices for PostmortemTestServices {
+        fn recover_agents(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn ingest_one_agent_result(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn process_one_agent_request(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<bool, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn read_verified_artifact(
+            &self,
+            artifact: &crate::store::artifact_registry::VerifiedArtifact,
+        ) -> Result<Vec<u8>, String> {
+            artifact.read_bytes(&self.artifacts)
+        }
+
+        fn observe_base_heads(
+            &mut self,
+        ) -> Result<std::collections::BTreeMap<crate::domain::ids::RepositoryId, String>, String>
+        {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn configuration_digest(&self) -> &crate::domain::ids::Digest {
+            &self.digest
+        }
+
+        fn profile_commit_mode(
+            &self,
+            _: &ProjectId,
+            _: Role,
+        ) -> Result<crate::domain::types::CommitMode, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn worker_publication_effect(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+            _: &Config,
+            _: &crate::store::scheduler::ActiveTicketRun,
+            _: &crate::store::agent_results::IngestedAgentResult,
+            _: u64,
+        ) -> Result<Option<crate::store::EffectIntent>, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn tick_profile_trials(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+            _: u32,
+            _: u32,
+        ) -> Result<(), String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn ticket_namespace(
+            &mut self,
+            _: &crate::domain::ids::AdapterId,
+        ) -> Result<crate::domain::ids::TicketNamespace, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn list_ticket_page(
+            &mut self,
+            _: &crate::store::scheduler::TicketScanKey,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<super::ExternalTicketPage, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn observe_publications(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: i64,
+        ) -> Result<crate::runtime_delivery::PublicationMonitorTick, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn prepare_role_launch(
+            &mut self,
+            _: &mut crate::store::ConfigStore,
+            _: u64,
+            _: &Config,
+            _: &crate::store::scheduler::PendingRoleWakeSession,
+            _: i64,
+        ) -> Result<bool, String> {
+            Err("unused by postmortem consumer test".into())
+        }
+
+        fn effect_handlers(&self) -> Vec<&dyn crate::effects::EffectHandler> {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn apply_postmortem_result(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        services: &mut PostmortemTestServices,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<bool, String> {
+        super::apply_agent_result(store, owner_generation, now_unix, config, services, result)
+    }
 
     use super::{
         FilterRotation, TickBudget, TicketDisposition, ValidatedHostObservation,

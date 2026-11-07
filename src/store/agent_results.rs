@@ -1486,13 +1486,13 @@ fn unix_now() -> Result<i64, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::ids::{OperationId, ProfileId, Revision};
     use crate::domain::types::Role;
     use std::path::PathBuf;
 
-    fn test_authority() -> AgentLaunchAuthority {
+    pub(super) fn test_authority() -> AgentLaunchAuthority {
         let digest = || Digest::parse("a".repeat(64)).unwrap();
         AgentLaunchAuthority {
             agent_run_id: AgentRunId::parse("worker-run").unwrap(),
@@ -1531,7 +1531,7 @@ mod tests {
         }
     }
 
-    fn reviewer_run_step_package(
+    pub(super) fn reviewer_run_step_package(
         authority: &AgentLaunchAuthority,
         result_schema: serde_json::Value,
     ) -> crate::run_step_package::RunStepPackage {
@@ -1611,7 +1611,7 @@ mod tests {
         }
     }
 
-    fn reviewer_qualification(authority: &AgentLaunchAuthority) -> ProviderQualification {
+    pub(super) fn reviewer_qualification(authority: &AgentLaunchAuthority) -> ProviderQualification {
         use crate::domain::types::{AgentAdapter, CommitMode};
         use crate::launch::{ProviderQualification, QualificationProof, QualificationStatus};
 
@@ -2194,5 +2194,366 @@ impl ConfigStore {
             reducer_revision,
             disposition,
         )
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod host_validation_fixture {
+    use super::*;
+    use crate::config::{AppliedConfig, SourceFile, SourceKind};
+    use crate::domain::ids::{ProfileId, Revision};
+    use crate::domain::types::{AgentAdapter, Role};
+    use crate::launch::ObservedProviderStart;
+    use crate::roles::RoleResultMessage;
+    use crate::run_step::{ObservedProcess, RunReceipt};
+    use crate::run_step_spool::{AgentTurnResult, StartRequestEnvelope};
+    use crate::store::OwnerMetadata;
+    use crate::store::{ConfigStore, ExpectedRevision, ProjectRecord};
+    use sha2::Sha256;
+    use std::process::Command;
+
+    pub(crate) struct TestValidatedResultFixture {
+        pub _temp: tempfile::TempDir,
+        pub store: ConfigStore,
+        pub artifacts: crate::artifacts::ArtifactStore,
+        pub owner_generation: u64,
+        pub start: StartRequestEnvelope,
+        pub terminal: VerifiedAgentTerminal,
+        pub ingested: IngestedAgentResult,
+    }
+
+    /// Builds real host terminal and result evidence around test-seeded running launch records.
+    /// Qualification, published package, process absence, terminal, and result validators are
+    /// production paths; only the earlier controller/Rex prerecords are seeded in the test DB.
+    pub(crate) fn host_validated_result(
+        role: Role,
+        mut message: RoleResultMessage,
+    ) -> Result<TestValidatedResultFixture, String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = std::fs::canonicalize(temp.path()).map_err(|error| error.to_string())?;
+        let mut store = ConfigStore::open_test(&root)?;
+        let config_digest = "a".repeat(64);
+        let applied = AppliedConfig {
+            config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"]}},"projects":{}})).map_err(|error| error.to_string())?,
+            profiles: std::collections::BTreeMap::new(),
+            source_root: root.display().to_string(),
+            source_files: vec![SourceFile { kind: SourceKind::File, path: root.join("config.toml").display().to_string(), canonical_path: root.join("config.toml").display().to_string(), sha256: digest(b"config" )?, bytes: 6, contents: "fixture".into() }],
+            digest: Digest::parse(config_digest.clone())?,
+        };
+        let applied = store.apply_snapshot("fixture", &applied, ExpectedRevision::Bootstrap)?;
+        let project_id = ProjectId::parse("fixture-project")?;
+        store.insert_project(&ProjectRecord {
+            id: project_id.clone(),
+            config_source: "fixture".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse(config_digest.clone())?,
+            mode: "goal".into(),
+            goal_revision: 1,
+            desired_lifecycle: "running".into(),
+            state_revision: Revision(0),
+        })?;
+        let owner_generation = store.start_owner(&OwnerMetadata {
+            owner_nonce: "fixture-owner".into(),
+            state_root: root.display().to_string(),
+            config_source: "fixture".into(),
+            process_start_identity: "test-owner-identity".into(),
+            executable_path: "/test/fixture".into(),
+            executable_digest: "b".repeat(64),
+            rex_endpoint: Some("http://fixture".into()),
+            rex_server_identity: Some("fixture-rex".into()),
+            rex_session_id: Some("fixture-session".into()),
+            rex_block_id: Some("fixture-block".into()),
+        })?;
+        let ticket_run_id = TicketRunId::parse("fixture-ticket-run")?;
+        let initial_phase = if role == Role::Postmortem {
+            "postmortem"
+        } else {
+            "reviewing"
+        };
+        store.connection.execute(
+            "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision) VALUES (?1,?2,'fixture',?3,?4,'fixture','T-1',1,?5,'running','in_review','in_review',1)",
+            rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), applied.revision.0, config_digest, initial_phase],
+        ).map_err(|error| error.to_string())?;
+        store.connection.execute(
+            "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,NULL,0,1)",
+            rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+        ).map_err(|error| error.to_string())?;
+        let agent_run_id = AgentRunId::parse("fixture-agent-run")?;
+        let mut authority = crate::store::agent_results::tests::test_authority();
+        authority.agent_run_id = agent_run_id.clone();
+        authority.project_id = project_id.clone();
+        authority.role = role;
+        authority.role_session_id = format!("fixture-{:?}", role).to_lowercase();
+        let parent_run_id = AgentRunId::parse("fixture-parent-run")?;
+        authority.parent_run_id = Some(parent_run_id.clone());
+        authority.parent_role = Some(Role::Coordinator);
+        authority.ticket_run_id = Some(ticket_run_id.clone());
+        authority.ticket_revision = Some(Revision(1));
+        authority.config_revision = applied.revision;
+        authority.config_digest = Digest::parse(config_digest.clone())?;
+        authority.controller_generation = owner_generation;
+        authority.rex_server_identity = "fixture-rex".into();
+        authority.rex_session_id = "fixture-session".into();
+        authority.rex_window_id = "fixture-window".into();
+        authority.rex_block_id = "fixture-block".into();
+        authority.descriptor_path = root.join("run-step-package.json");
+        authority.workspace_path = root.join("workspace");
+        authority.control_dir = root.join("control");
+        std::fs::create_dir(&authority.workspace_path).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&authority.control_dir).map_err(|error| error.to_string())?;
+        let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
+            "adapter":"codex", "command":["/bin/codex"], "model":"fixture", "commit_mode":"native", "turn_timeout_seconds":60
+        })).map_err(|error| error.to_string())?;
+        authority.profile_id = ProfileId::parse("fixture-profile")?;
+        authority.profile_digest =
+            digest(&serde_json::to_vec(&profile).map_err(|error| error.to_string())?)?;
+        let schema_name = match role {
+            Role::Reviewer => "reviewer-v1.json",
+            Role::Postmortem => "postmortem-v1.json",
+            _ => return Err("fixture currently supports Reviewer and Postmortem roles".into()),
+        };
+        let schema_bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("schemas/agent-results")
+                .join(schema_name),
+        )
+        .map_err(|error| error.to_string())?;
+        let schema: serde_json::Value = crate::protocol::parse_unique(&schema_bytes)?;
+        authority.result_schema_digest = crate::providers::project_result_schema(&schema)?
+            .identity
+            .source_schema_digest;
+        let qualification = crate::store::agent_results::tests::reviewer_qualification(&authority);
+        authority.qualification_receipt_digest = qualification.canonical_digest()?;
+        store.store_provider_qualification(owner_generation, &qualification)?;
+        let run_id_str = agent_run_id.as_str();
+        let role_str = serde_json::to_value(role)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let ticket_revision = 1_u64;
+        let now = 1_i64;
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,state,controller_generation) VALUES (?1,?2,'fixture',?3,?4,?5,'fixture-owner',1,?6,?7,?8,?9,'running',?10)",
+            rusqlite::params![run_id_str, project_id.as_str(), applied.revision.0, config_digest, authority.role_session_id, authority.operation_id.as_str(), authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, owner_generation],
+        ).map_err(|error| error.to_string())?;
+        let view_id = crate::launch::RexView::derive_id(
+            &project_id,
+            crate::launch::RexViewKind::Ticket,
+            Some("fixture"),
+            Some("T-1"),
+            1,
+        )?;
+        store.connection.execute(
+            "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'ticket','fixture','T-1',1,'fixture-rex','fixture-session','fixture-window',0,'active',?3,?3)",
+            rusqlite::params![view_id.as_str(), project_id.as_str(), now],
+        ).map_err(|error| error.to_string())?;
+        authority.rex_view_id = view_id;
+        authority.descriptor_path = root.join("run-step-package-final.json");
+        let package = crate::store::agent_results::tests::reviewer_run_step_package(
+            &authority,
+            schema.clone(),
+        );
+        authority.descriptor_digest = package.publish_once(&authority.descriptor_path)?;
+        let parent_run_id_str = parent_run_id.as_str();
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'fixture',?3,?4,'fixture-coordinator','fixture-owner',1,'fixture-parent-operation','running',?5)",
+            rusqlite::params![parent_run_id_str, project_id.as_str(), applied.revision.0, config_digest, owner_generation],
+        ).map_err(|error| error.to_string())?;
+        let parent_authority_digest = "c".repeat(64);
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'coordinator','fixture-coordinator',?3,1,?4,?5,1,1,?6,'fixture-parent-operation',?7,?8,?8,'/fixture/parent-package',?8,'fixture-profile',?8,?8,?8,?9,'fixture-rex','fixture-session','fixture-window','fixture-parent-block','/fixture/workspace','/fixture/control',?8,'{}',?10,?11)",
+            rusqlite::params![parent_run_id_str, project_id.as_str(), ticket_run_id.as_str(), applied.revision.0, config_digest, owner_generation, authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.qualification_receipt_digest.as_str(), parent_authority_digest, now],
+        ).map_err(|error| error.to_string())?;
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,'coordinator',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)",
+            rusqlite::params![run_id_str, project_id.as_str(), role_str, authority.role_session_id, parent_run_id_str, ticket_run_id.as_str(), ticket_revision, authority.config_revision.0, authority.config_digest.as_str(), authority.attempt, authority.run_epoch, owner_generation, authority.operation_id.as_str(), authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.runtime_binary_digest.as_str(), authority.descriptor_path.display().to_string(), authority.environment_snapshot_id.as_str(), authority.profile_id.as_str(), authority.profile_digest.as_str(), authority.instruction_digest.as_str(), authority.result_schema_digest.as_str(), authority.qualification_receipt_digest.as_str(), authority.rex_server_identity, authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, authority.workspace_path.display().to_string(), authority.control_dir.display().to_string(), authority.mailbox_capability_digest.as_str(), serde_json::to_string(&authority).map_err(|error| error.to_string())?, authority.digest()?.as_str(), now],
+        ).map_err(|error| error.to_string())?;
+        let child = Command::new("/bin/sleep")
+            .arg("0.2")
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let pid = child.id();
+        let process_identity = (0..100)
+            .find_map(|_| {
+                crate::process::inspect_process_table()
+                    .ok()?
+                    .into_iter()
+                    .find(|item| item.pid == pid)
+            })
+            .ok_or("test subprocess was not observed in the host process table")?;
+        let status = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?
+            .status;
+        if !status.success() {
+            return Err("fixture subprocess did not exit successfully".into());
+        }
+        let process = ObservedProcess {
+            pid,
+            parent_pid: process_identity.parent_pid,
+            process_group_id: process_identity.process_group_id,
+            start_identity: process_identity.start_identity.clone(),
+            command: process_identity.command.clone(),
+            identity_quality: match process_identity.quality {
+                crate::process::ProcessIdentityQuality::KernelBirthToken => "kernel_birth_token",
+                _ => "second_precision",
+            }
+            .into(),
+        };
+        let observed = ObservedProviderStart {
+            agent_run_id: agent_run_id.clone(),
+            operation_id: authority.operation_id.clone(),
+            provider_pid: pid,
+            provider_start_identity: process_identity.start_identity,
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest: digest(b"observed process tree")?,
+            process_tree_confirmed: true,
+        };
+        store.connection.execute(
+            "INSERT INTO agent_launch_state(agent_run_id,state,start_request_id,start_request_digest,provider_process_tree_json,last_observed_at_unix,updated_at_unix) VALUES (?1,'running',?2,?3,?4,?5,?5)",
+            rusqlite::params![run_id_str, authority.operation_id.as_str(), "f".repeat(64), serde_json::to_string(&observed).map_err(|error| error.to_string())?, now],
+        ).map_err(|error| error.to_string())?;
+        let request = crate::launch::AgentStartRequest {
+            schema_version: 1,
+            operation_id: authority.operation_id.clone(),
+            agent_run_id: agent_run_id.clone(),
+            project_id: project_id.clone(),
+            controller_generation: owner_generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            wrapper_pid: std::process::id(),
+            wrapper_start_identity: "fixture-wrapper".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+        };
+        let start = StartRequestEnvelope {
+            schema_version: 1,
+            request_digest: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&request).map_err(|error| error.to_string())?)
+            ),
+            request,
+        };
+        let start_json =
+            serde_json::to_string(&start.request).map_err(|error| error.to_string())?;
+        let actual_start_digest = format!("{:x}", Sha256::digest(start_json.as_bytes()));
+        store
+            .connection
+            .execute(
+                "DELETE FROM agent_launch_state WHERE agent_run_id=?1",
+                [run_id_str],
+            )
+            .map_err(|error| error.to_string())?;
+        store.connection.execute(
+            "INSERT INTO agent_launch_state(agent_run_id,state,start_request_id,start_request_digest,provider_process_tree_json,last_observed_at_unix,updated_at_unix) VALUES (?1,'running',?2,?3,?4,?5,?5)",
+            rusqlite::params![run_id_str, authority.operation_id.as_str(), actual_start_digest, serde_json::to_string(&observed).map_err(|error| error.to_string())?, now],
+        ).map_err(|error| error.to_string())?;
+        let artifacts = crate::artifacts::ArtifactStore::open(&root.join("artifacts"))?;
+        if role == Role::Postmortem {
+            let source_path = "postmortem/source.md";
+            let source_file = authority.workspace_path.join(source_path);
+            std::fs::create_dir_all(
+                source_file
+                    .parent()
+                    .ok_or("Postmortem source path has no parent")?,
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(
+                &source_file,
+                b"# Fixture source\n\nHost-registered Postmortem evidence.\n",
+            )
+            .map_err(|error| error.to_string())?;
+            let artifact = artifacts.register(
+                &authority.workspace_path,
+                &authority.project_id,
+                authority.agent_run_id.as_str(),
+                role,
+                source_path,
+                crate::engine::orchestration::RoleArtifactKind::Postmortem,
+                1,
+            )?;
+            message.artifact_refs = vec![artifact.reference.clone()];
+            message.structured_result["source_references"] =
+                serde_json::json!([artifact.reference]);
+            let request_digest = digest(b"fixture ArtifactAdd request")?;
+            crate::store::artifact_registry::persist_registration(
+                &mut store.connection,
+                owner_generation,
+                &authority,
+                "fixture-postmortem-artifact",
+                &request_digest,
+                &artifact.reference,
+                &artifact.object_path,
+            )?;
+            message.result_digest = digest(
+                &serde_json::to_vec(&message.structured_result)
+                    .map_err(|error| error.to_string())?,
+            )?;
+        }
+        let structured = serde_json::to_value(&message).map_err(|error| error.to_string())?;
+        let structured_digest =
+            digest(&serde_json::to_vec(&structured).map_err(|error| error.to_string())?)?;
+        let projection = crate::providers::project_result_schema(&schema)?.identity;
+        let receipt = RunReceipt {
+            run_id: agent_run_id.clone(),
+            attempt: authority.attempt,
+            provider: AgentAdapter::Codex,
+            effective_permission_mode: "workspace_write".into(),
+            conversation_id: None,
+            provider_version: Some("fixture-1".into()),
+            capability_receipt_digest: Some(authority.qualification_receipt_digest.clone()),
+            schema_projection: projection,
+            launch_pid_hint: Some(pid),
+            exit_code: Some(0),
+            timed_out: false,
+            cancellation_signal: None,
+            provider_process_failure: None,
+            provider_result_failure: None,
+            cleanup: CleanupState::Confirmed,
+            cleanup_detail: None,
+            processes: vec![process],
+            result_digest: Some(structured_digest),
+            outcome: TurnOutcome::Completed,
+        };
+        #[derive(serde::Serialize)]
+        struct Payload<'a> {
+            schema_version: u32,
+            start_request_digest: &'a str,
+            receipt: &'a RunReceipt,
+            structured_result: &'a Option<serde_json::Value>,
+        }
+        let payload = Payload {
+            schema_version: 1,
+            start_request_digest: &start.request_digest,
+            receipt: &receipt,
+            structured_result: &Some(structured.clone()),
+        };
+        let result_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload).map_err(|error| error.to_string())?)
+        );
+        let result = AgentTurnResult {
+            schema_version: 1,
+            start_request_digest: start.request_digest.clone(),
+            receipt,
+            structured_result: Some(structured),
+            result_digest,
+        };
+        let terminal = store.record_verified_agent_terminal(owner_generation, &start, &result)?;
+        let artifacts = crate::artifacts::ArtifactStore::open(&root.join("artifacts"))?;
+        let ingested =
+            store.store_validated_agent_result(&artifacts, owner_generation, &terminal, message)?;
+        Ok(TestValidatedResultFixture {
+            _temp: temp,
+            store,
+            artifacts,
+            owner_generation,
+            start,
+            terminal,
+            ingested,
+        })
     }
 }
