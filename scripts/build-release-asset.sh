@@ -44,17 +44,9 @@ if [[ "$reported_version" != "$expected_version" ]]; then
 	printf 'binary version mismatch: expected "%s", got "%s"\n' "$expected_version" "$reported_version" >&2
 	exit 1
 fi
-"$artifact_directory/rex-projects" version --json | python3 -c '
-import json
-import sys
-
-metadata = json.load(sys.stdin)
-expected_target = sys.argv[1]
-if metadata["target"] != expected_target or metadata["dirty"] or not metadata["source_revision"]:
-    raise SystemExit(f"release build metadata is not clean or target-matched: {metadata}")
-' "$rust_target"
-
-digest="$(shasum -a 256 "$artifact_directory/rex-projects" | awk '{ print $1 }')"
-printf '{\n  "version": "%s",\n  "target": "%s",\n  "rust_target": "%s",\n  "sha256": "%s"\n}\n' \
-	"$version" "$normalized_target" "$rust_target" "$digest" >"$artifact_directory/artifact.json"
+python3 "$repository_root/scripts/release_assets.py" artifact-manifest \
+	--binary "$artifact_directory/rex-projects" \
+	--version "$version" \
+	--target "$normalized_target" \
+	--output "$artifact_directory/artifact.json"
 printf '%s\n' "$artifact_directory/rex-projects" "$artifact_directory/artifact.json"
