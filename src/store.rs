@@ -94,6 +94,20 @@ type LaunchRexViewRow = (
     Option<String>,
 );
 
+type SucceededEffectRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+    u32,
+    i64,
+    Option<String>,
+);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectRecord {
     pub id: ProjectId,
@@ -143,6 +157,44 @@ pub struct ClaimedEffect {
     pub state: EffectClaimState,
     pub attempt_count: u32,
     pub created_at_unix: i64,
+}
+
+/// An immutable effect record re-read from SQLite after it reached `succeeded`.
+/// Its private fields prevent a caller from turning a transient handler observation into proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SucceededEffectReceipt {
+    intent: EffectIntent,
+    attempt_count: u32,
+    created_at_unix: i64,
+    receipt_json: String,
+}
+
+impl SucceededEffectReceipt {
+    pub fn intent(&self) -> &EffectIntent {
+        &self.intent
+    }
+
+    pub fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+
+    pub fn created_at_unix(&self) -> i64 {
+        self.created_at_unix
+    }
+
+    pub fn receipt_json(&self) -> &str {
+        &self.receipt_json
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(request: &crate::effects::EffectRequest, receipt_json: String) -> Self {
+        Self {
+            intent: request.intent.clone(),
+            attempt_count: request.attempt_count,
+            created_at_unix: request.created_at_unix,
+            receipt_json,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1675,6 +1727,73 @@ impl ConfigStore {
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Return a receipt only after SQLite has recorded this effect as succeeded.
+    /// Pending, claimed, uncertain, failed, cancelled, or missing effects return `None`.
+    pub fn succeeded_effect_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<SucceededEffectReceipt>, String> {
+        let row: Option<SucceededEffectRow> = self
+            .connection
+            .query_row(
+                "SELECT project_id, subject_type, subject_id, operation_id, logical_key, kind, request_json, request_digest, expected_revision, attempt_count, created_at_unix, receipt_json FROM effects WHERE operation_id=?1 AND status='succeeded'",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((
+            project_id,
+            subject_type,
+            subject_id,
+            operation_id,
+            logical_key,
+            kind,
+            request_json,
+            request_digest,
+            expected_revision,
+            attempt_count,
+            created_at_unix,
+            receipt_json,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let receipt_json =
+            receipt_json.ok_or_else(|| "succeeded effect has no persisted receipt".to_owned())?;
+        Ok(Some(SucceededEffectReceipt {
+            intent: EffectIntent {
+                project_id: ProjectId::parse(project_id)?,
+                subject_type,
+                subject_id,
+                operation_id,
+                logical_key,
+                kind,
+                request_json,
+                request_digest,
+                expected_revision,
+            },
+            attempt_count,
+            created_at_unix,
+            receipt_json,
+        }))
     }
 
     pub fn claim_ticket(
@@ -5114,6 +5233,19 @@ mod tests {
                 Some("{}"),
             )
             .unwrap();
+        let stored_receipt = store
+            .succeeded_effect_receipt("op-other-project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_receipt.intent().operation_id, "op-other-project");
+        assert_eq!(stored_receipt.receipt_json(), "{}");
+        assert!(store.succeeded_effect_receipt("op-1").unwrap().is_none());
+        assert!(
+            store
+                .succeeded_effect_receipt("missing-operation")
+                .unwrap()
+                .is_none()
+        );
         let new_generation = store
             .start_owner(&OwnerMetadata {
                 owner_nonce: "restarted-owner".into(),

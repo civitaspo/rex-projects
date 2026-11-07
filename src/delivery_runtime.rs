@@ -21,7 +21,7 @@ use crate::domain::ids::{
 };
 use crate::domain::types::CommitMode;
 use crate::effects::{AbsentProof, EffectHandler, EffectMode, EffectObservation, EffectRequest};
-use crate::engine::orchestration::WorkNodeId;
+use crate::engine::orchestration::{WorkNodeId, WorkPlan};
 use crate::engine::reducer::EffectKind;
 use crate::hooks::{HookReceipt, HookRunContext, HookRunner};
 use crate::host_commit::{
@@ -1680,7 +1680,9 @@ pub struct ValidatedImplementationPublication {
     project_id: ProjectId,
     ticket_run_id: TicketRunId,
     source_revision: u64,
-    receipt_digest: String,
+    work_node_ids: Vec<WorkNodeId>,
+    receipt_bindings: Vec<(WorkNodeId, String)>,
+    publication_set_digest: String,
 }
 
 impl ValidatedImplementationPublication {
@@ -1688,19 +1690,176 @@ impl ValidatedImplementationPublication {
         self.project_id == run.project_id
             && self.ticket_run_id == run.ticket_run_id
             && self.source_revision == run.revision.0
-            && self.receipt_digest.len() == 64
+            && !self.work_node_ids.is_empty()
+            && self
+                .receipt_bindings
+                .iter()
+                .map(|(node_id, _)| node_id.clone())
+                .eq(self.work_node_ids.iter().cloned())
+            && digest_json(&(&self.work_node_ids, &self.receipt_bindings))
+                .is_ok_and(|digest| digest == self.publication_set_digest)
     }
 }
 
-/// Validate the persisted Applied receipt against the original effect and prepared worktree.
-/// Caller code must invoke this on the durable dispatcher receipt before releasing Reviewer.
+/// Validate the complete planned work-node set against prepared nodes and durable Applied receipts.
+/// A partial or duplicate set never produces the capability required to start Reviewer.
 pub fn validate_implementation_publication_receipt(
+    work_plan: &WorkPlan,
+    prepared_worktrees: &PreparedWorktreesEffectReceipt,
+    project_id: &ProjectId,
+    repositories: &BTreeMap<RepositoryId, RepositoryConfig>,
+    publications: &[crate::store::SucceededEffectReceipt],
+) -> Result<ValidatedImplementationPublication, String> {
+    let planned_nodes = work_plan
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.clone(),
+                (node.repository.clone(), node.investigation),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if planned_nodes.len() != work_plan.nodes.len() {
+        return Err("work plan contains duplicate work node identities".into());
+    }
+    let implementation_nodes = planned_nodes
+        .iter()
+        .filter(|(_, (_, investigation))| !investigation)
+        .map(|(id, (repository, _))| (id.clone(), repository.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let expected_work_node_ids = implementation_nodes.keys().cloned().collect::<Vec<_>>();
+    if expected_work_node_ids.is_empty() || publications.len() != expected_work_node_ids.len() {
+        return Err("publication receipts do not cover every planned work node".into());
+    }
+    let mut expected_ids = expected_work_node_ids.to_vec();
+    expected_ids.sort();
+    expected_ids.dedup();
+    if expected_ids.len() != expected_work_node_ids.len() {
+        return Err("planned work node identities must be unique".into());
+    }
+    let mut prepared = prepared_worktrees.work_nodes.clone();
+    prepared.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
+    let prepared_ids = prepared
+        .iter()
+        .map(|node| node.work_node_id.clone())
+        .collect::<BTreeSet<_>>();
+    if prepared_ids.len() != prepared.len()
+        || prepared.iter().any(|node| {
+            planned_nodes
+                .get(&node.work_node_id)
+                .is_none_or(|(repository, _)| repository != &node.repository_id)
+        })
+        || expected_ids
+            .iter()
+            .any(|node_id| !prepared_ids.contains(node_id))
+    {
+        return Err(
+            "prepared worktrees do not cover the complete planned implementation set".into(),
+        );
+    }
+    let mut requests = BTreeMap::new();
+    for publication in publications {
+        let request = effect_request_from_persisted(publication);
+        let payload: PublishImplementationEffectPayload = decode_effect_payload(&request)?;
+        if requests
+            .insert(payload.work_node_id.clone(), (request, publication))
+            .is_some()
+        {
+            return Err("multiple publication receipts target the same work node".into());
+        }
+    }
+    if requests.len() != expected_ids.len()
+        || requests.keys().cloned().ne(expected_ids.iter().cloned())
+    {
+        return Err("publication receipts do not match the complete planned work-node set".into());
+    }
+    if prepared_worktrees.schema_version != 1
+        || prepared_worktrees.ticket_run_id.as_str().is_empty()
+    {
+        return Err(
+            "prepared worktree receipt is unsupported or has no ticket-run identity".into(),
+        );
+    }
+    let mut run_identity: Option<(TicketRunId, u64, Digest)> = None;
+    for prepared_node in prepared
+        .iter()
+        .filter(|node| implementation_nodes.contains_key(&node.work_node_id))
+    {
+        let publication = requests
+            .get(&prepared_node.work_node_id)
+            .expect("receipt set was checked against planned node set");
+        let (request, stored) = publication;
+        let payload: PublishImplementationEffectPayload = decode_effect_payload(request)?;
+        if payload.ticket_run_id != prepared_worktrees.ticket_run_id {
+            return Err("publication receipt belongs to a different ticket run".into());
+        }
+        let identity = (
+            payload.ticket_run_id.clone(),
+            payload.source_revision,
+            payload.configuration_digest.clone(),
+        );
+        if run_identity
+            .as_ref()
+            .is_some_and(|expected| expected != &identity)
+        {
+            return Err(
+                "publication effects do not share one run revision and configuration".into(),
+            );
+        }
+        run_identity = Some(identity);
+        let repository_config = repositories
+            .get(&prepared_node.repository_id)
+            .ok_or_else(|| "repository config is missing for a planned work node".to_owned())?;
+        validate_one_implementation_publication_receipt(
+            request,
+            prepared_node,
+            project_id,
+            repository_config,
+            stored.receipt_json(),
+        )?;
+    }
+    let (ticket_run_id, source_revision, _) =
+        run_identity.ok_or_else(|| "publication receipt set is empty".to_owned())?;
+    let receipt_bindings = expected_ids
+        .iter()
+        .map(|work_node_id| {
+            let publication = requests
+                .get(work_node_id)
+                .expect("receipt set was checked against planned node set");
+            (
+                work_node_id.clone(),
+                sha256_hex(publication.1.receipt_json().as_bytes()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let publication_set_digest = digest_json(&(&expected_ids, &receipt_bindings))?;
+    Ok(ValidatedImplementationPublication {
+        project_id: project_id.clone(),
+        ticket_run_id,
+        source_revision,
+        work_node_ids: expected_ids,
+        receipt_bindings,
+        publication_set_digest,
+    })
+}
+
+fn effect_request_from_persisted(stored: &crate::store::SucceededEffectReceipt) -> EffectRequest {
+    EffectRequest {
+        intent: stored.intent().clone(),
+        attempt_count: stored.attempt_count(),
+        created_at_unix: stored.created_at_unix(),
+    }
+}
+
+/// Validate one persisted Applied receipt against its request and prepared worktree.
+fn validate_one_implementation_publication_receipt(
     request: &EffectRequest,
     prepared_worktree: &PreparedWorktreeReceiptNode,
     project_id: &ProjectId,
     repository_config: &RepositoryConfig,
     receipt_json: &str,
-) -> Result<ValidatedImplementationPublication, String> {
+) -> Result<ImplementationPublicationReceipt, String> {
     let payload: PublishImplementationEffectPayload = decode_effect_payload(request)?;
     validate_effect_kind(request, EffectKind::PublishImplementation)?;
     validate_source_revision(request, payload.source_revision)?;
@@ -1833,12 +1992,7 @@ pub fn validate_implementation_publication_receipt(
             "implementation receipt pull request does not match the delivery intent".into(),
         );
     }
-    Ok(ValidatedImplementationPublication {
-        project_id: project_id.clone(),
-        ticket_run_id: payload.ticket_run_id,
-        source_revision: payload.source_revision,
-        receipt_digest: sha256_hex(receipt_json.as_bytes()),
-    })
+    Ok(receipt)
 }
 
 fn digest_json<T: Serialize>(value: &T) -> Result<String, String> {
@@ -2477,6 +2631,17 @@ mod tests {
         let repository_id = RepositoryId::parse("demo").unwrap();
         let ticket_run_id = TicketRunId::parse("run-5").unwrap();
         let work_node_id = WorkNodeId::parse("api").unwrap();
+        let work_plan = WorkPlan {
+            nodes: vec![crate::engine::orchestration::PlannedWorkNode {
+                id: work_node_id.clone(),
+                repository: repository_id.clone(),
+                task: "implement API change".into(),
+                depends_on: Vec::new(),
+                required_evidence: Vec::new(),
+                investigation: false,
+            }],
+            requested_investigation_children: 0,
+        };
         let configuration_digest = Digest::parse("e".repeat(64)).unwrap();
         let base = "a".repeat(40);
         let head = "b".repeat(40);
@@ -2528,6 +2693,11 @@ mod tests {
             branch: branch.clone(),
             base_sha: base.clone(),
             commit_mode: CommitMode::Native,
+        };
+        let prepared_receipt = PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: vec![prepared.clone()],
         };
         let pr_operation = derived_operation_id(
             &request.intent.operation_id,
@@ -2585,16 +2755,73 @@ mod tests {
         };
 
         let json = serde_json::to_string(&receipt).unwrap();
+        let stored_receipt = crate::store::SucceededEffectReceipt::for_test(&request, json.clone());
         let repository_config = fixture_repository_config("git@github.com:acme/demo.git".into());
+        let repository_configs = BTreeMap::from([(repository_id.clone(), repository_config)]);
         let validated = validate_implementation_publication_receipt(
-            &request,
-            &prepared,
+            &work_plan,
+            &prepared_receipt,
             &project_id,
-            &repository_config,
-            &json,
+            &repository_configs,
+            std::slice::from_ref(&stored_receipt),
         )
         .unwrap();
         assert_eq!(validated.source_revision, 7);
+        let mut unsupported_preparation = prepared_receipt.clone();
+        unsupported_preparation.schema_version = 2;
+        assert!(
+            validate_implementation_publication_receipt(
+                &work_plan,
+                &unsupported_preparation,
+                &project_id,
+                &repository_configs,
+                std::slice::from_ref(&stored_receipt),
+            )
+            .is_err()
+        );
+        let second_node_id = WorkNodeId::parse("db").unwrap();
+        let mut two_node_preparation = prepared_receipt.clone();
+        two_node_preparation
+            .work_nodes
+            .push(PreparedWorktreeReceiptNode {
+                work_node_id: second_node_id.clone(),
+                repository_id: RepositoryId::parse("database").unwrap(),
+                worktree_path: PathBuf::from("/managed/database-worktree"),
+                branch: "rex-projects/abcdef0123456789abcdef0123456789".into(),
+                base_sha: "a".repeat(40),
+                commit_mode: CommitMode::Native,
+            });
+        let two_repository_configs = BTreeMap::from([
+            (
+                RepositoryId::parse("demo").unwrap(),
+                fixture_repository_config("git@github.com:acme/demo.git".into()),
+            ),
+            (
+                RepositoryId::parse("database").unwrap(),
+                fixture_repository_config("git@github.com:acme/database.git".into()),
+            ),
+        ]);
+        let mut two_node_work_plan = work_plan.clone();
+        two_node_work_plan
+            .nodes
+            .push(crate::engine::orchestration::PlannedWorkNode {
+                id: second_node_id.clone(),
+                repository: RepositoryId::parse("database").unwrap(),
+                task: "implement database change".into(),
+                depends_on: Vec::new(),
+                required_evidence: Vec::new(),
+                investigation: false,
+            });
+        assert!(
+            validate_implementation_publication_receipt(
+                &two_node_work_plan,
+                &two_node_preparation,
+                &project_id,
+                &two_repository_configs,
+                std::slice::from_ref(&stored_receipt),
+            )
+            .is_err()
+        );
         let mut ticket_run = crate::engine::reducer::TicketRun {
             project_id,
             ticket_run_id,
@@ -2627,13 +2854,16 @@ mod tests {
         );
         let mut tampered = receipt;
         tampered.push.pushed_head = "c".repeat(40);
+        let tampered_json = serde_json::to_string(&tampered).unwrap();
+        let tampered_receipt =
+            crate::store::SucceededEffectReceipt::for_test(&request, tampered_json);
         assert!(
             validate_implementation_publication_receipt(
-                &request,
-                &prepared,
+                &work_plan,
+                &prepared_receipt,
                 &ProjectId::parse("project").unwrap(),
-                &repository_config,
-                &serde_json::to_string(&tampered).unwrap()
+                &repository_configs,
+                &[tampered_receipt],
             )
             .is_err()
         );
