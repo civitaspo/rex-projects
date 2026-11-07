@@ -905,6 +905,36 @@ impl ConfigStore {
         }))
     }
 
+    /// Resolve the single currently approval-eligible revision by its stable
+    /// candidate ID. Ambiguous IDs fail closed instead of choosing by recency.
+    pub fn current_learning_candidate_package(
+        &self,
+        project: &ProjectId,
+        candidate_id: &str,
+    ) -> Result<Option<LearningCandidatePackage>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT digest FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND status='awaiting_approval' ORDER BY digest",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![project.as_str(), candidate_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let digests = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(statement);
+        match digests.as_slice() {
+            [] => Ok(None),
+            [digest] => self.learning_candidate_package(
+                project,
+                candidate_id,
+                &Digest::parse(digest.clone())?,
+            ),
+            _ => Err("candidate ID has multiple approval-eligible revisions".into()),
+        }
+    }
+
     pub fn register_learning_candidate(
         &mut self,
         generation: u64,
@@ -2475,6 +2505,12 @@ mod tests {
             .unwrap();
         assert_eq!(candidate_package.files, files);
         assert_eq!(candidate_package.evidence, Some(evidence.clone()));
+        assert_eq!(
+            store
+                .current_learning_candidate_package(&project, candidate_id)
+                .unwrap(),
+            Some(candidate_package.clone())
+        );
 
         let declarative_root = temp.path().join("declarative");
         fs::create_dir_all(&declarative_root).unwrap();
@@ -2670,6 +2706,12 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(status, "promoted");
+        assert!(
+            store
+                .current_learning_candidate_package(&project, candidate_id)
+                .unwrap()
+                .is_none()
+        );
         store.stop_owner(generation).unwrap();
         drop(store);
         let mut reopened = ConfigStore::open_test(temp.path()).unwrap();
