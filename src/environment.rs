@@ -404,7 +404,8 @@ impl ShellKind {
 }
 
 /// The private CLI helper called at the end of the login-shell command.
-/// Writes only the framed protocol to stdout; it never prints values to diagnostics.
+/// Writes the framed protocol only to the host-created private output file. It never writes
+/// captured values to stdout, stderr, logs, or error messages.
 pub fn write_capture_frame(output_path: &Path, nonce: &str) -> Result<(), EnvironmentError> {
     if std::env::var_os("REX_PROJECTS_CONTEXT").as_deref() != Some(OsStr::new(CAPTURE_MARKER))
         || std::env::var_os("REX_PROJECTS_AGENT").is_some()
