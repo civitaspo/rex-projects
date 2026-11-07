@@ -1634,7 +1634,8 @@ mod tests {
     use crate::human_runtime::{
         HumanDecisionChoice, HumanDecisionIntent, HumanPresentationEffect,
         HumanPresenterEffectHandler, HumanPurpose, HumanRuntimeRequest, HumanSubjectBinding,
-        HumanSubjectKind, HumanSubjectObserver, write_runtime_review_artifact,
+        HumanSubjectKind, HumanSubjectObserver, PublicationAdoptionAuthority,
+        SelectedPublicationResource, write_runtime_review_artifact,
     };
     use crate::launch::{RexView, RexViewKind};
     use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
@@ -2725,5 +2726,111 @@ mod tests {
         assert!(write_runtime_review_artifact(temp.path(), &changed_request).is_err());
         subject.revision = Revision(4);
         assert_ne!(subject.digest().unwrap(), request.subject.digest().unwrap());
+    }
+
+    #[test]
+    fn approved_publication_adoption_updates_baseline_before_unblocking() {
+        let (temp, mut store, generation, _, artifact) = runtime_fixture();
+        let project_id = ProjectId::parse("human_project").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-1").unwrap();
+        let resource = crate::store::publication_monitor::PublicationResource {
+            project_id: project_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            repository_id: crate::domain::ids::RepositoryId::parse("repo-1").unwrap(),
+            branch: "rex-projects/test-branch".into(),
+        };
+        let previous_digest = "a".repeat(64);
+        store
+            .record_publication_irregularity(
+                generation,
+                &crate::store::publication_monitor::PublicationIrregularity {
+                    resource: resource.clone(),
+                    observation_digest: previous_digest.clone(),
+                    observed_at_unix: 50,
+                    facts: serde_json::json!({"reason":"external branch created"}),
+                },
+            )
+            .unwrap();
+        let observation = crate::delivery_runtime::RepositoryPublicationObservation {
+            remote_head: Some("head-adopted".into()),
+            pull_requests: crate::delivery_forge::ObservationCapability::Known(Vec::new()),
+        };
+        let unresolved = store
+            .latest_unresolved_publication(&resource)
+            .unwrap()
+            .unwrap();
+        let authority = PublicationAdoptionAuthority {
+            resource: resource.clone(),
+            event_id: unresolved.event_id,
+            event_revision: unresolved.revision,
+            previous_observation_digest: Digest::parse(previous_digest).unwrap(),
+            selected_resource: SelectedPublicationResource::Branch {
+                head: "head-adopted".into(),
+            },
+            current_observation_digest: crate::human_runtime::publication_observation_digest(
+                &observation,
+            )
+            .unwrap(),
+            current_observation: observation.clone(),
+            configuration_digest: store.project(&project_id).unwrap().unwrap().config_digest,
+            policy_digest: Digest::parse("c".repeat(64)).unwrap(),
+            expires_at_unix: 200,
+        };
+        let request_id = HumanRequestId::parse("human-publication-adoption-1").unwrap();
+        let request = crate::human_runtime::publication_adoption_request(
+            request_id.clone(),
+            authority.clone(),
+        )
+        .unwrap();
+        let material = crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption {
+            material: authority,
+        };
+        let view_id = request_view_id(&store, &request);
+        store
+            .register_human_request_with_authority(
+                generation, &request, &view_id, &artifact, &material, 60,
+            )
+            .unwrap();
+        let intent = HumanDecisionIntent {
+            request_id: request_id.clone(),
+            response_id: "publication-adoption-response-1".into(),
+            expected_subject_digest: request.subject.digest().unwrap(),
+            choice: HumanDecisionChoice::Approve,
+            explanation: Some("Verified the exact current branch head.".into()),
+        };
+        ConfigStore::enqueue_human_decision(temp.path(), &intent, 61).unwrap();
+        assert_eq!(
+            store
+                .process_human_decision(generation, &intent.response_id, &request.subject, 62)
+                .unwrap(),
+            HumanDecisionResult::Applied
+        );
+        let approval = store
+            .accepted_publication_adoption_approval(&request_id, 63)
+            .unwrap()
+            .unwrap();
+        let baseline = store
+            .adopt_publication_snapshot(
+                generation,
+                &approval,
+                &observation,
+                &request.subject.configuration_digest,
+                "main",
+                64,
+            )
+            .unwrap();
+        assert_eq!(baseline.observation, observation);
+        assert!(store.assert_publication_unblocked(&resource).is_ok());
+        assert_eq!(
+            store
+                .classify_publication_observation(
+                    &resource,
+                    &observation,
+                    &crate::publication_monitor::ReconciledHostEffects::default(),
+                )
+                .unwrap(),
+            crate::publication_monitor::PublicationClassification::Unchanged,
+            "the next foreground monitor comparison should accept the adopted baseline"
+        );
     }
 }

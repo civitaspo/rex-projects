@@ -71,14 +71,67 @@ impl RuntimeDelivery {
         let pulls = self
             .effects
             .observe_current_pull_requests(repository_id, branch)?;
-        Ok(crate::delivery_runtime::RepositoryPublicationObservation {
+        let mut observation = crate::delivery_runtime::RepositoryPublicationObservation {
             remote_head,
             pull_requests: pulls.pull_requests,
-        })
+        };
+        if let crate::delivery_forge::ObservationCapability::Known(entries) =
+            &mut observation.pull_requests
+        {
+            entries.sort_by_key(|pull| pull.number);
+        }
+        Ok(observation)
     }
 
-    /// Inspect at most one accepted work node per call. The durable snapshot cursor advances
-    /// round-robin so a large queue cannot starve later repositories.
+    /// Build a human adoption request from the latest unresolved event and a new host-side
+    /// observation. The requested resource must still be present in that complete observation.
+    pub fn publication_adoption_request(
+        &self,
+        store: &crate::store::ConfigStore,
+        resource: &crate::store::publication_monitor::PublicationResource,
+        selected_resource: crate::human_runtime::SelectedPublicationResource,
+        request_id: crate::domain::ids::HumanRequestId,
+        expires_at_unix: u64,
+    ) -> Result<
+        (
+            crate::human_runtime::HumanRuntimeRequest,
+            crate::human_runtime::HumanAuthorityMaterial,
+        ),
+        String,
+    > {
+        let unresolved = store
+            .latest_unresolved_publication(resource)?
+            .ok_or("publication resource has no unresolved irregularity")?;
+        let repository = self
+            .repositories
+            .get(&resource.repository_id)
+            .ok_or_else(|| format!("unknown repository `{}`", resource.repository_id))?;
+        let current_observation =
+            self.observe_snapshot(&resource.repository_id, &resource.branch)?;
+        let current_observation_digest =
+            crate::human_runtime::publication_observation_digest(&current_observation)?;
+        let authority = crate::human_runtime::PublicationAdoptionAuthority {
+            resource: resource.clone(),
+            event_id: unresolved.event_id,
+            event_revision: unresolved.revision,
+            previous_observation_digest: unresolved.observation_digest,
+            selected_resource,
+            current_observation,
+            current_observation_digest,
+            configuration_digest: self.configuration_digest.clone(),
+            policy_digest: crate::human_runtime::publication_adoption_policy_digest(repository)?,
+            expires_at_unix,
+        };
+        let request =
+            crate::human_runtime::publication_adoption_request(request_id, authority.clone())?;
+        let material = crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption {
+            material: authority,
+        };
+        Ok((request, material))
+    }
+
+    /// Inspect at most one accepted work node per call. The process-local round-robin cursor
+    /// prevents starvation while the controller runs; after restart, enumeration restarts.
     pub fn observe_publications(
         &self,
         store: &mut crate::store::ConfigStore,
@@ -178,15 +231,6 @@ impl RuntimeDelivery {
             return Ok(PublicationMonitorTick::Unknown);
         }
         let observation = self.observe_snapshot(&resource.repository_id, &resource.branch)?;
-        let expected = crate::publication_monitor::ExpectedPublicationState {
-            remote_head: baseline.observation.remote_head.clone(),
-            pull_requests: match &baseline.observation.pull_requests {
-                crate::delivery_forge::ObservationCapability::Known(pulls) => pulls.clone(),
-                crate::delivery_forge::ObservationCapability::Unknown => {
-                    return Ok(PublicationMonitorTick::Unknown);
-                }
-            },
-        };
         let publication = receipts
             .iter()
             .filter(|entry| entry.intent().kind == "publish_implementation")
@@ -228,7 +272,7 @@ impl RuntimeDelivery {
                 }
             }
         }
-        match crate::publication_monitor::classify(&expected, &observation, &host) {
+        match store.classify_publication_observation(&resource, &observation, &host)? {
             crate::publication_monitor::PublicationClassification::Unchanged => {
                 Ok(PublicationMonitorTick::Unchanged)
             }
@@ -325,6 +369,15 @@ impl RuntimeDelivery {
             heads.insert(repository_id.clone(), sha.to_owned());
         }
         Ok(heads)
+    }
+}
+
+impl crate::human_runtime::PublicationAdoptionSource for RuntimeDelivery {
+    fn observe_publication(
+        &self,
+        resource: &crate::store::publication_monitor::PublicationResource,
+    ) -> Result<crate::delivery_runtime::RepositoryPublicationObservation, String> {
+        self.observe_snapshot(&resource.repository_id, &resource.branch)
     }
 }
 

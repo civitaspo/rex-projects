@@ -173,6 +173,35 @@ impl ConfigStore {
         }))
     }
 
+    /// Compare a fresh host observation with the durable accepted snapshot. This is the core
+    /// foreground monitor decision used after each bounded remote read.
+    pub fn classify_publication_observation(
+        &self,
+        resource: &PublicationResource,
+        observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+        host_effects: &crate::publication_monitor::ReconciledHostEffects,
+    ) -> Result<crate::publication_monitor::PublicationClassification, String> {
+        let baseline = self
+            .load_publication_baseline(resource)?
+            .ok_or("publication baseline has not been established")?;
+        let expected = crate::publication_monitor::ExpectedPublicationState {
+            remote_head: baseline.observation.remote_head,
+            pull_requests: match baseline.observation.pull_requests {
+                crate::delivery_forge::ObservationCapability::Known(pulls) => pulls,
+                crate::delivery_forge::ObservationCapability::Unknown => {
+                    return Ok(
+                        crate::publication_monitor::PublicationClassification::UnknownCapability,
+                    );
+                }
+            },
+        };
+        Ok(crate::publication_monitor::classify(
+            &expected,
+            observation,
+            host_effects,
+        ))
+    }
+
     /// Advance only from a succeeded, exact publication effect whose receipt matches the new
     /// remote snapshot. The caller cannot supply a boolean or an operation ID as proof.
     pub fn advance_publication_baseline(
@@ -250,6 +279,18 @@ fn baseline_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn normalize_publication_observation(
+    observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+) -> crate::delivery_runtime::RepositoryPublicationObservation {
+    let mut normalized = observation.clone();
+    if let crate::delivery_forge::ObservationCapability::Known(pulls) =
+        &mut normalized.pull_requests
+    {
+        pulls.sort_by_key(|pull| pull.number);
+    }
+    normalized
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationResource {
@@ -281,18 +322,6 @@ pub struct UnresolvedPublicationIrregularity {
     pub revision: u64,
     pub observation_digest: crate::domain::ids::Digest,
     pub facts: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublicationResolution {
-    pub owner_generation: u64,
-    pub resource: PublicationResource,
-    pub expected_revision: u64,
-    pub expected_observation_digest: String,
-    pub fresh_observation_digest: String,
-    pub selected_resource: serde_json::Value,
-    pub human_disposition: String,
-    pub now_unix: i64,
 }
 
 impl ConfigStore {
@@ -431,90 +460,157 @@ impl ConfigStore {
         })
     }
 
-    /// Resolve only the exact latest observation a human reviewed. The adopted resource is
-    /// recorded as evidence; it does not manufacture a successful push, PR, or merge receipt.
-    pub fn resolve_publication_irregularity(
+    /// Adopt only the exact remote snapshot approved through the durable publication-adoption
+    /// request. The baseline update and irregularity resolution share one transaction so the
+    /// monitor cannot immediately rediscover the same external state as unexpected.
+    pub fn adopt_publication_snapshot(
         &mut self,
-        resolution: &PublicationResolution,
-    ) -> Result<(), String> {
-        if !matches!(
-            resolution.human_disposition.as_str(),
-            "adopt_exact_resource" | "replan"
-        ) {
-            return Err("unsupported publication irregularity resolution".into());
+        owner_generation: u64,
+        approval: &super::human::AcceptedPublicationAdoptionApproval,
+        fresh_observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+        configuration_digest: &crate::domain::ids::Digest,
+        base_branch: &str,
+        now_unix: i64,
+    ) -> Result<PublicationBaseline, String> {
+        let authority = approval.authority();
+        authority.review_bundle()?;
+        if !approval.receipt().approved()
+            || authority.configuration_digest != *configuration_digest
+            || approval.receipt().configuration_digest() != configuration_digest
+            || authority.compute_observation_digest()? != authority.current_observation_digest
+            || crate::human_runtime::publication_observation_digest(fresh_observation)?
+                != authority.current_observation_digest
+            || normalize_publication_observation(fresh_observation)
+                != normalize_publication_observation(&authority.current_observation)
+        {
+            return Err(
+                "publication adoption approval does not bind the fresh configured observation"
+                    .into(),
+            );
         }
-        let entity_id = publication_entity_id(&resolution.resource)?;
+        let resource = &authority.resource;
+        if base_branch.trim().is_empty() {
+            return Err("publication adoption requires a configured base branch".into());
+        }
+        let normalized = normalize_publication_observation(fresh_observation);
+        let current_json = super::canonical_json(&normalized)?;
+        let current_digest = baseline_digest(current_json.as_bytes());
+        let entity_id = publication_entity_id(resource)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        validate_active_generation(&tx, resolution.owner_generation)?;
-        let latest: Option<(u64, String)> = tx
+        validate_active_generation(&tx, owner_generation)?;
+
+        let latest: Option<(u64, String, String)> = tx
             .query_row(
-                "SELECT new_revision,evidence_json FROM transitions WHERE project_id=?1 AND entity_type='external_publication' AND entity_id=?2 ORDER BY new_revision DESC LIMIT 1",
-                params![resolution.resource.project_id.as_str(), entity_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT new_revision,input_id,evidence_json FROM transitions WHERE project_id=?1 AND entity_type='external_publication' AND entity_id=?2 ORDER BY new_revision DESC LIMIT 1",
+                params![resource.project_id.as_str(), entity_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((revision, evidence_json)) = latest else {
+        let Some((revision, event_id, evidence_json)) = latest else {
             return Err("publication irregularity no longer exists".into());
         };
-        let evidence: serde_json::Value = serde_json::from_str(&evidence_json)
-            .map_err(|error| format!("publication journal is invalid: {error}"))?;
-        let facts = &evidence["facts"]["facts"];
-        let selected_is_observed = if resolution.selected_resource["kind"] == "branch" {
-            facts["observed_remote_head"] == resolution.selected_resource["head"]
-        } else {
-            facts["pull_requests"]["value"]
-                .as_array()
-                .is_some_and(|resources| resources.contains(&resolution.selected_resource))
-        };
-        if revision != resolution.expected_revision
+        let evidence: serde_json::Value = crate::protocol::parse_unique(evidence_json.as_bytes())
+            .map_err(|error| error.to_string())?;
+        if event_id != authority.event_id
+            || revision != authority.event_revision
             || evidence["state"] != "unresolved"
             || evidence["observation_digest"].as_str()
-                != Some(resolution.expected_observation_digest.as_str())
-            || resolution.fresh_observation_digest != resolution.expected_observation_digest
-            || (resolution.human_disposition == "adopt_exact_resource" && !selected_is_observed)
+                != Some(authority.previous_observation_digest.as_str())
         {
             return Err(
-                "publication irregularity or selected resource changed after fresh human review"
-                    .into(),
+                "publication irregularity changed after the human approval was issued".into(),
             );
         }
+        let run_project: Option<String> = tx
+            .query_row(
+                "SELECT project_id FROM ticket_runs WHERE ticket_run_id=?1",
+                [resource.ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if run_project.as_deref() != Some(resource.project_id.as_str()) {
+            return Err("publication adoption does not match its durable TicketRun".into());
+        }
+        let project_configuration: Option<String> = tx
+            .query_row(
+                "SELECT config_digest FROM projects WHERE project_id=?1",
+                [resource.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if project_configuration.as_deref() != Some(configuration_digest.as_str()) {
+            return Err("publication adoption configuration is no longer current".into());
+        }
+
+        let existing: Option<(String, u64, String)> = tx
+            .query_row(
+                "SELECT base_branch,revision,current_digest FROM publication_baselines WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4",
+                params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((stored_base, baseline_revision, baseline_digest)) = existing {
+            if stored_base != base_branch {
+                return Err("publication baseline base branch changed since capture".into());
+            }
+            let next_revision = baseline_revision
+                .checked_add(1)
+                .ok_or("publication baseline revision overflow")?;
+            let changed = tx
+                .execute(
+                    "UPDATE publication_baselines SET current_snapshot_json=?5,current_digest=?6,revision=?7,last_effect_operation_id=NULL,updated_at_unix=?8 WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4 AND revision=?9 AND current_digest=?10",
+                    params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch,current_json,current_digest,next_revision,now_unix,baseline_revision,baseline_digest],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("publication baseline changed during human adoption".into());
+            }
+        } else {
+            // This is the first trusted snapshot. The human-approved observation becomes both the
+            // initial and current state; it is never claimed as a pre-execution baseline.
+            tx.execute(
+                "INSERT INTO publication_baselines(project_id,ticket_run_id,repository_id,branch,base_branch,initial_snapshot_json,initial_digest,current_snapshot_json,current_digest,revision,last_effect_operation_id,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?7,1,NULL,?8)",
+                params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch,base_branch,current_json,current_digest,now_unix],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
         let next_revision = revision
             .checked_add(1)
             .ok_or("publication journal revision overflow")?;
         let resolution_id = format!("{entity_id}:{next_revision}");
         let resolved = serde_json::json!({
-            "state": "resolved",
-            "observation_digest": resolution.expected_observation_digest,
-            "human_disposition": resolution.human_disposition,
-            "resolved_revision": revision,
-            "adopted_resource": (resolution.human_disposition == "adopt_exact_resource").then_some(&resolution.selected_resource),
+            "state":"resolved",
+            "observation_digest":authority.previous_observation_digest,
+            "adopted_observation_digest":current_digest,
+            "human_disposition":"adopt_exact_resource",
+            "resolved_revision":revision,
+            "adopted_resource":authority.selected_resource,
+            "human_request_id":approval.receipt().request_id().as_str(),
+            "human_response_id":approval.receipt().response_id(),
         });
         tx.execute(
-            "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'external_publication',?2,?3,?4,?5,'human resolved exact external publication observation',?6,?7)",
-            params![resolution.resource.project_id.as_str(), entity_id, revision, next_revision, resolution_id, resolved.to_string(), resolution.now_unix],
+            "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'external_publication',?2,?3,?4,?5,'human adopted exact current external publication',?6,?7)",
+            params![resource.project_id.as_str(),entity_id,revision,next_revision,resolution_id,resolved.to_string(),now_unix],
         )
         .map_err(|error| error.to_string())?;
-        let role_session = format!(
-            "ticket_run:{}:coordinator",
-            resolution.resource.ticket_run_id.as_str()
-        );
-        let wake = serde_json::json!({
-            "ticket_run_id": resolution.resource.ticket_run_id.as_str(),
-            "target": "coordinator",
-            "source": "publication_resolution",
-            "event_id": resolution_id,
-            "revision": next_revision,
-        });
+        let role_session = format!("ticket_run:{}:coordinator", resource.ticket_run_id.as_str());
+        let wake = serde_json::json!({"ticket_run_id":resource.ticket_run_id.as_str(),"target":"coordinator","source":"publication_adoption","event_id":resolution_id,"revision":next_revision});
         tx.execute(
-            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'external_publication_resolution',?3,?4,50,?5,'pending',?6)",
-            params![resolution.resource.project_id.as_str(), role_session, resolution_id, next_revision, wake.to_string(), resolution.now_unix],
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'publication_adoption',?3,?4,50,?5,'pending',?6)",
+            params![resource.project_id.as_str(),role_session,resolution_id,next_revision,wake.to_string(),now_unix],
         )
         .map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())
+        tx.commit().map_err(|error| error.to_string())?;
+        self.load_publication_baseline(resource)?
+            .ok_or_else(|| "adopted publication baseline disappeared".into())
     }
 
     /// Check the exact repository branch before any later publication or merge side effect.
@@ -727,57 +823,5 @@ mod tests {
             store.load_publication_baseline(&resource).unwrap(),
             Some(saved)
         );
-    }
-
-    #[test]
-    fn exact_adoption_requires_fresh_matching_revision_and_selected_resource() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut store, generation, resource) = setup_store(temp.path());
-        let selected = serde_json::json!({"number":7,"source_head":"b".repeat(40)});
-        let facts = serde_json::json!({
-            "pull_requests": {"status":"known","value":[selected.clone()]},
-            "observed_remote_head":"b".repeat(40),
-        });
-        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&facts).unwrap()));
-        let receipt = store
-            .record_publication_irregularity(
-                generation,
-                &PublicationIrregularity {
-                    resource: resource.clone(),
-                    observation_digest: digest.clone(),
-                    observed_at_unix: 10,
-                    facts,
-                },
-            )
-            .unwrap();
-        assert!(store.assert_publication_unblocked(&resource).is_err());
-        assert!(
-            store
-                .resolve_publication_irregularity(&PublicationResolution {
-                    owner_generation: generation,
-                    resource: resource.clone(),
-                    expected_revision: receipt.revision,
-                    expected_observation_digest: digest.clone(),
-                    fresh_observation_digest: "stale-observation".into(),
-                    selected_resource: selected.clone(),
-                    human_disposition: "adopt_exact_resource".into(),
-                    now_unix: 11,
-                },)
-                .is_err()
-        );
-        assert!(store.assert_publication_unblocked(&resource).is_err());
-        store
-            .resolve_publication_irregularity(&PublicationResolution {
-                owner_generation: generation,
-                resource: resource.clone(),
-                expected_revision: receipt.revision,
-                expected_observation_digest: digest.clone(),
-                fresh_observation_digest: digest,
-                selected_resource: selected,
-                human_disposition: "adopt_exact_resource".into(),
-                now_unix: 12,
-            })
-            .unwrap();
-        assert!(store.assert_publication_unblocked(&resource).is_ok());
     }
 }
