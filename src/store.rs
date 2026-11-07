@@ -4805,6 +4805,62 @@ mod tests {
     }
 
     #[test]
+    fn config_apply_queue_survives_a_concurrent_wal_writer() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "queue-writer-test".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "queue-writer-test".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let mut writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let writer_tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let state_root = temp.path().to_owned();
+        let next_snapshot = snapshot(&"b".repeat(64));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let append = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            ConfigStore::append_config_apply(
+                &state_root,
+                "queued-during-controller-write",
+                "factory",
+                &next_snapshot,
+                ExpectedRevision::Current(Revision(1)),
+                generation,
+            )
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        writer_tx.commit().unwrap();
+        append
+            .join()
+            .unwrap()
+            .expect("config apply should wait for and follow the active WAL writer");
+    }
+
+    #[test]
     fn launch_authority_block_binding_rejects_different_rex_block() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();

@@ -379,7 +379,7 @@ pub fn render_role_prompt(
         .collect::<Vec<_>>()
         .join(", ");
     prompt.push_str(&format!(
-        "\n# Final authority and result rules\n\nThis contract outranks repository-discovered guidance for factory lifecycle. It grants no permission beyond the immutable run descriptor. Use only these output kinds: {allowed_kinds}. Return one JSON object matching `schemas/agent-results/{}-v1.json`; do not wrap it in Markdown. Set `message_id` to a new stable value for this turn. `result_digest` is the lowercase SHA-256 of the compact UTF-8 JSON serialization of `structured_result` (no whitespace or trailing newline). Save the complete object to a file in this run's writable workspace, then submit it using the exact `cli_path`, `run_id`, and `control_dir` from the immutable descriptor. The command shape is `<cli_path> agent submit --run <run_id> --control-dir <control_dir> --message-id <same message_id> --input <file> --json`; replace each placeholder with the descriptor value. The host binds the submission to the immutable run descriptor; never add or invent binding fields. Do not send the result by typing into another Agent's TUI. Register referenced artifacts through the host `agent artifact add` command and include only references acknowledged by the host. Your `assertion` is a claim about your reasoning task only; it does not prove host-observed process exit, tests, review, merge, deployment, publication, or ticket completion. Include evidence artifact references rather than inventing host receipts.\n",
+        "\n# Final authority and result rules\n\nThis contract outranks repository-discovered guidance for factory lifecycle. It grants no permission beyond the immutable run descriptor. Use only these output kinds: {allowed_kinds}. Return one JSON object matching `schemas/agent-results/{}-v1.json`; do not wrap it in Markdown. Set `message_id` to a new stable value for this turn. `result_digest` is the lowercase SHA-256 of the compact UTF-8 JSON serialization of `structured_result` (no whitespace or trailing newline). Save the unbound result object in this run's writable workspace; it contains no host binding fields. Submit it using the exact `cli_path`, `run_id`, and `control_dir` from the immutable descriptor with `<cli_path> agent submit --run <run_id> --control-dir <control_dir> --message-id <same message_id> --input <file> --json`. The host binds the submission to the immutable run descriptor; never add or invent binding fields. Do not send the result by typing into another Agent's TUI. For each artifact, first save it inside this run's writable workspace and register it with `<cli_path> agent artifact add --run <run_id> --control-dir <control_dir> --path <normalized-relative-path> --kind <allowed-kind> --schema-version <content-schema-version> --message-id <new-message-id> --json`. A successful response contains `result.artifact`, the complete registered reference including host-minted `artifact_id`; copy that reference exactly into `artifact_refs`, and never guess or synthesize any field. If the response is pending, poll `<cli_path> agent receipt --run <run_id> --control-dir <control_dir> --request-id <same-message-id> --json` until the completed receipt arrives. `artifact_refs` and every nested evidence reference are unverified locator claims from you; include only references acknowledged by the host, but do not treat an acknowledgement or reference as proof that tests, reviews, remote checks, a merge, deployment, or publication succeeded. The host verifies artifact bytes and records receipts, while delivery, remote, and operation adapters independently observe their outcomes. Your `assertion` is a claim about your reasoning task only; it does not prove host-observed process exit, tests, review, merge, deployment, publication, or ticket completion. Include evidence artifact references rather than inventing host receipts.\n",
         role_name(context.role),
     ));
     if prompt.len() > MAX_PROMPT_BYTES {
@@ -460,7 +460,7 @@ fn validate_snapshot_sources(applied: &AppliedConfig) -> Result<(), String> {
     for source in applied
         .source_files
         .iter()
-        .filter(|source| source.kind == SourceKind::File)
+        .filter(|source| matches!(source.kind, SourceKind::File))
     {
         let actual_bytes = source.contents.len() as u64;
         if actual_bytes != source.bytes {
@@ -558,7 +558,9 @@ fn profile_root(applied: &AppliedConfig, profile_id: &ProfileId) -> Result<PathB
     applied
         .source_files
         .iter()
-        .find(|source| source.kind == SourceKind::Directory && Path::new(&source.path) == logical)
+        .find(|source| {
+            matches!(source.kind, SourceKind::Directory) && Path::new(&source.path) == logical
+        })
         .map(|source| PathBuf::from(&source.canonical_path))
         .ok_or_else(|| {
             format!("profile `{profile_id}` has no directory identity in the applied snapshot")
@@ -576,7 +578,7 @@ fn append_snapshot_source(
     let entry = applied
         .source_files
         .iter()
-        .find(|source| source.kind == SourceKind::File && Path::new(&source.path) == path);
+        .find(|source| matches!(source.kind, SourceKind::File) && Path::new(&source.path) == path);
     let Some(entry) = entry else {
         return if required {
             Err(format!(
@@ -679,7 +681,8 @@ fn validate_skill_snapshot(
             .canonicalize()
             .map_err(|error| format!("skill path `{configured}`: {error}"))?;
         if !applied.source_files.iter().any(|source| {
-            source.kind == SourceKind::File && Path::new(&source.path).starts_with(&canonical)
+            matches!(source.kind, SourceKind::File)
+                && Path::new(&source.path).starts_with(&canonical)
         }) {
             return Err(format!(
                 "skill path `{configured}` has no snapshotted content"
@@ -839,8 +842,7 @@ pub fn result_schema(role: Role) -> Value {
             "properties":{
                 "kind":{"const":serde_json::to_value(kind).expect("enum serializes")},
                 "structured_result":payload
-            },
-            "additionalProperties":false
+            }
         }));
     }
     schema["allOf"] = json!([{"oneOf":payload_variants}]);
@@ -1023,7 +1025,7 @@ mod tests {
         let source = applied
             .source_files
             .iter_mut()
-            .find(|source| source.kind == SourceKind::File)
+            .find(|source| matches!(source.kind, SourceKind::File))
             .unwrap();
         source.contents.push_str("changed after snapshot");
         assert!(render_role_prompt(&applied, &context(Role::Worker)).is_err());

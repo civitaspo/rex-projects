@@ -818,42 +818,6 @@
       },
       "type": "object"
     },
-    "StatusValues": {
-      "additionalProperties": false,
-      "properties": {
-        "backlog": {
-          "type": "string"
-        },
-        "canceled": {
-          "type": "string"
-        },
-        "done": {
-          "type": "string"
-        },
-        "in_progress": {
-          "type": "string"
-        },
-        "in_review": {
-          "type": "string"
-        },
-        "ready": {
-          "type": "string"
-        },
-        "triage": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "triage",
-        "backlog",
-        "ready",
-        "in_progress",
-        "in_review",
-        "done",
-        "canceled"
-      ],
-      "type": "object"
-    },
     "SuccessPredicate": {
       "oneOf": [
         {
@@ -940,9 +904,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "status_values": {
-          "$ref": "#/$defs/StatusValues"
-        },
         "write_timeout_seconds": {
           "default": 120,
           "format": "uint64",
@@ -952,8 +913,7 @@
       },
       "required": [
         "kind",
-        "command",
-        "status_values"
+        "command"
       ],
       "type": "object"
     },

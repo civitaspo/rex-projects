@@ -121,6 +121,7 @@ impl ArtifactStore {
         }
         publish_immutable_object(parent, &object_path, &bytes)?;
         let reference = RoleArtifactReference {
+            artifact_id: crate::domain::ids::ArtifactId::parse(artifact_id.clone())?,
             kind,
             schema_version,
             path: relative,

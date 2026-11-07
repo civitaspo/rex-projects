@@ -136,7 +136,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 - [ ] Create or update `src/protocol/`. Record the reviewed diff.
 - [ ] Create or update `src/config.rs`. Record the reviewed diff.
 - [ ] Create or update `schemas/`. Record the reviewed diff.
-- [ ] Create or update `schemas/version.v1.json` and `scripts/build-release-assets.sh`. Record the reviewed diff.
+- [ ] Create or update `schemas/version.v1.json` and document the csm-ci `cargo-raw` release contract in `docs/release-assets.md`. Release builds and uploaded artifacts are produced by the managed csm-ci service; do not add a repository-local release builder.
 - [ ] Create or update `mise.toml`. Record the reviewed diff.
 - [ ] Create or update `.github/workflows/`. Record the reviewed diff.
 
@@ -145,7 +145,7 @@ Vocabulary is in [GLOSSARY.md](../GLOSSARY.md). Architectural constraints are in
 - [ ] Add one Rust package and the rex-projects binary. Keep modules within one crate until a real consumer needs a separate crate.
 - [ ] Implement branded identifiers, request and response envelopes, configuration parsing, validation errors, and JSON Schema emission. Load named profiles from adjacent `profiles/<name>/` directories as specified in Appendix L.
 - [ ] Add config validate, config apply, doctor, schema, and version commands. Apply a validated complete configuration snapshot atomically in SQLite. Make stdout machine-readable under --json and reserve stderr for diagnostics.
-- [ ] Wire cargo fmt --check, cargo clippy with warnings denied, and cargo test into existing mise tasks and CI. Preserve workflow security checks. Build the Appendix O standalone release assets and SHA-256 metadata for verified targets; publication is a separate authorized release step. Do not change a Lua pin until its assets are available and validated.
+- [ ] Wire cargo fmt --check, cargo clippy with warnings denied, and cargo test into existing mise tasks and CI. Preserve workflow security checks. Configure the managed csm-ci `cargo-raw` release for the Appendix O targets and SHA-256 metadata; publication is a separate authorized release step. Use the development-only `cargo xtask` verifier to update a Lua pin only after signed assets are available and validated.
 
 **You see.**
 
@@ -1208,9 +1208,9 @@ Validate at the boundary. Internal domain logic works with parsed types.
 
 `result` and `error` are mutually exclusive. `error` contains `code`, `message`, `retryable`, optional `retry_after_seconds`, and optional structured details.
 Use normalized codes `not_found`, `unauthorized`, `forbidden`, `conflict`, `rate_limited`, `unavailable`, `unsupported`, and `invalid_request`.
-Keep provider details under `extensions` or error details. Do not branch the engine on Linear-specific labels or status IDs.
+Keep provider details under `extensions` or error details. Do not branch the engine on tracker-specific labels or status IDs.
 `revision` is opaque and may be unavailable if the provider has no stable revision. `adapter.describe` states whether conditional writes are supported. Without compare-and-set, re-read immediately before mutation and record that a race remains.
-The normalized external status is exactly `triage`, `backlog`, `ready`, `in_progress`, `in_review`, `done`, or `canceled`, as defined in Appendix E. In `[adapters.tickets.status_values]`, normalized semantic keys map to the native status strings to use when reading and writing tickets. The adapter response returns the normalized key plus the observed native value and display label. Reject unmapped statuses; never guess that an unknown status is `ready`.
+The normalized external status is exactly `triage`, `backlog`, `ready`, `in_progress`, `in_review`, `done`, or `canceled`, as defined in Appendix E. The external wrapper keeps its own mapping from these semantic keys to native status strings and returns that map in `adapter.describe`. The adapter response returns the normalized key plus the observed native value and display label. Reject unmapped statuses; never guess that an unknown status is `ready`.
 A Project's adapter scope filters every list and mutation. Out-of-scope tickets are rejected even if a model requests them. Adapters declare supported scoped filters and optional operations; core logic never sends opaque provider requests.
 
 ### Ticket methods
@@ -1318,11 +1318,11 @@ Keep conservative initial thresholds visible as proposed defaults. Calibrate aga
 ### Execute and verify merge
 
 1. Observe the current PR, head and base SHAs, checks, reviews, policy, and dependencies.
-2. Resolve the repository's trusted merge instructions and create a typed ordered procedure. The prototype supports `pr.update_body`, `merge.request`, `merge.execute`, and `merge.verify_commit` steps. An instruction may require a body update before merge, choose a direct merge or automation request, and define post-merge commit checks. Each step has typed inputs; never run shell text from the instruction. A requested step outside the registered operations requires human action and blocks unattended merging.
+2. Resolve the repository's trusted merge instructions and create a typed ordered procedure. The proposal types include `pr.update_body`, `merge.request`, `merge.execute`, and `merge.verify_commit`. A provider effect is executable only when its semantics are supported. GitHub does not offer an atomic conditional PR-body update, so rex-projects never writes the PR body automatically; that step is handed to a human, then all evidence and approval are rebuilt. An instruction may choose a direct merge or automation request and define post-merge commit checks. Each step has typed inputs; never run shell text from the instruction. A requested step outside registered, revision-safe operations requires human action and blocks unattended merging.
 3. Build the assessment from immutable evidence. Bind the PR identity, source head, base, resolved policy and instruction digests, ordered procedure, prepared body digest, expected trailers, and verification rules. Include the exact prepared PR body in any human review bundle. If the PR is ineligible or uncertain, create a HumanRequest.
 4. On approval, validate the answer's exact subject and expiry. Re-fetch the PR, body, head, base, checks, reviews, policy, and dependencies. Stop if any bound fact changed.
 5. Persist the complete merge intent and its ordered steps before executing them. Give every step a stable operation ID and effect receipt. Never hold a SQLite transaction across a forge call. After a lost response, observe the corresponding resource and reconcile that step before retrying it.
-6. For `pr.update_body`, read and record the prior body digest, write the exact approved content, then re-read and verify its digest and the unchanged head. Use a provider conditional body update when supported. Without one, retain the prior body for recovery and coordinate a short write window with the repository's other body writers. A read followed by a write is not atomic and can still overwrite a racing edit; record that limitation instead of claiming compare-and-swap. Re-read immediately before proceeding and stop for reconciliation on an observed difference. If body writes cannot be coordinated under that repository's cooperative workflow, leave this step for human execution rather than repeatedly overwriting the body. The reviewed body preserves existing content and ends with one valid `Co-authored-by` trailer for each commit author required by repository policy, with no text after the trailers.
+6. For `pr.update_body`, prepare the exact content and show it to the human. GitHub's PR update endpoint does not support conditional writes, so the controller must not PATCH the body after a digest preflight: that could overwrite a concurrent edit. After the human performs the update, re-observe it and rebuild the assessment and any human approval. The reviewed body preserves existing content and ends with one valid `Co-authored-by` trailer for each commit author required by repository policy, with no text after the trailers.
 7. Revalidate every mutable merge gate after the body update. For `merge.request`, submit the exact approved command or comment from the resolved repository instructions, then record its external reference. The repository automation must check the required policy and current revision when it acts. For `merge.execute`, use the approved expected-head guard and verify the execution-time base guard described below. Re-read the base immediately before the effect; a changed assessed base invalidates the assessment and approval. Never use an admin bypass.
 8. Observe the PR until it is actually merged, rejected, changed, or timed out. A request acknowledgement or merge-queue entry is not a completed merge. After observing a merge, fetch and inspect the actual squash or merge commit and verify the repository's required trailers and other post-merge rules. Record the merge commit, included revision, and verification receipts.
 9. If the remote merged the PR but post-merge verification fails, record `merged_verification_failed`, stop release operations and ticket completion, and request human reconciliation. Do not issue another merge request or attempt an automatic revert. If no merge occurred and a request timed out, reconcile its external state before any retry.
@@ -1709,15 +1709,6 @@ command = ["/absolute/path/example-ticket-adapter"]
 environment_allow = ["PATH", "HOME", "EXAMPLE_TICKET_TOKEN"]
 read_timeout_seconds = 30
 write_timeout_seconds = 120
-
-[adapters.tickets.status_values]
-triage = "Triage"
-backlog = "Backlog"
-ready = "ToDo"
-in_progress = "In Progress"
-in_review = "In Review"
-done = "Done"
-canceled = "Canceled"
 
 [human]
 kind = "local_html"

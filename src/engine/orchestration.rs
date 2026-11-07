@@ -8,8 +8,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::{Config, OperationRecipe, ProjectConfig, SuccessPredicate};
 use crate::domain::ids::{
-    AgentRunId, Digest, OperationId, ProfileId, ProjectId, RepositoryId, Revision, TicketId,
-    TicketNamespace, TicketRunId,
+    AgentRunId, ArtifactId, Digest, OperationId, ProfileId, ProjectId, RepositoryId, Revision,
+    TicketId, TicketNamespace, TicketRunId,
 };
 use crate::domain::types::CommitMode;
 use crate::domain::types::{ProjectMode, RecipeStage, Role, TicketStatus};
@@ -340,7 +340,6 @@ pub enum RoleOutputKind {
     LearningDecision,
     ProfileTrialResult,
     ProfilePromotionProposal,
-    GoalCompletion,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -366,14 +365,127 @@ pub enum RoleArtifactKind {
     General,
 }
 
-/// A pointer into this AgentRun's registered output root. The host artifact
-/// registrar must still open without following links, copy, hash and publish
-/// the same bytes before acknowledging the reference.
+impl RoleArtifactKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Change => "change",
+            Self::TestReceipt => "test_receipt",
+            Self::Review => "review",
+            Self::MergeAssessment => "merge_assessment",
+            Self::OperationReceipt => "operation_receipt",
+            Self::Postmortem => "postmortem",
+            Self::Learning => "learning",
+            Self::General => "general",
+        }
+    }
+}
+
+/// Agent request to register one artifact from its run-local writable output
+/// root. The host resolves this path relative to the bound AgentRun, copies and
+/// verifies the bytes, then returns a registered `RoleArtifactReference`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactAddRequest {
+    /// Artifact-add request envelope version.
+    pub schema_version: u32,
+    pub message_id: String,
+    /// Normalized relative path (at most 1,024 Unicode scalar values and
+    /// 4,096 UTF-8 bytes), rooted at the requesting AgentRun output root.
+    pub path: String,
+    pub kind: RoleArtifactKind,
+    /// Schema version of the artifact contents, independent of this request.
+    pub artifact_schema_version: u32,
+}
+
+impl ArtifactAddRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != ARTIFACT_ADD_REQUEST_SCHEMA_VERSION {
+            return Err("unsupported artifact-add request schema version".into());
+        }
+        if self.message_id.is_empty()
+            || self.message_id.len() > 128
+            || !self
+                .message_id
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !self
+                .message_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err("artifact-add message ID must be a bounded local identifier".into());
+        }
+        validate_artifact_relative_path(&self.path)?;
+        if self.artifact_schema_version == 0 {
+            return Err("artifact schema version must be positive".into());
+        }
+        Ok(())
+    }
+}
+
+pub const ARTIFACT_ADD_REQUEST_SCHEMA_VERSION: u32 = 1;
+const ARTIFACT_RELATIVE_PATH_PATTERN: &str = r"^(?![A-Za-z]:)(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^./\\\p{Cc}][^/\\\p{Cc}]*)((?:/(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*))*)$";
+
+pub fn artifact_add_request_schema() -> Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(ArtifactAddRequest))
+        .expect("artifact-add request schema serializes to JSON");
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        if let Some(request_version) = properties
+            .get_mut("schema_version")
+            .and_then(Value::as_object_mut)
+        {
+            request_version.insert(
+                "const".into(),
+                Value::from(ARTIFACT_ADD_REQUEST_SCHEMA_VERSION),
+            );
+        }
+        if let Some(artifact_version) = properties
+            .get_mut("artifact_schema_version")
+            .and_then(Value::as_object_mut)
+        {
+            artifact_version.insert("minimum".into(), Value::from(1));
+        }
+        if let Some(message_id) = properties
+            .get_mut("message_id")
+            .and_then(Value::as_object_mut)
+        {
+            message_id.insert("minLength".into(), Value::from(1));
+            message_id.insert("maxLength".into(), Value::from(128));
+            message_id.insert(
+                "pattern".into(),
+                Value::from(r"^[A-Za-z0-9][A-Za-z0-9._-]*$"),
+            );
+        }
+        if let Some(path) = properties.get_mut("path").and_then(Value::as_object_mut) {
+            path.insert("minLength".into(), Value::from(1));
+            path.insert("maxLength".into(), Value::from(1024));
+            path.insert(
+                "pattern".into(),
+                Value::from(ARTIFACT_RELATIVE_PATH_PATTERN),
+            );
+            path.insert("not".into(), serde_json::json!({"pattern": r"^[^/]:"}));
+        }
+    }
+    schema
+}
+
+/// A host-registered artifact locator returned after the AgentRun request path
+/// has been safely copied and its bytes have been checked. The opaque ID is
+/// still only a reference: readers must resolve it in host-owned registration
+/// state and verify the immutable receipt before relying on it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleArtifactReference {
+    /// Host-minted stable identity. This identifier alone is not an
+    /// acknowledgement; consumers must resolve it in host-owned registration
+    /// state before relying on the referenced artifact.
+    pub artifact_id: ArtifactId,
     pub kind: RoleArtifactKind,
     pub schema_version: u32,
+    /// Normalized relative locator in the host-managed artifact store, at most
+    /// 1,024 Unicode scalar values and 4,096 UTF-8 bytes.
     pub path: String,
     pub digest: Digest,
     pub bytes: u64,
@@ -663,10 +775,6 @@ role_payload!(ProfilePromotionProposalPayload {
     expected_target_digests: BTreeMap<String, Digest>,
     uncertain_efficacy_exception: Option<BTreeMap<String, String>>,
 });
-role_payload!(GoalCompletionProposalPayload {
-    evidence: GoalCompletionEvidence,
-    evidence_references: Vec<RoleArtifactReference>,
-});
 
 /// Closed role payloads that can cross the durable evidence boundary. These
 /// represent Agent assertions only; host observations and effects are stored
@@ -693,7 +801,6 @@ pub enum RoleResultPayload {
     LearningDecision(LearningDecisionPayload),
     ProfileTrialResult(ProfileTrialResultPayload),
     ProfilePromotionProposal(ProfilePromotionProposalPayload),
-    GoalCompletion(GoalCompletionProposalPayload),
 }
 
 impl RoleResultPayload {
@@ -748,9 +855,6 @@ impl RoleResultPayload {
             RoleOutputKind::ProfilePromotionProposal => {
                 parse_variant!(ProfilePromotionProposalPayload, ProfilePromotionProposal)
             }
-            RoleOutputKind::GoalCompletion => {
-                parse_variant!(GoalCompletionProposalPayload, GoalCompletion)
-            }
         }
     }
 
@@ -776,7 +880,6 @@ impl RoleResultPayload {
             Self::LearningDecision(_) => RoleOutputKind::LearningDecision,
             Self::ProfileTrialResult(_) => RoleOutputKind::ProfileTrialResult,
             Self::ProfilePromotionProposal(_) => RoleOutputKind::ProfilePromotionProposal,
-            Self::GoalCompletion(_) => RoleOutputKind::GoalCompletion,
         }
     }
 }
@@ -880,23 +983,6 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
                 );
             }
         }
-        RoleResultPayload::GoalCompletion(result)
-            if result.evidence.satisfied_acceptance.is_empty()
-                || result.evidence.satisfied_acceptance.len() > 256
-                || result.evidence.incomplete_ticket_ids.len() > 256
-                || result.evidence.deferred_risks.len() > 128
-                || result.evidence.operation_results.len() > 128
-                || result
-                    .evidence
-                    .satisfied_acceptance
-                    .iter()
-                    .chain(&result.evidence.deferred_risks)
-                    .chain(&result.evidence.operation_results)
-                    .any(|value| value.trim().is_empty() || value.len() > 4_096)
-                || result.evidence_references.len() > 128 =>
-        {
-            return Err("goal completion proposal has empty or oversized evidence".into());
-        }
         _ => {}
     }
     Ok(())
@@ -932,7 +1018,6 @@ fn validate_payload_artifacts(
         RoleResultPayload::ProfilePromotionProposal(value) => {
             references.extend(&value.evidence_references)
         }
-        RoleResultPayload::GoalCompletion(value) => references.extend(&value.evidence_references),
         RoleResultPayload::TicketProposal(_)
         | RoleResultPayload::DispatchRequest(_)
         | RoleResultPayload::Intervention(_)
@@ -992,7 +1077,6 @@ pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
         RoleOutputKind::ProfilePromotionProposal => {
             schema_for_kind!(ProfilePromotionProposalPayload)
         }
-        RoleOutputKind::GoalCompletion => schema_for_kind!(GoalCompletionProposalPayload),
     };
     constrain_payload_string_schemas(&mut schema);
     schema
@@ -1029,19 +1113,37 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                             | "HumanRequestId" | "OperationId" | "RexBlockId" => {
                                 constrain(definition, 1, 512, r"^[^\p{Cc}]*$")
                             }
-                            "Digest" => constrain(definition, 64, 64, r"^[a-f0-9]{64}$"),
+                            "Digest" | "ArtifactId" => {
+                                constrain(definition, 64, 64, r"^[a-f0-9]{64}$")
+                            }
                             "GitCommitId" => {
                                 constrain(definition, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
                             }
                             "RoleSessionId" => constrain(definition, 1, 255, r"^[A-Za-z0-9._-]+$"),
                             "RoleArtifactReference" => {
-                                if let Some(version) = definition
+                                if let Some(properties) = definition
                                     .get_mut("properties")
                                     .and_then(Value::as_object_mut)
-                                    .and_then(|properties| properties.get_mut("schema_version"))
-                                    .and_then(Value::as_object_mut)
                                 {
-                                    version.insert("minimum".into(), Value::from(1));
+                                    if let Some(version) = properties
+                                        .get_mut("schema_version")
+                                        .and_then(Value::as_object_mut)
+                                    {
+                                        version.insert("minimum".into(), Value::from(1));
+                                    }
+                                    if let Some(path) =
+                                        properties.get_mut("path").and_then(Value::as_object_mut)
+                                    {
+                                        path.insert("maxLength".into(), Value::from(1024));
+                                        path.insert(
+                                            "pattern".into(),
+                                            Value::from(ARTIFACT_RELATIVE_PATH_PATTERN),
+                                        );
+                                        path.insert(
+                                            "not".into(),
+                                            serde_json::json!({"pattern": r"^[^/]:"}),
+                                        );
+                                    }
                                 }
                             }
                             "ChangeReference" => {
@@ -1230,12 +1332,15 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                     constrain(items, 1, 80, r"^[A-Za-z0-9._-]+$");
                                 }
                             }
-                            "path" => constrain(
-                                property,
-                                1,
-                                4096,
-                                r"^(?![A-Za-z]:)(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*)(?:/(?:[^./\\\p{Cc}][^/\\\p{Cc}]*|\.[^./\\\p{Cc}][^/\\\p{Cc}]*|\.\.[^/\\\p{Cc}][^/\\\p{Cc}]*))*$",
-                            ),
+                            "path" => {
+                                constrain(property, 1, 1024, ARTIFACT_RELATIVE_PATH_PATTERN);
+                                if let Some(map) = property.as_object_mut() {
+                                    map.insert(
+                                        "not".into(),
+                                        serde_json::json!({"pattern": r"^[^/]:"}),
+                                    );
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1376,9 +1481,17 @@ fn validate_assertion(assertion: &AgentAssertion) -> Result<(), String> {
 }
 
 fn validate_artifact_reference(reference: &RoleArtifactReference) -> Result<(), String> {
-    let path = reference.path.as_str();
+    validate_artifact_relative_path(&reference.path)?;
+    if reference.schema_version == 0 {
+        return Err("artifact schema version must be positive".into());
+    }
+    Ok(())
+}
+
+fn validate_artifact_relative_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.len() > 4096
+        || path.chars().count() > 1024
         || path.starts_with('/')
         || path.starts_with('\\')
         || path.contains('\\')
@@ -1389,15 +1502,14 @@ fn validate_artifact_reference(reference: &RoleArtifactReference) -> Result<(), 
         || path
             .split('/')
             .next()
-            .is_some_and(|part| part.as_bytes().get(1) == Some(&b':'))
-        || reference.schema_version == 0
+            .is_some_and(|part| part.chars().nth(1) == Some(':'))
     {
-        return Err("artifact reference must name a bounded normalized relative path".into());
+        return Err("artifact path must be a bounded normalized relative path".into());
     }
     Ok(())
 }
 
-pub(crate) fn role_may_submit_artifact(role: Role, kind: RoleArtifactKind) -> bool {
+pub fn role_may_submit_artifact(role: Role, kind: RoleArtifactKind) -> bool {
     use RoleArtifactKind as K;
     match kind {
         K::Plan => matches!(role, Role::Coordinator | Role::Planner),
@@ -1426,7 +1538,6 @@ pub fn allowed_role_output_kinds(role: Role) -> Vec<RoleOutputKind> {
             K::LearningDecision,
             K::ProfileTrialResult,
             K::ProfilePromotionProposal,
-            K::GoalCompletion,
         ],
         Role::Coordinator => vec![K::SpawnRequest, K::PrepareWorktrees, K::PlanReady],
         Role::Planner => vec![K::PlanReady, K::InvestigationRequest],
@@ -1722,8 +1833,7 @@ pub struct WorkPlan {
     pub requested_investigation_children: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedWorkNode {
     pub id: WorkNodeId,
     pub repository: RepositoryId,
@@ -1734,8 +1844,7 @@ pub struct ValidatedWorkNode {
     pub role: Role,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkBaseSource {
     ControllerObservedCommit {
         commit: String,
@@ -1747,8 +1856,7 @@ pub enum WorkBaseSource {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedPlan {
     pub ticket_run_id: TicketRunId,
     pub nodes_in_execution_order: Vec<ValidatedWorkNode>,
@@ -1998,8 +2106,7 @@ pub fn select_planner(project: &ProjectConfig, complexity: PlanComplexity) -> Pl
     }
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalCompletionEvidence {
     pub satisfied_acceptance: Vec<String>,
     pub incomplete_ticket_ids: Vec<TicketId>,
@@ -2397,6 +2504,7 @@ mod tests {
     fn valid_merge_assessment_payload() -> Value {
         let reference = json!({
             "kind": "merge_assessment",
+            "artifact_id": "a".repeat(64),
             "schema_version": 1,
             "path": "evidence/gate.json",
             "digest": "a".repeat(64),
@@ -2427,7 +2535,7 @@ mod tests {
         let digest = "a".repeat(64);
         let commit = "1".repeat(40);
         let artifact = json!({
-            "kind":"general", "schema_version":1, "path":"evidence/result.json",
+            "kind":"general", "artifact_id": "a".repeat(64), "schema_version":1, "path":"evidence/result.json",
             "digest":digest, "bytes":10
         });
         vec![
@@ -2439,10 +2547,6 @@ mod tests {
             (
                 RoleOutputKind::HumanRequest,
                 json!({"kind":"clarification", "question":"Which option?", "choices":["a"], "evidence_references":[], "subject_digest":digest, "requested_continuation":null}),
-            ),
-            (
-                RoleOutputKind::GoalCompletion,
-                json!({"evidence":{"satisfied_acceptance":["api"],"incomplete_ticket_ids":[],"deferred_risks":[],"operation_results":["checks passed"],"subject_digest":digest},"evidence_references":[]}),
             ),
             (
                 RoleOutputKind::TicketProposal,
@@ -3195,6 +3299,7 @@ mod tests {
         let digest = "a".repeat(64);
         let reference = json!({
             "kind": "merge_assessment",
+            "artifact_id": "a".repeat(64),
             "schema_version": 1,
             "path": "evidence/gate.json",
             "digest": digest,
@@ -3307,6 +3412,7 @@ mod tests {
     #[test]
     fn nested_artifact_references_must_be_declared_and_remain_unverified_claims() {
         let artifact = RoleArtifactReference {
+            artifact_id: ArtifactId::parse("f".repeat(64)).unwrap(),
             kind: RoleArtifactKind::General,
             schema_version: 1,
             path: "evidence/observation.json".into(),
@@ -3347,7 +3453,6 @@ mod tests {
             RoleOutputKind::LearningDecision,
             RoleOutputKind::ProfileTrialResult,
             RoleOutputKind::ProfilePromotionProposal,
-            RoleOutputKind::GoalCompletion,
         ];
         for kind in kinds {
             let schema = role_result_payload_schema(kind);
@@ -3446,10 +3551,28 @@ mod tests {
 
         let mut with_artifact = valid_change.clone();
         with_artifact["irregularity_references"] = json!([{
-            "kind":"general", "schema_version":1, "path":"evidence/change.json",
+            "kind":"general", "artifact_id":"a".repeat(64), "schema_version":1, "path":"evidence/change.json",
             "digest":"a".repeat(64), "bytes":10
         }]);
         assert!(schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+        for invalid_path in [
+            "1:/outside",
+            ".:/outside",
+            "-:/outside",
+            "é:/outside",
+            "💥:/outside",
+        ] {
+            with_artifact["irregularity_references"][0]["path"] = json!(invalid_path);
+            assert!(!schema_accepts(
+                RoleOutputKind::ImplementationReady,
+                &with_artifact
+            ));
+        }
+        with_artifact["irregularity_references"][0]["path"] = json!("🍃".repeat(1100));
+        assert!(!schema_accepts(
             RoleOutputKind::ImplementationReady,
             &with_artifact
         ));
@@ -3479,6 +3602,27 @@ mod tests {
             RoleOutputKind::ImplementationReady,
             &with_artifact
         ));
+        with_artifact["irregularity_references"][0]["path"] = json!("evidence/change.json");
+        with_artifact["irregularity_references"][0]["artifact_id"] = json!("A".repeat(64));
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+        with_artifact["irregularity_references"][0]["artifact_id"] = json!("a".repeat(64));
+        with_artifact["irregularity_references"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_id");
+        assert!(!schema_accepts(
+            RoleOutputKind::ImplementationReady,
+            &with_artifact
+        ));
+        assert!(
+            serde_json::from_value::<RoleArtifactReference>(
+                with_artifact["irregularity_references"][0].clone()
+            )
+            .is_err()
+        );
 
         let mut intervention = json!({
             "coordinator_role_session_id":"coord-session_1",
@@ -3633,11 +3777,39 @@ mod tests {
     #[test]
     fn result_artifact_path_must_be_safe_and_role_owned() {
         let binding = worker_result_binding();
+        let oversized_path = "🍃".repeat(1100);
+        for path in [
+            "1:/outside",
+            ".:/outside",
+            "-:/outside",
+            "é:/outside",
+            "💥:/outside",
+            oversized_path.as_str(),
+        ] {
+            let mut invalid_path = worker_result_submission(
+                RoleOutputKind::ImplementationReady,
+                worker_implementation_ready_payload(),
+            );
+            invalid_path.artifact_refs.push(RoleArtifactReference {
+                artifact_id: ArtifactId::parse("f".repeat(64)).unwrap(),
+                kind: RoleArtifactKind::Change,
+                schema_version: 1,
+                path: path.into(),
+                digest: test_digest('f'),
+                bytes: 12,
+            });
+            assert!(
+                validate_role_result(&binding, invalid_path).is_err(),
+                "{path}"
+            );
+        }
+
         let mut submission = worker_result_submission(
             RoleOutputKind::ImplementationReady,
             worker_implementation_ready_payload(),
         );
         submission.artifact_refs.push(RoleArtifactReference {
+            artifact_id: ArtifactId::parse("f".repeat(64)).unwrap(),
             kind: RoleArtifactKind::Change,
             schema_version: 1,
             path: "../outside.patch".into(),
@@ -3653,6 +3825,7 @@ mod tests {
         wrong_role_artifact
             .artifact_refs
             .push(RoleArtifactReference {
+                artifact_id: ArtifactId::parse("1".repeat(64)).unwrap(),
                 kind: RoleArtifactKind::OperationReceipt,
                 schema_version: 1,
                 path: "receipts/deploy.json".into(),
@@ -3660,6 +3833,66 @@ mod tests {
                 bytes: 12,
             });
         assert!(validate_role_result(&binding, wrong_role_artifact).is_err());
+    }
+
+    #[test]
+    fn artifact_add_request_is_run_local_and_schema_bounded() {
+        let valid = ArtifactAddRequest {
+            schema_version: ARTIFACT_ADD_REQUEST_SCHEMA_VERSION,
+            message_id: "artifact-1".into(),
+            path: "output/change.json".into(),
+            kind: RoleArtifactKind::Change,
+            artifact_schema_version: 1,
+        };
+        valid.validate().unwrap();
+
+        let schema = artifact_add_request_schema();
+        let validator = jsonschema::options()
+            .offline()
+            .build(&schema)
+            .expect("artifact-add request schema is valid");
+        let value = serde_json::to_value(&valid).unwrap();
+        assert!(validator.is_valid(&value));
+
+        for path in [
+            "../outside",
+            "/outside",
+            "C:/outside",
+            "1:/outside",
+            ".:/outside",
+            "-:/outside",
+            "é:/outside",
+            "💥:/outside",
+            "dir\\file",
+            "a//b",
+        ] {
+            let invalid = ArtifactAddRequest {
+                path: path.into(),
+                ..valid.clone()
+            };
+            assert!(invalid.validate().is_err(), "{path}");
+            assert!(
+                !validator.is_valid(&serde_json::to_value(invalid).unwrap()),
+                "{path}"
+            );
+        }
+
+        let oversized = ArtifactAddRequest {
+            path: "🍃".repeat(1100),
+            ..valid.clone()
+        };
+        assert!(oversized.validate().is_err());
+        assert!(!validator.is_valid(&serde_json::to_value(oversized).unwrap()));
+
+        let mut invalid = serde_json::to_value(&valid).unwrap();
+        invalid["schema_version"] = json!(2);
+        assert!(!validator.is_valid(&invalid));
+        assert!(
+            serde_json::from_value::<ArtifactAddRequest>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

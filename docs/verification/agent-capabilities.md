@@ -28,7 +28,7 @@ For each provider, the host first observed the wrapper, native provider, and bus
 
 Direct block closure is a separate crash path. A busy Codex provider survived after its wrapper's Rex block closed. The host stopped those fixture-owned processes and confirmed absence. The controller must retain capacity and worktree ownership after abrupt block loss until process reconciliation succeeds. Missing blocks and missing receipts are not termination evidence.
 
-The fixture samples `ps` metadata every 200 ms. Start time is displayed at second precision, not a kernel birth token. Short-lived or detached children may escape sampling. Production process ownership therefore requires platform start identities and host reconciliation; these receipts do not claim a complete OS process audit. Local self-tests cover INT/TERM/HUP forwarding, unavailable process observations, receipt-write failure cleanup, and bounded fixture lifetime.
+The retired PR0 fixture sampled `ps` metadata every 200 ms. Start time was displayed at second precision, not a kernel birth token. Short-lived or detached children could escape sampling. Production process ownership therefore requires platform start identities and host reconciliation; these receipts do not claim a complete OS process audit. The retired local self-tests covered INT/TERM/HUP forwarding, unavailable process observations, receipt-write failure cleanup, and bounded fixture lifetime.
 
 ## Remaining integration qualification
 

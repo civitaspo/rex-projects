@@ -70,6 +70,21 @@
         }
       ]
     },
+    "ArtifactId": {
+      "allOf": [
+        {
+          "description": "Opaque stable identity for a host-registered Agent artifact.\n\nThe syntax is deliberately identical to a SHA-256 digest, but an\n`ArtifactId` is not itself proof that the host registered or acknowledged\nan artifact. Consumers must resolve it against host-owned registration\nstate.",
+          "type": "string"
+        },
+        {
+          "description": "Opaque stable identity for a host-registered Agent artifact.\n\nThe syntax is deliberately identical to a SHA-256 digest, but an\n`ArtifactId` is not itself proof that the host registered or acknowledged\nan artifact. Consumers must resolve it against host-owned registration\nstate.",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        }
+      ]
+    },
     "RoleArtifactKind": {
       "enum": [
         "operation_receipt",
@@ -81,8 +96,12 @@
       "allOf": [
         {
           "additionalProperties": false,
-          "description": "A pointer into this AgentRun's registered output root. The host artifact\nregistrar must still open without following links, copy, hash and publish\nthe same bytes before acknowledging the reference.",
+          "description": "A host-registered artifact locator returned after the AgentRun request path\nhas been safely copied and its bytes have been checked. The opaque ID is\nstill only a reference: readers must resolve it in host-owned registration\nstate and verify the immutable receipt before relying on it.",
           "properties": {
+            "artifact_id": {
+              "$ref": "#/$defs/ArtifactId",
+              "description": "Host-minted stable identity. This identifier alone is not an\nacknowledgement; consumers must resolve it in host-owned registration\nstate before relying on the referenced artifact."
+            },
             "bytes": {
               "format": "uint64",
               "minimum": 0,
@@ -95,6 +114,7 @@
               "$ref": "#/$defs/RoleArtifactKind"
             },
             "path": {
+              "description": "Normalized relative locator in the host-managed artifact store, at most\n1,024 Unicode scalar values and 4,096 UTF-8 bytes.",
               "type": "string"
             },
             "schema_version": {
@@ -104,6 +124,7 @@
             }
           },
           "required": [
+            "artifact_id",
             "kind",
             "schema_version",
             "path",
@@ -114,8 +135,12 @@
         },
         {
           "additionalProperties": false,
-          "description": "A pointer into this AgentRun's registered output root. The host artifact\nregistrar must still open without following links, copy, hash and publish\nthe same bytes before acknowledging the reference.",
+          "description": "A host-registered artifact locator returned after the AgentRun request path\nhas been safely copied and its bytes have been checked. The opaque ID is\nstill only a reference: readers must resolve it in host-owned registration\nstate and verify the immutable receipt before relying on it.",
           "properties": {
+            "artifact_id": {
+              "$ref": "#/$defs/ArtifactId",
+              "description": "Host-minted stable identity. This identifier alone is not an\nacknowledgement; consumers must resolve it in host-owned registration\nstate before relying on the referenced artifact."
+            },
             "bytes": {
               "format": "uint64",
               "minimum": 0,
@@ -131,9 +156,13 @@
               "$ref": "#/$defs/RoleArtifactKind"
             },
             "path": {
-              "maxLength": 4096,
+              "description": "Normalized relative locator in the host-managed artifact store, at most\n1,024 Unicode scalar values and 4,096 UTF-8 bytes.",
+              "maxLength": 1024,
               "minLength": 1,
-              "pattern": "^(?:[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.\\.[^/\\\\\\p{Cc}][^/\\\\\\p{Cc}]*)(?:/(?:[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.\\.[^/\\\\\\p{Cc}][^/\\\\\\p{Cc}]*))*$",
+              "not": {
+                "pattern": "^[^/]:"
+              },
+              "pattern": "^(?![A-Za-z]:)(?:[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.\\.[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*)((?:/(?:[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.[^./\\\\\\p{Cc}][^/\\\\\\p{Cc}]*|\\.\\.[^/\\\\\\p{Cc}][^/\\\\\\p{Cc}]*))*)$",
               "type": "string"
             },
             "schema_version": {
@@ -143,6 +172,7 @@
             }
           },
           "required": [
+            "artifact_id",
             "kind",
             "schema_version",
             "path",
@@ -193,7 +223,6 @@
     {
       "oneOf": [
         {
-          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "progress"
@@ -245,7 +274,6 @@
           "type": "object"
         },
         {
-          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "irregularity"
@@ -305,7 +333,6 @@
           "type": "object"
         },
         {
-          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "human_request"
@@ -361,7 +388,6 @@
           "type": "object"
         },
         {
-          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "operation_action"
@@ -418,7 +444,6 @@
           "type": "object"
         },
         {
-          "additionalProperties": false,
           "properties": {
             "kind": {
               "const": "operation_result"

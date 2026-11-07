@@ -929,6 +929,97 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn fixture_request(mode: &str, ready: &Path, start: &Path, release: &Path) -> ProcessRequest {
+        let mut req = request(
+            "",
+            &[
+                "--exact",
+                "process::tests::owned_process_fixture",
+                "--ignored",
+                "--nocapture",
+            ],
+        );
+        req.executable = std::env::current_exe().unwrap();
+        for (key, value) in [
+            ("REX_TEST_PROCESS_MODE", std::ffi::OsStr::new(mode)),
+            ("REX_TEST_READY", ready.as_os_str()),
+            ("REX_TEST_START", start.as_os_str()),
+            ("REX_TEST_RELEASE", release.as_os_str()),
+        ] {
+            req.environment.insert(key.into(), value.into());
+        }
+        req
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture invoked by the process lifecycle tests"]
+    fn owned_process_fixture() {
+        use std::process::Command;
+        use std::thread;
+        use std::time::Instant;
+
+        let mode = std::env::var("REX_TEST_PROCESS_MODE").unwrap();
+        let marker = |name| PathBuf::from(std::env::var_os(name).unwrap());
+        let ready = marker("REX_TEST_READY");
+        let release = marker("REX_TEST_RELEASE");
+        let wait_for = |path: &Path, timeout| {
+            let deadline = Instant::now() + timeout;
+            while !path.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        match mode.as_str() {
+            "timeout-parent" | "escaped-parent" => {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "process::tests::owned_process_fixture",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env(
+                        "REX_TEST_PROCESS_MODE",
+                        if mode == "timeout-parent" {
+                            "timeout-child"
+                        } else {
+                            "escaped-child"
+                        },
+                    )
+                    .spawn()
+                    .unwrap();
+                if mode == "escaped-parent" {
+                    wait_for(&ready, Duration::from_secs(3));
+                    thread::sleep(Duration::from_millis(250));
+                    // Exit without waiting so the escaped child retains its inherited pipes.
+                    std::process::exit(if ready.exists() { 0 } else { 2 });
+                }
+                wait_for(&marker("REX_TEST_START"), Duration::from_secs(3));
+                thread::sleep(Duration::from_secs(8));
+                let _ = child.wait();
+            }
+            "timeout-child" | "escaped-child" => {
+                if mode == "timeout-child" {
+                    // This isolated fixture process deliberately survives SIGTERM.
+                    unsafe {
+                        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                        for fd in [0, 1, 2] {
+                            libc::close(fd);
+                        }
+                    }
+                } else {
+                    // Only the new child changes session; the Rust test runner is unaffected.
+                    assert_eq!(unsafe { libc::setsid() }, std::process::id() as i32);
+                }
+                std::fs::write(&ready, std::process::id().to_string()).unwrap();
+                wait_for(&release, Duration::from_secs(8));
+            }
+            _ => panic!("unknown subprocess fixture mode: {mode}"),
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn bounds_output_and_preserves_nonzero_exit() {
         let output = run(request(
@@ -1000,17 +1091,7 @@ mod tests {
             release: release.clone(),
             identity: Arc::clone(&observed),
         };
-        let python = resolve_executable(
-            Path::new("python3"),
-            &std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let program = format!(
-            "import os,signal,time,pathlib; ready=pathlib.Path({:?}); start=pathlib.Path({:?}); release=pathlib.Path({:?}); pid=os.fork();\nif pid:\n deadline=time.monotonic()+3\n while not start.exists() and time.monotonic()<deadline: time.sleep(0.005)\n time.sleep(8)\nelse:\n signal.signal(signal.SIGTERM, signal.SIG_IGN)\n [os.close(fd) for fd in (0,1,2)]\n ready.write_text(str(os.getpid()))\n deadline=time.monotonic()+3\n while not start.exists() and time.monotonic()<deadline: time.sleep(0.005)\n while not release.exists() and time.monotonic()<deadline+5: time.sleep(0.01)",
-            ready, start, release
-        );
-        let mut req = request(python.to_str().unwrap(), &["-c", &program]);
-        req.executable = python;
+        let mut req = fixture_request("timeout-parent", &ready, &start, &release);
         // Leave enough time for a loaded CI host to schedule the observer and
         // capture the child's kernel start identity before timeout cleanup.
         req.timeout = Duration::from_secs(1);
@@ -1127,17 +1208,7 @@ mod tests {
             release: release.clone(),
             observed: None,
         };
-        let python = resolve_executable(
-            Path::new("python3"),
-            &std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let program = format!(
-            "import os,time,pathlib; ready=pathlib.Path({:?}); release=pathlib.Path({:?}); pid=os.fork();\nif pid:\n deadline=time.monotonic()+3\n while not ready.exists() and time.monotonic()<deadline: time.sleep(0.005)\n time.sleep(0.25)\n raise SystemExit(0 if ready.exists() else 2)\nos.setsid(); ready.write_text(str(os.getpid())); deadline=time.monotonic()+5\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)",
-            ready, release,
-        );
-        let mut req = request(python.to_str().unwrap(), &["-c", &program]);
-        req.executable = python;
+        let mut req = fixture_request("escaped-parent", &ready, &ready, &release);
         req.timeout = Duration::from_secs(2);
         req.shutdown_grace = Duration::from_millis(100);
         let started = Instant::now();

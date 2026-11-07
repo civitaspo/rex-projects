@@ -147,13 +147,18 @@ fn version_reports_the_cargo_package_version() {
 }
 
 #[test]
+#[ignore = "subprocess fixture invoked by the bounded stderr test"]
+fn stderr_exit_fixture() {
+    use std::io::Write;
+    std::io::stderr().write_all(&[b'x'; 20_000]).unwrap();
+    std::process::exit(17);
+}
+
+#[test]
 fn foreground_owner_reports_exit_status_and_bounds_captured_stderr() {
     let mut child = ForegroundOwner::spawn({
-        let mut command = Command::new("python3");
-        command.args([
-            "-c",
-            "import sys; sys.stderr.write('x' * 20000); sys.exit(17)",
-        ]);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "stderr_exit_fixture", "--ignored", "--nocapture"]);
         command
     })
     .expect("spawn stderr fixture");
@@ -423,17 +428,29 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         "Deliver the revised example migration.",
     );
     std::fs::write(&config, updated_config).unwrap();
-    let apply = command(&config, &state, &home)
-        .args(["config", "apply", "--expected-revision", "1", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        apply.status.success(),
-        "{}",
-        String::from_utf8_lossy(&apply.stdout)
-    );
-    let apply_report: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
-    assert_eq!(apply_report["state"], "queued");
+    let mut apply_processes = Vec::new();
+    for _ in 0..8 {
+        let mut apply = command(&config, &state, &home);
+        apply
+            .args(["config", "apply", "--expected-revision", "1", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_processes.push(apply.spawn().unwrap());
+    }
+    let outputs = apply_processes
+        .into_iter()
+        .map(|process| process.wait_with_output().unwrap())
+        .collect::<Vec<_>>();
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "config apply stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["state"], "queued");
+    }
     let mut applied = false;
     for _ in 0..100 {
         let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();

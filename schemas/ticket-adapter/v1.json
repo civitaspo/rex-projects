@@ -1,0 +1,1697 @@
+{
+  "methods": {
+    "adapter.describe": {
+      "params": {
+        "properties": {
+          "schema_version": {
+            "const": 1
+          }
+        },
+        "required": [
+          "schema_version"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "AdapterCapabilities": {
+            "properties": {
+              "atomic_scope_mutation": {
+                "type": "boolean"
+              },
+              "conditional_revision_mutation": {
+                "type": "boolean"
+              },
+              "filters": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "pagination": {
+                "type": "boolean"
+              },
+              "reconciliation": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "remote_idempotency": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "revision_support": {
+                "type": "boolean"
+              },
+              "supported_optional_methods": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "visibility_grace_seconds": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "pagination",
+              "filters",
+              "revision_support",
+              "conditional_revision_mutation",
+              "atomic_scope_mutation",
+              "remote_idempotency",
+              "reconciliation",
+              "visibility_grace_seconds",
+              "supported_optional_methods"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "capabilities": {
+            "$ref": "#/$defs/AdapterCapabilities"
+          },
+          "identity": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "native_value_convention": {
+            "type": "string"
+          },
+          "status_values": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "supported_schema_versions": {
+            "items": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "ticket_namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "identity",
+          "supported_schema_versions",
+          "native_value_convention",
+          "status_values",
+          "capabilities"
+        ],
+        "title": "AdapterDescription",
+        "type": "object"
+      }
+    },
+    "operation.find": {
+      "params": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "method": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "scope": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "stable_external_key": {
+            "type": "string"
+          },
+          "subject": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "scope",
+          "operation_id",
+          "method",
+          "stable_external_key",
+          "subject"
+        ],
+        "title": "OperationFindRequest",
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "OperationMatch": {
+            "properties": {
+              "method": {
+                "type": "string"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "receipt": true,
+              "stable_external_key": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ticket_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "operation_id",
+              "method",
+              "receipt"
+            ],
+            "type": "object"
+          },
+          "OperationMatchBasis": {
+            "enum": [
+              "operation_id",
+              "stable_external_key"
+            ],
+            "type": "string"
+          },
+          "ReconciliationOutcome": {
+            "enum": [
+              "found",
+              "absent",
+              "unknown"
+            ],
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "match_basis": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OperationMatchBasis"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "matches": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/OperationMatch"
+            },
+            "type": "array"
+          },
+          "outcome": {
+            "$ref": "#/$defs/ReconciliationOutcome"
+          },
+          "proof": {
+            "default": null
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket_namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "outcome"
+        ],
+        "title": "OperationLookup",
+        "type": "object"
+      }
+    },
+    "ticket.comment": {
+      "params": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "comment_key": {
+            "type": "string"
+          },
+          "references": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "ticket_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "ticket_id",
+          "comment_key",
+          "body"
+        ],
+        "title": "TicketCommentRequest",
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "CommentReceipt": {
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string"
+              },
+              "reference": {
+                "type": "string"
+              },
+              "ticket_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "reference",
+              "ticket_id",
+              "key",
+              "created_at"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "comment": {
+            "$ref": "#/$defs/CommentReceipt"
+          },
+          "ticket_namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "comment"
+        ],
+        "title": "CommentResult",
+        "type": "object"
+      }
+    },
+    "ticket.create": {
+      "params": {
+        "$defs": {
+          "NormalizedTicketStatus": {
+            "enum": [
+              "triage",
+              "backlog",
+              "ready",
+              "in_progress",
+              "in_review",
+              "done",
+              "canceled"
+            ],
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body": {
+            "type": "string"
+          },
+          "creation_key": {
+            "type": "string"
+          },
+          "dependencies": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "due_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "milestone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/NormalizedTicketStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "creation_key",
+          "title",
+          "body"
+        ],
+        "title": "TicketCreateRequest",
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "NormalizedTicket": {
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "created_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dependencies": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extensions": {
+                "additionalProperties": true,
+                "default": {},
+                "type": "object"
+              },
+              "id": {
+                "type": "string"
+              },
+              "key": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "labels": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "priority": {
+                "default": null,
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "revision": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "status": {
+                "$ref": "#/$defs/TicketStatusValue"
+              },
+              "ticket_namespace": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updated_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "ticket_namespace",
+              "scope",
+              "id",
+              "title",
+              "body",
+              "status"
+            ],
+            "type": "object"
+          },
+          "NormalizedTicketStatus": {
+            "enum": [
+              "triage",
+              "backlog",
+              "ready",
+              "in_progress",
+              "in_review",
+              "done",
+              "canceled"
+            ],
+            "type": "string"
+          },
+          "TicketStatusValue": {
+            "properties": {
+              "label": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "native_value": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "value": {
+                "$ref": "#/$defs/NormalizedTicketStatus"
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ticket": {
+            "$ref": "#/$defs/NormalizedTicket"
+          },
+          "ticket_namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "ticket"
+        ],
+        "title": "ScopedTicketResult",
+        "type": "object"
+      }
+    },
+    "ticket.get": {
+      "params": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "scope": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "ticket_id": {
+            "type": "string"
+          },
+          "timeline_limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "scope",
+          "ticket_id"
+        ],
+        "title": "TicketGetRequest",
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "NormalizedTicket": {
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "created_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dependencies": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extensions": {
+                "additionalProperties": true,
+                "default": {},
+                "type": "object"
+              },
+              "id": {
+                "type": "string"
+              },
+              "key": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "labels": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "priority": {
+                "default": null,
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "revision": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "status": {
+                "$ref": "#/$defs/TicketStatusValue"
+              },
+              "ticket_namespace": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updated_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "ticket_namespace",
+              "scope",
+              "id",
+              "title",
+              "body",
+              "status"
+            ],
+            "type": "object"
+          },
+          "NormalizedTicketStatus": {
+            "enum": [
+              "triage",
+              "backlog",
+              "ready",
+              "in_progress",
+              "in_review",
+              "done",
+              "canceled"
+            ],
+            "type": "string"
+          },
+          "TicketStatusValue": {
+            "properties": {
+              "label": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "native_value": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "value": {
+                "$ref": "#/$defs/NormalizedTicketStatus"
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "type": "object"
+          },
+          "TimelineEntry": {
+            "properties": {
+              "actor": {
+                "type": "string"
+              },
+              "event": {
+                "type": "string"
+              },
+              "reference": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "summary": {
+                "type": "string"
+              },
+              "time": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "actor",
+              "time",
+              "event",
+              "summary"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ticket": {
+            "$ref": "#/$defs/NormalizedTicket"
+          },
+          "ticket_namespace": {
+            "type": "string"
+          },
+          "timeline": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/TimelineEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "ticket"
+        ],
+        "title": "TicketGetResult",
+        "type": "object"
+      }
+    },
+    "ticket.list": {
+      "params": {
+        "$defs": {
+          "NormalizedTicketStatus": {
+            "enum": [
+              "triage",
+              "backlog",
+              "ready",
+              "in_progress",
+              "in_review",
+              "done",
+              "canceled"
+            ],
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "milestone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page_size": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "q": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "release": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/NormalizedTicketStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_since": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "scope"
+        ],
+        "title": "TicketListRequest",
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "NormalizedTicket": {
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "created_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dependencies": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extensions": {
+                "additionalProperties": true,
+                "default": {},
+                "type": "object"
+              },
+              "id": {
+                "type": "string"
+              },
+              "key": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "labels": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "priority": {
+                "default": null,
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "revision": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "status": {
+                "$ref": "#/$defs/TicketStatusValue"
+              },
+              "ticket_namespace": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updated_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "ticket_namespace",
+              "scope",
+              "id",
+              "title",
+              "body",
+              "status"
+            ],
+            "type": "object"
+          },
+          "NormalizedTicketStatus": {
+            "enum": [
+              "triage",
+              "backlog",
+              "ready",
+              "in_progress",
+              "in_review",
+              "done",
+              "canceled"
+            ],
+            "type": "string"
+          },
+          "TicketStatusValue": {
+            "properties": {
+              "label": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "native_value": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "value": {
+                "$ref": "#/$defs/NormalizedTicketStatus"
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "applied_filters": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "next_cursor": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_at": {
+            "type": "string"
+          },
+          "scan": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "ticket_namespace": {
+            "type": "string"
+          },
+          "tickets": {
+            "items": {
+              "$ref": "#/$defs/NormalizedTicket"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "tickets",
+          "applied_filters",
+          "observed_at",
+          "scan"
+        ],
+        "title": "TicketPage",
+        "type": "object"
+      }
+    },
+    "ticket.resolve_duplicate": {
+      "params": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "canonical_ticket_id": {
+            "type": "string"
+          },
+          "duplicate_ticket_id": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "scope": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "scope",
+          "duplicate_ticket_id",
+          "canonical_ticket_id",
+          "operation_key",
+          "reason"
+        ],
+        "title": "DuplicateResolutionRequest",
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "NormalizedTicket": {
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "created_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dependencies": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extensions": {
+                "additionalProperties": true,
+                "default": {},
+                "type": "object"
+              },
+              "id": {
+                "type": "string"
+              },
+              "key": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "labels": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "priority": {
+                "default": null,
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "revision": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "status": {
+                "$ref": "#/$defs/TicketStatusValue"
+              },
+              "ticket_namespace": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updated_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "ticket_namespace",
+              "scope",
+              "id",
+              "title",
+              "body",
+              "status"
+            ],
+            "type": "object"
+          },
+          "NormalizedTicketStatus": {
+            "enum": [
+              "triage",
+              "backlog",
+              "ready",
+              "in_progress",
+              "in_review",
+              "done",
+              "canceled"
+            ],
+            "type": "string"
+          },
+          "TicketStatusValue": {
+            "properties": {
+              "label": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "native_value": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "value": {
+                "$ref": "#/$defs/NormalizedTicketStatus"
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "canonical_ticket_id": {
+            "type": "string"
+          },
+          "comment_key": {
+            "type": "string"
+          },
+          "duplicate": {
+            "$ref": "#/$defs/NormalizedTicket"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "ticket_namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "duplicate",
+          "canonical_ticket_id",
+          "comment_key",
+          "outcome"
+        ],
+        "title": "DuplicateResolutionResult",
+        "type": "object"
+      }
+    },
+    "ticket.update": {
+      "params": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "expected_revision": {
+            "type": "string"
+          },
+          "patch": {
+            "additionalProperties": true,
+            "description": "Only fields in Appendix H's normalized patch allowlist are accepted.",
+            "type": "object"
+          },
+          "scope": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "ticket_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "ticket_id",
+          "expected_revision",
+          "patch"
+        ],
+        "title": "TicketUpdateRequest",
+        "type": "object"
+      },
+      "result": {
+        "$defs": {
+          "NormalizedTicket": {
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "created_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dependencies": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extensions": {
+                "additionalProperties": true,
+                "default": {},
+                "type": "object"
+              },
+              "id": {
+                "type": "string"
+              },
+              "key": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "labels": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "priority": {
+                "default": null,
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "revision": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "status": {
+                "$ref": "#/$defs/TicketStatusValue"
+              },
+              "ticket_namespace": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updated_at": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "ticket_namespace",
+              "scope",
+              "id",
+              "title",
+              "body",
+              "status"
+            ],
+            "type": "object"
+          },
+          "NormalizedTicketStatus": {
+            "enum": [
+              "triage",
+              "backlog",
+              "ready",
+              "in_progress",
+              "in_review",
+              "done",
+              "canceled"
+            ],
+            "type": "string"
+          },
+          "TicketStatusValue": {
+            "properties": {
+              "label": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "native_value": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "value": {
+                "$ref": "#/$defs/NormalizedTicketStatus"
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ticket": {
+            "$ref": "#/$defs/NormalizedTicket"
+          },
+          "ticket_namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_namespace",
+          "ticket"
+        ],
+        "title": "ScopedTicketResult",
+        "type": "object"
+      }
+    }
+  },
+  "notes": [
+    "ticket.triage is optional and is advertised by adapter.describe.supported_optional_methods",
+    "An adapter may reject an unsupported method with the normalized unsupported error code."
+  ],
+  "request_envelope": {
+    "$defs": {
+      "Role": {
+        "enum": [
+          "supervisor",
+          "coordinator",
+          "planner",
+          "worker",
+          "reviewer",
+          "merge_decision",
+          "operator",
+          "postmortem"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "attempt": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "expected_subject_revision": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "method": {
+        "type": "string"
+      },
+      "operation_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "params": true,
+      "project_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "request_id": {
+        "type": "string"
+      },
+      "role": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Role"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "run_epoch": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "run_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "schema_version": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "type": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id",
+      "method",
+      "params"
+    ],
+    "title": "RequestEnvelope",
+    "type": "object"
+  },
+  "response_envelope": {
+    "$defs": {
+      "ErrorCode": {
+        "enum": [
+          "not_found",
+          "unauthorized",
+          "forbidden",
+          "conflict",
+          "rate_limited",
+          "unavailable",
+          "unsupported",
+          "invalid_request"
+        ],
+        "type": "string"
+      },
+      "ProtocolError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/ErrorCode"
+          },
+          "details": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retry_after_ms": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ProtocolError"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "extensions": {
+        "additionalProperties": true,
+        "default": {},
+        "type": "object"
+      },
+      "request_id": {
+        "type": "string"
+      },
+      "result": true,
+      "schema_version": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "schema_version",
+      "request_id"
+    ],
+    "title": "ResponseEnvelope",
+    "type": "object"
+  },
+  "schema_version": 1
+}
