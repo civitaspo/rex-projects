@@ -1662,6 +1662,35 @@ mod tests {
 }
 
 impl ConfigStore {
+    pub fn applied_reviewer_correction_round_count(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<usize, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT i.payload_json FROM agent_result_evidence e JOIN agent_result_reducer_ack a USING(evidence_id) JOIN inbox i ON i.producer_id='rex-projects-agent-result' AND i.message_id='review-ready:' || e.evidence_id WHERE e.project_id=?1 AND e.ticket_run_id=?2 AND e.role='reviewer' AND a.disposition='applied'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut count = 0;
+        for row in rows {
+            let payload = row.map_err(|error| error.to_string())?;
+            let payload: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|error| format!("stored Reviewer transition is invalid: {error}"))?;
+            if payload["transition"] == "corrections_remain" {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn validated_agent_result_for_wake(
         &mut self,
         artifact_store: &crate::artifacts::ArtifactStore,

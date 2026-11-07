@@ -509,6 +509,12 @@ fn apply_agent_result(
     {
         return apply_worker_result(store, owner_generation, now_unix, config, services, result);
     }
+    if result.validated.kind == RoleOutputKind::ReviewReady
+        && binding.role == Role::Reviewer
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return apply_reviewer_result(store, owner_generation, now_unix, config, services, result);
+    }
     if result.validated.kind != RoleOutputKind::PlanReady
         || binding.role != Role::Coordinator
         || binding.ticket_run_id.is_none()
@@ -1251,6 +1257,240 @@ fn apply_supervisor_ticket_proposal(
         crate::store::agent_results::ResultDisposition::Applied,
     )?;
     Ok(true)
+}
+
+fn apply_reviewer_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::{ReviewProgress, RoleResultPayload, review_disposition};
+
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("Reviewer ReviewReady result lacks TicketRun scope")?;
+    let source_revision = binding
+        .ticket_revision
+        .ok_or("Reviewer ReviewReady result lacks TicketRun revision")?;
+    let run = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("Reviewer result references no active TicketRun")?;
+    if run.project_id != binding.project_id
+        || run.revision != source_revision.0
+        || run.phase != Phase::Reviewing
+    {
+        return Err("Reviewer ReviewReady result is stale or outside Reviewing".into());
+    }
+    let project_record = store
+        .project(&binding.project_id)?
+        .ok_or("Reviewer result Project has no durable configuration record")?;
+    let configuration_digest = services.configuration_digest().clone();
+    if project_record.config_digest != configuration_digest
+        || binding.config_digest != configuration_digest
+        || binding.config_revision != project_record.config_revision
+    {
+        return Err("Reviewer result belongs to a stale configuration snapshot".into());
+    }
+    let project = config
+        .projects
+        .get(&binding.project_id)
+        .ok_or("Reviewer result Project is no longer configured")?;
+    let Some(accepted) = store.latest_accepted_work_plan(&binding.project_id, ticket_run_id)?
+    else {
+        return Err("Reviewer result has no accepted work plan".into());
+    };
+    if accepted.configuration_digest != configuration_digest {
+        return Err("accepted work plan belongs to a stale configuration snapshot".into());
+    }
+    let _validated_plan = accepted.validate_for(project, &configuration_digest)?;
+
+    let receipts = store.list_succeeded_effect_receipts(
+        owner_generation,
+        &run.project_id,
+        "ticket_run",
+        run.ticket_run_id.as_str(),
+        256,
+    )?;
+    let prepared_receipt = receipts
+        .iter()
+        .find(|receipt| {
+            receipt.intent().kind
+                == crate::engine::reducer::effect_name(
+                    &crate::engine::reducer::EffectKind::PrepareWorktrees,
+                )
+                && receipt.intent().expected_revision == Some(accepted.accepted_revision)
+        })
+        .ok_or("accepted work plan has no succeeded prepared-worktree receipt")?;
+    let prepared: crate::delivery_runtime::PreparedWorktreesEffectReceipt =
+        serde_json::from_str(prepared_receipt.receipt_json())
+            .map_err(|error| format!("invalid prepared-worktree receipt: {error}"))?;
+    let publications = receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.intent().kind
+                == crate::engine::reducer::effect_name(
+                    &crate::engine::reducer::EffectKind::PublishImplementation,
+                )
+                && receipt.intent().expected_revision == Some(run.revision)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let publication_proof = crate::delivery_runtime::validate_implementation_publication_receipt(
+        &accepted.proposal,
+        &prepared,
+        &run.project_id,
+        &config.repositories,
+        &publications,
+    )?;
+    let reducer_run = crate::engine::reducer::TicketRun {
+        project_id: run.project_id.clone(),
+        ticket_run_id: run.ticket_run_id.clone(),
+        revision: Revision(run.revision),
+        phase: run.phase,
+        activity: run.activity,
+        external_status: run.external_status,
+        required_review_revision: run.required_review_revision.map(Revision),
+    };
+    if !publication_proof.matches(&reducer_run) {
+        return Err("publication receipts do not match the current TicketRun revision".into());
+    }
+    let RoleResultPayload::ReviewReady(assessment) = &result.validated.typed_payload else {
+        return Err("validated ReviewReady kind has a different typed payload".into());
+    };
+    if assessment.subject_kind != "implementation_publication_set" {
+        return Err("Reviewer assessment names a different subject kind".into());
+    }
+    let mut publication_facts = publications
+        .iter()
+        .map(|receipt| {
+            let published: crate::delivery_runtime::ImplementationPublicationReceipt =
+                serde_json::from_str(receipt.receipt_json()).map_err(|error| {
+                    format!("invalid implementation publication receipt: {error}")
+                })?;
+            Ok(serde_json::json!({
+                "work_node_id": published.work_node_id,
+                "repository_id": published.repository_id,
+                "pull_request_number": published.pull_request.number,
+                "pull_request_node_id": published.pull_request.node_id,
+                "pull_request_head": published.pull_request.source_head,
+                "published_head": published.push.pushed_head,
+                "receipt_digest": sha256_hex(receipt.receipt_json().as_bytes()),
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    publication_facts
+        .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
+    let subject = serde_json::json!({
+        "ticket_run_id": ticket_run_id,
+        "accepted_plan_digest": accepted.plan_digest,
+        "publications": publication_facts,
+    });
+    let subject_bytes = serde_json::to_vec(&subject).map_err(|error| error.to_string())?;
+    let expected_subject_digest = sha256_hex(&subject_bytes);
+    if assessment.subject_digest.as_str() != expected_subject_digest {
+        return Err(
+            "Reviewer assessment does not match the current published PR and head set".into(),
+        );
+    }
+    let expected_coverage = accepted
+        .proposal
+        .nodes
+        .iter()
+        .filter(|node| !node.investigation)
+        .map(|node| node.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_coverage = assessment
+        .evidence_coverage
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if actual_coverage != expected_coverage
+        || actual_coverage.len() != assessment.evidence_coverage.len()
+    {
+        return Err(
+            "Reviewer evidence coverage does not match every implementation work node".into(),
+        );
+    }
+    let unresolved = !assessment.findings.is_empty() || !assessment.unknowns.is_empty();
+    let completed_rounds =
+        store.applied_reviewer_correction_round_count(&run.project_id, ticket_run_id)?;
+    let disposition = review_disposition(
+        ReviewProgress {
+            completed_rounds,
+            maximum_rounds: project.max_review_rounds,
+        },
+        unresolved,
+    )?;
+    if assessment.disposition.trim().is_empty() {
+        return Err("Reviewer assessment has an empty disposition".into());
+    }
+    let (transition, transition_name) = review_transition(disposition);
+    let accepted_revision = run
+        .revision
+        .checked_add(1)
+        .ok_or("TicketRun revision overflow")?;
+    let input_payload = serde_json::json!({
+        "schema_version": 1,
+        "kind": "review_assessment",
+        "evidence_id": result.receipt.evidence_id(),
+        "result_digest": result.validated.result_digest,
+        "source_revision": run.revision,
+        "accepted_revision": accepted_revision,
+        "completed_rounds": completed_rounds + 1,
+        "maximum_rounds": project.max_review_rounds,
+        "transition": transition_name,
+        "assessment": assessment,
+        "publication_subject": subject,
+    })
+    .to_string();
+    let durable = DurableInput {
+        producer_id: "rex-projects-agent-result".into(),
+        message_id: format!("review-ready:{}", result.receipt.evidence_id()),
+        content_digest: durable_input_digest("ticket_run", &input_payload),
+        recipient: "ticket_run".into(),
+        payload: input_payload.clone(),
+    };
+    store.commit_ticket_transition(
+        owner_generation,
+        ticket_run_id,
+        Revision(run.revision),
+        &durable,
+        transition,
+        "host validated Reviewer assessment against the current accepted plan and complete publication receipt set",
+        &input_payload,
+        &[],
+    )?;
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        accepted_revision,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    let _ = now_unix;
+    Ok(true)
+}
+
+fn review_transition(
+    disposition: crate::engine::orchestration::ReviewDisposition,
+) -> (Input, &'static str) {
+    use crate::engine::orchestration::ReviewDisposition as D;
+    match disposition {
+        D::StartCorrectionWorker => (Input::CorrectionsRemain, "corrections_remain"),
+        D::StartMergeDecision => (Input::ReviewConverged, "review_converged"),
+        D::HumanRequiredAtRoundLimit => (Input::ReviewConverged, "review_round_limit_reached"),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn apply_worker_result(
@@ -2129,6 +2369,40 @@ mod tests {
             ticket_disposition(&config, &project, TicketStatus::Ready, &labels),
             TicketDisposition::AwaitHuman { .. }
         ));
+    }
+
+    #[test]
+    fn reviewer_corrections_stop_at_the_configured_round_limit() {
+        use super::review_transition;
+        use crate::engine::orchestration::{ReviewDisposition, ReviewProgress, review_disposition};
+        use crate::engine::reducer::Input;
+
+        let before_limit = review_disposition(
+            ReviewProgress {
+                completed_rounds: 2,
+                maximum_rounds: 3,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            review_transition(before_limit),
+            (Input::CorrectionsRemain, "corrections_remain")
+        );
+
+        let at_limit = review_disposition(
+            ReviewProgress {
+                completed_rounds: 3,
+                maximum_rounds: 3,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(at_limit, ReviewDisposition::HumanRequiredAtRoundLimit);
+        assert_eq!(
+            review_transition(at_limit),
+            (Input::ReviewConverged, "review_round_limit_reached")
+        );
     }
 
     #[test]
