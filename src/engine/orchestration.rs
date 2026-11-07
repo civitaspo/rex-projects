@@ -2,10 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::config::{Config, OperationRecipe, ProjectConfig, SuccessPredicate};
-use crate::domain::ids::{ProjectId, RepositoryId, TicketId, TicketNamespace, TicketRunId};
+use crate::domain::ids::{
+    AgentRunId, Digest, OperationId, ProjectId, RepositoryId, Revision, TicketId, TicketNamespace,
+    TicketRunId,
+};
 use crate::domain::types::{ProjectMode, RecipeStage, Role, TicketStatus};
 use crate::engine::reducer::Input;
 
@@ -209,6 +213,371 @@ fn validate_gap(gap: &GoalGap) -> Result<(), String> {
 fn goal_ticket_key(project_id: &ProjectId, revision: u64, gap_key: &str) -> String {
     let digest = Sha256::digest(gap_key.as_bytes());
     format!("rex-projects:{project_id}:goal:{revision}:gap:{digest:x}")
+}
+
+pub const ROLE_RESULT_SCHEMA_VERSION: u32 = 1;
+const MAX_ROLE_RESULT_JSON_BYTES: usize = 1_048_576;
+const MAX_ROLE_RESULT_ARTIFACTS: usize = 256;
+const MAX_ROLE_RESULT_ARTIFACTS_JSON_BYTES: usize = 262_144;
+
+/// Stable identity copied from the host-owned run descriptor and authority row.
+/// A submitted result must repeat it exactly before any evidence is accepted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleResultBinding {
+    pub agent_run_id: AgentRunId,
+    pub operation_id: OperationId,
+    pub project_id: ProjectId,
+    pub role_session_id: RoleSessionId,
+    pub role: Role,
+    pub parent_run_id: Option<AgentRunId>,
+    pub parent_role: Option<Role>,
+    pub ticket_run_id: Option<TicketRunId>,
+    pub ticket_revision: Option<Revision>,
+    pub config_revision: Revision,
+    pub config_digest: Digest,
+    pub profile_digest: Digest,
+    pub instruction_digest: Digest,
+    pub provider_capability_receipt_digest: Digest,
+    pub result_schema_digest: Digest,
+    pub controller_generation: u64,
+    pub run_epoch: u64,
+    pub attempt: u32,
+}
+
+impl RoleResultBinding {
+    fn validate(&self) -> Result<(), String> {
+        RoleSessionId::parse(self.role_session_id.as_str())?;
+        if self.config_revision.0 == 0
+            || self.controller_generation == 0
+            || self.run_epoch == 0
+            || self.attempt == 0
+        {
+            return Err("role result binding has a zero revision or run counter".into());
+        }
+        if self.parent_run_id.is_some() != self.parent_role.is_some() {
+            return Err("parent run ID and parent role must be present together".into());
+        }
+        let requires_ticket = self.role != Role::Supervisor;
+        if self.ticket_run_id.is_some() != requires_ticket
+            || self.ticket_revision.is_some() != requires_ticket
+        {
+            return Err("role result binding has an invalid TicketRun scope".into());
+        }
+        let valid_parent = match self.role {
+            Role::Supervisor => self.parent_role.is_none(),
+            Role::Coordinator => self.parent_role == Some(Role::Supervisor),
+            Role::Planner | Role::Reviewer => matches!(
+                self.parent_role,
+                Some(Role::Coordinator | Role::Planner | Role::Reviewer)
+            ),
+            Role::Worker => matches!(
+                self.parent_role,
+                Some(Role::Coordinator | Role::Planner | Role::Reviewer)
+            ),
+            Role::MergeDecision | Role::Operator | Role::Postmortem => {
+                self.parent_role == Some(Role::Coordinator)
+            }
+        };
+        if !valid_parent {
+            return Err("role result binding has an invalid parent role for this run".into());
+        }
+        Ok(())
+    }
+}
+
+/// Local logical identity for a durable role session. It is not an Agent
+/// supplied destination; validation matches it against the host descriptor.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct RoleSessionId(String);
+
+impl<'de> Deserialize<'de> for RoleSessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl RoleSessionId {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 255
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err("invalid role session ID".into());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleOutputKind {
+    Progress,
+    Irregularity,
+    HumanRequest,
+    TicketProposal,
+    DispatchRequest,
+    Intervention,
+    SpawnRequest,
+    InvestigationRequest,
+    PrepareWorktrees,
+    PlanReady,
+    ImplementationReady,
+    ReviewReady,
+    MergeAssessment,
+    MergeIntent,
+    OperationAction,
+    OperationResult,
+    PostmortemReady,
+    LearningDecision,
+    ProfileTrialResult,
+    ProfilePromotionProposal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "assertion", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentAssertion {
+    Succeeded,
+    Blocked { reason: String },
+    Failed { reason: String },
+    Cancelled { reason: Option<String> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleArtifactKind {
+    Plan,
+    Change,
+    TestReceipt,
+    Review,
+    MergeAssessment,
+    OperationReceipt,
+    Postmortem,
+    Learning,
+    General,
+}
+
+/// A pointer into this AgentRun's registered output root. The host artifact
+/// registrar must still open without following links, copy, hash and publish
+/// the same bytes before acknowledging the reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleArtifactReference {
+    pub kind: RoleArtifactKind,
+    pub schema_version: u32,
+    pub path: String,
+    pub digest: Digest,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleResultSubmission {
+    pub schema_version: u32,
+    pub message_id: String,
+    pub binding: RoleResultBinding,
+    pub kind: RoleOutputKind,
+    pub assertion: AgentAssertion,
+    pub structured_result: Value,
+    /// SHA-256 of compact serde_json serialization of structured_result.
+    pub result_digest: Digest,
+    pub artifact_refs: Vec<RoleArtifactReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedRoleResult {
+    pub binding: RoleResultBinding,
+    pub message_id: String,
+    pub kind: RoleOutputKind,
+    /// This remains an Agent claim and never represents host process success,
+    /// hook success, merge completion, or deployment success.
+    pub assertion: AgentAssertion,
+    pub structured_result: Value,
+    pub result_digest: Digest,
+    pub artifact_refs: Vec<RoleArtifactReference>,
+    /// Derived from the verified parent binding, never from Agent content.
+    pub wake_recipients: Vec<WakeSessionKey>,
+}
+
+/// Validate a run-local Agent result against host-owned immutable authority.
+/// This function creates evidence only; callers must separately persist host
+/// process, hook, forge and operation observations and must not reduce directly
+/// from the Agent's success assertion.
+pub fn validate_role_result(
+    expected: &RoleResultBinding,
+    submission: RoleResultSubmission,
+) -> Result<ValidatedRoleResult, String> {
+    expected.validate()?;
+    if submission.schema_version != ROLE_RESULT_SCHEMA_VERSION {
+        return Err("unsupported role result schema version".into());
+    }
+    submission.binding.validate()?;
+    if &submission.binding != expected {
+        return Err("role result binding does not match host-owned run authority".into());
+    }
+    if submission.message_id.trim().is_empty()
+        || submission.message_id.len() > 255
+        || submission.message_id.chars().any(char::is_control)
+    {
+        return Err("invalid role result message ID".into());
+    }
+    if !role_may_submit_output(submission.binding.role, submission.kind) {
+        return Err("role is not allowed to submit this result kind".into());
+    }
+    validate_assertion(&submission.assertion)?;
+    let encoded_result = serde_json::to_vec(&submission.structured_result)
+        .map_err(|error| format!("serialize structured role result: {error}"))?;
+    if !submission.structured_result.is_object() {
+        return Err("structured role result must be a JSON object".into());
+    }
+    if encoded_result.len() > MAX_ROLE_RESULT_JSON_BYTES {
+        return Err("structured role result exceeds its byte limit".into());
+    }
+    let actual_digest = Digest::parse(format!("{:x}", Sha256::digest(encoded_result)))?;
+    if actual_digest != submission.result_digest {
+        return Err("structured result digest does not match its content".into());
+    }
+    if submission.artifact_refs.len() > MAX_ROLE_RESULT_ARTIFACTS
+        || serde_json::to_vec(&submission.artifact_refs)
+            .map_err(|error| format!("serialize role result artifact references: {error}"))?
+            .len()
+            > MAX_ROLE_RESULT_ARTIFACTS_JSON_BYTES
+    {
+        return Err("role result artifact references exceed their limits".into());
+    }
+    let mut artifact_paths = BTreeSet::new();
+    for artifact in &submission.artifact_refs {
+        validate_artifact_reference(artifact)?;
+        if !role_may_submit_artifact(submission.binding.role, artifact.kind) {
+            return Err("role is not allowed to submit this artifact kind".into());
+        }
+        if !artifact_paths.insert(&artifact.path) {
+            return Err("role result repeats an artifact path".into());
+        }
+    }
+    let wake_recipients = result_wake_recipients(&submission.binding, submission.kind);
+    Ok(ValidatedRoleResult {
+        binding: submission.binding,
+        message_id: submission.message_id,
+        kind: submission.kind,
+        assertion: submission.assertion,
+        structured_result: submission.structured_result,
+        result_digest: submission.result_digest,
+        artifact_refs: submission.artifact_refs,
+        wake_recipients,
+    })
+}
+
+fn validate_assertion(assertion: &AgentAssertion) -> Result<(), String> {
+    let reason = match assertion {
+        AgentAssertion::Succeeded => return Ok(()),
+        AgentAssertion::Blocked { reason } | AgentAssertion::Failed { reason } => Some(reason),
+        AgentAssertion::Cancelled { reason } => reason.as_ref(),
+    };
+    if reason.is_some_and(|value| {
+        value.trim().is_empty() || value.len() > 32_000 || value.chars().any(char::is_control)
+    }) {
+        return Err("Agent assertion reason must be bounded plain text".into());
+    }
+    Ok(())
+}
+
+fn validate_artifact_reference(reference: &RoleArtifactReference) -> Result<(), String> {
+    let path = reference.path.as_str();
+    if path.is_empty()
+        || path.len() > 4096
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.as_bytes().get(1) == Some(&b':'))
+        || reference.schema_version == 0
+    {
+        return Err("artifact reference must name a bounded normalized relative path".into());
+    }
+    Ok(())
+}
+
+fn role_may_submit_artifact(role: Role, kind: RoleArtifactKind) -> bool {
+    use RoleArtifactKind as K;
+    match kind {
+        K::Plan => matches!(role, Role::Coordinator | Role::Planner),
+        K::Change | K::TestReceipt => role == Role::Worker,
+        K::Review => role == Role::Reviewer,
+        K::MergeAssessment => role == Role::MergeDecision,
+        K::OperationReceipt => role == Role::Operator,
+        K::Postmortem => role == Role::Postmortem,
+        K::Learning => role == Role::Supervisor,
+        K::General => true,
+    }
+}
+
+fn role_may_submit_output(role: Role, kind: RoleOutputKind) -> bool {
+    use RoleOutputKind as K;
+    if matches!(kind, K::Progress | K::Irregularity | K::HumanRequest) {
+        return true;
+    }
+    match role {
+        Role::Supervisor => matches!(
+            kind,
+            K::TicketProposal
+                | K::DispatchRequest
+                | K::Intervention
+                | K::LearningDecision
+                | K::ProfileTrialResult
+                | K::ProfilePromotionProposal
+        ),
+        Role::Coordinator => matches!(kind, K::SpawnRequest | K::PrepareWorktrees | K::PlanReady),
+        Role::Planner => matches!(kind, K::PlanReady | K::InvestigationRequest),
+        Role::Worker => matches!(kind, K::ImplementationReady),
+        Role::Reviewer => matches!(kind, K::ReviewReady | K::InvestigationRequest),
+        Role::MergeDecision => matches!(kind, K::MergeAssessment | K::MergeIntent),
+        Role::Operator => matches!(kind, K::OperationAction | K::OperationResult),
+        Role::Postmortem => kind == K::PostmortemReady,
+    }
+}
+
+fn result_wake_recipients(
+    binding: &RoleResultBinding,
+    kind: RoleOutputKind,
+) -> Vec<WakeSessionKey> {
+    let mut recipients = BTreeSet::new();
+    if let Some(parent_role) = binding.parent_role {
+        recipients.insert(WakeSessionKey {
+            project_id: binding.project_id.clone(),
+            ticket_run_id: if parent_role == Role::Supervisor {
+                None
+            } else {
+                binding.ticket_run_id.clone()
+            },
+            role: parent_role,
+        });
+    }
+    if kind == RoleOutputKind::Irregularity && binding.role != Role::Supervisor {
+        recipients.insert(WakeSessionKey {
+            project_id: binding.project_id.clone(),
+            ticket_run_id: None,
+            role: Role::Supervisor,
+        });
+    }
+    recipients.into_iter().collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1057,10 +1426,53 @@ pub fn handle_irregularity(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use serde_json::json;
+
     use super::*;
     use crate::config::{GoalConfig, OperationMatch};
     use crate::domain::ids::{AdapterId, TicketId};
     use crate::domain::types::RecipeStage;
+
+    fn test_digest(value: char) -> Digest {
+        Digest::parse(value.to_string().repeat(64)).unwrap()
+    }
+
+    fn worker_result_binding() -> RoleResultBinding {
+        RoleResultBinding {
+            agent_run_id: AgentRunId::parse("worker-run-1").unwrap(),
+            operation_id: OperationId::parse("launch-1").unwrap(),
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role_session_id: RoleSessionId::parse("worker-session").unwrap(),
+            role: Role::Worker,
+            parent_run_id: Some(AgentRunId::parse("coordinator-run-1").unwrap()),
+            parent_role: Some(Role::Coordinator),
+            ticket_run_id: Some(TicketRunId::parse("ticket-run-1").unwrap()),
+            ticket_revision: Some(Revision(4)),
+            config_revision: Revision(3),
+            config_digest: test_digest('a'),
+            profile_digest: test_digest('b'),
+            instruction_digest: test_digest('c'),
+            provider_capability_receipt_digest: test_digest('d'),
+            result_schema_digest: test_digest('e'),
+            controller_generation: 2,
+            run_epoch: 5,
+            attempt: 1,
+        }
+    }
+
+    fn worker_result_submission(kind: RoleOutputKind, payload: Value) -> RoleResultSubmission {
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        RoleResultSubmission {
+            schema_version: ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "result-1".into(),
+            binding: worker_result_binding(),
+            kind,
+            assertion: AgentAssertion::Succeeded,
+            result_digest: Digest::parse(format!("{:x}", Sha256::digest(encoded))).unwrap(),
+            structured_result: payload,
+            artifact_refs: vec![],
+        }
+    }
 
     fn goal_project() -> ProjectConfig {
         ProjectConfig {
@@ -1670,5 +2082,106 @@ mod tests {
             select_planner(&project, PlanComplexity::Uncertain),
             PlannerSelection::HumanClarificationRequired
         );
+    }
+
+    #[test]
+    fn role_result_is_bound_to_run_and_routes_only_to_trusted_parent() {
+        let binding = worker_result_binding();
+        let validated = validate_role_result(
+            &binding,
+            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []})),
+        )
+        .unwrap();
+        assert_eq!(validated.binding, binding);
+        assert_eq!(validated.assertion, AgentAssertion::Succeeded);
+        assert_eq!(
+            validated.wake_recipients,
+            vec![WakeSessionKey {
+                project_id: ProjectId::parse("project-a").unwrap(),
+                ticket_run_id: Some(TicketRunId::parse("ticket-run-1").unwrap()),
+                role: Role::Coordinator,
+            }]
+        );
+
+        let mut stale =
+            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        stale.binding.ticket_revision = Some(Revision(3));
+        assert!(validate_role_result(&binding, stale).is_err());
+    }
+
+    #[test]
+    fn result_assertions_cannot_claim_host_effects_or_choose_a_wake_target() {
+        let submission =
+            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        let mut value = serde_json::to_value(submission).unwrap();
+        value["host_exit_succeeded"] = json!(true);
+        value["wake_target"] = json!("supervisor");
+        assert!(serde_json::from_value::<RoleResultSubmission>(value).is_err());
+
+        let binding = worker_result_binding();
+        let merge_claim =
+            worker_result_submission(RoleOutputKind::MergeIntent, json!({"method": "squash"}));
+        assert!(validate_role_result(&binding, merge_claim).is_err());
+    }
+
+    #[test]
+    fn irregularity_wakes_bound_parent_and_project_supervisor() {
+        let binding = worker_result_binding();
+        let result = validate_role_result(
+            &binding,
+            worker_result_submission(RoleOutputKind::Irregularity, json!({"severity": "high"})),
+        )
+        .unwrap();
+        let recipients: BTreeSet<_> = result.wake_recipients.into_iter().collect();
+        assert_eq!(
+            recipients,
+            BTreeSet::from([
+                WakeSessionKey {
+                    project_id: ProjectId::parse("project-a").unwrap(),
+                    ticket_run_id: None,
+                    role: Role::Supervisor,
+                },
+                WakeSessionKey {
+                    project_id: ProjectId::parse("project-a").unwrap(),
+                    ticket_run_id: Some(TicketRunId::parse("ticket-run-1").unwrap()),
+                    role: Role::Coordinator,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn result_artifact_path_must_be_safe_and_role_owned() {
+        let binding = worker_result_binding();
+        let mut submission =
+            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        submission.artifact_refs.push(RoleArtifactReference {
+            kind: RoleArtifactKind::Change,
+            schema_version: 1,
+            path: "../outside.patch".into(),
+            digest: test_digest('f'),
+            bytes: 12,
+        });
+        assert!(validate_role_result(&binding, submission).is_err());
+
+        let mut wrong_role_artifact =
+            worker_result_submission(RoleOutputKind::ImplementationReady, json!({"changes": []}));
+        wrong_role_artifact
+            .artifact_refs
+            .push(RoleArtifactReference {
+                kind: RoleArtifactKind::OperationReceipt,
+                schema_version: 1,
+                path: "receipts/deploy.json".into(),
+                digest: test_digest('1'),
+                bytes: 12,
+            });
+        assert!(validate_role_result(&binding, wrong_role_artifact).is_err());
+    }
+
+    #[test]
+    fn role_session_id_deserialization_uses_constructor_validation() {
+        for invalid in ["../outside", "folder/session", "bad id"] {
+            assert!(serde_json::from_str::<RoleSessionId>(&format!("{invalid:?}")).is_err());
+        }
     }
 }
