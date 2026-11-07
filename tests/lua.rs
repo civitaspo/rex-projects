@@ -3,7 +3,9 @@ use std::path::Path;
 
 use mlua::{Lua, Table};
 
-fn run_lua_test(lua: &Lua, root: &Path, relative_path: &str) -> mlua::Result<()> {
+fn run_lua_test(relative_path: &str) -> mlua::Result<()> {
+    let lua = Lua::new();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let package: Table = lua.globals().get("package")?;
     let lua_dir = root.join("lua");
     package.set(
@@ -24,17 +26,16 @@ fn run_lua_test(lua: &Lua, root: &Path, relative_path: &str) -> mlua::Result<()>
 }
 
 #[test]
-fn lua_51_contract_scripts_pass() -> mlua::Result<()> {
-    let lua = Lua::new();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+fn bootstrap_version_contract_runs_in_lua_51() -> mlua::Result<()> {
+    run_lua_test("tests/lua/bootstrap_version_contract.lua")
+}
 
-    for script in [
-        "tests/lua/bootstrap_version_contract.lua",
-        "tests/lua/bootstrap_spec.lua",
-        "tests/lua/runtime_details_spec.lua",
-    ] {
-        run_lua_test(&lua, root, script)?;
-    }
+#[test]
+fn bootstrap_contract_runs_in_lua_51() -> mlua::Result<()> {
+    run_lua_test("tests/lua/bootstrap_spec.lua")
+}
 
-    Ok(())
+#[test]
+fn runtime_details_contract_runs_in_lua_51() -> mlua::Result<()> {
+    run_lua_test("tests/lua/runtime_details_spec.lua")
 }

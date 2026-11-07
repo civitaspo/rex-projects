@@ -2,16 +2,48 @@
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
+use rex_projects::process::{ProcessOutput, ProcessRequest, run};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 fn sha256(path: &std::path::Path) -> String {
     let digest = Sha256::digest(fs::read(path).unwrap());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn link(source: &Path, destination: &Path) -> Result<ProcessOutput, String> {
+    let search_path =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    let executable = search_path
+        .iter()
+        .map(|directory| directory.join("link"))
+        .find(|path| {
+            fs::metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .ok_or_else(|| "could not resolve the host link executable".to_owned())?;
+    run(ProcessRequest {
+        executable,
+        args: vec![
+            source.as_os_str().to_owned(),
+            destination.as_os_str().to_owned(),
+        ],
+        stdin: Vec::new(),
+        cwd: None,
+        clear_environment: true,
+        environment: Default::default(),
+        timeout: Duration::from_secs(2),
+        shutdown_grace: Duration::from_millis(100),
+        stdout_limit: 1024,
+        stderr_tail_limit: 2048,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[test]
@@ -34,7 +66,7 @@ fn hard_link_publication_is_atomic_no_replace() {
             let destination = destination.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                fs::hard_link(source, destination)
+                link(&source, &destination)
             })
         })
         .collect();
@@ -43,13 +75,30 @@ fn hard_link_publication_is_atomic_no_replace() {
         .map(|attempt| attempt.join().unwrap())
         .collect();
 
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(results.iter().all(|result| result.is_ok()));
+    let results = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+    assert!(
+        results
+            .iter()
+            .all(|result| !result.timed_out && result.cleanup_confirmed)
+    );
+    let successes = results
+        .iter()
+        .filter(|result| {
+            result
+                .status
+                .as_ref()
+                .is_some_and(|status| status.success())
+        })
+        .count();
+    assert_eq!(successes, 1, "unexpected link utility results: {results:?}");
     assert_eq!(
         results
             .iter()
             .filter(|result| result
+                .status
                 .as_ref()
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists))
+                .is_some_and(|status| !status.success()))
             .count(),
         7
     );
@@ -63,7 +112,8 @@ fn hard_link_publication_is_atomic_no_replace() {
     let symlink_destination = temp.path().join("symlink-winner");
     fs::write(&outside, b"preserve me").unwrap();
     symlink(&outside, &symlink_destination).unwrap();
-    assert!(fs::hard_link(&source, &symlink_destination).is_err());
+    let symlink_result = link(&source, &symlink_destination).unwrap();
+    assert!(!symlink_result.status.unwrap().success());
     assert!(
         fs::symlink_metadata(&symlink_destination)
             .unwrap()
@@ -74,7 +124,8 @@ fn hard_link_publication_is_atomic_no_replace() {
 
     let directory_destination = temp.path().join("directory-winner");
     fs::create_dir(&directory_destination).unwrap();
-    assert!(fs::hard_link(&source, &directory_destination).is_err());
+    let directory_result = link(&source, &directory_destination).unwrap();
+    assert!(!directory_result.status.unwrap().success());
     assert!(directory_destination.is_dir());
 }
 
