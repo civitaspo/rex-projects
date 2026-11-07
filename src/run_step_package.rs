@@ -51,10 +51,8 @@ impl RunStepPackage {
     /// absence as a wait state; a crash before link leaves only a private staging file.
     pub fn publish_once(&self, path: &std::path::Path) -> Result<Digest, String> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        if bytes.len() > 8 * 1024 * 1024 {
-            return Err("run-step package exceeds the 8 MiB limit".into());
-        }
+        let bytes = crate::protocol::serialize_bounded(self, 8 * 1024 * 1024)
+            .map_err(|error| format!("serialize run-step package: {error}"))?;
         let parent = path
             .parent()
             .ok_or("run-step package has no parent directory")?;
@@ -75,18 +73,7 @@ impl RunStepPackage {
                 .as_nanos()
         );
         let stage = parent.join(format!(".run-step-{nonce}.tmp"));
-        let _stage_cleanup = StagedFile(stage.clone());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&stage)
-            .map_err(|error| format!("create staged run-step package: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| error.to_string())?;
-        }
+        let (mut file, _stage_cleanup) = create_staged_file(&stage)?;
         file.write_all(&bytes).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
         drop(file);
@@ -139,7 +126,10 @@ impl RunStepPackage {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 || self.controller_generation == 0 {
+        if self.schema_version != 1
+            || self.descriptor.schema_version != 1
+            || self.controller_generation == 0
+        {
             return Err("unsupported or incomplete run-step package".into());
         }
         if self.descriptor.run_id.as_str().is_empty()
@@ -170,7 +160,8 @@ impl RunStepPackage {
         let profile_digest = Digest::parse(format!(
             "{:x}",
             sha2::Sha256::digest(
-                serde_json::to_vec(&self.profile).map_err(|error| error.to_string())?
+                crate::protocol::serialize_bounded(&self.profile, 8 * 1024 * 1024)
+                    .map_err(|error| error.to_string())?
             )
         ))?;
         if profile_digest != self.descriptor.profile_digest {
@@ -188,9 +179,23 @@ impl Drop for StagedFile {
     }
 }
 
+fn create_staged_file(path: &std::path::Path) -> Result<(std::fs::File, StagedFile), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("create staged run-step package: {error}"))?;
+    Ok((file, StagedFile(path.to_path_buf())))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::RunStepPackage;
+    use super::{RunStepPackage, create_staged_file};
     use crate::config::Profile;
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RexBlockId};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
@@ -304,8 +309,33 @@ mod tests {
         assert!(package.validate().is_err());
 
         package.schema_version = 1;
+        package.descriptor.schema_version = 2;
+        assert!(package.validate().is_err());
+
+        package.descriptor.schema_version = 1;
         package.profile.model = Some("different-profile".into());
         assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn failed_stage_creation_preserves_a_file_owned_by_another_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join(".run-step-existing.tmp");
+        std::fs::write(&stage, b"owned by another writer").unwrap();
+
+        assert!(create_staged_file(&stage).is_err());
+        assert_eq!(std::fs::read(stage).unwrap(), b"owned by another writer");
+    }
+
+    #[test]
+    fn package_serialization_stops_at_the_package_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("package.json");
+        let mut package = package();
+        package.prompt = "x".repeat(8 * 1024 * 1024);
+
+        assert!(package.publish_once(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]

@@ -7,6 +7,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,8 @@ pub struct AgentTurnResult {
 #[derive(Clone, Debug)]
 pub struct RunStepSpool {
     directory: PathBuf,
+    #[cfg(unix)]
+    directory_handle: Arc<File>,
 }
 
 impl RunStepSpool {
@@ -79,7 +82,21 @@ impl RunStepSpool {
         if canonical != directory {
             return Err("run-step spool path changed during canonicalization".into());
         }
-        Ok(Self { directory })
+        #[cfg(unix)]
+        let directory_handle = Arc::new(
+            open_dir(&directory)
+                .map_err(|error| format!("open run-step spool directory: {error}"))?,
+        );
+        sync_directory(&canonical_parent)?;
+        #[cfg(unix)]
+        directory_handle
+            .sync_all()
+            .map_err(|error| format!("sync run-step spool directory: {error}"))?;
+        Ok(Self {
+            directory,
+            #[cfg(unix)]
+            directory_handle,
+        })
     }
 
     pub fn directory(&self) -> &Path {
@@ -92,25 +109,22 @@ impl RunStepSpool {
         request: AgentStartRequest,
     ) -> Result<StartRequestEnvelope, String> {
         request.validate()?;
-        let request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+        let request_bytes = crate::protocol::serialize_bounded(&request, MAX_START_BYTES)
+            .map_err(|error| error.to_string())?;
         let envelope = StartRequestEnvelope {
             schema_version: PROTOCOL_VERSION,
             request_digest: sha256(&request_bytes),
             request,
         };
-        let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
-        publish_once(
-            &self.directory,
-            "start.request.json",
-            &bytes,
-            MAX_START_BYTES,
-        )?;
+        let bytes = crate::protocol::serialize_bounded(&envelope, MAX_START_BYTES)
+            .map_err(|error| error.to_string())?;
+        self.publish_file("start.request.json", &bytes, MAX_START_BYTES)?;
         Ok(envelope)
     }
 
     /// Host-side read. The caller must authorize this request against durable store state.
     pub fn read_start_request(&self) -> Result<StartRequestEnvelope, String> {
-        let bytes = read_bounded(&self.directory.join("start.request.json"), MAX_START_BYTES)?;
+        let bytes = self.read_file("start.request.json", MAX_START_BYTES)?;
         let envelope: StartRequestEnvelope = parse_unique(&bytes)?;
         envelope.validate()?;
         Ok(envelope)
@@ -129,13 +143,9 @@ impl RunStepSpool {
             request_digest: request.request_digest.clone(),
             receipt,
         };
-        let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
-        publish_once(
-            &self.directory,
-            "start.receipt.json",
-            &bytes,
-            MAX_START_BYTES,
-        )
+        let bytes = crate::protocol::serialize_bounded(&envelope, MAX_START_BYTES)
+            .map_err(|error| error.to_string())?;
+        self.publish_file("start.receipt.json", &bytes, MAX_START_BYTES)
     }
 
     /// Host-side read of an already published start receipt. Existing receipts remain
@@ -145,7 +155,7 @@ impl RunStepSpool {
         request: &StartRequestEnvelope,
     ) -> Result<Option<AgentLaunchReceipt>, String> {
         request.validate()?;
-        match read_bounded(&self.directory.join("start.receipt.json"), MAX_START_BYTES) {
+        match self.read_file("start.receipt.json", MAX_START_BYTES) {
             Ok(bytes) => {
                 let envelope: StartReceiptEnvelope = parse_unique(&bytes)?;
                 envelope.validate_for(request)?;
@@ -185,7 +195,7 @@ impl RunStepSpool {
         }
         let _: serde_json::Value = parse_unique(bytes)?;
         let digest = sha256(bytes);
-        publish_once(&self.directory, "turn.result.json", bytes, MAX_RESULT_BYTES)?;
+        self.publish_file("turn.result.json", bytes, MAX_RESULT_BYTES)?;
         Ok(digest)
     }
 
@@ -206,19 +216,16 @@ impl RunStepSpool {
             return Err("provider result belongs to a different AgentRun".into());
         }
         envelope.result_digest = envelope.payload_digest()?;
-        let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
-        publish_once(
-            &self.directory,
-            "turn.result.json",
-            &bytes,
-            MAX_RESULT_BYTES,
-        )?;
+        let bytes = crate::protocol::serialize_bounded(&envelope, MAX_RESULT_BYTES)
+            .map_err(|error| error.to_string())?;
+        let _: AgentTurnResult = parse_unique(&bytes)?;
+        self.publish_file("turn.result.json", &bytes, MAX_RESULT_BYTES)?;
         Ok(envelope)
     }
 
     /// Host-side bounded read; callers must validate the envelope and treat its claims as evidence.
     pub fn read_result(&self) -> Result<Vec<u8>, String> {
-        read_bounded(&self.directory.join("turn.result.json"), MAX_RESULT_BYTES)
+        self.read_file("turn.result.json", MAX_RESULT_BYTES)
     }
 
     pub fn read_turn_result(
@@ -231,6 +238,33 @@ impl RunStepSpool {
         envelope.validate_for(request)?;
         Ok(envelope)
     }
+
+    fn publish_file(&self, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            publish_once_at(&self.directory_handle, name, bytes, limit)
+        }
+        #[cfg(not(unix))]
+        {
+            publish_once(&self.directory, name, bytes, limit)
+        }
+    }
+
+    fn read_file(&self, name: &str, limit: usize) -> Result<Vec<u8>, String> {
+        #[cfg(unix)]
+        {
+            read_bounded_at(&self.directory_handle, name, limit).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::NotFound => "run-step spool file is not present".into(),
+                    _ => format!("read run-step spool file: {error}"),
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            read_bounded(&self.directory.join(name), limit)
+        }
+    }
 }
 
 impl StartRequestEnvelope {
@@ -239,7 +273,8 @@ impl StartRequestEnvelope {
             return Err("unsupported run-step start request schema".into());
         }
         self.request.validate()?;
-        let bytes = serde_json::to_vec(&self.request).map_err(|error| error.to_string())?;
+        let bytes = crate::protocol::serialize_bounded(&self.request, MAX_START_BYTES)
+            .map_err(|error| error.to_string())?;
         if self.request_digest != sha256(&bytes) {
             return Err("run-step start request digest does not match its payload".into());
         }
@@ -249,6 +284,7 @@ impl StartRequestEnvelope {
 
 impl StartReceiptEnvelope {
     pub fn validate_for(&self, request: &StartRequestEnvelope) -> Result<(), String> {
+        request.validate()?;
         if self.schema_version != PROTOCOL_VERSION || self.request_digest != request.request_digest
         {
             return Err("host start receipt is not bound to this start request".into());
@@ -259,6 +295,7 @@ impl StartReceiptEnvelope {
 
 impl AgentTurnResult {
     pub fn validate_for(&self, request: &StartRequestEnvelope) -> Result<(), String> {
+        request.validate()?;
         if self.schema_version != PROTOCOL_VERSION
             || self.start_request_digest != request.request_digest
             || self.receipt.run_id != request.request.agent_run_id
@@ -279,17 +316,21 @@ impl AgentTurnResult {
             receipt: &'a RunReceipt,
             structured_result: &'a Option<serde_json::Value>,
         }
-        let bytes = serde_json::to_vec(&Payload {
-            schema_version: self.schema_version,
-            start_request_digest: &self.start_request_digest,
-            receipt: &self.receipt,
-            structured_result: &self.structured_result,
-        })
+        let bytes = crate::protocol::serialize_bounded(
+            &Payload {
+                schema_version: self.schema_version,
+                start_request_digest: &self.start_request_digest,
+                receipt: &self.receipt,
+                structured_result: &self.structured_result,
+            },
+            MAX_RESULT_BYTES,
+        )
         .map_err(|error| error.to_string())?;
         Ok(sha256(&bytes))
     }
 }
 
+#[cfg(not(unix))]
 fn publish_once(directory: &Path, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
     if bytes.len() > limit {
         return Err("run-step spool payload exceeds its byte limit".into());
@@ -331,6 +372,7 @@ fn publish_once(directory: &Path, name: &str, bytes: &[u8], limit: usize) -> Res
     }
 }
 
+#[cfg(not(unix))]
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -363,13 +405,8 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
 }
 
 fn parse_unique<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = serde_path_to_error::deserialize(&mut deserializer)
-        .map_err(|error| format!("invalid run-step spool JSON at {}", error.path()))?;
-    deserializer
-        .end()
-        .map_err(|_| "trailing data in run-step spool JSON".to_owned())?;
-    Ok(value)
+    crate::protocol::parse_unique(bytes)
+        .map_err(|error| format!("invalid run-step spool JSON: {error}"))
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -393,6 +430,117 @@ fn nonce() -> String {
 }
 
 #[cfg(unix)]
+fn open_dir(path: &Path) -> Result<File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn read_bounded_at(directory: &File, name: &str, limit: usize) -> Result<Vec<u8>, std::io::Error> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new(name).expect("internal spool filename has no nul");
+    // SAFETY: directory is a retained directory descriptor and name is a fixed basename.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "run-step spool entry is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "run-step spool entry exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn publish_once_at(directory: &File, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if bytes.len() > limit {
+        return Err("run-step spool payload exceeds its byte limit".into());
+    }
+    let temporary = std::ffi::CString::new(format!(".{name}.{}.tmp", nonce()))
+        .expect("internal spool filename has no nul");
+    let destination = std::ffi::CString::new(name).expect("internal spool destination has no nul");
+    // SAFETY: directory is an open directory and temporary is a unique internal basename.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "create run-step temporary file: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let result = (|| {
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write run-step spool file: {error}"))?;
+        drop(file);
+        // SAFETY: both names are internal basenames under the retained directory descriptor.
+        let linked = unsafe {
+            libc::linkat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                destination.as_ptr(),
+                0,
+            )
+        };
+        if linked < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("run-step spool file `{name}` was already published")
+            } else {
+                format!("publish run-step spool file: {error}")
+            });
+        }
+        // SAFETY: temporary is the private file created by this call.
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } < 0 {
+            return Err(format!(
+                "remove run-step temporary file: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        directory
+            .sync_all()
+            .map_err(|error| format!("sync run-step spool directory: {error}"))
+    })();
+    if result.is_err() {
+        // SAFETY: temporary is owned by this call and removed beneath its pinned directory.
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+    }
+    result
+}
+
+#[cfg(unix)]
 fn set_private_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -402,12 +550,6 @@ fn set_private_dir(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_private_dir(_path: &Path) -> Result<(), String> {
     Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file_options(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
 }
 
 #[cfg(not(unix))]
@@ -606,21 +748,139 @@ mod tests {
         let temp = tempdir().unwrap();
         let spool = RunStepSpool::open(temp.path()).unwrap();
         let request = spool.publish_start_once(request()).unwrap();
-        spool
-            .publish_turn_result_once(&request, turn_result(&request.request))
-            .unwrap();
+        let mut original = turn_result(&request.request);
+        original.structured_result = Some(serde_json::json!({"answer":"ok"}));
+        spool.publish_turn_result_once(&request, original).unwrap();
         let read = spool.read_turn_result(&request).unwrap();
         read.validate_for(&request).unwrap();
 
         let mut forged: AgentTurnResult =
             serde_json::from_slice(&spool.read_result().unwrap()).unwrap();
-        forged.receipt.exit_code = Some(99);
+        forged.structured_result = Some(serde_json::json!({"answer":"changed"}));
         assert!(forged.validate_for(&request).is_err());
         assert!(
             spool
                 .publish_turn_result_once(&request, turn_result(&request.request))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn typed_result_rejects_oversize_and_unreadable_payloads_before_publication() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let request = spool.publish_start_once(request()).unwrap();
+
+        let mut oversized = turn_result(&request.request);
+        oversized.structured_result = Some(serde_json::json!({
+            "payload": "x".repeat(1024 * 1024)
+        }));
+        assert!(spool.publish_turn_result_once(&request, oversized).is_err());
+        assert!(!spool.directory().join("turn.result.json").exists());
+
+        let mut deeply_nested = serde_json::Value::String("leaf".into());
+        for _ in 0..160 {
+            deeply_nested = serde_json::Value::Array(vec![deeply_nested]);
+        }
+        let mut unreadable = turn_result(&request.request);
+        unreadable.structured_result = Some(deeply_nested);
+        assert!(
+            spool
+                .publish_turn_result_once(&request, unreadable)
+                .is_err()
+        );
+        assert!(!spool.directory().join("turn.result.json").exists());
+    }
+
+    #[test]
+    fn response_validators_reject_an_invalid_start_request_even_with_matching_digest() {
+        let mut request_envelope = StartRequestEnvelope {
+            schema_version: 1,
+            request_digest: String::new(),
+            request: request(),
+        };
+        request_envelope.request.schema_version = 2;
+        request_envelope.request_digest =
+            super::sha256(&serde_json::to_vec(&request_envelope.request).unwrap());
+
+        let receipt = StartReceiptEnvelope {
+            schema_version: 1,
+            request_digest: request_envelope.request_digest.clone(),
+            receipt: receipt(&request_envelope.request),
+        };
+        assert!(receipt.validate_for(&request_envelope).is_err());
+
+        let result = turn_result(&request_envelope.request);
+        let mut result = AgentTurnResult {
+            schema_version: 1,
+            start_request_digest: request_envelope.request_digest.clone(),
+            receipt: result.receipt,
+            structured_result: result.structured_result,
+            result_digest: String::new(),
+        };
+        result.result_digest = result.payload_digest().unwrap();
+        assert!(result.validate_for(&request_envelope).is_err());
+    }
+
+    #[test]
+    fn result_cannot_be_replayed_for_a_different_valid_wrapper_binding() {
+        let original_request = request();
+        let mut result = turn_result(&original_request);
+        result.structured_result = Some(serde_json::json!({"answer":"ok"}));
+        let mut envelope = AgentTurnResult {
+            schema_version: 1,
+            start_request_digest: "0".repeat(64),
+            receipt: result.receipt,
+            structured_result: result.structured_result,
+            result_digest: String::new(),
+        };
+        let original = StartRequestEnvelope {
+            schema_version: 1,
+            request_digest: super::sha256(&serde_json::to_vec(&original_request).unwrap()),
+            request: original_request,
+        };
+        envelope.start_request_digest = original.request_digest.clone();
+        envelope.result_digest = envelope.payload_digest().unwrap();
+        envelope.validate_for(&original).unwrap();
+
+        let mut changed_request = original.request.clone();
+        changed_request.wrapper_start_identity = "different-kernel-birth".into();
+        let changed = StartRequestEnvelope {
+            schema_version: 1,
+            request_digest: super::sha256(&serde_json::to_vec(&changed_request).unwrap()),
+            request: changed_request,
+        };
+
+        assert!(envelope.validate_for(&changed).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_reads_and_writes_remain_bound_to_opened_directory() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let pinned = temp.path().join("pinned-run-step");
+        std::fs::rename(spool.directory(), &pinned).unwrap();
+        std::fs::create_dir(spool.directory()).unwrap();
+
+        spool.publish_result_once(br#"{"result":1}"#).unwrap();
+
+        assert_eq!(spool.read_result().unwrap(), br#"{"result":1}"#);
+        assert!(!spool.directory().join("turn.result.json").exists());
+        assert_eq!(
+            std::fs::read(pinned.join("turn.result.json")).unwrap(),
+            br#"{"result":1}"#
+        );
+    }
+
+    #[test]
+    fn raw_result_rejects_duplicate_keys_in_nested_objects() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let bytes = br#"{"outer":{"result":1,"result":2}}"#;
+
+        assert!(spool.publish_result_once(bytes).is_err());
+        assert!(spool.read_result().is_err());
     }
 
     #[test]

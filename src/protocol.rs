@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::Write;
 
 use schemars::JsonSchema;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -271,6 +272,39 @@ impl<'de> Deserialize<'de> for UniqueValue {
 pub fn parse_unique<T: for<'de> Deserialize<'de>>(input: &[u8]) -> Result<T, String> {
     let value = serde_json::from_slice::<UniqueValue>(input).map_err(|error| error.to_string())?;
     serde_json::from_value(value.0).map_err(|error| error.to_string())
+}
+
+pub(crate) fn serialize_bounded(
+    value: &impl Serialize,
+    limit: usize,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut writer = BoundedWriter {
+        bytes: Vec::with_capacity(limit.min(8192)),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.bytes)
+}
+
+struct BoundedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(
+                "serialized JSON value exceeds its byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
