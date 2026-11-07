@@ -2429,6 +2429,7 @@ impl ConfigStore {
                 if manifest["operation_id"].as_str() != Some(proof.knowledge_operation_id())
                     || manifest["project_id"].as_str() != Some(project_id.as_str())
                     || manifest["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
+                    || canonical_json(&manifest)? != manifest_json
                     || content_digest(&manifest_json) != proof.knowledge_manifest_digest().as_str()
                 {
                     return Err(

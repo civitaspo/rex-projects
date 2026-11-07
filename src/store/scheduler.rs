@@ -89,6 +89,14 @@ pub struct GoalTicketCandidateReceipt {
     pub duplicate_ticket_ids: Vec<TicketId>,
 }
 
+/// Immutable external ticket identity and revision for one host-owned TicketRun effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketRunStatusTarget {
+    pub namespace: TicketNamespace,
+    pub ticket_id: TicketId,
+    pub external_revision: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentWakeInput {
     pub wake_input_id: u64,
@@ -452,7 +460,12 @@ impl ConfigStore {
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if run != Some(("completing".into(), expected_revision)) {
+        let Some(completed_revision) = expected_revision.checked_add(1) else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        if !matches!(run, Some((ref phase, revision)) if (phase == "completing" && revision == expected_revision) || (phase == "done" && revision == completed_revision))
+        {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
@@ -498,6 +511,7 @@ impl ConfigStore {
         if manifest["operation_id"].as_str() != Some(knowledge_operation_id.as_str())
             || manifest["project_id"].as_str() != Some(project_id.as_str())
             || manifest["ticket_run_id"].as_str() != Some(ticket_run_id.as_str())
+            || super::canonical_json(&manifest)? != manifest_json
         {
             return Err("stored Postmortem manifest identity or encoding is invalid".into());
         }
@@ -518,6 +532,46 @@ impl ConfigStore {
             );
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Some(proof))
+    }
+
+    /// Read the external ticket coordinates pinned when this TicketRun was created.
+    /// Completion handlers use it to build the next reducer-owned publication intent.
+    pub fn ticket_run_status_target(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        expected_revision: u64,
+    ) -> Result<TicketRunStatusTarget, String> {
+        let active_owner: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let row: Option<(String, String, String, u64, Option<String>)> = self.connection.query_row(
+            "SELECT namespace,ticket_id,internal_phase,revision,external_revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+            params![ticket_run_id.as_str(), project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((namespace, ticket_id, phase, revision, external_revision)) = row else {
+            return Err("TicketRun completion references an unknown subject".into());
+        };
+        let completed_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| "TicketRun revision is exhausted".to_owned())?;
+        if !((phase == "completing" && revision == expected_revision)
+            || (phase == "done" && revision == completed_revision))
+        {
+            return Err("TicketRun completion effect is stale".into());
+        }
+        Ok(TicketRunStatusTarget {
+            namespace: TicketNamespace::parse(namespace)?,
+            ticket_id: TicketId::parse(ticket_id)?,
+            external_revision,
+        })
     }
 
     /// Enqueue a dashboard instruction as a high-priority Coordinator wake. The request is
@@ -1028,17 +1082,25 @@ impl ConfigStore {
                     &candidate.namespace,
                     &candidate.ticket_id,
                 )?;
-                let request = serde_json::json!({
-                    "schema_version": 1,
-                    "project_id": project,
-                    "goal_revision": goal_revision,
-                    "request_key": request_key,
-                    "canonical": {"namespace": canonical_namespace.as_str(), "ticket_id": canonical_ticket_id.as_str()},
-                    "duplicate": {"namespace": candidate.namespace.as_str(), "ticket_id": candidate.ticket_id.as_str()},
-                    "resolution": "comment_then_cancel",
-                });
-                let request_json =
-                    serde_json::to_string(&request).map_err(|error| error.to_string())?;
+                let request = crate::engine::ticket_effects::ResolveDuplicateTicket {
+                    schema_version: 1,
+                    project_id: ProjectId::parse(project.clone())?,
+                    namespace: candidate.namespace.clone(),
+                    goal_revision,
+                    request_key: request_key.clone(),
+                    duplicate_ticket_id: candidate.ticket_id.clone(),
+                    canonical_ticket_id: canonical_ticket_id.clone(),
+                    expected_external_revision: None,
+                    comment_body: format!(
+                        "Duplicate of {}. This ticket was created from the same stable goal proposal.",
+                        canonical_ticket_id.as_str()
+                    ),
+                };
+                request.validate()?;
+                let request_json = serde_json::to_string(
+                    &serde_json::to_value(&request).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
                 tx.execute(
                     "UPDATE goal_ticket_candidates SET state='duplicate_pending' WHERE project_id=?1 AND goal_revision=?2 AND request_key=?3 AND namespace=?4 AND ticket_id=?5 AND state!='duplicate_resolved'",
                     params![project,goal_revision,request_key,candidate.namespace.as_str(),candidate.ticket_id.as_str()],

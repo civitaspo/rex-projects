@@ -69,6 +69,8 @@ pub struct ResolveDuplicateTicket {
     pub schema_version: u32,
     pub project_id: ProjectId,
     pub namespace: TicketNamespace,
+    pub goal_revision: u64,
+    pub request_key: String,
     pub duplicate_ticket_id: TicketId,
     pub canonical_ticket_id: TicketId,
     pub expected_external_revision: Option<String>,
@@ -201,6 +203,8 @@ impl CreateGoalTicket {
 impl ResolveDuplicateTicket {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1
+            || self.goal_revision == 0
+            || self.request_key.is_empty()
             || self.duplicate_ticket_id == self.canonical_ticket_id
             || self.comment_body.trim().is_empty()
             || self.comment_body.len() > 16_384
