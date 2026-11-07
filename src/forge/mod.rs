@@ -395,6 +395,13 @@ pub struct DirectMergeIntent {
     pub expected_head_sha: String,
     /// Preflight staleness check only. GitHub cannot atomically condition the merge on this SHA.
     pub expected_base_sha: String,
+    /// Exact PR body assessed for this merge. The forge adapter must re-read and match it.
+    pub expected_body: String,
+    pub expected_body_digest: Digest,
+    /// Exact provider commit message derived from the assessed body and procedure trailers.
+    pub expected_commit_message: String,
+    /// Optional expiry of the human approval; checked again after forge preflight.
+    pub approval_expires_at_unix: Option<u64>,
     /// Exact final trailer block required by the reviewed procedure. Empty means no trailer is required.
     pub expected_trailers: Vec<String>,
 }
@@ -464,4 +471,41 @@ pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<Digest, ForgeE
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Digest::parse(hex).map_err(ForgeError)
+}
+
+pub(crate) fn merge_commit_message(
+    body: &str,
+    expected_trailers: &[String],
+) -> Result<String, ForgeError> {
+    if expected_trailers.is_empty()
+        || expected_trailers
+            .iter()
+            .any(|line| !line.starts_with("Co-authored-by: ") || line.contains(['\n', '\r']))
+    {
+        return Err(ForgeError("required merge trailer block is invalid".into()));
+    }
+    let body = body.trim_end();
+    let trailer_lines = body
+        .lines()
+        .filter(|line| line.starts_with("Co-authored-by: "))
+        .collect::<Vec<_>>();
+    let expected = expected_trailers
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !trailer_lines.is_empty() {
+        let body_lines = body.lines().collect::<Vec<_>>();
+        if trailer_lines != expected || !body_lines.ends_with(&expected) {
+            return Err(ForgeError(
+                "PR body has a different or misplaced co-author trailer block".into(),
+            ));
+        }
+        return Ok(body.to_owned());
+    }
+    let mut message = body.to_owned();
+    if !message.is_empty() {
+        message.push_str("\n\n");
+    }
+    message.push_str(&expected_trailers.join("\n"));
+    Ok(message)
 }

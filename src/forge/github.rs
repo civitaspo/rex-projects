@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -18,7 +18,7 @@ use crate::forge::{
     Forge, ForgeError, ForgeObservation, IssueComment, MergeEffectIntent, MergeEffectOperation,
     Observed, PullRequestFile, PullRequestObservation, PullRequestRef, PullRequestState,
     Reconciliation, RepositoryIdentity, RepositoryRef, Review, ReviewComment, ReviewThread,
-    canonical_digest,
+    canonical_digest, merge_commit_message,
 };
 use crate::process::{ProcessError, ProcessOutput, ProcessRequest};
 
@@ -775,6 +775,19 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 reason: Some("PR identity or revisions changed before merge".into()),
             });
         }
+        let live_body = before.body.as_deref().unwrap_or_default();
+        if !direct_merge_body_matches(intent, live_body) {
+            return Ok(EffectAcknowledgement {
+                operation_key: intent.operation_key.clone(),
+                request_digest: canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
+                certainty: EffectCertainty::DefinitelyAbsent,
+                external_id: None,
+                external_url: None,
+                resulting_head_sha: Some(before.head_sha),
+                resulting_merge_sha: None,
+                reason: Some("PR body changed after merge assessment".into()),
+            });
+        }
         let endpoint = self.endpoint(
             &intent.pull.repository,
             &format!("pulls/{}/merge", intent.pull.number),
@@ -808,20 +821,44 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             {
                 return Err(ForgeError("required merge trailer block is invalid".into()));
             }
-            let commit_message = merge_commit_message(
-                before.body.as_deref().unwrap_or_default(),
-                &intent.expected_trailers,
-            )?;
-            body.insert("commit_message".into(), Value::String(commit_message));
+            let derived = merge_commit_message(&intent.expected_body, &intent.expected_trailers)?;
+            if derived != intent.expected_commit_message {
+                return Err(ForgeError(
+                    "exact squash commit message differs from the reviewed merge intent".into(),
+                ));
+            }
+            body.insert(
+                "commit_message".into(),
+                Value::String(intent.expected_commit_message.clone()),
+            );
+        } else if !intent.expected_commit_message.is_empty() {
+            return Err(ForgeError(
+                "unreviewed squash commit message is not allowed".into(),
+            ));
         }
         // GitHub accepts an expected head SHA but no expected base SHA. The separate base SHA is
         // retained in the durable request digest and must be re-observed by the executor.
+        let mutation_digest = canonical_digest(intent).map_err(|error| ForgeError(error.0))?;
+        if !human_approval_current(intent.approval_expires_at_unix, now_unix_seconds()) {
+            return Ok(EffectAcknowledgement {
+                operation_key: intent.operation_key.clone(),
+                request_digest: mutation_digest,
+                certainty: EffectCertainty::DefinitelyAbsent,
+                external_id: None,
+                external_url: None,
+                resulting_head_sha: Some(before.head_sha),
+                resulting_merge_sha: None,
+                reason: Some(
+                    "human approval expired after forge preflight; merge was not submitted".into(),
+                ),
+            });
+        }
         self.mutate(
             "PUT",
             &endpoint,
             Value::Object(body),
             &intent.operation_key,
-            &canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
+            &mutation_digest,
         )
     }
 
@@ -1352,38 +1389,23 @@ fn hex_digest(bytes: &[u8]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn merge_commit_message(body: &str, expected_trailers: &[String]) -> Result<String, ForgeError> {
-    if expected_trailers.is_empty()
-        || expected_trailers
-            .iter()
-            .any(|line| !line.starts_with("Co-authored-by: ") || line.contains(['\n', '\r']))
-    {
-        return Err(ForgeError("required merge trailer block is invalid".into()));
+fn now_unix_seconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn direct_merge_body_matches(intent: &DirectMergeIntent, live_body: &str) -> bool {
+    live_body == intent.expected_body
+        && hex_digest(live_body.as_bytes()) == intent.expected_body_digest.as_str()
+}
+
+fn human_approval_current(expires_at_unix: Option<u64>, now_unix: Option<u64>) -> bool {
+    match expires_at_unix {
+        None => true,
+        Some(expires) => now_unix.is_some_and(|now| now < expires),
     }
-    let body = body.trim_end();
-    let trailer_lines = body
-        .lines()
-        .filter(|line| line.starts_with("Co-authored-by: "))
-        .collect::<Vec<_>>();
-    let expected = expected_trailers
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    if !trailer_lines.is_empty() {
-        let body_lines = body.lines().collect::<Vec<_>>();
-        if trailer_lines != expected || !body_lines.ends_with(&expected) {
-            return Err(ForgeError(
-                "PR body has a different or misplaced co-author trailer block".into(),
-            ));
-        }
-        return Ok(body.to_owned());
-    }
-    let mut message = body.to_owned();
-    if !message.is_empty() {
-        message.push_str("\n\n");
-    }
-    message.push_str(&expected_trailers.join("\n"));
-    Ok(message)
 }
 
 fn value_to_string(value: &Value) -> String {
@@ -1539,6 +1561,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn merge_preflight_binds_exact_body_and_rechecks_approval_expiry() {
+        let expected_body = "PR body".to_owned();
+        let intent = DirectMergeIntent {
+            pull: test_pull(),
+            operation_key: "merge-op".into(),
+            method: MergeMethod::Squash,
+            expected_head_sha: "a".repeat(40),
+            expected_base_sha: "b".repeat(40),
+            expected_body_digest: Digest::parse(hex_digest(expected_body.as_bytes())).unwrap(),
+            expected_body: expected_body.clone(),
+            expected_commit_message: "PR body\n\nCo-authored-by: Agent <agent@example.com>".into(),
+            approval_expires_at_unix: Some(500),
+            expected_trailers: vec!["Co-authored-by: Agent <agent@example.com>".into()],
+        };
+        assert!(direct_merge_body_matches(&intent, &expected_body));
+        assert!(!direct_merge_body_matches(&intent, "changed body"));
+        assert!(human_approval_current(Some(500), Some(499)));
+        assert!(!human_approval_current(Some(500), Some(500)));
+        assert!(!human_approval_current(Some(500), None));
+        assert!(human_approval_current(None, None));
     }
 
     #[test]

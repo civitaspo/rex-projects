@@ -16,6 +16,7 @@ use crate::domain::types::MergeMethod;
 use crate::forge::{
     DirectMergeIntent, EffectAcknowledgement, EffectCertainty, Forge, ForgeError, ForgeObservation,
     MergeEffectIntent, Observed, PullRequestRef, Reconciliation, canonical_digest,
+    merge_commit_message,
 };
 use crate::merge_policy::{
     MergeAssessment, MergeDisposition, MergeEvidenceSnapshot, MergePolicy, MergeProcedure,
@@ -350,7 +351,23 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                     ));
                 }
                 ensure_open_same_revisions(&observed, &approved.subject)?;
-                let expected_body_digest = procedure.steps.iter().find_map(|step| {
+                let live = complete_pull(&observed)?;
+                let bound_body_digest = approved
+                    .subject
+                    .prepared_body_digest
+                    .as_ref()
+                    .ok_or_else(|| {
+                        MergeExecutionError::Blocked(
+                            "merge assessment does not bind the current PR body".into(),
+                        )
+                    })?;
+                let current_body = live.body.as_deref().unwrap_or_default();
+                if body_digest(current_body)? != *bound_body_digest {
+                    return Err(MergeExecutionError::Stale(
+                        "PR body differs from the body digest bound to the merge assessment".into(),
+                    ));
+                }
+                let procedure_body_digest = procedure.steps.iter().find_map(|step| {
                     if let MergeProcedureOperation::UpdatePullRequestBody {
                         approved_body_digest,
                         ..
@@ -361,24 +378,38 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                         None
                     }
                 });
-                if let Some(expected_body_digest) = expected_body_digest {
+                if let Some(procedure_body_digest) = procedure_body_digest {
                     let prepared_body = intent.exact_prepared_body.as_ref().ok_or_else(|| {
                         MergeExecutionError::Invalid(
                             "prepared PR body is missing for the approved procedure".into(),
                         )
                     })?;
-                    let live = complete_pull(&observed)?;
-                    if digest_bytes(prepared_body.as_bytes())? != *expected_body_digest
-                        || approved.subject.prepared_body_digest.as_ref()
-                            != Some(expected_body_digest)
-                        || body_digest(live.body.as_deref().unwrap_or_default())?
-                            != digest_bytes(prepared_body.as_bytes())?
+                    let prepared_digest = digest_bytes(prepared_body.as_bytes())?;
+                    if digest_bytes(prepared_body.as_bytes())? != *procedure_body_digest
+                        || prepared_digest != body_digest(current_body)?
                     {
                         return Err(MergeExecutionError::Stale(
                             "PR body changed after its reviewed update; refusing merge".into(),
                         ));
                     }
                 }
+                let expected_trailers = procedure
+                    .steps
+                    .iter()
+                    .find_map(|step| match &step.operation {
+                        MergeProcedureOperation::VerifyMergeCommit { expected_trailers } => {
+                            Some(expected_trailers.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if procedure.method != MergeMethod::Squash {
+                    return Err(MergeExecutionError::Blocked(
+                        "GitHub cannot set required trailers for this merge method; use squash or hand off to a human".into(),
+                    ));
+                }
+                let expected_commit_message = merge_commit_message(current_body, &expected_trailers)
+                    .map_err(forge_error)?;
                 let protection = complete_observation(&observed.branch_protection)?;
                 if !protection.supports_execution_base_guard(
                     &policy.required_checks,
@@ -394,13 +425,11 @@ impl<F: Forge> MergeProcedureExecutor<F> {
                     method: procedure.method,
                     expected_head_sha: expected_head_sha.clone(),
                     expected_base_sha: approved.subject.base_sha.clone(),
-                    expected_trailers: procedure.steps.iter().find_map(|step| {
-                        if let MergeProcedureOperation::VerifyMergeCommit { expected_trailers } = &step.operation {
-                            Some(expected_trailers.clone())
-                        } else {
-                            None
-                        }
-                    }).unwrap_or_default(),
+                    expected_body: current_body.to_owned(),
+                    expected_body_digest: bound_body_digest.clone(),
+                    expected_commit_message,
+                    approval_expires_at_unix: approval.map(|value| value.expires_at_unix),
+                    expected_trailers,
                 };
                 validate_approval(
                     approved,
