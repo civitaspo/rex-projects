@@ -1485,6 +1485,79 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Atomically records an applied effect and queues its next step. The continuation must
+    /// belong to the same project and durable subject so one ticket's workflow cannot advance
+    /// another ticket or project.
+    pub fn finish_effect_with_follow_up(
+        &mut self,
+        operation_id: &str,
+        owner_generation: u64,
+        receipt: &str,
+        next_effect: &EffectIntent,
+    ) -> Result<bool, String> {
+        validate_effect(next_effect)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let source: Option<(String, String, String, String, Option<String>)> = tx
+            .query_row(
+                "SELECT project_id,subject_type,subject_id,status,receipt_json FROM effects WHERE operation_id=?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((project_id, subject_type, subject_id, status, previous_receipt)) = source else {
+            return Err("effect claim is stale or no longer active".into());
+        };
+        if next_effect.project_id.as_str() != project_id
+            || next_effect.subject_type != subject_type
+            || next_effect.subject_id != subject_id
+        {
+            return Err("follow-up effect must retain the source project and subject".into());
+        }
+
+        if status == "succeeded" {
+            if previous_receipt.as_deref() != Some(receipt) {
+                return Err("completed effect was replayed with a different receipt".into());
+            }
+            let inserted = insert_effect(&tx, next_effect, now_unix()?)?;
+            if inserted {
+                return Err("completed effect has no matching durable follow-up".into());
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        if status != "claimed" {
+            return Err("effect claim is stale or no longer active".into());
+        }
+        let active_claim: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM effects WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed')",
+                params![operation_id, owner_generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !active_claim {
+            return Err("effect claim is stale or no longer active".into());
+        }
+
+        let inserted = insert_effect(&tx, next_effect, now_unix()?)?;
+        let changed = tx
+            .execute(
+                "UPDATE effects SET status='succeeded',receipt_json=?3,owner_generation=NULL WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed'",
+                params![operation_id, owner_generation, receipt],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("effect claim is stale or no longer active".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
+    }
+
     pub fn claim_ticket(
         &mut self,
         owner_generation: u64,
@@ -3816,7 +3889,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn effect_restart_reconciles_same_identity_before_retry() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
@@ -3871,6 +3943,7 @@ mod tests {
         struct MockHandler {
             actions: Mutex<std::collections::VecDeque<&'static str>>,
             seen: Mutex<Vec<(crate::effects::EffectMode, crate::effects::EffectRequest)>>,
+            next_effect: EffectIntent,
         }
         impl crate::effects::EffectHandler for MockHandler {
             fn kind(&self) -> crate::effects::EffectKind {
@@ -3898,13 +3971,31 @@ mod tests {
                     "applied" => Ok(crate::effects::EffectObservation::Applied {
                         receipt: "{\"merged\":true}".into(),
                     }),
+                    "applied_with_follow_up" => {
+                        Ok(crate::effects::EffectObservation::AppliedWithFollowUp {
+                            receipt: "{\"merged\":true}".into(),
+                            next_effect: self.next_effect.clone(),
+                        })
+                    }
                     other => Err(format!("unexpected test action {other}")),
                 }
             }
         }
+        let next_effect = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "project".into(),
+            subject_id: project_id.as_str().into(),
+            operation_id: "stable-follow-up-operation".into(),
+            logical_key: "stable-follow-up-key".into(),
+            kind: "postmortem".into(),
+            request_json: "{}".into(),
+            request_digest: content_digest("{}"),
+            expected_revision: Some(0),
+        };
         let handler = MockHandler {
-            actions: Mutex::new(["pending", "absent", "applied"].into()),
+            actions: Mutex::new(["pending", "absent", "applied_with_follow_up"].into()),
             seen: Mutex::new(Vec::new()),
+            next_effect: next_effect.clone(),
         };
         let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
         let limits = crate::effects::EffectLimits {
@@ -3975,9 +4066,21 @@ mod tests {
                 && request.intent.request_digest == intent.request_digest
         ));
         assert_eq!(
-            seen.iter().map(|(_, request)| request.attempt_count).collect::<Vec<_>>(),
-            [1, 1, 1, 1, 2]
+            seen.iter()
+                .map(|(_, request)| request.attempt_count)
+                .collect::<Vec<_>>(),
+            [1, 1, 2]
         );
+        drop(seen);
+        let follow_up_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id=?1",
+                [&next_effect.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(follow_up_status, "pending");
     }
 
     #[test]
@@ -4045,6 +4148,228 @@ mod tests {
         assert_eq!(loaded.revision.0, 2);
         assert_eq!(loaded.config.config.schema_version, 1);
         assert_eq!(loaded.config.digest.as_str(), "b".repeat(64));
+    }
+
+    #[test]
+    fn effect_completion_queues_same_subject_follow_up_atomically_and_replays_safely() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("payments").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            mode: "goal".into(),
+            goal_revision: 1,
+            desired_lifecycle: "running".into(),
+            state_revision: Revision(0),
+        };
+        let other_project = ProjectRecord {
+            id: ProjectId::parse("support").unwrap(),
+            ..project.clone()
+        };
+        assert!(store.insert_project(&project).unwrap());
+        assert!(store.insert_project(&other_project).unwrap());
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: "test-process-start".into(),
+            executable_path: "/tmp/rex-projects-test".into(),
+            executable_digest: "e".repeat(64),
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let generation = store.start_owner(&owner("owner-1")).unwrap();
+        let namespace = TicketNamespace::parse("github:org/repo").unwrap();
+        let ticket = TicketId::parse("#1").unwrap();
+        let ticket_run = TicketRunId::parse("payments-1-g1").unwrap();
+        store
+            .set_project_lifecycle(generation, &project.id, "running")
+            .unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project.id,
+                &namespace,
+                &ticket,
+                &ticket_run,
+                1,
+                "merge_pending",
+                "In Progress",
+            )
+            .unwrap();
+        let other_ticket = TicketId::parse("#2").unwrap();
+        let other_run = TicketRunId::parse("support-2-g1").unwrap();
+        store
+            .set_project_lifecycle(generation, &other_project.id, "running")
+            .unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &other_project.id,
+                &namespace,
+                &other_ticket,
+                &other_run,
+                1,
+                "merge_pending",
+                "In Progress",
+            )
+            .unwrap();
+        let effect = |project_id: &ProjectId,
+                      subject_id: &str,
+                      operation_id: &str,
+                      logical_key: &str,
+                      kind: &str| EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: subject_id.into(),
+            operation_id: operation_id.into(),
+            logical_key: logical_key.into(),
+            kind: kind.into(),
+            request_json: "{}".into(),
+            request_digest: content_digest("{}"),
+            expected_revision: None,
+        };
+        let source = effect(
+            &project.id,
+            ticket_run.as_str(),
+            "merge-operation",
+            "payments:1:merge",
+            "merge_step",
+        );
+        let next = effect(
+            &project.id,
+            ticket_run.as_str(),
+            "postmortem-operation",
+            "payments:1:postmortem",
+            "postmortem",
+        );
+        let wrong_scope = effect(
+            &other_project.id,
+            other_run.as_str(),
+            "wrong-scope-operation",
+            "support:2:postmortem",
+            "postmortem",
+        );
+        assert!(store.enqueue_effect(generation, &source).unwrap());
+        let supported = vec!["merge_step".into()];
+        let claimed = store
+            .claim_next_due_effect(generation, i64::MAX, &supported)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.intent.operation_id, source.operation_id);
+
+        assert!(
+            store
+                .finish_effect_with_follow_up(
+                    &source.operation_id,
+                    generation,
+                    r#"{"merged":true}"#,
+                    &wrong_scope,
+                )
+                .is_err()
+        );
+        let source_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id=?1",
+                [&source.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_status, "claimed");
+        let wrong_scope_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM effects WHERE operation_id=?1",
+                [&wrong_scope.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_scope_count, 0);
+
+        drop(store);
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let recovered_generation = store.start_owner(&owner("owner-2")).unwrap();
+        let recovered_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id=?1",
+                [&source.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_status, "uncertain");
+        let recovered_claim = store
+            .claim_next_due_effect(recovered_generation, i64::MAX, &supported)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_claim.intent.operation_id, source.operation_id);
+        assert_eq!(recovered_claim.state, super::EffectClaimState::Uncertain);
+        assert!(
+            store
+                .finish_effect_with_follow_up(
+                    &source.operation_id,
+                    recovered_generation,
+                    r#"{"merged":true}"#,
+                    &next,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .finish_effect_with_follow_up(
+                    &source.operation_id,
+                    recovered_generation,
+                    r#"{"merged":true}"#,
+                    &next,
+                )
+                .unwrap()
+        );
+        store.stop_owner(recovered_generation).unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let final_generation = store.start_owner(&owner("owner-3")).unwrap();
+        let (source_status, source_receipt): (String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT status,receipt_json FROM effects WHERE operation_id=?1",
+                [&source.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source_status, "succeeded");
+        assert_eq!(source_receipt.as_deref(), Some(r#"{"merged":true}"#));
+        let next_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id=?1",
+                [&next.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_status, "pending");
+        let next_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM effects WHERE project_id=?1 AND subject_type='ticket_run' AND subject_id=?2 AND logical_key=?3",
+                rusqlite::params![project.id.as_str(), ticket_run.as_str(), next.logical_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_count, 1);
+        store.stop_owner(final_generation).unwrap();
     }
 
     #[test]

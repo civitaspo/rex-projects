@@ -51,10 +51,22 @@ impl AbsentProof {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EffectObservation {
-    Applied { receipt: String },
-    AuthoritativelyAbsent { proof: AbsentProof },
-    Pending { receipt: String },
-    Rejected { receipt: String },
+    Applied {
+        receipt: String,
+    },
+    AppliedWithFollowUp {
+        receipt: String,
+        next_effect: EffectIntent,
+    },
+    AuthoritativelyAbsent {
+        proof: AbsentProof,
+    },
+    Pending {
+        receipt: String,
+    },
+    Rejected {
+        receipt: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +242,22 @@ impl EffectDispatcher {
                         owner_generation,
                         EffectOutcome::Succeeded,
                         Some(&receipt),
+                    )
+                    .map_err(EffectDispatchError::Store)?;
+                Ok(DispatchTick::Completed {
+                    operation_id: request.intent.operation_id,
+                })
+            }
+            Ok(EffectObservation::AppliedWithFollowUp {
+                receipt,
+                next_effect,
+            }) => {
+                store
+                    .finish_effect_with_follow_up(
+                        &request.intent.operation_id,
+                        owner_generation,
+                        &receipt,
+                        &next_effect,
                     )
                     .map_err(EffectDispatchError::Store)?;
                 Ok(DispatchTick::Completed {
