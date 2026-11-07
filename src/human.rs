@@ -284,6 +284,7 @@ pub struct HumanDecisionInput {
 #[serde(rename_all = "snake_case")]
 pub enum DecisionValidation {
     Accepted,
+    InvalidRequest,
     Expired,
     StaleSubject,
     ChoiceNotOffered,
@@ -299,6 +300,9 @@ pub fn validate_decision(
     input: &HumanDecisionInput,
     now: u64,
 ) -> DecisionValidation {
+    if request.validate().is_err() {
+        return DecisionValidation::InvalidRequest;
+    }
     if input.response_id.trim().is_empty()
         || input.response_id.len() > 255
         || input.response_id.chars().any(char::is_control)
@@ -320,7 +324,7 @@ pub fn validate_decision(
     {
         return DecisionValidation::StaleSubject;
     }
-    if !request.choices.contains(&input.choice) {
+    if !request.kind.allows(input.choice) || !request.choices.contains(&input.choice) {
         return DecisionValidation::ChoiceNotOffered;
     }
     DecisionValidation::Accepted
@@ -855,6 +859,24 @@ mod tests {
         assert_eq!(
             validate_decision(&request, &request.subject, &unoffered, 400),
             DecisionValidation::ChoiceNotOffered
+        );
+    }
+
+    #[test]
+    fn malformed_request_cannot_authorize_a_choice_invalid_for_its_kind() {
+        let (mut request, _) = sample();
+        request.choices = vec![HumanChoice::RevisePlan];
+        assert!(request.validate().is_err());
+        let input = HumanDecisionInput {
+            request_id: request.request_id.clone(),
+            expected_subject_digest: subject_digest(&request.subject),
+            response_id: "answer-invalid-kind".into(),
+            choice: HumanChoice::RevisePlan,
+            explanation: None,
+        };
+        assert_eq!(
+            validate_decision(&request, &request.subject, &input, 400),
+            DecisionValidation::InvalidRequest
         );
     }
 
