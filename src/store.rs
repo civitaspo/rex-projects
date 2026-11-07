@@ -20,7 +20,7 @@ use crate::launch::{
     RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 pub mod human;
 pub mod scheduler;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
@@ -380,6 +380,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             Self::migrate_human_v8(&mut connection)?;
+        }
+        if existing_version < 9 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            scheduler::migrate_v9(&connection)?;
         }
         Ok(Self {
             connection,

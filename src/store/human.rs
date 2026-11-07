@@ -886,18 +886,28 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            HUMAN_SCHEMA_VERSION
+            super::super::SCHEMA_VERSION
         );
         // Start from the real v7 schema produced by the versioned migration chain. Remove only
-        // v8's tables and marker so this database can exercise the preceding upgrade boundary.
+        // v8/v9 tables and markers so each upgrade boundary can be exercised independently.
         store
             .connection
             .execute_batch(
-                "DROP TABLE human_presentations;
+                "DROP TABLE goal_ticket_candidates;
+                 DROP TABLE ticket_observations;
+                 DROP TABLE ticket_scan_cursors;
+                 DROP TABLE scheduler_audit;
+                 DROP TABLE ticket_run_context;
+                 DROP TABLE ticket_scan_sequence;
+                 DROP TABLE goal_runtime;
+                 DROP TABLE agent_wake_context;
+                 DROP TABLE goal_ticket_requests;
+                 DROP TABLE human_presentations;
                  DROP TABLE human_decisions;
                  DROP TABLE human_decision_intents;
                  DROP TABLE human_requests;
                  DELETE FROM schema_migrations WHERE version=8;
+                 DELETE FROM schema_migrations WHERE version=9;
                  PRAGMA user_version=7;",
             )
             .unwrap();
@@ -917,7 +927,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            HUMAN_SCHEMA_VERSION
+            super::super::SCHEMA_VERSION
         );
         for table in [
             "human_requests",
