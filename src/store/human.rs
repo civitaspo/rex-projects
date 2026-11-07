@@ -149,6 +149,25 @@ pub struct HumanApprovalReceipt {
     request_expires_at_unix: u64,
 }
 
+/// Typed host capability for an approved publication-adoption decision. It can only be minted by
+/// the Store after checking the stored request purpose, authority, full subject digest, policy,
+/// configuration, and non-expired approval receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedPublicationAdoptionApproval {
+    receipt: HumanApprovalReceipt,
+    authority: crate::human_runtime::PublicationAdoptionAuthority,
+}
+
+impl AcceptedPublicationAdoptionApproval {
+    pub fn receipt(&self) -> &HumanApprovalReceipt {
+        &self.receipt
+    }
+
+    pub fn authority(&self) -> &crate::human_runtime::PublicationAdoptionAuthority {
+        &self.authority
+    }
+}
+
 impl HumanApprovalReceipt {
     pub fn request_id(&self) -> &HumanRequestId {
         &self.request_id
@@ -258,8 +277,8 @@ impl ConfigStore {
             "CREATE TABLE human_requests (
                 request_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(project_id),
-                purpose TEXT NOT NULL CHECK(purpose IN ('plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','project_configuration','release_decision')),
-                subject_kind TEXT NOT NULL CHECK(subject_kind IN ('ticket_run','plan','operation','profile','goal','project_configuration','release')),
+                purpose TEXT NOT NULL CHECK(purpose IN ('plan_decision','ticket_review','operation_approval','profile_promotion','profile_trial','goal_change','goal_completion','publication_adoption','project_configuration','release_decision')),
+                subject_kind TEXT NOT NULL CHECK(subject_kind IN ('ticket_run','plan','operation','profile','goal','publication','project_configuration','release')),
                 subject_id TEXT NOT NULL,
                 subject_revision INTEGER NOT NULL CHECK(subject_revision >= 0),
                 rex_view_id TEXT NOT NULL REFERENCES rex_views(view_id),
@@ -422,10 +441,13 @@ impl ConfigStore {
                     ..
                 }
                 | crate::human_runtime::HumanAuthorityMaterial::GoalCompletion { source, .. } => {
-                    source
+                    Some(source)
                 }
+                crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption { .. } => None,
             };
-            if !self.human_role_result_is_current_source(source)? {
+            if let Some(source) = source
+                && !self.human_role_result_is_current_source(source)?
+            {
                 return Err(
                     "human request source does not match a completed validated Agent result".into(),
                 );
@@ -597,9 +619,25 @@ impl ConfigStore {
         {
             return Ok(false);
         }
-        let result: serde_json::Value = crate::protocol::parse_unique(result_json.as_bytes())?;
-        let result_bytes = serde_json::to_vec(&result).map_err(|error| error.to_string())?;
-        if format!("{:x}", Sha256::digest(result_bytes)) != source.result_digest.as_str() {
+        let submission: crate::engine::orchestration::RoleResultSubmission =
+            crate::protocol::parse_unique(result_json.as_bytes())?;
+        if submission.result_digest != source.result_digest
+            || submission.kind != source.result_kind
+            || submission.assertion != source.assertion
+            || submission.binding != source.binding
+            || source.result_kind != crate::engine::orchestration::RoleOutputKind::HumanRequest
+            || source.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+        {
+            return Ok(false);
+        }
+        let validated =
+            crate::engine::orchestration::validate_role_result(&source.binding, submission)?;
+        let crate::engine::orchestration::RoleResultPayload::HumanRequest(stored_request) =
+            validated.typed_payload
+        else {
+            return Ok(false);
+        };
+        if stored_request != source.human_request {
             return Ok(false);
         }
         let stored_refs: Vec<crate::engine::orchestration::RoleArtifactReference> =
@@ -1139,6 +1177,44 @@ impl ConfigStore {
             request_expires_at_unix: receipt.request_expires_at_unix,
         }))
     }
+
+    pub fn accepted_publication_adoption_approval(
+        &self,
+        request_id: &HumanRequestId,
+        now: u64,
+    ) -> Result<Option<AcceptedPublicationAdoptionApproval>, String> {
+        let Some(summary) = load_request(&self.connection, request_id)? else {
+            return Ok(None);
+        };
+        if summary.request.purpose != crate::human_runtime::HumanPurpose::PublicationAdoption {
+            return Ok(None);
+        }
+        let Some(crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption { material }) =
+            self.human_request_authority(request_id)?
+        else {
+            return Ok(None);
+        };
+        if crate::human_runtime::publication_adoption_request(request_id.clone(), material.clone())?
+            != summary.request
+        {
+            return Ok(None);
+        }
+        let subject_digest = summary.request.subject.digest()?;
+        let Some(receipt) = self.accepted_human_approval(
+            request_id,
+            &subject_digest,
+            &summary.request.subject.configuration_digest,
+            &summary.request.subject.policy_digest,
+            now,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AcceptedPublicationAdoptionApproval {
+            receipt,
+            authority: material,
+        }))
+    }
 }
 
 fn validate_current_ticket(
@@ -1209,7 +1285,8 @@ fn validate_active_request_view(
         | HumanPurpose::ReleaseDecision => "supervisor",
         HumanPurpose::PlanDecision
         | HumanPurpose::TicketReview
-        | HumanPurpose::OperationApproval => "ticket",
+        | HumanPurpose::OperationApproval
+        | HumanPurpose::PublicationAdoption => "ticket",
     };
     if view_kind != expected_kind {
         return Err(format!("human request requires a {expected_kind} Rex view"));
@@ -1219,8 +1296,14 @@ fn validate_active_request_view(
     } else {
         request.subject.ticket_run_id.clone()
     };
-    if request.purpose == HumanPurpose::OperationApproval && ticket_run_id.is_none() {
-        return Err("operation approval requires a ticket-scoped Rex view".into());
+    if matches!(
+        request.purpose,
+        HumanPurpose::OperationApproval | HumanPurpose::PublicationAdoption
+    ) && ticket_run_id.is_none()
+    {
+        return Err(
+            "operation and publication-adoption decisions require a ticket-scoped Rex view".into(),
+        );
     }
     if let Some(ticket_run) = ticket_run_id {
         let ticket: Option<(String, String)> = tx
@@ -1386,6 +1469,7 @@ fn purpose_name(value: HumanPurpose) -> &'static str {
         HumanPurpose::ProfileTrial => "profile_trial",
         HumanPurpose::GoalChange => "goal_change",
         HumanPurpose::GoalCompletion => "goal_completion",
+        HumanPurpose::PublicationAdoption => "publication_adoption",
         HumanPurpose::ProjectConfiguration => "project_configuration",
         HumanPurpose::ReleaseDecision => "release_decision",
     }
@@ -1398,6 +1482,7 @@ fn subject_kind_name(value: HumanSubjectKind) -> &'static str {
         HumanSubjectKind::Operation => "operation",
         HumanSubjectKind::Profile => "profile",
         HumanSubjectKind::Goal => "goal",
+        HumanSubjectKind::Publication => "publication",
         HumanSubjectKind::ProjectConfiguration => "project_configuration",
         HumanSubjectKind::Release => "release",
     }

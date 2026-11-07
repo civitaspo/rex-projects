@@ -16,7 +16,9 @@ use crate::domain::ids::{Digest, HumanRequestId, ProjectId, Revision, TicketRunI
 use crate::effects::{
     EffectContext, EffectHandler, EffectKind, EffectMode, EffectObservation, EffectRequest,
 };
-use crate::engine::orchestration::{RoleArtifactReference, RoleResultBinding};
+use crate::engine::orchestration::{
+    AgentAssertion, HumanRequestPayload, RoleArtifactReference, RoleResultBinding,
+};
 use crate::human::{ReviewBundle, ReviewEvidence, review_bundle_digest};
 use crate::protocol::{
     MethodName, ProtocolError, RequestEnvelope, RequestId as ProtocolRequestId, SCHEMA_VERSION,
@@ -36,6 +38,7 @@ pub enum HumanSubjectKind {
     Operation,
     Profile,
     Goal,
+    Publication,
     ProjectConfiguration,
     Release,
 }
@@ -52,6 +55,7 @@ pub enum HumanPurpose {
     ProfileTrial,
     GoalChange,
     GoalCompletion,
+    PublicationAdoption,
     ProjectConfiguration,
     ReleaseDecision,
 }
@@ -77,6 +81,7 @@ impl HumanPurpose {
             Self::OperationApproval => HumanSubjectKind::Operation,
             Self::ProfilePromotion | Self::ProfileTrial => HumanSubjectKind::Profile,
             Self::GoalChange | Self::GoalCompletion => HumanSubjectKind::Goal,
+            Self::PublicationAdoption => HumanSubjectKind::Publication,
             Self::ProjectConfiguration => HumanSubjectKind::ProjectConfiguration,
             Self::ReleaseDecision => HumanSubjectKind::Release,
         }
@@ -101,6 +106,7 @@ impl HumanPurpose {
             Self::OperationApproval
             | Self::ProfilePromotion
             | Self::ProfileTrial
+            | Self::PublicationAdoption
             | Self::ProjectConfiguration
             | Self::ReleaseDecision => matches!(
                 choice,
@@ -187,7 +193,7 @@ impl HumanSubjectBinding {
         }
         if matches!(
             self.kind,
-            HumanSubjectKind::Operation | HumanSubjectKind::Plan
+            HumanSubjectKind::Operation | HumanSubjectKind::Plan | HumanSubjectKind::Publication
         ) && self.ticket_run_id.is_none()
         {
             return Err(
@@ -312,6 +318,7 @@ impl HumanRuntimeRequest {
             HumanPurpose::OperationApproval | HumanPurpose::ReleaseDecision => {
                 HumanWakeTarget::Operator
             }
+            HumanPurpose::PublicationAdoption => HumanWakeTarget::Coordinator,
             _ => HumanWakeTarget::Coordinator,
         }
     }
@@ -616,6 +623,15 @@ pub trait HumanSubjectObserver: Send + Sync {
     ) -> Result<HumanSubjectObservation, String>;
 }
 
+/// Read-only adapter for the current, complete remote state of one owned publication resource.
+/// Implementations reuse the configured Git/Forge clients and preserve unknown capabilities.
+pub trait PublicationAdoptionSource: Send + Sync {
+    fn observe_publication(
+        &self,
+        resource: &crate::store::publication_monitor::PublicationResource,
+    ) -> Result<crate::delivery_runtime::RepositoryPublicationObservation, String>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HumanSubjectObservation {
     Current(HumanSubjectBinding),
@@ -634,6 +650,7 @@ pub struct DurableHumanSubjectObserver {
     declarative_root: PathBuf,
     delivery_effects: Option<std::sync::Arc<crate::delivery_runtime::RepositoryDeliveryEffects>>,
     owner_generation: Option<u64>,
+    publication_source: Option<std::sync::Arc<dyn PublicationAdoptionSource>>,
 }
 
 impl DurableHumanSubjectObserver {
@@ -645,6 +662,7 @@ impl DurableHumanSubjectObserver {
             declarative_root,
             delivery_effects: None,
             owner_generation: None,
+            publication_source: None,
         })
     }
 
@@ -660,6 +678,23 @@ impl DurableHumanSubjectObserver {
             declarative_root,
             delivery_effects: Some(delivery_effects),
             owner_generation: Some(owner_generation),
+            publication_source: None,
+        })
+    }
+
+    pub fn with_publication_adoption(
+        declarative_root: PathBuf,
+        owner_generation: u64,
+        publication_source: std::sync::Arc<dyn PublicationAdoptionSource>,
+    ) -> Result<Self, String> {
+        if !declarative_root.is_absolute() || owner_generation == 0 {
+            return Err("human observer requires an absolute config root and active owner".into());
+        }
+        Ok(Self {
+            declarative_root,
+            delivery_effects: None,
+            owner_generation: Some(owner_generation),
+            publication_source: Some(publication_source),
         })
     }
 }
@@ -678,6 +713,19 @@ impl HumanSubjectObserver for DurableHumanSubjectObserver {
             HumanPurpose::ProfileTrial => observe_profile_trial_subject(store, request),
             HumanPurpose::PlanDecision | HumanPurpose::GoalCompletion => {
                 observe_typed_role_authority(store, request)
+            }
+            HumanPurpose::PublicationAdoption => {
+                match (&self.publication_source, self.owner_generation) {
+                    (Some(source), Some(generation)) => observe_publication_adoption_subject(
+                        store,
+                        request,
+                        source.as_ref(),
+                        generation,
+                    ),
+                    _ => Err(
+                        "publication adoption requires the configured fresh remote observer".into(),
+                    ),
+                }
             }
             HumanPurpose::TicketReview => {
                 let _configured =
@@ -721,6 +769,77 @@ fn observe_profile_trial_subject(
     if expected != *request {
         return Ok(HumanSubjectObservation::Gone(
             "the profile trial review scope, evidence, or choices changed".into(),
+        ));
+    }
+    Ok(HumanSubjectObservation::Current(expected.subject))
+}
+
+fn observe_publication_adoption_subject(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+    source: &dyn PublicationAdoptionSource,
+    _owner_generation: u64,
+) -> Result<HumanSubjectObservation, String> {
+    let Some(HumanAuthorityMaterial::PublicationAdoption { material }) =
+        store.human_request_authority(&request.request_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the publication adoption authority is no longer available".into(),
+        ));
+    };
+    let Some(latest) = store.latest_unresolved_publication(&material.resource)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the publication irregularity is no longer unresolved".into(),
+        ));
+    };
+    if latest.event_id != material.event_id
+        || latest.revision != material.event_revision
+        || latest.observation_digest != material.previous_observation_digest
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "a newer publication observation superseded this adoption request".into(),
+        ));
+    }
+    let Some(project) = store.project(&material.resource.project_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project for this publication no longer exists".into(),
+        ));
+    };
+    let Some(snapshot) = store.load_snapshot(&project.config_source)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if snapshot.revision != project.config_revision
+        || snapshot.config.digest != project.config_digest
+        || snapshot.config.digest != material.configuration_digest
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project configuration changed after publication adoption was prepared".into(),
+        ));
+    }
+    let Some(repository) = snapshot
+        .config
+        .config
+        .repositories
+        .get(&material.resource.repository_id)
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the affected repository is no longer configured".into(),
+        ));
+    };
+    if publication_adoption_policy_digest(repository)? != material.policy_digest {
+        return Ok(HumanSubjectObservation::Gone(
+            "the repository publication adoption policy changed".into(),
+        ));
+    }
+    let current_observation = source.observe_publication(&material.resource)?;
+    let mut current_material = material.clone();
+    current_material.current_observation_digest =
+        publication_observation_digest(&current_observation)?;
+    current_material.current_observation = current_observation;
+    let expected = publication_adoption_request(request.request_id.clone(), current_material)?;
+    if expected != *request {
+        return Ok(HumanSubjectObservation::Gone(
+            "the selected external resource or its complete remote evidence changed".into(),
         ));
     }
     Ok(HumanSubjectObservation::Current(expected.subject))
@@ -848,6 +967,11 @@ fn observe_typed_role_authority(
     let source = match &authority {
         HumanAuthorityMaterial::PlannerClarification { source, .. }
         | HumanAuthorityMaterial::GoalCompletion { source, .. } => source,
+        HumanAuthorityMaterial::PublicationAdoption { .. } => {
+            return Ok(HumanSubjectObservation::Gone(
+                "publication adoption is not a Planner or goal decision".into(),
+            ));
+        }
     };
     if !store.human_role_result_is_current_source(source)? {
         return Ok(HumanSubjectObservation::Gone(
@@ -926,6 +1050,7 @@ fn observe_typed_role_authority(
                 ));
             }
         }
+        HumanAuthorityMaterial::PublicationAdoption { .. } => unreachable!("handled above"),
     }
     Ok(HumanSubjectObservation::Current(request.subject.clone()))
 }
@@ -961,8 +1086,11 @@ pub enum HumanAuthorityMaterial {
         source: HumanRoleResultSource,
         goal_revision: u64,
         acceptance_criteria: Vec<String>,
-        evidence: crate::engine::orchestration::GoalCompletionEvidence,
+        evidence: HumanGoalCompletionEvidence,
         documents: Vec<HumanEvidenceDocument>,
+    },
+    PublicationAdoption {
+        material: PublicationAdoptionAuthority,
     },
 }
 
@@ -973,7 +1101,22 @@ pub struct HumanRoleResultSource {
     pub message_id: String,
     pub result_digest: Digest,
     pub result_kind: crate::engine::orchestration::RoleOutputKind,
+    pub assertion: AgentAssertion,
+    pub human_request: HumanRequestPayload,
     pub claimed_artifact_refs: Vec<RoleArtifactReference>,
+}
+
+/// Immutable evidence copied from the host-validated Supervisor proposal. The host rechecks the
+/// current goal criteria and open work before accepting a response; this is never authority by
+/// itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanGoalCompletionEvidence {
+    pub satisfied_acceptance: Vec<String>,
+    pub incomplete_ticket_ids: Vec<crate::domain::ids::TicketId>,
+    pub deferred_risks: Vec<String>,
+    pub operation_results: Vec<String>,
+    pub subject_digest: Digest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -984,8 +1127,236 @@ pub struct HumanEvidenceDocument {
     pub bytes: Vec<u8>,
 }
 
+/// Exact remote state a human is being asked to adopt after an unexpected publication.
+/// The producer must create this only from a fresh, complete host observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationAdoptionAuthority {
+    pub resource: crate::store::publication_monitor::PublicationResource,
+    pub event_id: String,
+    pub event_revision: u64,
+    pub previous_observation_digest: Digest,
+    pub selected_resource: SelectedPublicationResource,
+    pub current_observation: crate::delivery_runtime::RepositoryPublicationObservation,
+    pub current_observation_digest: Digest,
+    pub configuration_digest: Digest,
+    pub policy_digest: Digest,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SelectedPublicationResource {
+    Branch {
+        head: String,
+    },
+    PullRequest {
+        number: u64,
+        node_id: String,
+        head_sha: String,
+        base_sha: String,
+    },
+}
+
+impl PublicationAdoptionAuthority {
+    pub fn compute_observation_digest(&self) -> Result<Digest, String> {
+        publication_observation_digest(&self.current_observation)
+    }
+
+    pub fn material_digest(&self) -> Result<Digest, String> {
+        let material = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        if material.len() > MAX_HUMAN_REQUEST_BYTES {
+            return Err(
+                "publication adoption evidence exceeds the human request size limit".into(),
+            );
+        }
+        Digest::parse(hex(&Sha256::digest(material)))
+    }
+
+    pub fn review_bundle(&self) -> Result<ReviewBundle, String> {
+        validate_publication_adoption_authority(self)?;
+        let resource = &self.resource;
+        let selected = serde_json::to_string_pretty(&self.selected_resource)
+            .map_err(|error| error.to_string())?;
+        let observation = serde_json::to_string_pretty(&self.current_observation)
+            .map_err(|error| error.to_string())?;
+        let bundle = ReviewBundle {
+            title: "Adopt an external publication".into(),
+            summary: format!(
+                "Review the unexpected remote state for project {}, ticket run {}, repository {}, branch {}. The selected resource is shown below.",
+                resource.project_id,
+                resource.ticket_run_id,
+                resource.repository_id,
+                resource.branch
+            ),
+            risk: Some(crate::human::ReviewRisk {
+                rating: 3,
+                confidence: crate::human::RiskConfidence::High,
+                rationale: "This adopts an externally created or changed remote resource into the project record. It does not create a host publication receipt.".into(),
+                unresolved_gates: vec!["Confirm the exact resource identity and current remote state.".into()],
+            }),
+            repositories: Vec::new(),
+            evidence: vec![
+                ReviewEvidence {
+                    title: "Selected resource to adopt".into(),
+                    body: selected,
+                    truncated: false,
+                },
+                ReviewEvidence {
+                    title: "Complete current remote observation".into(),
+                    body: observation,
+                    truncated: false,
+                },
+            ],
+            unknowns: vec![
+                "The selected resource was created outside the rex-projects host effect journal.".into(),
+                format!("Previous irregularity observation digest: {}", self.previous_observation_digest),
+                format!("Fresh observation digest: {}", self.current_observation_digest),
+            ],
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
+}
+
+pub fn publication_observation_digest(
+    observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+) -> Result<Digest, String> {
+    let bytes = serde_json::to_vec(observation).map_err(|error| error.to_string())?;
+    let mut material = b"rex-projects-publication-observation-v1\0".to_vec();
+    material.extend(bytes);
+    Digest::parse(hex(&Sha256::digest(material)))
+}
+
+fn validate_publication_adoption_authority(
+    authority: &PublicationAdoptionAuthority,
+) -> Result<(), String> {
+    if authority.event_id.is_empty()
+        || authority.event_id.len() > 512
+        || authority.event_id.chars().any(char::is_control)
+        || authority.event_revision == 0
+        || authority.expires_at_unix == 0
+        || authority.compute_observation_digest()? != authority.current_observation_digest
+    {
+        return Err(
+            "publication adoption authority identity or observation digest is invalid".into(),
+        );
+    }
+    let crate::delivery_forge::ObservationCapability::Known(pulls) =
+        &authority.current_observation.pull_requests
+    else {
+        return Err("publication adoption requires a complete pull-request observation".into());
+    };
+    if pulls.iter().any(|pull| {
+        !matches!(
+            pull.timeline,
+            crate::delivery_forge::ObservationCapability::Known(_)
+        )
+    }) {
+        return Err("publication adoption requires complete pull-request timelines".into());
+    }
+    match (&authority.selected_resource, &authority.current_observation) {
+        (SelectedPublicationResource::Branch { head }, observation)
+            if observation.remote_head.as_deref() == Some(head.as_str()) => {}
+        (
+            SelectedPublicationResource::PullRequest {
+                number,
+                node_id,
+                head_sha,
+                base_sha,
+            },
+            observation,
+        ) => {
+            let crate::delivery_forge::ObservationCapability::Known(pulls) =
+                &observation.pull_requests
+            else {
+                unreachable!()
+            };
+            let matches = pulls
+                .iter()
+                .filter(|pull| {
+                    pull.number == *number
+                        && pull.node_id == *node_id
+                        && pull.source_head == *head_sha
+                        && pull.base_sha == *base_sha
+                })
+                .count();
+            if matches != 1 {
+                return Err("selected pull request is missing, ambiguous, or changed in the current observation".into());
+            }
+        }
+        _ => {
+            return Err(
+                "selected publication resource is not present in the current observation".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Construct the immutable request used by both the producer and response observer.
+pub fn publication_adoption_request(
+    request_id: HumanRequestId,
+    material: PublicationAdoptionAuthority,
+) -> Result<HumanRuntimeRequest, String> {
+    validate_publication_adoption_authority(&material)?;
+    let review_bundle = material.review_bundle()?;
+    let subject = HumanSubjectBinding {
+        project_id: material.resource.project_id.clone(),
+        kind: HumanSubjectKind::Publication,
+        subject_id: material.event_id.clone(),
+        ticket_run_id: Some(material.resource.ticket_run_id.clone()),
+        revision: Revision(material.event_revision),
+        material_digest: material.material_digest()?,
+        configuration_digest: material.configuration_digest.clone(),
+        policy_digest: material.policy_digest.clone(),
+        bundle_digest: review_bundle_digest(&review_bundle)?,
+    };
+    let request = HumanRuntimeRequest {
+        request_id,
+        purpose: HumanPurpose::PublicationAdoption,
+        subject,
+        question: format!(
+            "Adopt the selected external resource for repository {} branch {}?",
+            material.resource.repository_id, material.resource.branch
+        ),
+        choices: vec![
+            HumanDecisionChoice::Approve,
+            HumanDecisionChoice::Refuse,
+            HumanDecisionChoice::Defer,
+        ],
+        expires_at_unix: material.expires_at_unix,
+        review_bundle,
+    };
+    request.validate(material.expires_at_unix.saturating_sub(1))?;
+    Ok(request)
+}
+
+pub fn publication_adoption_policy_digest(
+    repository: &crate::config::RepositoryConfig,
+) -> Result<Digest, String> {
+    let bytes = serde_json::to_vec(&(
+        "rex-projects-publication-adoption-policy-v1",
+        &repository.forge,
+        &repository.base_branch,
+        &repository.merge,
+    ))
+    .map_err(|error| error.to_string())?;
+    Digest::parse(hex(&Sha256::digest(bytes)))
+}
+
 impl HumanAuthorityMaterial {
     pub fn validate_for(&self, request: &HumanRuntimeRequest) -> Result<(), String> {
+        if let Self::PublicationAdoption { material } = self {
+            if publication_adoption_request(request.request_id.clone(), material.clone())?
+                != *request
+            {
+                return Err(
+                    "publication adoption authority does not match its human request".into(),
+                );
+            }
+            return Ok(());
+        }
         let (source, required_purpose, required_role) = match self {
             Self::PlannerClarification { source, documents } => {
                 let total = documents.iter().try_fold(0usize, |total, document| {
@@ -1017,6 +1388,8 @@ impl HumanAuthorityMaterial {
                 if references != claimed
                     || source.result_kind
                         != crate::engine::orchestration::RoleOutputKind::HumanRequest
+                    || source.human_request.kind != "clarification"
+                    || source.human_request.evidence_references != source.claimed_artifact_refs
                 {
                     return Err(
                         "Planner evidence documents do not match its validated HumanRequest result"
@@ -1075,12 +1448,14 @@ impl HumanAuthorityMaterial {
                 references.sort_by(|left, right| left.path.cmp(&right.path));
                 let mut claimed = source.claimed_artifact_refs.clone();
                 claimed.sort_by(|left, right| left.path.cmp(&right.path));
-                if source.result_kind
-                    != crate::engine::orchestration::RoleOutputKind::GoalCompletion
+                if source.result_kind != crate::engine::orchestration::RoleOutputKind::HumanRequest
+                    || source.human_request.kind != "goal_completion"
+                    || source.human_request.evidence_references != source.claimed_artifact_refs
                     || references != claimed
                 {
                     return Err(
-                        "goal completion documents do not match its validated typed result".into(),
+                        "goal completion evidence does not match its validated typed request"
+                            .into(),
                     );
                 }
                 (
@@ -1089,6 +1464,7 @@ impl HumanAuthorityMaterial {
                     crate::domain::types::Role::Supervisor,
                 )
             }
+            Self::PublicationAdoption { .. } => unreachable!("handled above"),
         };
         let binding = &source.binding;
         if request.purpose != required_purpose
@@ -1102,6 +1478,7 @@ impl HumanAuthorityMaterial {
                     .as_ref()
                     .map(|_| request.subject.revision)
             || binding.config_digest != request.subject.configuration_digest
+            || source.assertion != AgentAssertion::Succeeded
             || source.message_id.trim().is_empty()
             || source.message_id.len() > 255
             || source.message_id.chars().any(char::is_control)
@@ -1136,6 +1513,7 @@ impl HumanAuthorityMaterial {
             Self::PlannerClarification { source, .. } | Self::GoalCompletion { source, .. } => {
                 &source.binding
             }
+            Self::PublicationAdoption { material } => return Ok(material.policy_digest.clone()),
         };
         let bytes = serde_json::to_vec(&(
             &binding.profile_digest,
@@ -1208,6 +1586,7 @@ impl HumanAuthorityMaterial {
                     "Completion evidence is a Supervisor assertion and must be checked against current project state.".into(),
                 ],
             },
+            Self::PublicationAdoption { material } => material.review_bundle()?,
         };
         bundle.validate()?;
         Ok(bundle)
@@ -1842,6 +2221,101 @@ mod presenter_tests {
         assert!(changed.validate().is_err());
     }
 
+    fn publication_authority(
+        selected_resource: SelectedPublicationResource,
+        pull_requests: crate::delivery_forge::ObservationCapability<
+            Vec<crate::delivery_forge::ObservedPullRequest>,
+        >,
+    ) -> PublicationAdoptionAuthority {
+        let mut authority = PublicationAdoptionAuthority {
+            resource: crate::store::publication_monitor::PublicationResource {
+                project_id: ProjectId::parse("p1").unwrap(),
+                ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+                repository_id: crate::domain::ids::RepositoryId::parse("repo-1").unwrap(),
+                branch: "feature/example".into(),
+            },
+            event_id: "irregularity-1".into(),
+            event_revision: 2,
+            previous_observation_digest: Digest::parse("a".repeat(64)).unwrap(),
+            selected_resource,
+            current_observation: crate::delivery_runtime::RepositoryPublicationObservation {
+                remote_head: Some("head-2".into()),
+                pull_requests,
+            },
+            current_observation_digest: Digest::parse("b".repeat(64)).unwrap(),
+            configuration_digest: Digest::parse("c".repeat(64)).unwrap(),
+            policy_digest: Digest::parse("d".repeat(64)).unwrap(),
+            expires_at_unix: 500,
+        };
+        authority.current_observation_digest = authority.compute_observation_digest().unwrap();
+        authority
+    }
+
+    #[test]
+    fn publication_adoption_binds_the_exact_observed_branch_and_request() {
+        let authority = publication_authority(
+            SelectedPublicationResource::Branch {
+                head: "head-2".into(),
+            },
+            crate::delivery_forge::ObservationCapability::Known(Vec::new()),
+        );
+        let request = publication_adoption_request(
+            HumanRequestId::parse("human-adopt-1").unwrap(),
+            authority.clone(),
+        )
+        .unwrap();
+        request.validate(100).unwrap();
+        let material = HumanAuthorityMaterial::PublicationAdoption {
+            material: authority,
+        };
+        material.validate_for(&request).unwrap();
+
+        let changed = publication_authority(
+            SelectedPublicationResource::Branch {
+                head: "head-1".into(),
+            },
+            crate::delivery_forge::ObservationCapability::Known(Vec::new()),
+        );
+        assert!(changed.review_bundle().is_err());
+    }
+
+    #[test]
+    fn publication_adoption_rejects_unknown_or_incomplete_remote_evidence() {
+        let unknown = publication_authority(
+            SelectedPublicationResource::Branch {
+                head: "head-2".into(),
+            },
+            crate::delivery_forge::ObservationCapability::Unknown,
+        );
+        assert!(unknown.review_bundle().is_err());
+
+        let pull = crate::delivery_forge::ObservedPullRequest {
+            number: 7,
+            node_id: "PR_node_7".into(),
+            url: "https://example.invalid/owner/repo/pull/7".into(),
+            state: "open".into(),
+            merged: false,
+            merged_at: None,
+            source_branch: "feature/example".into(),
+            source_head: "head-2".into(),
+            base_branch: "main".into(),
+            base_sha: "base-1".into(),
+            title: "change".into(),
+            body: None,
+            timeline: crate::delivery_forge::ObservationCapability::Unknown,
+        };
+        let incomplete = publication_authority(
+            SelectedPublicationResource::PullRequest {
+                number: 7,
+                node_id: "PR_node_7".into(),
+                head_sha: "head-2".into(),
+                base_sha: "base-1".into(),
+            },
+            crate::delivery_forge::ObservationCapability::Known(vec![pull]),
+        );
+        assert!(incomplete.review_bundle().is_err());
+    }
+
     #[test]
     fn operation_presentation_uses_ticket_scope_but_keeps_operation_subject_id() {
         let request = sample_request();
@@ -1881,6 +2355,15 @@ mod presenter_tests {
             message_id: "planner-result-1".into(),
             result_digest: Digest::parse("a".repeat(64)).unwrap(),
             result_kind: RoleOutputKind::HumanRequest,
+            assertion: AgentAssertion::Succeeded,
+            human_request: HumanRequestPayload {
+                kind: "clarification".into(),
+                question: "Which option?".into(),
+                choices: vec!["a".into()],
+                evidence_references: Vec::new(),
+                subject_digest: Digest::parse("a".repeat(64)).unwrap(),
+                requested_continuation: None,
+            },
             claimed_artifact_refs: Vec::new(),
         };
         let authority = HumanAuthorityMaterial::PlannerClarification {
@@ -1918,6 +2401,20 @@ mod presenter_tests {
             source.binding.instruction_digest = Digest::parse("1".repeat(64)).unwrap();
         }
         assert!(changed.validate_for(&request).is_err());
+
+        let mut wrong_kind = authority.clone();
+        if let HumanAuthorityMaterial::PlannerClarification { source, .. } = &mut wrong_kind {
+            source.human_request.kind = "goal_completion".into();
+        }
+        assert!(wrong_kind.validate_for(&request).is_err());
+
+        let mut unsuccessful = authority;
+        if let HumanAuthorityMaterial::PlannerClarification { source, .. } = &mut unsuccessful {
+            source.assertion = AgentAssertion::Blocked {
+                reason: "missing information".into(),
+            };
+        }
+        assert!(unsuccessful.validate_for(&request).is_err());
     }
 
     #[test]
