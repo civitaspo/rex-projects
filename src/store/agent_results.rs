@@ -21,7 +21,7 @@ use crate::engine::orchestration::{
 };
 use crate::launch::{AgentLaunchAuthority, ProviderQualification};
 use crate::roles::RoleResultMessage;
-use crate::run_step::{CleanupState, RunDescriptor, TurnOutcome};
+use crate::run_step::{CleanupState, TurnOutcome};
 use crate::run_step_spool::{AgentTurnResult, StartRequestEnvelope};
 use crate::store::ConfigStore;
 
@@ -125,7 +125,7 @@ pub fn record_and_verify_agent_terminal(
     validate_request_authority(&authority, start)?;
     let qualification = load_qualification(&store.connection, &authority)?;
     validate_result_for_start(&authority, start, result, &qualification)?;
-    validate_descriptor_and_projection(&authority, result)?;
+    validate_descriptor_and_projection(&authority, result, &qualification)?;
     let receipt_json = serde_json::to_vec(result).map_err(|error| error.to_string())?;
     if receipt_json.len() > MAX_TERMINAL_BYTES {
         return Err("Agent terminal receipt exceeds its storage limit".into());
@@ -262,7 +262,7 @@ pub fn verify_agent_terminal(
     validate_request_authority(&authority, &start)?;
     let qualification = load_qualification(&store.connection, &authority)?;
     validate_result_for_start(&authority, &start, &result, &qualification)?;
-    validate_descriptor_and_projection(&authority, &result)?;
+    validate_descriptor_and_projection(&authority, &result, &qualification)?;
     let process_tree_json: Option<String> = store
         .connection
         .query_row(
@@ -800,12 +800,39 @@ fn validate_result_for_start(
 fn validate_descriptor_and_projection(
     authority: &AgentLaunchAuthority,
     result: &AgentTurnResult,
+    qualification: &ProviderQualification,
 ) -> Result<(), String> {
-    let bytes = read_regular_file(&authority.descriptor_path, 1_048_576)?;
+    let bytes = read_regular_file(&authority.descriptor_path, 8 * 1024 * 1024)?;
     if digest(&bytes)? != authority.descriptor_digest {
-        return Err("persisted run descriptor digest does not match launch authority".into());
+        return Err("persisted run-step package digest does not match launch authority".into());
     }
-    let descriptor: RunDescriptor = crate::protocol::parse_unique(&bytes)?;
+    let package: crate::run_step_package::RunStepPackage = crate::protocol::parse_unique(&bytes)?;
+    package.validate()?;
+    let descriptor = &package.descriptor;
+    let capability = &descriptor.provider_capability;
+    if package.operation_id != authority.operation_id
+        || package.project_id != authority.project_id
+        || package.controller_generation != authority.controller_generation
+        || package.runtime_binary_digest != authority.runtime_binary_digest
+        || package.qualification_receipt_digest != authority.qualification_receipt_digest
+        || package.rex_server_identity != authority.rex_server_identity
+        || package.rex_window_id != authority.rex_window_id
+        || package.qualification_receipt_digest != qualification.canonical_digest()?
+        || package.profile.adapter != qualification.adapter
+        || package.profile.commit_mode != qualification.commit_mode
+        || capability.adapter != qualification.adapter
+        || capability.executable_path != qualification.executable_path
+        || capability.executable_digest != qualification.executable_digest
+        || capability.version != qualification.provider_version
+        || capability.permission_mode != qualification.permission_mode
+        || capability.invocation_options_digest != qualification.invocation_options_digest
+        || capability.commit_mode != qualification.commit_mode
+        || capability.profile_digest != qualification.profile_digest
+        || capability.receipt_digest != authority.qualification_receipt_digest
+        || capability.status != crate::run_step::ProviderQualificationStatus::Verified
+    {
+        return Err("run-step package does not match immutable launch authority".into());
+    }
     if descriptor.run_id != authority.agent_run_id
         || descriptor.project_id != authority.project_id
         || descriptor.role != authority.role
@@ -813,13 +840,16 @@ fn validate_descriptor_and_projection(
         || descriptor.attempt != authority.attempt
         || descriptor.run_epoch != authority.run_epoch
         || descriptor.controller_generation != authority.controller_generation
+        || descriptor.workspace != authority.workspace_path
+        || descriptor.control_dir != authority.control_dir
+        || descriptor.wake_snapshot_digest != authority.wake_snapshot_digest
         || descriptor.profile_digest != authority.profile_digest
         || descriptor.instruction_digest != authority.instruction_digest
         || descriptor.environment_snapshot_id != authority.environment_snapshot_id
         || descriptor.rex_session_id != authority.rex_session_id
         || descriptor.rex_block_id.as_str() != authority.rex_block_id
     {
-        return Err("run descriptor does not match persisted launch authority".into());
+        return Err("run-step package descriptor does not match persisted launch authority".into());
     }
     let expected_projection =
         crate::providers::project_result_schema(&descriptor.result_schema)?.identity;
@@ -1288,6 +1318,129 @@ mod tests {
         }
     }
 
+    fn reviewer_run_step_package(
+        authority: &AgentLaunchAuthority,
+        result_schema: serde_json::Value,
+    ) -> crate::run_step_package::RunStepPackage {
+        use crate::config::Profile;
+        use crate::domain::types::{AgentAdapter, CommitMode};
+        use crate::run_step::{
+            ProviderCapabilityEvidence, ProviderQualificationStatus, RunDescriptor,
+        };
+
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "adapter":"codex", "command":["/bin/codex"], "model":"fixture",
+            "commit_mode":"native", "turn_timeout_seconds":60
+        }))
+        .unwrap();
+        let profile_digest = digest(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let schema_projection = crate::providers::project_result_schema(&result_schema)
+            .unwrap()
+            .identity;
+        crate::run_step_package::RunStepPackage {
+            schema_version: 1,
+            descriptor: RunDescriptor {
+                schema_version: 1,
+                project_id: authority.project_id.clone(),
+                run_id: authority.agent_run_id.clone(),
+                role: authority.role,
+                ticket_run_id: authority.ticket_run_id.clone(),
+                attempt: authority.attempt,
+                run_epoch: authority.run_epoch,
+                controller_generation: authority.controller_generation,
+                workspace: authority.workspace_path.clone(),
+                control_dir: authority.control_dir.clone(),
+                rex_session_id: authority.rex_session_id.clone(),
+                rex_block_id: crate::domain::ids::RexBlockId::parse(authority.rex_block_id.clone())
+                    .unwrap(),
+                profile_digest: profile_digest.clone(),
+                instruction_digest: authority.instruction_digest.clone(),
+                plan_digest: None,
+                environment_snapshot_id: authority.environment_snapshot_id.clone(),
+                wake_snapshot_digest: authority.wake_snapshot_digest.clone(),
+                provider_capability: ProviderCapabilityEvidence {
+                    schema_version: 1,
+                    adapter: AgentAdapter::Codex,
+                    profile_digest,
+                    version: "fixture-1".into(),
+                    executable_path: "/bin/codex".into(),
+                    executable_digest: digest(&[b'c'; 1]).unwrap(),
+                    permission_mode: "workspace_write".into(),
+                    invocation_options_digest: digest(&[b'd'; 1]).unwrap(),
+                    commit_mode: CommitMode::Native,
+                    schema_projection: schema_projection.clone(),
+                    receipt_digest: authority.qualification_receipt_digest.clone(),
+                    status: ProviderQualificationStatus::Verified,
+                },
+                result_schema,
+            },
+            operation_id: authority.operation_id.clone(),
+            project_id: authority.project_id.clone(),
+            controller_generation: authority.controller_generation,
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            rex_cli_path: "/bin/rex".into(),
+            rex_search_path: vec![],
+            rex_endpoint: "http://localhost".into(),
+            rex_server_identity: authority.rex_server_identity.clone(),
+            rex_window_id: authority.rex_window_id.clone(),
+            profile,
+            role_contract: "reviewer contract".into(),
+            prompt: "review this publication".into(),
+            continuation: None,
+            shutdown_grace_seconds: 5,
+            start_ack_timeout_seconds: 5,
+        }
+    }
+
+    fn reviewer_qualification(authority: &AgentLaunchAuthority) -> ProviderQualification {
+        use crate::domain::types::{AgentAdapter, CommitMode};
+        use crate::launch::{ProviderQualification, QualificationProof, QualificationStatus};
+
+        let markers = [
+            "REX_PROJECTS_AGENT",
+            "REX_PROJECTS_CONTEXT",
+            "REX_PROJECTS_PROJECT_ID",
+            "REX_PROJECTS_ROLE",
+            "REX_PROJECTS_RUN_ID",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+        ProviderQualification {
+            schema_version: 1,
+            project_id: authority.project_id.clone(),
+            profile_id: authority.profile_id.clone(),
+            profile_digest: authority.profile_digest.clone(),
+            adapter: AgentAdapter::Codex,
+            executable_path: "/bin/codex".into(),
+            executable_digest: digest(&[b'c'; 1]).unwrap(),
+            provider_version: "fixture-1".into(),
+            permission_mode: "workspace_write".into(),
+            invocation_options_digest: digest(&[b'd'; 1]).unwrap(),
+            commit_mode: CommitMode::Native,
+            proof: QualificationProof {
+                schema_version: 1,
+                probe_id: "probe-a".into(),
+                fixture_digest: digest(&[b'e'; 1]).unwrap(),
+                rex_instance_id: "rex-fixture".into(),
+                tool_shell_marker_digest: digest(&[b'f'; 1]).unwrap(),
+                tool_shell_markers_present: markers.clone(),
+                descendant_marker_digest: digest(&[b'1'; 1]).unwrap(),
+                descendant_markers_present: markers,
+                automatic_turn_result_digest: digest(&[b'2'; 1]).unwrap(),
+                automatic_turn_completed: true,
+                structured_result_valid: true,
+                observed_permission_mode: "workspace_write".into(),
+                permission_prompt_count: 0,
+                cleanup_process_tree_digest: digest(&[b'3'; 1]).unwrap(),
+                process_tree_absent: true,
+                cleanup_confirmed: true,
+            },
+            status: QualificationStatus::Verified,
+        }
+    }
+
     #[test]
     fn coordinator_result_wake_resolves_only_its_bound_parent_session() {
         let mut connection = rusqlite::Connection::open_in_memory().unwrap();
@@ -1353,6 +1506,102 @@ mod tests {
             "other-token"
         ));
         assert!(!process_tree_contains_root(&[process], 43, "birth-token"));
+    }
+
+    #[test]
+    fn terminal_descriptor_validation_accepts_published_run_step_package() {
+        use crate::domain::types::AgentAdapter;
+        use crate::run_step::{CleanupState, RunReceipt, TurnOutcome};
+
+        let temp = tempfile::tempdir().unwrap();
+        let temp_path = std::fs::canonicalize(temp.path()).unwrap();
+        let mut authority = test_authority();
+        authority.role = Role::Reviewer;
+        authority.role_session_id = "ticket_run:ticket-run:reviewer".into();
+        authority.descriptor_path = temp_path.join("run-step-package.json");
+        authority.workspace_path = temp_path.join("workspace");
+        authority.control_dir = temp_path.join("control");
+        std::fs::create_dir(&authority.workspace_path).unwrap();
+        std::fs::create_dir(&authority.control_dir).unwrap();
+        let schema: serde_json::Value = crate::protocol::parse_unique(include_bytes!(
+            "../../schemas/agent-results/reviewer-v1.json"
+        ))
+        .unwrap();
+        let package = reviewer_run_step_package(&authority, schema.clone());
+        authority.result_schema_digest = crate::providers::project_result_schema(&schema)
+            .unwrap()
+            .identity
+            .source_schema_digest;
+        authority.profile_digest = package.descriptor.profile_digest.clone();
+        let qualification = reviewer_qualification(&authority);
+        authority.qualification_receipt_digest = qualification.canonical_digest().unwrap();
+        let package = reviewer_run_step_package(&authority, schema.clone());
+        authority.descriptor_digest = package.publish_once(&authority.descriptor_path).unwrap();
+        let projection = crate::providers::project_result_schema(&schema)
+            .unwrap()
+            .identity;
+        let result = AgentTurnResult {
+            schema_version: 1,
+            start_request_digest: "a".repeat(64),
+            receipt: RunReceipt {
+                run_id: authority.agent_run_id.clone(),
+                attempt: authority.attempt,
+                provider: AgentAdapter::Codex,
+                effective_permission_mode: "workspace_write".into(),
+                conversation_id: None,
+                provider_version: Some("fixture-1".into()),
+                capability_receipt_digest: Some(authority.qualification_receipt_digest.clone()),
+                schema_projection: projection,
+                launch_pid_hint: None,
+                exit_code: Some(0),
+                timed_out: false,
+                cancellation_signal: None,
+                cleanup: CleanupState::Confirmed,
+                cleanup_detail: None,
+                processes: vec![],
+                result_digest: None,
+                outcome: TurnOutcome::Completed,
+            },
+            structured_result: Some(serde_json::json!({})),
+            result_digest: "b".repeat(64),
+        };
+        validate_descriptor_and_projection(&authority, &result, &qualification).unwrap();
+
+        let mut wrong_generation = package;
+        wrong_generation.runtime_binary_digest = digest(&[b'z'; 1]).unwrap();
+        let wrong_path = temp_path.join("wrong-package.json");
+        authority.descriptor_path = wrong_path.clone();
+        authority.descriptor_digest = wrong_generation.publish_once(&wrong_path).unwrap();
+        assert!(
+            validate_descriptor_and_projection(&authority, &result, &qualification)
+                .unwrap_err()
+                .contains("package does not match")
+        );
+
+        let mut wrong_revision = reviewer_run_step_package(&authority, schema.clone());
+        wrong_revision.descriptor.attempt += 1;
+        let wrong_path = temp_path.join("wrong-revision-package.json");
+        authority.descriptor_path = wrong_path.clone();
+        authority.descriptor_digest = wrong_revision.publish_once(&wrong_path).unwrap();
+        assert!(
+            validate_descriptor_and_projection(&authority, &result, &qualification)
+                .unwrap_err()
+                .contains("descriptor does not match")
+        );
+
+        authority.descriptor_path = temp_path.join("run-step-package.json");
+        authority.descriptor_digest =
+            digest(&std::fs::read(&authority.descriptor_path).unwrap()).unwrap();
+        let mut wrong_projection = result;
+        wrong_projection
+            .receipt
+            .schema_projection
+            .source_schema_digest = digest(&[b'z'; 1]).unwrap();
+        assert!(
+            validate_descriptor_and_projection(&authority, &wrong_projection, &qualification)
+                .unwrap_err()
+                .contains("schema projection")
+        );
     }
 
     #[test]
