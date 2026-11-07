@@ -353,7 +353,7 @@ impl ConfigStore {
                 .ok_or("unresolved publication record has no observation digest")?
                 .to_owned(),
         )?;
-        let facts = evidence["facts"]["facts"].clone();
+        let facts = evidence["facts"].clone();
         if facts["resource"] != serde_json::to_value(resource).map_err(|error| error.to_string())?
             || facts["observation_digest"] != observation_digest.as_str()
         {
@@ -548,17 +548,21 @@ impl ConfigStore {
             return Err("publication adoption configuration is no longer current".into());
         }
 
-        let existing: Option<(String, u64, String)> = tx
+        let existing: Option<(String, String, u64, String)> = tx
             .query_row(
-                "SELECT base_branch,revision,current_digest FROM publication_baselines WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4",
+                "SELECT base_branch,configuration_digest,revision,current_digest FROM publication_baselines WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4",
                 params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some((stored_base, baseline_revision, baseline_digest)) = existing {
-            if stored_base != base_branch {
-                return Err("publication baseline base branch changed since capture".into());
+        if let Some((stored_base, stored_configuration, baseline_revision, baseline_digest)) =
+            existing
+        {
+            if stored_base != base_branch || stored_configuration != configuration_digest.as_str() {
+                return Err(
+                    "publication baseline repository configuration changed since capture".into(),
+                );
             }
             let next_revision = baseline_revision
                 .checked_add(1)
@@ -576,8 +580,8 @@ impl ConfigStore {
             // This is the first trusted snapshot. The human-approved observation becomes both the
             // initial and current state; it is never claimed as a pre-execution baseline.
             tx.execute(
-                "INSERT INTO publication_baselines(project_id,ticket_run_id,repository_id,branch,base_branch,initial_snapshot_json,initial_digest,current_snapshot_json,current_digest,revision,last_effect_operation_id,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?7,1,NULL,?8)",
-                params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch,base_branch,current_json,current_digest,now_unix],
+                "INSERT INTO publication_baselines(project_id,ticket_run_id,repository_id,branch,base_branch,configuration_digest,initial_snapshot_json,initial_digest,current_snapshot_json,current_digest,revision,last_effect_operation_id,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?7,?8,1,NULL,?9)",
+                params![resource.project_id.as_str(),resource.ticket_run_id.as_str(),resource.repository_id.as_str(),resource.branch,base_branch,configuration_digest.as_str(),current_json,current_digest,now_unix],
             )
             .map_err(|error| error.to_string())?;
         }
