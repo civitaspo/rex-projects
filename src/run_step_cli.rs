@@ -369,23 +369,49 @@ fn digest_file(path: &Path) -> Result<Digest, String> {
 }
 
 fn process_start_identity() -> Result<String, String> {
+    observed_process_start_identity(std::process::id())
+        .filter(|identity| !identity.is_empty())
+        .ok_or_else(|| "cannot observe wrapper process start identity".into())
+}
+
+fn observed_process_start_identity(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-        let output = Command::new("ps")
-            .args(["-o", "lstart=", "-p", &std::process::id().to_string()])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err("cannot observe wrapper start identity".into());
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let found = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if found != size {
+            return None;
         }
-        String::from_utf8(output.stdout)
-            .map(|s| s.trim().to_owned())
-            .map_err(|e| e.to_string())
+        let info = unsafe { info.assume_init() };
+        Some(format!(
+            "{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        Err("wrapper start identity is unsupported on this platform".into())
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        Some(
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(19)?
+                .to_owned(),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -399,5 +425,18 @@ fn role_name(role: Role) -> &'static str {
         Role::MergeDecision => "merge_decision",
         Role::Operator => "operator",
         Role::Postmortem => "postmortem",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::observed_process_start_identity;
+
+    #[test]
+    fn current_wrapper_start_identity_is_observable() {
+        assert!(
+            observed_process_start_identity(std::process::id())
+                .is_some_and(|identity| !identity.is_empty())
+        );
     }
 }
