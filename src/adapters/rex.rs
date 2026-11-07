@@ -50,6 +50,16 @@ pub struct OwnedBlock {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RexContextBlock {
+    pub server_instance_id: String,
+    pub session_id: String,
+    pub window_id: String,
+    pub block_id: String,
+    pub label: String,
+    pub flavor: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowBlock {
     pub block_id: String,
     pub label: String,
@@ -379,6 +389,32 @@ impl RexCliTransport {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Confirms the active Rex context block exists exactly once in the explicitly bound
+    /// server and session.
+    pub fn validate_context_block(&self, block_id: &str) -> Result<RexContextBlock, RexError> {
+        if block_id.is_empty() || block_id.len() > 512 || block_id.chars().any(char::is_control) {
+            return Err(RexError::Invalid(
+                "Rex context block ID is malformed".into(),
+            ));
+        }
+        self.verify_identity()?;
+        let view = self.session_view()?;
+        let blocks = context_blocks(&view, block_id)?;
+        self.verify_identity()?;
+        if blocks.len() != 1 {
+            return Err(RexError::Uncertain);
+        }
+        let (window_id, label, flavor) = blocks.into_iter().next().expect("one block checked");
+        Ok(RexContextBlock {
+            server_instance_id: self.capabilities.server_instance_id.clone(),
+            session_id: self.session_id.clone(),
+            window_id,
+            block_id: block_id.to_owned(),
+            label,
+            flavor,
+        })
     }
 
     pub fn find_or_create_ticket_window(
@@ -1038,6 +1074,36 @@ fn blocks_in_window(
         }
     }
     Ok(result)
+}
+
+fn context_blocks(view: &Value, wanted: &str) -> Result<Vec<(String, String, String)>, RexError> {
+    let windows = view
+        .get("windows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RexError::Protocol("session view has no windows array".into()))?;
+    let mut found = Vec::new();
+    for window in windows {
+        let window_id = required_string(window, "window_id")?.to_owned();
+        let layers = window
+            .get("layers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("window has no layers array".into()))?;
+        for layer in layers {
+            let Some(blocks) = layer.get("blocks").and_then(Value::as_array) else {
+                continue;
+            };
+            for block in blocks {
+                if block.get("block_id").and_then(Value::as_str) == Some(wanted) {
+                    found.push((
+                        window_id.clone(),
+                        required_string(block, "label")?.to_owned(),
+                        required_string(block, "flavor")?.to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn all_blocks_in_window(view: &Value, window_id: &str) -> Result<Vec<WindowBlock>, RexError> {

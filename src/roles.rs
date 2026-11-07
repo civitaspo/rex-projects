@@ -795,6 +795,10 @@ fn builtin_contract(role: Role) -> &'static str {
     }
 }
 
+pub fn builtin_role_contract(role: Role) -> &'static str {
+    builtin_contract(role)
+}
+
 pub fn allowed_output_kinds(role: Role) -> Vec<RoleOutputKind> {
     allowed_role_output_kinds(role)
 }

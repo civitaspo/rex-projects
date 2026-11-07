@@ -191,6 +191,48 @@ impl EnvironmentHandoff {
         self.consumed = true;
         result
     }
+
+    /// Consume a one-use handoff from the finite-turn wrapper, bound to the exact snapshot and
+    /// launch operation stored in the immutable run package.
+    pub fn consume_file(
+        path: &Path,
+        expected_snapshot: &Digest,
+        expected_operation: &str,
+    ) -> Result<BTreeMap<OsString, OsString>, EnvironmentError> {
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_none_or(|name| !name.ends_with(".env"))
+            || !has_private_parent(path)
+        {
+            return Err(EnvironmentError::Handoff);
+        }
+        let claim_path = path.with_extension("env.claim");
+        let claim = private_create_new(&claim_path)?;
+        drop(claim);
+        let result = (|| {
+            let bytes = read_handoff_bytes(path)?;
+            let frame = bytes
+                .strip_prefix(HANDOFF_MAGIC)
+                .ok_or(EnvironmentError::Handoff)?;
+            let (snapshot, rest) =
+                take_nul_terminated(frame).map_err(|_| EnvironmentError::Handoff)?;
+            let (operation, rest) =
+                take_nul_terminated(rest).map_err(|_| EnvironmentError::Handoff)?;
+            let (nonce, _) = take_nul_terminated(rest).map_err(|_| EnvironmentError::Handoff)?;
+            if snapshot != expected_snapshot.as_str().as_bytes()
+                || operation != expected_operation.as_bytes()
+            {
+                return Err(EnvironmentError::Handoff);
+            }
+            let nonce = std::str::from_utf8(nonce).map_err(|_| EnvironmentError::Handoff)?;
+            let nonce = Digest::parse(nonce.to_owned()).map_err(|_| EnvironmentError::Handoff)?;
+            read_handoff(path, expected_snapshot, expected_operation, &nonce)
+        })();
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(claim_path);
+        result
+    }
 }
 
 impl std::fmt::Debug for EnvironmentHandoff {
@@ -761,6 +803,33 @@ fn read_handoff(
     }
     validate_variables(&variables).map_err(|_| EnvironmentError::Handoff)?;
     Ok(variables)
+}
+
+fn read_handoff_bytes(path: &Path) -> Result<Vec<u8>, EnvironmentError> {
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|_| EnvironmentError::Handoff)?;
+    let metadata = file.metadata().map_err(|_| EnvironmentError::Handoff)?;
+    if !metadata.is_file() || metadata.len() as usize > MAX_ENVIRONMENT_BYTES + 512 {
+        return Err(EnvironmentError::Handoff);
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(EnvironmentError::Handoff);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_ENVIRONMENT_BYTES + 513) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| EnvironmentError::Handoff)?;
+    if bytes.len() > MAX_ENVIRONMENT_BYTES + 512 {
+        return Err(EnvironmentError::Handoff);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

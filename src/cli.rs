@@ -169,6 +169,14 @@ enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
+    RunStep {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long)]
+        environment_handoff: PathBuf,
+    },
     Submit {
         #[arg(long, env = "REX_PROJECTS_CONTROL_DIR")]
         control_dir: PathBuf,
@@ -1271,6 +1279,23 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
     use crate::protocol::RequestEnvelope;
     use serde_json::Value;
     match command {
+        AgentCommand::RunStep {
+            run,
+            package,
+            environment_handoff,
+        } => {
+            let result = crate::run_step_cli::run_step(&run, &package, &environment_handoff)
+                .map_err(CliError::unavailable)?;
+            if json {
+                print_json(&serde_json::json!({
+                    "run_id": result.run_id,
+                    "result_digest": result.result_digest,
+                }))
+            } else {
+                println!("Completed finite Agent turn {}.", result.run_id);
+                Ok(())
+            }
+        }
         AgentCommand::Submit {
             control_dir,
             run_id,

@@ -22,6 +22,120 @@ pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_DATABASE_SCHEMA_VERSION: i64 = 7;
 
+/// Minimal durable StartAgent intent. Handlers resolve authority from controller-owned state.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartAgentEffectPayload {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub launch_reservation_digest: ContentDigest,
+}
+
+impl StartAgentEffectPayload {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != LAUNCH_SCHEMA_VERSION {
+            return Err("unsupported StartAgent effect payload schema".into());
+        }
+        Ok(())
+    }
+}
+
+/// Host-owned phase-one launch identity. Rex block identity is bound only after it is observed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLaunchReservation {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub project_id: ProjectId,
+    pub role: Role,
+    pub role_session_id: String,
+    pub parent_run_id: Option<AgentRunId>,
+    pub parent_role: Option<Role>,
+    pub ticket_run_id: Option<TicketRunId>,
+    pub ticket_revision: Option<Revision>,
+    pub config_revision: Revision,
+    pub config_digest: ContentDigest,
+    pub attempt: u32,
+    pub run_epoch: u64,
+    pub controller_generation: u64,
+    pub project_epoch: u64,
+    pub operation_id: OperationId,
+    pub operation_recipe_id: Option<String>,
+    pub rex_view_id: ContentDigest,
+    pub runtime_binary_digest: ContentDigest,
+    pub environment_snapshot_id: ContentDigest,
+    pub profile_id: ProfileId,
+    pub profile_digest: ContentDigest,
+    pub instruction_digest: ContentDigest,
+    pub result_schema_digest: ContentDigest,
+    pub wake_snapshot: crate::agent_api::AgentWakeSnapshot,
+    pub qualification_receipt_digest: ContentDigest,
+    pub descriptor_path: PathBuf,
+    pub workspace_path: PathBuf,
+    pub control_dir: PathBuf,
+    pub mailbox_directory: PathBuf,
+    pub mailbox_capability_digest: ContentDigest,
+    pub mailbox_expires_at_unix: u64,
+    pub mailbox_max_request_bytes: u64,
+    pub mailbox_max_pending_requests: u32,
+    pub pool: String,
+    pub slot_index: u32,
+    pub global_capacity: u32,
+    pub project_capacity: u32,
+}
+
+impl AgentLaunchReservation {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != LAUNCH_SCHEMA_VERSION
+            || self.attempt == 0
+            || self.run_epoch == 0
+            || self.controller_generation == 0
+            || self.project_epoch == 0
+            || self.mailbox_expires_at_unix == 0
+            || self.mailbox_max_request_bytes == 0
+            || self.mailbox_max_pending_requests == 0
+            || self.global_capacity == 0
+            || self.project_capacity == 0
+            || !matches!(self.pool.as_str(), "agent" | "rex_projects_hook")
+        {
+            return Err("Agent launch reservation has an invalid schema, counter, or limit".into());
+        }
+        if self.parent_run_id.is_some() != self.parent_role.is_some() {
+            return Err("reservation parent AgentRun ID and role must be present together".into());
+        }
+        if self.role == Role::Supervisor {
+            if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {
+                return Err("Project Supervisor reservation cannot have a TicketRun".into());
+            }
+        } else if self.ticket_run_id.is_none() || self.ticket_revision.is_none() {
+            return Err("ticket role reservation requires a TicketRun and revision".into());
+        }
+        for path in [
+            &self.descriptor_path,
+            &self.workspace_path,
+            &self.control_dir,
+            &self.mailbox_directory,
+        ] {
+            if !path.is_absolute() {
+                return Err("reservation paths must be absolute".into());
+            }
+        }
+        if self.wake_snapshot.project_id != self.project_id
+            || self.wake_snapshot.agent_run_id != self.agent_run_id.as_str()
+            || self.wake_snapshot.role_session_id != self.role_session_id
+        {
+            return Err("wake snapshot scope does not match launch reservation".into());
+        }
+        self.wake_snapshot.validate()
+    }
+
+    pub fn digest(&self) -> Result<ContentDigest, String> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        ContentDigest::parse(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RexViewKind {
@@ -606,6 +720,7 @@ pub struct AgentLaunchAuthority {
     pub profile_digest: ContentDigest,
     pub instruction_digest: ContentDigest,
     pub result_schema_digest: ContentDigest,
+    pub wake_snapshot_digest: ContentDigest,
     pub qualification_receipt_digest: ContentDigest,
     pub rex_server_identity: String,
     pub rex_session_id: String,

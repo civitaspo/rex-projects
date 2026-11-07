@@ -10,6 +10,7 @@ use crate::launch::{AgentLaunchReservation, StartAgentEffectPayload};
 use crate::store::{EffectIntent, insert_effect, now_unix, validate_active_generation};
 
 const MAX_WAKE_SNAPSHOT_ITEMS: usize = 256;
+const MAX_PROFILE_QUALIFICATION_CANDIDATES: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +30,104 @@ pub enum LaunchPreparationOutcome {
 }
 
 impl ConfigStore {
+    /// Suggest the first currently free agent slot without claiming it. The launch
+    /// reservation transaction remains authoritative and rechecks the slot atomically.
+    pub fn available_execution_slot(
+        &self,
+        project_id: &ProjectId,
+        pool: &str,
+        global_capacity: u32,
+        project_capacity: u32,
+    ) -> Result<Option<u32>, String> {
+        if pool.trim().is_empty() || global_capacity == 0 || project_capacity == 0 {
+            return Err("execution slot query requires positive capacities and a pool".into());
+        }
+        let global_used: u32 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM execution_slots WHERE pool=?1 AND disposition!='released'",
+                [pool],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let project_used: u32 = self.connection.query_row(
+            "SELECT COUNT(*) FROM execution_slots WHERE project_id=?1 AND disposition!='released'",
+            [project_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if global_used >= global_capacity || project_used >= project_capacity {
+            return Ok(None);
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT slot_index FROM execution_slots WHERE pool=?1 AND disposition!='released'",
+            )
+            .map_err(|error| error.to_string())?;
+        let used = statement
+            .query_map([pool], |row| row.get::<_, u32>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok((0..global_capacity).find(|slot| !used.contains(slot)))
+    }
+
+    /// Return bounded verified provider qualifications for one exact applied profile.
+    /// Callers must still compare the executable and invocation identity to the live profile.
+    pub fn verified_provider_qualifications(
+        &self,
+        project_id: &ProjectId,
+        profile_id: &crate::domain::ids::ProfileId,
+        profile_digest: &Digest,
+        limit: usize,
+    ) -> Result<Vec<crate::launch::ProviderQualification>, String> {
+        if limit == 0 || limit > MAX_PROFILE_QUALIFICATION_CANDIDATES {
+            return Err(format!(
+                "qualification candidate limit must be between 1 and {MAX_PROFILE_QUALIFICATION_CANDIDATES}"
+            ));
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT receipt_digest,receipt_json FROM provider_qualifications \
+             WHERE project_id=?1 AND profile_id=?2 AND profile_digest=?3 AND status='verified' \
+             ORDER BY created_at_unix DESC,receipt_digest ASC LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    project_id.as_str(),
+                    profile_id.as_str(),
+                    profile_digest.as_str(),
+                    limit as u64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut qualifications = Vec::new();
+        for row in rows {
+            let (stored_digest, json) = row.map_err(|error| error.to_string())?;
+            let qualification: crate::launch::ProviderQualification =
+                crate::protocol::parse_unique(json.as_bytes()).map_err(|error| {
+                    format!("stored provider qualification is invalid: {error}")
+                })?;
+            if qualification.canonical_digest()?.as_str() != stored_digest
+                || qualification.project_id != *project_id
+                || qualification.profile_id != *profile_id
+                || qualification.profile_digest != *profile_digest
+                || qualification.status != crate::launch::QualificationStatus::Verified
+            {
+                return Err(
+                    "provider qualification row does not match its exact query scope".into(),
+                );
+            }
+            qualification.validate_for_unattended_launch()?;
+            qualifications.push(qualification);
+        }
+        Ok(qualifications)
+    }
+
     /// Load the exact host-owned phase-one reservation for a claimed StartAgent effect.
     /// The digest is checked again so a caller cannot substitute a serialized reservation.
     pub fn agent_launch_reservation(
@@ -782,6 +881,25 @@ mod tests {
         let q_digest = store
             .store_provider_qualification(generation, &qualification)
             .unwrap();
+        let qualifications = store
+            .verified_provider_qualifications(
+                &project,
+                &qualification.profile_id,
+                &qualification.profile_digest,
+                4,
+            )
+            .unwrap();
+        assert_eq!(qualifications, vec![qualification.clone()]);
+        assert!(
+            store
+                .verified_provider_qualifications(
+                    &project,
+                    &qualification.profile_id,
+                    &qualification.profile_digest,
+                    MAX_PROFILE_QUALIFICATION_CANDIDATES + 1,
+                )
+                .is_err()
+        );
         store.connection.execute(
             "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'project:project-a:supervisor','test','event-1',1,10,'{\"kind\":\"start\"}','pending',1)",
             [project.as_str()],
