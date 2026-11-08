@@ -629,16 +629,26 @@ fn project_list(
     explicit_state_root: Option<&Path>,
     json: bool,
 ) -> Result<(), CliError> {
-    let state_root = selected_state_root(config_path, explicit_state_root)?;
-    let status = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
+    let (_, configured) = load_config(config_path)?;
+    let state_root =
+        config::state_root(&configured.config, explicit_state_root).map_err(CliError::usage)?;
+    let (effective, snapshot_source, applied_revision) =
+        read_effective_snapshot(config_path, explicit_state_root, configured)?;
+    let database = state_root.join("state.sqlite3");
+    let status = match std::fs::symlink_metadata(&database) {
+        Ok(_) => Some(ConfigStore::status(&state_root).map_err(CliError::unavailable)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(CliError::unavailable(error.to_string())),
+    };
     #[derive(Serialize)]
     struct ProjectEntry {
         id: String,
         mode: String,
-        desired_lifecycle: String,
-        observed_lifecycle: String,
-        project_epoch: u64,
-        next_due_at_unix: i64,
+        runtime_observation: &'static str,
+        desired_lifecycle: Option<String>,
+        observed_lifecycle: Option<String>,
+        project_epoch: Option<u64>,
+        next_due_at_unix: Option<i64>,
         last_error: Option<String>,
     }
     #[derive(Serialize)]
@@ -646,41 +656,58 @@ fn project_list(
         schema_version: u32,
         source: &'static str,
         freshness: &'static str,
-        observed_at_unix: i64,
+        applied_revision: Option<u64>,
+        observed_at_unix: Option<i64>,
         external_services_queried: bool,
         projects: Vec<ProjectEntry>,
     }
     let report = ProjectListReport {
         schema_version: 1,
-        source: "local_state_snapshot",
-        freshness: "local_snapshot",
-        observed_at_unix: status.observed_at_unix,
+        source: snapshot_source,
+        freshness: if status.is_some() {
+            "local_snapshot"
+        } else {
+            "configuration_only"
+        },
+        applied_revision,
+        observed_at_unix: status.as_ref().map(|status| status.observed_at_unix),
         external_services_queried: false,
-        projects: status
+        projects: effective
+            .config
             .projects
             .iter()
-            .map(|project| ProjectEntry {
-                id: project.id.to_string(),
-                mode: project.mode.clone(),
-                desired_lifecycle: project.desired_lifecycle.clone(),
-                observed_lifecycle: project.observed_lifecycle.clone(),
-                project_epoch: project.project_epoch,
-                next_due_at_unix: project.next_due_at_unix,
-                last_error: project.last_error.clone(),
+            .map(|(id, config)| {
+                let runtime = status
+                    .as_ref()
+                    .and_then(|status| status.projects.iter().find(|project| project.id == *id));
+                ProjectEntry {
+                    id: id.to_string(),
+                    mode: match config.mode {
+                        crate::domain::types::ProjectMode::Goal => "goal".into(),
+                        crate::domain::types::ProjectMode::Operations => "operations".into(),
+                    },
+                    runtime_observation: if runtime.is_some() {
+                        "observed"
+                    } else {
+                        "not_observed"
+                    },
+                    desired_lifecycle: runtime.map(|project| project.desired_lifecycle.clone()),
+                    observed_lifecycle: runtime.map(|project| project.observed_lifecycle.clone()),
+                    project_epoch: runtime.map(|project| project.project_epoch),
+                    next_due_at_unix: runtime.map(|project| project.next_due_at_unix),
+                    last_error: runtime.and_then(|project| project.last_error.clone()),
+                }
             })
             .collect(),
     };
     if json {
         print_json(&report)
     } else {
-        println!(
-            "Projects from local snapshot observed at Unix {} (external services not queried):",
-            report.observed_at_unix
-        );
-        for project in &status.projects {
+        println!("Projects (external services not queried):");
+        for project in &report.projects {
             println!(
-                "{} [{}] desired={} observed={}",
-                project.id, project.mode, project.desired_lifecycle, project.observed_lifecycle
+                "{} [{}] runtime={}",
+                project.id, project.mode, project.runtime_observation
             );
         }
         Ok(())

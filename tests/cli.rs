@@ -536,19 +536,32 @@ fn config_validation_works_without_creating_state() {
 #[test]
 fn project_list_reports_local_snapshot_and_does_not_initialize_missing_state() {
     let temp = tempfile::tempdir().unwrap();
-    let (config, state, home) = projection_fixture(&temp);
+    let (config, state, home) = fixture(&temp);
     let output = command(&config, &state, &home)
         .args(["--json", "project", "list"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(5));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["source"], "configured_snapshot");
+    assert_eq!(report["freshness"], "configuration_only");
+    assert_eq!(report["applied_revision"], serde_json::Value::Null);
+    let projects = report["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 2);
+    assert_eq!(projects[0]["runtime_observation"], "not_observed");
+    assert_eq!(projects[0]["desired_lifecycle"], serde_json::Value::Null);
+    assert_eq!(projects[0]["project_epoch"], serde_json::Value::Null);
     assert!(!state.exists());
 }
 
 #[test]
 fn project_list_identifies_applied_data_as_a_local_snapshot() {
     let temp = tempfile::tempdir().unwrap();
-    let (config, state, home) = projection_fixture(&temp);
+    let (config, state, home) = fixture(&temp);
     let applied = command(&config, &state, &home)
         .args(["config", "apply", "--bootstrap"])
         .output()
@@ -569,9 +582,50 @@ fn project_list_identifies_applied_data_as_a_local_snapshot() {
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["freshness"], "local_snapshot");
-    assert_eq!(report["source"], "local_state_snapshot");
+    assert_eq!(report["source"], "applied_snapshot");
     assert_eq!(report["external_services_queried"], false);
+    assert_eq!(
+        report["projects"].as_array().unwrap().len(),
+        2,
+        "{report:#}"
+    );
     assert!(report["observed_at_unix"].as_i64().unwrap() > 0);
+}
+
+#[test]
+fn project_list_uses_applied_projects_when_current_configuration_differs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let applied = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(applied.status.success());
+
+    let current = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, current.replace("goal_project", "local_project")).unwrap();
+
+    let output = command(&config, &state, &home)
+        .args(["--json", "project", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["source"], "applied_snapshot");
+    assert_eq!(
+        report["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|project| project["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["goal_project", "operations_project"]
+    );
+    assert_eq!(report["projects"][0]["runtime_observation"], "observed");
 }
 
 #[test]
@@ -785,9 +839,29 @@ fn controller_once_publishes_local_project_status_then_releases_ownership() {
         .unwrap();
     assert!(status.status.success());
     let report: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let status_projects = report["projects"].as_array().unwrap().clone();
     assert_eq!(report["owner"]["active"], false);
     assert_eq!(report["freshness"], "local_snapshot");
     assert_eq!(report["projects"].as_array().unwrap().len(), 2);
+
+    let listed = command(&config, &state, &home)
+        .args(["--json", "project", "list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["source"], "applied_snapshot");
+    assert_eq!(listed["projects"].as_array().unwrap().len(), 2);
+    for project in listed["projects"].as_array().unwrap() {
+        let status = status_projects
+            .iter()
+            .find(|status| status["id"] == project["id"])
+            .unwrap();
+        assert_eq!(project["runtime_observation"], "observed");
+        assert_eq!(project["desired_lifecycle"], status["desired_lifecycle"]);
+        assert_eq!(project["observed_lifecycle"], status["observed_lifecycle"]);
+        assert_eq!(project["project_epoch"], status["project_epoch"]);
+    }
 }
 
 #[cfg(unix)]
