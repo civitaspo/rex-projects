@@ -182,7 +182,7 @@ impl crate::store::ConfigStore {
             |row| row.get(0),
         ).map_err(|error| error.to_string())?;
         if !active_block {
-            return Err("mailbox run has no exact active Rex block binding".into());
+            return Ok(false);
         }
         let wake_context: Option<(String, String)> = self
             .connection

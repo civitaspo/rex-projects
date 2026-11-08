@@ -1748,10 +1748,34 @@ mod tests {
                 [reservation.agent_run_id.as_str()],
             )
             .unwrap();
-        std::fs::remove_file(reservation.mailbox_directory.join("descriptor.json")).unwrap();
         let artifact_store =
             crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
         let mut mailbox_cursor = None;
+        store
+            .connection
+            .execute(
+                "UPDATE rex_view_blocks SET lifecycle='unknown' WHERE block_id='block-run-1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut store,
+                generation,
+                crate::store::now_unix().unwrap(),
+                &artifact_store,
+                &mut mailbox_cursor,
+            )
+            .unwrap()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE rex_view_blocks SET lifecycle='active' WHERE block_id='block-run-1'",
+                [],
+            )
+            .unwrap();
+        std::fs::remove_file(reservation.mailbox_directory.join("descriptor.json")).unwrap();
         assert!(
             !crate::runtime_services::process_one_registered_agent_request(
                 &mut store,
