@@ -384,8 +384,15 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
                     )
                 })
                 .unwrap_or_else(|| "missing".into());
+            #[cfg(target_os = "linux")]
+            let fixture_process_diagnostic = linux_fixture_process_diagnostic(
+                std::path::Path::new(env!("CARGO_BIN_EXE_xtask")),
+                &fixture_state,
+            );
+            #[cfg(not(target_os = "linux"))]
+            let fixture_process_diagnostic = "not_applicable".to_owned();
             panic!(
-                "pooled invoke did not settle: fixture_receipt_exists={}, operation_state={:?}, operation_external_reference_present={}, operation_terminal_receipt_present={}, invoke_host_job={invoke_job_diagnostic}",
+                "pooled invoke did not settle: fixture_receipt_exists={}, operation_state={:?}, operation_external_reference_present={}, operation_terminal_receipt_present={}, invoke_host_job={invoke_job_diagnostic}, fixture_process={fixture_process_diagnostic}",
                 fixture_receipt.exists(),
                 operation.state,
                 operation.external_reference.is_some(),
@@ -486,4 +493,90 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
             HostJobState::Succeeded | HostJobState::Failed
         ));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fixture_process_diagnostic(
+    executable: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Duration;
+
+    const MAX_ENTRIES: usize = 8192;
+    const SCAN_BUDGET: Duration = Duration::from_secs(1);
+
+    let started = Instant::now();
+    let expected_executable = std::fs::canonicalize(executable).ok();
+    let expected_state_dir = state_dir.as_os_str().as_bytes();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return "proc_scan_error".into(),
+    };
+    let mut numeric_entries = 0;
+    let mut proc_read_errors = 0;
+    let mut matched = Vec::new();
+    let mut truncated = false;
+
+    for entry in entries {
+        if numeric_entries >= MAX_ENTRIES || started.elapsed() >= SCAN_BUDGET {
+            truncated = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            proc_read_errors += 1;
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        numeric_entries += 1;
+
+        let process_dir = entry.path();
+        let comm = match std::fs::read_to_string(process_dir.join("comm")) {
+            Ok(comm) => comm,
+            Err(_) => {
+                proc_read_errors += 1;
+                continue;
+            }
+        };
+        if comm.trim_end() != "xtask" {
+            continue;
+        }
+        let executable_matches = std::fs::read_link(process_dir.join("exe"))
+            .ok()
+            .zip(expected_executable.as_ref())
+            .is_some_and(|(actual, expected)| actual == *expected);
+        if !executable_matches {
+            continue;
+        }
+        let command_line = match std::fs::read(process_dir.join("cmdline")) {
+            Ok(command_line) => command_line,
+            Err(_) => {
+                proc_read_errors += 1;
+                continue;
+            }
+        };
+        if !command_line
+            .split(|byte| *byte == 0)
+            .any(|argument| argument == expected_state_dir)
+        {
+            continue;
+        }
+        if let Ok(Some(identity)) = rex_projects::process::process_identity_for_pid(pid) {
+            matched.push(format!("pid={pid},birth={}", identity.start_identity));
+        }
+    }
+
+    format!(
+        "proc_numeric_entries={}, matches=[{}], scan_elapsed_ms={}, truncated={}, proc_read_errors={proc_read_errors}",
+        numeric_entries,
+        matched.join(";"),
+        started.elapsed().as_millis(),
+        truncated,
+    )
 }
