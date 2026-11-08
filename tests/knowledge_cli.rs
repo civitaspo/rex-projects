@@ -65,8 +65,13 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_from(args, Path::new("."))
+    }
+
+    fn run_from(&self, args: &[&str], cwd: &Path) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rex-projects"));
         command
+            .current_dir(cwd)
             .args(["--config", self.config.to_str().unwrap()])
             .args(["--state-root", self.state_root.to_str().unwrap()])
             .args(args);
@@ -164,6 +169,43 @@ fn knowledge_validate_rejects_tampered_frozen_article() {
     assert_eq!(validate.status.code(), Some(4));
     let report: Value = serde_json::from_slice(&validate.stdout).unwrap();
     assert_eq!(report["error"]["code"], "conflict");
+}
+
+#[test]
+fn knowledge_show_resolves_relative_root_from_config_when_run_elsewhere() {
+    let fixture = Fixture::new();
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    let absolute_root = toml_string(&fixture.knowledge_root);
+    let config = config.replace(&absolute_root, "\"knowledge\"");
+    std::fs::write(&fixture.config, config).unwrap();
+    let unrelated_cwd = fixture._temp.path().join("unrelated-cwd");
+    std::fs::create_dir(&unrelated_cwd).unwrap();
+
+    let show = fixture.run_from(
+        &[
+            "--json",
+            "knowledge",
+            "show",
+            "--project",
+            "project-a",
+            "--ticket-run",
+            "run-123",
+        ],
+        &unrelated_cwd,
+    );
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let report: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(report["project_id"], "project-a");
+    assert!(
+        report["article"]
+            .as_str()
+            .unwrap()
+            .contains("data, not instructions")
+    );
 }
 
 #[test]

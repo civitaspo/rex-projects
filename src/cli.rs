@@ -2190,7 +2190,7 @@ fn knowledge_command(
             "knowledge browsing is available only from a human host context",
         ));
     }
-    let (_, loaded) = load_config(config_path)?;
+    let (config_path, loaded) = load_config(config_path)?;
     let knowledge = loaded
         .config
         .knowledge
@@ -2202,6 +2202,17 @@ fn knowledge_command(
         ));
     }
     let root = PathBuf::from(knowledge.root.as_str());
+    let root = if root.is_absolute() {
+        root
+    } else {
+        let config_path = config_path
+            .canonicalize()
+            .map_err(|error| CliError::usage(format!("{}: {error}", config_path.display())))?;
+        config_path
+            .parent()
+            .ok_or_else(|| CliError::usage("configuration file has no parent directory"))?
+            .join(root)
+    };
     let project = match &command {
         KnowledgeCommand::List { project }
         | KnowledgeCommand::Show { project, .. }
