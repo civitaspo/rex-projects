@@ -650,9 +650,9 @@ mod tests {
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision};
     use crate::domain::types::Role;
     use crate::launch::{
-        AgentLaunchAuthority, AgentLaunchReservation, AgentStartRequest, ObservedWrapperIdentity,
-        ProviderQualification, QualificationProof, QualificationStatus, RexBlockLifecycle,
-        RexBlockOwnership, RexView, RexViewBlock, RexViewKind,
+        AgentLaunchAuthority, AgentLaunchReservation, AgentStartRequest, ObservedProviderStart,
+        ObservedWrapperIdentity, ProviderQualification, QualificationProof, QualificationStatus,
+        RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind,
     };
     use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
 
@@ -1358,6 +1358,10 @@ mod tests {
             );
         }
         set_project_lifecycle(&store, &project, "running", "running", 1);
+        let receipt = store
+            .authorize_agent_start(generation, &request, &observed)
+            .unwrap();
+        assert_eq!(receipt.decision, crate::launch::LaunchDecision::Accepted);
         assert_eq!(
             store
                 .authorize_agent_start(generation, &request, &observed)
@@ -1365,12 +1369,39 @@ mod tests {
                 .decision,
             crate::launch::LaunchDecision::Accepted
         );
-        assert_eq!(
+        let provider_observation = ObservedProviderStart {
+            agent_run_id: run_id.clone(),
+            operation_id: reservation.operation_id.clone(),
+            provider_pid: 456,
+            provider_start_identity: "provider-start".into(),
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest: digest('a'),
+            process_tree_confirmed: true,
+        };
+        set_project_lifecycle(&store, &project, "paused", "paused", 2);
+        assert!(
             store
                 .authorize_agent_start(generation, &request, &observed)
-                .unwrap()
-                .decision,
-            crate::launch::LaunchDecision::Accepted
+                .unwrap_err()
+                .contains("Project lifecycle or epoch changed")
+        );
+        assert!(
+            store
+                .confirm_provider_started(generation, &provider_observation)
+                .unwrap_err()
+                .contains("Project lifecycle or epoch changed")
+        );
+        let launch_states: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT s.state,r.state FROM agent_launch_state s JOIN agent_runs r USING(agent_run_id) WHERE s.agent_run_id=?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            launch_states,
+            ("awaiting_provider".into(), "launch_pending".into())
         );
         let lifecycle: String = store
             .connection

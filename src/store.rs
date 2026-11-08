@@ -3422,6 +3422,13 @@ impl ConfigStore {
         {
             return Err("Agent launch reservation has not been finalized".into());
         }
+        if let Some((_, project_epoch)) = &reservation_state {
+            agent_runtime::validate_project_launch_epoch(
+                &tx,
+                &authority.project_id,
+                *project_epoch,
+            )?;
+        }
         if reservation_state.is_some() {
             let block_is_active: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2 AND agent_run_id=?3 AND ownership='factory' AND lifecycle='active')",
@@ -3491,13 +3498,6 @@ impl ConfigStore {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(receipt);
         }
-        if let Some((_, project_epoch)) = reservation_state {
-            agent_runtime::validate_project_launch_epoch(
-                &tx,
-                &authority.project_id,
-                project_epoch,
-            )?;
-        }
         let wrapper_json = serde_json::to_string(observed).map_err(|error| error.to_string())?;
         let changed = tx.execute(
             "UPDATE agent_launch_state SET state='awaiting_provider',start_request_id=?2,start_request_digest=?3,wrapper_process_identity_json=?4,launch_receipt_json=?5,last_observed_at_unix=?6,updated_at_unix=?6 WHERE agent_run_id=?1 AND state IN ('block_created','unknown') AND start_request_id IS NULL",
@@ -3540,6 +3540,24 @@ impl ConfigStore {
             return Err(
                 "provider start observation does not match the active launch authority".into(),
             );
+        }
+        let reservation: Option<(String, u64)> = tx
+            .query_row(
+                "SELECT lifecycle,project_epoch FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [observation.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((lifecycle, project_epoch)) = reservation {
+            if lifecycle != "authorized" {
+                return Err("Agent launch reservation has not been finalized".into());
+            }
+            agent_runtime::validate_project_launch_epoch(
+                &tx,
+                &authority.project_id,
+                project_epoch,
+            )?;
         }
         let qualification_json: String = tx
             .query_row(
