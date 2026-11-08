@@ -18,6 +18,17 @@ use crate::domain::types::{Role, TicketStatus};
 use crate::engine::orchestration::WorkNodeId;
 use crate::engine::reducer::{Activity, Input, Phase, TicketRun, bind_effects, reduce};
 
+type TicketScanCursorRow = (
+    Option<String>,
+    u64,
+    u64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    u64,
+);
+
 /// Cursor and timing information for one Project/status scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TicketScanCursor {
@@ -1592,7 +1603,7 @@ impl ConfigStore {
     /// continuation cursor.
     pub fn ticket_scan_cursor(&self, key: &TicketScanKey) -> Result<TicketScanCursor, String> {
         key.validate()?;
-        let row: Option<(Option<String>, u64, u64, i64, Option<i64>, Option<i64>, i64, u64)> = self
+        let row: Option<TicketScanCursorRow> = self
             .connection
             .query_row(
                 "SELECT cursor,scan_generation,page_count,started_at_unix,last_page_at_unix,completed_at_unix,next_due_at_unix,last_served_sequence FROM ticket_scan_cursors WHERE project_id=?1 AND adapter_id=?2 AND namespace=?3 AND scope_digest=?4 AND filter_digest=?5 AND status=?6",

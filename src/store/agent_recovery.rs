@@ -11,6 +11,8 @@ use crate::run_step_spool::BlockLossCleanupSnapshot;
 
 use super::{ConfigStore, validate_active_generation};
 
+type AgentAdoptionLookupRow = (String, u64, u64, String, u64, String, String, String);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoverableAgentRun {
     pub agent_run_id: AgentRunId,
@@ -1450,7 +1452,7 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, evidence.controller_generation)?;
-        let row: Option<(String, u64, u64, String, u64, String, String, String)> = tx
+        let row: Option<AgentAdoptionLookupRow> = tx
             .query_row(
                 "SELECT a.authority_json,r.controller_generation,r.reservation_epoch,r.disposition,
                         r.slot_index,r.pool,r.owner_id,r.owner_kind

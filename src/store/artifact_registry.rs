@@ -20,6 +20,32 @@ use crate::launch::AgentLaunchAuthority;
 use crate::mailbox::{MailboxCapability, MailboxRequest, unix_time_now};
 use crate::protocol::{RequestId, ResponseEnvelope};
 
+type ForeignKeyViolationRow = (String, Option<i64>, String, i64);
+type RegisteredArtifactLookupRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<u64>,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    u64,
+    String,
+);
+
 /// A registration receipt whose private fields can only be created after the host has re-read
 /// and hashed the immutable object named by a durable registry row.
 #[derive(Clone, Debug)]
@@ -136,9 +162,7 @@ pub fn migrate_v12(connection: &Connection) -> Result<(), String> {
     validate_v12_schema(connection)
 }
 
-fn foreign_key_violations(
-    connection: &Connection,
-) -> Result<Vec<(String, Option<i64>, String, i64)>, String> {
+fn foreign_key_violations(connection: &Connection) -> Result<Vec<ForeignKeyViolationRow>, String> {
     let mut statement = connection
         .prepare("PRAGMA foreign_key_check")
         .map_err(|error| error.to_string())?;
@@ -794,7 +818,7 @@ pub(crate) fn lookup_registered_artifact_tx(
     if authority_stored != *authority {
         return Ok(None);
     }
-    let row: Option<(String,String,String,String,String,Option<String>,Option<u64>,u64,String,String,String,String,String,String,String,String,String,i64,String,String,u64,String)> = tx.query_row(
+    let row: Option<RegisteredArtifactLookupRow> = tx.query_row(
         "SELECT artifact_id,project_id,agent_run_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,profile_id,profile_digest,workspace_path,control_dir,authority_digest,message_id,request_digest,kind,schema_version,relative_path,content_digest,byte_count,object_path FROM registered_artifacts WHERE artifact_id=?1",
         [reference.artifact_id.as_str()],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?,r.get(17)?,r.get(18)?,r.get(19)?,r.get(20)?,r.get(21)?)),

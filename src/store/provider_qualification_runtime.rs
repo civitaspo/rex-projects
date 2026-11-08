@@ -10,6 +10,25 @@ use crate::store::{ConfigStore, now_unix, validate_active_generation};
 
 const MAX_PROVIDER_QUALIFICATION_JOBS: usize = 32;
 const MAX_QUALIFICATION_REQUEST_ID_BYTES: usize = 255;
+type ProviderQualificationJobRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+);
 
 /// Exact applied-config identity requested by a human. The CLI cannot select an
 /// executable, profile body, schema, permission mode, or qualification result.
@@ -66,7 +85,7 @@ pub struct ProviderQualificationJob {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QualificationClaim {
     Claimed {
-        job: ProviderQualificationJob,
+        job: Box<ProviderQualificationJob>,
         slot_index: u32,
     },
     CapacityUnavailable,
@@ -304,7 +323,7 @@ impl ConfigStore {
             read_job(&tx, &request_id)?.ok_or("claimed provider qualification job disappeared")?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(QualificationClaim::Claimed {
-            job: claimed,
+            job: Box::new(claimed),
             slot_index,
         })
     }
@@ -542,7 +561,7 @@ fn read_job(
     connection: &Connection,
     request_id: &str,
 ) -> Result<Option<ProviderQualificationJob>, String> {
-    let row: Option<(String, String, String, String, String, u64, String, String, String, u64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> = connection.query_row(
+    let row: Option<ProviderQualificationJobRow> = connection.query_row(
         "SELECT request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,rex_session_id,rex_window_id,rex_block_id,result_json,evidence_digest,created_at_unix,updated_at_unix FROM provider_qualification_jobs WHERE request_id=?1",
         [request_id],
         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?)),

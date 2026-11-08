@@ -2389,14 +2389,6 @@ fn selected_state_root(
     config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)
 }
 
-#[derive(Clone, Debug)]
-struct RexConnectionBinding {
-    endpoint: String,
-    instance_id: String,
-    session_id: Option<String>,
-    block_id: Option<String>,
-}
-
 #[derive(Deserialize)]
 struct RexWhoAmI {
     endpoint: String,
@@ -2406,7 +2398,7 @@ struct RexWhoAmI {
 fn discover_rex_binding(
     configured_binary: &str,
     explicit_server: Option<&str>,
-) -> Result<Option<RexConnectionBinding>, CliError> {
+) -> Result<(), CliError> {
     let session_id = std::env::var("REX_SESSION").ok();
     let block_id = std::env::var("REX_BLOCK").ok();
     if block_id.is_some() && session_id.is_none() {
@@ -2417,7 +2409,7 @@ fn discover_rex_binding(
     // Direct CLI development outside Rex remains supported. A Rex-owned
     // runtime always carries REX_SESSION; an explicit server also opts in.
     if session_id.is_none() && explicit_server.is_none() {
-        return Ok(None);
+        return Ok(());
     }
     let search_path = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
@@ -2477,12 +2469,7 @@ fn discover_rex_binding(
                 .map_err(|_| CliError::unavailable("REX_BLOCK is not present in REX_SESSION"))?;
         }
     }
-    Ok(Some(RexConnectionBinding {
-        endpoint: who.endpoint,
-        instance_id: who.instance_id,
-        session_id,
-        block_id,
-    }))
+    Ok(())
 }
 
 fn run_controller(
@@ -2501,7 +2488,7 @@ fn run_controller(
         config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)?;
     // Resolve and validate Rex before acquiring the machine state lock. The
     // owner projection pins this connection for later dashboard calls.
-    let rex_binding = discover_rex_binding(&loaded.config.runtime.rex_binary, rex_server_override)?;
+    discover_rex_binding(&loaded.config.runtime.rex_binary, rex_server_override)?;
     let mut store = ConfigStore::open(&state_root).map_err(CliError::unavailable)?;
     let current = store
         .current_revision(&config_source)
@@ -2597,7 +2584,6 @@ fn run_controller(
         &projection,
         generation,
         &owner,
-        rex_binding.as_ref(),
         snapshot.revision.0,
         snapshot.config.digest.as_str(),
     )
@@ -2684,7 +2670,6 @@ fn run_controller(
             &projection,
             generation,
             &owner,
-            rex_binding.as_ref(),
             snapshot.revision.0,
             snapshot.config.digest.as_str(),
         )
@@ -2791,7 +2776,6 @@ fn publish_owner_projection(
     path: &Path,
     generation: u64,
     owner: &OwnerMetadata,
-    _rex_binding: Option<&RexConnectionBinding>,
     config_revision: u64,
     config_digest: &str,
 ) -> Result<(), String> {

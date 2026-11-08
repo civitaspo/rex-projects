@@ -18,6 +18,20 @@ use crate::operations::{
 };
 
 pub const OPERATIONS_SCHEMA_VERSION: i64 = 11;
+type InvokingEffectRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+    Option<u64>,
+    String,
+    u32,
+    Option<String>,
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -441,7 +455,7 @@ impl<'a> OperationsStore<'a> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_owner(&tx, owner_generation)?;
-        let effect_row: Option<(String,String,String,String,String,String,String,Option<u64>,Option<u64>,String,u32,Option<String>)> = tx.query_row(
+        let effect_row: Option<InvokingEffectRow> = tx.query_row(
             "SELECT project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,owner_generation,status,attempt_count,receipt_json FROM effects WHERE operation_id=?1",
             [operation_id.as_str()],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?)),

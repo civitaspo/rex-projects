@@ -2196,6 +2196,7 @@ impl ConfigStore {
         Ok(Some(project))
     }
 
+    #[cfg(test)]
     pub(crate) fn record_learning_trial(
         &mut self,
         generation: u64,

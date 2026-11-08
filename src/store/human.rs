@@ -22,6 +22,18 @@ const MAX_PENDING_DECISIONS: usize = 256;
 const MAX_AUTHORITY_JSON_BYTES: usize = 4 * 1_048_576;
 type HumanViewIdentityRow = (String, String, Option<String>, Option<String>, String);
 type HumanRequestSummaryRow = (String, String, String, Option<String>, Option<String>);
+type HumanApprovalStateRow = (
+    String,
+    String,
+    Option<String>,
+    u32,
+    u64,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+type HumanProjectStateRow = (crate::domain::ids::ProjectId, u64, String, Option<u64>);
 
 /// Additive schema fragment called inside the coordinated v12 migration transaction.
 pub(crate) fn migrate_v12_human_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
@@ -642,7 +654,7 @@ impl ConfigStore {
         {
             return Ok(false);
         }
-        let row: Option<(String, String, Option<String>, u32, u64, String, Option<String>, String, String)> = self
+        let row: Option<HumanApprovalStateRow> = self
             .connection
             .query_row(
                 "SELECT project_id,role,ticket_run_id,attempt,run_epoch,message_id,result_digest,result_json,artifact_refs_json FROM agent_result_evidence WHERE agent_run_id=?1 AND message_id=?2 AND outcome='completed'",
@@ -709,7 +721,7 @@ impl ConfigStore {
     pub(crate) fn current_ticket_human_scope(
         &self,
         ticket_run_id: &TicketRunId,
-    ) -> Result<Option<(ProjectId, u64, String, Option<u64>)>, String> {
+    ) -> Result<Option<HumanProjectStateRow>, String> {
         self.connection
             .query_row(
                 "SELECT project_id,revision,internal_phase,required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",

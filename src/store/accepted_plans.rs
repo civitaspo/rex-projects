@@ -13,6 +13,40 @@ use crate::engine::orchestration::{ValidatedPlan, WorkNodeId, WorkPlan};
 use crate::store::{ConfigStore, SucceededEffectReceipt};
 
 const MAX_PLAN_BYTES: usize = 1_048_576;
+type AcceptedPlanRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+type AcceptedEffectRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+    String,
+    String,
+    String,
+);
+type AcceptedPlanIdentityRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 pub(crate) fn coordinator_role_session_id(
     ticket_run_id: &TicketRunId,
@@ -386,7 +420,7 @@ pub(crate) fn revalidate_prepared_worker_launch(
         return Err("prepared Worker authority is stale for the current TicketRun".into());
     }
 
-    let accepted: Option<(String, String, String, String, String, String, String, String, String, String)> = tx
+    let accepted: Option<AcceptedPlanRow> = tx
         .query_row(
             "SELECT configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest FROM accepted_work_plans WHERE project_id=?1 AND ticket_run_id=?2 AND accepted_revision=?3",
             params![prepared.project_id.as_str(), prepared.ticket_run_id.as_str(), prepared.accepted_revision],
@@ -473,7 +507,7 @@ pub(crate) fn revalidate_prepared_worker_launch(
         return Err("accepted Worker plan Coordinator authority changed".into());
     }
 
-    let effect: Option<(String, String, String, String, Option<u64>, String, String, String)> = tx
+    let effect: Option<AcceptedEffectRow> = tx
         .query_row(
             "SELECT project_id,subject_type,subject_id,kind,expected_revision,request_json,request_digest,receipt_json FROM effects WHERE operation_id=?1 AND status='succeeded'",
             [&prepared.prepare_operation_id],
@@ -584,7 +618,7 @@ impl ConfigStore {
         ticket_run_id: &TicketRunId,
         accepted_revision: u64,
     ) -> Result<Option<AcceptedWorkPlanRecord>, String> {
-        let row: Option<(String,String,String,String,String,String,String,String,String,String)> = self.connection.query_row(
+        let row: Option<AcceptedPlanIdentityRow> = self.connection.query_row(
             "SELECT configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest FROM accepted_work_plans WHERE project_id=?1 AND ticket_run_id=?2 AND accepted_revision=?3",
             params![project_id.as_str(),ticket_run_id.as_str(),accepted_revision],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),

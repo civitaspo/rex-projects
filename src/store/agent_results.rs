@@ -41,6 +41,30 @@ type ObsoleteConfigurationSourceRow = (
     String,
     String,
 );
+type ValidatedResultParentRow = (
+    String,
+    u32,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+type ArtifactSourceRow = (String, String, Option<String>, Option<u64>, String);
+type ArtifactSourceWithAuthorityRow = (
+    String,
+    String,
+    Option<String>,
+    Option<u64>,
+    String,
+    u64,
+    String,
+    String,
+    String,
+);
 
 /// An immutable host receipt proving that the persisted provider run completed and its observed
 /// process tree is absent. Its private fields prevent callers from manufacturing or deserializing
@@ -280,7 +304,7 @@ pub fn verify_agent_terminal(
     owner_generation: u64,
     agent_run_id: &AgentRunId,
 ) -> Result<VerifiedAgentTerminal, String> {
-    let row: Option<(String, u32, u64, String, String, String, String, String, String, String)> = store
+    let row: Option<ValidatedResultParentRow> = store
         .connection
         .query_row(
             "SELECT t.project_id,t.attempt,t.controller_generation,t.authority_digest,t.start_request_digest,t.start_request_json,t.terminal_digest,t.result_digest,t.absence_digest,t.receipt_json FROM agent_terminal_receipts t JOIN agent_launch_state s USING(agent_run_id) JOIN agent_runs r USING(agent_run_id) WHERE t.agent_run_id=?1 AND s.state='completed' AND r.state='completed' AND s.start_request_digest=t.start_request_digest AND s.result_digest=t.result_digest AND s.result_receipt_json=t.receipt_json",
@@ -975,7 +999,7 @@ pub fn acknowledge_committed_role_result(
             "committed Agent result transition receipt has a different subject or revision".into(),
         );
     }
-    let source: Option<(String, String, Option<String>, Option<u64>, String)> = tx
+    let source: Option<ArtifactSourceRow> = tx
         .query_row(
             "SELECT e.project_id,e.role,e.ticket_run_id,a.ticket_revision,e.result_digest FROM agent_result_evidence e JOIN agent_launch_authority a USING(agent_run_id) WHERE e.evidence_id=?1",
             [evidence_id],
@@ -2591,7 +2615,7 @@ impl ConfigStore {
             .map_err(|error| error.to_string())?;
         super::validate_active_generation(&tx, owner_generation)?;
 
-        let source: Option<(String, String, Option<String>, Option<u64>, String, u64, String, String, String)> = tx.query_row(
+        let source: Option<ArtifactSourceWithAuthorityRow> = tx.query_row(
             "SELECT e.project_id,e.role,e.ticket_run_id,a.ticket_revision,a.role_session_id,a.config_revision,a.config_digest,a.authority_json,a.authority_digest FROM agent_result_evidence e JOIN agent_launch_authority a USING(agent_run_id) WHERE e.evidence_id=?1 AND e.result_digest=?2",
             rusqlite::params![result.receipt.evidence_id(), result.validated.result_digest.as_str()],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
@@ -2847,8 +2871,6 @@ pub(crate) mod host_validation_fixture {
         pub store: ConfigStore,
         pub artifacts: crate::artifacts::ArtifactStore,
         pub owner_generation: u64,
-        pub start: StartRequestEnvelope,
-        pub terminal: VerifiedAgentTerminal,
         pub ingested: IngestedAgentResult,
     }
 
@@ -2947,8 +2969,6 @@ pub(crate) mod host_validation_fixture {
             store,
             artifacts: evidence.artifacts,
             owner_generation,
-            start: evidence.start,
-            terminal: evidence.terminal,
             ingested: evidence.ingested,
         })
     }

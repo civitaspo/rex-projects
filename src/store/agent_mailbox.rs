@@ -9,6 +9,17 @@ use crate::artifacts::ArtifactStore;
 use crate::domain::ids::{AgentRunId, Digest};
 use crate::mailbox::{MailboxCapability, MailboxLimits};
 
+type MailboxRunAuthorityStateRow = (
+    String,
+    u64,
+    String,
+    u64,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
 #[derive(Debug)]
 pub enum AgentMailboxProcessingError {
     Authority(String),
@@ -133,16 +144,7 @@ impl crate::store::ConfigStore {
             );
         }
 
-        let state: Option<(
-            String,
-            u64,
-            String,
-            u64,
-            String,
-            Option<String>,
-            String,
-            String,
-        )> = self
+        let state: Option<MailboxRunAuthorityStateRow> = self
             .connection
             .query_row(
                 "SELECT runs.state,runs.controller_generation,runs.project_id,runs.config_revision,runs.config_digest,runs.role_session_id,runs.launch_operation_id,authority.authority_digest FROM agent_runs runs JOIN agent_launch_authority authority USING(agent_run_id) WHERE runs.agent_run_id=?1",

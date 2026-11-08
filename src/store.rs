@@ -133,6 +133,29 @@ type SucceededEffectRow = (
     i64,
     Option<String>,
 );
+type RuntimeSnapshotRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    bool,
+    Option<u64>,
+    Option<String>,
+);
+type AcceptedWorkPlanSourceRow = (String, String, String, String, String, u64, Option<u64>);
+type ArtifactSourceAuthorityRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<u64>,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectRecord {
     pub id: ProjectId,
@@ -1293,7 +1316,7 @@ impl ConfigStore {
     }
 
     pub fn rex_view_anchor(&self, view_id: &Digest) -> Result<Option<RexViewAnchorRecord>, String> {
-        let row: Option<(String,String,String,String,String,bool,Option<u64>,Option<String>)> = self.connection.query_row(
+        let row: Option<RuntimeSnapshotRow> = self.connection.query_row(
             "SELECT a.block_id,a.run_id,a.owned_label,a.command_digest,a.lifecycle,a.process_absent_confirmed,a.terminal_at_unix,r.content_digest FROM rex_view_anchors a LEFT JOIN rex_view_anchor_archives r USING(view_id,block_id) WHERE a.view_id=?1",
             [view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
         ).optional().map_err(|error| error.to_string())?;
@@ -2905,7 +2928,7 @@ impl ConfigStore {
             });
         }
 
-        let stored: Option<(String, String, String, String, String, u64, Option<u64>)> = tx
+        let stored: Option<AcceptedWorkPlanSourceRow> = tx
             .query_row(
                 "SELECT project_id, config_digest, internal_phase, activity, external_status, revision, required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
                 [ticket_run_id.as_str()],
@@ -3099,7 +3122,7 @@ impl ConfigStore {
             {
                 return Err("validated work plan differs from Coordinator result evidence".into());
             }
-            let source_row: Option<(String,String,String,Option<String>,Option<u64>,String,String,String,String,String)> = tx.query_row(
+            let source_row: Option<ArtifactSourceAuthorityRow> = tx.query_row(
                 "SELECT e.agent_run_id,e.project_id,e.role,e.ticket_run_id,a.ticket_revision,a.role_session_id,a.config_digest,a.authority_digest,a.role,a.parent_role FROM agent_result_evidence e JOIN agent_launch_authority a USING(agent_run_id) WHERE e.evidence_id=?1 AND e.message_id=?2 AND e.result_digest=?3",
                 params![plan.source_evidence_id,plan.source_message_id,plan.source_result_digest.as_str()],
                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),

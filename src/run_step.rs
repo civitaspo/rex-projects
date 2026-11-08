@@ -654,6 +654,7 @@ enum RunContext {
     ProfileTrial,
 }
 
+#[cfg(test)]
 fn run_turn_with_qualification<O: ProcessObserver>(
     request: &TurnRequest,
     observer: &mut O,

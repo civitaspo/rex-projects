@@ -177,10 +177,9 @@ fn read_rex_events(
             oversized = false;
         }
     }
-    if !frame.is_empty() || oversized {
-        if sender.try_send(RexEventSignal::RescanRequired).is_err() {
-            overflowed.store(true, Ordering::Release);
-        }
+    if (!frame.is_empty() || oversized) && sender.try_send(RexEventSignal::RescanRequired).is_err()
+    {
+        overflowed.store(true, Ordering::Release);
     }
 }
 
@@ -372,10 +371,6 @@ impl RexQualificationSessionReceipt {
 
     pub(crate) fn block_id(&self) -> &str {
         &self.block_id
-    }
-
-    pub(crate) fn window_label(&self) -> &str {
-        &self.window_label
     }
 
     pub(crate) fn operation_id(&self) -> &str {

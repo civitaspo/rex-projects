@@ -433,29 +433,8 @@ impl ProfileTrialRunReceipt {
     pub(crate) fn authorization_id(&self) -> &str {
         &self.authorization_id
     }
-    pub(crate) fn authorization_digest(&self) -> &Digest {
-        &self.authorization_digest
-    }
-    pub(crate) fn human_response_receipt_digest(&self) -> &Digest {
-        &self.human_response_receipt_digest
-    }
-    pub(crate) fn project_id(&self) -> &ProjectId {
-        &self.project_id
-    }
-    pub(crate) fn role(&self) -> Role {
-        self.role
-    }
-    pub(crate) fn candidate_id(&self) -> &str {
-        &self.candidate_id
-    }
-    pub(crate) fn candidate_digest(&self) -> &Digest {
-        &self.candidate_digest
-    }
     pub(crate) fn pair_index(&self) -> u8 {
         self.pair_index
-    }
-    pub(crate) fn input_id(&self) -> &str {
-        &self.input_id
     }
     pub(crate) fn input_digest(&self) -> &Digest {
         &self.input_digest
@@ -469,53 +448,8 @@ impl ProfileTrialRunReceipt {
     pub(crate) fn attempt_id(&self) -> &str {
         &self.attempt_id
     }
-    pub(crate) fn attempt_ordinal(&self) -> u8 {
-        self.attempt_ordinal
-    }
-    pub(crate) fn profile_id(&self) -> &ProfileId {
-        &self.profile_id
-    }
-    pub(crate) fn profile_digest(&self) -> &Digest {
-        &self.profile_digest
-    }
-    pub(crate) fn instruction_digest(&self) -> &Digest {
-        &self.instruction_digest
-    }
-    pub(crate) fn config_revision(&self) -> Revision {
-        self.config_revision
-    }
-    pub(crate) fn config_digest(&self) -> &Digest {
-        &self.config_digest
-    }
-    pub(crate) fn provider_qualification_digest(&self) -> &Digest {
-        &self.provider_qualification_digest
-    }
-    pub(crate) fn fixture_id(&self) -> &str {
-        &self.fixture_id
-    }
-    pub(crate) fn fixture_revision(&self) -> &Digest {
-        &self.fixture_revision
-    }
-    pub(crate) fn workspace_seed_digest(&self) -> &Digest {
-        &self.workspace_seed_digest
-    }
-    pub(crate) fn evaluator_id(&self) -> &str {
-        &self.evaluator_id
-    }
-    pub(crate) fn evaluator_revision(&self) -> &Digest {
-        &self.evaluator_revision
-    }
-    pub(crate) fn no_effects_receipt_digest(&self) -> &Digest {
-        &self.no_effects_receipt_digest
-    }
     pub(crate) fn status(&self) -> TrialRunStatus {
         self.status
-    }
-    pub(crate) fn result_receipt_digest(&self) -> &Digest {
-        &self.result_receipt_digest
-    }
-    pub(crate) fn completed_at_unix(&self) -> u64 {
-        self.completed_at_unix
     }
 }
 
