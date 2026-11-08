@@ -3633,6 +3633,55 @@ mod tests {
     }
 
     #[test]
+    fn role_contract_mailbox_commands_parse_with_the_supported_options() {
+        let inbox = Cli::try_parse_from([
+            "rex-projects",
+            "agent",
+            "inbox",
+            "--run",
+            "agent-test",
+            "--control-dir",
+            "/tmp/agent-test/control",
+            "--json",
+        ]);
+        assert!(inbox.is_ok());
+
+        let artifact = Cli::try_parse_from([
+            "rex-projects",
+            "agent",
+            "artifact-add",
+            "--run",
+            "agent-test",
+            "--control-dir",
+            "/tmp/agent-test/control",
+            "--path",
+            "evidence.json",
+            "--kind",
+            "general",
+            "--schema-version",
+            "1",
+            "--message-id",
+            "artifact-request",
+            "--json",
+        ]);
+        assert!(artifact.is_ok());
+
+        let receipt = Cli::try_parse_from([
+            "rex-projects",
+            "agent",
+            "receipt",
+            "--run-id",
+            "agent-test",
+            "--control-dir",
+            "/tmp/agent-test/control",
+            "--request-id",
+            "artifact-request",
+            "--json",
+        ]);
+        assert!(receipt.is_ok());
+    }
+
+    #[test]
     fn read_projections_accept_the_public_command_shapes() {
         assert!(Cli::try_parse_from(["rex-projects", "project", "list", "--json"]).is_ok());
         assert!(

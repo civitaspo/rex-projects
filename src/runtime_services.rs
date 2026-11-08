@@ -1477,6 +1477,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                     .as_ref()
                     .map(|context| context.token.commit_mode()),
             },
+            &self.runtime_binary,
         )?;
         if rendered.instruction_digest != reservation.instruction_digest
             || rendered.result_schema_digest != reservation.result_schema_digest
@@ -2319,6 +2320,7 @@ impl FactoryRuntimeServices for RuntimeServices {
                 stop_conditions: Vec::new(),
                 assigned_commit_mode: None,
             },
+            &self.runtime_binary,
         )?;
         let result_schema = rendered.result_schema.clone();
         let schema_projection = crate::providers::project_result_schema(&result_schema)?;
@@ -2893,6 +2895,7 @@ impl RuntimeServices {
                     .as_ref()
                     .map(|context| context.token.commit_mode()),
             },
+            &self.runtime_binary,
         )?;
         let wake_inputs = store.pending_role_wake_inputs(
             &candidate.project_id,

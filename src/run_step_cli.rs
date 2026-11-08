@@ -146,6 +146,10 @@ pub fn finalize_and_ack_start(
         &reservation.digest()?,
         &authority,
     )?;
+    crate::agent_api::publish_wake_snapshot(
+        &reservation.control_dir,
+        reservation.wake_snapshot.clone(),
+    )?;
 
     let spool = RunStepSpool::open(&reservation.control_dir)?;
     let start = wait_for_start_request(
