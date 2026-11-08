@@ -109,13 +109,258 @@ fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::
     command
 }
 
-fn process_start_trace(path: &std::path::Path) -> String {
-    let Ok(file) = std::fs::File::open(path) else {
-        return "unavailable".into();
+const MAX_OWNER_THREADS_IN_DIAGNOSTIC: usize = 8;
+const MAX_OWNER_CHILDREN_IN_DIAGNOSTIC: usize = 4;
+const MAX_PROC_DIAGNOSTIC_FILE_BYTES: u64 = 1024;
+
+struct ProcStatSummary {
+    state: String,
+    parent_pid: u32,
+    start_ticks: u64,
+}
+
+fn read_proc_diagnostic(path: &std::path::Path, limit: u64) -> Result<String, &'static str> {
+    let file = std::fs::File::open(path).map_err(|error| match error.kind() {
+        io::ErrorKind::PermissionDenied => "denied",
+        io::ErrorKind::NotFound => "gone",
+        _ => "unavailable",
+    })?;
+    let mut text = String::new();
+    file.take(limit)
+        .read_to_string(&mut text)
+        .map_err(|_| "unavailable")?;
+    Ok(text)
+}
+
+fn proc_stat_summary(path: &std::path::Path) -> Result<ProcStatSummary, &'static str> {
+    let stat = read_proc_diagnostic(path, MAX_PROC_DIAGNOSTIC_FILE_BYTES)?;
+    let fields = stat
+        .rfind(')')
+        .and_then(|end| stat.get(end + 1..))
+        .ok_or("invalid")?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let state = fields.first().ok_or("invalid")?.to_string();
+    let parent_pid = fields
+        .get(1)
+        .ok_or("invalid")?
+        .parse()
+        .map_err(|_| "invalid")?;
+    let start_ticks = fields
+        .get(19)
+        .ok_or("invalid")?
+        .parse()
+        .map_err(|_| "invalid")?;
+    Ok(ProcStatSummary {
+        state,
+        parent_pid,
+        start_ticks,
+    })
+}
+
+fn diagnostic_token(value: &str, limit: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .take(limit)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '<' | '>' | '.')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn thread_wait_snapshot(proc_root: &std::path::Path, pid: u32, tid: u32) -> String {
+    let thread_dir = proc_root
+        .join(pid.to_string())
+        .join("task")
+        .join(tid.to_string());
+    let state = proc_stat_summary(&thread_dir.join("stat"))
+        .map(|stat| diagnostic_token(&stat.state, 8))
+        .unwrap_or_else(|reason| reason.into());
+    let wchan = read_proc_diagnostic(&thread_dir.join("wchan"), 128)
+        .map(|value| diagnostic_token(&value, 80))
+        .unwrap_or_else(|reason| reason.into());
+    let syscall = read_proc_diagnostic(&thread_dir.join("syscall"), 128)
+        .map(|value| {
+            value
+                .split_whitespace()
+                .next()
+                .map(|number| diagnostic_token(number, 24))
+                .filter(|number| !number.is_empty())
+                .unwrap_or_else(|| "unavailable".into())
+        })
+        .unwrap_or_else(|reason| reason.into());
+    format!("tid={tid},state={state},wchan={wchan},syscall={syscall}")
+}
+
+fn linux_owner_snapshot_at(proc_root: &std::path::Path, owner_pid: u32) -> String {
+    let owner_dir = proc_root.join(owner_pid.to_string());
+    let owner_stat = match proc_stat_summary(&owner_dir.join("stat")) {
+        Ok(stat) => format!(
+            "pid={owner_pid},ppid={},state={},start_ticks={}",
+            stat.parent_pid,
+            diagnostic_token(&stat.state, 8),
+            stat.start_ticks
+        ),
+        Err(reason) => format!("pid={owner_pid},stat={reason}"),
     };
-    let mut trace = Vec::new();
-    let _ = file.take(256).read_to_end(&mut trace);
-    String::from_utf8_lossy(&trace).into_owned()
+    let task_dir = owner_dir.join("task");
+    let task_entries = match std::fs::read_dir(&task_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let reason = if error.kind() == io::ErrorKind::PermissionDenied {
+                "denied"
+            } else if error.kind() == io::ErrorKind::NotFound {
+                "gone"
+            } else {
+                "unavailable"
+            };
+            return format!("owner=({owner_stat}),threads={reason}");
+        }
+    };
+    let mut tids = vec![owner_pid];
+    tids.extend(
+        task_entries
+            .take(MAX_OWNER_THREADS_IN_DIAGNOSTIC + 2)
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                name.to_str()?.parse::<u32>().ok()
+            })
+            .collect::<Vec<_>>(),
+    );
+    tids.sort_unstable();
+    tids.dedup();
+    let threads_truncated = tids.len() > MAX_OWNER_THREADS_IN_DIAGNOSTIC;
+    let mut sampled_tids = vec![owner_pid];
+    sampled_tids.extend(
+        tids.into_iter()
+            .filter(|tid| *tid != owner_pid)
+            .take(MAX_OWNER_THREADS_IN_DIAGNOSTIC - 1),
+    );
+    let threads = sampled_tids
+        .into_iter()
+        .take(MAX_OWNER_THREADS_IN_DIAGNOSTIC)
+        .map(|tid| thread_wait_snapshot(proc_root, owner_pid, tid))
+        .collect::<Vec<_>>();
+    let children =
+        read_proc_diagnostic(&task_dir.join(owner_pid.to_string()).join("children"), 128)
+            .map(|text| {
+                let mut child_pids = text
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok())
+                    .take(MAX_OWNER_CHILDREN_IN_DIAGNOSTIC + 1)
+                    .collect::<Vec<_>>();
+                let children_truncated =
+                    child_pids.len() > MAX_OWNER_CHILDREN_IN_DIAGNOSTIC || text.len() == 128;
+                child_pids.truncate(MAX_OWNER_CHILDREN_IN_DIAGNOSTIC);
+                let child_snapshots = child_pids
+                    .into_iter()
+                    .map(|child_pid| {
+                        match proc_stat_summary(&proc_root.join(child_pid.to_string()).join("stat"))
+                        {
+                            Ok(stat) if stat.parent_pid == owner_pid => format!(
+                                "pid={child_pid},start_ticks={},{}",
+                                stat.start_ticks,
+                                thread_wait_snapshot(proc_root, child_pid, child_pid)
+                            ),
+                            Ok(_) => format!("pid={child_pid},identity_changed=true"),
+                            Err(reason) => format!("pid={child_pid},stat={reason}"),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "[{}],truncated={children_truncated}",
+                    child_snapshots.join(";")
+                )
+            })
+            .unwrap_or_else(|reason| reason.into());
+    format!(
+        "owner=({owner_stat}),threads=[{}],threads_truncated={threads_truncated},children={children}",
+        threads.join(";")
+    )
+}
+
+#[test]
+fn linux_owner_snapshot_is_bounded_and_omits_syscall_arguments() {
+    fn write_stat(path: &std::path::Path, pid: u32, parent_pid: u32, start_ticks: u64) {
+        let mut fields = vec!["S".to_owned(), parent_pid.to_string()];
+        while fields.len() < 19 {
+            fields.push("0".into());
+        }
+        fields.push(start_ticks.to_string());
+        std::fs::write(
+            path,
+            format!("{pid} (fixture process) {}", fields.join(" ")),
+        )
+        .unwrap();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let owner_pid = 123;
+    let task_dir = temp.path().join(owner_pid.to_string()).join("task");
+    std::fs::create_dir_all(&task_dir).unwrap();
+    write_stat(
+        &temp.path().join(owner_pid.to_string()).join("stat"),
+        owner_pid,
+        7,
+        456,
+    );
+    for tid in owner_pid + 1..owner_pid + MAX_OWNER_THREADS_IN_DIAGNOSTIC as u32 + 3 {
+        let thread_dir = task_dir.join(tid.to_string());
+        std::fs::create_dir_all(&thread_dir).unwrap();
+        write_stat(
+            &thread_dir.join("stat"),
+            tid,
+            7,
+            456 + u64::from(tid - owner_pid),
+        );
+        std::fs::write(thread_dir.join("wchan"), "futex_wait_queue\n").unwrap();
+        std::fs::write(thread_dir.join("syscall"), "202 987654321 123456789\n").unwrap();
+    }
+    let leader_dir = task_dir.join(owner_pid.to_string());
+    std::fs::create_dir_all(&leader_dir).unwrap();
+    write_stat(&leader_dir.join("stat"), owner_pid, 7, 456);
+    std::fs::write(leader_dir.join("wchan"), "futex_wait_queue\n").unwrap();
+    std::fs::write(leader_dir.join("syscall"), "202 987654321 123456789\n").unwrap();
+    std::fs::write(leader_dir.join("children"), "456\n").unwrap();
+    let child_dir = temp.path().join("456");
+    let child_task_dir = child_dir.join("task/456");
+    std::fs::create_dir_all(&child_task_dir).unwrap();
+    write_stat(&child_dir.join("stat"), 456, owner_pid, 789);
+    write_stat(&child_task_dir.join("stat"), 456, owner_pid, 789);
+    std::fs::write(child_task_dir.join("wchan"), "do_poll.constprop.0\n").unwrap();
+    std::fs::write(child_task_dir.join("syscall"), "7 555444 333222\n").unwrap();
+
+    let snapshot = linux_owner_snapshot_at(temp.path(), owner_pid);
+    assert!(snapshot.contains("pid=123,ppid=7,state=S,start_ticks=456"));
+    assert!(snapshot.contains("tid=123,state=S,wchan=futex_wait_queue,syscall=202"));
+    assert!(
+        snapshot.contains(
+            "pid=456,start_ticks=789,tid=456,state=S,wchan=do_poll.constprop.0,syscall=7"
+        )
+    );
+    assert!(snapshot.contains("wchan=futex_wait_queue,syscall=202"));
+    assert!(snapshot.contains("threads_truncated=true"));
+    assert!(!snapshot.contains("987654321"));
+    assert!(!snapshot.contains("fixture process"));
+}
+
+fn owner_process_snapshot(owner_pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        linux_owner_snapshot_at(std::path::Path::new("/proc"), owner_pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = owner_pid;
+        "unsupported_platform".into()
+    }
 }
 
 fn fixture(
@@ -1058,7 +1303,6 @@ fn provider_status_is_read_only_and_reports_missing_request_ids() {
 fn project_start_queues_only_to_the_active_foreground_owner() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
-    let process_start_trace_path = temp.path().join("owner-process-start-trace");
     let apply = command(&config, &state, &home)
         .args(["config", "apply", "--bootstrap"])
         .output()
@@ -1067,10 +1311,6 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
 
     let mut owner_command = command(&config, &state, &home);
     owner_command.args(["runtime", "run"]);
-    owner_command.env(
-        "REX_TEST_PROCESS_START_TRACE_PATH",
-        &process_start_trace_path,
-    );
     let mut owner = ForegroundOwner::spawn(owner_command)
         .expect("spawn foreground controller with captured stderr");
     let startup_deadline = Instant::now() + Duration::from_secs(10);
@@ -1106,22 +1346,15 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
             break;
         }
         if Instant::now() >= startup_deadline {
+            let owner_pid = owner.child.id();
+            let process_snapshot = owner_process_snapshot(owner_pid);
             owner.terminate();
             let stderr = owner.stderr_tail();
-            let process_start_trace = process_start_trace(&process_start_trace_path);
             panic!(
-                "foreground controller startup timed out after 10s; polls={status_polls}; last status={status_diagnostic}; process_start_trace={process_start_trace:?}; controller stderr: {stderr}"
+                "foreground controller startup timed out after 10s; polls={status_polls}; last status={status_diagnostic}; owner_process_snapshot={process_snapshot:?}; controller stderr: {stderr}"
             );
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-    #[cfg(debug_assertions)]
-    {
-        let process_start_trace = process_start_trace(&process_start_trace_path);
-        assert!(
-            process_start_trace.contains("stage="),
-            "foreground owner startup should write a process-start trace marker; got {process_start_trace:?}"
-        );
     }
     let start = command(&config, &state, &home)
         .args([
