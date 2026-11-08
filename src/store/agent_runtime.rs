@@ -492,6 +492,12 @@ impl ConfigStore {
         let reservation: AgentLaunchReservation = crate::protocol::parse_unique(json.as_bytes())
             .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
         validate_project_launch_epoch(&tx, &reservation.project_id, reservation.project_epoch)?;
+        validate_project_launch_config(
+            &tx,
+            &reservation.project_id,
+            reservation.config_revision.0,
+            &reservation.config_digest,
+        )?;
         if reservation.digest()? != *reservation_digest
             || !authority_matches_reservation(authority, &reservation)
         {
@@ -557,6 +563,27 @@ pub(super) fn validate_project_launch_epoch(
     Ok(())
 }
 
+pub(super) fn validate_project_launch_config(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    expected_revision: u64,
+    expected_digest: &Digest,
+) -> Result<(), String> {
+    let current: Option<(u64, String)> = tx
+        .query_row(
+            "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+            [project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if !matches!(current, Some((revision, ref digest)) if revision == expected_revision && digest == expected_digest.as_str())
+    {
+        return Err("Project config changed before Agent launch authorization".into());
+    }
+    Ok(())
+}
+
 fn load_exact_wake_inputs(
     tx: &rusqlite::Transaction<'_>,
     reservation: &AgentLaunchReservation,
@@ -591,6 +618,9 @@ pub(super) fn validate_qualification_profile(
     qualification: &crate::launch::ProviderQualification,
     profile: &crate::config::Profile,
 ) -> Result<(), String> {
+    if qualification.proof.observed_permission_mode != qualification.permission_mode {
+        return Err("provider qualification proof permission mode does not match its declared permission mode".into());
+    }
     let identity = crate::run_step::profile_runtime_identity(profile)
         .map_err(|error| format!("derive launch profile runtime identity: {error}"))?;
     if qualification.adapter != identity.adapter
@@ -947,6 +977,27 @@ mod tests {
                 .unwrap_err()
                 .contains("applied profile runtime identity")
         );
+
+        let mut contradictory_qualification = qualification.clone();
+        contradictory_qualification.proof.observed_permission_mode =
+            "dangerously_unrestricted".into();
+        let contradictory_digest = store
+            .store_provider_qualification(generation, &contradictory_qualification)
+            .unwrap();
+        let mut contradictory_proof = reservation.clone();
+        contradictory_proof.qualification_receipt_digest = contradictory_digest;
+        assert!(
+            store
+                .prepare_role_launch(&contradictory_proof)
+                .unwrap_err()
+                .contains("proof permission mode")
+        );
+        let launch_side_effects: u64 = store.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_launch_reservations) + (SELECT COUNT(*) FROM execution_slots) + (SELECT COUNT(*) FROM agent_wake_context) + (SELECT COUNT(*) FROM effects WHERE kind='start_agent')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(launch_side_effects, 0);
 
         let mut hook_pool = reservation.clone();
         hook_pool.pool = "rex_projects_hook".into();
@@ -1314,6 +1365,57 @@ mod tests {
             );
         }
         set_project_lifecycle(&store, &project, "running", "running", 1);
+        let mut changed_config = store.load_snapshot("factory").unwrap().unwrap().config;
+        changed_config
+            .profiles
+            .get_mut(&ProfileId::parse("supervisor").unwrap())
+            .unwrap()
+            .model = Some("changed".into());
+        changed_config.source_files[0].sha256 = digest('c');
+        changed_config.source_files[0].contents = "changed".into();
+        changed_config.digest = digest('c');
+        let changed_snapshot = store
+            .apply_snapshot(
+                "factory",
+                &changed_config,
+                ExpectedRevision::Current(applied.revision),
+            )
+            .unwrap();
+        assert_ne!(changed_snapshot.revision, applied.revision);
+        assert_ne!(changed_snapshot.digest, reservation.config_digest);
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET config_revision=?2,config_digest=?3 WHERE project_id=?1",
+                rusqlite::params![
+                    project.as_str(),
+                    changed_snapshot.revision.0,
+                    changed_snapshot.digest.as_str()
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .finalize_agent_launch_reservation(
+                    generation,
+                    &run_id,
+                    &reservation_digest,
+                    &authority
+                )
+                .unwrap_err()
+                .contains("Project config changed")
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET config_revision=?2,config_digest=?3 WHERE project_id=?1",
+                rusqlite::params![
+                    project.as_str(),
+                    applied.revision.0,
+                    applied.digest.as_str()
+                ],
+            )
+            .unwrap();
         assert!(
             store
                 .authorize_agent_start(generation, &request, &observed)
@@ -1322,6 +1424,34 @@ mod tests {
         );
         store
             .finalize_agent_launch_reservation(generation, &run_id, &reservation_digest, &authority)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET config_revision=?2,config_digest=?3 WHERE project_id=?1",
+                rusqlite::params![
+                    project.as_str(),
+                    changed_snapshot.revision.0,
+                    changed_snapshot.digest.as_str()
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .authorize_agent_start(generation, &request, &observed)
+                .unwrap_err()
+                .contains("Project config changed")
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET config_revision=?2,config_digest=?3 WHERE project_id=?1",
+                rusqlite::params![
+                    project.as_str(),
+                    applied.revision.0,
+                    applied.digest.as_str()
+                ],
+            )
             .unwrap();
         store
             .finalize_agent_launch_reservation(generation, &run_id, &reservation_digest, &authority)
@@ -1378,6 +1508,34 @@ mod tests {
             process_tree_digest: digest('a'),
             process_tree_confirmed: true,
         };
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET config_revision=?2,config_digest=?3 WHERE project_id=?1",
+                rusqlite::params![
+                    project.as_str(),
+                    changed_snapshot.revision.0,
+                    changed_snapshot.digest.as_str()
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .confirm_provider_started(generation, &provider_observation)
+                .unwrap_err()
+                .contains("Project config changed")
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET config_revision=?2,config_digest=?3 WHERE project_id=?1",
+                rusqlite::params![
+                    project.as_str(),
+                    applied.revision.0,
+                    applied.digest.as_str()
+                ],
+            )
+            .unwrap();
         set_project_lifecycle(&store, &project, "paused", "paused", 2);
         assert!(
             store

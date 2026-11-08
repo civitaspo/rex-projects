@@ -1013,6 +1013,10 @@ impl ConfigStore {
                 "new launch authority must belong to the active controller generation".into(),
             );
         }
+        if exact_replay {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
         let expected_role = serde_json::to_value(authority.role)
             .map_err(|error| error.to_string())?
             .as_str()
@@ -3408,9 +3412,9 @@ impl ConfigStore {
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
         authority.validate()?;
-        let reservation_state: Option<(String, u64)> = tx
+        let reservation_state: Option<(String, String)> = tx
             .query_row(
-                "SELECT lifecycle,project_epoch FROM agent_launch_reservations WHERE agent_run_id=?1",
+                "SELECT lifecycle,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
                 [request.agent_run_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -3422,11 +3426,20 @@ impl ConfigStore {
         {
             return Err("Agent launch reservation has not been finalized".into());
         }
-        if let Some((_, project_epoch)) = &reservation_state {
+        if let Some((_, reservation_json)) = &reservation_state {
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(reservation_json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
             agent_runtime::validate_project_launch_epoch(
                 &tx,
                 &authority.project_id,
-                *project_epoch,
+                reservation.project_epoch,
+            )?;
+            agent_runtime::validate_project_launch_config(
+                &tx,
+                &authority.project_id,
+                reservation.config_revision.0,
+                &reservation.config_digest,
             )?;
         }
         if reservation_state.is_some() {
@@ -3541,22 +3554,31 @@ impl ConfigStore {
                 "provider start observation does not match the active launch authority".into(),
             );
         }
-        let reservation: Option<(String, u64)> = tx
+        let reservation: Option<(String, String)> = tx
             .query_row(
-                "SELECT lifecycle,project_epoch FROM agent_launch_reservations WHERE agent_run_id=?1",
+                "SELECT lifecycle,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
                 [observation.agent_run_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some((lifecycle, project_epoch)) = reservation {
+        if let Some((lifecycle, reservation_json)) = reservation {
             if lifecycle != "authorized" {
                 return Err("Agent launch reservation has not been finalized".into());
             }
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(reservation_json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
             agent_runtime::validate_project_launch_epoch(
                 &tx,
                 &authority.project_id,
-                project_epoch,
+                reservation.project_epoch,
+            )?;
+            agent_runtime::validate_project_launch_config(
+                &tx,
+                &authority.project_id,
+                reservation.config_revision.0,
+                &reservation.config_digest,
             )?;
         }
         let qualification_json: String = tx
@@ -4698,6 +4720,28 @@ mod tests {
     }
 
     #[test]
+    fn exact_launch_authority_replay_does_not_revalidate_changed_runtime_profile() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        assert!(
+            store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
+        );
+        let changed = store.connection.execute(
+            "UPDATE config_snapshots SET effective_config_json=json_set(effective_config_json,'$.profiles.worker.command[0]','/missing/provider') WHERE source_identity='factory' AND revision=?1",
+            [authority.config_revision.0],
+        ).unwrap();
+        assert_eq!(changed, 1);
+        assert!(
+            !store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn populated_v7_authority_and_start_receipt_survive_v8_migration() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let (temp, mut store, generation, authority, _, _) =
@@ -4796,6 +4840,14 @@ mod tests {
                 .unwrap(),
             Some(expected_legacy_authority.clone())
         );
+        let changed = store
+            .connection
+            .execute(
+                "UPDATE config_snapshots SET effective_config_json=json_set(effective_config_json,'$.profiles.worker.command[0]','/missing/provider') WHERE source_identity='factory' AND revision=?1",
+                [authority.config_revision.0],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
         assert!(
             !store
                 .register_agent_launch_authority(generation, &expected_legacy_authority)
