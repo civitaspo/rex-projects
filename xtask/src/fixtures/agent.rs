@@ -1374,7 +1374,8 @@ struct TicketObservation {
     title: String,
     labels: Vec<String>,
     external_revision: String,
-    goal_revision: u64,
+    #[serde(rename = "goal_revision")]
+    _goal_revision: u64,
 }
 
 impl FixtureInbox {
@@ -1461,7 +1462,6 @@ impl FixtureInbox {
                     && ticket.status == "ready"
                     && !ticket.title.is_empty()
                     && ticket.labels.is_empty()
-                    && ticket.goal_revision > 0
                     && !ticket.ticket_id.is_empty()
                     && !ticket.external_revision.is_empty()
                     && ticket.external_revision.len() <= 512
@@ -2155,7 +2155,7 @@ mod tests {
                     "payload_json":{
                         "schema_version":1,"kind":"ticket_observation","ticket_namespace":"fixture/acceptance",
                         "ticket_id":"T-42","status":"ready","title":"Acceptance ticket","labels":[],
-                        "external_revision":"rev-opaque-42","goal_revision":1
+                        "external_revision":"rev-opaque-42","goal_revision":0
                     },
                     "host_artifacts":[]
                 }]
@@ -2170,6 +2170,29 @@ mod tests {
             ..RunInputEvidence::default()
         });
         inbox
+    }
+
+    #[test]
+    fn operations_ticket_with_zero_goal_revision_produces_dispatch_request() {
+        let run_id = "operations-zero-goal-ticket";
+        let temp = tempfile::tempdir().unwrap();
+        let dispatch = run_supervisor_message(
+            &supervisor_context(),
+            &supervisor_invocation(run_id),
+            &ticket_inbox(run_id),
+            temp.path(),
+        );
+
+        assert_eq!(dispatch.kind, super::RoleOutputKind::DispatchRequest);
+        assert_eq!(dispatch.structured_result["ticket_reference"], "T-42");
+        assert_eq!(
+            dispatch.structured_result["expected_ticket_revision"],
+            "rev-opaque-42"
+        );
+        assert_eq!(
+            dispatch.structured_result["coordinator_profile"],
+            "fixture_coordinator"
+        );
     }
 
     fn run_supervisor_message(
