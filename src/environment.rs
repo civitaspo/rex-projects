@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::{EnvironmentConfig, EnvironmentSource};
 use crate::domain::ids::Digest;
-use crate::process::{ProcessRequest, resolve_executable, run};
+use crate::process::{ProcessRequest, resolve_executable};
 
 const FRAME_MAGIC: &[u8] = b"\0REX-PROJECTS-ENV\0\x01";
 const HANDOFF_MAGIC: &[u8] = b"\0REX-PROJECTS-HANDOFF\0\x01";
@@ -502,7 +502,8 @@ fn capture_login_shell(
         stdout_limit: MAX_STARTUP_OUTPUT_BYTES,
         stderr_tail_limit: MAX_STARTUP_OUTPUT_BYTES,
     };
-    let output = run(request).map_err(|_| EnvironmentError::CaptureFailed)?;
+    let output =
+        crate::process::run_in_new_session(request).map_err(|_| EnvironmentError::CaptureFailed)?;
     if Instant::now() > deadline {
         return Err(EnvironmentError::CaptureTimedOut);
     }

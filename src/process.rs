@@ -113,7 +113,13 @@ impl std::error::Error for ProcessError {
 }
 
 pub fn run(request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-    run_inner(request, |_| {}, false)
+    run_inner(request, |_| {}, false, false)
+}
+
+/// Run a child in a new session with no controlling terminal. The child's process group remains
+/// isolated under its PID, so the existing process-group cleanup still owns its descendants.
+pub fn run_in_new_session(request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+    run_inner(request, |_| {}, false, true)
 }
 
 /// Run a child while reporting its kernel identity before waiting for completion.
@@ -122,13 +128,14 @@ pub fn run_with_started_identity(
     request: ProcessRequest,
     on_started: impl FnOnce(ProcessIdentity),
 ) -> Result<ProcessOutput, ProcessError> {
-    run_inner(request, on_started, true)
+    run_inner(request, on_started, true, false)
 }
 
 fn run_inner(
     mut request: ProcessRequest,
     on_started: impl FnOnce(ProcessIdentity),
     require_started_identity: bool,
+    new_session: bool,
 ) -> Result<ProcessOutput, ProcessError> {
     validate(&request)?;
     let mut command = Command::new(&request.executable);
@@ -147,7 +154,19 @@ fn run_inner(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        if new_session {
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        } else {
+            command.process_group(0);
+        }
     }
     let mut child = command.spawn().map_err(ProcessError::Start)?;
     let root_pid = child.id();
@@ -1002,7 +1021,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{ProcessRequest, resolve_executable, run};
+    use super::{ProcessRequest, resolve_executable, run, run_in_new_session};
     use std::path::Path;
 
     #[cfg(unix)]
@@ -1075,6 +1094,34 @@ mod tests {
             req.environment.insert(key.into(), value.into());
         }
         req
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_session_keeps_a_private_process_group() {
+        let mut req = request(
+            "",
+            &[
+                "--exact",
+                "process::tests::detached_session_fixture",
+                "--ignored",
+                "--nocapture",
+            ],
+        );
+        req.executable = std::env::current_exe().unwrap();
+        req.timeout = Duration::from_secs(5);
+        let output = run_in_new_session(req).unwrap();
+        assert_eq!(output.status.unwrap().code(), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture invoked by the process lifecycle tests"]
+    fn detached_session_fixture() {
+        let pid = std::process::id() as i32;
+        assert_eq!(unsafe { libc::getsid(0) }, pid);
+        assert_eq!(unsafe { libc::getpgrp() }, pid);
+        std::process::exit(0);
     }
 
     #[cfg(unix)]
