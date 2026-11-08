@@ -1580,6 +1580,16 @@ impl FixtureInbox {
     }
 }
 
+fn validate_coordinator_dispatch(inbox: &FixtureInbox, ticket_run_id: &str) -> Result<(), String> {
+    if inbox
+        .ticket_run_dispatch_id()?
+        .is_some_and(|dispatch_ticket_run_id| dispatch_ticket_run_id != ticket_run_id)
+    {
+        return Err("Coordinator dispatch wake differs from its host-bound TicketRun".into());
+    }
+    Ok(())
+}
+
 fn read_public_inbox(
     runtime_binary: Option<&Path>,
     invocation: &FixtureInvocation,
@@ -1639,12 +1649,12 @@ fn read_public_inbox(
         None
     };
     if invocation.scope.role == Role::Coordinator {
-        let dispatch_ticket_run_id = inbox
-            .ticket_run_dispatch_id()?
-            .ok_or("Coordinator's public Agent inbox has no TicketRun dispatch wake")?;
-        if invocation.scope.ticket_run_id.as_deref() != Some(dispatch_ticket_run_id.as_str()) {
-            return Err("Coordinator dispatch wake differs from its host-bound TicketRun".into());
-        }
+        let ticket_run_id = invocation
+            .scope
+            .ticket_run_id
+            .as_deref()
+            .ok_or("Coordinator fixture has no host-bound TicketRun ID")?;
+        validate_coordinator_dispatch(&inbox, ticket_run_id)?;
     } else if invocation.scope.role == Role::Worker {
         let ticket_run_id = invocation
             .scope
@@ -2143,8 +2153,8 @@ mod tests {
     use super::{
         AgentContext, FixtureAction, FixtureInbox, FixtureInvocation, FixtureLane, FixtureScope,
         RunInputEvidence, next_message, parse_shell_words, prompt_ticket, source_schema,
-        validate_action, validate_recipe_references, validate_source_prompt, worker_assignment,
-        worker_node_id, worker_node_id_for_lane,
+        validate_action, validate_coordinator_dispatch, validate_recipe_references,
+        validate_source_prompt, worker_assignment, worker_node_id, worker_node_id_for_lane,
     };
     use std::path::Path;
 
@@ -2547,6 +2557,35 @@ mod tests {
             "run_id":"run-a","after":0,"next_after":1,"inputs":[]
         });
         assert!(FixtureInbox::parse(bad_cursor, "run-a").is_err());
+    }
+
+    #[test]
+    fn coordinator_continuation_accepts_planner_result_without_replaying_dispatch() {
+        let inbox = FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":"coordinator-run","after":3,"next_after":4,
+                "inputs":[{"wake_input_id":4,"source_type":"agent_result","source_id":"planner-result","source_revision":1,"priority":1,"payload_json":{"kind":"validated_agent_result","source":{"role":"planner","project_id":"project-a","ticket_run_id":"ticket-a"},"result":{"kind":"plan_ready","structured_result":{"plan":{}}}}}]
+            }),
+            "coordinator-run",
+        )
+        .unwrap();
+        assert!(validate_coordinator_dispatch(&inbox, "ticket-a").is_ok());
+        assert!(
+            inbox
+                .planner_result("project-a", Some("ticket-a"))
+                .unwrap()
+                .is_some()
+        );
+
+        let mismatched = FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":"coordinator-run","after":0,"next_after":1,
+                "inputs":[{"wake_input_id":1,"source_type":"ticket_run_dispatch","source_id":"ticket-b","source_revision":1,"priority":1,"payload_json":{"ticket_run_id":"ticket-b"}}]
+            }),
+            "coordinator-run",
+        )
+        .unwrap();
+        assert!(validate_coordinator_dispatch(&mismatched, "ticket-a").is_err());
     }
 
     #[test]
