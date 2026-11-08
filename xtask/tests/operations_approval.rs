@@ -34,6 +34,18 @@ use rex_projects::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectR
 
 const SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+fn is_xtask_comm(comm: &[u8]) -> bool {
+    comm.strip_suffix(b"\n").unwrap_or(comm) == b"xtask"
+}
+
+#[test]
+fn xtask_comm_matches_linux_comm_bytes() {
+    assert!(is_xtask_comm(b"xtask\n"));
+    assert!(is_xtask_comm(b"xtask"));
+    assert!(!is_xtask_comm(b"other\n"));
+    assert!(!is_xtask_comm(b"xtask\nother"));
+}
+
 struct XdgStateHomeGuard(Option<std::ffi::OsString>);
 
 impl XdgStateHomeGuard {
@@ -595,7 +607,7 @@ fn linux_fixture_process_diagnostic(
                 continue;
             }
         };
-        if comm.trim_end() != "xtask" {
+        if !is_xtask_comm(&comm) {
             continue;
         }
         let executable_matches = std::fs::read_link(process_dir.join("exe"))
