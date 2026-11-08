@@ -783,7 +783,7 @@ fn is_prepared_worker_inbox_observation(
         && binding.repository_id.as_str()
             == assignment["repository_id"].as_str().unwrap_or_default()
         && binding.base_sha == assignment["base_sha"].as_str().unwrap_or_default()
-        && binding.worktree_path == PathBuf::from(worktree_path)
+        && binding.worktree_path.as_path() == Path::new(worktree_path)
         && Path::new(worktree_path).is_absolute()
         && binding.ticket_revision == ticket_revision.unwrap_or_default()
         && source_message_id == Some(expected_source_message.as_str());
