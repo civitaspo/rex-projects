@@ -120,20 +120,20 @@ fn emit_git_watch_paths() {
             }
         }
     }
-    if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
-        if let Some(path) = git(&[
+    if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"])
+        && let Some(path) = git(&[
             "rev-parse",
             "--path-format=absolute",
             "--git-path",
             &reference,
-        ]) {
-            let reference_path = Path::new(&path);
-            emit_changed_path(reference_path);
-            if !reference_path.exists()
-                && let Some(parent) = reference_path.parent()
-            {
-                emit_changed_path(parent);
-            }
+        ])
+    {
+        let reference_path = Path::new(&path);
+        emit_changed_path(reference_path);
+        if !reference_path.exists()
+            && let Some(parent) = reference_path.parent()
+        {
+            emit_changed_path(parent);
         }
     }
 }

@@ -1933,8 +1933,8 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let snapshot_with_survivor = make_cleanup_snapshot(&recoverable, launch_tree, false, 22);
-        assert!(matches!(
-            store
+        assert!(
+            !store
                 .reconcile_missing_agent_block(
                     generation,
                     &recoverable,
@@ -1942,9 +1942,8 @@ mod tests {
                     &snapshot_with_survivor,
                     &[surviving_provider],
                 )
-                .unwrap(),
-            false
-        ));
+                .unwrap()
+        );
         let retained: String = store
             .connection
             .query_row(
