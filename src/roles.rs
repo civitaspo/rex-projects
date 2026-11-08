@@ -1054,6 +1054,16 @@ mod tests {
                         .text
                         .contains("\"coordinator\": \"judgment_claude\"")
                 );
+                assert!(
+                    rendered
+                        .text
+                        .contains("`payload_json.ticket_id` string, byte-for-byte")
+                );
+                assert!(
+                    rendered
+                        .text
+                        .contains("payload_json.external_revision` string")
+                );
             }
             assert!(
                 rendered

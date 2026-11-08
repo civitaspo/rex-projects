@@ -474,6 +474,7 @@
                   "type": "string"
                 },
                 "expected_ticket_revision": {
+                  "description": "Copy `payload_json.external_revision` byte-for-byte from the same ticket observation.",
                   "type": "string"
                 },
                 "priority": {
@@ -484,6 +485,7 @@
                   "type": "string"
                 },
                 "ticket_reference": {
+                  "description": "Copy `payload_json.ticket_id` byte-for-byte from the selected current ticket observation.\nDo not add a namespace, adapter name, URL, or source identifier unless it is part of that\nticket ID itself.",
                   "maxLength": 512,
                   "minLength": 1,
                   "pattern": "^[^\\p{Cc}]*$",

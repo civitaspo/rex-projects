@@ -567,7 +567,11 @@ role_payload!(TicketProposalPayload {
     dependencies: Vec<TicketId>,
 });
 role_payload!(DispatchRequestPayload {
+    /// Copy `payload_json.ticket_id` byte-for-byte from the selected current ticket observation.
+    /// Do not add a namespace, adapter name, URL, or source identifier unless it is part of that
+    /// ticket ID itself.
     ticket_reference: TicketId,
+    /// Copy `payload_json.external_revision` byte-for-byte from the same ticket observation.
     expected_ticket_revision: TicketRevision,
     coordinator_profile: ProfileId,
     priority: i32,
@@ -3605,6 +3609,20 @@ mod tests {
         assert!(encoded.contains(r"^[A-Za-z0-9._-]+$"));
         assert!(encoded.contains(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$"));
         assert!(encoded.contains(r"^[a-f0-9]{64}$"));
+    }
+
+    #[test]
+    fn dispatch_schema_documents_opaque_ticket_identity_mapping() {
+        let schema = role_result_payload_schema(RoleOutputKind::DispatchRequest);
+        let reference = schema["properties"]["ticket_reference"]["description"]
+            .as_str()
+            .unwrap();
+        let revision = schema["properties"]["expected_ticket_revision"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(reference.contains("payload_json.ticket_id"));
+        assert!(reference.contains("byte-for-byte"));
+        assert!(revision.contains("payload_json.external_revision"));
     }
 
     #[test]

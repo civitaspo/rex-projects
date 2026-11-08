@@ -3099,9 +3099,9 @@ pub(crate) mod tests {
         use rusqlite::params;
         use serde_json::json;
 
-        fn run(expected_revision: &str) -> (Result<bool, String>, usize) {
+        fn run(ticket_reference: &str, expected_revision: &str) -> (Result<bool, String>, usize) {
             let payload = json!({
-                "ticket_reference": "T-1",
+                "ticket_reference": ticket_reference,
                 "expected_ticket_revision": expected_revision,
                 "coordinator_profile": "judgment_claude",
                 "priority": 3,
@@ -3160,8 +3160,11 @@ pub(crate) mod tests {
                         expected_page_count: 0,
                         next_cursor: None,
                         tickets: &[ObservedTicket {
-                            id: TicketId::parse("T-1").unwrap(),
-                            revision: Some("rev-1".into()),
+                            id: TicketId::parse("43").unwrap(),
+                            revision: Some(
+                                "3ef900fc1927e9ad609e95b52b74a048fd9baa76194eb0ba60d738df088727b4"
+                                    .into(),
+                            ),
                             status: TicketStatus::Ready,
                             title: "Fixture ticket".into(),
                             labels: Vec::new(),
@@ -3204,7 +3207,7 @@ pub(crate) mod tests {
                 .store
                 .test_connection()
                 .query_row(
-                    "SELECT COUNT(*) FROM ticket_runs WHERE project_id=?1 AND ticket_id='T-1'",
+                    "SELECT COUNT(*) FROM ticket_runs WHERE project_id=?1 AND ticket_id='43'",
                     [project_id.as_str()],
                     |row| row.get(0),
                 )
@@ -3212,11 +3215,20 @@ pub(crate) mod tests {
             (applied, count)
         }
 
-        let (allocated, allocated_count) = run("rev-1");
+        let revision = "3ef900fc1927e9ad609e95b52b74a048fd9baa76194eb0ba60d738df088727b4";
+        let (allocated, allocated_count) = run("43", revision);
         assert!(allocated.unwrap());
         assert_eq!(allocated_count, 1);
 
-        let (stale, stale_count) = run("rev-stale");
+        let (qualified, qualified_count) = run("github:civitaspo/rex-projects:43", revision);
+        assert!(
+            qualified
+                .unwrap_err()
+                .contains("not a current eligible ticket observation")
+        );
+        assert_eq!(qualified_count, 0);
+
+        let (stale, stale_count) = run("43", "rev-stale");
         assert!(
             stale
                 .unwrap_err()
