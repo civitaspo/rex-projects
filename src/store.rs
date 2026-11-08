@@ -3562,13 +3562,16 @@ impl ConfigStore {
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some((lifecycle, reservation_json)) = reservation {
+        let reserved_wake_count = if let Some((lifecycle, reservation_json)) = reservation {
             if lifecycle != "authorized" {
                 return Err("Agent launch reservation has not been finalized".into());
             }
             let reservation: AgentLaunchReservation =
                 crate::protocol::parse_unique(reservation_json.as_bytes())
                     .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            if reservation.wake_snapshot.digest != authority.wake_snapshot_digest {
+                return Err("launch authority wake manifest does not match its reservation".into());
+            }
             agent_runtime::validate_project_launch_epoch(
                 &tx,
                 &authority.project_id,
@@ -3580,7 +3583,73 @@ impl ConfigStore {
                 reservation.config_revision.0,
                 &reservation.config_digest,
             )?;
-        }
+
+            let mut statement = tx
+                .prepare(
+                    "SELECT wake_input_id,project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle FROM role_wake_inputs WHERE consuming_agent_run_id=?1 ORDER BY wake_input_id",
+                )
+                .map_err(|error| error.to_string())?;
+            let owned_wakes = statement
+                .query_map([observation.agent_run_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, i32>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            drop(statement);
+            if owned_wakes.len() != reservation.wake_snapshot.inputs.len()
+                || owned_wakes.iter().any(
+                    |(
+                        wake_id,
+                        project_id,
+                        role_session_id,
+                        source_type,
+                        source_id,
+                        source_revision,
+                        priority,
+                        payload_json,
+                        lifecycle,
+                    )| {
+                        let Some(expected) = reservation
+                            .wake_snapshot
+                            .inputs
+                            .iter()
+                            .find(|input| input.wake_input_id == *wake_id)
+                        else {
+                            return true;
+                        };
+                        let stored_payload =
+                            crate::protocol::parse_unique(payload_json.as_bytes()).ok();
+                        project_id != authority.project_id.as_str()
+                            || role_session_id != reservation.role_session_id.as_str()
+                            || source_type != expected.source_type.as_str()
+                            || source_id != expected.source_id.as_str()
+                            || *source_revision != expected.source_revision
+                            || *priority != expected.priority
+                            || stored_payload.as_ref() != Some(&expected.payload_json)
+                            || lifecycle != "assigned"
+                            || !expected.host_artifacts.is_empty()
+                    },
+                )
+            {
+                return Err(
+                    "assigned wake inputs do not match the immutable launch reservation".into(),
+                );
+            }
+            reservation.wake_snapshot.inputs.len()
+        } else {
+            0
+        };
         let qualification_json: String = tx
             .query_row(
                 "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
@@ -3618,6 +3687,15 @@ impl ConfigStore {
             return Err(
                 "AgentRun state changed before provider start observation was committed".into(),
             );
+        }
+        let consumed_wakes = tx
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE consuming_agent_run_id=?1 AND lifecycle='assigned'",
+                [observation.agent_run_id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+        if consumed_wakes != reserved_wake_count {
+            return Err("assigned wake inputs changed before provider start was committed".into());
         }
         tx.commit().map_err(|error| error.to_string())
     }

@@ -899,13 +899,37 @@ mod tests {
             .store_provider_qualification(generation, &qualification)
             .unwrap();
         let run_id = AgentRunId::parse("run-1").unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'project:project-a:supervisor','human','wake-success',3,7,'{\"message\":\"start\"}','pending',0)",
+                [project.as_str()],
+            )
+            .unwrap();
+        let wake_input_id = u64::try_from(store.connection.last_insert_rowid()).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'project:project-a:supervisor','human','wake-unselected',1,-1,'{}','pending',0)",
+                [project.as_str()],
+            )
+            .unwrap();
+        let unselected_wake_id = u64::try_from(store.connection.last_insert_rowid()).unwrap();
         let wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: project.clone(),
             role_session_id: "project:project-a:supervisor".into(),
             agent_run_id: run_id.as_str().into(),
             digest: digest('0'),
-            inputs: vec![],
+            inputs: vec![crate::agent_api::AgentWakeItem {
+                wake_input_id,
+                source_type: "human".into(),
+                source_id: "wake-success".into(),
+                source_revision: 3,
+                priority: 7,
+                payload_json: serde_json::json!({"message": "start"}),
+                host_artifacts: vec![],
+            }],
         };
         let mut wake_snapshot = wake_snapshot;
         wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
@@ -1582,6 +1606,89 @@ mod tests {
             wake_context,
             crate::store::canonical_json(&reservation.wake_snapshot).unwrap()
         );
+        set_project_lifecycle(&store, &project, "running", "running", 1);
+        let mut unconfirmed_observation = provider_observation.clone();
+        unconfirmed_observation.process_tree_confirmed = false;
+        assert!(
+            store
+                .confirm_provider_started(generation, &unconfirmed_observation)
+                .is_err()
+        );
+        let wake_state: (String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=?1",
+                [wake_input_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            wake_state,
+            ("assigned".into(), Some(run_id.as_str().into()))
+        );
+        let launch_states: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT s.state,r.state FROM agent_launch_state s JOIN agent_runs r USING(agent_run_id) WHERE s.agent_run_id=?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            launch_states,
+            ("awaiting_provider".into(), "launch_pending".into())
+        );
+        let unselected_wake_state: (String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=?1",
+                [unselected_wake_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unselected_wake_state, ("pending".into(), None));
+
+        store
+            .confirm_provider_started(generation, &provider_observation)
+            .unwrap();
+        let committed: (String, String, String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT s.state,r.state,r.process_identity_json,w.lifecycle FROM agent_launch_state s JOIN agent_runs r USING(agent_run_id) JOIN role_wake_inputs w ON w.consuming_agent_run_id=r.agent_run_id WHERE r.agent_run_id=?1 AND w.wake_input_id=?2",
+                rusqlite::params![run_id.as_str(), wake_input_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(committed.0, "running");
+        assert_eq!(committed.1, "running");
+        assert_eq!(committed.3.as_deref(), Some("consumed"));
+        let unselected_wake_state: (String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=?1",
+                [unselected_wake_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unselected_wake_state, ("pending".into(), None));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&committed.2).unwrap(),
+            serde_json::json!({
+                "provider_pid": provider_observation.provider_pid,
+                "provider_start_identity": provider_observation.provider_start_identity,
+                "executable_digest": provider_observation.executable_digest,
+                "process_tree_digest": provider_observation.process_tree_digest,
+            })
+        );
+        let committed_manifest: String = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM agent_wake_context WHERE agent_run_id=?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed_manifest, wake_context);
     }
 
     #[test]
