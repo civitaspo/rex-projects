@@ -344,10 +344,54 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
         {
             break;
         }
-        assert!(
-            Instant::now() < invoke_deadline,
-            "pooled invoke did not settle"
-        );
+        if Instant::now() >= invoke_deadline {
+            let operation = store
+                .operations()
+                .unwrap()
+                .operation(&operation_id)
+                .unwrap()
+                .expect("durable operation remains present");
+            let invoke_job_diagnostic = store
+                .host_job(&invoke_job)
+                .unwrap()
+                .map(|job| {
+                    let state = match job.state {
+                        HostJobState::Pending => "pending",
+                        HostJobState::Starting => "starting",
+                        HostJobState::Running => "running",
+                        HostJobState::Unknown { .. } => "unknown",
+                        HostJobState::Succeeded => "succeeded",
+                        HostJobState::Failed => "failed",
+                    };
+                    let safe_receipt = job
+                        .receipt_json
+                        .as_deref()
+                        .and_then(|receipt| serde_json::from_str::<serde_json::Value>(receipt).ok())
+                        .map(|receipt| {
+                            format!(
+                                "status_code={:?}, timed_out={:?}, cleanup_confirmed={:?}, stdout_truncated={:?}, stderr_truncated={:?}",
+                                receipt.get("status_code").and_then(serde_json::Value::as_i64),
+                                receipt.get("timed_out").and_then(serde_json::Value::as_bool),
+                                receipt.get("cleanup_confirmed").and_then(serde_json::Value::as_bool),
+                                receipt.get("stdout_truncated").and_then(serde_json::Value::as_bool),
+                                receipt.get("stderr_truncated").and_then(serde_json::Value::as_bool),
+                            )
+                        })
+                        .unwrap_or_else(|| "none".into());
+                    format!(
+                        "state={state}, attempt_count={}, safe_receipt=({safe_receipt})",
+                        job.attempt_count
+                    )
+                })
+                .unwrap_or_else(|| "missing".into());
+            panic!(
+                "pooled invoke did not settle: fixture_receipt_exists={}, operation_state={:?}, operation_external_reference_present={}, operation_terminal_receipt_present={}, invoke_host_job={invoke_job_diagnostic}",
+                fixture_receipt.exists(),
+                operation.state,
+                operation.external_reference.is_some(),
+                operation.terminal_receipt_json.is_some(),
+            );
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
