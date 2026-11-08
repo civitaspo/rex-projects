@@ -858,9 +858,8 @@ fn prepare_local_repository(request: &Request<'_>, executable: &Path) -> Result<
     )
     .map_err(|error| error.to_string())?;
     fs::create_dir_all(request.fixture_root.join("bin")).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(executable, request.fixture_root.join("bin/gh"))
-        .map_err(|error| format!("link owned fake gh transport: {error}"))?;
+    fs::copy(executable, request.fixture_root.join("bin/gh"))
+        .map_err(|error| format!("copy owned fake gh transport: {error}"))?;
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("xtask is not directly under the repository root")?
@@ -2579,6 +2578,36 @@ mod tests {
             .map(OsString::from)
             .collect::<Vec<_>>();
         crate::fixtures::github::run_cli(&root, &args).unwrap();
+    }
+
+    #[test]
+    fn owned_fake_gh_survives_production_executable_resolution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("acceptance");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("state")).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        let executable = std::env::current_exe().unwrap();
+        prepare_local_repository(&request, &executable).unwrap();
+
+        let fake_gh = root.join("bin/gh");
+        assert_eq!(
+            rex_projects::process::resolve_executable(
+                Path::new("gh"),
+                std::slice::from_ref(&root.join("bin")),
+            ),
+            Some(root.join("bin").canonicalize().unwrap().join("gh")),
+        );
+        let metadata = fs::symlink_metadata(&fake_gh).unwrap();
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
     }
 
     #[test]
