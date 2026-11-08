@@ -48,7 +48,13 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
     ]);
     if let Some(conversation_id) = conversation_id {
         validate_conversation_id(conversation_id)?;
-        args.extend(["resume".into(), conversation_id.into()]);
+        args.extend([
+            "resume".into(),
+            "--skip-git-repo-check".into(),
+            conversation_id.into(),
+        ]);
+    } else {
+        args.push("--skip-git-repo-check".into());
     }
     args.extend([
         "--json".into(),
@@ -140,9 +146,73 @@ fn validate_conversation_id(value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::json;
 
-    use super::parse_result;
+    use super::{build, parse_result};
+    use crate::providers::InvocationInput;
+
+    fn build_args(conversation_id: Option<&str>) -> Vec<String> {
+        let schema = json!({"type":"object"});
+        build(InvocationInput {
+            executable: "/usr/bin/codex".into(),
+            prefix: vec![],
+            role_contract: "Follow the role contract.",
+            prompt: "Complete the assigned turn.",
+            schema: &schema,
+            schema_path: Path::new("/tmp/result-schema.json"),
+            conversation_id,
+            model: None,
+            effort: None,
+            codex_options: None,
+            claude_options: None,
+        })
+        .unwrap()
+        .args
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect()
+    }
+
+    #[test]
+    fn allows_initial_and_resumed_exec_outside_git_repositories() {
+        let initial = build_args(None);
+        let exec = initial
+            .iter()
+            .position(|argument| argument == "exec")
+            .unwrap();
+        assert_eq!(initial[exec + 1], "--skip-git-repo-check");
+        assert!(initial.contains(&"--sandbox".into()));
+        assert!(
+            initial
+                .windows(2)
+                .any(|args| args == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            initial
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "never"])
+        );
+
+        let resumed = build_args(Some("thread-123"));
+        let resume = resumed
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        assert_eq!(resumed[resume + 1], "--skip-git-repo-check");
+        assert_eq!(resumed[resume + 2], "thread-123");
+        assert!(
+            resumed
+                .windows(2)
+                .any(|args| args == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            resumed
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "never"])
+        );
+    }
 
     #[test]
     fn extracts_only_final_structured_message_and_thread_identity() {
