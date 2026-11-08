@@ -2784,13 +2784,24 @@ impl RuntimeServices {
         let profile_digest = crate::store::agent_profile_digest(&profile)?;
         let runtime_identity = crate::run_step::profile_runtime_identity(&profile)
             .map_err(|error| error.to_string())?;
-        let qualification = self.verified_qualification(
+        let Some(qualification) = self.verified_qualification(
             store,
             &candidate.project_id,
             &profile_id,
             &profile_digest,
             &runtime_identity,
-        )?;
+        )?
+        else {
+            eprintln!(
+                "rex-projects: parked ticket role launch for Project {}: role {} profile {} has no exact verified provider qualification; run `rex-projects provider qualify --project {} --role {}`",
+                candidate.project_id,
+                role_name(candidate.role),
+                profile_id,
+                candidate.project_id,
+                role_name(candidate.role),
+            );
+            return Ok(false);
+        };
         let scope = project
             .ticket_scope
             .iter()
@@ -3096,8 +3107,8 @@ impl RuntimeServices {
         profile_id: &crate::domain::ids::ProfileId,
         profile_digest: &Digest,
         runtime_identity: &crate::run_step::ProfileRuntimeIdentity,
-    ) -> Result<crate::launch::ProviderQualification, String> {
-        store
+    ) -> Result<Option<crate::launch::ProviderQualification>, String> {
+        let qualification = store
             .verified_provider_qualifications(project_id, profile_id, profile_digest, 32)?
             .into_iter()
             .find(|qualification| {
@@ -3109,8 +3120,8 @@ impl RuntimeServices {
                     && qualification.invocation_options_digest
                         == runtime_identity.invocation_options_digest
                     && qualification.permission_mode == runtime_identity.effective_permission_mode
-            })
-            .ok_or_else(|| "profile has no exact verified unattended qualification".into())
+            });
+        Ok(qualification)
     }
 
     fn view_has_block_capacity(

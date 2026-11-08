@@ -209,6 +209,8 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     // or synthesizes host receipts.
     let mut qualifications = Vec::new();
     let mut terminal_qualifications = BTreeMap::new();
+    let mut project_started = false;
+    let mut coordinator_qualification_wait_proof = None;
     let qualification_deadline = Instant::now() + QUALIFICATION_LIMIT;
     let mut qualification_failure = false;
     for role in provider_roles.iter().copied() {
@@ -309,6 +311,34 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         if qualification_failure {
             break;
         }
+        if bounded_coordinator_stage && role == "supervisor" {
+            let project = FIXTURE_PROJECT_ID;
+            let output = product(
+                &request,
+                &state_root,
+                &["project", "start", project, "--json"],
+            )?;
+            if !output.status.is_some_and(|status| status.success()) {
+                trace.push(json!({"step":"project_start_after_supervisor_qualification","project":project,"status":"rejected","evidence":json_stdout(&output)}));
+                qualification_failure = true;
+                break;
+            }
+            project_started = true;
+            trace.push(json!({"step":"project_start_after_supervisor_qualification","project":project,"status":"queued","evidence":json_stdout(&output)}));
+            let proof = observe_coordinator_qualification_wait(
+                &request,
+                &state_root,
+                &block,
+                "fixture_coordinator",
+            );
+            trace.push(json!({"step":"coordinator_missing_qualification_wait","status":proof["status"],"evidence":proof}));
+            if proof["status"] != "passed" {
+                qualification_failure = true;
+                coordinator_qualification_wait_proof = Some(proof);
+                break;
+            }
+            coordinator_qualification_wait_proof = Some(proof);
+        }
     }
     let all_verified = !qualification_failure
         && qualifications.len() == provider_roles.len()
@@ -324,7 +354,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let mut last_status = json!({});
     let mut dashboard = json!({});
     let mut external_ticket_status = "unknown".to_owned();
-    if all_verified {
+    if all_verified && !project_started {
         let project = "operations_project";
         let output = product(
             &request,
@@ -407,13 +437,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 trace.push(json!({"step":"coordinator_inbox_boundary_observed","status":"passed","evidence":coordinator}));
                 coordinator_boundary_reached = true;
                 if coordinator_block_loss_stage {
-                    let proof = observe_coordinator_block_loss(
-                        &request,
-                        &state_root,
-                        &last_status,
-                        &dashboard,
-                        coordinator,
-                    );
+                    let proof = observe_coordinator_block_loss(&request, &state_root, coordinator);
                     let proof = proof.unwrap_or_else(
                         |error| json!({"status":"failed","reason":error,"fault_injected":false}),
                     );
@@ -508,6 +532,9 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         .iter()
         .find(|observation| observation["role"] == "supervisor");
     let stage_valid = bounded_coordinator_stage
+        && coordinator_qualification_wait_proof
+            .as_ref()
+            .is_some_and(|proof| proof["status"] == "passed")
         && coordinator_boundary_reached
         && stopped
         && coordinator_observation.is_some()
@@ -524,6 +551,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     if bounded_coordinator_stage {
         let hold_evidence = if coordinator_block_loss_stage {
             json!({
+                "coordinator_missing_qualification_wait":coordinator_qualification_wait_proof,
                 "coordinator_process_held_until_stop":coordinator_block_loss_proof
                     .as_ref()
                     .and_then(|proof| (proof["agent_state"] == "cancelled").then_some(false)),
@@ -533,7 +561,10 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 "block_loss_recovery":coordinator_block_loss_proof
             })
         } else {
-            json!({"coordinator_process_held_until_stop":coordinator_boundary_reached})
+            json!({
+                "coordinator_missing_qualification_wait":coordinator_qualification_wait_proof,
+                "coordinator_process_held_until_stop":coordinator_boundary_reached
+            })
         };
         trace.push(json!({"step":"supervisor_coordinator_contract","status":if stage_valid {"passed"} else {"failed"},"evidence":{"supervisor_prompt_role_profiles":supervisor_observation.and_then(|observation|observation.pointer("/input_files/effective_role_profiles").cloned()),"coordinator_dispatch_observation":coordinator_observation,"hold_evidence":hold_evidence}}));
     }
@@ -1334,19 +1365,256 @@ fn require_success(label: &str, output: &ProcessOutput) -> Result<(), String> {
     Ok(())
 }
 
+struct CoordinatorQualificationWaitState {
+    generation: u64,
+    heartbeat_at_unix: i64,
+    owner_active: bool,
+    ticket_run_id: Option<String>,
+    pending_wake_count: u64,
+    verified_qualification_count: u64,
+    agent_run_count: u64,
+    active_slot_count: u64,
+}
+
+fn coordinator_qualification_wait_state(
+    database: &Connection,
+    project: &str,
+    namespace: &str,
+    ticket: &str,
+    profile: &str,
+) -> Result<CoordinatorQualificationWaitState, String> {
+    let (generation, heartbeat_at_unix, stopped_at_unix): (u64, i64, Option<i64>) = database
+        .query_row(
+            "SELECT generation,heartbeat_at_unix,stopped_at_unix FROM controller_owners WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("read acceptance controller owner: {error}"))?;
+    let ticket_run_id: Option<String> = database
+        .query_row(
+            "SELECT ticket_run_id FROM ticket_runs WHERE project_id=?1 AND namespace=?2 AND ticket_id=?3 AND internal_phase NOT IN ('done','canceled') ORDER BY generation DESC LIMIT 1",
+            params![project, namespace, ticket],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("read acceptance TicketRun: {error}"))?;
+    let (pending_wake_count, verified_qualification_count, agent_run_count, active_slot_count) =
+        if let Some(ticket_run_id) = ticket_run_id.as_deref() {
+            (
+                database
+                    .query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='ticket_run_dispatch' AND source_id=?3 AND lifecycle='pending'",
+                        params![project, format!("ticket_run:{ticket_run_id}:coordinator"), ticket_run_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("read pending Coordinator dispatch wake: {error}"))?,
+                database
+                    .query_row(
+                        "SELECT COUNT(*) FROM provider_qualifications WHERE project_id=?1 AND profile_id=?2 AND status='verified'",
+                        params![project, profile],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("read Coordinator qualification: {error}"))?,
+                database
+                    .query_row(
+                        "SELECT COUNT(*) FROM agent_launch_authority WHERE project_id=?1 AND ticket_run_id=?2 AND role='coordinator'",
+                        params![project, ticket_run_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("read Coordinator AgentRun authority: {error}"))?,
+                database
+                    .query_row(
+                        "SELECT COUNT(*) FROM execution_slots s JOIN agent_launch_authority a ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id WHERE a.project_id=?1 AND a.ticket_run_id=?2 AND a.role='coordinator' AND s.disposition!='released'",
+                        params![project, ticket_run_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("read Coordinator execution slot: {error}"))?,
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+    Ok(CoordinatorQualificationWaitState {
+        generation,
+        heartbeat_at_unix,
+        owner_active: stopped_at_unix.is_none(),
+        ticket_run_id,
+        pending_wake_count,
+        verified_qualification_count,
+        agent_run_count,
+        active_slot_count,
+    })
+}
+
+fn observe_coordinator_qualification_wait(
+    request: &Request<'_>,
+    state_root: &Path,
+    block: &str,
+    profile: &str,
+) -> Value {
+    let database = match Connection::open_with_flags(
+        state_root.join("state.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(database) => database,
+        Err(error) => {
+            return json!({"status":"inconclusive","reason":format!("open acceptance state read-only: {error}")});
+        }
+    };
+    if let Err(error) = database.busy_timeout(Duration::from_secs(2)) {
+        return json!({"status":"inconclusive","reason":format!("set acceptance SQLite timeout: {error}")});
+    }
+    let deadline = Instant::now() + COORDINATOR_STAGE_LIMIT;
+    let mut heartbeat_baseline = None;
+    let mut last_heartbeat = None;
+    let mut heartbeat_advances = Vec::new();
+    let diagnostic = format!(
+        "parked ticket role launch for Project {FIXTURE_PROJECT_ID}: role coordinator profile {profile} has no exact verified provider qualification"
+    );
+    loop {
+        let status = match product(request, state_root, &["status", "--json"]) {
+            Ok(output) if output.status.is_some_and(|status| status.success()) => {
+                json_stdout(&output)
+            }
+            Ok(output) => {
+                return json!({"status":"inconclusive","reason":"product status failed while observing Coordinator qualification wait","stdout":String::from_utf8_lossy(&output.stdout)});
+            }
+            Err(error) => return json!({"status":"inconclusive","reason":error}),
+        };
+        let state = match coordinator_qualification_wait_state(
+            &database,
+            FIXTURE_PROJECT_ID,
+            FIXTURE_TICKET_NAMESPACE,
+            FIXTURE_TICKET_ID,
+            profile,
+        ) {
+            Ok(state) => state,
+            Err(error) => return json!({"status":"inconclusive","reason":error}),
+        };
+        let owner_active =
+            state.owner_active && status.pointer("/owner/active") == Some(&Value::Bool(true));
+        if !owner_active {
+            let capture = rex_capture(request, block).ok();
+            let controller_output = capture
+                .as_ref()
+                .map(|output| String::from_utf8_lossy(&output.stdout).to_string());
+            return json!({
+                "status":"failed",
+                "reason":"controller stopped while Coordinator was waiting for an unqualified profile",
+                "owner_generation":state.generation,
+                "ticket_run_id":state.ticket_run_id,
+                "pending_coordinator_dispatch_wakes":state.pending_wake_count,
+                "coordinator_qualifications":state.verified_qualification_count,
+                "coordinator_agent_runs":state.agent_run_count,
+                "coordinator_active_slots":state.active_slot_count,
+                "controller_output":controller_output
+            });
+        }
+        let at_boundary = state.ticket_run_id.is_some()
+            && state.pending_wake_count == 1
+            && state.verified_qualification_count == 0
+            && state.agent_run_count == 0
+            && state.active_slot_count == 0;
+        if at_boundary {
+            let baseline = *heartbeat_baseline.get_or_insert(state.heartbeat_at_unix);
+            if last_heartbeat.is_none_or(|last| state.heartbeat_at_unix > last) {
+                last_heartbeat = Some(state.heartbeat_at_unix);
+                if state.heartbeat_at_unix > baseline
+                    && !heartbeat_advances.contains(&state.heartbeat_at_unix)
+                {
+                    heartbeat_advances.push(state.heartbeat_at_unix);
+                }
+            }
+            let capture = rex_capture(request, block).ok();
+            let diagnostic_observed = capture.as_ref().is_some_and(|output| {
+                output.status.is_some_and(|status| status.success())
+                    && String::from_utf8_lossy(&output.stdout).contains(&diagnostic)
+            });
+            if diagnostic_observed && heartbeat_advances.len() >= 2 && projects_running(&status) {
+                return json!({
+                    "status":"passed",
+                    "owner_generation":state.generation,
+                    "owner_active":true,
+                    "ticket_run_id":state.ticket_run_id,
+                    "pending_coordinator_dispatch_wakes":state.pending_wake_count,
+                    "coordinator_profile":profile,
+                    "coordinator_qualifications":state.verified_qualification_count,
+                    "coordinator_agent_runs":state.agent_run_count,
+                    "coordinator_active_slots":state.active_slot_count,
+                    "heartbeat_baseline":baseline,
+                    "distinct_heartbeat_advances":heartbeat_advances,
+                    "parked_diagnostic":diagnostic
+                });
+            }
+        } else if state.ticket_run_id.is_some() {
+            return json!({
+                "status":"failed",
+                "reason":"Coordinator dispatch wake was not left pending without qualification or launch state",
+                "owner_generation":state.generation,
+                "owner_active":true,
+                "ticket_run_id":state.ticket_run_id,
+                "pending_coordinator_dispatch_wakes":state.pending_wake_count,
+                "coordinator_qualifications":state.verified_qualification_count,
+                "coordinator_agent_runs":state.agent_run_count,
+                "coordinator_active_slots":state.active_slot_count
+            });
+        }
+        if Instant::now() >= deadline {
+            return json!({
+                "status":"timed_out",
+                "reason":"Supervisor dispatch did not leave an unqualified Coordinator wake pending",
+                "owner_generation":state.generation,
+                "owner_active":true,
+                "ticket_run_id":state.ticket_run_id,
+                "pending_coordinator_dispatch_wakes":state.pending_wake_count,
+                "coordinator_qualifications":state.verified_qualification_count,
+                "coordinator_agent_runs":state.agent_run_count,
+                "coordinator_active_slots":state.active_slot_count,
+                "heartbeat_baseline":heartbeat_baseline,
+                "distinct_heartbeat_advances":heartbeat_advances
+            });
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 fn observe_coordinator_block_loss(
     request: &Request<'_>,
     state_root: &Path,
-    status: &Value,
-    dashboard: &Value,
     inbox_observation: &Value,
 ) -> Result<Value, String> {
     let run_id = inbox_observation
         .get("run_id")
         .and_then(Value::as_str)
         .ok_or("Coordinator inbox observation omitted its AgentRun ID")?;
-    let agent = dashboard_agent(dashboard, run_id)
-        .ok_or("dashboard omitted the Coordinator AgentRun identity")?;
+    let deadline = Instant::now() + COORDINATOR_STAGE_LIMIT;
+    let (status, agent) = loop {
+        let status = product(request, state_root, &["status", "--json"])?;
+        let dashboard = product(request, state_root, &["dashboard", "--json"])?;
+        require_success("read controller before block-loss fault", &status)?;
+        require_success("read Coordinator before block-loss fault", &dashboard)?;
+        let status = json_stdout(&status);
+        let dashboard = json_stdout(&dashboard);
+        if status.pointer("/owner/active") != Some(&Value::Bool(true)) {
+            return Err("controller stopped before the block-loss fault".into());
+        }
+        if let Some(agent) = dashboard_agent(&dashboard, run_id) {
+            match agent["state"].as_str() {
+                Some("running")
+                    if agent["rex_session_id"].as_str() == Some(request.rex_session)
+                        && agent["rex_window_id"].as_str().is_some()
+                        && agent["rex_block_id"].as_str().is_some() =>
+                {
+                    break (status, agent.clone());
+                }
+                Some("launch_pending" | "running") => {}
+                _ => return Err("Coordinator stopped before the block-loss fault".into()),
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("Coordinator did not publish a running Rex block before the fault".into());
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
     let window_id = agent["rex_window_id"]
         .as_str()
         .ok_or("Coordinator dashboard row omitted its Rex window")?;
@@ -1705,6 +1973,60 @@ mod tests {
             Some(COORDINATOR_BLOCK_LOSS_STAGE.into())
         );
         assert!(parse_acceptance_stage(Some("unknown".into())).is_err());
+    }
+
+    #[test]
+    fn coordinator_qualification_wait_query_requires_pending_wake_and_no_launch_state() {
+        let database = Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE controller_owners(singleton INTEGER,generation INTEGER,heartbeat_at_unix INTEGER,stopped_at_unix INTEGER);
+                 CREATE TABLE ticket_runs(ticket_run_id TEXT,project_id TEXT,namespace TEXT,ticket_id TEXT,generation INTEGER,internal_phase TEXT);
+                 CREATE TABLE role_wake_inputs(project_id TEXT,role_session_id TEXT,source_type TEXT,source_id TEXT,lifecycle TEXT);
+                 CREATE TABLE provider_qualifications(project_id TEXT,profile_id TEXT,status TEXT);
+                 CREATE TABLE agent_launch_authority(project_id TEXT,ticket_run_id TEXT,role TEXT,agent_run_id TEXT);
+                 CREATE TABLE agent_runs(agent_run_id TEXT);
+                 CREATE TABLE execution_slots(owner_kind TEXT,owner_id TEXT,disposition TEXT);
+                 INSERT INTO controller_owners VALUES (1,5,100,NULL);
+                 INSERT INTO ticket_runs VALUES ('ticket-run-1','operations_project','fixture/acceptance','ticket-1',1,'planning');
+                 INSERT INTO role_wake_inputs VALUES ('operations_project','ticket_run:ticket-run-1:coordinator','ticket_run_dispatch','ticket-run-1','pending');",
+            )
+            .unwrap();
+        let state = coordinator_qualification_wait_state(
+            &database,
+            "operations_project",
+            "fixture/acceptance",
+            "ticket-1",
+            "fixture_coordinator",
+        )
+        .unwrap();
+        assert_eq!(state.generation, 5);
+        assert_eq!(state.heartbeat_at_unix, 100);
+        assert!(state.owner_active);
+        assert_eq!(state.ticket_run_id.as_deref(), Some("ticket-run-1"));
+        assert_eq!(state.pending_wake_count, 1);
+        assert_eq!(state.verified_qualification_count, 0);
+        assert_eq!(state.agent_run_count, 0);
+        assert_eq!(state.active_slot_count, 0);
+
+        database
+            .execute(
+                "INSERT INTO provider_qualifications VALUES ('operations_project','fixture_coordinator','verified')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator_qualification_wait_state(
+                &database,
+                "operations_project",
+                "fixture/acceptance",
+                "ticket-1",
+                "fixture_coordinator",
+            )
+            .unwrap()
+            .verified_qualification_count,
+            1
+        );
     }
 
     #[test]
