@@ -2132,17 +2132,39 @@ mod tests {
         );
         let mut completed_snapshot = snapshot_with_survivor;
         completed_snapshot.cleanup_covered = true;
-        assert!(
-            store
-                .reconcile_missing_agent_block(
+        let disposition = crate::agent_recovery::observe_after_recovery_marker(
+            &mut store,
+            generation,
+            &recoverable,
+            26,
+            |store| {
+                if store.reconcile_missing_agent_block(
                     generation,
                     &recoverable,
                     26,
                     &completed_snapshot,
                     &[],
-                )
-                .unwrap()
+                )? {
+                    Ok(crate::agent_recovery::AgentRecoveryDisposition::BlockLossTerminal)
+                } else {
+                    Err("expected terminal block-loss reconciliation".into())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            disposition,
+            crate::agent_recovery::AgentRecoveryDisposition::BlockLossTerminal
         );
+        let observation_epoch: u64 = store
+            .connection
+            .query_row(
+                "SELECT reservation_epoch FROM agent_run_recovery_observations WHERE agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observation_epoch, recoverable.reservation_epoch);
         let released: String = store
             .connection
             .query_row(

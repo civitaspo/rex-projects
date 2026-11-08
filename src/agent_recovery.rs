@@ -97,6 +97,22 @@ pub struct AgentRecoveryReport {
     pub more_pending: bool,
 }
 
+pub(crate) fn observe_after_recovery_marker(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &RecoverableAgentRun,
+    observed_at_unix: i64,
+    observe: impl FnOnce(&mut ConfigStore) -> Result<AgentRecoveryDisposition, String>,
+) -> Result<AgentRecoveryDisposition, String> {
+    store.record_agent_recovery_observation(
+        owner_generation,
+        &run.agent_run_id,
+        run.reservation_epoch,
+        observed_at_unix,
+    )?;
+    observe(store)
+}
+
 const MAX_FORK_WATCH_RUNS: usize = 64;
 const MAX_FORK_WATCH_IDENTITIES: usize = 1024;
 
@@ -416,26 +432,28 @@ impl AgentRecoveryRuntime {
         let rex_instance = pinned_rex.capabilities().server_instance_id.as_str();
         let mut observations = Vec::with_capacity(runs.len());
         for run in runs {
-            let disposition = if let Some(processes) = &process_table {
-                self.observe_one(
-                    store,
-                    owner_generation,
-                    pinned_rex,
-                    policy,
-                    &run,
-                    rex_instance,
-                    processes,
-                )?
-            } else {
-                AgentRecoveryDisposition::Unresolved {
-                    reason: RecoveryUnknown::ProcessInspectionUnavailable,
-                }
-            };
-            store.record_agent_recovery_observation(
+            let disposition = observe_after_recovery_marker(
+                store,
                 owner_generation,
-                &run.agent_run_id,
-                run.reservation_epoch,
+                &run,
                 policy.now_unix,
+                |store| {
+                    if let Some(processes) = &process_table {
+                        self.observe_one(
+                            store,
+                            owner_generation,
+                            pinned_rex,
+                            policy,
+                            &run,
+                            rex_instance,
+                            processes,
+                        )
+                    } else {
+                        Ok(AgentRecoveryDisposition::Unresolved {
+                            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                        })
+                    }
+                },
             )?;
             observations.push(AgentRecoveryObservation {
                 agent_run_id: run.agent_run_id,
