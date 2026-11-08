@@ -1060,6 +1060,7 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
     let mut owner = ForegroundOwner::spawn(owner_command)
         .expect("spawn foreground controller with captured stderr");
     let startup_deadline = Instant::now() + Duration::from_secs(10);
+    let mut status_polls = 0;
     loop {
         if let Some(status) = owner
             .try_wait()
@@ -1072,16 +1073,30 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
             .args(["--json", "status"])
             .output()
             .unwrap();
-        if status.status.success()
-            && serde_json::from_slice::<serde_json::Value>(&status.stdout)
-                .is_ok_and(|report| report["owner"]["active"] == true)
-        {
+        status_polls += 1;
+        let report = serde_json::from_slice::<serde_json::Value>(&status.stdout);
+        let active = report
+            .as_ref()
+            .map(|report| report["owner"]["active"].clone())
+            .map_err(ToString::to_string);
+        let status_stdout = String::from_utf8_lossy(&status.stdout);
+        let status_stderr = String::from_utf8_lossy(&status.stderr);
+        let status_diagnostic = format!(
+            "exit={:?}, success={}, owner_active={active:?}, stdout={:?}, stderr={:?}",
+            status.status.code(),
+            status.status.success(),
+            status_stdout.chars().take(2048).collect::<String>(),
+            status_stderr.chars().take(2048).collect::<String>(),
+        );
+        if status.status.success() && report.is_ok_and(|report| report["owner"]["active"] == true) {
             break;
         }
         if Instant::now() >= startup_deadline {
             owner.terminate();
             let stderr = owner.stderr_tail();
-            panic!("foreground controller startup timed out after 10s; stderr: {stderr}");
+            panic!(
+                "foreground controller startup timed out after 10s; polls={status_polls}; last status={status_diagnostic}; controller stderr: {stderr}"
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
