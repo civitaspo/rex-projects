@@ -442,6 +442,287 @@ fn validate_stop_process_snapshot(
 }
 
 impl ConfigStore {
+    pub(crate) fn migrate_v13_block_lifecycle(tx: &Transaction<'_>) -> Result<(), String> {
+        tx.execute_batch(
+            "CREATE TABLE agent_block_lifecycle_facts (
+                fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_run_id TEXT NOT NULL REFERENCES agent_runs(agent_run_id),
+                reservation_epoch INTEGER NOT NULL CHECK(reservation_epoch > 0),
+                rex_block_id TEXT NOT NULL,
+                fact_type TEXT NOT NULL CHECK(fact_type IN ('event_received','process_survived','exit_confirmed','slot_released')),
+                observed_at_unix INTEGER NOT NULL CHECK(observed_at_unix >= 0),
+                proof_digest TEXT CHECK(proof_digest IS NULL OR length(proof_digest)=64),
+                detail_json TEXT NOT NULL CHECK(length(detail_json) <= 65536),
+                UNIQUE(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix)
+             );
+             CREATE INDEX agent_block_lifecycle_facts_run
+                 ON agent_block_lifecycle_facts(agent_run_id,reservation_epoch,fact_id);
+             CREATE TRIGGER agent_block_lifecycle_facts_immutable_update
+             BEFORE UPDATE ON agent_block_lifecycle_facts
+             BEGIN SELECT RAISE(ABORT, 'Agent block lifecycle facts are immutable'); END;
+             CREATE TRIGGER agent_block_lifecycle_facts_immutable_delete
+             BEFORE DELETE ON agent_block_lifecycle_facts
+             BEGIN SELECT RAISE(ABORT, 'Agent block lifecycle facts are retained'); END;",
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn record_agent_block_close_event(
+        &mut self,
+        owner_generation: u64,
+        rex_server_identity: &str,
+        rex_session_id: &str,
+        rex_block_id: &str,
+        observed_at_unix: i64,
+    ) -> Result<Option<AgentRunId>, String> {
+        if rex_server_identity.trim().is_empty()
+            || rex_session_id.trim().is_empty()
+            || rex_block_id.trim().is_empty()
+            || observed_at_unix < 0
+        {
+            return Err("Rex block-close event identity is incomplete".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let mut statement = tx
+            .prepare(
+                "SELECT a.agent_run_id,a.authority_json,s.reservation_epoch
+                 FROM agent_launch_authority a
+                 JOIN execution_slots s
+                   ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id
+                 WHERE a.rex_server_identity=?1 AND a.rex_session_id=?2 AND a.rex_block_id=?3
+                   AND s.controller_generation=?4 AND s.disposition!='released'",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement
+            .query(params![
+                rex_server_identity,
+                rex_session_id,
+                rex_block_id,
+                owner_generation
+            ])
+            .map_err(|error| error.to_string())?;
+        let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+            drop(rows);
+            drop(statement);
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        let run_id =
+            AgentRunId::parse(row.get::<_, String>(0).map_err(|error| error.to_string())?)?;
+        let authority_json: String = row.get(1).map_err(|error| error.to_string())?;
+        let reservation_epoch: u64 = row.get(2).map_err(|error| error.to_string())?;
+        if rows.next().map_err(|error| error.to_string())?.is_some() {
+            return Err("Rex block-close event maps to multiple active AgentRuns".into());
+        }
+        drop(rows);
+        drop(statement);
+        let authority: crate::launch::AgentLaunchAuthority =
+            crate::protocol::parse_unique(authority_json.as_bytes())
+                .map_err(|error| format!("stored Agent authority is invalid: {error}"))?;
+        if authority.agent_run_id != run_id
+            || authority.rex_server_identity != rex_server_identity
+            || authority.rex_session_id != rex_session_id
+            || authority.rex_block_id != rex_block_id
+        {
+            return Err("Rex block-close event does not match exact launch authority".into());
+        }
+        let detail_json = serde_json::to_string(&serde_json::json!({
+            "server_instance_id": rex_server_identity,
+            "session_id": rex_session_id,
+            "block_id": rex_block_id,
+        }))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
+             VALUES (?1,?2,?3,'event_received',?4,NULL,?5) ON CONFLICT DO NOTHING",
+            params![run_id.as_str(), reservation_epoch, rex_block_id, observed_at_unix, detail_json],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some(run_id))
+    }
+
+    /// Record observations from a missing-block recovery. Capacity is released only when the
+    /// saved process tree and its process group are both absent from the current host snapshot.
+    pub(crate) fn reconcile_missing_agent_block(
+        &mut self,
+        owner_generation: u64,
+        run: &RecoverableAgentRun,
+        observed_at_unix: i64,
+        survivors: &[ProcessIdentity],
+        tree_digest: &Digest,
+    ) -> Result<bool, String> {
+        if observed_at_unix < 0 {
+            return Err("Agent block recovery timestamp is invalid".into());
+        }
+        let provider_json = run
+            .provider_tree_json
+            .as_deref()
+            .ok_or("missing Agent block has no saved provider process tree")?;
+        let provider: ObservedProviderStart =
+            crate::protocol::parse_unique(provider_json.as_bytes())
+                .map_err(|error| format!("saved Agent provider tree is invalid: {error}"))?;
+        let tree_bytes =
+            serde_json::to_vec(&provider.process_tree).map_err(|error| error.to_string())?;
+        let stored_tree_digest = Digest::parse(format!("{:x}", Sha256::digest(tree_bytes)))?;
+        if !provider.process_tree_confirmed
+            || provider.agent_run_id != run.agent_run_id
+            || provider.process_tree.is_empty()
+            || provider.process_tree_digest != *tree_digest
+            || stored_tree_digest != *tree_digest
+        {
+            return Err("Agent block recovery has no exact saved provider tree".into());
+        }
+        let wrapper_json = run
+            .wrapper_identity_json
+            .as_deref()
+            .ok_or("missing Agent block has no saved wrapper identity")?;
+        let wrapper: ObservedWrapperIdentity =
+            crate::protocol::parse_unique(wrapper_json.as_bytes())
+                .map_err(|error| format!("saved Agent wrapper identity is invalid: {error}"))?;
+        if provider.operation_id != run.authority.operation_id
+            || wrapper.rex_session_id != run.authority.rex_session_id
+            || wrapper.rex_block_id != run.authority.rex_block_id
+            || wrapper.runtime_binary_digest != run.authority.runtime_binary_digest
+            || !provider.process_tree.iter().any(|process| {
+                process.pid == provider.provider_pid
+                    && process.start_identity == provider.provider_start_identity
+            })
+            || !provider.process_tree.iter().any(|process| {
+                process.pid == wrapper.pid && process.start_identity == wrapper.start_identity
+            })
+        {
+            return Err("saved Agent process tree does not match its provider or wrapper".into());
+        }
+        if survivors.iter().any(|survivor| {
+            survivor.quality != ProcessIdentityQuality::KernelBirthToken
+                || !provider.process_tree.iter().any(|saved| {
+                    saved.pid == survivor.pid
+                        && saved.start_identity == survivor.start_identity
+                        && saved.process_group_id == survivor.process_group_id
+                        && saved.identity_quality == survivor.quality
+                })
+        }) {
+            return Err("surviving Agent process is outside the saved process tree".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let (authority_json, reservation_epoch, disposition): (String, u64, String) = tx
+            .query_row(
+                "SELECT a.authority_json,s.reservation_epoch,s.disposition
+                 FROM agent_launch_authority a JOIN execution_slots s
+                   ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id
+                 WHERE a.agent_run_id=?1 AND s.controller_generation=?2",
+                params![run.agent_run_id.as_str(), owner_generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if reservation_epoch != run.reservation_epoch
+            || !matches!(disposition.as_str(), "launch_pending" | "live" | "unknown")
+        {
+            return Err("Agent block recovery lost its exact active reservation".into());
+        }
+        let authority: crate::launch::AgentLaunchAuthority =
+            crate::protocol::parse_unique(authority_json.as_bytes())
+                .map_err(|error| format!("stored Agent authority is invalid: {error}"))?;
+        if authority.agent_run_id != run.agent_run_id
+            || authority.rex_block_id != run.authority.rex_block_id
+            || authority.digest()? != run.authority_digest
+        {
+            return Err("Agent block recovery authority changed".into());
+        }
+        if !survivors.is_empty() {
+            let detail_json = serde_json::to_string(&serde_json::json!({
+                "surviving_processes": survivors.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                "process_tree_digest": tree_digest,
+            }))
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
+                 VALUES (?1,?2,?3,'process_survived',?4,?5,?6) ON CONFLICT DO NOTHING",
+                params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, tree_digest.as_str(), detail_json],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        let detail_json = serde_json::to_string(&serde_json::json!({
+            "process_tree_digest": tree_digest,
+            "process_tree_absent": true,
+        }))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
+             VALUES (?1,?2,?3,'exit_confirmed',?4,?5,?6) ON CONFLICT DO NOTHING",
+            params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, tree_digest.as_str(), detail_json],
+        )
+        .map_err(|error| error.to_string())?;
+        let run_changed = tx.execute(
+            "UPDATE agent_runs SET state='cancelled',finished_at_unix=COALESCE(finished_at_unix,?2),controller_generation=?3
+             WHERE agent_run_id=?1 AND controller_generation=?3 AND state IN ('launch_pending','running','unknown')",
+            params![run.agent_run_id.as_str(), observed_at_unix, owner_generation],
+        ).map_err(|error| error.to_string())?;
+        if run_changed != 1 {
+            return Err("AgentRun changed before missing-block terminal proof".into());
+        }
+        let slot_changed = tx
+            .execute(
+                "UPDATE execution_slots SET disposition='released',controller_generation=?3
+             WHERE owner_kind='agent_run' AND owner_id=?1 AND reservation_epoch=?2
+               AND controller_generation=?3 AND disposition IN ('launch_pending','live','unknown')",
+                params![
+                    run.agent_run_id.as_str(),
+                    reservation_epoch,
+                    owner_generation
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if slot_changed != 1 {
+            return Err("exact AgentRun slot changed before missing-block release".into());
+        }
+        let released_detail = serde_json::to_string(&serde_json::json!({
+            "reservation_epoch": reservation_epoch,
+            "process_tree_digest": tree_digest,
+        }))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
+             VALUES (?1,?2,?3,'slot_released',?4,?5,?6) ON CONFLICT DO NOTHING",
+            params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, tree_digest.as_str(), released_detail],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    pub(crate) fn missing_block_survival_age_seconds(
+        &self,
+        run: &RecoverableAgentRun,
+        now_unix: i64,
+    ) -> Result<u64, String> {
+        let first_seen: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT MIN(observed_at_unix) FROM agent_block_lifecycle_facts
+                 WHERE agent_run_id=?1 AND reservation_epoch=?2 AND rex_block_id=?3
+                   AND fact_type='process_survived'",
+                params![
+                    run.agent_run_id.as_str(),
+                    run.reservation_epoch,
+                    run.authority.rex_block_id
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(first_seen.map_or(0, |seen| now_unix.saturating_sub(seen).max(0) as u64))
+    }
+
     pub(crate) fn record_stop_process_snapshot(
         &mut self,
         owner_generation: u64,
@@ -1216,11 +1497,21 @@ impl ConfigStore {
             "UPDATE agent_runs SET state='running',controller_generation=?2 WHERE agent_run_id=?1 AND controller_generation=?2 AND state='unknown'",
             params![evidence.agent_run_id.as_str(),evidence.controller_generation],
         ).map_err(|error| error.to_string())?;
+        let provider_start_json: String = tx
+            .query_row(
+                "SELECT provider_process_tree_json FROM agent_launch_state WHERE agent_run_id=?1",
+                [evidence.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let provider_start: ObservedProviderStart =
+            crate::protocol::parse_unique(provider_start_json.as_bytes())
+                .map_err(|error| format!("stored provider start receipt is invalid: {error}"))?;
         let slot_changed = tx.execute(
             "UPDATE execution_slots SET disposition='live',controller_generation=?4,process_identity_json=?5
              WHERE pool='agent' AND owner_kind='agent_run' AND owner_id=?1 AND slot_index=?2
                AND reservation_epoch=?3 AND disposition IN ('unknown','live')",
-            params![evidence.agent_run_id.as_str(),_slot_index,expected_reservation_epoch,evidence.controller_generation,serde_json::to_string(&serde_json::json!({"provider_pid":evidence.provider_pid,"provider_start_identity":evidence.provider_start_identity,"process_tree_digest":evidence.process_tree_digest})).map_err(|error| error.to_string())?],
+            params![evidence.agent_run_id.as_str(),_slot_index,expected_reservation_epoch,evidence.controller_generation,serde_json::to_string(&serde_json::json!({"provider_pid":evidence.provider_pid,"provider_start_identity":evidence.provider_start_identity,"process_tree_digest":evidence.process_tree_digest,"process_tree":provider_start.process_tree})).map_err(|error| error.to_string())?],
         ).map_err(|error| error.to_string())?;
         if run_changed != 1 || slot_changed != 1 {
             return Err("AgentRun or slot changed while adoption was being recorded".into());

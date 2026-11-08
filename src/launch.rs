@@ -22,6 +22,7 @@ use crate::engine::orchestration::WorkNodeId;
 pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_DATABASE_SCHEMA_VERSION: i64 = 7;
+const MAX_PROVIDER_PROCESS_TREE_IDENTITIES: usize = 1024;
 
 /// Minimal durable StartAgent intent. Handlers resolve authority from controller-owned state.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -987,7 +988,7 @@ pub struct AgentStartRequest {
     pub rex_block_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedWrapperIdentity {
     pub pid: u32,
@@ -1009,6 +1010,19 @@ pub struct ObservedProviderStart {
     pub executable_digest: ContentDigest,
     pub process_tree_digest: ContentDigest,
     pub process_tree_confirmed: bool,
+    #[serde(default)]
+    pub process_tree: Vec<ProviderProcessIdentity>,
+}
+
+/// Secret free kernel identities retained so a vanished Rex block can still be reconciled.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderProcessIdentity {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub process_group_id: u32,
+    pub start_identity: String,
+    pub identity_quality: crate::process::ProcessIdentityQuality,
 }
 
 impl ObservedProviderStart {
@@ -1020,6 +1034,63 @@ impl ObservedProviderStart {
             || !self.process_tree_confirmed
         {
             return Err("provider process start observation is incomplete or mismatched".into());
+        }
+        if !self.process_tree.is_empty() {
+            let provider = self.process_tree.iter().find(|process| {
+                process.pid == self.provider_pid
+                    && process.start_identity == self.provider_start_identity
+            });
+            if provider.is_none()
+                || self.process_tree.iter().any(|process| {
+                    process.pid == 0
+                        || process.start_identity.trim().is_empty()
+                        || process.identity_quality
+                            != crate::process::ProcessIdentityQuality::KernelBirthToken
+                        || process.process_group_id == 0
+                })
+            {
+                return Err("provider process tree lacks exact kernel identities".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the full tree before it can authorize cleanup or capacity release. The older
+    /// `validate` path still accepts an empty tree for reading legacy receipts, but those
+    /// receipts do not establish host process ownership.
+    pub fn validate_complete_process_tree(
+        &self,
+        qualification: &ProviderQualification,
+    ) -> Result<(), String> {
+        self.validate(qualification)?;
+        if self.process_tree.is_empty()
+            || self.process_tree.len() > MAX_PROVIDER_PROCESS_TREE_IDENTITIES
+        {
+            return Err("provider process tree is empty or exceeds its identity limit".into());
+        }
+        let mut pids = BTreeSet::new();
+        let mut provider_found = false;
+        for process in &self.process_tree {
+            if process.pid == 0
+                || process.start_identity.trim().is_empty()
+                || process.identity_quality
+                    != crate::process::ProcessIdentityQuality::KernelBirthToken
+                || process.process_group_id == 0
+                || !pids.insert(process.pid)
+            {
+                return Err("provider process tree has incomplete or duplicate identities".into());
+            }
+            provider_found |= process.pid == self.provider_pid
+                && process.start_identity == self.provider_start_identity;
+        }
+        if !provider_found {
+            return Err("provider process tree does not identify the provider".into());
+        }
+        let tree_bytes =
+            serde_json::to_vec(&self.process_tree).map_err(|error| error.to_string())?;
+        let tree_digest = ContentDigest::parse(format!("{:x}", Sha256::digest(tree_bytes)))?;
+        if tree_digest != self.process_tree_digest {
+            return Err("provider process tree digest does not match its identities".into());
         }
         Ok(())
     }
@@ -1183,13 +1254,15 @@ impl AgentLaunchReceipt {
 mod tests {
     use super::{
         AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, LaunchDecision,
-        LaunchExpectation, ObservedProviderStart, ProviderQualification, QualificationIdentity,
-        QualificationProof, QualificationStatus, authorize_start, migrate_v7,
+        LaunchExpectation, ObservedProviderStart, ProviderProcessIdentity, ProviderQualification,
+        QualificationIdentity, QualificationProof, QualificationStatus, authorize_start,
+        migrate_v7,
     };
     use crate::domain::ids::{
         AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketRunId,
     };
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
+    use sha2::Digest as _;
 
     fn digest(byte: char) -> Digest {
         Digest::parse(byte.to_string().repeat(64)).unwrap()
@@ -1350,6 +1423,7 @@ mod tests {
             executable_digest: qualification.executable_digest.clone(),
             process_tree_digest: digest('4'),
             process_tree_confirmed: true,
+            process_tree: Vec::new(),
         };
         assert!(observation.validate(&qualification).is_ok());
         observation.process_tree_confirmed = false;
@@ -1357,6 +1431,59 @@ mod tests {
         observation.process_tree_confirmed = true;
         observation.executable_digest = digest('5');
         assert!(observation.validate(&qualification).is_err());
+    }
+
+    #[test]
+    fn cleanup_tree_requires_exact_digest_and_accepts_owned_descendant_groups() {
+        let qualification = qualification(QualificationStatus::Verified);
+        let mut observation = ObservedProviderStart {
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            operation_id: OperationId::parse("op-1").unwrap(),
+            provider_pid: 44,
+            provider_start_identity: "pid-start-44".into(),
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest: digest('4'),
+            process_tree_confirmed: true,
+            process_tree: vec![
+                ProviderProcessIdentity {
+                    pid: 43,
+                    parent_pid: 1,
+                    process_group_id: 43,
+                    start_identity: "pid-start-43".into(),
+                    identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+                },
+                ProviderProcessIdentity {
+                    pid: 44,
+                    parent_pid: 43,
+                    process_group_id: 44,
+                    start_identity: "pid-start-44".into(),
+                    identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+                },
+            ],
+        };
+        observation.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&observation.process_tree).unwrap())
+        ))
+        .unwrap();
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_ok()
+        );
+        observation.provider_pid = 45;
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_err()
+        );
+        observation.provider_pid = 44;
+        observation.process_tree_digest = digest('5');
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1474,30 +1601,36 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(connection
-            .execute(
-                "UPDATE agent_runs SET role='coordinator' WHERE agent_run_id='reserved-run'",
-                [],
-            )
-            .is_err());
+        assert!(
+            connection
+                .execute(
+                    "UPDATE agent_runs SET role='coordinator' WHERE agent_run_id='reserved-run'",
+                    [],
+                )
+                .is_err()
+        );
         connection
             .execute(
                 "INSERT INTO agent_runs(agent_run_id) VALUES ('legacy-run')",
                 [],
             )
             .unwrap();
-        assert!(connection
-            .execute(
-                "UPDATE agent_runs SET role='worker' WHERE agent_run_id='legacy-run'",
-                [],
-            )
-            .is_err());
-        assert!(connection
-            .execute(
-                "INSERT INTO agent_runs(agent_run_id,role) VALUES ('invalid-role','other')",
-                [],
-            )
-            .is_err());
+        assert!(
+            connection
+                .execute(
+                    "UPDATE agent_runs SET role='worker' WHERE agent_run_id='legacy-run'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO agent_runs(agent_run_id,role) VALUES ('invalid-role','other')",
+                    [],
+                )
+                .is_err()
+        );
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('provider_qualifications','agent_launch_authority','agent_launch_state','agent_result_evidence','agent_result_wakes')",

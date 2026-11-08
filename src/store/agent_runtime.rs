@@ -1176,8 +1176,10 @@ mod tests {
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
     use crate::launch::{
         AgentLaunchReservation, LAUNCH_SCHEMA_VERSION, ObservedProviderStart,
-        ProviderQualification, QualificationProof, QualificationStatus, RexView, RexViewKind,
+        ProviderProcessIdentity, ProviderQualification, QualificationProof, QualificationStatus,
+        RexView, RexViewKind,
     };
+    use sha2::Digest as _;
 
     #[test]
     fn coordinator_waits_for_active_or_ambiguous_ticket_agents_to_finish() {
@@ -1680,6 +1682,7 @@ mod tests {
             executable_digest: qualification.executable_digest.clone(),
             process_tree_digest: digest('a'),
             process_tree_confirmed: false,
+            process_tree: Vec::new(),
         };
         assert!(
             store
@@ -1696,6 +1699,27 @@ mod tests {
             .unwrap();
         assert_eq!(unchanged, "assigned");
         unconfirmed.process_tree_confirmed = true;
+        unconfirmed.process_tree = vec![
+            ProviderProcessIdentity {
+                pid: 42,
+                parent_pid: 1,
+                process_group_id: 42,
+                start_identity: "wrapper-start-1".into(),
+                identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            },
+            ProviderProcessIdentity {
+                pid: 100,
+                parent_pid: 42,
+                process_group_id: 100,
+                start_identity: "provider-start".into(),
+                identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            },
+        ];
+        unconfirmed.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&unconfirmed.process_tree).unwrap())
+        ))
+        .unwrap();
         store
             .confirm_provider_started(generation, &unconfirmed)
             .unwrap();
@@ -1708,6 +1732,183 @@ mod tests {
             )
             .unwrap();
         assert_eq!(consumed, "consumed");
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO execution_slots(pool,slot_index,owner_kind,owner_id,reservation_epoch,controller_generation,disposition)
+                 VALUES ('rex_projects_hook',7,'agent_run','unrelated-run',99,?1,'unknown')",
+                [generation],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .record_agent_block_close_event(
+                    generation,
+                    "rex-fixture",
+                    "session",
+                    "unrelated-block",
+                    20,
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .record_agent_block_close_event(
+                    generation,
+                    "rex-fixture",
+                    "session",
+                    "block-run-1",
+                    21,
+                )
+                .unwrap(),
+            Some(authority.agent_run_id.clone())
+        );
+        let recoverable = store
+            .recoverable_agent_runs(generation, 8)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.agent_run_id == authority.agent_run_id)
+            .unwrap();
+        let invalid_digest = Digest::parse("f".repeat(64)).unwrap();
+        assert!(
+            store
+                .reconcile_missing_agent_block(generation, &recoverable, 22, &[], &invalid_digest,)
+                .is_err()
+        );
+        let mut without_provider = recoverable.clone();
+        let mut provider: ObservedProviderStart = crate::protocol::parse_unique(
+            without_provider
+                .provider_tree_json
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        provider.process_tree.retain(|process| process.pid == 42);
+        provider.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&provider.process_tree).unwrap())
+        ))
+        .unwrap();
+        let providerless_digest = provider.process_tree_digest.clone();
+        without_provider.provider_tree_json = Some(serde_json::to_string(&provider).unwrap());
+        assert!(
+            store
+                .reconcile_missing_agent_block(
+                    generation,
+                    &without_provider,
+                    22,
+                    &[],
+                    &providerless_digest,
+                )
+                .is_err()
+        );
+        let mut without_wrapper = recoverable.clone();
+        let mut provider: ObservedProviderStart = crate::protocol::parse_unique(
+            without_wrapper
+                .provider_tree_json
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        provider.process_tree.retain(|process| process.pid == 100);
+        provider.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&provider.process_tree).unwrap())
+        ))
+        .unwrap();
+        let wrapperless_digest = provider.process_tree_digest.clone();
+        without_wrapper.provider_tree_json = Some(serde_json::to_string(&provider).unwrap());
+        assert!(
+            store
+                .reconcile_missing_agent_block(
+                    generation,
+                    &without_wrapper,
+                    22,
+                    &[],
+                    &wrapperless_digest,
+                )
+                .is_err()
+        );
+        let state_before_valid_observation: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_before_valid_observation, "launch_pending");
+        let surviving_provider = crate::process::ProcessIdentity {
+            pid: 100,
+            parent_pid: 42,
+            process_group_id: 100,
+            start_identity: "provider-start".into(),
+            command: "/usr/bin/codex".into(),
+            quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+        };
+        assert!(matches!(
+            store
+                .reconcile_missing_agent_block(
+                    generation,
+                    &recoverable,
+                    22,
+                    &[surviving_provider],
+                    &unconfirmed.process_tree_digest,
+                )
+                .unwrap(),
+            false
+        ));
+        let retained: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unrelated: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id='unrelated-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, "launch_pending");
+        assert_eq!(unrelated, "unknown");
+        assert!(
+            store
+                .reconcile_missing_agent_block(
+                    generation,
+                    &recoverable,
+                    26,
+                    &[],
+                    &unconfirmed.process_tree_digest,
+                )
+                .unwrap()
+        );
+        let released: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unrelated: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id='unrelated-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(released, "released");
+        assert_eq!(unrelated, "unknown");
         let persisted_role: String = store
             .connection
             .query_row(
@@ -1770,10 +1971,11 @@ mod tests {
         next.wake_snapshot.inputs[0].wake_input_id = 2;
         next.wake_snapshot.inputs[0].source_id = "event-2".into();
         next.wake_snapshot.digest = next.wake_snapshot.content_digest().unwrap();
-        assert!(matches!(
-            reopened.prepare_role_launch(&next).unwrap(),
-            LaunchPreparationOutcome::Prepared { .. }
-        ));
+        let next_preparation = reopened.prepare_role_launch(&next).unwrap();
+        assert!(
+            matches!(&next_preparation, LaunchPreparationOutcome::Prepared { .. }),
+            "unexpected next launch preparation: {next_preparation:?}"
+        );
         let slot_owner: String = reopened
             .connection
             .query_row(

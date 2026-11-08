@@ -248,11 +248,26 @@ pub fn record_and_verify_agent_terminal(
     if run_changed != 1 {
         return Err("AgentRun state changed before terminal evidence was recorded".into());
     }
-    tx.execute(
-        "UPDATE execution_slots SET disposition='released',controller_generation=?2 WHERE owner_id=(SELECT logical_owner FROM agent_runs WHERE agent_run_id=?1) AND project_id=?3 AND controller_generation=?2 AND disposition IN ('launch_pending','live','parked')",
-        params![run_id.as_str(), owner_generation, authority.project_id.as_str()],
-    )
-    .map_err(|error| error.to_string())?;
+    let slot: Option<(String, u32, u64)> = tx
+        .query_row(
+            "SELECT pool,slot_index,reservation_epoch FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND project_id=?2 AND controller_generation=?3 AND disposition IN ('launch_pending','live','parked','unknown')",
+            params![run_id.as_str(), authority.project_id.as_str(), owner_generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((pool, slot_index, reservation_epoch)) = slot else {
+        return Err("Agent terminal has no exact active execution slot to release".into());
+    };
+    let released = tx
+        .execute(
+            "UPDATE execution_slots SET disposition='released',controller_generation=?5 WHERE pool=?1 AND slot_index=?2 AND owner_kind='agent_run' AND owner_id=?3 AND reservation_epoch=?4 AND project_id=?6 AND controller_generation=?5 AND disposition IN ('launch_pending','live','parked','unknown')",
+            params![pool, slot_index, run_id.as_str(), reservation_epoch, owner_generation, authority.project_id.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
+    if released != 1 {
+        return Err("Agent terminal did not release its exact execution slot".into());
+    }
     tx.commit().map_err(|error| error.to_string())?;
 
     verify_agent_terminal(store, owner_generation, run_id)
@@ -3230,6 +3245,7 @@ pub(crate) mod host_validation_fixture {
             executable_digest: qualification.executable_digest.clone(),
             process_tree_digest: digest(b"observed process tree")?,
             process_tree_confirmed: true,
+            process_tree: Vec::new(),
         };
         store.connection.execute(
             "INSERT INTO agent_launch_state(agent_run_id,state,start_request_id,start_request_digest,provider_process_tree_json,last_observed_at_unix,updated_at_unix) VALUES (?1,'running',?2,?3,?4,?5,?5)",

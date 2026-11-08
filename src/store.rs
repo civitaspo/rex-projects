@@ -36,7 +36,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -514,6 +514,10 @@ impl ConfigStore {
         if existing_version == 12 {
             artifact_registry::validate_v12_schema(&connection)?;
         }
+        if existing_version == 13 {
+            artifact_registry::validate_v12_schema(&connection)?;
+            artifact_registry::validate_v13_schema(&connection)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
@@ -582,6 +586,13 @@ impl ConfigStore {
             artifact_registry::migrate_v12(&connection)?;
         }
         artifact_registry::validate_v12_schema(&connection)?;
+        if existing_version < 13 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            artifact_registry::migrate_v13(&connection)?;
+        }
+        artifact_registry::validate_v13_schema(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,
@@ -4733,7 +4744,7 @@ impl ConfigStore {
         let qualification: ProviderQualification =
             crate::protocol::parse_unique(qualification_json.as_bytes())
                 .map_err(|error| format!("stored provider qualification is invalid: {error}"))?;
-        observation.validate(&qualification)?;
+        observation.validate_complete_process_tree(&qualification)?;
         let process_tree_json =
             serde_json::to_string(observation).map_err(|error| error.to_string())?;
         let now = now_unix()?;
@@ -4749,6 +4760,7 @@ impl ConfigStore {
             "provider_start_identity": observation.provider_start_identity,
             "executable_digest": observation.executable_digest,
             "process_tree_digest": observation.process_tree_digest,
+            "process_tree": &observation.process_tree,
         });
         let run_changed = tx.execute(
             "UPDATE agent_runs SET state='running',process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state='launch_pending' AND controller_generation=?4",

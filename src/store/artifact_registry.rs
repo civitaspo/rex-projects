@@ -289,7 +289,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version != 12 {
+    if !matches!(version, 12 | 13) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -353,6 +353,76 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
         return Err(
             "schema 12 agent_runs.role immutable trigger is missing or incompatible".into(),
         );
+    }
+    Ok(())
+}
+
+pub fn migrate_v13(connection: &Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version == 13 {
+        return validate_v13_schema(connection);
+    }
+    if version != 12 {
+        return Err(format!(
+            "Agent block lifecycle migration 13 requires schema 12, found {version}"
+        ));
+    }
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    crate::store::ConfigStore::migrate_v13_block_lifecycle(&tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations(version,applied_at_unix) VALUES (13,?1)",
+        [crate::store::now_unix()?],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.pragma_update(None, "user_version", 13)
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    validate_v13_schema(connection)
+}
+
+pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version != 13 {
+        return Err(format!(
+            "Agent block lifecycle schema version mismatch: {version}"
+        ));
+    }
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_block_lifecycle_facts')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let migration_recorded: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=13)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let immutable_update: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='agent_block_lifecycle_facts_immutable_update')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let immutable_delete: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='agent_block_lifecycle_facts_immutable_delete')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !exists || !migration_recorded || !immutable_update || !immutable_delete {
+        return Err("schema 13 Agent block lifecycle migration is incomplete".into());
     }
     Ok(())
 }
@@ -1267,14 +1337,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v12_migration_composes_helpers_and_reopens_without_schema_changes() {
+    fn fresh_v13_migration_composes_helpers_and_reopens_without_schema_changes() {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         for table in [
             "registered_artifacts",
             "agent_terminal_receipts",
@@ -1287,6 +1357,7 @@ mod tests {
             "profile_trial_authorizations",
             "publication_baselines",
             "merge_work_items",
+            "agent_block_lifecycle_facts",
         ] {
             let found: bool = store
                 .connection
@@ -1296,7 +1367,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert!(found, "schema v12 is missing {table}");
+            assert!(found, "schema v13 is missing {table}");
         }
         drop(store);
 
@@ -1305,8 +1376,9 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         super::validate_v12_schema(&reopened.connection).unwrap();
+        super::validate_v13_schema(&reopened.connection).unwrap();
     }
 
     #[test]
@@ -1361,11 +1433,11 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]
-    fn valid_v10_database_migrates_to_v12_and_reopens() {
+    fn valid_v10_database_migrates_to_v13_and_reopens() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite3");
         let mut connection = Connection::open(&path).unwrap();
@@ -1391,8 +1463,9 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         super::validate_v12_schema(&store.connection).unwrap();
+        super::validate_v13_schema(&store.connection).unwrap();
     }
 
     fn test_authority() -> AgentLaunchAuthority {

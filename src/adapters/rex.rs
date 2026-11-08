@@ -227,6 +227,17 @@ fn parse_rex_event_frame(frame: &[u8]) -> Result<Option<RexEventSignal>, ()> {
     }
 }
 
+pub(crate) fn rex_event_requires_inventory(
+    signal: &RexEventSignal,
+    expected_session: &str,
+) -> bool {
+    match signal {
+        RexEventSignal::BlockClosed { session_id, .. }
+        | RexEventSignal::InventoryChanged { session_id } => session_id == expected_session,
+        RexEventSignal::RescanRequired => true,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentBlockSpec {
     pub run_id: String,
@@ -1442,6 +1453,42 @@ impl RexCliTransport {
         Ok(observation)
     }
 
+    /// Return whether the exact managed block remains in a successful pinned session inventory.
+    /// `false` is authoritative absence; transport or identity errors stay `Err`.
+    pub fn agent_block_is_present(
+        &self,
+        window: &TicketWindow,
+        run_id: &str,
+        block_id: &str,
+    ) -> Result<bool, RexError> {
+        self.check_window(window)?;
+        let expected_label = owned_block_label(run_id)?;
+        let view = self.session_view()?;
+        if view.get("session_id").and_then(Value::as_str) != Some(&self.session_id) {
+            return Err(RexError::Uncertain);
+        }
+        let windows = view
+            .get("windows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RexError::Protocol("session view has no windows array".into()))?;
+        let mut present = false;
+        for item in windows {
+            let Some(window_id) = item.get("window_id").and_then(Value::as_str) else {
+                return Err(RexError::Protocol("session view window has no ID".into()));
+            };
+            for block in blocks_in_window(&view, window_id, None)? {
+                if block.block_id == block_id {
+                    if block.label != expected_label {
+                        return Err(RexError::Uncertain);
+                    }
+                    present = true;
+                }
+            }
+        }
+        self.verify_identity()?;
+        Ok(present)
+    }
+
     fn check_window(&self, window: &TicketWindow) -> Result<(), RexError> {
         if window.server_instance_id != self.expected_instance_id
             || window.session_id != self.session_id
@@ -2079,13 +2126,20 @@ mod tests {
 
     #[test]
     fn rex_event_reader_bounds_frames_and_requests_rescan_on_overflow() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+        let (sender, receiver) = mpsc::sync_channel(2);
         let overflowed = Arc::new(AtomicBool::new(false));
         let mut input = vec![b'x'; MAX_REX_EVENT_FRAME_BYTES + 1];
         input.push(b'\n');
-        input.extend_from_slice(br#"{"type":"session_event","payload":{"session_id":"s","event":{"type":"block_closed","payload":{"block_id":"b"}}}}"#);
-        input.push(b'\n');
+        for block in ["b", "c", "d"] {
+            input.extend_from_slice(
+                format!(
+                    "{{\"type\":\"session_event\",\"payload\":{{\"session_id\":\"s\",\"event\":{{\"type\":\"block_closed\",\"payload\":{{\"block_id\":\"{block}\"}}}}}}}}\n"
+                )
+                .as_bytes(),
+            );
+        }
         read_rex_events(input.as_slice(), sender, Arc::clone(&overflowed));
+        assert!(overflowed.load(Ordering::Acquire));
         assert_eq!(receiver.try_recv(), Ok(RexEventSignal::RescanRequired));
         assert_eq!(
             receiver.try_recv(),
@@ -2094,6 +2148,104 @@ mod tests {
                 block_id: "b".into()
             })
         );
-        assert!(!overflowed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rex_events_for_other_sessions_do_not_request_inventory() {
+        assert!(!rex_event_requires_inventory(
+            &RexEventSignal::BlockClosed {
+                session_id: "other-session".into(),
+                block_id: "block-a".into(),
+            },
+            "pinned-session"
+        ));
+        assert!(rex_event_requires_inventory(
+            &RexEventSignal::BlockClosed {
+                session_id: "pinned-session".into(),
+                block_id: "block-a".into(),
+            },
+            "pinned-session"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_event_stream_reaps_its_cli_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rex fake");
+        let body = r##"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/rex-test.sock","instance_id":"instance-1","host_id":"host-1","rex_version":"1.2.3"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"events -s session-a --json"*) exec /bin/sleep 30 ;;
+  *) exit 3 ;;
+esac
+"##;
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let transport = RexCliTransport::connect(
+            &script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "instance-1".into(),
+            "session-a".into(),
+            BTreeMap::<OsString, OsString>::new(),
+        )
+        .unwrap();
+        let stream = transport.subscribe_events().unwrap();
+        let pid = stream.child.id();
+        drop(stream);
+        assert!(
+            !crate::process::inspect_process_table()
+                .unwrap()
+                .iter()
+                .any(|process| process.pid == pid)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_stream_eof_requests_reconnect_and_new_stream_receives_events() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rex fake");
+        let body = r##"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/rex-test.sock","instance_id":"instance-1","host_id":"host-1","rex_version":"1.2.3"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"events -s session-a --json"*) printf '%s\n' '{"type":"session_event","payload":{"session_id":"session-a","event":{"type":"block_closed","payload":{"block_id":"block-a"}}}}' ;;
+  *) exit 3 ;;
+esac
+"##;
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let transport = RexCliTransport::connect(
+            &script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "instance-1".into(),
+            "session-a".into(),
+            BTreeMap::<OsString, OsString>::new(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let mut stream = transport.subscribe_events().unwrap();
+            let mut received = Vec::new();
+            for _ in 0..100 {
+                received.extend(stream.drain(4));
+                if !stream.is_alive().unwrap() && !received.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(received.contains(&RexEventSignal::BlockClosed {
+                session_id: "session-a".into(),
+                block_id: "block-a".into(),
+            }));
+            assert!(!stream.is_alive().unwrap());
+        }
     }
 }

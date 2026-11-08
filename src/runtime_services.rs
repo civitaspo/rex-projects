@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::adapters::rex::{
     AgentBlockSpec, CreateDisposition, RexCliTransport, RexContextBlock, RexIdentity, RexWindow,
@@ -66,6 +66,8 @@ pub struct RuntimeServices {
     rex: Arc<RexCliTransport>,
     rex_events: Option<crate::adapters::rex::RexEventStream>,
     rex_inventory_required: bool,
+    rex_inventory_last_checked: Option<Instant>,
+    rex_event_retry_after: Option<Instant>,
     rex_cli_path: PathBuf,
     rex_search_path: Vec<PathBuf>,
     state_root: PathBuf,
@@ -280,6 +282,8 @@ impl RuntimeServices {
             rex,
             rex_events,
             rex_inventory_required: true,
+            rex_inventory_last_checked: None,
+            rex_event_retry_after: None,
             rex_cli_path: rex_binary,
             rex_search_path: search_path,
             state_root: state_root.to_owned(),
@@ -2429,6 +2433,7 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
+        let now = Instant::now();
         if self
             .rex_events
             .as_mut()
@@ -2436,34 +2441,73 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
         {
             self.rex_events = None;
             self.rex_inventory_required = true;
+            self.rex_inventory_last_checked = None;
+            self.rex_event_retry_after = Some(now + Duration::from_secs(5));
         }
-        if self.rex_events.is_none() {
-            self.rex_events = self.rex.subscribe_events().ok();
-            self.rex_inventory_required = true;
-        }
-        if let Some(events) = &self.rex_events {
-            for signal in events.drain(128) {
-                match signal {
-                    crate::adapters::rex::RexEventSignal::BlockClosed { session_id, .. }
-                    | crate::adapters::rex::RexEventSignal::InventoryChanged { session_id }
-                        if session_id == self.rex_identity.session_id =>
-                    {
-                        self.rex_inventory_required = true;
-                    }
-                    crate::adapters::rex::RexEventSignal::RescanRequired => {
-                        self.rex_inventory_required = true;
-                    }
-                    _ => {}
+        if self.rex_events.is_none()
+            && self
+                .rex_event_retry_after
+                .is_none_or(|retry_after| now >= retry_after)
+        {
+            match self.rex.subscribe_events() {
+                Ok(events) => {
+                    self.rex_events = Some(events);
+                    self.rex_event_retry_after = None;
+                    self.rex_inventory_required = true;
+                    self.rex_inventory_last_checked = None;
+                }
+                Err(_) => {
+                    self.rex_event_retry_after = Some(now + Duration::from_secs(5));
                 }
             }
         }
-        if self.rex_inventory_required {
+        if let Some(events) = &self.rex_events {
+            for signal in events.drain(128) {
+                if let crate::adapters::rex::RexEventSignal::BlockClosed {
+                    session_id,
+                    block_id,
+                } = &signal
+                    && session_id == &self.rex_identity.session_id
+                {
+                    store.record_agent_block_close_event(
+                        owner_generation,
+                        &self.rex_identity.instance_id,
+                        session_id,
+                        block_id,
+                        now_unix,
+                    )?;
+                }
+                if crate::adapters::rex::rex_event_requires_inventory(
+                    &signal,
+                    &self.rex_identity.session_id,
+                ) {
+                    self.rex_inventory_required = true;
+                    self.rex_inventory_last_checked = None;
+                }
+            }
+        }
+        if self.rex_inventory_required
+            && self
+                .rex_inventory_last_checked
+                .is_none_or(|checked| now.duration_since(checked) >= Duration::from_secs(5))
+        {
             // This pinned inventory is only a wake/reconciliation input. The recovery
             // runtime still verifies each persisted AgentRun and its process identities.
-            self.rex
-                .list_owned_windows_and_blocks()
-                .map_err(|error| error.to_string())?;
-            self.rex_inventory_required = false;
+            if self.rex.list_owned_windows_and_blocks().is_ok() {
+                self.rex_inventory_required = false;
+                self.rex_inventory_last_checked = Some(now);
+            } else {
+                // Per-run recovery below independently retains every uncertain slot. Keep
+                // the inventory pending and retry at a bounded cadence without stopping the
+                // foreground controller.
+                self.rex_inventory_last_checked = Some(now);
+            }
+        }
+        if self
+            .rex_inventory_last_checked
+            .is_some_and(|checked| now.duration_since(checked) >= Duration::from_secs(5))
+        {
+            self.rex_inventory_required = true;
         }
         let policy = crate::agent_recovery::RecoveryPolicy {
             rex_session_id: self.rex_identity.session_id.clone(),

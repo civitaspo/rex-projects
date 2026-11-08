@@ -1,6 +1,6 @@
 //! Reconcile live finite Agent turns after the machine controller changes owner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -14,7 +14,8 @@ use crate::adapters::rex::{
 use crate::domain::ids::{AgentRunId, Digest, ProfileId};
 use crate::launch::{ObservedProviderStart, ObservedWrapperIdentity};
 use crate::process::{
-    ProcessIdentity, ProcessIdentityQuality, capture_process_tree, inspect_process_table,
+    ProcessIdentity, ProcessIdentityQuality, ProcessSignal, capture_process_tree,
+    inspect_process_table, signal_process_group_if_observed,
 };
 use crate::store::ConfigStore;
 use crate::store::agent_recovery::{
@@ -60,6 +61,9 @@ pub enum AgentRecoveryDisposition {
     Adopted,
     AdoptedWithAttention,
     AlreadyAdopted,
+    ProviderStarted,
+    BlockLossStopping,
+    BlockLossTerminal,
     Unresolved { reason: RecoveryUnknown },
 }
 
@@ -178,6 +182,17 @@ impl AgentRecoveryRuntime {
                 });
             }
         };
+        if run.launch_state == "awaiting_provider" && run.provider_tree_json.is_none() {
+            return observe_provider_start(
+                store,
+                owner_generation,
+                pinned_rex,
+                run,
+                &wrapper,
+                rex_instance,
+                process_table,
+            );
+        }
         let provider: ObservedProviderStart = match run.provider_tree_json.as_deref() {
             Some(json) => crate::protocol::parse_unique(json.as_bytes())
                 .map_err(|error| format!("stored provider start receipt is invalid: {error}"))?,
@@ -215,6 +230,7 @@ impl AgentRecoveryRuntime {
             || stored_process.provider_start_identity != provider.provider_start_identity
             || stored_process.executable_digest != provider.executable_digest
             || stored_process.process_tree_digest != provider.process_tree_digest
+            || stored_process.process_tree != provider.process_tree
         {
             return Ok(AgentRecoveryDisposition::Unresolved {
                 reason: RecoveryUnknown::ProviderIdentityMismatch,
@@ -223,7 +239,19 @@ impl AgentRecoveryRuntime {
         let qualification = store
             .provider_qualification(&authority.qualification_receipt_digest)?
             .ok_or_else(|| "Agent recovery qualification receipt is missing".to_owned())?;
-        provider.validate(&qualification)?;
+        if provider
+            .validate_complete_process_tree(&qualification)
+            .is_err()
+        {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProviderIdentityMismatch,
+            });
+        }
+        if !provider_tree_contains_wrapper(&provider, &wrapper) {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::WrapperIdentityMismatch,
+            });
+        }
         let window = TicketWindow {
             server_instance_id: rex_instance.to_owned(),
             session_id: authority.rex_session_id.clone(),
@@ -232,6 +260,30 @@ impl AgentRecoveryRuntime {
             initial_block_id: Some(authority.rex_block_id.clone()),
             disposition: CreateDisposition::Existing,
         };
+        match pinned_rex.agent_block_is_present(
+            &window,
+            authority.agent_run_id.as_str(),
+            &authority.rex_block_id,
+        ) {
+            Ok(false) => {
+                return reconcile_missing_block(
+                    store,
+                    owner_generation,
+                    run,
+                    &provider,
+                    &wrapper,
+                    &qualification,
+                    policy,
+                    process_table,
+                );
+            }
+            Ok(true) => {}
+            Err(_) => {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::RexObservationUnavailable,
+                });
+            }
+        }
         let observation = match pinned_rex.observe_process(
             &window,
             authority.agent_run_id.as_str(),
@@ -370,6 +422,246 @@ impl AgentRecoveryRuntime {
     }
 }
 
+fn reconcile_missing_block(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &RecoverableAgentRun,
+    provider: &ObservedProviderStart,
+    wrapper: &ObservedWrapperIdentity,
+    qualification: &crate::launch::ProviderQualification,
+    policy: &RecoveryPolicy,
+    current: &[ProcessIdentity],
+) -> Result<AgentRecoveryDisposition, String> {
+    if provider
+        .validate_complete_process_tree(qualification)
+        .is_err()
+        || !provider_tree_contains_wrapper(provider, wrapper)
+    {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProviderIdentityMismatch,
+        });
+    }
+    let saved = provider
+        .process_tree
+        .iter()
+        .map(|identity| ProcessIdentity {
+            pid: identity.pid,
+            parent_pid: identity.parent_pid,
+            process_group_id: identity.process_group_id,
+            start_identity: identity.start_identity.clone(),
+            command: String::new(),
+            quality: identity.identity_quality,
+        })
+        .collect::<Vec<_>>();
+    if saved.is_empty() {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let groups = saved
+        .iter()
+        .map(|process| process.process_group_id)
+        .collect::<BTreeSet<_>>();
+    if groups.contains(&0)
+        || saved.iter().any(|process| {
+            process.quality != ProcessIdentityQuality::KernelBirthToken
+                || process.start_identity.trim().is_empty()
+        })
+    {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let survivors = saved
+        .iter()
+        .filter(|expected| {
+            current.iter().any(|actual| {
+                actual.pid == expected.pid
+                    && actual.start_identity == expected.start_identity
+                    && actual.quality == ProcessIdentityQuality::KernelBirthToken
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let identity_downgrade = saved.iter().any(|expected| {
+        current.iter().any(|actual| {
+            actual.pid == expected.pid
+                && actual.start_identity == expected.start_identity
+                && actual.quality != ProcessIdentityQuality::KernelBirthToken
+        })
+    });
+    if identity_downgrade {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let unrecorded_group_members = current.iter().any(|actual| {
+        groups.contains(&actual.process_group_id)
+            && !saved.iter().any(|expected| {
+                expected.pid == actual.pid && expected.start_identity == actual.start_identity
+            })
+    });
+    if unrecorded_group_members {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let digest = provider.process_tree_digest.clone();
+    let released = store.reconcile_missing_agent_block(
+        owner_generation,
+        run,
+        policy.now_unix,
+        &survivors,
+        &digest,
+    )?;
+    if released {
+        return Ok(AgentRecoveryDisposition::BlockLossTerminal);
+    }
+    let signal = if store.missing_block_survival_age_seconds(run, policy.now_unix)? >= 3 {
+        ProcessSignal::Kill
+    } else {
+        ProcessSignal::Terminate
+    };
+    for group_id in groups {
+        signal_process_group_if_observed(group_id, &saved, current, signal)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(AgentRecoveryDisposition::BlockLossStopping)
+}
+
+fn provider_tree_contains_wrapper(
+    provider: &ObservedProviderStart,
+    wrapper: &ObservedWrapperIdentity,
+) -> bool {
+    provider.process_tree.iter().any(|process| {
+        process.pid == wrapper.pid && process.start_identity == wrapper.start_identity
+    })
+}
+
+fn observe_provider_start(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    pinned_rex: &RexCliTransport,
+    run: &RecoverableAgentRun,
+    wrapper: &ObservedWrapperIdentity,
+    rex_instance: &str,
+    process_table: &[ProcessIdentity],
+) -> Result<AgentRecoveryDisposition, String> {
+    let authority = &run.authority;
+    if wrapper.rex_session_id != authority.rex_session_id
+        || wrapper.rex_block_id != authority.rex_block_id
+        || wrapper.runtime_binary_digest != authority.runtime_binary_digest
+    {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::WrapperIdentityMismatch,
+        });
+    }
+    let qualification = store
+        .provider_qualification(&authority.qualification_receipt_digest)?
+        .ok_or_else(|| "Agent start qualification receipt is missing".to_owned())?;
+    let window = TicketWindow {
+        server_instance_id: rex_instance.to_owned(),
+        session_id: authority.rex_session_id.clone(),
+        window_id: authority.rex_window_id.clone(),
+        label: String::new(),
+        initial_block_id: Some(authority.rex_block_id.clone()),
+        disposition: CreateDisposition::Existing,
+    };
+    let rex_observation = match pinned_rex.observe_process(
+        &window,
+        authority.agent_run_id.as_str(),
+        &authority.rex_block_id,
+    ) {
+        Ok(observation) => observation,
+        Err(_) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::RexObservationUnavailable,
+            });
+        }
+    };
+    let Some(rex_wrapper) = rex_observation.child.as_ref() else {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::WrapperIdentityMismatch,
+        });
+    };
+    let Some(rex_provider) = rex_observation.foreground.as_ref() else {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProviderIdentityMismatch,
+        });
+    };
+    let expected_executable = std::fs::canonicalize(&qualification.executable_path).ok();
+    if rex_observation.last_exit.is_some()
+        || rex_wrapper.pid != wrapper.pid
+        || rex_provider.pid == wrapper.pid
+        || expected_executable.as_ref().is_none_or(|expected| {
+            rex_provider
+                .path
+                .as_deref()
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .as_ref()
+                != Some(expected)
+        })
+    {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProviderIdentityMismatch,
+        });
+    }
+    let Some(wrapper_process) =
+        kernel_identity(process_table, wrapper.pid, &wrapper.start_identity)
+    else {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::WrapperIdentityMismatch,
+        });
+    };
+    let Some(provider_process) = process_table.iter().find(|process| {
+        process.pid == rex_provider.pid
+            && process.quality == ProcessIdentityQuality::KernelBirthToken
+            && std::fs::canonicalize(&process.command).ok() == expected_executable
+    }) else {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProviderIdentityMismatch,
+        });
+    };
+    let tree = capture_process_tree(wrapper_process.pid, process_table);
+    if tree.is_empty()
+        || tree.iter().any(|process| {
+            process.quality != ProcessIdentityQuality::KernelBirthToken
+                || process.process_group_id == 0
+        })
+        || !tree.iter().any(|process| {
+            process.pid == provider_process.pid
+                && process.start_identity == provider_process.start_identity
+        })
+    {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let process_tree = tree
+        .iter()
+        .map(|process| crate::launch::ProviderProcessIdentity {
+            pid: process.pid,
+            parent_pid: process.parent_pid,
+            process_group_id: process.process_group_id,
+            start_identity: process.start_identity.clone(),
+            identity_quality: process.quality,
+        })
+        .collect::<Vec<_>>();
+    let observation = ObservedProviderStart {
+        agent_run_id: authority.agent_run_id.clone(),
+        operation_id: authority.operation_id.clone(),
+        provider_pid: provider_process.pid,
+        provider_start_identity: provider_process.start_identity.clone(),
+        executable_digest: qualification.executable_digest.clone(),
+        process_tree_digest: digest_json(&process_tree)?,
+        process_tree_confirmed: true,
+        process_tree,
+    };
+    observation.validate_complete_process_tree(&qualification)?;
+    store.confirm_provider_started(owner_generation, &observation)?;
+    Ok(AgentRecoveryDisposition::ProviderStarted)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeartbeatStatus {
     Fresh,
@@ -486,11 +778,48 @@ struct StoredProviderIdentity {
     provider_start_identity: String,
     executable_digest: Digest,
     process_tree_digest: Digest,
+    #[serde(default)]
+    process_tree: Vec<crate::launch::ProviderProcessIdentity>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_tree_must_include_the_exact_wrapper_birth_identity() {
+        let provider = ObservedProviderStart {
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            operation_id: crate::domain::ids::OperationId::parse("op-1").unwrap(),
+            provider_pid: 22,
+            provider_start_identity: "provider-born".into(),
+            executable_digest: Digest::parse("a".repeat(64)).unwrap(),
+            process_tree_digest: Digest::parse("b".repeat(64)).unwrap(),
+            process_tree_confirmed: true,
+            process_tree: vec![crate::launch::ProviderProcessIdentity {
+                pid: 11,
+                parent_pid: 1,
+                process_group_id: 11,
+                start_identity: "wrapper-born".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            }],
+        };
+        let wrapper = ObservedWrapperIdentity {
+            pid: 11,
+            start_identity: "wrapper-born".into(),
+            rex_session_id: "session".into(),
+            rex_block_id: "block".into(),
+            runtime_binary_digest: Digest::parse("c".repeat(64)).unwrap(),
+        };
+        assert!(provider_tree_contains_wrapper(&provider, &wrapper));
+        let reused_pid = ObservedWrapperIdentity {
+            start_identity: "different-birth".into(),
+            ..wrapper.clone()
+        };
+        assert!(!provider_tree_contains_wrapper(&provider, &reused_pid));
+        let omitted_wrapper = ObservedWrapperIdentity { pid: 12, ..wrapper };
+        assert!(!provider_tree_contains_wrapper(&provider, &omitted_wrapper));
+    }
 
     fn policy() -> RecoveryPolicy {
         RecoveryPolicy {
