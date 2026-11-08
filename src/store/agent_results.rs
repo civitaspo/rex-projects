@@ -214,7 +214,8 @@ pub fn record_and_verify_agent_terminal(
         .map_err(|error| error.to_string())?;
     super::validate_active_generation(&tx, owner_generation)?;
     verify_persisted_authority(&tx, &authority, &authority_digest)?;
-    verify_ticket_and_run_snapshot(&tx, &authority, owner_generation)?;
+    verify_agent_run_snapshot(&tx, &authority)?;
+    verify_ticket_snapshot(&tx, &authority)?;
     let prior: Option<(String, String)> = tx
         .query_row(
             "SELECT terminal_digest,receipt_json FROM agent_terminal_receipts WHERE agent_run_id=?1",
@@ -491,7 +492,7 @@ pub fn ingest_agent_result(
     super::validate_active_generation(&tx, owner_generation)?;
     verify_persisted_authority(&tx, &authority, &terminal.authority_digest)?;
     verify_terminal_row(&tx, terminal)?;
-    verify_ticket_and_run_snapshot(&tx, &authority, owner_generation)?;
+    verify_agent_run_snapshot(&tx, &authority)?;
     verify_registered_artifacts(
         &tx,
         &authority,
@@ -514,6 +515,11 @@ pub fn ingest_agent_result(
         tx.commit().map_err(|error| error.to_string())?;
         return Ok(IngestedAgentResult { validated, receipt, verified_artifacts });
     }
+
+    // A newly submitted result must still target the current TicketRun revision. An exact
+    // evidence replay has already passed this check when first persisted, and can be needed to
+    // resolve a durable parent wake after the reducer advances the TicketRun.
+    verify_ticket_snapshot(&tx, &authority)?;
 
     let persisted_submission = RoleResultSubmission {
         schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
@@ -674,9 +680,7 @@ pub fn agent_result_for_wake(
     let authority = store
         .agent_launch_authority(&run_id)?
         .ok_or("Agent result wake source has no launch authority")?;
-    if authority.controller_generation != owner_generation
-        || binding_for(&authority)? != submission.binding
-    {
+    if binding_for(&authority)? != submission.binding {
         return Err("Agent result wake source no longer matches its launch authority".into());
     }
     let terminal = verify_agent_terminal(store, owner_generation, &run_id)?;
@@ -1423,10 +1427,9 @@ fn verify_persisted_authority(
     Ok(())
 }
 
-fn verify_ticket_and_run_snapshot(
+fn verify_agent_run_snapshot(
     tx: &Transaction<'_>,
     authority: &AgentLaunchAuthority,
-    _generation: u64,
 ) -> Result<(), String> {
     let run: Option<(String, String, u64, String, u64, String, String)> = tx.query_row("SELECT project_id,config_source,config_revision,config_digest,controller_generation,state,logical_owner FROM agent_runs WHERE agent_run_id=?1", [authority.agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional().map_err(|error| error.to_string())?;
     let Some((project, _source, config_revision, config_digest, run_generation, state, _owner)) =
@@ -1445,6 +1448,13 @@ fn verify_ticket_and_run_snapshot(
                 .into(),
         );
     }
+    Ok(())
+}
+
+fn verify_ticket_snapshot(
+    tx: &Transaction<'_>,
+    authority: &AgentLaunchAuthority,
+) -> Result<(), String> {
     if let Some(ticket_run) = &authority.ticket_run_id {
         let ticket: Option<(String, u64, String, u64)> = tx.query_row("SELECT project_id,revision,config_digest,config_revision FROM ticket_runs WHERE ticket_run_id=?1", [ticket_run.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|error| error.to_string())?;
         if !matches!(ticket, Some((ref project_id, revision, ref config_digest, config_revision)) if project_id == authority.project_id.as_str() && revision == authority.ticket_revision.map(|value| value.0).unwrap_or_default() && config_digest == authority.config_digest.as_str() && config_revision == authority.config_revision.0)
@@ -2408,6 +2418,166 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn applied_result_wake_replays_after_ticket_revision_and_owner_advance() {
+        let payload = serde_json::json!({
+            "plan": { "nodes": [], "requested_investigation_children": 0 },
+            "unresolved_questions": []
+        });
+        let message = RoleResultMessage {
+            schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "coordinator-plan-ready-replay".into(),
+            kind: crate::engine::orchestration::RoleOutputKind::PlanReady,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            result_digest: Some(digest(&serde_json::to_vec(&payload).unwrap()).unwrap()),
+            structured_result: payload,
+            artifact_refs: Vec::new(),
+        };
+        let first_submission = message.clone();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Coordinator,
+                message,
+            )
+            .unwrap();
+        let source_generation = fixture.owner_generation;
+        let evidence_id = fixture.ingested.receipt.evidence_id.clone();
+        let wake_id = fixture.ingested.receipt.wake_input_ids[0];
+        let ticket_run_id = fixture
+            .ingested
+            .validated
+            .binding
+            .ticket_run_id
+            .as_ref()
+            .unwrap();
+
+        // Model the accepted-plan ACK, subsequent prepare/revision advance, and owner restart.
+        fixture
+            .store
+            .acknowledge_validated_agent_result(
+                source_generation,
+                &evidence_id,
+                4,
+                ResultDisposition::Applied,
+            )
+            .unwrap();
+        fixture.store.connection.execute(
+            "UPDATE ticket_runs SET revision=5,internal_phase='implementing' WHERE ticket_run_id=?1",
+            [ticket_run_id.as_str()],
+        ).unwrap();
+
+        let same_owner_replay = agent_result_for_wake(
+            &mut fixture.store,
+            &fixture.artifacts,
+            source_generation,
+            i64::try_from(wake_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(same_owner_replay.receipt.evidence_id, evidence_id);
+
+        fixture.store.stop_owner(source_generation).unwrap();
+        let current_generation = fixture
+            .store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "fixture-owner-restarted".into(),
+                state_root: fixture._temp.path().display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: "test-owner-restarted".into(),
+                executable_path: "/test/fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("http://fixture".into()),
+                rex_server_identity: Some("fixture-rex".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        assert_ne!(source_generation, current_generation);
+
+        let replayed = agent_result_for_wake(
+            &mut fixture.store,
+            &fixture.artifacts,
+            current_generation,
+            i64::try_from(wake_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replayed.receipt.evidence_id, evidence_id);
+        assert!(replayed.receipt.wake_input_ids.contains(&wake_id));
+
+        let repeated = agent_result_for_wake(
+            &mut fixture.store,
+            &fixture.artifacts,
+            current_generation,
+            i64::try_from(wake_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(repeated.receipt.evidence_id, evidence_id);
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                &evidence_id,
+            )
+            .unwrap()
+            .unwrap(),
+            (4, "applied".into())
+        );
+
+        let terminal = verify_agent_terminal(
+            &fixture.store,
+            current_generation,
+            &replayed.validated.binding.agent_run_id,
+        )
+        .unwrap();
+        assert_eq!(
+            terminal.agent_run_id,
+            replayed.validated.binding.agent_run_id
+        );
+        // Even with the old TicketRun revision, the provider terminal still binds the exact
+        // persisted message; changing that message cannot turn a replay into new evidence.
+        let mut changed_submission = first_submission.clone();
+        changed_submission.message_id.push_str("-changed");
+        assert!(
+            ingest_agent_result(
+                &mut fixture.store,
+                &fixture.artifacts,
+                current_generation,
+                &terminal,
+                changed_submission,
+            )
+            .unwrap_err()
+            .contains("submitted role result differs from the persisted provider terminal payload")
+        );
+
+        let mut stale_fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_terminal_result(
+                Role::Coordinator,
+                first_submission.clone(),
+            )
+            .unwrap();
+        stale_fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=5,internal_phase='implementing' WHERE ticket_run_id='fixture-ticket-run'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            stale_fixture
+                .store
+                .store_validated_agent_result(
+                    &stale_fixture.artifacts,
+                    stale_fixture.owner_generation,
+                    &stale_fixture.terminal,
+                    first_submission,
+                )
+                .unwrap_err()
+                .contains("TicketRun revision or config no longer matches Agent launch authority")
+        );
+    }
+
+    #[test]
     fn reviewer_ack_replay_uses_committed_transition_after_ticket_phase_advanced() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
@@ -3288,9 +3458,23 @@ pub(crate) mod host_validation_fixture {
         pub ingested: IngestedAgentResult,
     }
 
+    pub(crate) struct TestTerminalResultFixture {
+        pub _temp: tempfile::TempDir,
+        pub store: ConfigStore,
+        pub artifacts: crate::artifacts::ArtifactStore,
+        pub owner_generation: u64,
+        pub terminal: VerifiedAgentTerminal,
+    }
+
     pub(crate) struct InPlaceValidatedResultFixture {
         pub artifacts: crate::artifacts::ArtifactStore,
         pub ingested: IngestedAgentResult,
+    }
+
+    struct InPlaceTerminalFixture {
+        artifacts: crate::artifacts::ArtifactStore,
+        terminal: VerifiedAgentTerminal,
+        message: RoleResultMessage,
     }
 
     /// Builds real host terminal and result evidence around test-seeded running launch records.
@@ -3300,6 +3484,49 @@ pub(crate) mod host_validation_fixture {
         role: Role,
         message: RoleResultMessage,
     ) -> Result<TestValidatedResultFixture, String> {
+        let mut fixture = host_validated_result_setup(role, message)?;
+        let ingested = fixture.store.store_validated_agent_result(
+            &fixture.artifacts,
+            fixture.owner_generation,
+            &fixture.terminal,
+            fixture.message,
+        )?;
+        Ok(TestValidatedResultFixture {
+            _temp: fixture.temp,
+            store: fixture.store,
+            artifacts: fixture.artifacts,
+            owner_generation: fixture.owner_generation,
+            ingested,
+        })
+    }
+
+    pub(crate) fn host_validated_terminal_result(
+        role: Role,
+        message: RoleResultMessage,
+    ) -> Result<TestTerminalResultFixture, String> {
+        let fixture = host_validated_result_setup(role, message)?;
+        Ok(TestTerminalResultFixture {
+            _temp: fixture.temp,
+            store: fixture.store,
+            artifacts: fixture.artifacts,
+            owner_generation: fixture.owner_generation,
+            terminal: fixture.terminal,
+        })
+    }
+
+    struct HostValidatedResultSetup {
+        temp: tempfile::TempDir,
+        store: ConfigStore,
+        owner_generation: u64,
+        artifacts: crate::artifacts::ArtifactStore,
+        terminal: VerifiedAgentTerminal,
+        message: RoleResultMessage,
+    }
+
+    fn host_validated_result_setup(
+        role: Role,
+        message: RoleResultMessage,
+    ) -> Result<HostValidatedResultSetup, String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = std::fs::canonicalize(temp.path()).map_err(|error| error.to_string())?;
         let mut store = ConfigStore::open_test(&root)?;
@@ -3358,7 +3585,7 @@ pub(crate) mod host_validation_fixture {
         ).map_err(|error| error.to_string())?;
         }
         let evidence = if role == Role::Supervisor {
-            host_validated_supervisor_result_in(
+            host_validated_supervisor_terminal_in(
                 &mut store,
                 &root,
                 owner_generation,
@@ -3366,7 +3593,7 @@ pub(crate) mod host_validation_fixture {
                 message,
             )?
         } else {
-            host_validated_result_in(
+            host_validated_terminal_in(
                 &mut store,
                 &root,
                 owner_generation,
@@ -3376,12 +3603,13 @@ pub(crate) mod host_validation_fixture {
                 message,
             )?
         };
-        Ok(TestValidatedResultFixture {
-            _temp: temp,
+        Ok(HostValidatedResultSetup {
+            temp,
             store,
-            artifacts: evidence.artifacts,
             owner_generation,
-            ingested: evidence.ingested,
+            artifacts: evidence.artifacts,
+            terminal: evidence.terminal,
+            message: evidence.message,
         })
     }
 
@@ -3397,6 +3625,36 @@ pub(crate) mod host_validation_fixture {
         role: Role,
         message: RoleResultMessage,
     ) -> Result<InPlaceValidatedResultFixture, String> {
+        let prepared = host_validated_result_inner(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            Some(ticket_run_id),
+            role,
+            message,
+        )?;
+        let ingested = store.store_validated_agent_result(
+            &prepared.artifacts,
+            owner_generation,
+            &prepared.terminal,
+            prepared.message,
+        )?;
+        Ok(InPlaceValidatedResultFixture {
+            artifacts: prepared.artifacts,
+            ingested,
+        })
+    }
+
+    fn host_validated_terminal_in(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        role: Role,
+        message: RoleResultMessage,
+    ) -> Result<InPlaceTerminalFixture, String> {
         host_validated_result_inner(
             store,
             root,
@@ -3408,14 +3666,13 @@ pub(crate) mod host_validation_fixture {
         )
     }
 
-    /// Builds a host-validated Project-scoped Supervisor result without a TicketRun binding.
-    pub(crate) fn host_validated_supervisor_result_in(
+    fn host_validated_supervisor_terminal_in(
         store: &mut ConfigStore,
         root: &std::path::Path,
         owner_generation: u64,
         project_id: ProjectId,
         message: RoleResultMessage,
-    ) -> Result<InPlaceValidatedResultFixture, String> {
+    ) -> Result<InPlaceTerminalFixture, String> {
         host_validated_result_inner(
             store,
             root,
@@ -3435,7 +3692,7 @@ pub(crate) mod host_validation_fixture {
         ticket_run_id: Option<TicketRunId>,
         role: Role,
         mut message: RoleResultMessage,
-    ) -> Result<InPlaceValidatedResultFixture, String> {
+    ) -> Result<InPlaceTerminalFixture, String> {
         let project = store
             .project(&project_id)?
             .ok_or("fixture Project is missing")?;
@@ -3835,11 +4092,10 @@ pub(crate) mod host_validation_fixture {
         };
         let terminal = store.record_verified_agent_terminal(owner_generation, &start, &result)?;
         let artifacts = crate::artifacts::ArtifactStore::open(&root.join("artifacts"))?;
-        let ingested =
-            store.store_validated_agent_result(&artifacts, owner_generation, &terminal, message)?;
-        Ok(InPlaceValidatedResultFixture {
+        Ok(InPlaceTerminalFixture {
             artifacts,
-            ingested,
+            terminal,
+            message,
         })
     }
 
