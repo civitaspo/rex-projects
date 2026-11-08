@@ -2,9 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -17,7 +18,7 @@ use crate::domain::ids::{AgentRunId, Digest, ProfileId};
 use crate::launch::{ObservedProviderStart, ObservedWrapperIdentity};
 use crate::process::{
     ProcessIdentity, ProcessIdentityQuality, ProcessSignal, capture_process_tree,
-    inspect_process_table, signal_process_group_if_observed,
+    executable_path_for_identity, inspect_process_table, signal_process_group_if_observed,
 };
 use crate::run_step_spool::{BlockLossCleanupSnapshot, RunStepSpool};
 use crate::store::ConfigStore;
@@ -622,6 +623,10 @@ impl AgentRecoveryRuntime {
             || process_tree
                 .iter()
                 .any(|process| process.quality != ProcessIdentityQuality::KernelBirthToken)
+            || !process_tree.iter().any(|process| {
+                process.pid == wrapper_process.pid
+                    && process.start_identity == wrapper_process.start_identity
+            })
             || !process_tree.iter().any(|process| {
                 process.pid == provider_process.pid
                     && process.start_identity == provider_process.start_identity
@@ -1353,23 +1358,10 @@ fn observe_provider_start(
             reason: RecoveryUnknown::WrapperIdentityMismatch,
         });
     };
-    let Some(rex_provider) = rex_observation.foreground.as_ref() else {
-        return Ok(AgentRecoveryDisposition::Unresolved {
-            reason: RecoveryUnknown::ProviderIdentityMismatch,
-        });
-    };
-    let expected_executable = std::fs::canonicalize(&qualification.executable_path).ok();
+    let expected_executable = verified_qualification_executable(&qualification);
     if rex_observation.last_exit.is_some()
         || rex_wrapper.pid != wrapper.pid
-        || rex_provider.pid == wrapper.pid
-        || expected_executable.as_ref().is_none_or(|expected| {
-            rex_provider
-                .path
-                .as_deref()
-                .and_then(|path| std::fs::canonicalize(path).ok())
-                .as_ref()
-                != Some(expected)
-        })
+        || expected_executable.is_none()
     {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProviderIdentityMismatch,
@@ -1382,16 +1374,29 @@ fn observe_provider_start(
             reason: RecoveryUnknown::WrapperIdentityMismatch,
         });
     };
-    let Some(provider_process) = process_table.iter().find(|process| {
-        process.pid == rex_provider.pid
-            && process.quality == ProcessIdentityQuality::KernelBirthToken
-            && std::fs::canonicalize(&process.command).ok() == expected_executable
-    }) else {
+    let tree = capture_process_tree(wrapper_process.pid, process_table);
+    if tree
+        .iter()
+        .find(|process| process.pid == wrapper_process.pid)
+        .is_none_or(|process| process.start_identity != wrapper_process.start_identity)
+    {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let Some(provider_process) = discover_provider_process(
+        wrapper_process.pid,
+        rex_observation
+            .foreground
+            .as_ref()
+            .map(|process| process.pid),
+        expected_executable.as_deref(),
+        &tree,
+    ) else {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProviderIdentityMismatch,
         });
     };
-    let tree = capture_process_tree(wrapper_process.pid, process_table);
     if tree.is_empty()
         || tree.iter().any(|process| {
             process.quality != ProcessIdentityQuality::KernelBirthToken
@@ -1493,6 +1498,58 @@ fn kernel_identity<'a>(
     })
 }
 
+fn process_is_descendant_of(
+    candidate: &ProcessIdentity,
+    root_pid: u32,
+    process_tree: &[ProcessIdentity],
+) -> bool {
+    let mut parent_pid = candidate.parent_pid;
+    let mut visited = BTreeSet::new();
+    while parent_pid != 0 && visited.insert(parent_pid) {
+        if parent_pid == root_pid {
+            return true;
+        }
+        let Some(parent) = process_tree
+            .iter()
+            .find(|process| process.pid == parent_pid)
+        else {
+            return false;
+        };
+        parent_pid = parent.parent_pid;
+    }
+    false
+}
+
+fn discover_provider_process<'a>(
+    wrapper_pid: u32,
+    rex_foreground_pid: Option<u32>,
+    expected_executable: Option<&Path>,
+    process_tree: &'a [ProcessIdentity],
+) -> Option<&'a ProcessIdentity> {
+    let expected_executable = expected_executable?;
+    let candidates = process_tree
+        .iter()
+        .filter(|process| {
+            process.quality == ProcessIdentityQuality::KernelBirthToken
+                && process.pid != wrapper_pid
+                && process_is_descendant_of(process, wrapper_pid, process_tree)
+                && executable_path_for_identity(process)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(expected_executable)
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return None;
+    }
+    let provider = candidates[0];
+    if rex_foreground_pid.is_some_and(|pid| pid != wrapper_pid && pid != provider.pid) {
+        return None;
+    }
+    Some(provider)
+}
+
 fn rex_processes_match(
     observation: &RexProcessObservation,
     wrapper: &ObservedWrapperIdentity,
@@ -1503,10 +1560,38 @@ fn rex_processes_match(
             .child
             .as_ref()
             .is_some_and(|process| process.pid == wrapper.pid)
-        && observation
-            .foreground
-            .as_ref()
-            .is_some_and(|process| process.pid == provider.provider_pid)
+        && observation.foreground.as_ref().is_some_and(|process| {
+            process.pid == provider.provider_pid || process.pid == wrapper.pid
+        })
+}
+
+fn verified_qualification_executable(
+    qualification: &crate::launch::ProviderQualification,
+) -> Option<PathBuf> {
+    let path = Path::new(&qualification.executable_path);
+    if !path.is_absolute() {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1024 * 1024 * 1024
+    {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    let mut file = fs::File::open(&canonical).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = Digest::parse(format!("{:x}", hasher.finalize())).ok()?;
+    (digest == qualification.executable_digest).then_some(canonical)
 }
 
 fn digest_json(value: &impl serde::Serialize) -> Result<Digest, String> {
@@ -1590,6 +1675,71 @@ mod tests {
         assert!(!provider_tree_contains_wrapper(&provider, &reused_pid));
         let omitted_wrapper = ObservedWrapperIdentity { pid: 12, ..wrapper };
         assert!(!provider_tree_contains_wrapper(&provider, &omitted_wrapper));
+    }
+
+    #[test]
+    fn provider_discovery_uses_unique_qualified_descendant_when_rex_foreground_is_wrapper() {
+        let mut native_provider = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let actual = wait_for_identity(native_provider.id());
+        let wrapper = ProcessIdentity {
+            pid: u32::MAX - 1,
+            parent_pid: 1,
+            process_group_id: u32::MAX - 1,
+            start_identity: "wrapper-born".into(),
+            command: "/path/to/rex-wrapper".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let provider = ProcessIdentity {
+            pid: actual.pid,
+            parent_pid: wrapper.pid,
+            ..actual.clone()
+        };
+        let tree = vec![wrapper.clone(), provider.clone()];
+        let executable = Path::new("/bin/sleep").canonicalize().unwrap();
+
+        let discovered =
+            discover_provider_process(wrapper.pid, Some(wrapper.pid), Some(&executable), &tree);
+        assert_eq!(discovered, Some(&provider));
+
+        let unrelated_foreground =
+            discover_provider_process(wrapper.pid, Some(99), Some(&executable), &tree);
+        assert_eq!(unrelated_foreground, None);
+
+        let unrelated = ProcessIdentity {
+            pid: actual.pid,
+            parent_pid: 1,
+            ..actual.clone()
+        };
+        assert_eq!(
+            discover_provider_process(
+                wrapper.pid,
+                Some(wrapper.pid),
+                Some(&executable),
+                &[wrapper.clone(), unrelated],
+            ),
+            None
+        );
+
+        let mut second_provider = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let second_actual = wait_for_identity(second_provider.id());
+        let ambiguous = ProcessIdentity {
+            pid: second_actual.pid,
+            parent_pid: wrapper.pid,
+            ..second_actual
+        };
+        assert_eq!(
+            discover_provider_process(
+                wrapper.pid,
+                Some(wrapper.pid),
+                Some(&executable),
+                &[wrapper, provider, ambiguous],
+            ),
+            None
+        );
+        native_provider.kill().unwrap();
+        native_provider.wait().unwrap();
+        second_provider.kill().unwrap();
+        second_provider.wait().unwrap();
     }
 
     fn policy() -> RecoveryPolicy {

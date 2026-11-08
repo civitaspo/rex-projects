@@ -331,6 +331,63 @@ pub fn inspect_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
     }
 }
 
+/// Resolve the executable image for a process only while its kernel birth token
+/// still matches the supplied process identity.
+pub fn executable_path_for_identity(
+    identity: &ProcessIdentity,
+) -> Result<Option<PathBuf>, ProcessError> {
+    let matches_identity = |table: &[ProcessIdentity]| {
+        table.iter().any(|current| {
+            current.pid == identity.pid
+                && current.start_identity == identity.start_identity
+                && current.quality == ProcessIdentityQuality::KernelBirthToken
+        })
+    };
+    if !matches_identity(&inspect_process_table()?) {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    let path = std::fs::canonicalize(format!("/proc/{}/exe", identity.pid));
+    #[cfg(target_os = "macos")]
+    let path = macos_executable_path(identity.pid);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let path: Result<PathBuf, std::io::Error> = Err(std::io::Error::other(
+        "executable path inspection is unsupported on this platform",
+    ));
+    let path = match path {
+        Ok(path) => path,
+        Err(error) if is_process_gone(&error) => return Ok(None),
+        Err(error) => return Err(ProcessError::Inspection(error.to_string())),
+    };
+    if !matches_identity(&inspect_process_table()?) {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_executable_path(pid: u32) -> std::io::Result<PathBuf> {
+    use std::ffi::{CStr, c_int, c_void};
+
+    unsafe extern "C" {
+        fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+
+    let mut buffer = [0_i8; 4096];
+    let length = unsafe {
+        proc_pidpath(
+            pid as c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 || length as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    Ok(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
+}
+
 pub fn capture_process_tree(
     root_pid: u32,
     initial_table: &[ProcessIdentity],
@@ -947,6 +1004,40 @@ mod tests {
 
     use super::{ProcessRequest, resolve_executable, run};
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_path_requires_live_kernel_birth_identity() {
+        use super::{
+            ProcessIdentity, ProcessIdentityQuality, executable_path_for_identity,
+            inspect_process_table,
+        };
+        use std::process::Command;
+
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let identity = inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == child.id())
+            .unwrap();
+        let executable = executable_path_for_identity(&identity).unwrap().unwrap();
+        assert_eq!(executable, Path::new("/bin/sleep").canonicalize().unwrap());
+
+        let reused_pid = ProcessIdentity {
+            start_identity: "wrong-birth-token".into(),
+            ..identity
+        };
+        assert_eq!(executable_path_for_identity(&reused_pid).unwrap(), None);
+
+        let current = inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == child.id())
+            .unwrap();
+        assert_eq!(current.quality, ProcessIdentityQuality::KernelBirthToken);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 
     fn request(executable: &str, args: &[&str]) -> ProcessRequest {
         ProcessRequest {
