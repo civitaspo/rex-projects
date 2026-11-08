@@ -4477,28 +4477,53 @@ impl ConfigStore {
             [request.agent_run_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let Some((reservation_json, lifecycle)) = reservation else {
-            return Err("Agent start request has no finalized launch reservation".into());
-        };
-        if lifecycle != "authorized" {
-            return Err("Agent launch reservation has not been finalized".into());
+        if let Some((reservation_json, lifecycle)) = reservation {
+            if lifecycle != "authorized" {
+                return Err("Agent launch reservation has not been finalized".into());
+            }
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(reservation_json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            if reservation.agent_run_id != request.agent_run_id
+                || reservation.operation_id != request.operation_id
+                || reservation.controller_generation != current_generation
+            {
+                return Err("launch reservation does not match the start request".into());
+            }
+            agent_runtime::validate_project_launch_identity(
+                &tx,
+                &reservation.project_id,
+                reservation.project_epoch,
+                reservation.config_revision.0,
+                &reservation.config_digest,
+            )?;
+            let active_block: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2 AND agent_run_id=?3 AND ownership='factory' AND lifecycle='active')",
+                params![authority.rex_view_id.as_str(), authority.rex_block_id, request.agent_run_id.as_str()],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            let wake_digest: Option<String> = tx
+                .query_row(
+                    "SELECT snapshot_digest FROM agent_wake_context WHERE agent_run_id=?1",
+                    [request.agent_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if !active_block
+                || wake_digest.as_deref() != Some(authority.wake_snapshot_digest.as_str())
+            {
+                return Err("Agent launch reservation lacks its finalized active Rex block and wake context".into());
+            }
+        } else {
+            let existing_ack: Option<(Option<String>, Option<String>)> = tx.query_row(
+                "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            if persisted_start_ack(existing_ack)?.is_none() {
+                return Err("new Agent starts require a finalized launch reservation".into());
+            }
         }
-        let reservation: AgentLaunchReservation =
-            crate::protocol::parse_unique(reservation_json.as_bytes())
-                .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
-        if reservation.agent_run_id != request.agent_run_id
-            || reservation.operation_id != request.operation_id
-            || reservation.controller_generation != current_generation
-        {
-            return Err("launch reservation does not match the start request".into());
-        }
-        agent_runtime::validate_project_launch_identity(
-            &tx,
-            &reservation.project_id,
-            reservation.project_epoch,
-            reservation.config_revision.0,
-            &reservation.config_digest,
-        )?;
         authority.validate()?;
         let qualification_json: String = tx
             .query_row(
