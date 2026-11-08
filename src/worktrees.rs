@@ -142,8 +142,8 @@ impl WorktreeManager {
         }
         let remote = self.git_output(
             &canonical_path,
-            "remote get-url origin",
-            ["remote", "get-url", "origin"],
+            "read configured origin URL",
+            ["config", "--get-all", "remote.origin.url"],
         )?;
         if remote.trim() != clone_url {
             return Err(WorktreeError::Conflict(format!(
@@ -958,5 +958,117 @@ mod tests {
                 .ensure_repository(&id, remote.to_str().unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn clone_url_rewrite_does_not_change_managed_origin_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote.git");
+        let executable = which_git().unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        git(
+            &executable,
+            temp.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+
+        let clone_url = "https://github.com/fixture/repository.git";
+        let mut environment = BTreeMap::new();
+        environment.insert(OsString::from("GIT_CONFIG_COUNT"), OsString::from("1"));
+        environment.insert(
+            OsString::from("GIT_CONFIG_KEY_0"),
+            OsString::from(format!("url.file://{}.insteadOf", remote.display())),
+        );
+        environment.insert(
+            OsString::from("GIT_CONFIG_VALUE_0"),
+            OsString::from(clone_url),
+        );
+        let state = temp.path().join("state");
+        let manager = WorktreeManager::new(
+            &state,
+            GitOptions {
+                executable: executable.clone(),
+                environment,
+                timeout: Duration::from_secs(20),
+            },
+        )
+        .unwrap();
+        let id = RepositoryId::parse("fixture").unwrap();
+        let repository = manager.ensure_repository(&id, clone_url).unwrap();
+        let key = TicketKey {
+            namespace: TicketNamespace::parse("fixture/acceptance").unwrap(),
+            ticket_id: TicketId::parse("ticket-1").unwrap(),
+        };
+        let worktree = manager.prepare_worktree(&repository, "main", &key);
+
+        // The empty remote intentionally has no main branch, so preparation must reach base
+        // resolution after the successful fetch instead of rejecting HTTPS as a changed origin.
+        assert!(matches!(
+            worktree,
+            Err(WorktreeError::Git {
+                operation: "resolve fetched base",
+                ..
+            })
+        ));
+
+        let raw_origin = manager
+            .git_output(
+                &repository.path,
+                "read configured origin URL",
+                ["config", "--get-all", "remote.origin.url"],
+            )
+            .unwrap();
+        assert_eq!(raw_origin.trim(), clone_url);
+        let rewritten_origin = manager
+            .git_output(
+                &repository.path,
+                "resolve rewritten origin URL",
+                ["remote", "get-url", "origin"],
+            )
+            .unwrap();
+        assert_eq!(
+            rewritten_origin.trim(),
+            format!("file://{}", remote.display())
+        );
+
+        let mut conflicting_environment = manager.git.environment.clone();
+        conflicting_environment.insert(OsString::from("GIT_CONFIG_COUNT"), OsString::from("2"));
+        conflicting_environment.insert(
+            OsString::from("GIT_CONFIG_KEY_1"),
+            OsString::from("remote.origin.url"),
+        );
+        conflicting_environment.insert(
+            OsString::from("GIT_CONFIG_VALUE_1"),
+            OsString::from("https://invalid.example/global-origin.git"),
+        );
+        let conflicting_manager = WorktreeManager::new(
+            &state,
+            GitOptions {
+                executable: executable.clone(),
+                environment: conflicting_environment,
+                timeout: Duration::from_secs(20),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            conflicting_manager.ensure_repository(&id, clone_url),
+            Err(WorktreeError::Conflict(_))
+        ));
+
+        git(
+            &executable,
+            &repository.path,
+            &[
+                "config",
+                "--local",
+                "--add",
+                "remote.origin.url",
+                "https://invalid.example/second-origin.git",
+            ],
+        );
+        assert!(matches!(
+            manager.ensure_repository(&id, clone_url),
+            Err(WorktreeError::Conflict(_))
+        ));
     }
 }
