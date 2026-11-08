@@ -1178,40 +1178,11 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     if !applied {
-        let original_failure_state = last_applied_state.clone();
-        let late_observation_deadline = Instant::now() + Duration::from_secs(8);
-        let mut late_observation = String::from("no post-deadline observation");
-        let mut late_convergence = false;
-        while Instant::now() < late_observation_deadline {
-            let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
-            let revision: u64 = connection
-                .query_row("SELECT revision FROM config_current", [], |row| row.get(0))
-                .unwrap();
-            let project_revision: u64 = connection
-                .query_row(
-                    "SELECT config_revision FROM projects WHERE project_id='goal_project'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let owner_projection: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(state.join("runtime-owner.json")).unwrap_or_default(),
-            )
-            .unwrap_or_default();
-            late_observation = format!(
-                "config_revision={revision}, project_revision={project_revision}, owner_projection={owner_projection}"
-            );
-            if revision == 2 && project_revision == 2 && owner_projection["config_revision"] == 2 {
-                late_convergence = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
         let controller_status = owner.try_wait().unwrap();
         owner.terminate();
         let stderr = owner.stderr_tail();
         panic!(
-            "active controller did not apply and load the durable config snapshot after {apply_polls} polls; original failure state: {original_failure_state}; late convergence: {late_convergence}; late observation: {late_observation}; controller status: {controller_status:?}; stderr: {stderr}"
+            "active controller did not apply and load the durable config snapshot after {apply_polls} polls; last state: {last_applied_state}; controller status: {controller_status:?}; stderr: {stderr}"
         );
     }
 

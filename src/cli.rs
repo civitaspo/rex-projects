@@ -2540,17 +2540,12 @@ fn run_controller(
     .map_err(|error| CliError::unavailable(error.to_string()))?;
     let executable_path =
         std::env::current_exe().map_err(|error| CliError::unexpected(error.to_string()))?;
-    let executable_hash_started = std::time::Instant::now();
     let executable_bytes =
         std::fs::read(&executable_path).map_err(|error| CliError::unexpected(error.to_string()))?;
     use sha2::{Digest as _, Sha256};
     let executable_digest = format!("{:x}", Sha256::digest(executable_bytes));
     let runtime_executable_digest =
         Digest::parse(executable_digest.clone()).map_err(CliError::usage)?;
-    eprintln!(
-        "diagnostic_timing executable_hash_ms={:.3}",
-        executable_hash_started.elapsed().as_secs_f64() * 1000.0
-    );
     let owner = OwnerMetadata {
         owner_nonce: generated_request_id()?,
         state_root: state_root.display().to_string(),
@@ -2563,15 +2558,9 @@ fn run_controller(
         rex_session_id: Some(rex_identity.session_id.clone()),
         rex_block_id: rex_identity.block_id.clone(),
     };
-    let environment_capture_started = std::time::Instant::now();
     let mut environment = crate::environment::capture(&snapshot.config.config.runtime.environment)
         .map_err(|error| CliError::unavailable(error.to_string()))?;
-    eprintln!(
-        "diagnostic_timing environment_capture_ms={:.3}",
-        environment_capture_started.elapsed().as_secs_f64() * 1000.0
-    );
     let generation = store.start_owner(&owner).map_err(CliError::unavailable)?;
-    let runtime_services_started = std::time::Instant::now();
     let services = crate::runtime_services::RuntimeServices::new(
         &snapshot.config,
         &environment,
@@ -2591,12 +2580,7 @@ fn run_controller(
             return Err(CliError::unavailable(error));
         }
     };
-    eprintln!(
-        "diagnostic_timing runtime_services_initial_ms={:.3}",
-        runtime_services_started.elapsed().as_secs_f64() * 1000.0
-    );
     let projection = state_root.join("runtime-owner.json");
-    let projection_publish_started = std::time::Instant::now();
     publish_owner_projection(
         &projection,
         generation,
@@ -2605,51 +2589,30 @@ fn run_controller(
         snapshot.config.digest.as_str(),
     )
     .map_err(CliError::unexpected)?;
-    eprintln!(
-        "diagnostic_timing owner_projection_initial_ms={:.3}",
-        projection_publish_started.elapsed().as_secs_f64() * 1000.0
-    );
     install_stop_signals();
     let started = unix_now_i64()?;
     let mut should_stop = false;
     loop {
         let mut consumed = 0;
         while consumed < 100 {
-            let process_control_started = std::time::Instant::now();
             let Some(command) = store
                 .process_next_control(generation)
                 .map_err(CliError::unexpected)?
             else {
                 break;
             };
-            eprintln!(
-                "diagnostic_timing process_control_ms={:.3} kind={}",
-                process_control_started.elapsed().as_secs_f64() * 1000.0,
-                command.kind
-            );
             consumed += 1;
             if let Some(applied) = command.applied_config
                 && (applied.revision != snapshot.revision
                     || applied.digest != snapshot.config.digest)
             {
-                let snapshot_reload_started = std::time::Instant::now();
                 snapshot = store.load_snapshot(&config_source)
                     .map_err(CliError::unexpected)?
                     .filter(|loaded| loaded.revision == applied.revision && loaded.config.digest == applied.digest)
                     .ok_or_else(|| CliError::unexpected("applied configuration snapshot is missing or does not match its durable receipt"))?;
-                eprintln!(
-                    "diagnostic_timing snapshot_reload_ms={:.3}",
-                    snapshot_reload_started.elapsed().as_secs_f64() * 1000.0
-                );
-                let environment_capture_started = std::time::Instant::now();
                 environment =
                     crate::environment::capture(&snapshot.config.config.runtime.environment)
                         .map_err(|error| CliError::unavailable(error.to_string()))?;
-                eprintln!(
-                    "diagnostic_timing environment_capture_reload_ms={:.3}",
-                    environment_capture_started.elapsed().as_secs_f64() * 1000.0
-                );
-                let runtime_services_started = std::time::Instant::now();
                 let rebuilt = crate::runtime_services::RuntimeServices::new(
                     &snapshot.config,
                     &environment,
@@ -2669,10 +2632,6 @@ fn run_controller(
                         return Err(CliError::unavailable(error));
                     }
                 };
-                eprintln!(
-                    "diagnostic_timing runtime_services_rebuild_ms={:.3}",
-                    runtime_services_started.elapsed().as_secs_f64() * 1000.0
-                );
             }
             if command.kind == "machine_stop" {
                 should_stop = true;
@@ -2695,15 +2654,9 @@ fn run_controller(
             )
             .map_err(CliError::unavailable)?;
         } else {
-            let qualification_tick_started = std::time::Instant::now();
             if let Err(error) = services.tick_provider_qualification_jobs(&mut store, tick_now) {
                 eprintln!("rex-projects provider qualification: {error}");
             }
-            eprintln!(
-                "diagnostic_timing qualification_tick_ms={:.3}",
-                qualification_tick_started.elapsed().as_secs_f64() * 1000.0
-            );
-            let factory_tick_started = std::time::Instant::now();
             let tick = crate::engine::factory_runtime::FactoryRuntime::tick(
                 &mut store,
                 generation,
@@ -2712,15 +2665,10 @@ fn run_controller(
                 &mut services,
             )
             .map_err(CliError::unavailable)?;
-            eprintln!(
-                "diagnostic_timing factory_tick_ms={:.3}",
-                factory_tick_started.elapsed().as_secs_f64() * 1000.0
-            );
             for error in tick.external_errors {
                 eprintln!("rex-projects runtime: {error}");
             }
         }
-        let projection_publish_started = std::time::Instant::now();
         publish_owner_projection(
             &projection,
             generation,
@@ -2729,11 +2677,6 @@ fn run_controller(
             snapshot.config.digest.as_str(),
         )
         .map_err(CliError::unexpected)?;
-        eprintln!(
-            "diagnostic_timing owner_projection_ms={:.3} config_revision={}",
-            projection_publish_started.elapsed().as_secs_f64() * 1000.0,
-            snapshot.revision.0
-        );
         if once {
             break;
         }
