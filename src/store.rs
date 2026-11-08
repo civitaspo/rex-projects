@@ -3629,7 +3629,7 @@ impl ConfigStore {
             return Err("invalid control request ID".into());
         }
         let database = state_root.join("state.sqlite3");
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -3638,7 +3638,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
         let tx = connection
-            .unchecked_transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let project_id = command.project_id.as_ref().map(ProjectId::as_str);
@@ -3735,7 +3735,7 @@ impl ConfigStore {
         }
         let payload = canonical_json(release)?;
         let database = state_root.join("state.sqlite3");
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -3744,7 +3744,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         let tx = connection
-            .unchecked_transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         tx.execute("INSERT INTO human_claim_release_commands(request_id,payload_json,state,created_at_unix,expected_generation) VALUES (?1,?2,'pending',?3,?4) ON CONFLICT(request_id) DO NOTHING", params![request_id,payload,now_unix()?,owner_generation]).map_err(|error| error.to_string())?;
@@ -5265,6 +5265,114 @@ mod tests {
                 .unwrap()
         );
         assert!(!store.should_stop(second_generation).unwrap());
+    }
+
+    #[test]
+    fn append_control_waits_for_concurrent_writer_before_validating_owner() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "concurrent-writer-test".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let state_root = temp.path().to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let append = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = ConfigStore::append_control(
+                &state_root,
+                "concurrent-start",
+                &ControlCommand {
+                    request_id: "concurrent-start".into(),
+                    kind: "machine_stop".into(),
+                    project_id: None,
+                    lifecycle: None,
+                    created_at_unix: 1,
+                    applied_config: None,
+                },
+                generation,
+            );
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        writer.execute_batch("COMMIT").unwrap();
+
+        result_rx.recv().unwrap().unwrap();
+        append.join().unwrap();
+        let pending: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT request_id,kind FROM controller_commands WHERE request_id='concurrent-start'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, ("concurrent-start".into(), "machine_stop".into()));
+
+        let writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let state_root = temp.path().to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = ConfigStore::append_human_claim_release(
+                &state_root,
+                "concurrent-release",
+                &super::HumanClaimRelease {
+                    namespace: "fixture/repo".into(),
+                    ticket: "T-1".into(),
+                    ticket_run_id: "run-1".into(),
+                    generation: 1,
+                    expected_revision: 1,
+                    reason: "release test".into(),
+                    disposition: "cancel".into(),
+                },
+                generation,
+            );
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        writer.execute_batch("COMMIT").unwrap();
+        result_rx.recv().unwrap().unwrap();
+        release.join().unwrap();
+        let release_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM human_claim_release_commands WHERE request_id='concurrent-release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(release_count, 1);
     }
 
     #[test]
