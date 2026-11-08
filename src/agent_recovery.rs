@@ -99,16 +99,9 @@ pub struct AgentRecoveryReport {
 const MAX_FORK_WATCH_RUNS: usize = 64;
 const MAX_FORK_WATCH_IDENTITIES: usize = 1024;
 
+#[derive(Default)]
 pub struct AgentRecoveryRuntime {
     fork_watches: BTreeMap<AgentRunId, RunForkWatch>,
-}
-
-impl Default for AgentRecoveryRuntime {
-    fn default() -> Self {
-        Self {
-            fork_watches: BTreeMap::new(),
-        }
-    }
 }
 
 struct RunForkWatch {
@@ -415,8 +408,7 @@ impl AgentRecoveryRuntime {
         let mut observations = Vec::with_capacity(runs.len());
         for run in runs {
             let disposition = if let Some(processes) = &process_table {
-                Self::observe_one(
-                    self,
+                self.observe_one(
                     store,
                     owner_generation,
                     pinned_rex,
@@ -448,8 +440,9 @@ impl AgentRecoveryRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn observe_one(
-        runtime: &mut Self,
+        &mut self,
         store: &mut ConfigStore,
         owner_generation: u64,
         pinned_rex: &RexCliTransport,
@@ -560,7 +553,7 @@ impl AgentRecoveryRuntime {
         ) {
             Ok(false) => {
                 return reconcile_missing_block(
-                    runtime,
+                    self,
                     store,
                     owner_generation,
                     run,
@@ -716,6 +709,7 @@ impl AgentRecoveryRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_missing_block(
     runtime: &mut AgentRecoveryRuntime,
     store: &mut ConfigStore,
@@ -882,10 +876,8 @@ fn reconcile_missing_block(
             watch_healthy = false;
         }
     }
-    let Some(extended) = (match extend_process_tree(&snapshot.process_tree, &fresh) {
-        Ok(extended) => extended,
-        Err(_) => None,
-    }) else {
+    let Some(extended) = extend_process_tree(&snapshot.process_tree, &fresh).unwrap_or_default()
+    else {
         if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
             watch.invalidated = true;
         }
@@ -983,10 +975,9 @@ fn reconcile_missing_block(
             );
         }
     };
-    let Some(final_tree) = (match extend_process_tree(&snapshot.process_tree, &final_table) {
-        Ok(tree) => tree,
-        Err(_) => None,
-    }) else {
+    let Some(final_tree) =
+        extend_process_tree(&snapshot.process_tree, &final_table).unwrap_or_default()
+    else {
         if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
             watch.invalidated = true;
         }
@@ -1091,6 +1082,7 @@ fn reconcile_missing_block(
     Ok(AgentRecoveryDisposition::BlockLossStopping)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stop_known_processes_without_watch(
     store: &mut ConfigStore,
     run: &RecoverableAgentRun,
@@ -1270,7 +1262,7 @@ fn extend_process_tree(
             }
             anchored_groups.insert(root.process_group_id);
             observed_groups.insert(root.process_group_id);
-            merge_process_tree(&mut extended, &[root.clone()]);
+            merge_process_tree(&mut extended, std::slice::from_ref(root));
             let captured = capture_process_tree(root.pid, current);
             if captured.iter().any(|process| {
                 process.quality != ProcessIdentityQuality::KernelBirthToken
@@ -1709,7 +1701,7 @@ mod tests {
         let cumulative = extend_process_tree(&initial, &current).unwrap().unwrap();
         assert!(contains_process_identities(
             &cumulative,
-            &[child_identity.clone()]
+            std::slice::from_ref(&child_identity)
         ));
         let snapshot = make_test_snapshot(cumulative.clone(), false);
         assert!(!cleanup_absence_confirmed(&snapshot, &current));
