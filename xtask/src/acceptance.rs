@@ -4,8 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rex_projects::adapters::rex::{owned_supervisor_window_label, owned_ticket_window_label};
+use rex_projects::adapters::rex::{
+    CreateDisposition, RexCliTransport, TicketWindow, owned_supervisor_window_label,
+    owned_ticket_window_label,
+};
 use rex_projects::process::{ProcessOutput, ProcessRequest, run as run_process};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -19,6 +23,7 @@ const QUALIFICATION_LIMIT: Duration = Duration::from_secs(180);
 const COORDINATOR_STAGE_LIMIT: Duration = Duration::from_secs(180);
 const ACCEPTANCE_STAGE_ENV: &str = "REX_PROJECTS_ACCEPTANCE_STAGE";
 const COORDINATOR_INBOX_STAGE: &str = "supervisor_coordinator_inbox";
+const COORDINATOR_BLOCK_LOSS_STAGE: &str = "supervisor_coordinator_block_loss";
 const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
 const FIXTURE_PROJECT_ID: &str = "operations_project";
 const FIXTURE_TICKET_NAMESPACE: &str = "fixture/acceptance";
@@ -44,6 +49,20 @@ pub struct Request<'a> {
     pub fixture_root: &'a Path,
 }
 
+fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(stage)
+            if stage == COORDINATOR_INBOX_STAGE || stage == COORDINATOR_BLOCK_LOSS_STAGE =>
+        {
+            Ok(Some(stage))
+        }
+        Some(_) => Err(format!(
+            "unsupported acceptance stage in {ACCEPTANCE_STAGE_ENV}"
+        )),
+    }
+}
+
 /// Start from real external boundaries: generate private fixture configuration and a local bare
 /// remote, apply it through the product CLI, and run the product controller in an owned Rex
 /// window. The report preserves the last actual dashboard/status snapshot when later stages are
@@ -53,16 +72,14 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         return Err("fixture root must be a new absolute path".into());
     }
     verify_owned_session(&request)?;
-    let bounded_coordinator_stage = match std::env::var(ACCEPTANCE_STAGE_ENV) {
-        Ok(stage) if stage == COORDINATOR_INBOX_STAGE => true,
-        Ok(_) => {
-            return Err(format!(
-                "unsupported acceptance stage in {ACCEPTANCE_STAGE_ENV}"
-            ));
-        }
-        Err(std::env::VarError::NotPresent) => false,
+    let stage_value = match std::env::var(ACCEPTANCE_STAGE_ENV) {
+        Ok(stage) => Some(stage),
+        Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(format!("read {ACCEPTANCE_STAGE_ENV}: {error}")),
     };
+    let stage = parse_acceptance_stage(stage_value)?;
+    let bounded_coordinator_stage = stage.is_some();
+    let coordinator_block_loss_stage = stage.as_deref() == Some(COORDINATOR_BLOCK_LOSS_STAGE);
     let provider_roles: &[&str] = if bounded_coordinator_stage {
         &["supervisor", "coordinator"]
     } else {
@@ -341,6 +358,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let mut first_dashboard = true;
     let mut lifecycle_traced = false;
     let mut coordinator_boundary_reached = false;
+    let mut coordinator_block_loss_proof = None;
     loop {
         let status = product(&request, &state_root, &["status", "--json"])?;
         if !status.status.is_some_and(|status| status.success()) {
@@ -387,13 +405,28 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 .find(|observation| is_coordinator_dispatch_observation(observation))
             {
                 trace.push(json!({"step":"coordinator_inbox_boundary_observed","status":"passed","evidence":coordinator}));
+                coordinator_boundary_reached = true;
+                if coordinator_block_loss_stage {
+                    let proof = observe_coordinator_block_loss(
+                        &request,
+                        &state_root,
+                        &last_status,
+                        &dashboard,
+                        coordinator,
+                    );
+                    let proof = proof.unwrap_or_else(
+                        |error| json!({"status":"failed","reason":error,"fault_injected":false}),
+                    );
+                    trace.push(json!({"step":"coordinator_block_loss_recovery","status":proof["status"],"evidence":proof}));
+                    coordinator_block_loss_proof = Some(proof);
+                    break;
+                }
                 let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
                 if !stop.status.is_some_and(|status| status.success()) {
                     trace.push(json!({"step":"bounded_stage_stop_request","status":"rejected","evidence":json_stdout(&stop)}));
                     break;
                 }
                 trace.push(json!({"step":"bounded_stage_stop_request","status":"queued","evidence":json_stdout(&stop)}));
-                coordinator_boundary_reached = true;
                 break;
             }
         }
@@ -478,6 +511,10 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         && coordinator_boundary_reached
         && stopped
         && coordinator_observation.is_some()
+        && (!coordinator_block_loss_stage
+            || coordinator_block_loss_proof
+                .as_ref()
+                .is_some_and(|proof| proof["status"] == "passed"))
         && supervisor_observation.is_some_and(|observation| {
             observation
                 .pointer("/input_files/effective_role_profiles/coordinator")
@@ -485,18 +522,31 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 == Some("fixture_coordinator")
         });
     if bounded_coordinator_stage {
-        trace.push(json!({"step":"supervisor_coordinator_contract","status":if stage_valid {"passed"} else {"failed"},"evidence":{"supervisor_prompt_role_profiles":supervisor_observation.and_then(|observation|observation.pointer("/input_files/effective_role_profiles").cloned()),"coordinator_dispatch_observation":coordinator_observation,"coordinator_process_held_until_stop":coordinator_boundary_reached}}));
+        let hold_evidence = if coordinator_block_loss_stage {
+            json!({
+                "coordinator_process_held_until_stop":coordinator_block_loss_proof
+                    .as_ref()
+                    .and_then(|proof| (proof["agent_state"] == "cancelled").then_some(false)),
+                "coordinator_process_held_until_fault":coordinator_block_loss_proof
+                    .as_ref()
+                    .and_then(|proof| proof["fault_injected"].as_bool()),
+                "block_loss_recovery":coordinator_block_loss_proof
+            })
+        } else {
+            json!({"coordinator_process_held_until_stop":coordinator_boundary_reached})
+        };
+        trace.push(json!({"step":"supervisor_coordinator_contract","status":if stage_valid {"passed"} else {"failed"},"evidence":{"supervisor_prompt_role_profiles":supervisor_observation.and_then(|observation|observation.pointer("/input_files/effective_role_profiles").cloned()),"coordinator_dispatch_observation":coordinator_observation,"hold_evidence":hold_evidence}}));
     }
     let report = json!({
         "status":if stage_valid {"STAGE_PASSED"} else {"UNSUPPORTED"},
-        "stage":if bounded_coordinator_stage {Some(COORDINATOR_INBOX_STAGE)} else {None},
+        "stage":stage,
         "product_cli_identity":cli_identity,
         "trace":trace,
         "last_dashboard":dashboard,
         "furthest_stage":furthest_role.unwrap_or("project_started"),
         "external_ticket_status":external_ticket_status,
         "current_stop":current_stop,
-        "missing_capabilities":if bounded_coordinator_stage {vec!["This bounded emulated stage stops after the first Coordinator inbox read and does not claim downstream completion."]} else {vec!["This emulated lane does not establish host-verified completion of every required role stage and external Done."]},
+        "missing_capabilities":if bounded_coordinator_stage {vec!["This bounded emulated stage does not claim downstream role completion or external Done."]} else {vec!["This emulated lane does not establish host-verified completion of every required role stage and external Done."]},
         "fixture_provider":"EMULATED",
         "resources_created":true,
         "owned_rex_session":request.rex_session,
@@ -1284,6 +1334,311 @@ fn require_success(label: &str, output: &ProcessOutput) -> Result<(), String> {
     Ok(())
 }
 
+fn observe_coordinator_block_loss(
+    request: &Request<'_>,
+    state_root: &Path,
+    status: &Value,
+    dashboard: &Value,
+    inbox_observation: &Value,
+) -> Result<Value, String> {
+    let run_id = inbox_observation
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or("Coordinator inbox observation omitted its AgentRun ID")?;
+    let agent = dashboard_agent(dashboard, run_id)
+        .ok_or("dashboard omitted the Coordinator AgentRun identity")?;
+    let window_id = agent["rex_window_id"]
+        .as_str()
+        .ok_or("Coordinator dashboard row omitted its Rex window")?;
+    let block_id = agent["rex_block_id"]
+        .as_str()
+        .ok_or("Coordinator dashboard row omitted its Rex block")?;
+    if agent["state"] != "running"
+        || agent["rex_session_id"].as_str() != Some(request.rex_session)
+        || status.pointer("/owner/active") != Some(&Value::Bool(true))
+    {
+        return Err("Coordinator block-loss stage did not start from a live owned AgentRun".into());
+    }
+    let generation = status
+        .pointer("/owner/generation")
+        .and_then(Value::as_u64)
+        .ok_or("controller status omitted owner generation")?;
+    let rex = RexCliTransport::connect(
+        request.rex,
+        &[],
+        request.rex_server.to_owned(),
+        request.expected_instance.to_owned(),
+        request.rex_session.to_owned(),
+        BTreeMap::new(),
+    )
+    .map_err(|error| format!("connect to pinned Rex identity: {error}"))?;
+    let window = TicketWindow {
+        server_instance_id: request.expected_instance.to_owned(),
+        session_id: request.rex_session.to_owned(),
+        window_id: window_id.to_owned(),
+        label: String::new(),
+        initial_block_id: Some(block_id.to_owned()),
+        disposition: CreateDisposition::Existing,
+    };
+    if !rex
+        .agent_block_is_present(&window, run_id, block_id)
+        .map_err(|error| format!("verify exact Coordinator block before close: {error}"))?
+    {
+        return Err("exact Coordinator block was absent before the fault".into());
+    }
+
+    let database = Connection::open_with_flags(
+        state_root.join("state.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("open acceptance state read-only: {error}"))?;
+    let baseline = recovery_state(&database, run_id, block_id)?;
+    if baseline.generation != generation
+        || baseline.disposition == "released"
+        || baseline.state != "running"
+    {
+        return Err("Coordinator has no active recovery cursor at the block-loss boundary".into());
+    }
+    let deadline = Instant::now() + COORDINATOR_STAGE_LIMIT;
+    let mut last_order = baseline.observation_order;
+    let mut observed_advances = 0;
+    while observed_advances < 2 {
+        if Instant::now() >= deadline {
+            return Err(
+                "two regular live Coordinator recovery observations did not complete".into(),
+            );
+        }
+        let status = product(request, state_root, &["status", "--json"])?;
+        let snapshot = product(request, state_root, &["dashboard", "--json"])?;
+        if !status.status.is_some_and(|status| status.success())
+            || !snapshot.status.is_some_and(|status| status.success())
+        {
+            return Err(
+                "controller status became unavailable before Coordinator block close".into(),
+            );
+        }
+        let status = json_stdout(&status);
+        let snapshot = json_stdout(&snapshot);
+        let live_agent = dashboard_agent(&snapshot, run_id);
+        if status.pointer("/owner/active") != Some(&Value::Bool(true))
+            || !live_agent.is_some_and(|agent| agent["state"] == "running")
+        {
+            return Err("Coordinator or controller stopped before the block-loss fault".into());
+        }
+        let cursor = recovery_state(&database, run_id, block_id)?;
+        if cursor.generation != generation || cursor.reservation_epoch != baseline.reservation_epoch
+        {
+            return Err(
+                "Coordinator recovery cursor changed generation or reservation epoch".into(),
+            );
+        }
+        if observe_cursor_advance(&mut last_order, cursor.observation_order)? {
+            observed_advances += 1;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    if !rex
+        .agent_block_is_present(&window, run_id, block_id)
+        .map_err(|error| format!("recheck exact Coordinator block before close: {error}"))?
+    {
+        return Err("Coordinator block disappeared before the requested block-loss fault".into());
+    }
+    if let Err(error) = rex.close_agent_block(&window, run_id, block_id) {
+        return Ok(json!({
+            "status":"inconclusive",
+            "reason":format!("close exact Coordinator block: {error}"),
+            "fault_injected":null,
+            "run_id":run_id,
+            "reservation_epoch":baseline.reservation_epoch
+        }));
+    }
+
+    let deadline = Instant::now() + COORDINATOR_STAGE_LIMIT;
+    loop {
+        let status = match product(request, state_root, &["status", "--json"]) {
+            Ok(status) => status,
+            Err(error) => {
+                return Ok(
+                    json!({"status":"inconclusive","reason":error,"fault_injected":true,"run_id":run_id,"reservation_epoch":baseline.reservation_epoch}),
+                );
+            }
+        };
+        let snapshot = match product(request, state_root, &["dashboard", "--json"]) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(
+                    json!({"status":"inconclusive","reason":error,"fault_injected":true,"run_id":run_id,"reservation_epoch":baseline.reservation_epoch}),
+                );
+            }
+        };
+        if !status.status.is_some_and(|status| status.success())
+            || !snapshot.status.is_some_and(|status| status.success())
+        {
+            return Ok(
+                json!({"status":"inconclusive","reason":"controller status became unavailable after block close","fault_injected":true,"run_id":run_id,"reservation_epoch":baseline.reservation_epoch}),
+            );
+        }
+        let status = json_stdout(&status);
+        let snapshot = json_stdout(&snapshot);
+        let evidence = match recovery_state(&database, run_id, block_id) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(
+                    json!({"status":"inconclusive","reason":error,"fault_injected":true,"run_id":run_id,"reservation_epoch":baseline.reservation_epoch}),
+                );
+            }
+        };
+        let agent_cancelled =
+            dashboard_agent(&snapshot, run_id).is_some_and(|agent| agent["state"] == "cancelled");
+        let proof_complete = status.pointer("/owner/active") == Some(&Value::Bool(true))
+            && evidence.generation == generation
+            && evidence.reservation_epoch == baseline.reservation_epoch
+            && observed_advances == 2
+            && agent_cancelled
+            && evidence.disposition == "released"
+            && evidence.event_received
+            && evidence.exit_confirmed
+            && evidence.slot_released;
+        if proof_complete {
+            return Ok(json!({
+                "status":"passed",
+                "run_id":run_id,
+                "reservation_epoch":evidence.reservation_epoch,
+                "recovery_observation_order":evidence.observation_order,
+                "observed_live_recovery_advances":observed_advances,
+                "agent_state":"cancelled",
+                "slot_disposition":evidence.disposition,
+                "process_survived":evidence.process_survived,
+                "lifecycle_facts":{"event_received":true,"exit_confirmed":true,"slot_released":true},
+                "fault_injected":true,
+                "owner_active":true
+            }));
+        }
+        if Instant::now() >= deadline {
+            return Ok(json!({
+                "status":"timed_out",
+                "run_id":run_id,
+                "reservation_epoch":evidence.reservation_epoch,
+                "recovery_observation_order":evidence.observation_order,
+                "observed_live_recovery_advances":observed_advances,
+                "agent_state":dashboard_agent(&snapshot, run_id).and_then(|agent| agent["state"].as_str()),
+                "slot_disposition":evidence.disposition,
+                "lifecycle_facts":{"event_received":evidence.event_received,"exit_confirmed":evidence.exit_confirmed,"slot_released":evidence.slot_released},
+                "process_survived":evidence.process_survived,
+                "fault_injected":true,
+                "owner_active":status.pointer("/owner/active") == Some(&Value::Bool(true))
+            }));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn observe_cursor_advance(last: &mut Option<u64>, current: Option<u64>) -> Result<bool, String> {
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    match *last {
+        None => {
+            *last = Some(current);
+            Ok(false)
+        }
+        Some(previous) if current > previous => {
+            *last = Some(current);
+            Ok(true)
+        }
+        Some(previous) if current == previous => Ok(false),
+        Some(_) => Err("Coordinator recovery observation order moved backwards".into()),
+    }
+}
+
+struct RecoveryState {
+    generation: u64,
+    reservation_epoch: u64,
+    observation_order: Option<u64>,
+    disposition: String,
+    state: String,
+    event_received: bool,
+    exit_confirmed: bool,
+    slot_released: bool,
+    process_survived: Option<Value>,
+}
+
+fn recovery_state(
+    database: &Connection,
+    run_id: &str,
+    block_id: &str,
+) -> Result<RecoveryState, String> {
+    let row: Option<(u64, u64, String, String, Option<u64>, Option<u64>, Option<u64>, bool, bool, bool, Option<String>)> = database
+        .query_row(
+            "SELECT r.controller_generation,s.reservation_epoch,s.disposition,r.state,
+                    o.controller_generation,o.reservation_epoch,o.observation_order,
+                    EXISTS(SELECT 1 FROM agent_block_lifecycle_facts f WHERE f.agent_run_id=r.agent_run_id AND f.reservation_epoch=s.reservation_epoch AND f.rex_block_id=?2 AND f.fact_type='event_received'),
+                    EXISTS(SELECT 1 FROM agent_block_lifecycle_facts f WHERE f.agent_run_id=r.agent_run_id AND f.reservation_epoch=s.reservation_epoch AND f.rex_block_id=?2 AND f.fact_type='exit_confirmed'),
+                    EXISTS(SELECT 1 FROM agent_block_lifecycle_facts f WHERE f.agent_run_id=r.agent_run_id AND f.reservation_epoch=s.reservation_epoch AND f.rex_block_id=?2 AND f.fact_type='slot_released'),
+                    (SELECT f.detail_json FROM agent_block_lifecycle_facts f WHERE f.agent_run_id=r.agent_run_id AND f.reservation_epoch=s.reservation_epoch AND f.rex_block_id=?2 AND f.fact_type='process_survived')
+             FROM agent_runs r JOIN execution_slots s
+               ON s.owner_kind='agent_run' AND s.owner_id=r.agent_run_id
+             LEFT JOIN agent_run_recovery_observations o USING(agent_run_id)
+             WHERE r.agent_run_id=?1",
+            params![run_id, block_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("read Coordinator recovery cursor: {error}"))?;
+    let (
+        generation,
+        reservation_epoch,
+        disposition,
+        state,
+        observed_generation,
+        observed_epoch,
+        order,
+        event_received,
+        exit_confirmed,
+        slot_released,
+        survived,
+    ) = row.ok_or("Coordinator AgentRun slot was absent from fixture state")?;
+    match (observed_generation, observed_epoch, order) {
+        (None, None, None) => {}
+        (Some(observed_generation), Some(observed_epoch), Some(_))
+            if observed_generation == generation && observed_epoch == reservation_epoch => {}
+        _ => return Err("Coordinator recovery cursor is not bound to its active slot".into()),
+    }
+    Ok(RecoveryState {
+        generation,
+        reservation_epoch,
+        observation_order: order,
+        disposition,
+        state,
+        event_received,
+        exit_confirmed,
+        slot_released,
+        process_survived: survived.and_then(|detail| serde_json::from_str(&detail).ok()),
+    })
+}
+
+fn dashboard_agent<'a>(dashboard: &'a Value, run_id: &str) -> Option<&'a Value> {
+    dashboard
+        .get("agents")?
+        .as_array()?
+        .iter()
+        .find(|agent| agent["agent_run_id"] == run_id && agent["role"] == "coordinator")
+}
+
 fn parse_rex_window(stdout: &[u8]) -> Result<(String, String), String> {
     let value: Value = serde_json::from_slice(stdout)
         .map_err(|error| format!("Rex window creation returned invalid JSON: {error}"))?;
@@ -1337,6 +1692,111 @@ fn emit_report(fixture_root: &Path, report: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
+
+    #[test]
+    fn private_acceptance_stages_keep_inbox_and_add_block_loss_selector() {
+        assert_eq!(parse_acceptance_stage(None).unwrap(), None);
+        assert_eq!(
+            parse_acceptance_stage(Some(COORDINATOR_INBOX_STAGE.into())).unwrap(),
+            Some(COORDINATOR_INBOX_STAGE.into())
+        );
+        assert_eq!(
+            parse_acceptance_stage(Some(COORDINATOR_BLOCK_LOSS_STAGE.into())).unwrap(),
+            Some(COORDINATOR_BLOCK_LOSS_STAGE.into())
+        );
+        assert!(parse_acceptance_stage(Some("unknown".into())).is_err());
+    }
+
+    #[test]
+    fn coordinator_warmup_counts_distinct_per_run_cursor_values_not_numeric_delta() {
+        let mut last = Some(5);
+        assert!(observe_cursor_advance(&mut last, Some(15)).unwrap());
+        assert!(!observe_cursor_advance(&mut last, Some(15)).unwrap());
+        assert!(observe_cursor_advance(&mut last, Some(20)).unwrap());
+        assert_eq!(last, Some(20));
+
+        let mut initially_missing = None;
+        assert!(!observe_cursor_advance(&mut initially_missing, Some(40)).unwrap());
+        assert!(observe_cursor_advance(&mut initially_missing, Some(41)).unwrap());
+        assert!(!observe_cursor_advance(&mut initially_missing, Some(41)).unwrap());
+        assert!(observe_cursor_advance(&mut initially_missing, Some(50)).unwrap());
+        assert!(observe_cursor_advance(&mut initially_missing, Some(49)).is_err());
+    }
+
+    #[test]
+    fn block_loss_state_query_reads_exact_epoch_facts_from_read_only_sqlite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writable = Connection::open(&path).unwrap();
+        writable
+            .execute_batch(
+                "CREATE TABLE agent_runs(agent_run_id TEXT,controller_generation INTEGER,state TEXT);
+                 CREATE TABLE execution_slots(owner_kind TEXT,owner_id TEXT,reservation_epoch INTEGER,disposition TEXT);
+                 CREATE TABLE agent_run_recovery_observations(agent_run_id TEXT,controller_generation INTEGER,reservation_epoch INTEGER,observation_order INTEGER);
+                 CREATE TABLE agent_block_lifecycle_facts(agent_run_id TEXT,reservation_epoch INTEGER,rex_block_id TEXT,fact_type TEXT,detail_json TEXT);
+                 INSERT INTO agent_runs VALUES('run-1',3,'running');
+                 INSERT INTO execution_slots VALUES('agent_run','run-1',8,'live');",
+            )
+            .unwrap();
+        drop(writable);
+
+        let readonly =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let missing_cursor = recovery_state(&readonly, "run-1", "block-1").unwrap();
+        assert_eq!(missing_cursor.observation_order, None);
+        assert_eq!(missing_cursor.state, "running");
+        assert_eq!(missing_cursor.disposition, "live");
+        assert!(
+            readonly
+                .execute("UPDATE agent_runs SET state='cancelled'", [])
+                .is_err()
+        );
+        drop(readonly);
+
+        let writable = Connection::open(&path).unwrap();
+        writable
+            .execute_batch(
+                "UPDATE agent_runs SET state='cancelled';
+                 UPDATE execution_slots SET disposition='released';
+                 INSERT INTO agent_run_recovery_observations VALUES('run-1',3,8,42);
+                 INSERT INTO agent_block_lifecycle_facts VALUES('run-1',8,'block-1','event_received','{}');
+                 INSERT INTO agent_block_lifecycle_facts VALUES('run-1',8,'block-1','exit_confirmed','{}');
+                 INSERT INTO agent_block_lifecycle_facts VALUES('run-1',8,'block-1','slot_released','{}');
+                 INSERT INTO agent_block_lifecycle_facts VALUES('run-1',8,'block-1','process_survived','{\"surviving_processes\":[23]}');",
+            )
+            .unwrap();
+        drop(writable);
+
+        let readonly =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let state = recovery_state(&readonly, "run-1", "block-1").unwrap();
+        assert_eq!(state.reservation_epoch, 8);
+        assert_eq!(state.observation_order, Some(42));
+        assert_eq!(state.disposition, "released");
+        assert!(state.event_received && state.exit_confirmed && state.slot_released);
+        assert_eq!(
+            state.process_survived.unwrap()["surviving_processes"][0],
+            23
+        );
+        let other_block = recovery_state(&readonly, "run-1", "different-block").unwrap();
+        assert!(
+            !other_block.event_received
+                && !other_block.exit_confirmed
+                && !other_block.slot_released
+        );
+        drop(readonly);
+        let writable = Connection::open(&path).unwrap();
+        writable
+            .execute(
+                "UPDATE agent_run_recovery_observations SET controller_generation=4 WHERE agent_run_id='run-1'",
+                [],
+            )
+            .unwrap();
+        drop(writable);
+        let readonly =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(recovery_state(&readonly, "run-1", "block-1").is_err());
+    }
 
     #[test]
     fn acceptance_preflight_rejects_reused_fixture_windows_but_allows_harmless_windows() {
