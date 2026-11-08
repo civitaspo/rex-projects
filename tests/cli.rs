@@ -194,6 +194,7 @@ case "$*" in
   *whoami*) printf '%s\n' '{"endpoint":"http://fixture","instance_id":"fixture-server","host_id":"fixture-host","rex_version":"test"}' ;;
   *"api list"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
   *"api call session.view"*) printf '%s\n' '{"windows":[{"layers":[{"blocks":[{"block_id":"fixture-block"}]}]}]}' ;;
+  *"events -s fixture-session --json"*) exit 0 ;;
   *) touch "$REX_FORBIDDEN_MARKER"; exit 91 ;;
 esac
 "##,
@@ -877,12 +878,6 @@ fn controller_once_leaves_queued_qualification_and_never_uses_mutating_transport
 
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
-    let mut source = std::fs::read_to_string(&config).unwrap();
-    source = source.replace(
-        "\n[adapters.tickets]",
-        "\n[runtime.environment]\nsource = \"inherit\"\n\n[adapters.tickets]",
-    );
-    std::fs::write(&config, source).unwrap();
 
     let call_log = temp.path().join("rex-calls.log");
     let forbidden_call = temp.path().join("rex-mutation-attempted");
@@ -979,6 +974,7 @@ fn controller_once_leaves_queued_qualification_and_never_uses_mutating_transport
     assert!(rex_calls.contains("whoami"));
     assert!(rex_calls.contains("api list"));
     assert!(rex_calls.contains("api call session.view"));
+    assert!(rex_calls.contains("events -s fixture-session --json"));
     assert!(!state.join("runtime-owner.json").exists());
 
     let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();

@@ -1619,7 +1619,6 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        crate::store::artifact_registry::migrate_v12(&store.connection).unwrap();
         let config = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "adapters": {"tickets": {
@@ -1734,7 +1733,6 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        crate::store::artifact_registry::migrate_v12(&store.connection).unwrap();
         let generation = store
             .start_owner(&OwnerMetadata {
                 owner_nonce: "stop-progress-owner".into(),
@@ -1840,7 +1838,6 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        crate::store::artifact_registry::migrate_v12(&store.connection).unwrap();
         store
             .connection
             .pragma_update(None, "foreign_keys", "OFF")

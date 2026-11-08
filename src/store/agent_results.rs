@@ -3060,7 +3060,7 @@ pub(crate) mod host_validation_fixture {
             authority.parent_run_id = Some(parent_run_id.clone());
             authority.parent_role = Some(parent_role);
             authority.ticket_run_id = ticket_run_id.clone();
-            authority.ticket_revision = ticket_run_id.map(|_| Revision(ticket_revision));
+            authority.ticket_revision = ticket_run_id.as_ref().map(|_| Revision(ticket_revision));
         }
         authority.config_revision = config_revision;
         authority.config_digest = Digest::parse(config_digest.clone())?;
@@ -3204,6 +3204,26 @@ pub(crate) mod host_validation_fixture {
         store.connection.execute(
             "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
             rusqlite::params![run_id_str, project_id.as_str(), role_str, authority.role_session_id, authority.parent_run_id.as_ref().map(AgentRunId::as_str), authority.parent_role.map(|role| serde_json::to_value(role).unwrap().as_str().unwrap().to_owned()), authority.ticket_run_id.as_ref().map(TicketRunId::as_str), authority.ticket_revision.map(|revision| revision.0), authority.config_revision.0, authority.config_digest.as_str(), authority.attempt, authority.run_epoch, owner_generation, authority.operation_id.as_str(), authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.runtime_binary_digest.as_str(), authority.descriptor_path.display().to_string(), authority.environment_snapshot_id.as_str(), authority.profile_id.as_str(), authority.profile_digest.as_str(), authority.instruction_digest.as_str(), authority.result_schema_digest.as_str(), authority.qualification_receipt_digest.as_str(), authority.rex_server_identity, authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, authority.workspace_path.display().to_string(), authority.control_dir.display().to_string(), authority.mailbox_capability_digest.as_str(), serde_json::to_string(&authority).map_err(|error| error.to_string())?, authority.digest()?.as_str(), now],
+        ).map_err(|error| error.to_string())?;
+        let project_epoch: u64 = store
+            .connection
+            .query_row(
+                "SELECT project_epoch FROM project_runtimes WHERE project_id=?1",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let slot_index: u32 = store
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(slot_index) + 1, 0) FROM execution_slots WHERE pool='agent'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        store.connection.execute(
+            "INSERT INTO execution_slots(pool,slot_index,project_id,ticket_run_id,owner_kind,owner_id,reservation_epoch,controller_generation,process_identity_json,disposition) VALUES ('agent',?1,?2,?3,'agent_run',?4,?5,?6,NULL,'live')",
+            rusqlite::params![slot_index, project_id.as_str(), ticket_run_id.as_ref().map(TicketRunId::as_str), run_id_str, project_epoch, owner_generation],
         ).map_err(|error| error.to_string())?;
         let child = Command::new("/bin/sleep")
             .arg("0.2")

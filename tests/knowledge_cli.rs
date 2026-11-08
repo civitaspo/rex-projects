@@ -235,7 +235,7 @@ fn seed_database(state_root: &Path, input: &PostmortemInput, receipt: &Publicati
                 manifest_digest TEXT,
                 created_at_unix INTEGER NOT NULL
             );
-            PRAGMA user_version = 12;",
+            PRAGMA user_version = 13;",
         )
         .unwrap();
     let request_json = serde_json::to_string(input).unwrap();
