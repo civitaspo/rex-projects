@@ -1579,7 +1579,8 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
         };
         let window_id = observed_block.window_id.clone();
         let package = crate::run_step_package::RunStepPackage {
-            schema_version: 1,
+            schema_version: 2,
+            execution_slot_epoch: reservation.project_epoch,
             descriptor,
             operation_id: reservation.operation_id.clone(),
             project_id: reservation.project_id.clone(),

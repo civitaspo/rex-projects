@@ -2011,7 +2011,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(super) fn reviewer_run_step_package(
+    pub(crate) fn reviewer_run_step_package(
         authority: &AgentLaunchAuthority,
         result_schema: serde_json::Value,
     ) -> crate::run_step_package::RunStepPackage {
@@ -2031,7 +2031,8 @@ pub(crate) mod tests {
             .unwrap()
             .identity;
         crate::run_step_package::RunStepPackage {
-            schema_version: 1,
+            schema_version: 2,
+            execution_slot_epoch: 1,
             descriptor: RunDescriptor {
                 schema_version: 1,
                 project_id: authority.project_id.clone(),

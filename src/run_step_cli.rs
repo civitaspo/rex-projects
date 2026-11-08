@@ -68,6 +68,7 @@ pub fn finalize_and_ack_start(
                 .unwrap_or(0)
         || package.descriptor.attempt != reservation.attempt
         || package.descriptor.run_epoch != reservation.run_epoch
+        || package.execution_slot_epoch != reservation.project_epoch
         || package.descriptor.profile_digest != reservation.profile_digest
         || package.descriptor.instruction_digest != reservation.instruction_digest
         || package.descriptor.provider_capability.receipt_digest
@@ -187,7 +188,7 @@ pub fn finalize_and_ack_start(
     spool.publish_run_family_binding_once(&RunFamilyBinding {
         schema_version: 1,
         agent_run_id: authority.agent_run_id.clone(),
-        reservation_epoch: reservation.run_epoch,
+        reservation_epoch: reservation.project_epoch,
         authority_digest: authority.digest()?,
         descriptor_digest: authority.descriptor_digest.clone(),
         wrapper_pid: request.wrapper_pid,
@@ -401,6 +402,26 @@ pub struct RunStepCliResult {
     pub result_digest: String,
 }
 
+pub(crate) fn validate_run_family_binding(
+    package: &RunStepPackage,
+    family_binding: &RunFamilyBinding,
+    start_request: &crate::launch::AgentStartRequest,
+    wrapper_pid: u32,
+    wrapper_start_identity: &str,
+) -> Result<(), String> {
+    if family_binding.agent_run_id != package.descriptor.run_id
+        || family_binding.reservation_epoch != package.execution_slot_epoch
+        || family_binding.descriptor_digest != start_request.descriptor_digest
+        || start_request.wrapper_pid != wrapper_pid
+        || family_binding.wrapper_pid != wrapper_pid
+        || start_request.wrapper_start_identity != wrapper_start_identity
+        || family_binding.wrapper_start_identity != wrapper_start_identity
+    {
+        return Err("host process-family binding does not match the accepted launch".into());
+    }
+    Ok(())
+}
+
 /// Run one bounded finite turn from the exact host package and return only its receipt summary.
 pub fn run_step(
     run_id: &str,
@@ -528,14 +549,13 @@ pub fn run_step(
         return Err("host did not durably accept this exact Agent launch".into());
     }
     let family_binding = spool.read_run_family_binding()?;
-    if family_binding.agent_run_id != package.descriptor.run_id
-        || family_binding.reservation_epoch != package.descriptor.run_epoch
-        || family_binding.descriptor_digest != start.request.descriptor_digest
-        || family_binding.wrapper_pid != std::process::id()
-        || family_binding.wrapper_start_identity != start.request.wrapper_start_identity
-    {
-        return Err("host process-family binding does not match the accepted launch".into());
-    }
+    validate_run_family_binding(
+        &package,
+        &family_binding,
+        &start.request,
+        std::process::id(),
+        &start.request.wrapper_start_identity,
+    )?;
     let mut environment = crate::environment::EnvironmentHandoff::consume_file(
         environment_handoff,
         &package.descriptor.environment_snapshot_id,

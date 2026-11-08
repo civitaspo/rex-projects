@@ -1311,7 +1311,7 @@ mod tests {
         }))
         .unwrap();
         let profile: Profile = serde_json::from_value(serde_json::json!({
-            "adapter":"codex", "command":["/usr/bin/codex"], "model":"fixture",
+            "adapter":"codex", "command":["/bin/codex"], "model":"fixture",
             "commit_mode":"native", "turn_timeout_seconds":60
         }))
         .unwrap();
@@ -1503,6 +1503,19 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        let result_schema: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("schemas/agent-results/supervisor-v1.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let result_schema_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&result_schema).unwrap())
+        ))
+        .unwrap();
         let mut reservation = AgentLaunchReservation {
             schema_version: LAUNCH_SCHEMA_VERSION,
             agent_run_id: run_id,
@@ -1528,10 +1541,12 @@ mod tests {
             profile_id,
             profile_digest,
             instruction_digest: digest('6'),
-            result_schema_digest: digest('7'),
+            result_schema_digest,
             wake_snapshot,
             qualification_receipt_digest: q_digest,
-            descriptor_path: temp.path().join("run-1.json"),
+            descriptor_path: std::fs::canonicalize(temp.path())
+                .unwrap()
+                .join("run-1.json"),
             workspace_path: temp.path().join("workspace"),
             control_dir: temp.path().join("control"),
             mailbox_directory: temp.path().join("control"),
@@ -1573,6 +1588,14 @@ mod tests {
                 "operations".into()
             )
         );
+        store
+            .connection
+            .execute(
+                "UPDATE project_runtimes SET project_epoch=2 WHERE project_id=?1",
+                [project.as_str()],
+            )
+            .unwrap();
+        reservation.project_epoch = 2;
         let mut worker_without_provenance = reservation.clone();
         worker_without_provenance.role = Role::Worker;
         worker_without_provenance.ticket_run_id =
@@ -1649,7 +1672,7 @@ mod tests {
 
         // A launch authority binds the semantic wake snapshot digest. The serialized envelope
         // includes that digest field itself, so hashing the JSON would produce a different value.
-        let authority = crate::launch::AgentLaunchAuthority {
+        let mut authority = crate::launch::AgentLaunchAuthority {
             agent_run_id: reservation.agent_run_id.clone(),
             project_id: reservation.project_id.clone(),
             role: reservation.role,
@@ -1684,6 +1707,12 @@ mod tests {
             control_dir: reservation.control_dir.clone(),
             mailbox_capability_digest: reservation.mailbox_capability_digest.clone(),
         };
+        let mut package = crate::store::agent_results::tests::reviewer_run_step_package(
+            &authority,
+            result_schema,
+        );
+        package.execution_slot_epoch = reservation.project_epoch;
+        authority.descriptor_digest = package.publish_once(&reservation.descriptor_path).unwrap();
         store
             .register_agent_launch_authority(generation, &authority)
             .unwrap();
@@ -1743,6 +1772,83 @@ mod tests {
         assert_eq!(
             store.persisted_start_receipt(&start_request).unwrap(),
             Some(receipt.clone())
+        );
+        let spool = crate::run_step_spool::RunStepSpool::open(&reservation.control_dir).unwrap();
+        spool.publish_start_once(start_request.clone()).unwrap();
+        let rex_script = temp.path().join("rex-finalize-start-fixture");
+        std::fs::write(
+            &rex_script,
+            "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{\"endpoint\":\"unix:///tmp/rex-test.sock\",\"instance_id\":\"rex-fixture\",\"host_id\":\"fixture-host\",\"rex_version\":\"1.2.3\"}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{\"methods\":{\"session.view\":{},\"session.new_window\":{},\"session.new_split\":{},\"session.focus_block\":{},\"session.zoom_block\":{},\"block.close\":{}}}' ;;\n  *) exit 3 ;;\nesac\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&rex_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let rex = crate::adapters::rex::RexCliTransport::connect(
+            &rex_script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "rex-fixture".into(),
+            "session".into(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let observed_block = crate::adapters::rex::RexContextBlock {
+            server_instance_id: "rex-fixture".into(),
+            session_id: "session".into(),
+            window_id: "window".into(),
+            block_id: "block-run-1".into(),
+            label: String::new(),
+            flavor: String::new(),
+        };
+        let mut wrong_slot_package = package.clone();
+        wrong_slot_package.execution_slot_epoch = reservation.run_epoch;
+        assert!(
+            crate::run_step_cli::finalize_and_ack_start(
+                &mut store,
+                generation,
+                &reservation,
+                &wrong_slot_package,
+                &observed_block,
+                &rex,
+            )
+            .is_err()
+        );
+        crate::run_step_cli::finalize_and_ack_start(
+            &mut store,
+            generation,
+            &reservation,
+            &package,
+            &observed_block,
+            &rex,
+        )
+        .unwrap();
+        let family_binding = spool.read_run_family_binding().unwrap();
+        assert_eq!(family_binding.reservation_epoch, 2);
+        let wrapper_package: crate::run_step_package::RunStepPackage =
+            crate::protocol::parse_unique(&std::fs::read(&reservation.descriptor_path).unwrap())
+                .unwrap();
+        crate::run_step_cli::validate_run_family_binding(
+            &wrapper_package,
+            &family_binding,
+            &start_request,
+            start_request.wrapper_pid,
+            &start_request.wrapper_start_identity,
+        )
+        .unwrap();
+        let mut wrong_slot_binding = family_binding;
+        wrong_slot_binding.reservation_epoch = reservation.run_epoch;
+        assert!(
+            crate::run_step_cli::validate_run_family_binding(
+                &wrapper_package,
+                &wrong_slot_binding,
+                &start_request,
+                start_request.wrapper_pid,
+                &start_request.wrapper_start_identity,
+            )
+            .is_err()
         );
         store
             .connection

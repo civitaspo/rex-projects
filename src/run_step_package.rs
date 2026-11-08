@@ -16,6 +16,8 @@ use crate::run_step::RunDescriptor;
 #[serde(deny_unknown_fields)]
 pub struct RunStepPackage {
     pub schema_version: u32,
+    /// Epoch of the reserved execution slot; distinct from the descriptor's finite-turn epoch.
+    pub execution_slot_epoch: u64,
     pub descriptor: RunDescriptor,
     pub operation_id: OperationId,
     pub project_id: ProjectId,
@@ -139,7 +141,10 @@ impl RunStepPackage {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 || self.controller_generation == 0 {
+        if self.schema_version != 2
+            || self.execution_slot_epoch == 0
+            || self.controller_generation == 0
+        {
             return Err("unsupported or incomplete run-step package".into());
         }
         if self.descriptor.run_id.as_str().is_empty()
@@ -204,7 +209,8 @@ mod tests {
         .unwrap();
         let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
         RunStepPackage {
-            schema_version: 1,
+            schema_version: 2,
+            execution_slot_epoch: 1,
             descriptor: RunDescriptor {
                 schema_version: 1,
                 project_id: ProjectId::parse("project-a").unwrap(),
@@ -270,6 +276,25 @@ mod tests {
         package.profile.model = Some("changed".into());
 
         assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn package_rejects_legacy_schema_and_zero_execution_slot_epoch() {
+        let mut legacy_package = package();
+        legacy_package.schema_version = 1;
+        assert!(legacy_package.validate().is_err());
+
+        let mut legacy_json = serde_json::to_value(package()).unwrap();
+        legacy_json["schema_version"] = serde_json::json!(1);
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_slot_epoch");
+        assert!(serde_json::from_value::<RunStepPackage>(legacy_json).is_err());
+
+        let mut zero_epoch = package();
+        zero_epoch.execution_slot_epoch = 0;
+        assert!(zero_epoch.validate().is_err());
     }
 
     #[test]
