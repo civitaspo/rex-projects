@@ -20,10 +20,12 @@ use crate::run_step::{RunReceipt, TurnResult};
 
 const PROTOCOL_VERSION: u32 = 1;
 pub(crate) const BLOCK_LOSS_SNAPSHOT_VERSION: u32 = 2;
+const RUN_FAMILY_VERSION: u32 = 1;
 const MAX_START_BYTES: usize = 32 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_BLOCK_LOSS_SNAPSHOT_BYTES: usize = 512 * 1024;
 const MAX_BLOCK_LOSS_IDENTITIES: usize = 1024;
+const MAX_RUN_FAMILY_BYTES: usize = 512 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,6 +67,94 @@ pub struct BlockLossCleanupSnapshot {
     pub cleanup_covered: bool,
     pub process_tree: Vec<ProcessIdentity>,
     pub process_tree_digest: Digest,
+}
+
+/// Immutable host-issued binding that lets the run-step producer checkpoint without SQLite.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFamilyBinding {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub reservation_epoch: u64,
+    pub authority_digest: Digest,
+    pub descriptor_digest: Digest,
+    pub wrapper_pid: u32,
+    pub wrapper_start_identity: String,
+}
+
+impl RunFamilyBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != RUN_FAMILY_VERSION
+            || self.reservation_epoch == 0
+            || self.wrapper_pid == 0
+            || self.wrapper_start_identity.trim().is_empty()
+        {
+            return Err("run-family binding is outside its bounds".into());
+        }
+        Ok(())
+    }
+}
+
+/// Durable cumulative identities observed by the provider-owning run-step process.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFamilyRecord {
+    pub schema_version: u32,
+    pub binding: RunFamilyBinding,
+    pub observed_at_unix: i64,
+    pub coverage: RunFamilyCoverage,
+    pub provider_root: ProcessIdentity,
+    pub process_tree: Vec<ProcessIdentity>,
+    pub process_tree_digest: Digest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFamilyCoverage {
+    Observing,
+    Complete,
+    Interrupted,
+}
+
+impl RunFamilyRecord {
+    pub fn validate(&self) -> Result<(), String> {
+        self.binding.validate()?;
+        if self.schema_version != RUN_FAMILY_VERSION
+            || self.observed_at_unix < 0
+            || self.process_tree.is_empty()
+            || self.process_tree.len() > MAX_BLOCK_LOSS_IDENTITIES
+        {
+            return Err("run-family record is outside its bounds".into());
+        }
+        if self.provider_root.pid == 0
+            || self.provider_root.process_group_id == 0
+            || self.provider_root.quality != ProcessIdentityQuality::KernelBirthToken
+            || self.provider_root.start_identity.trim().is_empty()
+            || !self.process_tree.iter().any(|process| {
+                process.pid == self.provider_root.pid
+                    && process.start_identity == self.provider_root.start_identity
+                    && process.quality == self.provider_root.quality
+            })
+        {
+            return Err("run-family record has no exact provider root anchor".into());
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for process in &self.process_tree {
+            if process.pid == 0
+                || process.process_group_id == 0
+                || process.quality != ProcessIdentityQuality::KernelBirthToken
+                || process.start_identity.trim().is_empty()
+                || !identities.insert((process.pid, process.start_identity.as_str()))
+            {
+                return Err("run-family record has invalid process identities".into());
+            }
+        }
+        let bytes = serde_json::to_vec(&self.process_tree).map_err(|error| error.to_string())?;
+        if self.process_tree_digest != Digest::parse(sha256(&bytes))? {
+            return Err("run-family record digest does not match its process tree".into());
+        }
+        Ok(())
+    }
 }
 
 impl BlockLossCleanupSnapshot {
@@ -159,6 +249,81 @@ impl RunStepSpool {
         Ok(envelope)
     }
 
+    pub fn publish_run_family_binding_once(
+        &self,
+        binding: &RunFamilyBinding,
+    ) -> Result<(), String> {
+        binding.validate()?;
+        let bytes = serde_json::to_vec(binding).map_err(|error| error.to_string())?;
+        publish_once(
+            &self.directory,
+            "run-family-binding.json",
+            &bytes,
+            MAX_START_BYTES,
+        )
+    }
+
+    pub fn read_run_family_binding(&self) -> Result<RunFamilyBinding, String> {
+        let bytes = read_bounded(
+            &self.directory.join("run-family-binding.json"),
+            MAX_START_BYTES,
+        )?;
+        let binding: RunFamilyBinding = parse_unique(&bytes)?;
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub fn read_run_family_record(&self) -> Result<Option<RunFamilyRecord>, String> {
+        match read_bounded(
+            &self.directory.join("run-family.json"),
+            MAX_RUN_FAMILY_BYTES,
+        ) {
+            Ok(bytes) => {
+                let record: RunFamilyRecord = parse_unique(&bytes)?;
+                record.validate()?;
+                Ok(Some(record))
+            }
+            Err(error) if error == "run-step spool file is not present" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Atomically replaces cumulative producer evidence without allowing rebinding or promotion
+    /// from an interrupted producer to a clean terminal.
+    pub fn write_run_family_record(&self, record: &RunFamilyRecord) -> Result<(), String> {
+        record.validate()?;
+        if self.read_run_family_binding()? != record.binding {
+            return Err("run-family record does not match its immutable binding".into());
+        }
+        if let Some(previous) = self.read_run_family_record()? {
+            if previous == *record {
+                return Ok(());
+            }
+            if previous.binding != record.binding
+                || previous.provider_root.pid != record.provider_root.pid
+                || previous.provider_root.start_identity != record.provider_root.start_identity
+                || previous.provider_root.process_group_id != record.provider_root.process_group_id
+                || previous.provider_root.quality != record.provider_root.quality
+                || record.observed_at_unix < previous.observed_at_unix
+                || !process_tree_contains(&record.process_tree, &previous.process_tree)
+                || previous.coverage != RunFamilyCoverage::Observing
+            {
+                return Err(
+                    "run-family record changed its binding, root, identities, or phase".into(),
+                );
+            }
+        } else if record.coverage != RunFamilyCoverage::Observing {
+            return Err("run-family terminal phase has no preceding observation".into());
+        }
+        let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+        replace_bounded(
+            &self.directory,
+            "run-family.json",
+            &bytes,
+            MAX_RUN_FAMILY_BYTES,
+        )
+    }
+
     /// Host-side read. The caller must authorize this request against durable store state.
     pub fn read_start_request(&self) -> Result<StartRequestEnvelope, String> {
         let bytes = read_bounded(&self.directory.join("start.request.json"), MAX_START_BYTES)?;
@@ -246,6 +411,19 @@ impl RunStepSpool {
         result: TurnResult,
     ) -> Result<AgentTurnResult, String> {
         request.validate()?;
+        let family = self
+            .read_run_family_record()?
+            .ok_or("run-step producer has no durable process-family evidence")?;
+        if family.binding.agent_run_id != request.request.agent_run_id
+            || family.binding.descriptor_digest != request.request.descriptor_digest
+            || family.binding.wrapper_pid != request.request.wrapper_pid
+            || family.binding.wrapper_start_identity != request.request.wrapper_start_identity
+            || family.coverage != RunFamilyCoverage::Complete
+        {
+            return Err(
+                "run-step producer did not durably complete this exact process family".into(),
+            );
+        }
         let mut envelope = AgentTurnResult {
             schema_version: PROTOCOL_VERSION,
             start_request_digest: request.request_digest.clone(),
@@ -331,6 +509,19 @@ impl RunStepSpool {
     ) -> Result<AgentTurnResult, String> {
         request.validate()?;
         let bytes = self.read_result()?;
+        let family = self
+            .read_run_family_record()?
+            .ok_or("run-step producer has no durable process-family evidence")?;
+        if family.binding.agent_run_id != request.request.agent_run_id
+            || family.binding.descriptor_digest != request.request.descriptor_digest
+            || family.binding.wrapper_pid != request.request.wrapper_pid
+            || family.binding.wrapper_start_identity != request.request.wrapper_start_identity
+            || family.coverage != RunFamilyCoverage::Complete
+        {
+            return Err(
+                "run-step producer did not durably complete this exact process family".into(),
+            );
+        }
         let envelope: AgentTurnResult = parse_unique(&bytes)?;
         envelope.validate_for(request)?;
         Ok(envelope)
@@ -570,8 +761,9 @@ fn sync_directory(_path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentTurnResult, BLOCK_LOSS_SNAPSHOT_VERSION, BlockLossCleanupSnapshot, RunStepSpool,
-        StartReceiptEnvelope, StartRequestEnvelope,
+        AgentTurnResult, BLOCK_LOSS_SNAPSHOT_VERSION, BlockLossCleanupSnapshot, RunFamilyBinding,
+        RunFamilyCoverage, RunFamilyRecord, RunStepSpool, StartReceiptEnvelope,
+        StartRequestEnvelope,
     };
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId};
     use crate::launch::{AgentLaunchReceipt, AgentStartRequest, LaunchDecision};
@@ -627,6 +819,37 @@ mod tests {
             process_tree,
             process_tree_digest: Digest::parse(format!("{:x}", sha2::Sha256::digest(bytes)))
                 .unwrap(),
+        }
+    }
+
+    fn family_binding(request: &AgentStartRequest) -> RunFamilyBinding {
+        RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: request.agent_run_id.clone(),
+            reservation_epoch: 2,
+            authority_digest: digest('f'),
+            descriptor_digest: request.descriptor_digest.clone(),
+            wrapper_pid: request.wrapper_pid,
+            wrapper_start_identity: request.wrapper_start_identity.clone(),
+        }
+    }
+
+    fn family_record(
+        binding: RunFamilyBinding,
+        process_tree: Vec<ProcessIdentity>,
+    ) -> RunFamilyRecord {
+        RunFamilyRecord {
+            schema_version: 1,
+            binding,
+            observed_at_unix: 10,
+            coverage: RunFamilyCoverage::Observing,
+            provider_root: process_tree[0].clone(),
+            process_tree_digest: Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+            ))
+            .unwrap(),
+            process_tree,
         }
     }
 
@@ -734,6 +957,26 @@ mod tests {
         let temp = tempdir().unwrap();
         let spool = RunStepSpool::open(temp.path()).unwrap();
         let request = spool.publish_start_once(request()).unwrap();
+        assert_eq!(
+            spool.read_turn_result(&request).unwrap_err(),
+            "run-step spool file is not present"
+        );
+        assert!(
+            spool
+                .publish_turn_result_once(&request, turn_result(&request.request))
+                .is_err()
+        );
+        let binding = family_binding(&request.request);
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let mut family = family_record(binding, vec![process(200, "birth-200", 200)]);
+        spool.write_run_family_record(&family).unwrap();
+        assert!(
+            spool
+                .publish_turn_result_once(&request, turn_result(&request.request))
+                .is_err()
+        );
+        family.coverage = RunFamilyCoverage::Complete;
+        spool.write_run_family_record(&family).unwrap();
         spool
             .publish_turn_result_once(&request, turn_result(&request.request))
             .unwrap();
@@ -744,6 +987,68 @@ mod tests {
             serde_json::from_slice(&spool.read_result().unwrap()).unwrap();
         forged.receipt.exit_code = Some(99);
         assert!(forged.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn producer_family_retains_late_child_and_rejects_rebinding_or_lost_history() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let binding = family_binding(&request());
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let initial = family_record(binding.clone(), vec![process(200, "birth-200", 200)]);
+        spool.write_run_family_record(&initial).unwrap();
+        let mut cumulative = family_record(
+            binding,
+            vec![
+                process(200, "birth-200", 200),
+                process(201, "late-birth-201", 201),
+            ],
+        );
+        cumulative.observed_at_unix = 11;
+        spool.write_run_family_record(&cumulative).unwrap();
+        assert_eq!(
+            spool.read_run_family_record().unwrap(),
+            Some(cumulative.clone())
+        );
+
+        let mut lost_child = initial;
+        lost_child.observed_at_unix = 12;
+        assert!(spool.write_run_family_record(&lost_child).is_err());
+        let mut rebound = cumulative.clone();
+        rebound.binding.reservation_epoch += 1;
+        assert!(spool.write_run_family_record(&rebound).is_err());
+        let mut moved_root = cumulative.clone();
+        moved_root.provider_root.process_group_id += 1;
+        assert!(spool.write_run_family_record(&moved_root).is_err());
+
+        cumulative.coverage = RunFamilyCoverage::Interrupted;
+        spool.write_run_family_record(&cumulative).unwrap();
+        spool.write_run_family_record(&cumulative).unwrap();
+        let mut false_completion = cumulative.clone();
+        false_completion.coverage = RunFamilyCoverage::Complete;
+        assert!(spool.write_run_family_record(&false_completion).is_err());
+        assert_eq!(spool.read_run_family_record().unwrap(), Some(cumulative));
+    }
+
+    #[test]
+    fn producer_completion_cannot_reopen_observation_or_accept_corrupt_history() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let binding = family_binding(&request());
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let mut family = family_record(binding, vec![process(200, "birth-200", 200)]);
+        family.coverage = RunFamilyCoverage::Complete;
+        assert!(spool.write_run_family_record(&family).is_err());
+        family.coverage = RunFamilyCoverage::Observing;
+        spool.write_run_family_record(&family).unwrap();
+        family.coverage = RunFamilyCoverage::Complete;
+        spool.write_run_family_record(&family).unwrap();
+        spool.write_run_family_record(&family).unwrap();
+        family.coverage = RunFamilyCoverage::Observing;
+        assert!(spool.write_run_family_record(&family).is_err());
+        std::fs::write(spool.directory().join("run-family.json"), b"{bad}").unwrap();
+        assert!(spool.read_run_family_record().is_err());
+        assert!(spool.write_run_family_record(&family).is_err());
     }
 
     #[test]

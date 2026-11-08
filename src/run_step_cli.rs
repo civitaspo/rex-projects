@@ -11,9 +11,11 @@ use crate::launch::{
     AgentLaunchAuthority, AgentLaunchReservation, LaunchDecision, ObservedWrapperIdentity,
     RexBlockLifecycle, RexBlockOwnership, RexViewBlock,
 };
-use crate::process::{ProcessIdentityQuality, inspect_process_table};
+use crate::process::{
+    ProcessIdentity, ProcessIdentityQuality, ProcessSignal, inspect_process_table,
+};
 use crate::run_step_package::RunStepPackage;
-use crate::run_step_spool::RunStepSpool;
+use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunFamilyRecord, RunStepSpool};
 use crate::store::ConfigStore;
 
 fn wait_for_start_request(
@@ -178,6 +180,15 @@ pub fn finalize_and_ack_start(
     {
         return Err("wrapper start request does not match the finalized host launch".into());
     }
+    spool.publish_run_family_binding_once(&RunFamilyBinding {
+        schema_version: 1,
+        agent_run_id: authority.agent_run_id.clone(),
+        reservation_epoch: reservation.run_epoch,
+        authority_digest: authority.digest()?,
+        descriptor_digest: authority.descriptor_digest.clone(),
+        wrapper_pid: request.wrapper_pid,
+        wrapper_start_identity: request.wrapper_start_identity.clone(),
+    })?;
     if let Some(receipt) = store.persisted_start_receipt(request)? {
         spool.publish_start_receipt(&start, receipt)?;
         return Ok(authority);
@@ -512,6 +523,15 @@ pub fn run_step(
     {
         return Err("host did not durably accept this exact Agent launch".into());
     }
+    let family_binding = spool.read_run_family_binding()?;
+    if family_binding.agent_run_id != package.descriptor.run_id
+        || family_binding.reservation_epoch != package.descriptor.run_epoch
+        || family_binding.descriptor_digest != start.request.descriptor_digest
+        || family_binding.wrapper_pid != std::process::id()
+        || family_binding.wrapper_start_identity != start.request.wrapper_start_identity
+    {
+        return Err("host process-family binding does not match the accepted launch".into());
+    }
     let mut environment = crate::environment::EnvironmentHandoff::consume_file(
         environment_handoff,
         &package.descriptor.environment_snapshot_id,
@@ -557,13 +577,166 @@ pub fn run_step(
         continuation,
         shutdown_grace: Duration::from_secs(package.shutdown_grace_seconds),
     };
-    let result = crate::run_step::run_turn(&request, &mut crate::run_step::SystemProcessObserver)
-        .map_err(|e| e.to_string())?;
+    let mut observer = DurableFamilyObserver::new(&spool, family_binding);
+    let result = crate::run_step::run_turn(&request, &mut observer).map_err(|e| e.to_string())?;
     let envelope = spool.publish_turn_result_once(&start, result)?;
     Ok(RunStepCliResult {
         run_id: run_id.to_owned(),
         result_digest: envelope.result_digest,
     })
+}
+
+pub(crate) struct DurableFamilyObserver<'a> {
+    spool: &'a RunStepSpool,
+    binding: RunFamilyBinding,
+    inner: crate::run_step::SystemProcessObserver,
+    provider_root: Option<ProcessIdentity>,
+    interrupted: bool,
+}
+
+impl<'a> DurableFamilyObserver<'a> {
+    pub(crate) fn new(spool: &'a RunStepSpool, binding: RunFamilyBinding) -> Self {
+        Self {
+            spool,
+            binding,
+            inner: crate::run_step::SystemProcessObserver,
+            provider_root: None,
+            interrupted: false,
+        }
+    }
+
+    fn write_phase(
+        &mut self,
+        provider_pid: u32,
+        tree: &[ProcessIdentity],
+        coverage: RunFamilyCoverage,
+    ) -> Result<(), String> {
+        if self.interrupted && coverage != RunFamilyCoverage::Interrupted {
+            return Err("run-step process-family observation was interrupted".into());
+        }
+        let result = self.write_phase_inner(provider_pid, tree, coverage);
+        if result.is_err() {
+            self.interrupted = true;
+        }
+        result
+    }
+
+    fn write_phase_inner(
+        &mut self,
+        provider_pid: u32,
+        tree: &[ProcessIdentity],
+        coverage: RunFamilyCoverage,
+    ) -> Result<(), String> {
+        let root = match &self.provider_root {
+            Some(root) => root.clone(),
+            None => {
+                let root = tree
+                    .iter()
+                    .find(|process| process.pid == provider_pid)
+                    .cloned()
+                    .ok_or("run-step sample omitted the exact provider root")?;
+                self.provider_root = Some(root.clone());
+                root
+            }
+        };
+        let mut process_tree = tree.to_vec();
+        process_tree.sort_by(|left, right| {
+            (left.pid, &left.start_identity).cmp(&(right.pid, &right.start_identity))
+        });
+        let bytes = serde_json::to_vec(&process_tree).map_err(|error| error.to_string())?;
+        self.spool.write_run_family_record(&RunFamilyRecord {
+            schema_version: 1,
+            binding: self.binding.clone(),
+            observed_at_unix: unix_now_seconds()?,
+            coverage,
+            provider_root: root,
+            process_tree_digest: Digest::parse(format!("{:x}", Sha256::digest(bytes)))?,
+            process_tree,
+        })
+    }
+}
+
+impl crate::run_step::ProcessObserver for DurableFamilyObserver<'_> {
+    type Identity = ProcessIdentity;
+
+    fn after_spawn(&mut self, pid: u32) -> Result<(), String> {
+        crate::run_step::ProcessObserver::after_spawn(&mut self.inner, pid)
+    }
+    fn inspect(&mut self) -> Result<Vec<Self::Identity>, String> {
+        crate::run_step::ProcessObserver::inspect(&mut self.inner)
+    }
+    fn try_wait(
+        &mut self,
+        child: &mut std::process::Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        crate::run_step::ProcessObserver::try_wait(&mut self.inner, child)
+    }
+    fn pid(identity: &Self::Identity) -> u32 {
+        <crate::run_step::SystemProcessObserver as crate::run_step::ProcessObserver>::pid(identity)
+    }
+    fn group(identity: &Self::Identity) -> u32 {
+        <crate::run_step::SystemProcessObserver as crate::run_step::ProcessObserver>::group(
+            identity,
+        )
+    }
+    fn capture_tree(&self, root_pid: u32, table: &[Self::Identity]) -> Vec<Self::Identity> {
+        crate::run_step::ProcessObserver::capture_tree(&self.inner, root_pid, table)
+    }
+    fn matching(
+        &self,
+        observed: &[Self::Identity],
+        current: &[Self::Identity],
+    ) -> Vec<Self::Identity> {
+        crate::run_step::ProcessObserver::matching(&self.inner, observed, current)
+    }
+    fn signal_group_if_observed(
+        &self,
+        group: u32,
+        observed: &[Self::Identity],
+        current: &[Self::Identity],
+        signal: ProcessSignal,
+    ) -> Result<bool, String> {
+        crate::run_step::ProcessObserver::signal_group_if_observed(
+            &self.inner,
+            group,
+            observed,
+            current,
+            signal,
+        )
+    }
+    fn checkpoint_family(
+        &mut self,
+        provider_pid: u32,
+        tree: &[Self::Identity],
+    ) -> Result<(), String> {
+        self.write_phase(provider_pid, tree, RunFamilyCoverage::Observing)
+    }
+    fn complete_family(
+        &mut self,
+        provider_pid: u32,
+        tree: &[Self::Identity],
+    ) -> Result<(), String> {
+        self.write_phase(provider_pid, tree, RunFamilyCoverage::Complete)
+    }
+    fn interrupt_family(&mut self) -> Result<(), String> {
+        self.interrupted = true;
+        let Some(mut record) = self.spool.read_run_family_record()? else {
+            return Ok(());
+        };
+        if record.coverage == RunFamilyCoverage::Observing {
+            record.coverage = RunFamilyCoverage::Interrupted;
+            record.observed_at_unix = unix_now_seconds()?;
+            self.spool.write_run_family_record(&record)?;
+        }
+        Ok(())
+    }
+}
+
+fn unix_now_seconds() -> Result<i64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .map_err(|_| "system clock is before Unix epoch".into())
 }
 
 fn digest_file(path: &Path) -> Result<Digest, String> {

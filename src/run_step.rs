@@ -49,6 +49,23 @@ pub trait ProcessObserver {
         current: &[Self::Identity],
         signal: ProcessSignal,
     ) -> Result<bool, String>;
+    fn checkpoint_family(
+        &mut self,
+        _provider_pid: u32,
+        _tree: &[Self::Identity],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn complete_family(
+        &mut self,
+        _provider_pid: u32,
+        _tree: &[Self::Identity],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn interrupt_family(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Production observer backed by identity-checked process-table operations.
@@ -819,15 +836,36 @@ fn run_prepared<O: ProcessObserver>(
     if !observed.iter().any(|item| O::pid(item) == pid) {
         observed.push(root_identity);
     }
-    if let Some(error) = registration_error {
-        let cleanup = stop_observed_groups(
+    if observer.checkpoint_family(pid, &observed).is_err() {
+        let _ = stop_observed_groups(
             observer,
             &mut child,
             process_group,
             &mut observed,
             &prepared,
-        )
-        .unwrap_or(false);
+        );
+        let _ = observer.interrupt_family();
+        discard_readers(stdout_reader, stderr_reader);
+        return Ok(unresolved_receipt(
+            request,
+            &prepared,
+            Some("provider process-family checkpoint failed".into()),
+            false,
+            None,
+            Some(pid),
+            observed.into_iter().map(observed_process).collect(),
+            CleanupState::Unknown,
+        ));
+    }
+    if let Some(error) = registration_error {
+        let _ = stop_observed_groups(
+            observer,
+            &mut child,
+            process_group,
+            &mut observed,
+            &prepared,
+        );
+        let _ = observer.interrupt_family();
         discard_readers(stdout_reader, stderr_reader);
         return Ok(unresolved_receipt(
             request,
@@ -837,11 +875,7 @@ fn run_prepared<O: ProcessObserver>(
             None,
             Some(pid),
             observed.into_iter().map(observed_process).collect(),
-            if cleanup {
-                CleanupState::Confirmed
-            } else {
-                CleanupState::Unknown
-            },
+            CleanupState::Unknown,
         ));
     }
     let started = std::time::Instant::now();
@@ -910,6 +944,24 @@ fn run_prepared<O: ProcessObserver>(
             }
         };
         merge_observed(observer, pid, &table, &mut observed);
+        if observer.checkpoint_family(pid, &observed).is_err() {
+            inspection_error = Some("provider process-family checkpoint failed".into());
+            cleanup_known = match stop_observed_groups(
+                observer,
+                &mut child,
+                process_group,
+                &mut observed,
+                &prepared,
+            ) {
+                Ok(stopped) => stopped,
+                Err(error) => {
+                    inspection_error = Some(error.to_string());
+                    false
+                }
+            };
+            let _ = observer.interrupt_family();
+            break;
+        }
         #[cfg(unix)]
         let received = PENDING_SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(unix))]
@@ -1090,6 +1142,34 @@ fn run_prepared<O: ProcessObserver>(
         outcome = TurnOutcome::ProviderFailed;
         structured_result = None;
         inspection_error.get_or_insert_with(|| "qualification deadline exceeded".into());
+    }
+    if inspection_error.is_some() {
+        cleanup_known = false;
+    }
+    if cleanup_known {
+        match observer.inspect() {
+            Ok(final_table) => {
+                merge_observed(observer, pid, &final_table, &mut observed);
+                if observer.checkpoint_family(pid, &observed).is_err()
+                    || !observer.matching(&observed, &final_table).is_empty()
+                    || observer.complete_family(pid, &observed).is_err()
+                {
+                    cleanup_known = false;
+                    inspection_error.get_or_insert_with(|| {
+                        "provider process-family terminal coverage was not confirmed".into()
+                    });
+                }
+            }
+            Err(error) => {
+                cleanup_known = false;
+                inspection_error.get_or_insert(error);
+            }
+        }
+    }
+    if !cleanup_known {
+        let _ = observer.interrupt_family();
+        outcome = TurnOutcome::ProviderFailed;
+        structured_result = None;
     }
     let result_digest = structured_result
         .as_ref()
@@ -1323,7 +1403,13 @@ fn merge_observed<O: ProcessObserver>(
     observed: &mut Vec<O::Identity>,
 ) {
     for identity in observer.capture_tree(root_pid, current) {
-        if !observed.contains(&identity) {
+        if let Some(previous) = observed.iter_mut().find(|previous| {
+            previous.pid() == identity.pid()
+                && previous.start_identity() == identity.start_identity()
+                && previous.identity_quality() == identity.identity_quality()
+        }) {
+            *previous = identity;
+        } else {
             observed.push(identity);
         }
     }
@@ -1414,6 +1500,9 @@ fn observe_until_stopped<O: ProcessObserver>(
             .map(O::pid)
             .unwrap_or(root_group);
         merge_observed(observer, root, &current, observed);
+        if observer.checkpoint_family(root, observed).is_err() {
+            let _ = observer.interrupt_family();
+        }
         let live = observer.matching(observed, &current);
         if live.is_empty() {
             return Ok(true);
@@ -2648,6 +2737,115 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn durable_producer_checkpoints_late_own_group_child_before_completion() {
+        use crate::run_step_cli::DurableFamilyObserver;
+        use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunStepSpool};
+        use std::os::unix::fs::PermissionsExt;
+
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        let executable = root.path().join("late child provider");
+        let release = root.path().join("release");
+        let child_pid_file = root.path().join("child-pid");
+        let response = r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#;
+        fs::write(&executable, format!(
+            "#!/bin/sh\n/bin/sleep 0.4\nset -m\n/bin/sleep 8 &\necho $! > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 80 ]; do /bin/sleep 0.05; i=$((i+1)); done\nprintf '%s' '{}'\n",
+            child_pid_file.display(), release.display(), response,
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        let spool = RunStepSpool::open(&turn.descriptor.control_dir).unwrap();
+        let wrapper = process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .unwrap();
+        let binding = RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: turn.descriptor.run_id.clone(),
+            reservation_epoch: turn.descriptor.run_epoch,
+            authority_digest: Digest::parse("f".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("a".repeat(64)).unwrap(),
+            wrapper_pid: wrapper.pid,
+            wrapper_start_identity: wrapper.start_identity,
+        };
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                let mut observer = DurableFamilyObserver::new(&spool, binding);
+                run_fixture_turn(&turn, &mut observer).unwrap()
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            let (observing, late_child) = loop {
+                let child_pid = fs::read_to_string(&child_pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                if let (Some(pid), Some(record)) =
+                    (child_pid, spool.read_run_family_record().unwrap())
+                    && let Some(child) = record
+                        .process_tree
+                        .iter()
+                        .find(|process| process.pid == pid)
+                        .cloned()
+                {
+                    break (record, child);
+                }
+                if std::time::Instant::now() >= deadline {
+                    fs::write(&release, "continue").unwrap();
+                    let result = producer.join().unwrap();
+                    panic!(
+                        "late child must be durable while provider is alive; receipt={:?}; family={:?}",
+                        result.receipt,
+                        spool.read_run_family_record()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(observing.coverage, RunFamilyCoverage::Observing);
+            assert_ne!(
+                late_child.process_group_id,
+                observing.provider_root.process_group_id
+            );
+            assert_eq!(
+                late_child.quality,
+                process::ProcessIdentityQuality::KernelBirthToken
+            );
+            let current = process::inspect_process_table().unwrap();
+            assert!(
+                current
+                    .iter()
+                    .any(|process| process.pid == observing.provider_root.pid
+                        && process.start_identity == observing.provider_root.start_identity)
+            );
+            fs::write(&release, "continue").unwrap();
+            let result = producer.join().unwrap();
+            assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+            assert!(matches!(result.receipt.outcome, TurnOutcome::Completed));
+            let complete = spool.read_run_family_record().unwrap().unwrap();
+            assert_eq!(complete.coverage, RunFamilyCoverage::Complete);
+            assert!(
+                complete
+                    .process_tree
+                    .iter()
+                    .any(|process| process.pid == late_child.pid
+                        && process.start_identity == late_child.start_identity)
+            );
+            assert!(
+                process::matching_processes(
+                    &complete.process_tree,
+                    &process::inspect_process_table().unwrap()
+                )
+                .is_empty()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fake_provider_runs_finite_structured_turn_and_resumes_same_conversation() {
         let _run_lock = TEST_RUN_LOCK.lock().unwrap();
         let root = tempdir().unwrap();
@@ -2958,7 +3156,7 @@ mod tests {
         assert!(registration.receipt.launch_pid_hint.is_some());
         assert!(matches!(
             registration.receipt.cleanup,
-            CleanupState::Confirmed
+            CleanupState::Unknown
         ));
         assert!(registration.receipt.processes.iter().any(|process| {
             process.identity_quality == "test_only" && !process.start_identity.is_empty()
@@ -3001,7 +3199,7 @@ mod tests {
             ..TestObserver::default()
         };
         let wait = run_fixture_turn(&make_turn(), &mut wait_failure).unwrap();
-        assert!(matches!(wait.receipt.cleanup, CleanupState::Confirmed));
+        assert!(matches!(wait.receipt.cleanup, CleanupState::Unknown));
         assert!(wait.receipt.cleanup_detail.is_some());
         assert!(!wait.receipt.processes.is_empty());
     }

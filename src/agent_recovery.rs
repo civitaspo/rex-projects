@@ -20,7 +20,7 @@ use crate::process::{
     ProcessIdentity, ProcessIdentityQuality, ProcessSignal, capture_process_tree,
     executable_path_for_identity, inspect_process_table, signal_process_group_if_observed,
 };
-use crate::run_step_spool::{BlockLossCleanupSnapshot, RunStepSpool};
+use crate::run_step_spool::{BlockLossCleanupSnapshot, RunFamilyCoverage, RunStepSpool};
 use crate::store::ConfigStore;
 use crate::store::agent_recovery::{
     AdoptedProcessIdentity, AgentAdoptionEvidence, RecoverableAgentRun,
@@ -808,9 +808,33 @@ fn reconcile_missing_block(
             });
         }
     };
+    let family = spool
+        .read_run_family_record()
+        .ok()
+        .flatten()
+        .filter(|family| {
+            family.binding.agent_run_id == run.agent_run_id
+                && family.binding.reservation_epoch == run.reservation_epoch
+                && family.binding.authority_digest == run.authority_digest
+                && family.binding.descriptor_digest == run.authority.descriptor_digest
+                && family.binding.wrapper_pid == wrapper.pid
+                && family.binding.wrapper_start_identity == wrapper.start_identity
+                && family.provider_root.pid == provider.provider_pid
+                && family.provider_root.start_identity == provider.provider_start_identity
+                && family.provider_root.quality == ProcessIdentityQuality::KernelBirthToken
+                && launch_tree.iter().any(|process| {
+                    process.pid == family.provider_root.pid
+                        && process.start_identity == family.provider_root.start_identity
+                        && process.process_group_id == family.provider_root.process_group_id
+                        && process.quality == family.provider_root.quality
+                })
+        });
+    let producer_complete = family
+        .as_ref()
+        .is_some_and(|family| family.coverage == RunFamilyCoverage::Complete);
     let snapshot_exists = existing_snapshot.is_some();
     let mut snapshot = match existing_snapshot {
-        Some(snapshot) => {
+        Some(mut snapshot) => {
             if snapshot.agent_run_id != run.agent_run_id
                 || snapshot.reservation_epoch != run.reservation_epoch
                 || snapshot.authority_digest != run.authority_digest
@@ -820,6 +844,29 @@ fn reconcile_missing_block(
                 return Ok(AgentRecoveryDisposition::Unresolved {
                     reason: RecoveryUnknown::ProcessInspectionUnavailable,
                 });
+            }
+            let family_was_already_recorded = family.as_ref().is_none_or(|family| {
+                contains_process_identities(&snapshot.process_tree, &family.process_tree)
+            });
+            if let Some(family) = &family {
+                merge_process_tree(&mut snapshot.process_tree, &family.process_tree);
+            }
+            if snapshot.process_tree.len() > MAX_FORK_WATCH_IDENTITIES {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                });
+            }
+            snapshot.observed_at_unix = snapshot.observed_at_unix.max(policy.now_unix);
+            snapshot.process_tree_digest = match digest_process_tree(&snapshot.process_tree) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    return Ok(AgentRecoveryDisposition::Unresolved {
+                        reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                    });
+                }
+            };
+            if !producer_complete || !family_was_already_recorded {
+                snapshot.cleanup_covered = false;
             }
             if snapshot.cleanup_covered {
                 let Some(fresh) = inspect_process_table().ok() else {
@@ -847,9 +894,25 @@ fn reconcile_missing_block(
             snapshot
         }
         None => {
-            make_block_loss_snapshot(run, provider, launch_tree.clone(), policy.now_unix, false)?
+            let mut process_tree = launch_tree.clone();
+            if let Some(family) = &family {
+                merge_process_tree(&mut process_tree, &family.process_tree);
+            }
+            make_block_loss_snapshot(run, provider, process_tree, policy.now_unix, false)?
         }
     };
+    if !producer_complete {
+        return stop_known_processes_without_watch(
+            store,
+            run,
+            owner_generation,
+            policy,
+            &spool,
+            snapshot,
+            current,
+            RecoveryUnknown::ProcessInspectionUnavailable,
+        );
+    }
     if runtime
         .run_fork_watch(run, &provider.process_tree_digest, snapshot_exists)
         .is_none()
