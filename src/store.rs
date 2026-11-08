@@ -15,12 +15,15 @@ use crate::domain::ids::{
 use crate::domain::types::Role;
 use crate::engine::reducer::{Input, TicketRun, WakeTarget, reduce};
 use crate::launch::{
-    AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, ObservedProviderStart,
-    ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle, RexFocusTarget, RexView,
-    RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
+    AgentLaunchAuthority, AgentLaunchReceipt, AgentLaunchReservation, AgentStartRequest,
+    ObservedProviderStart, ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle,
+    RexFocusTarget, RexView, RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord,
+    authorize_start,
 };
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
+mod agent_runtime;
+pub use agent_runtime::{LaunchPreparationOutcome, PendingRoleWakeInput};
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
@@ -373,6 +376,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             crate::launch::migrate_v7(&mut connection)?;
+        }
+        if existing_version < 8 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            crate::launch::migrate_v8(&mut connection)?;
         }
         Ok(Self {
             connection,
@@ -951,17 +960,62 @@ impl ConfigStore {
         authority: &AgentLaunchAuthority,
     ) -> Result<bool, String> {
         authority.validate()?;
-        let authority_json = serde_json::to_string(authority).map_err(|error| error.to_string())?;
+        let authority_json = authority.storage_json()?;
         let authority_digest = authority.digest()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
+        let prior_authority: Option<(String, String)> = tx
+            .query_row(
+                "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let exact_replay = match prior_authority {
+            Some((stored_json, stored_digest)) => {
+                if stored_json != authority_json || stored_digest != authority_digest.as_str() {
+                    return Err(
+                        "AgentRun already has a different immutable launch authority".into(),
+                    );
+                }
+                true
+            }
+            None => false,
+        };
+        if !exact_replay {
+            authority.validate_new_launch_topology()?;
+        }
+        let reservation_row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT reservation_json,reservation_digest FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((reservation_json, reservation_digest)) = reservation_row {
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(reservation_json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            reservation.validate()?;
+            if reservation.digest()?.as_str() != reservation_digest
+                || !agent_runtime::authority_matches_reservation(authority, &reservation)
+            {
+                return Err("launch authority does not match its immutable reservation".into());
+            }
+        }
         if authority.controller_generation != owner_generation {
             return Err(
                 "new launch authority must belong to the active controller generation".into(),
             );
+        }
+        if exact_replay {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
         }
         let expected_role = serde_json::to_value(authority.role)
             .map_err(|error| error.to_string())?
@@ -1042,6 +1096,39 @@ impl ConfigStore {
         let effective: EffectiveConfig =
             crate::protocol::parse_unique(effective_json.as_bytes())
                 .map_err(|error| format!("applied config snapshot is invalid: {error}"))?;
+        if let Some(project_config) = effective.config.projects.get(&authority.project_id) {
+            let project_roles = crate::config::effective_project_roles(
+                &authority.project_id,
+                &effective.config.projects,
+            )?;
+            let expected_profile = if let Some(recipe_id) = &authority.operation_recipe_id {
+                if !project_config
+                    .operation_matches
+                    .iter()
+                    .any(|operation| &operation.recipe == recipe_id)
+                {
+                    return Err("operation recipe is not selected by this Project".into());
+                }
+                effective
+                    .config
+                    .operation_recipes
+                    .get(recipe_id)
+                    .ok_or("launch operation recipe is missing from applied configuration")?
+                    .roles
+                    .get(&authority.role)
+                    .or_else(|| project_roles.get(&authority.role))
+            } else {
+                project_roles.get(&authority.role)
+            }
+            .ok_or("launch role has no effective profile")?;
+            if expected_profile != &authority.profile_id {
+                return Err(
+                    "launch profile does not match the Project's effective role profile".into(),
+                );
+            }
+        } else if authority.operation_recipe_id.is_some() {
+            return Err("launch Project is missing from the applied config snapshot".into());
+        }
         let profile = effective
             .profiles
             .get(&authority.profile_id)
@@ -1114,9 +1201,10 @@ impl ConfigStore {
             return Err("qualification receipt does not match the immutable launch profile".into());
         }
         qualification.validate_for_unattended_launch()?;
+        agent_runtime::validate_qualification_profile(&qualification, profile)?;
         let authority_inserted = tx.execute(
-            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34) ON CONFLICT(agent_run_id) DO NOTHING",
-            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,operation_recipe_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,wake_snapshot_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36) ON CONFLICT(agent_run_id) DO NOTHING",
+            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.operation_recipe_id,authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.wake_snapshot_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
         ).map_err(|error| error.to_string())?;
         let existing: Option<(String,String)> = tx
             .query_row(
@@ -3324,6 +3412,56 @@ impl ConfigStore {
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
         authority.validate()?;
+        let reservation_state: Option<(String, String)> = tx
+            .query_row(
+                "SELECT lifecycle,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if reservation_state
+            .as_ref()
+            .is_some_and(|(state, _)| state != "authorized")
+        {
+            return Err("Agent launch reservation has not been finalized".into());
+        }
+        if let Some((_, reservation_json)) = &reservation_state {
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(reservation_json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            agent_runtime::validate_project_launch_epoch(
+                &tx,
+                &authority.project_id,
+                reservation.project_epoch,
+            )?;
+            agent_runtime::validate_project_launch_config(
+                &tx,
+                &authority.project_id,
+                reservation.config_revision.0,
+                &reservation.config_digest,
+            )?;
+        }
+        if reservation_state.is_some() {
+            let block_is_active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2 AND agent_run_id=?3 AND ownership='factory' AND lifecycle='active')",
+                params![authority.rex_view_id.as_str(),authority.rex_block_id,request.agent_run_id.as_str()],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            let wake_digest: Option<String> = tx
+                .query_row(
+                    "SELECT snapshot_digest FROM agent_wake_context WHERE agent_run_id=?1",
+                    [request.agent_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if !block_is_active
+                || wake_digest.as_deref() != Some(authority.wake_snapshot_digest.as_str())
+            {
+                return Err("Agent launch reservation lacks its finalized active Rex block and wake context".into());
+            }
+        }
         let qualification_json: String = tx
             .query_row(
                 "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
@@ -3416,6 +3554,102 @@ impl ConfigStore {
                 "provider start observation does not match the active launch authority".into(),
             );
         }
+        let reservation: Option<(String, String)> = tx
+            .query_row(
+                "SELECT lifecycle,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [observation.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let reserved_wake_count = if let Some((lifecycle, reservation_json)) = reservation {
+            if lifecycle != "authorized" {
+                return Err("Agent launch reservation has not been finalized".into());
+            }
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(reservation_json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            if reservation.wake_snapshot.digest != authority.wake_snapshot_digest {
+                return Err("launch authority wake manifest does not match its reservation".into());
+            }
+            agent_runtime::validate_project_launch_epoch(
+                &tx,
+                &authority.project_id,
+                reservation.project_epoch,
+            )?;
+            agent_runtime::validate_project_launch_config(
+                &tx,
+                &authority.project_id,
+                reservation.config_revision.0,
+                &reservation.config_digest,
+            )?;
+
+            let mut statement = tx
+                .prepare(
+                    "SELECT wake_input_id,project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle FROM role_wake_inputs WHERE consuming_agent_run_id=?1 ORDER BY wake_input_id",
+                )
+                .map_err(|error| error.to_string())?;
+            let owned_wakes = statement
+                .query_map([observation.agent_run_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, i32>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            drop(statement);
+            if owned_wakes.len() != reservation.wake_snapshot.inputs.len()
+                || owned_wakes.iter().any(
+                    |(
+                        wake_id,
+                        project_id,
+                        role_session_id,
+                        source_type,
+                        source_id,
+                        source_revision,
+                        priority,
+                        payload_json,
+                        lifecycle,
+                    )| {
+                        let Some(expected) = reservation
+                            .wake_snapshot
+                            .inputs
+                            .iter()
+                            .find(|input| input.wake_input_id == *wake_id)
+                        else {
+                            return true;
+                        };
+                        let stored_payload =
+                            crate::protocol::parse_unique(payload_json.as_bytes()).ok();
+                        project_id != authority.project_id.as_str()
+                            || role_session_id != reservation.role_session_id.as_str()
+                            || source_type != expected.source_type.as_str()
+                            || source_id != expected.source_id.as_str()
+                            || *source_revision != expected.source_revision
+                            || *priority != expected.priority
+                            || stored_payload.as_ref() != Some(&expected.payload_json)
+                            || lifecycle != "assigned"
+                            || !expected.host_artifacts.is_empty()
+                    },
+                )
+            {
+                return Err(
+                    "assigned wake inputs do not match the immutable launch reservation".into(),
+                );
+            }
+            reservation.wake_snapshot.inputs.len()
+        } else {
+            0
+        };
         let qualification_json: String = tx
             .query_row(
                 "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
@@ -3453,6 +3687,15 @@ impl ConfigStore {
             return Err(
                 "AgentRun state changed before provider start observation was committed".into(),
             );
+        }
+        let consumed_wakes = tx
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE consuming_agent_run_id=?1 AND lifecycle='assigned'",
+                [observation.agent_run_id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+        if consumed_wakes != reserved_wake_count {
+            return Err("assigned wake inputs changed before provider start was committed".into());
         }
         tx.commit().map_err(|error| error.to_string())
     }
@@ -3785,7 +4028,7 @@ mod tests {
         AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketId, TicketNamespace,
         TicketRunId,
     };
-    use crate::domain::types::{AgentAdapter, CommitMode, Role};
+    use crate::domain::types::Role;
     use crate::engine::reducer::Input;
     use crate::launch::{
         AgentLaunchAuthority, AgentStartRequest, ObservedWrapperIdentity, ProviderQualification,
@@ -4211,10 +4454,11 @@ mod tests {
         let profile_id = ProfileId::parse("worker").unwrap();
         let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
             "adapter": "codex",
-            "command": ["/usr/bin/codex"],
+            "command": [std::env::current_exe().unwrap().display().to_string()],
             "commit_mode": "host"
         }))
         .unwrap();
+        let profile_identity = crate::run_step::profile_runtime_identity(&profile).unwrap();
         let profile_digest = Digest::parse(format!(
             "{:x}",
             sha2::Sha256::digest(super::canonical_json(&profile).unwrap().as_bytes())
@@ -4314,13 +4558,13 @@ mod tests {
             project_id: project_a.clone(),
             profile_id: profile_id.clone(),
             profile_digest: profile_digest.clone(),
-            adapter: AgentAdapter::Codex,
-            executable_path: "/usr/bin/codex".into(),
-            executable_digest: Digest::parse("7".repeat(64)).unwrap(),
+            adapter: profile_identity.adapter,
+            executable_path: profile_identity.executable_path.display().to_string(),
+            executable_digest: profile_identity.executable_digest.clone(),
             provider_version: "fixture".into(),
-            permission_mode: "workspace_write".into(),
-            invocation_options_digest: Digest::parse("8".repeat(64)).unwrap(),
-            commit_mode: CommitMode::Host,
+            permission_mode: profile_identity.effective_permission_mode.into(),
+            invocation_options_digest: profile_identity.invocation_options_digest.clone(),
+            commit_mode: profile_identity.commit_mode,
             proof: QualificationProof {
                 schema_version: 1,
                 probe_id: "probe".into(),
@@ -4333,7 +4577,7 @@ mod tests {
                 automatic_turn_result_digest: Digest::parse("3".repeat(64)).unwrap(),
                 automatic_turn_completed: true,
                 structured_result_valid: true,
-                observed_permission_mode: "workspace_write".into(),
+                observed_permission_mode: profile_identity.effective_permission_mode.into(),
                 permission_prompt_count: 0,
                 cleanup_process_tree_digest: Digest::parse("4".repeat(64)).unwrap(),
                 process_tree_absent: true,
@@ -4360,6 +4604,7 @@ mod tests {
             run_epoch: 1,
             controller_generation: generation,
             operation_id,
+            operation_recipe_id: None,
             rex_view_id: view_id,
             descriptor_digest: Digest::parse("c".repeat(64)).unwrap(),
             runtime_binary_digest: Digest::parse("d".repeat(64)).unwrap(),
@@ -4369,6 +4614,7 @@ mod tests {
             profile_digest,
             instruction_digest: Digest::parse("3".repeat(64)).unwrap(),
             result_schema_digest: Digest::parse("4".repeat(64)).unwrap(),
+            wake_snapshot_digest: Digest::parse("7".repeat(64)).unwrap(),
             qualification_receipt_digest: qualification_digest,
             rex_server_identity: "rex-instance".into(),
             rex_session_id: "session".into(),
@@ -4505,6 +4751,31 @@ mod tests {
     }
 
     #[test]
+    fn new_reservationless_operator_authority_cannot_use_legacy_parent_topology() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, mut authority, _, _) =
+            launch_authority_fixture(false, Some("operator"));
+        authority.role = Role::Operator;
+        authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        authority.parent_role = Some(Role::Supervisor);
+        assert!(authority.validate().is_ok());
+
+        let error = store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap_err();
+        assert!(error.contains("Operator launch parent role must be Coordinator"));
+        let count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_launch_authority WHERE agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn launch_authority_rejects_legacy_agent_run_without_reserved_role() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let (_temp, mut store, generation, authority, _, _) = launch_authority_fixture(false, None);
@@ -4523,6 +4794,160 @@ mod tests {
             store
                 .register_agent_launch_authority(generation, &authority)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_launch_authority_replay_does_not_revalidate_changed_runtime_profile() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (_temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        assert!(
+            store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
+        );
+        let changed = store.connection.execute(
+            "UPDATE config_snapshots SET effective_config_json=json_set(effective_config_json,'$.profiles.worker.command[0]','/missing/provider') WHERE source_identity='factory' AND revision=?1",
+            [authority.config_revision.0],
+        ).unwrap();
+        assert_eq!(changed, 1);
+        assert!(
+            !store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn populated_v7_authority_and_start_receipt_survive_v8_migration() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let (temp, mut store, generation, authority, _, _) =
+            launch_authority_fixture(false, Some("worker"));
+        assert!(
+            store
+                .register_agent_launch_authority(generation, &authority)
+                .unwrap()
+        );
+        let request = AgentStartRequest {
+            schema_version: 1,
+            operation_id: authority.operation_id.clone(),
+            agent_run_id: authority.agent_run_id.clone(),
+            project_id: authority.project_id.clone(),
+            controller_generation: generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            wrapper_pid: 456,
+            wrapper_start_identity: "v7-wrapper".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+        };
+        let observed = ObservedWrapperIdentity {
+            pid: request.wrapper_pid,
+            start_identity: request.wrapper_start_identity.clone(),
+            rex_session_id: request.rex_session_id.clone(),
+            rex_block_id: request.rex_block_id.clone(),
+            runtime_binary_digest: request.runtime_binary_digest.clone(),
+        };
+        let receipt = store
+            .authorize_agent_start(generation, &request, &observed)
+            .unwrap();
+
+        // Recreate a schema-v7 Operator authority with its historical Supervisor parent.
+        // Its exact old JSON and digest must remain readable and replayable after migration.
+        let mut historical_authority = authority.clone();
+        historical_authority.role = Role::Operator;
+        historical_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        historical_authority.parent_role = Some(Role::Supervisor);
+        historical_authority.wake_snapshot_digest = Digest::parse("0".repeat(64)).unwrap();
+        let legacy_json = historical_authority.storage_json().unwrap();
+        assert!(!legacy_json.contains("operation_recipe_id"));
+        assert!(!legacy_json.contains("wake_snapshot_digest"));
+        let legacy_digest = historical_authority.digest().unwrap().to_string();
+        store
+            .connection
+            .execute_batch(
+                "DROP TRIGGER agent_launch_authority_immutable_update;
+             DROP TRIGGER agent_launch_authority_immutable_delete;
+             DROP TRIGGER agent_runs_role_immutable;",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES ('supervisor-run',?1,'factory',?2,?3,'supervisor-session','supervisor','legacy-test',1,'supervisor-op','running',?4)",
+                rusqlite::params![authority.project_id.as_str(), authority.config_revision.0, authority.config_digest.as_str(), generation],
+            )
+            .unwrap();
+        store.connection.execute(
+            "UPDATE agent_launch_authority SET role='operator',parent_run_id='supervisor-run',parent_role='supervisor',authority_json=?2,authority_digest=?3 WHERE agent_run_id=?1",
+            rusqlite::params![authority.agent_run_id.as_str(), legacy_json, legacy_digest],
+        ).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET role='operator' WHERE agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX agent_launch_reservations_project;
+             DROP TRIGGER agent_launch_reservation_identity_guard;
+             DROP TRIGGER agent_launch_reservation_no_delete;
+             DROP TRIGGER agent_wake_context_immutable_update;
+             DROP TRIGGER agent_wake_context_immutable_delete;
+             DROP TABLE agent_launch_reservations;
+             DROP TABLE agent_wake_context;
+             ALTER TABLE agent_launch_authority DROP COLUMN operation_recipe_id;
+             ALTER TABLE agent_launch_authority DROP COLUMN wake_snapshot_digest;
+             DELETE FROM schema_migrations WHERE version=8;
+             PRAGMA user_version=7;",
+            )
+            .unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let expected_legacy_authority = historical_authority;
+        assert_eq!(
+            store
+                .agent_launch_authority(&authority.agent_run_id)
+                .unwrap(),
+            Some(expected_legacy_authority.clone())
+        );
+        let changed = store
+            .connection
+            .execute(
+                "UPDATE config_snapshots SET effective_config_json=json_set(effective_config_json,'$.profiles.worker.command[0]','/missing/provider') WHERE source_identity='factory' AND revision=?1",
+                [authority.config_revision.0],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(
+            !store
+                .register_agent_launch_authority(generation, &expected_legacy_authority)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .authorize_agent_start(generation, &request, &observed)
+                .unwrap(),
+            receipt
+        );
+        let mut changed_request = request.clone();
+        changed_request.wrapper_pid += 1;
+        let changed_observation = ObservedWrapperIdentity {
+            pid: changed_request.wrapper_pid,
+            ..observed
+        };
+        assert!(
+            store
+                .authorize_agent_start(generation, &changed_request, &changed_observation)
+                .unwrap_err()
+                .contains("different persisted start acknowledgement")
         );
     }
 

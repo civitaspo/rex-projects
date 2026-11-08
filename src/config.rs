@@ -1243,6 +1243,14 @@ fn resolve_roles<'a>(
     Ok(roles)
 }
 
+/// Resolve inherited role profiles for a project from an already validated configuration.
+pub fn effective_project_roles(
+    id: &ProjectId,
+    projects: &BTreeMap<ProjectId, ProjectConfig>,
+) -> Result<BTreeMap<Role, ProfileId>, String> {
+    resolve_roles(id, projects, &mut BTreeSet::new())
+}
+
 fn validate_selector(target_id: &str, selector: &BTreeMap<String, String>) -> Result<(), String> {
     const ALLOWED: &[&str] = &[
         "workflow",
