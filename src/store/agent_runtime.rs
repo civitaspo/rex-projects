@@ -728,6 +728,9 @@ impl ConfigStore {
                 payload_json,
             });
         }
+        // SQL selects the highest-priority bounded set. Canonicalize that set by durable ID
+        // because AgentWakeSnapshot requires strictly increasing wake_input_id values.
+        inputs.sort_by_key(|input| input.wake_input_id);
         Ok(inputs)
     }
 

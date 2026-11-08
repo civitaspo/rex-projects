@@ -2186,7 +2186,7 @@ impl ConfigStore {
         let source_id = format!("learning-review:{scheduled_due}");
         tx.execute(
             "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'learning_maintenance',?3,?4,1,?5,'pending',?6)",
-            params![project.as_str(),format!("project:{}:supervisor",project.as_str()),source_id,scheduled_due,payload_json,now_unix],
+            params![project.as_str(),format!("project:{}:supervisor",project.as_str()),source_id,scheduled_due.max(1),payload_json,now_unix],
         ).map_err(|e|e.to_string())?;
         tx.execute(
             "INSERT INTO supervisor_learning_schedule(project_id,next_due_at_unix,last_run_at_unix,last_snapshot_digest) VALUES (?1,?2,?3,?4) ON CONFLICT(project_id) DO UPDATE SET next_due_at_unix=excluded.next_due_at_unix,last_run_at_unix=excluded.last_run_at_unix,last_snapshot_digest=excluded.last_snapshot_digest",
@@ -3685,6 +3685,59 @@ mod tests {
                 .unwrap(),
             None
         );
+        let supervisor_session = format!("project:{}:supervisor", project.as_str());
+        store
+            .connection
+            .execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_observation','ticket-1:ready',1,30,'{}','pending',101)",
+                rusqlite::params![project.as_str(), supervisor_session],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'periodic_supervisor_review','low-priority',1,0,'{}','pending',101)",
+                rusqlite::params![project.as_str(), supervisor_session],
+            )
+            .unwrap();
+        let pending = store
+            .pending_role_wake_inputs(&project, &supervisor_session, 2)
+            .unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|wake| wake.source_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["learning_maintenance", "ticket_observation"]
+        );
+        assert_eq!(
+            pending.iter().map(|wake| wake.priority).collect::<Vec<_>>(),
+            vec![1, 30]
+        );
+        assert_eq!(pending[0].source_id, "learning-review:0");
+        assert_eq!(pending[0].source_revision, 1);
+        assert!(pending.iter().all(|wake| wake.source_revision > 0));
+        let mut inbox = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project.clone(),
+            role_session_id: supervisor_session,
+            agent_run_id: "agent-supervisor-test".into(),
+            digest: crate::domain::ids::Digest::parse("0".repeat(64)).unwrap(),
+            inputs: pending
+                .into_iter()
+                .map(|wake| crate::agent_api::AgentWakeItem {
+                    wake_input_id: wake.wake_input_id,
+                    source_type: wake.source_type,
+                    source_id: wake.source_id,
+                    source_revision: wake.source_revision,
+                    priority: wake.priority,
+                    payload_json: wake.payload_json,
+                    host_artifacts: Vec::new(),
+                })
+                .collect(),
+        };
+        inbox.digest = inbox.content_digest().unwrap();
+        inbox.validate().unwrap();
         let wake: (String,String,String) = store.connection.query_row(
             "SELECT role_session_id,source_type,payload_json FROM role_wake_inputs WHERE project_id=?1",
             [project.as_str()],
