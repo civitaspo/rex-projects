@@ -15,6 +15,8 @@ const MAX_WAKE_CONTEXT_MIGRATION_ROWS: usize = 65_536;
 const MAX_WAKE_CONTEXT_MIGRATION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROFILE_QUALIFICATION_CANDIDATES: usize = 32;
 
+type ParentAuthorityScopeRow = (String, String, String, String, Option<String>, u64, String);
+
 pub(crate) fn validate_project_launch_identity(
     connection: &Connection,
     project_id: &ProjectId,
@@ -1047,7 +1049,7 @@ impl ConfigStore {
             }
         }
         if let Some(parent_id) = &reservation.parent_run_id {
-            let parent: Option<(String,String,String,String,Option<String>,u64,String)> = tx
+            let parent: Option<ParentAuthorityScopeRow> = tx
                 .query_row(
                     "SELECT r.project_id,r.state,a.role,a.role_session_id,a.ticket_run_id,a.config_revision,a.config_digest FROM agent_runs r JOIN agent_launch_authority a USING(agent_run_id) WHERE r.agent_run_id=?1",
                     [parent_id.as_str()],
