@@ -74,6 +74,7 @@ pub struct RuntimeServices {
     owner_generation: u64,
     runtime_binary: PathBuf,
     runtime_binary_digest: Digest,
+    config_file: PathBuf,
     artifacts: ArtifactStore,
     delivery: RuntimeDelivery,
     mailbox_cursor: Option<String>,
@@ -82,22 +83,45 @@ pub struct RuntimeServices {
     agent_recovery: crate::agent_recovery::AgentRecoveryRuntime,
 }
 
+pub struct RuntimeExecutable<'a> {
+    pub path: &'a Path,
+    pub digest: &'a Digest,
+}
+
+struct WorkerAssignmentContext<'a> {
+    plan_record: &'a crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    validated_plan: &'a crate::engine::orchestration::ValidatedPlan,
+    node: &'a crate::engine::orchestration::ValidatedWorkNode,
+    worktree_path: &'a Path,
+    branch: &'a str,
+    base_sha: &'a str,
+    commit_mode: crate::domain::types::CommitMode,
+    repository_id: &'a crate::domain::ids::RepositoryId,
+}
+
 impl RuntimeServices {
     pub fn new(
         applied_config: &AppliedConfig,
         environment: &EnvironmentSnapshot,
-        config_dir: &Path,
+        config_file: &Path,
         state_root: &Path,
         owner_generation: u64,
         rex_identity: &RexIdentity,
-        runtime_binary: &Path,
-        runtime_binary_digest: &Digest,
+        runtime_executable: RuntimeExecutable<'_>,
     ) -> Result<Self, String> {
+        let RuntimeExecutable {
+            path: runtime_binary,
+            digest: runtime_binary_digest,
+        } = runtime_executable;
         if owner_generation == 0 || !runtime_binary.is_absolute() {
             return Err(
                 "RuntimeServices requires an active owner and absolute runtime binary".into(),
             );
         }
+        let config_file = config_file.to_owned();
+        let config_dir = config_file
+            .parent()
+            .ok_or("configuration file has no parent directory")?;
         let mut active_rex_environment = BTreeMap::new();
         active_rex_environment.insert(
             OsString::from("REX_SESSION"),
@@ -290,6 +314,7 @@ impl RuntimeServices {
             owner_generation,
             runtime_binary: runtime_binary.to_owned(),
             runtime_binary_digest: runtime_binary_digest.clone(),
+            config_file,
             artifacts,
             delivery,
             mailbox_cursor: None,
@@ -1445,16 +1470,18 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 ticket,
                 recovery_summary: None,
                 accepted_plan: match (&worker_context, &accepted_plan) {
-                    (Some(context), _) => Some(worker_assignment_context(
-                        &context.plan_record,
-                        &context.validated_plan,
-                        &context.node,
-                        context.token.worktree_path(),
-                        context.token.branch(),
-                        context.token.base_sha(),
-                        context.token.commit_mode(),
-                        context.token.repository_id(),
-                    )?),
+                    (Some(context), _) => {
+                        Some(worker_assignment_context(&WorkerAssignmentContext {
+                            plan_record: &context.plan_record,
+                            validated_plan: &context.validated_plan,
+                            node: &context.node,
+                            worktree_path: context.token.worktree_path(),
+                            branch: context.token.branch(),
+                            base_sha: context.token.base_sha(),
+                            commit_mode: context.token.commit_mode(),
+                            repository_id: context.token.repository_id(),
+                        })?)
+                    }
                     (None, Some(plan)) => Some(
                         serde_json::to_string(&plan.proposal).map_err(|error| error.to_string())?,
                     ),
@@ -1791,7 +1818,6 @@ impl FactoryRuntimeServices for RuntimeServices {
         &mut self,
         store: &mut ConfigStore,
         owner_generation: u64,
-        now_unix: i64,
         config: &Config,
         run: &crate::store::scheduler::ActiveTicketRun,
         result: &crate::store::agent_results::IngestedAgentResult,
@@ -2017,7 +2043,6 @@ impl FactoryRuntimeServices for RuntimeServices {
         let (request_json, request_digest) = canonical_delivery_payload(&payload)?;
         let (operation_id, logical_key) =
             worker_publication_identity(ticket_run_id, &node_id, result.receipt.evidence_id())?;
-        let _ = now_unix;
         Ok(Some(crate::store::EffectIntent {
             project_id: run.project_id.clone(),
             subject_type: "ticket_run".into(),
@@ -2862,16 +2887,16 @@ impl RuntimeServices {
                     (Some(plan), Some(validated), Some(context), Some(node))
                         if candidate.role == Role::Worker =>
                     {
-                        Some(worker_assignment_context(
-                            plan,
-                            validated,
+                        Some(worker_assignment_context(&WorkerAssignmentContext {
+                            plan_record: plan,
+                            validated_plan: validated,
                             node,
-                            context.token.worktree_path(),
-                            context.token.branch(),
-                            context.token.base_sha(),
-                            context.token.commit_mode(),
-                            context.token.repository_id(),
-                        )?)
+                            worktree_path: context.token.worktree_path(),
+                            branch: context.token.branch(),
+                            base_sha: context.token.base_sha(),
+                            commit_mode: context.token.commit_mode(),
+                            repository_id: context.token.repository_id(),
+                        })?)
                     }
                     (Some(plan), _, _, _) => Some(
                         serde_json::to_string(&plan.proposal).map_err(|error| error.to_string())?,
@@ -3277,11 +3302,7 @@ impl RuntimeServices {
         AgentBlockSpec {
             run_id,
             command: PathBuf::from("/usr/bin/env"),
-            args: vec![
-                self.runtime_binary.display().to_string(),
-                "status".into(),
-                "--json".into(),
-            ],
+            args: view_anchor_args(&self.runtime_binary, &self.config_file, &self.state_root),
             cwd: self.state_root.clone(),
             path_prepend: self.search_path(),
         }
@@ -3327,6 +3348,44 @@ impl RuntimeServices {
             &command_digest,
         )?;
         Ok(())
+    }
+}
+
+fn view_anchor_args(runtime_binary: &Path, config_file: &Path, state_root: &Path) -> Vec<String> {
+    vec![
+        runtime_binary.display().to_string(),
+        "--config".into(),
+        config_file.display().to_string(),
+        "--state-root".into(),
+        state_root.display().to_string(),
+        "status".into(),
+        "--json".into(),
+    ]
+}
+
+#[cfg(test)]
+mod view_anchor_args_tests {
+    use super::view_anchor_args;
+    use std::path::Path;
+
+    #[test]
+    fn status_anchor_uses_the_pinned_config_and_state_root_before_the_command() {
+        assert_eq!(
+            view_anchor_args(
+                Path::new("/opt/rex-projects"),
+                Path::new("/etc/rex-projects/config.toml"),
+                Path::new("/var/lib/rex-projects"),
+            ),
+            [
+                "/opt/rex-projects",
+                "--config",
+                "/etc/rex-projects/config.toml",
+                "--state-root",
+                "/var/lib/rex-projects",
+                "status",
+                "--json",
+            ]
+        );
     }
 }
 
@@ -3601,16 +3660,17 @@ fn resolve_prepared_worker_context_for_reservation(
     })
 }
 
-fn worker_assignment_context(
-    plan_record: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
-    validated_plan: &crate::engine::orchestration::ValidatedPlan,
-    node: &crate::engine::orchestration::ValidatedWorkNode,
-    worktree_path: &Path,
-    branch: &str,
-    base_sha: &str,
-    commit_mode: crate::domain::types::CommitMode,
-    repository_id: &crate::domain::ids::RepositoryId,
-) -> Result<String, String> {
+fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<String, String> {
+    let WorkerAssignmentContext {
+        plan_record,
+        validated_plan,
+        node,
+        worktree_path,
+        branch,
+        base_sha,
+        commit_mode,
+        repository_id,
+    } = context;
     let describe_base = |source: &crate::engine::orchestration::WorkBaseSource,
                          resolved_sha: Option<&str>| {
         match source {
@@ -3755,16 +3815,16 @@ mod worker_assignment_context_tests {
             coordinator_authority_digest: Digest::parse("e".repeat(64)).unwrap(),
         };
 
-        let context = worker_assignment_context(
-            &plan_record,
-            &validated,
-            &node,
-            Path::new("/state/worktree"),
-            "agent/run-a/worker-b",
-            &base_sha,
-            CommitMode::Host,
-            &repository,
-        )
+        let context = worker_assignment_context(&WorkerAssignmentContext {
+            plan_record: &plan_record,
+            validated_plan: &validated,
+            node: &node,
+            worktree_path: Path::new("/state/worktree"),
+            branch: "agent/run-a/worker-b",
+            base_sha: &base_sha,
+            commit_mode: CommitMode::Host,
+            repository_id: &repository,
+        })
         .unwrap();
         let context: serde_json::Value = serde_json::from_str(&context).unwrap();
         let assigned_base = &context["assigned_node"]["base"];

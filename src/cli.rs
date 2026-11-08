@@ -2544,13 +2544,15 @@ fn run_controller(
         std::fs::read(&executable_path).map_err(|error| CliError::unexpected(error.to_string()))?;
     use sha2::{Digest as _, Sha256};
     let executable_digest = format!("{:x}", Sha256::digest(executable_bytes));
+    let runtime_executable_digest =
+        Digest::parse(executable_digest.clone()).map_err(CliError::usage)?;
     let owner = OwnerMetadata {
         owner_nonce: generated_request_id()?,
         state_root: state_root.display().to_string(),
         config_source: config_source.clone(),
         process_start_identity: process_start_identity()?,
         executable_path: executable_path.display().to_string(),
-        executable_digest: executable_digest.clone(),
+        executable_digest,
         rex_endpoint: Some(rex_identity.endpoint.clone()),
         rex_server_identity: Some(rex_identity.instance_id.clone()),
         rex_session_id: Some(rex_identity.session_id.clone()),
@@ -2559,18 +2561,17 @@ fn run_controller(
     let mut environment = crate::environment::capture(&snapshot.config.config.runtime.environment)
         .map_err(|error| CliError::unavailable(error.to_string()))?;
     let generation = store.start_owner(&owner).map_err(CliError::unavailable)?;
-    let config_dir = canonical_source
-        .parent()
-        .ok_or_else(|| CliError::usage("configuration file has no parent directory"))?;
     let services = crate::runtime_services::RuntimeServices::new(
         &snapshot.config,
         &environment,
-        config_dir,
+        &canonical_source,
         &state_root,
         generation,
         &rex_identity,
-        &executable_path,
-        &Digest::parse(executable_digest.clone()).map_err(CliError::usage)?,
+        crate::runtime_services::RuntimeExecutable {
+            path: &executable_path,
+            digest: &runtime_executable_digest,
+        },
     );
     let mut services = match services {
         Ok(services) => services,
@@ -2615,12 +2616,14 @@ fn run_controller(
                 let rebuilt = crate::runtime_services::RuntimeServices::new(
                     &snapshot.config,
                     &environment,
-                    config_dir,
+                    &canonical_source,
                     &state_root,
                     generation,
                     &rex_identity,
-                    &executable_path,
-                    &Digest::parse(executable_digest.clone()).map_err(CliError::usage)?,
+                    crate::runtime_services::RuntimeExecutable {
+                        path: &executable_path,
+                        digest: &runtime_executable_digest,
+                    },
                 );
                 services = match rebuilt {
                     Ok(services) => services,

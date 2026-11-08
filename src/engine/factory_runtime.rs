@@ -164,7 +164,6 @@ pub trait FactoryRuntimeServices {
         &mut self,
         store: &mut ConfigStore,
         owner_generation: u64,
-        now_unix: i64,
         config: &Config,
         run: &crate::store::scheduler::ActiveTicketRun,
         result: &crate::store::agent_results::IngestedAgentResult,
@@ -576,7 +575,7 @@ fn apply_agent_result(
         && binding.role == Role::Worker
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
     {
-        return apply_worker_result(store, owner_generation, now_unix, config, services, result);
+        return apply_worker_result(store, owner_generation, config, services, result);
     }
     if result.validated.kind == RoleOutputKind::ReviewReady
         && binding.role == Role::Reviewer
@@ -1897,7 +1896,6 @@ fn format_utc_timestamp(unix: i64) -> Result<String, String> {
 fn apply_worker_result(
     store: &mut ConfigStore,
     owner_generation: u64,
-    now_unix: i64,
     config: &Config,
     services: &mut impl FactoryRuntimeServices,
     result: &crate::store::agent_results::IngestedAgentResult,
@@ -1962,7 +1960,6 @@ fn apply_worker_result(
     let effect = services.worker_publication_effect(
         store,
         owner_generation,
-        now_unix,
         config,
         &run,
         result,
@@ -2846,7 +2843,6 @@ pub(crate) mod tests {
             &mut self,
             _: &mut crate::store::ConfigStore,
             _: u64,
-            _: i64,
             _: &Config,
             _: &crate::store::scheduler::ActiveTicketRun,
             _: &crate::store::agent_results::IngestedAgentResult,
@@ -2995,7 +2991,6 @@ pub(crate) mod tests {
             &mut self,
             _: &mut crate::store::ConfigStore,
             _: u64,
-            _: i64,
             _: &Config,
             run: &crate::store::scheduler::ActiveTicketRun,
             result: &crate::store::agent_results::IngestedAgentResult,
@@ -4568,7 +4563,6 @@ pub(crate) mod tests {
                 &mut self,
                 _: &mut ConfigStore,
                 _: u64,
-                _: i64,
                 _: &Config,
                 _: &crate::store::scheduler::ActiveTicketRun,
                 _: &IngestedAgentResult,

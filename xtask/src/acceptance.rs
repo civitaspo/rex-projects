@@ -911,188 +911,6 @@ command = [{:?}, "fixture", "operations", "--state-dir", {:?}, "--observe-status
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
-
-    #[test]
-    fn generated_fixture_contexts_deserialize_with_the_agent_contract() {
-        for role in PROVIDER_ROLES {
-            let scenario = format!("acceptance_{role}");
-            let context = serde_json::json!({
-                "schema_version": 1,
-                "scenario": scenario,
-                "messages": profile_messages(role).unwrap(),
-            });
-            serde_json::from_value::<crate::fixtures::agent::AgentContext>(context)
-                .unwrap_or_else(|error| panic!("{role} fixture context is invalid: {error}"));
-        }
-    }
-
-    #[test]
-    fn emulated_workflow_messages_match_current_role_schemas() {
-        for role in PROVIDER_ROLES {
-            for message in profile_messages(role).unwrap() {
-                if message["lane"] != "workflow" {
-                    continue;
-                }
-                let kind: RoleOutputKind = serde_json::from_value(message["kind"].clone()).unwrap();
-                let payload = resolve_test_references(message["structured_result"].clone());
-                crate::fixtures::agent::validate_payload(kind, &payload).unwrap_or_else(|error| {
-                    panic!(
-                        "{role} {:?} payload does not match the current schema: {error}; {payload}",
-                        kind
-                    )
-                });
-                for reference in message["artifact_refs"].as_array().into_iter().flatten() {
-                    let resolved = resolve_test_references(reference.clone());
-                    serde_json::from_value::<RoleArtifactReference>(resolved).unwrap_or_else(
-                        |error| panic!("{role} artifact ref has invalid schema: {error}"),
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn supervisor_dispatch_uses_observed_ticket_and_coordinator_waits_for_planner() {
-        let supervisor = profile_messages("supervisor").unwrap();
-        let dispatch = &supervisor
-            .iter()
-            .find(|message| message["lane"] == "workflow")
-            .unwrap()["structured_result"];
-        assert_eq!(
-            dispatch["ticket_reference"]["$fixture_ref"],
-            "inbox.ticket_id"
-        );
-        assert_eq!(
-            dispatch["expected_ticket_revision"]["$fixture_ref"],
-            "inbox.external_revision"
-        );
-
-        let coordinator = profile_messages("coordinator").unwrap();
-        let workflow = coordinator
-            .iter()
-            .filter(|message| message["lane"] == "workflow")
-            .collect::<Vec<_>>();
-        assert_eq!(workflow[0]["kind"], "spawn_request");
-        assert_eq!(workflow[0]["structured_result"]["role"], "planner");
-        assert!(workflow[0]["structured_result"]["plan_digest"].is_null());
-        assert_eq!(workflow[1]["kind"], "plan_ready");
-        assert_eq!(
-            workflow[1]["structured_result"]["$fixture_ref"],
-            "inbox.planner_result"
-        );
-    }
-
-    #[test]
-    fn fake_forge_reads_the_owned_fixture_bare_repository() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("acceptance");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(root.join("state")).unwrap();
-        let request = Request {
-            cli: Path::new("/usr/bin/true"),
-            rex: Path::new("/usr/bin/true"),
-            rex_server: "unix:///fixture.sock",
-            rex_session: "acceptance-session",
-            expected_instance: "fixture-instance",
-            fixture_root: &root,
-        };
-        prepare_local_repository(&request, &std::env::current_exe().unwrap()).unwrap();
-        let args = ["api", "repos/fixture/repository"]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>();
-        crate::fixtures::github::run_cli(&root, &args).unwrap();
-    }
-
-    #[test]
-    fn generated_operations_fixture_config_passes_product_config_validation() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("acceptance");
-        fs::create_dir(&root).unwrap();
-        let request = Request {
-            cli: Path::new("/usr/bin/true"),
-            rex: Path::new("/usr/bin/true"),
-            rex_server: "unix:///fixture.sock",
-            rex_session: "acceptance-session",
-            expected_instance: "fixture-instance",
-            fixture_root: &root,
-        };
-        let executable = std::env::current_exe().unwrap();
-        prepare_profiles(&request, &executable, request.cli).unwrap();
-        let config = root.join("config.toml");
-        fs::write(&config, config_text(&request, &executable)).unwrap();
-        rex_projects::config::load(&config).unwrap();
-    }
-
-    fn resolve_test_references(value: Value) -> Value {
-        match value {
-            Value::Object(mut map) if map.len() == 1 && map.contains_key("$fixture_ref") => {
-                let name = map
-                    .remove("$fixture_ref")
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_owned();
-                match name.as_str() {
-                    "worker.commit_shas" => json!(["1".repeat(40)]),
-                    "worker.commit_mode" => json!("native"),
-                    "worker.base_sha"
-                    | "worker.previous_head"
-                    | "worker.branch_head"
-                    | "prompt.source_commit" => json!("1".repeat(40)),
-                    "worker.repository_id" => json!("fixture"),
-                    name if name.starts_with("artifact.") => {
-                        artifact_ref(name.trim_start_matches("artifact."))
-                    }
-                    name if name.starts_with("prompt.") => {
-                        let field = name.trim_start_matches("prompt.");
-                        match field {
-                            "node_key" => json!("acceptance-node"),
-                            "environment" => json!("test"),
-                            "remote_receipt" => json!({}),
-                            "pr_reference" => json!("fixture/repository#1"),
-                            _ => json!("a".repeat(64)),
-                        }
-                    }
-                    "ticket_revision" => json!(1),
-                    "inbox.ticket_id" => json!("T-1"),
-                    "inbox.external_revision" => json!("rev-1"),
-                    "inbox.planner_result" => json!({
-                        "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":"Create and commit a bounded acceptance fixture artifact.","depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
-                        "unresolved_questions":[]
-                    }),
-                    _ => json!("acceptance-node"),
-                }
-            }
-            Value::Object(map) => Value::Object(
-                map.into_iter()
-                    .map(|(key, value)| (key, resolve_test_references(value)))
-                    .collect(),
-            ),
-            Value::Array(items) => {
-                Value::Array(items.into_iter().map(resolve_test_references).collect())
-            }
-            primitive => primitive,
-        }
-    }
-
-    fn artifact_ref(kind: &str) -> Value {
-        let bytes = 16;
-        let path = format!("evidence/{kind}.md");
-        let digest = "b".repeat(64);
-        let kind = if kind == "operation" {
-            "operation_receipt"
-        } else {
-            kind
-        };
-        json!({"kind":kind,"artifact_id":"c".repeat(64),"schema_version":1,"path":path,"digest":digest,"bytes":bytes})
-    }
-}
-
 fn verify_owned_session(request: &Request<'_>) -> Result<(), String> {
     let identity = rex_call(request, &["whoami", "--json"])?;
     require_success("verify Rex instance", &identity)?;
@@ -1368,4 +1186,186 @@ fn emit_report(fixture_root: &Path, report: &Value) -> Result<(), String> {
         serde_json::to_string(report).map_err(|error| error.to_string())?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
+
+    #[test]
+    fn generated_fixture_contexts_deserialize_with_the_agent_contract() {
+        for role in PROVIDER_ROLES {
+            let scenario = format!("acceptance_{role}");
+            let context = serde_json::json!({
+                "schema_version": 1,
+                "scenario": scenario,
+                "messages": profile_messages(role).unwrap(),
+            });
+            serde_json::from_value::<crate::fixtures::agent::AgentContext>(context)
+                .unwrap_or_else(|error| panic!("{role} fixture context is invalid: {error}"));
+        }
+    }
+
+    #[test]
+    fn emulated_workflow_messages_match_current_role_schemas() {
+        for role in PROVIDER_ROLES {
+            for message in profile_messages(role).unwrap() {
+                if message["lane"] != "workflow" {
+                    continue;
+                }
+                let kind: RoleOutputKind = serde_json::from_value(message["kind"].clone()).unwrap();
+                let payload = resolve_test_references(message["structured_result"].clone());
+                crate::fixtures::agent::validate_payload(kind, &payload).unwrap_or_else(|error| {
+                    panic!(
+                        "{role} {:?} payload does not match the current schema: {error}; {payload}",
+                        kind
+                    )
+                });
+                for reference in message["artifact_refs"].as_array().into_iter().flatten() {
+                    let resolved = resolve_test_references(reference.clone());
+                    serde_json::from_value::<RoleArtifactReference>(resolved).unwrap_or_else(
+                        |error| panic!("{role} artifact ref has invalid schema: {error}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supervisor_dispatch_uses_observed_ticket_and_coordinator_waits_for_planner() {
+        let supervisor = profile_messages("supervisor").unwrap();
+        let dispatch = &supervisor
+            .iter()
+            .find(|message| message["lane"] == "workflow")
+            .unwrap()["structured_result"];
+        assert_eq!(
+            dispatch["ticket_reference"]["$fixture_ref"],
+            "inbox.ticket_id"
+        );
+        assert_eq!(
+            dispatch["expected_ticket_revision"]["$fixture_ref"],
+            "inbox.external_revision"
+        );
+
+        let coordinator = profile_messages("coordinator").unwrap();
+        let workflow = coordinator
+            .iter()
+            .filter(|message| message["lane"] == "workflow")
+            .collect::<Vec<_>>();
+        assert_eq!(workflow[0]["kind"], "spawn_request");
+        assert_eq!(workflow[0]["structured_result"]["role"], "planner");
+        assert!(workflow[0]["structured_result"]["plan_digest"].is_null());
+        assert_eq!(workflow[1]["kind"], "plan_ready");
+        assert_eq!(
+            workflow[1]["structured_result"]["$fixture_ref"],
+            "inbox.planner_result"
+        );
+    }
+
+    #[test]
+    fn fake_forge_reads_the_owned_fixture_bare_repository() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("acceptance");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("state")).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        prepare_local_repository(&request, &std::env::current_exe().unwrap()).unwrap();
+        let args = ["api", "repos/fixture/repository"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        crate::fixtures::github::run_cli(&root, &args).unwrap();
+    }
+
+    #[test]
+    fn generated_operations_fixture_config_passes_product_config_validation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("acceptance");
+        fs::create_dir(&root).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        let executable = std::env::current_exe().unwrap();
+        prepare_profiles(&request, &executable, request.cli).unwrap();
+        let config = root.join("config.toml");
+        fs::write(&config, config_text(&request, &executable)).unwrap();
+        rex_projects::config::load(&config).unwrap();
+    }
+
+    fn resolve_test_references(value: Value) -> Value {
+        match value {
+            Value::Object(mut map) if map.len() == 1 && map.contains_key("$fixture_ref") => {
+                let name = map
+                    .remove("$fixture_ref")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                match name.as_str() {
+                    "worker.commit_shas" => json!(["1".repeat(40)]),
+                    "worker.commit_mode" => json!("native"),
+                    "worker.base_sha"
+                    | "worker.previous_head"
+                    | "worker.branch_head"
+                    | "prompt.source_commit" => json!("1".repeat(40)),
+                    "worker.repository_id" => json!("fixture"),
+                    name if name.starts_with("artifact.") => {
+                        artifact_ref(name.trim_start_matches("artifact."))
+                    }
+                    name if name.starts_with("prompt.") => {
+                        let field = name.trim_start_matches("prompt.");
+                        match field {
+                            "node_key" => json!("acceptance-node"),
+                            "environment" => json!("test"),
+                            "remote_receipt" => json!({}),
+                            "pr_reference" => json!("fixture/repository#1"),
+                            _ => json!("a".repeat(64)),
+                        }
+                    }
+                    "ticket_revision" => json!(1),
+                    "inbox.ticket_id" => json!("T-1"),
+                    "inbox.external_revision" => json!("rev-1"),
+                    "inbox.planner_result" => json!({
+                        "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":"Create and commit a bounded acceptance fixture artifact.","depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
+                        "unresolved_questions":[]
+                    }),
+                    _ => json!("acceptance-node"),
+                }
+            }
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, resolve_test_references(value)))
+                    .collect(),
+            ),
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(resolve_test_references).collect())
+            }
+            primitive => primitive,
+        }
+    }
+
+    fn artifact_ref(kind: &str) -> Value {
+        let bytes = 16;
+        let path = format!("evidence/{kind}.md");
+        let digest = "b".repeat(64);
+        let kind = if kind == "operation" {
+            "operation_receipt"
+        } else {
+            kind
+        };
+        json!({"kind":kind,"artifact_id":"c".repeat(64),"schema_version":1,"path":path,"digest":digest,"bytes":bytes})
+    }
 }
