@@ -16,6 +16,29 @@ use crate::run_step_package::RunStepPackage;
 use crate::run_step_spool::RunStepSpool;
 use crate::store::ConfigStore;
 
+fn wait_for_start_request(
+    spool: &RunStepSpool,
+    timeout: std::time::Duration,
+    mut check_owner: impl FnMut() -> Result<(), String>,
+) -> Result<crate::run_step_spool::StartRequestEnvelope, String> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "start request deadline overflow".to_owned())?;
+    loop {
+        check_owner()?;
+        match spool.read_start_request() {
+            Ok(request) => return Ok(request),
+            Err(error) if error == "run-step spool file is not present" => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out waiting for wrapper start request".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
+    }
+}
+
 /// Publish the immutable package, bind the observed block and authority, then ACK only after
 /// the start request has been checked against that durable host state.
 pub fn finalize_and_ack_start(
@@ -123,7 +146,24 @@ pub fn finalize_and_ack_start(
     )?;
 
     let spool = RunStepSpool::open(&reservation.control_dir)?;
-    let start = spool.read_start_request()?;
+    let start = wait_for_start_request(
+        &spool,
+        std::time::Duration::from_secs(package.start_ack_timeout_seconds),
+        || {
+            if store.owner_generation()? != Some(owner_generation) {
+                return Err(
+                    "controller owner generation changed before start acknowledgement".into(),
+                );
+            }
+            if store.should_stop(owner_generation)? {
+                return Err("controller stop requested before start acknowledgement".into());
+            }
+            if store.pending_machine_stop_requested(owner_generation)? {
+                return Err("controller stop requested before start acknowledgement".into());
+            }
+            Ok(())
+        },
+    )?;
     let request = &start.request;
     if request.operation_id != reservation.operation_id
         || request.agent_run_id != reservation.agent_run_id
@@ -650,8 +690,62 @@ fn role_name(role: Role) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_wrapper_process, observed_process_start_identity};
-    use crate::domain::ids::Digest;
+    use super::{observe_wrapper_process, observed_process_start_identity, wait_for_start_request};
+    use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId};
+    use crate::launch::AgentStartRequest;
+    use crate::run_step_spool::RunStepSpool;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn start_request() -> AgentStartRequest {
+        AgentStartRequest {
+            schema_version: 1,
+            operation_id: OperationId::parse("op-1").unwrap(),
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            project_id: ProjectId::parse("project-a").unwrap(),
+            controller_generation: 1,
+            descriptor_digest: digest('a'),
+            runtime_binary_digest: digest('b'),
+            environment_snapshot_id: digest('c'),
+            qualification_receipt_digest: digest('d'),
+            wrapper_pid: 100,
+            wrapper_start_identity: "birth-100".into(),
+            rex_session_id: "session-1".into(),
+            rex_block_id: "block-1".into(),
+        }
+    }
+
+    fn digest(value: char) -> Digest {
+        Digest::parse(value.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn host_waits_for_delayed_wrapper_start_request_before_validating_it() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let writer_spool = spool.clone();
+        let expected = start_request();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            writer_spool.publish_start_once(expected).unwrap()
+        });
+
+        let observed = wait_for_start_request(&spool, Duration::from_secs(2), || Ok(())).unwrap();
+        let published = writer.join().unwrap();
+        assert_eq!(observed.request_digest, published.request_digest);
+        assert_eq!(observed.request, published.request);
+    }
+
+    #[test]
+    fn host_start_request_wait_stops_when_owner_check_cancels() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let error = wait_for_start_request(&spool, Duration::from_secs(2), || {
+            Err("controller owner generation changed".into())
+        })
+        .unwrap_err();
+        assert_eq!(error, "controller owner generation changed");
+    }
 
     #[test]
     fn current_wrapper_start_identity_is_observable() {

@@ -3511,6 +3511,11 @@ impl ConfigStore {
         Ok(count > 0)
     }
 
+    pub fn pending_machine_stop_requested(&self, owner_generation: u64) -> Result<bool, String> {
+        let count: u64 = self.connection.query_row("SELECT COUNT(*) FROM controller_commands WHERE kind='machine_stop' AND state='pending' AND expected_generation=?1", [owner_generation], |row| row.get(0)).map_err(|e| e.to_string())?;
+        Ok(count > 0)
+    }
+
     pub fn list_projects(&self) -> Result<Vec<ProjectRecord>, String> {
         let mut statement = self.connection.prepare("SELECT project_id, config_source, config_revision, config_digest, mode, goal_revision, desired_lifecycle, state_revision FROM projects ORDER BY project_id").map_err(|e| e.to_string())?;
         let rows = statement
@@ -5082,9 +5087,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        AgentLaunchAuthority, ConfigStore, DurableInput, EffectIntent, EffectOutcome,
-        ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord, agent_profile_digest,
-        canonical_json, content_digest, durable_input_digest, persisted_start_ack,
+        AgentLaunchAuthority, ConfigStore, ControlCommand, DurableInput, EffectIntent,
+        EffectOutcome, ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord,
+        agent_profile_digest, canonical_json, content_digest, durable_input_digest,
+        persisted_start_ack,
     };
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
@@ -5132,6 +5138,69 @@ mod tests {
         );
         assert!(persisted_start_ack(Some((Some("digest".into()), None))).is_err());
         assert!(persisted_start_ack(Some((None, Some("receipt".into())))).is_err());
+    }
+
+    #[test]
+    fn pending_machine_stop_is_scoped_to_its_expected_owner_generation() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: nonce.into(),
+            executable_path: "/tmp/rex-projects-test".into(),
+            executable_digest: "f".repeat(64),
+            rex_endpoint: None,
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let first_generation = store.start_owner(&owner("first")).unwrap();
+        let stop = |request_id: &str| ControlCommand {
+            request_id: request_id.into(),
+            kind: "machine_stop".into(),
+            project_id: None,
+            lifecycle: None,
+            created_at_unix: 1,
+            applied_config: None,
+        };
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-first-owner",
+            &stop("stop-first-owner"),
+            first_generation,
+        )
+        .unwrap();
+        assert!(
+            store
+                .pending_machine_stop_requested(first_generation)
+                .unwrap()
+        );
+
+        store.stop_owner(first_generation).unwrap();
+        let second_generation = store.start_owner(&owner("second")).unwrap();
+        assert!(
+            !store
+                .pending_machine_stop_requested(second_generation)
+                .unwrap()
+        );
+        assert!(!store.should_stop(second_generation).unwrap());
+
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-second-owner",
+            &stop("stop-second-owner"),
+            second_generation,
+        )
+        .unwrap();
+        assert!(
+            store
+                .pending_machine_stop_requested(second_generation)
+                .unwrap()
+        );
+        assert!(!store.should_stop(second_generation).unwrap());
     }
 
     #[test]
