@@ -4,7 +4,23 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-pub fn run(state_dir: &Path) -> Result<(), String> {
+pub fn run(state_dir: &Path, observe_status: &str) -> Result<(), String> {
+    if !matches!(
+        observe_status,
+        "legacy"
+            | "queued"
+            | "running"
+            | "awaiting_approval"
+            | "succeeded"
+            | "failed"
+            | "cancelled"
+            | "skipped"
+            | "missing"
+            | "timed_out"
+            | "unknown"
+    ) {
+        return Err("unsupported fixture operation observation status".into());
+    }
     fs::create_dir_all(state_dir)
         .map_err(|error| format!("create operations fixture state directory: {error}"))?;
 
@@ -130,11 +146,9 @@ pub fn run(state_dir: &Path) -> Result<(), String> {
             "environment": params["environment"],
             "source_sha": params["source_sha"],
             "observed_at": "2026-01-01T00:00:00Z",
-            "status": if params["action_id"] == "fixture_lost_reply" {
-                "succeeded"
-            } else {
-                "unknown"
-            },
+            "status": if observe_status == "legacy" {
+                if params["action_id"] == "fixture_lost_reply" { "succeeded" } else { "unknown" }
+            } else { observe_status },
             "evidence": [],
             "jobs": {}
         }),

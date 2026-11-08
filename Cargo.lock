@@ -958,6 +958,7 @@ name = "rex-projects-xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "jsonschema",
  "rex-projects",
  "rusqlite",
  "serde",
