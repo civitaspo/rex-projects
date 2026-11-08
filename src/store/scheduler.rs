@@ -508,8 +508,9 @@ impl ConfigStore {
             status_key(ticket.status)
         );
         let revision_digest = content_digest(&payload);
-        let source_revision =
-            u64::from_str_radix(&revision_digest[..16], 16).map_err(|error| error.to_string())?;
+        let source_revision = u64::from_str_radix(&revision_digest[..16], 16)
+            .map_err(|error| error.to_string())?
+            & (i64::MAX as u64);
         let inserted = tx.execute(
             "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_observation',?3,?4,30,?5,'pending',?6) ON CONFLICT(role_session_id,source_type,source_id,source_revision) DO NOTHING",
             params![key.project_id.as_str(),role_session,source_id,source_revision.max(1),payload,now_unix],
@@ -2315,6 +2316,103 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn supervisor_ticket_observation_revision_fits_sqlite_and_deduplicates() {
+        use super::{ConfigStore, PendingTicketObservation};
+        use crate::domain::ids::{AdapterId, ProjectId, TicketId, TicketNamespace};
+        use crate::store::MachineLock;
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE controller_owners(singleton INTEGER PRIMARY KEY, generation INTEGER NOT NULL, stopped_at_unix INTEGER);
+                 INSERT INTO controller_owners VALUES (1,7,NULL);
+                 CREATE TABLE projects(project_id TEXT PRIMARY KEY, desired_lifecycle TEXT NOT NULL, goal_revision INTEGER NOT NULL);
+                 INSERT INTO projects VALUES ('project-a','running',0);
+                 CREATE TABLE project_runtimes(project_id TEXT PRIMARY KEY, observed_lifecycle TEXT NOT NULL);
+                 INSERT INTO project_runtimes VALUES ('project-a','running');
+                 CREATE TABLE role_wake_inputs(
+                    project_id TEXT NOT NULL,
+                    role_session_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_revision INTEGER NOT NULL,
+                    priority INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    lifecycle TEXT NOT NULL,
+                    created_at_unix INTEGER NOT NULL,
+                    UNIQUE(role_session_id,source_type,source_id,source_revision)
+                 );",
+            )
+            .unwrap();
+        let mut store = ConfigStore {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        };
+        let key = TicketScanKey {
+            project_id: ProjectId::parse("project-a").unwrap(),
+            adapter_id: AdapterId::parse("tickets").unwrap(),
+            namespace: TicketNamespace::parse("fixture/acceptance").unwrap(),
+            scope_digest: crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
+            filter_digest: crate::domain::ids::Digest::parse("b".repeat(64)).unwrap(),
+            status: TicketStatus::Ready,
+        };
+        let external_revision = Some("rev-1".to_owned());
+        let labels = Vec::new();
+        let title_for = |title: String| PendingTicketObservation {
+            ticket_id: TicketId::parse("ticket-1").unwrap(),
+            revision: external_revision.clone(),
+            status: TicketStatus::Ready,
+            title,
+            labels: labels.clone(),
+            observed_at_unix: 1,
+        };
+        let high_bit_ticket = title_for("Native lifecycle fixed recovery fixture".into());
+        assert!(
+            store
+                .enqueue_supervisor_ticket_observation(7, &key, &high_bit_ticket, 10)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .enqueue_supervisor_ticket_observation(7, &key, &high_bit_ticket, 11)
+                .unwrap()
+        );
+        let changed_ticket = title_for("Changed supervisor title".into());
+        let legacy_revision = 0x0a8516033543cd1f_i64;
+        let legacy_payload = r#"{"external_revision":"rev-1","goal_revision":0,"kind":"ticket_observation","labels":[],"schema_version":1,"status":"ready","ticket_id":"ticket-1","ticket_namespace":"fixture/acceptance","title":"Changed supervisor title"}"#;
+        store.connection.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES ('project-a','project:project-a:supervisor','ticket_observation','fixture/acceptance:ticket-1:ready',?1,30,?2,'pending',12)",
+            rusqlite::params![legacy_revision, legacy_payload],
+        ).unwrap();
+        assert!(
+            !store
+                .enqueue_supervisor_ticket_observation(7, &key, &changed_ticket, 13)
+                .unwrap()
+        );
+
+        let rows: Vec<(i64, String)> = store
+            .connection
+            .prepare(
+                "SELECT source_revision,payload_json FROM role_wake_inputs WHERE source_type='ticket_observation' ORDER BY created_at_unix",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            super::content_digest(&rows[0].1),
+            "8e2e2e019ce40a07b8f3c6afd87e46b192f5e3408338f2f2b20d4191872f3398"
+        );
+        assert!(rows[0].0 > 0);
+        assert_eq!(rows[1].0, legacy_revision);
+        assert_ne!(rows[0].0, rows[1].0);
+        assert!(rows[0].1.contains(&high_bit_ticket.title));
+        assert!(rows[1].1.contains(&changed_ticket.title));
     }
 
     #[test]
