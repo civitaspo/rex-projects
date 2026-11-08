@@ -109,6 +109,15 @@ fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::
     command
 }
 
+fn process_start_trace(path: &std::path::Path) -> String {
+    let Ok(file) = std::fs::File::open(path) else {
+        return "unavailable".into();
+    };
+    let mut trace = Vec::new();
+    let _ = file.take(256).read_to_end(&mut trace);
+    String::from_utf8_lossy(&trace).into_owned()
+}
+
 fn fixture(
     temp: &tempfile::TempDir,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
@@ -1049,6 +1058,7 @@ fn provider_status_is_read_only_and_reports_missing_request_ids() {
 fn project_start_queues_only_to_the_active_foreground_owner() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = fixture(&temp);
+    let process_start_trace_path = temp.path().join("owner-process-start-trace");
     let apply = command(&config, &state, &home)
         .args(["config", "apply", "--bootstrap"])
         .output()
@@ -1057,6 +1067,10 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
 
     let mut owner_command = command(&config, &state, &home);
     owner_command.args(["runtime", "run"]);
+    owner_command.env(
+        "REX_TEST_PROCESS_START_TRACE_PATH",
+        &process_start_trace_path,
+    );
     let mut owner = ForegroundOwner::spawn(owner_command)
         .expect("spawn foreground controller with captured stderr");
     let startup_deadline = Instant::now() + Duration::from_secs(10);
@@ -1094,11 +1108,20 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         if Instant::now() >= startup_deadline {
             owner.terminate();
             let stderr = owner.stderr_tail();
+            let process_start_trace = process_start_trace(&process_start_trace_path);
             panic!(
-                "foreground controller startup timed out after 10s; polls={status_polls}; last status={status_diagnostic}; controller stderr: {stderr}"
+                "foreground controller startup timed out after 10s; polls={status_polls}; last status={status_diagnostic}; process_start_trace={process_start_trace:?}; controller stderr: {stderr}"
             );
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    #[cfg(debug_assertions)]
+    {
+        let process_start_trace = process_start_trace(&process_start_trace_path);
+        assert!(
+            process_start_trace.contains("stage="),
+            "foreground owner startup should write a process-start trace marker; got {process_start_trace:?}"
+        );
     }
     let start = command(&config, &state, &home)
         .args([
