@@ -745,44 +745,28 @@ fn prepare_profiles(
         let scenario = format!("acceptance_{role}");
         let context = contexts.join(format!("{role}.json"));
         let messages = profile_messages(role)?;
+        let hold = hold_coordinator_after_inbox && role == "coordinator";
         fs::write(
             &context,
             serde_json::to_vec(
-                &json!({"schema_version":1,"scenario":scenario,"messages":messages}),
+                &json!({"schema_version":1,"scenario":scenario,"hold_after_inbox":hold,"messages":messages}),
             )
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let hold = hold_coordinator_after_inbox && role == "coordinator";
-        let command = if hold {
-            format!(
-                "[\"/usr/bin/env\", \"REX_PROJECTS_FIXTURE_HOLD_AFTER_INBOX=1\", {:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]",
-                executable.display().to_string(),
-                role,
-                scenario,
-                context.display().to_string(),
-                request
-                    .fixture_root
-                    .join("agent-state")
-                    .display()
-                    .to_string(),
-                runtime_binary.display().to_string()
-            )
-        } else {
-            format!(
-                "[{:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]",
-                executable.display().to_string(),
-                role,
-                scenario,
-                context.display().to_string(),
-                request
-                    .fixture_root
-                    .join("agent-state")
-                    .display()
-                    .to_string(),
-                runtime_binary.display().to_string()
-            )
-        };
+        let command = format!(
+            "[{:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]",
+            executable.display().to_string(),
+            role,
+            scenario,
+            context.display().to_string(),
+            request
+                .fixture_root
+                .join("agent-state")
+                .display()
+                .to_string(),
+            runtime_binary.display().to_string()
+        );
         let config = format!(
             "adapter = \"codex\"\ncommand = {command}\nmodel = \"fixture-emulator\"\n\n[options]\nsandbox = \"workspace_write\"\napproval = \"never\"\n"
         );
@@ -2166,6 +2150,48 @@ mod tests {
             serde_json::from_value::<crate::fixtures::agent::AgentContext>(context)
                 .unwrap_or_else(|error| panic!("{role} fixture context is invalid: {error}"));
         }
+    }
+
+    #[test]
+    fn held_coordinator_profile_uses_the_direct_executable_from_product_config_parser() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("acceptance");
+        fs::create_dir(&root).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        let executable = std::env::current_exe().unwrap();
+        prepare_profiles(&request, &executable, request.cli, true).unwrap();
+        fs::write(root.join("config.toml"), config_text(&request, &executable)).unwrap();
+
+        let applied = rex_projects::config::load(&root.join("config.toml")).unwrap();
+        let profile = applied
+            .profiles
+            .iter()
+            .find(|(profile_id, _)| profile_id.as_str() == "fixture_coordinator")
+            .map(|(_, profile)| profile)
+            .unwrap();
+        let configured_executable = Path::new(&profile.command[0]).canonicalize().unwrap();
+        assert_eq!(configured_executable, executable.canonicalize().unwrap());
+        assert_eq!(profile.command[1..3], ["fixture", "agent"]);
+        assert!(profile.command.iter().all(|argument| {
+            argument != "/usr/bin/env" && !argument.starts_with("REX_PROJECTS_FIXTURE_HOLD_")
+        }));
+
+        let context =
+            crate::fixtures::agent::read_context(&root.join("contexts/coordinator.json")).unwrap();
+        assert!(context.hold_after_inbox);
+
+        let probe = std::process::Command::new(&configured_executable)
+            .arg("--list")
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
     }
 
     #[test]

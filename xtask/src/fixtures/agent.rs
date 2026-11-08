@@ -29,6 +29,8 @@ const OUTPUT_LIMIT: usize = 1024 * 1024;
 pub struct AgentContext {
     pub schema_version: u32,
     pub scenario: String,
+    #[serde(default)]
+    pub hold_after_inbox: bool,
     pub messages: Vec<ContextMessage>,
 }
 
@@ -189,7 +191,7 @@ pub fn run(
     };
     if role == Role::Coordinator
         && invocation.scope.lane == FixtureLane::Workflow
-        && std::env::var_os("REX_PROJECTS_FIXTURE_HOLD_AFTER_INBOX").is_some()
+        && context.hold_after_inbox
     {
         loop {
             std::thread::sleep(Duration::from_secs(1));
