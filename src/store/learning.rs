@@ -75,6 +75,13 @@ pub struct KnowledgePublicationReceipt {
     pub manifest_digest: Digest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedKnowledgeRecord {
+    pub input: PostmortemInput,
+    pub manifest: PublicationManifest,
+    pub manifest_digest: Digest,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProfilePromotionIntent {
     pub operation_id: OperationId,
@@ -433,6 +440,66 @@ pub(crate) fn validate_v10_schema(connection: &Connection) -> Result<(), String>
 }
 
 impl ConfigStore {
+    /// Read the committed publications for one Project through the typed store API.
+    pub fn published_knowledge(
+        &self,
+        project: &ProjectId,
+        ticket_run: Option<&TicketRunId>,
+        limit: usize,
+    ) -> Result<Vec<PublishedKnowledgeRecord>, String> {
+        const MAX_ITEMS: usize = 100;
+        if limit == 0 || limit > MAX_ITEMS {
+            return Err(format!(
+                "knowledge result limit must be between 1 and {MAX_ITEMS}"
+            ));
+        }
+        let ticket_run_filter = ticket_run.map(TicketRunId::as_str);
+        let mut statement = self.connection.prepare(
+            "SELECT ticket_run_id,request_digest,request_json,manifest_json,manifest_digest FROM knowledge_publications WHERE project_id=?1 AND state='published' AND (?2 IS NULL OR ticket_run_id=?2) ORDER BY created_at_unix DESC,ticket_run_id DESC LIMIT ?3",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![project.as_str(), ticket_run_filter, limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let mut publications = Vec::new();
+        for row in rows {
+            let (ticket_run_id, request_digest, request_json, manifest_json, manifest_digest) =
+                row.map_err(|error| error.to_string())?;
+            verify_digest(&request_json, &Digest::parse(request_digest)?)?;
+            let input: PostmortemInput = crate::protocol::parse_unique(request_json.as_bytes())?;
+            validate_postmortem_input(&input).map_err(|error| error.to_string())?;
+            let manifest: PublicationManifest =
+                crate::protocol::parse_unique(manifest_json.as_bytes())?;
+            let manifest_digest = Digest::parse(manifest_digest)?;
+            let canonical_manifest = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+            if input.project_id != *project
+                || input.ticket_run_id.as_str() != ticket_run_id
+                || manifest.project_id != *project
+                || manifest.ticket_run_id.as_str() != ticket_run_id
+                || manifest.operation_id != input.operation_id
+                || format!("{:x}", Sha256::digest(&canonical_manifest)) != manifest_digest.as_str()
+            {
+                return Err("stored knowledge publication has invalid provenance".into());
+            }
+            publications.push(PublishedKnowledgeRecord {
+                input,
+                manifest,
+                manifest_digest,
+            });
+        }
+        Ok(publications)
+    }
+
     /// Resolve the exact immutable profile-trial authorization for a pending human request.
     /// The table is created by the coordinated v12 learning migration.
     /// Persist the exact bounded trial batch before making its human request visible.

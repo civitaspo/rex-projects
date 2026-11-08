@@ -74,6 +74,33 @@ enum Command {
         #[command(subcommand)]
         command: HumanCommand,
     },
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KnowledgeCommand {
+    /// List committed postmortem publications for one Project.
+    List {
+        #[arg(long)]
+        project: String,
+    },
+    /// Show one committed postmortem and its source provenance.
+    Show {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        ticket_run: String,
+    },
+    /// Validate published article bytes against their stored request and receipt.
+    Validate {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        ticket_run: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -467,6 +494,12 @@ pub fn run() -> Result<i32, CliError> {
             json,
         ),
         Command::Human { command } => human_command(
+            cli.config.as_deref(),
+            cli.state_root.as_deref(),
+            command,
+            json,
+        ),
+        Command::Knowledge { command } => knowledge_command(
             cli.config.as_deref(),
             cli.state_root.as_deref(),
             command,
@@ -2142,6 +2175,206 @@ fn human_command(
             }
         }
     }
+}
+
+fn knowledge_command(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    command: KnowledgeCommand,
+    json: bool,
+) -> Result<(), CliError> {
+    if std::env::var_os("REX_PROJECTS_AGENT").is_some()
+        || std::env::var_os("REX_PROJECTS_CONTEXT").is_some()
+    {
+        return Err(CliError::human_only(
+            "knowledge browsing is available only from a human host context",
+        ));
+    }
+    let (_, loaded) = load_config(config_path)?;
+    let knowledge = loaded
+        .config
+        .knowledge
+        .as_ref()
+        .ok_or_else(|| CliError::usage("knowledge is not configured"))?;
+    if knowledge.format != "okf" {
+        return Err(CliError::usage(
+            "knowledge browse and validate currently support the configured OKF format only",
+        ));
+    }
+    let root = PathBuf::from(knowledge.root.as_str());
+    let project = match &command {
+        KnowledgeCommand::List { project }
+        | KnowledgeCommand::Show { project, .. }
+        | KnowledgeCommand::Validate { project, .. } => {
+            ProjectId::parse(project.clone()).map_err(CliError::usage)?
+        }
+    };
+    let ticket_run = match &command {
+        KnowledgeCommand::Show { ticket_run, .. }
+        | KnowledgeCommand::Validate { ticket_run, .. } => Some(
+            crate::domain::ids::TicketRunId::parse(ticket_run.clone()).map_err(CliError::usage)?,
+        ),
+        KnowledgeCommand::List { .. } => None,
+    };
+    let state_root =
+        config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)?;
+    let store = ConfigStore::open_readonly(&state_root).map_err(CliError::unavailable)?;
+    let records = store
+        .published_knowledge(&project, ticket_run.as_ref(), 100)
+        .map_err(CliError::unavailable)?;
+    match command {
+        KnowledgeCommand::List { .. } => {
+            let entries = records
+                .iter()
+                .map(|record| {
+                    serde_json::json!({
+                        "project_id": record.manifest.project_id,
+                        "ticket_run_id": record.manifest.ticket_run_id,
+                        "title": bounded_knowledge_title(&record.input.title),
+                        "generated_at": record.input.generated_at,
+                        "source_digests": record.manifest.source_digests,
+                        "content_sha256": record.manifest.content_sha256,
+                        "byte_count": record.manifest.byte_count,
+                        "manifest_sha256": record.manifest_digest,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if json {
+                print_json(&serde_json::json!({"project_id": project, "publications": entries}))
+            } else if entries.is_empty() {
+                println!("No knowledge publications for Project {}.", project);
+                Ok(())
+            } else {
+                for record in records {
+                    println!(
+                        "{}  {}  {}  ({} sources)",
+                        record.manifest.ticket_run_id,
+                        record.input.generated_at,
+                        terminal_safe_text(&bounded_knowledge_title(&record.input.title)),
+                        record.input.sources.len()
+                    );
+                }
+                Ok(())
+            }
+        }
+        KnowledgeCommand::Show { .. } => {
+            let record = records
+                .into_iter()
+                .next()
+                .ok_or_else(|| CliError::not_found("knowledge publication was not found"))?;
+            let article = crate::knowledge::validate_publication(
+                &root,
+                &record.input,
+                &record.manifest,
+                &record.manifest_digest,
+            )
+            .map_err(|error| CliError::conflict(error.to_string()))?;
+            if json {
+                let sources = record
+                    .input
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        serde_json::json!({
+                            "id": source.id,
+                            "title": source.title,
+                            "resource": source.resource,
+                            "digest": source.digest,
+                            "trusted": source.trusted,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                print_json(&serde_json::json!({
+                    "project_id": project,
+                    "ticket_run_id": record.manifest.ticket_run_id,
+                    "title": record.input.title,
+                    "summary": record.input.summary,
+                    "generated_at": record.input.generated_at,
+                    "sources": sources,
+                    "manifest": record.manifest,
+                    "manifest_sha256": record.manifest_digest,
+                    "article": article,
+                }))
+            } else {
+                println!(
+                    "{} — {}\nGenerated: {}\nSources: {}\nReceipt: {}\n",
+                    terminal_safe_text(&record.input.title),
+                    record.manifest.ticket_run_id,
+                    record.input.generated_at,
+                    record.input.sources.len(),
+                    record.manifest.content_sha256
+                );
+                print!("{}", terminal_safe_text(&article));
+                Ok(())
+            }
+        }
+        KnowledgeCommand::Validate { .. } => {
+            let record = records
+                .into_iter()
+                .next()
+                .ok_or_else(|| CliError::not_found("knowledge publication was not found"))?;
+            let article = crate::knowledge::validate_publication(
+                &root,
+                &record.input,
+                &record.manifest,
+                &record.manifest_digest,
+            )
+            .map_err(|error| CliError::conflict(error.to_string()))?;
+            let report = serde_json::json!({
+                "valid": true,
+                "project_id": project,
+                "ticket_run_id": record.manifest.ticket_run_id,
+                "format": record.manifest.format,
+                "content_sha256": record.manifest.content_sha256,
+                "byte_count": article.len(),
+                "source_count": record.input.sources.len(),
+                "manifest_sha256": record.manifest_digest,
+            });
+            if json {
+                print_json(&report)
+            } else {
+                println!(
+                    "Valid {} publication {} ({} bytes, {} sources).",
+                    record.manifest.format,
+                    record.manifest.ticket_run_id,
+                    article.len(),
+                    record.input.sources.len()
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+fn terminal_safe_text(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        let bidi_control = matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        );
+        if (character.is_control() && character != '\n') || bidi_control {
+            use std::fmt::Write as _;
+            write!(safe, "\\u{{{:x}}}", character as u32).expect("writing to String cannot fail");
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
+fn bounded_knowledge_title(value: &str) -> String {
+    const MAX_CHARS: usize = 256;
+    let mut chars = value.chars();
+    let mut title = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    title
 }
 
 fn unix_now_i64() -> Result<i64, CliError> {

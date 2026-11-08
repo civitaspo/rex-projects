@@ -48,8 +48,8 @@ pub mod merge_work;
 pub use learning_store::{
     CandidateRegistration, KnowledgePublicationIntent, KnowledgePublicationReceipt,
     LearningCandidatePackage, LearningCandidateRecord, ProfilePromotionIntent,
-    ProjectSupervisorMaintenance, StoredApprovedProfilePackage, StoredTrial,
-    SupervisorCandidateEntry, SupervisorKnowledgeEntry, TrialProgress,
+    ProjectSupervisorMaintenance, PublishedKnowledgeRecord, StoredApprovedProfilePackage,
+    StoredTrial, SupervisorCandidateEntry, SupervisorKnowledgeEntry, TrialProgress,
 };
 pub mod operations;
 pub mod provider_qualification_runtime;

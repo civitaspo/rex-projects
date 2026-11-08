@@ -1880,7 +1880,9 @@ Removing a repository used by active work produces a migration decision rather t
 | `policy explain --repository <id>` | Show effective fields, instruction digests, provenance, and capabilities. |
 | `effect inspect --operation <id>` | Show intent, attempts, known remote facts, uncertainty, and permitted recovery inputs. |
 | `effect reconcile --operation <id>` | Submit an observation request, including verification of externally applied files for an approved configuration effect. Resume only that effect's authorized continuation; never blindly repeat a side effect. |
-| `knowledge list`, `show`, `validate` | Browse and validate source-linked publications. |
+| `knowledge list --project <id>` | List up to 100 newest committed postmortem receipts and source digests for one Project. |
+| `knowledge show --project <id> --ticket-run <id>` | Verify the immutable article against its stored request and receipt, then show its content and provenance. |
+| `knowledge validate --project <id> --ticket-run <id>` | Verify one article's OKF metadata, frozen content, source links, byte count, and receipt digests without writing state. |
 | `learning status --project <id>` | Show the issued batch, checkpoint, open efficacy checks, candidate capacity, managed slots, and due review. |
 | `learning review --project <id>` | Submit a due-review intent to the controller; it does not approve trials or promotions. |
 | `proposal list`, `show`, `respond` | Inspect guidance changes and record exact-digest human decisions through the existing HumanRequest protocol. |

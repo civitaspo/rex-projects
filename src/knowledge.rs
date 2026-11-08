@@ -6,7 +6,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write as IoWrite};
+use std::io::{self, Read, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -199,6 +199,109 @@ pub fn publish_postmortem(
             Err(e.into())
         }
     }
+}
+
+/// Verify the immutable article against its durable publication request and receipt.
+/// The returned string is the bytes read from disk after they match the frozen render.
+pub fn validate_publication(
+    root: &Path,
+    input: &PostmortemInput,
+    manifest: &PublicationManifest,
+    manifest_sha256: &Digest,
+) -> Result<String, KnowledgeError> {
+    validate_postmortem_input(input)?;
+    let expected_key = hex(&Sha256::digest(input.ticket_run_id.as_str().as_bytes()));
+    let expected_relative_path = format!(
+        "projects/{}/postmortems/{expected_key}.md",
+        input.project_id.as_str()
+    );
+    let mut expected_source_digests: Vec<_> = input
+        .sources
+        .iter()
+        .map(|source| source.digest.clone())
+        .collect();
+    expected_source_digests.sort();
+    let manifest_json = serde_json::to_vec(manifest)?;
+    if manifest.operation_id != input.operation_id
+        || manifest.project_id != input.project_id
+        || manifest.ticket_run_id != input.ticket_run_id
+        || manifest.relative_path != expected_relative_path
+        || manifest.format != format!("okf-{OKF_VERSION}")
+        || manifest.source_digests != expected_source_digests
+        || digest(&manifest_json) != *manifest_sha256
+    {
+        return Err(KnowledgeError::Conflict(
+            "stored knowledge publication manifest does not match its frozen request".into(),
+        ));
+    }
+    let expected = render(input)?;
+    if manifest.byte_count != expected.len()
+        || manifest.content_sha256 != digest(&expected)
+        || expected.len() > DEFAULT_MAX_ARTICLE_BYTES
+    {
+        return Err(KnowledgeError::Conflict(
+            "stored knowledge publication manifest has invalid article content metadata".into(),
+        ));
+    }
+
+    let root = fs::canonicalize(root)?;
+    let project_directory = checked_directory(&root, "projects")?;
+    let project_directory = checked_directory(&project_directory, input.project_id.as_str())?;
+    let postmortems = checked_directory(&project_directory, "postmortems")?;
+    let path = postmortems.join(format!("{expected_key}.md"));
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(KnowledgeError::Conflict(
+            "published knowledge article is not a regular file".into(),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let article = options.open(&path)?;
+    if !article.metadata()?.is_file() {
+        return Err(KnowledgeError::Conflict(
+            "published knowledge article is not a regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(manifest.byte_count.min(DEFAULT_MAX_ARTICLE_BYTES));
+    article
+        .take((DEFAULT_MAX_ARTICLE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > DEFAULT_MAX_ARTICLE_BYTES
+        || bytes.len() != manifest.byte_count
+        || digest(&bytes) != manifest.content_sha256
+        || bytes != expected
+    {
+        return Err(KnowledgeError::Conflict(
+            "published knowledge article differs from its frozen content or receipt".into(),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| KnowledgeError::Conflict("published knowledge article is not UTF-8".into()))
+}
+
+fn checked_directory(parent: &Path, name: &str) -> Result<PathBuf, KnowledgeError> {
+    if Path::new(name)
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(KnowledgeError::Invalid(
+            "invalid knowledge path component".into(),
+        ));
+    }
+    let path = parent.join(name);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(KnowledgeError::Conflict(
+            "knowledge publication path contains a symlink or non-directory".into(),
+        ));
+    }
+    Ok(path)
 }
 
 fn reconcile_existing(
