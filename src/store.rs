@@ -3534,6 +3534,14 @@ impl ConfigStore {
                     "stopped"
                 };
                 tx.execute("UPDATE project_runtimes SET desired_lifecycle=?2, observed_lifecycle=?3, controller_generation=?4, project_epoch=?5 WHERE project_id=?1", params![project, lifecycle, observed, owner_generation, next_epoch]).map_err(|e| e.to_string())?;
+                if lifecycle == "running" {
+                    ConfigStore::enqueue_pending_supervisor_ticket_observations(
+                        &tx,
+                        &ProjectId::parse(project)?,
+                        next_epoch,
+                        now_unix()?,
+                    )?;
+                }
             }
             _ => return Err("stored controller command has an unsupported kind".into()),
         }
@@ -5137,9 +5145,13 @@ mod tests {
         persisted_start_ack,
     };
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
-    use crate::domain::ids::{Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId};
+    use crate::domain::ids::{
+        AdapterId, Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
+    };
+    use crate::domain::types::TicketStatus;
     use crate::engine::reducer::Input;
     use crate::launch::{RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind};
+    use crate::store::scheduler::{PendingTicketObservation, TicketScanKey};
     use sha2::{Digest as _, Sha256};
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -8474,6 +8486,250 @@ mod tests {
             "running"
         );
         assert_eq!(store.activate_starting_projects(generation).unwrap(), 0);
+    }
+
+    #[test]
+    fn public_resume_requeues_only_a_current_consumed_ticket_observation() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let project_id = ProjectId::parse("payments").unwrap();
+        let project_config: crate::config::ProjectConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "ticket_scope": {"repository": "org/repo"},
+                "dispatch_states": ["ready"]
+            }))
+            .unwrap();
+        let mut snapshot = snapshot(&"a".repeat(64));
+        snapshot
+            .config
+            .projects
+            .insert(project_id.clone(), project_config.clone());
+        let applied = store
+            .apply_snapshot("factory", &snapshot, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let namespace = TicketNamespace::parse("github:org/repo").unwrap();
+        let adapter = AdapterId::parse("tickets").unwrap();
+        let key = TicketScanKey::for_project(
+            &project_id,
+            &adapter,
+            &namespace,
+            &project_config,
+            TicketStatus::Ready,
+        )
+        .unwrap();
+        for index in 0..100 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO ticket_observations(project_id,adapter_id,namespace,ticket_id,scope_digest,filter_digest,external_revision,status,title,labels_json,last_seen_at_unix,scan_generation,dispatch_state) VALUES (?1,?2,?3,?4,?5,?6,'old-rev','ready','Stale scope','[]',?7,1,'pending')",
+                    rusqlite::params![
+                        project_id.as_str(),
+                        adapter.as_str(),
+                        namespace.as_str(),
+                        format!("stale-{index:03}"),
+                        "f".repeat(64),
+                        key.filter_digest.as_str(),
+                        index as i64
+                    ],
+                )
+                .unwrap();
+        }
+        for index in 0..100 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO ticket_observations(project_id,adapter_id,namespace,ticket_id,scope_digest,filter_digest,external_revision,status,title,labels_json,last_seen_at_unix,scan_generation,dispatch_state) VALUES (?1,?2,?3,?4,?5,?6,'rev-pending','ready','No consumed wake','[]',?7,1,'pending')",
+                    rusqlite::params![
+                        project_id.as_str(),
+                        adapter.as_str(),
+                        namespace.as_str(),
+                        format!("nonconsumed-{index:03}"),
+                        key.scope_digest.as_str(),
+                        key.filter_digest.as_str(),
+                        100 + index as i64
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO ticket_observations(project_id,adapter_id,namespace,ticket_id,scope_digest,filter_digest,external_revision,status,title,labels_json,last_seen_at_unix,scan_generation,dispatch_state) VALUES (?1,?2,?3,'#42',?4,?5,'rev-1','ready','Current ticket','[\"plan\"]',300,1,'pending')",
+                rusqlite::params![
+                    project_id.as_str(),
+                    adapter.as_str(),
+                    namespace.as_str(),
+                    key.scope_digest.as_str(),
+                    key.filter_digest.as_str()
+                ],
+            )
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "resume-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+
+        let append_lifecycle = |store: &mut ConfigStore, request_id: &str, lifecycle: &str| {
+            ConfigStore::append_control(
+                temp.path(),
+                request_id,
+                &ControlCommand {
+                    request_id: request_id.into(),
+                    kind: "project_lifecycle".into(),
+                    project_id: Some(project_id.clone()),
+                    lifecycle: Some(lifecycle.into()),
+                    created_at_unix: 1,
+                    applied_config: None,
+                },
+                generation,
+            )
+            .unwrap();
+            store.process_next_control(generation).unwrap().unwrap();
+        };
+
+        // An initial start has no consumed scanner wake to retry.
+        append_lifecycle(&mut store, "start-payments", "running");
+        let wake_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(wake_count, 0);
+        store.activate_starting_projects(generation).unwrap();
+
+        // Model a regular scanner wake; start/resume must not duplicate an in-flight one.
+        let observation = PendingTicketObservation {
+            ticket_id: TicketId::parse("#42").unwrap(),
+            revision: Some("rev-1".into()),
+            status: TicketStatus::Ready,
+            title: "Current ticket".into(),
+            labels: vec!["plan".into()],
+            observed_at_unix: 300,
+        };
+        assert!(
+            store
+                .enqueue_supervisor_ticket_observation(generation, &key, &observation, 11)
+                .unwrap()
+        );
+        let regular: (u64, String, u64, String) = store
+            .connection
+            .query_row(
+                "SELECT wake_input_id,source_id,source_revision,payload_json FROM role_wake_inputs WHERE source_type='ticket_observation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(regular.1, "github:org/repo:#42:ready");
+        append_lifecycle(&mut store, "pause-with-pending", "paused");
+        append_lifecycle(&mut store, "resume-with-pending", "running");
+        let pending_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending_count, 1);
+        store
+            .connection
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='assigned' WHERE wake_input_id=?1",
+                [regular.0],
+            )
+            .unwrap();
+        append_lifecycle(&mut store, "pause-with-assigned", "paused");
+        append_lifecycle(&mut store, "resume-with-assigned", "running");
+        let assigned_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(assigned_count, 1);
+
+        // Model the completed Supervisor review, retaining the consumed history.
+        store
+            .connection
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE wake_input_id=?1",
+                [regular.0],
+            )
+            .unwrap();
+
+        append_lifecycle(&mut store, "pause-payments", "paused");
+        append_lifecycle(&mut store, "resume-payments", "running");
+
+        let resumed_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            resumed_count, 2,
+            "resume must enqueue the current observation"
+        );
+        let resumed: (String, u64, String, String) = store
+            .connection
+            .query_row(
+                "SELECT source_id,source_revision,payload_json,lifecycle FROM role_wake_inputs WHERE wake_input_id!=?1",
+                [regular.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(resumed.0, "github:org/repo:#42:ready:resume:8");
+        assert_eq!(resumed.1, regular.2);
+        assert_eq!(resumed.2, regular.3);
+        assert_eq!(resumed.3, "pending");
+        assert!(resumed.2.contains("\"external_revision\":\"rev-1\""));
+        assert!(resumed.2.contains("\"ticket_id\":\"#42\""));
+        let old_lifecycle: String = store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM role_wake_inputs WHERE wake_input_id=?1",
+                [regular.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_lifecycle, "consumed");
+
+        // Replaying the same public request cannot advance the epoch or add another wake.
+        ConfigStore::append_control(
+            temp.path(),
+            "resume-payments",
+            &ControlCommand {
+                request_id: "resume-payments".into(),
+                kind: "project_lifecycle".into(),
+                project_id: Some(project_id),
+                lifecycle: Some("running".into()),
+                created_at_unix: 1,
+                applied_config: None,
+            },
+            generation,
+        )
+        .unwrap();
+        assert!(store.process_next_control(generation).unwrap().is_none());
+        let final_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(final_count, 2);
+        assert_eq!(applied.revision.0, 1);
     }
 
     #[test]

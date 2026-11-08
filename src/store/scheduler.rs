@@ -343,19 +343,12 @@ impl TicketScanKey {
         if project.ticket_adapter != *adapter_id {
             return Err("ticket scan adapter does not match Project configuration".into());
         }
-        let scope_json =
-            serde_json::to_string(&project.ticket_scope).map_err(|error| error.to_string())?;
-        let filter_json = serde_json::to_string(&serde_json::json!({
-            "status": status_key(status),
-            "page_size": 100,
-        }))
-        .map_err(|error| error.to_string())?;
         Ok(Self {
             project_id: project_id.clone(),
             adapter_id: adapter_id.clone(),
             namespace: namespace.clone(),
-            scope_digest: Digest::parse(content_digest(&scope_json))?,
-            filter_digest: Digest::parse(content_digest(&filter_json))?,
+            scope_digest: ticket_scope_digest(project)?,
+            filter_digest: ticket_filter_digest(status)?,
             status,
         })
     }
@@ -366,6 +359,21 @@ impl TicketScanKey {
         }
         Ok(())
     }
+}
+
+fn ticket_scope_digest(project: &crate::config::ProjectConfig) -> Result<Digest, String> {
+    let scope_json =
+        serde_json::to_string(&project.ticket_scope).map_err(|error| error.to_string())?;
+    Digest::parse(content_digest(&scope_json))
+}
+
+fn ticket_filter_digest(status: TicketStatus) -> Result<Digest, String> {
+    let filter_json = serde_json::to_string(&serde_json::json!({
+        "status": status_key(status),
+        "page_size": 100,
+    }))
+    .map_err(|error| error.to_string())?;
+    Digest::parse(content_digest(&filter_json))
 }
 
 impl ConfigStore {
@@ -517,6 +525,169 @@ impl ConfigStore {
         ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(inserted == 1)
+    }
+
+    /// Queue observational Supervisor wakes for the Project's current, scoped,
+    /// pending ticket rows when a public lifecycle command starts it.
+    pub(crate) fn enqueue_pending_supervisor_ticket_observations(
+        connection: &Connection,
+        project_id: &ProjectId,
+        project_epoch: u64,
+        now_unix: i64,
+    ) -> Result<usize, String> {
+        let row: Option<(u64, String)> = connection.query_row(
+            "SELECT p.goal_revision,s.effective_config_json
+             FROM projects p
+             JOIN config_snapshots s ON s.source_identity=p.config_source AND s.revision=p.config_revision AND s.digest=p.config_digest
+             WHERE p.project_id=?1",
+            [project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((goal_revision, effective_json)) = row else {
+            return Err("Project has no matching applied configuration snapshot".into());
+        };
+        let effective: serde_json::Value = serde_json::from_str(&effective_json)
+            .map_err(|error| format!("stored applied configuration is invalid: {error}"))?;
+        let config: crate::config::Config = serde_json::from_value(
+            effective
+                .get("config")
+                .cloned()
+                .ok_or_else(|| "stored applied configuration has no config".to_owned())?,
+        )
+        .map_err(|error| format!("stored applied configuration is invalid: {error}"))?;
+        let Some(project_config) = config.projects.get(project_id) else {
+            return Ok(0);
+        };
+
+        if project_config.dispatch_states.is_empty() {
+            return Ok(0);
+        }
+        let scope_digest = ticket_scope_digest(project_config)?;
+        let filters = project_config
+            .dispatch_states
+            .iter()
+            .map(|status| Ok((*status, ticket_filter_digest(*status)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let status_predicates =
+            vec!["(o.status=? AND o.filter_digest=?)"; filters.len()].join(" OR ");
+        let query = format!(
+            "SELECT o.adapter_id,o.namespace,o.ticket_id,o.scope_digest,o.filter_digest,o.external_revision,o.status,o.title,o.labels_json
+             FROM ticket_observations o
+             LEFT JOIN ticket_claims c ON c.namespace=o.namespace AND c.ticket_id=o.ticket_id
+             WHERE o.project_id=? AND o.adapter_id=? AND o.scope_digest=? AND o.dispatch_state='pending'
+               AND ({status_predicates}) AND c.ticket_run_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM ticket_runs r WHERE r.project_id=o.project_id AND r.namespace=o.namespace AND r.ticket_id=o.ticket_id AND r.internal_phase NOT IN ('done','canceled'))
+             ORDER BY o.last_seen_at_unix,o.ticket_id,o.namespace LIMIT 100 OFFSET ?"
+        );
+        let mut query_params = vec![
+            rusqlite::types::Value::Text(project_id.as_str().to_owned()),
+            rusqlite::types::Value::Text(project_config.ticket_adapter.as_str().to_owned()),
+            rusqlite::types::Value::Text(scope_digest.as_str().to_owned()),
+        ];
+        for (status, filter) in &filters {
+            query_params.push(rusqlite::types::Value::Text(status_key(*status).to_owned()));
+            query_params.push(rusqlite::types::Value::Text(filter.as_str().to_owned()));
+        }
+        let mut queued = 0;
+        let mut offset = 0_i64;
+        loop {
+            let page = {
+                let mut params = query_params.clone();
+                params.push(rusqlite::types::Value::Integer(offset));
+                let mut statement = connection
+                    .prepare(&query)
+                    .map_err(|error| error.to_string())?;
+                let observations = statement
+                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                        ))
+                    })
+                    .map_err(|error| error.to_string())?;
+                observations
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+            };
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            for (adapter, namespace, ticket, scope, filter, revision, status, title, labels_json) in
+                page
+            {
+                let adapter = crate::domain::ids::AdapterId::parse(adapter)?;
+                if adapter != project_config.ticket_adapter {
+                    continue;
+                }
+                let namespace = TicketNamespace::parse(namespace)?;
+                let status = parse_status_key(&status)?;
+                if !project_config.dispatch_states.contains(&status) {
+                    continue;
+                }
+                let key = TicketScanKey::for_project(
+                    project_id,
+                    &adapter,
+                    &namespace,
+                    project_config,
+                    status,
+                )?;
+                if key.scope_digest.as_str() != scope || key.filter_digest.as_str() != filter {
+                    continue;
+                }
+                let ticket_id = TicketId::parse(ticket)?;
+                let labels: Vec<String> = serde_json::from_str(&labels_json)
+                    .map_err(|error| format!("stored ticket labels are invalid: {error}"))?;
+                let payload = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "ticket_observation",
+                    "ticket_namespace": namespace.as_str(),
+                    "ticket_id": ticket_id.as_str(),
+                    "status": status_key(status),
+                    "title": title,
+                    "labels": labels,
+                    "external_revision": revision,
+                    "goal_revision": goal_revision,
+                })
+                .to_string();
+                let regular_source_id = format!(
+                    "{}:{}:{}",
+                    namespace.as_str(),
+                    ticket_id.as_str(),
+                    status_key(status)
+                );
+                let revision_digest = content_digest(&payload);
+                let source_revision = u64::from_str_radix(&revision_digest[..16], 16)
+                    .map_err(|error| error.to_string())?
+                    & (i64::MAX as u64);
+                let regular_consumed: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='ticket_observation' AND source_id=?2 AND source_revision=?3 AND payload_json=?4 AND lifecycle='consumed')",
+                params![format!("project:{}:supervisor",project_id.as_str()),regular_source_id,source_revision.max(1),payload],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+                if !regular_consumed {
+                    continue;
+                }
+                let source_id = format!("{regular_source_id}:resume:{project_epoch}");
+                let inserted = connection.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_observation',?3,?4,30,?5,'pending',?6) ON CONFLICT(role_session_id,source_type,source_id,source_revision) DO NOTHING",
+                params![project_id.as_str(),format!("project:{}:supervisor",project_id.as_str()),source_id,source_revision.max(1),payload,now_unix],
+            ).map_err(|error| error.to_string())?;
+                queued += inserted as usize;
+            }
+            offset = offset.saturating_add(page_len as i64);
+            if page_len < 100 {
+                break;
+            }
+        }
+        Ok(queued)
     }
 
     pub fn goal_ticket_reservation_count(
