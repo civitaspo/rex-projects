@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -10,7 +11,7 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
         prefix,
         role_contract,
         prompt,
-        schema_path,
+        paths,
         conversation_id,
         model,
         effort,
@@ -18,6 +19,10 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
         ..
     } = input;
     let mut args: Vec<OsString> = prefix;
+    if let Some(control_dir) = paths.control_dir {
+        validate_control_dir(control_dir)?;
+        args.extend(["--add-dir".into(), control_dir.as_os_str().to_owned()]);
+    }
     args.extend([
         "--no-daemon".into(),
         "--config".into(),
@@ -59,7 +64,7 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
     args.extend([
         "--json".into(),
         "--output-schema".into(),
-        schema_path.as_os_str().to_owned(),
+        paths.schema_path.as_os_str().to_owned(),
         prompt.into(),
     ]);
     Ok(Invocation {
@@ -67,6 +72,24 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
         args,
         effective_mode: "workspace-write; approvals never; automatic provider execution",
     })
+}
+
+fn validate_control_dir(control_dir: &Path) -> Result<(), String> {
+    if !control_dir.is_absolute() {
+        return Err("Codex run control directory must be absolute".into());
+    }
+    let metadata = std::fs::symlink_metadata(control_dir)
+        .map_err(|_| "Codex run control directory is unavailable")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Codex run control directory must be a real directory".into());
+    }
+    let canonical = control_dir
+        .canonicalize()
+        .map_err(|_| "Codex run control directory is unavailable")?;
+    if canonical != control_dir {
+        return Err("Codex run control directory must be canonical".into());
+    }
+    Ok(())
 }
 
 pub(super) fn parse_result(
@@ -151,7 +174,7 @@ mod tests {
     use serde_json::json;
 
     use super::{build, parse_result};
-    use crate::providers::InvocationInput;
+    use crate::providers::{InvocationInput, InvocationPaths};
 
     fn build_args(conversation_id: Option<&str>) -> Vec<String> {
         let schema = json!({"type":"object"});
@@ -161,7 +184,10 @@ mod tests {
             role_contract: "Follow the role contract.",
             prompt: "Complete the assigned turn.",
             schema: &schema,
-            schema_path: Path::new("/tmp/result-schema.json"),
+            paths: InvocationPaths {
+                schema_path: Path::new("/tmp/result-schema.json"),
+                control_dir: None,
+            },
             conversation_id,
             model: None,
             effort: None,
@@ -212,6 +238,70 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--ask-for-approval", "never"])
         );
+    }
+
+    #[test]
+    fn grants_only_the_canonical_run_control_directory_before_exec() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_dir = temp.path().canonicalize().unwrap();
+        let schema = json!({"type":"object"});
+        let invocation = build(InvocationInput {
+            executable: "/usr/bin/codex".into(),
+            prefix: vec![],
+            role_contract: "Follow the role contract.",
+            prompt: "Complete the assigned turn.",
+            schema: &schema,
+            paths: InvocationPaths {
+                schema_path: Path::new("/tmp/result-schema.json"),
+                control_dir: Some(&control_dir),
+            },
+            conversation_id: Some("thread-123"),
+            model: None,
+            effort: None,
+            codex_options: None,
+            claude_options: None,
+        })
+        .unwrap();
+        let args = invocation
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let grant = args
+            .iter()
+            .position(|argument| argument == "--add-dir")
+            .unwrap();
+        let exec = args.iter().position(|argument| argument == "exec").unwrap();
+        assert_eq!(args[grant + 1], control_dir.to_string_lossy());
+        assert!(grant < exec);
+        assert_eq!(args[exec + 1], "resume");
+    }
+
+    #[test]
+    fn rejects_a_noncanonical_run_control_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_dir = temp
+            .path()
+            .join("..")
+            .join(temp.path().file_name().unwrap());
+        let schema = json!({"type":"object"});
+        let result = build(InvocationInput {
+            executable: "/usr/bin/codex".into(),
+            prefix: vec![],
+            role_contract: "Follow the role contract.",
+            prompt: "Complete the assigned turn.",
+            schema: &schema,
+            paths: InvocationPaths {
+                schema_path: Path::new("/tmp/result-schema.json"),
+                control_dir: Some(&control_dir),
+            },
+            conversation_id: None,
+            model: None,
+            effort: None,
+            codex_options: None,
+            claude_options: None,
+        });
+        assert!(result.is_err());
     }
 
     #[test]

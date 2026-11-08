@@ -40,13 +40,19 @@ pub struct Invocation {
     pub effective_mode: &'static str,
 }
 
+#[derive(Clone, Copy)]
+pub struct InvocationPaths<'a> {
+    pub schema_path: &'a Path,
+    pub control_dir: Option<&'a Path>,
+}
+
 pub(super) struct InvocationInput<'a> {
     pub executable: PathBuf,
     pub prefix: Vec<OsString>,
     pub role_contract: &'a str,
     pub prompt: &'a str,
     pub schema: &'a Value,
-    pub schema_path: &'a Path,
+    pub paths: InvocationPaths<'a>,
     pub conversation_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
@@ -59,7 +65,7 @@ pub fn build_invocation(
     role_contract: &str,
     prompt: &str,
     schema: &Value,
-    schema_path: &Path,
+    paths: InvocationPaths<'_>,
     conversation_id: Option<&str>,
 ) -> Result<Invocation, String> {
     if profile.command.is_empty() || role_contract.trim().is_empty() || prompt.trim().is_empty() {
@@ -90,7 +96,7 @@ pub fn build_invocation(
                 role_contract: &projected_contract,
                 prompt: &projected_prompt,
                 schema: &projection.schema,
-                schema_path,
+                paths,
                 conversation_id,
                 model: profile.model.as_deref(),
                 effort: profile.effort.as_deref(),
@@ -110,7 +116,7 @@ pub fn build_invocation(
                 role_contract: &projected_contract,
                 prompt: &projected_prompt,
                 schema: &projection.schema,
-                schema_path,
+                paths,
                 conversation_id,
                 model: profile.model.as_deref(),
                 effort: profile.effort.as_deref(),
@@ -355,8 +361,8 @@ mod tests {
     use crate::domain::types::{AgentAdapter, CommitMode};
 
     use super::{
-        RESULT_SCHEMA_PROJECTION_VERSION, build_invocation, project_result_schema, validate_schema,
-        validate_schema_definition,
+        InvocationPaths, RESULT_SCHEMA_PROJECTION_VERSION, build_invocation, project_result_schema,
+        validate_schema, validate_schema_definition,
     };
 
     #[test]
@@ -437,7 +443,10 @@ mod tests {
             "Worker contract",
             "Do the work",
             &source,
-            std::path::Path::new("unused-schema-path"),
+            InvocationPaths {
+                schema_path: std::path::Path::new("unused-schema-path"),
+                control_dir: None,
+            },
             None,
         )
         .unwrap();

@@ -405,7 +405,10 @@ pub(crate) fn profile_runtime_identity(
         "runtime identity probe",
         "runtime identity probe",
         &serde_json::json!({"type":"object"}),
-        Path::new("qualification-schema.json"),
+        providers::InvocationPaths {
+            schema_path: Path::new("qualification-schema.json"),
+            control_dir: None,
+        },
         None,
     )
     .map_err(RunError::Invalid)?;
@@ -555,16 +558,16 @@ fn prepare_with_qualification(
     let conversation_id = validate_continuation(request)?;
     let provider_schema = providers::project_result_schema(&request.descriptor.result_schema)
         .map_err(RunError::Invalid)?;
-    let schema_path = if request.profile.adapter == AgentAdapter::Codex {
-        let control_dir = request
-            .descriptor
-            .control_dir
-            .canonicalize()
-            .map_err(RunError::Io)?;
-        Some(write_schema_snapshot(
-            &control_dir,
-            &provider_schema.schema,
+    let control_dir = if request.profile.adapter == AgentAdapter::Codex {
+        Some(canonical_real_directory(
+            &request.descriptor.control_dir,
+            "control directory",
         )?)
+    } else {
+        None
+    };
+    let schema_path = if let Some(control_dir) = &control_dir {
+        Some(write_schema_snapshot(control_dir, &provider_schema.schema)?)
     } else {
         None
     };
@@ -573,7 +576,10 @@ fn prepare_with_qualification(
         &request.role_contract,
         &request.prompt,
         &request.descriptor.result_schema,
-        schema_path.as_deref().unwrap_or_else(|| Path::new("")),
+        providers::InvocationPaths {
+            schema_path: schema_path.as_deref().unwrap_or_else(|| Path::new("")),
+            control_dir: control_dir.as_deref(),
+        },
         conversation_id.as_deref(),
     )
     .map_err(RunError::Invalid)?;
@@ -1774,7 +1780,6 @@ pub(crate) fn invocation_options_digest(profile: &Profile) -> Result<Digest, Run
     Ok(sha256(&bytes))
 }
 
-#[allow(dead_code)]
 fn canonical_real_directory(path: &Path, name: &str) -> Result<PathBuf, RunError> {
     let metadata = fs::symlink_metadata(path).map_err(RunError::Io)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -2678,25 +2683,38 @@ mod tests {
     #[test]
     fn codex_and_claude_commands_use_verified_automatic_modes_and_contracts() {
         let root = tempdir().unwrap();
-        let codex = prepare_with_qualification(
-            &request(
-                root.path(),
-                AgentAdapter::Codex,
-                executable().to_str().unwrap(),
-            ),
-            true,
-            false,
-        )
-        .unwrap();
-        let codex = codex
+        let codex_request = request(
+            root.path(),
+            AgentAdapter::Codex,
+            executable().to_str().unwrap(),
+        );
+        let expected_control_dir = codex_request.descriptor.control_dir.canonicalize().unwrap();
+        let codex = prepare_with_qualification(&codex_request, true, false).unwrap();
+        let codex_args = codex
             .args
             .iter()
             .map(|v| v.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(codex.contains("--no-daemon"));
-        assert!(codex.contains("--ask-for-approval never"));
-        assert!(codex.contains("Worker must use the mailbox"));
+            .collect::<Vec<_>>();
+        assert!(codex_args.contains(&"--no-daemon".into()));
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "never"])
+        );
+        assert!(codex_args.join(" ").contains("Worker must use the mailbox"));
+        let add_dir = codex_args
+            .iter()
+            .position(|argument| argument == "--add-dir")
+            .unwrap();
+        let exec = codex_args
+            .iter()
+            .position(|argument| argument == "exec")
+            .unwrap();
+        assert_eq!(
+            codex_args[add_dir + 1],
+            expected_control_dir.to_string_lossy()
+        );
+        assert!(add_dir < exec);
         let claude = prepare_with_qualification(
             &request(
                 root.path(),
@@ -2707,15 +2725,27 @@ mod tests {
             false,
         )
         .unwrap();
-        let claude = claude
+        let claude_args = claude
             .args
             .iter()
             .map(|v| v.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(claude.contains("--permission-mode auto"));
-        assert!(claude.contains("--permission-prompts none"));
-        assert!(claude.contains("--append-system-prompt Worker must use the mailbox"));
+            .collect::<Vec<_>>();
+        assert!(
+            claude_args
+                .windows(2)
+                .any(|args| args == ["--permission-mode", "auto"])
+        );
+        assert!(
+            claude_args
+                .windows(2)
+                .any(|args| args == ["--permission-prompts", "none"])
+        );
+        assert!(
+            claude_args
+                .join(" ")
+                .contains("--append-system-prompt Worker must use the mailbox")
+        );
+        assert!(!claude_args.contains(&"--add-dir".into()));
     }
 
     #[test]
