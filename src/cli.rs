@@ -769,7 +769,9 @@ fn policy_command(
                                     "effective profile is missing from applied snapshot",
                                 )
                             })?;
-                            let profile_digest = canonical_digest(profile)?;
+                            let profile_digest = crate::store::agent_profile_digest(profile)
+                                .map_err(CliError::unexpected)?
+                                .to_string();
                             let mut instruction_files = profile
                                 .instruction_files
                                 .iter()
@@ -1050,7 +1052,7 @@ fn read_effective_snapshot(
     }
 }
 
-fn canonical_digest<T: Serialize>(value: &T) -> Result<String, CliError> {
+fn serialized_digest<T: Serialize>(value: &T) -> Result<String, CliError> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| CliError::unexpected(error.to_string()))?;
     Ok(text_digest_bytes(&bytes))
@@ -1118,8 +1120,8 @@ fn diff_map<K: Ord + std::fmt::Display, T: Serialize>(
     for key in keys {
         let old = before.get(key);
         let new = after.get(key);
-        let old_digest = old.map(canonical_digest).transpose()?;
-        let new_digest = new.map(canonical_digest).transpose()?;
+        let old_digest = old.map(serialized_digest).transpose()?;
+        let new_digest = new.map(serialized_digest).transpose()?;
         if old_digest != new_digest {
             changes.push(ConfigDiffChange {
                 kind: kind.to_owned(),

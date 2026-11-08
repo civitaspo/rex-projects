@@ -606,6 +606,55 @@ fn policy_explain_marks_capabilities_unobserved_and_emits_merge_instruction_dige
 }
 
 #[test]
+fn policy_explain_uses_applied_canonical_profile_digest() {
+    use sha2::Digest as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let applied = rex_projects::config::load(&config).unwrap();
+    let profile =
+        &applied.profiles[&rex_projects::domain::ids::ProfileId::parse("worker_codex").unwrap()];
+    let canonical = serde_json::to_string(&serde_json::to_value(profile).unwrap()).unwrap();
+    let expected = format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()));
+    assert_ne!(
+        expected,
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(profile).unwrap())
+        )
+    );
+
+    let applied_output = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(applied_output.status.success());
+
+    let profile_config = temp.path().join("profiles/worker_codex/config.toml");
+    let local = std::fs::read_to_string(&profile_config).unwrap();
+    std::fs::write(
+        profile_config,
+        local.replace("configured-supported-model", "local-different-model"),
+    )
+    .unwrap();
+
+    let output = command(&config, &state, &home)
+        .args(["--json", "policy", "explain", "--repository", "example"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["snapshot_source"], "applied_snapshot");
+    let roles = report["projects"][0]["effective_roles"].as_array().unwrap();
+    let worker = roles.iter().find(|role| role["role"] == "Worker").unwrap();
+    assert_eq!(worker["profile_digest"], expected);
+}
+
+#[test]
 fn config_diff_is_read_only_and_reports_normalized_candidate_changes() {
     let temp = tempfile::tempdir().unwrap();
     let (config, state, home) = projection_fixture(&temp);
