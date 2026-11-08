@@ -34,7 +34,6 @@ fn confirm_ticket_claim_repolled_tx(
     owner_generation: u64,
     namespace: &TicketNamespace,
     ticket: &TicketId,
-    eligible_for_claim: bool,
     observed_status: &str,
     external_revision: Option<&str>,
     repolled_at_unix: i64,
@@ -43,14 +42,9 @@ fn confirm_ticket_claim_repolled_tx(
         return Err("repolled external status is required".into());
     }
     validate_active_generation(tx, owner_generation)?;
-    let state = if eligible_for_claim {
-        "repolled_open"
-    } else {
-        "repolled_closed"
-    };
     tx.execute(
         "UPDATE ticket_claim_reconciliations SET state=?3,observed_status=?4,external_revision=?5,repolled_by_generation=?6,repolled_at_unix=?7 WHERE namespace=?1 AND ticket_id=?2",
-        params![namespace.as_str(),ticket.as_str(),state,observed_status,external_revision,owner_generation,repolled_at_unix],
+        params![namespace.as_str(),ticket.as_str(),"repolled_open",observed_status,external_revision,owner_generation,repolled_at_unix],
     )
     .map(|changed| changed == 1)
     .map_err(|error| error.to_string())
@@ -2134,7 +2128,6 @@ impl ConfigStore {
                     owner_generation,
                     &key.namespace,
                     &ticket.id,
-                    true,
                     status_key(ticket.status),
                     ticket.revision.as_deref(),
                     now_unix,
@@ -2647,6 +2640,9 @@ mod tests {
                  INSERT INTO projects VALUES ('project-a','running',0);
                  CREATE TABLE project_runtimes(project_id TEXT PRIMARY KEY, observed_lifecycle TEXT NOT NULL);
                  INSERT INTO project_runtimes VALUES ('project-a','running');
+                 CREATE TABLE ticket_claim_reconciliations(namespace TEXT,ticket_id TEXT,release_request_id TEXT,state TEXT);
+                 CREATE TABLE human_claim_release_commands(request_id TEXT,state TEXT,payload_json TEXT);
+                 CREATE TABLE ticket_runs(ticket_run_id TEXT,project_id TEXT);
                  CREATE TABLE role_wake_inputs(
                     project_id TEXT NOT NULL,
                     role_session_id TEXT NOT NULL,
