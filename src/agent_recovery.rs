@@ -1384,7 +1384,7 @@ fn observe_provider_start(
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
-    let Some(provider_process) = discover_provider_process(
+    let provider_process = match discover_provider_process(
         wrapper_process.pid,
         rex_observation
             .foreground
@@ -1392,10 +1392,19 @@ fn observe_provider_start(
             .map(|process| process.pid),
         expected_executable.as_deref(),
         &tree,
-    ) else {
-        return Ok(AgentRecoveryDisposition::Unresolved {
-            reason: RecoveryUnknown::ProviderIdentityMismatch,
-        });
+        |process| executable_path_for_identity(process).map_err(|_| ()),
+    ) {
+        Ok(Some(provider_process)) => provider_process,
+        Ok(None) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProviderIdentityMismatch,
+            });
+        }
+        Err(()) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProcessInspectionUnavailable,
+            });
+        }
     };
     if tree.is_empty()
         || tree.iter().any(|process| {
@@ -1525,29 +1534,29 @@ fn discover_provider_process<'a>(
     rex_foreground_pid: Option<u32>,
     expected_executable: Option<&Path>,
     process_tree: &'a [ProcessIdentity],
-) -> Option<&'a ProcessIdentity> {
-    let expected_executable = expected_executable?;
-    let candidates = process_tree
-        .iter()
-        .filter(|process| {
-            process.quality == ProcessIdentityQuality::KernelBirthToken
-                && process.pid != wrapper_pid
-                && process_is_descendant_of(process, wrapper_pid, process_tree)
-                && executable_path_for_identity(process)
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some(expected_executable)
-        })
-        .collect::<Vec<_>>();
+    mut executable_path: impl FnMut(&ProcessIdentity) -> Result<Option<PathBuf>, ()>,
+) -> Result<Option<&'a ProcessIdentity>, ()> {
+    let Some(expected_executable) = expected_executable else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::new();
+    for process in process_tree.iter().filter(|process| {
+        process.quality == ProcessIdentityQuality::KernelBirthToken
+            && process.pid != wrapper_pid
+            && process_is_descendant_of(process, wrapper_pid, process_tree)
+    }) {
+        if executable_path(process)?.as_deref() == Some(expected_executable) {
+            candidates.push(process);
+        }
+    }
     if candidates.len() != 1 {
-        return None;
+        return Ok(None);
     }
     let provider = candidates[0];
     if rex_foreground_pid.is_some_and(|pid| pid != wrapper_pid && pid != provider.pid) {
-        return None;
+        return Ok(None);
     }
-    Some(provider)
+    Ok(Some(provider))
 }
 
 fn rex_processes_match(
@@ -1697,13 +1706,20 @@ mod tests {
         let tree = vec![wrapper.clone(), provider.clone()];
         let executable = Path::new("/bin/sleep").canonicalize().unwrap();
 
-        let discovered =
-            discover_provider_process(wrapper.pid, Some(wrapper.pid), Some(&executable), &tree);
-        assert_eq!(discovered, Some(&provider));
+        let discovered = discover_provider_process(
+            wrapper.pid,
+            Some(wrapper.pid),
+            Some(&executable),
+            &tree,
+            |process| executable_path_for_identity(process).map_err(|_| ()),
+        );
+        assert_eq!(discovered, Ok(Some(&provider)));
 
         let unrelated_foreground =
-            discover_provider_process(wrapper.pid, Some(99), Some(&executable), &tree);
-        assert_eq!(unrelated_foreground, None);
+            discover_provider_process(wrapper.pid, Some(99), Some(&executable), &tree, |process| {
+                executable_path_for_identity(process).map_err(|_| ())
+            });
+        assert_eq!(unrelated_foreground, Ok(None));
 
         let unrelated = ProcessIdentity {
             pid: actual.pid,
@@ -1716,8 +1732,9 @@ mod tests {
                 Some(wrapper.pid),
                 Some(&executable),
                 &[wrapper.clone(), unrelated],
+                |_| Ok(None),
             ),
-            None
+            Ok(None)
         );
 
         let mut second_provider = Command::new("/bin/sleep").arg("30").spawn().unwrap();
@@ -1732,10 +1749,28 @@ mod tests {
                 wrapper.pid,
                 Some(wrapper.pid),
                 Some(&executable),
-                &[wrapper, provider, ambiguous],
+                &[wrapper.clone(), provider.clone(), ambiguous.clone()],
+                |process| executable_path_for_identity(process).map_err(|_| ()),
             ),
-            None
+            Ok(None)
         );
+
+        let wrapper_pid = wrapper.pid;
+        let unreadable_candidate_tree = [wrapper, provider.clone(), ambiguous];
+        let inspection_failed = discover_provider_process(
+            wrapper_pid,
+            Some(wrapper_pid),
+            Some(&executable),
+            &unreadable_candidate_tree,
+            |process| {
+                if process.pid == provider.pid {
+                    Ok(Some(executable.clone()))
+                } else {
+                    Err(())
+                }
+            },
+        );
+        assert_eq!(inspection_failed, Err(()));
         native_provider.kill().unwrap();
         native_provider.wait().unwrap();
         second_provider.kill().unwrap();
