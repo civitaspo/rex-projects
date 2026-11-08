@@ -2469,7 +2469,7 @@ pub(crate) mod tests {
             &mut fixture.store,
             &fixture.artifacts,
             source_generation,
-            i64::try_from(wake_id).unwrap(),
+            wake_id,
         )
         .unwrap()
         .unwrap();
@@ -2497,7 +2497,7 @@ pub(crate) mod tests {
             &mut fixture.store,
             &fixture.artifacts,
             current_generation,
-            i64::try_from(wake_id).unwrap(),
+            wake_id,
         )
         .unwrap()
         .unwrap();
@@ -2508,7 +2508,7 @@ pub(crate) mod tests {
             &mut fixture.store,
             &fixture.artifacts,
             current_generation,
-            i64::try_from(wake_id).unwrap(),
+            wake_id,
         )
         .unwrap()
         .unwrap();
