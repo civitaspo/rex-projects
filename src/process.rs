@@ -131,7 +131,7 @@ pub fn run_with_started_identity(
     run_inner(request, on_started, true, false)
 }
 
-#[cfg(all(target_os = "linux", debug_assertions))]
+#[cfg(debug_assertions)]
 fn write_test_process_start_trace(stage: &str, pid: Option<u32>, elapsed: Duration) {
     let Some(path) = std::env::var_os("REX_TEST_PROCESS_START_TRACE_PATH") else {
         return;
@@ -144,7 +144,7 @@ fn write_test_process_start_trace(stage: &str, pid: Option<u32>, elapsed: Durati
     let _ = std::fs::write(path, marker.as_bytes());
 }
 
-#[cfg(not(all(target_os = "linux", debug_assertions)))]
+#[cfg(not(debug_assertions))]
 fn write_test_process_start_trace(_: &str, _: Option<u32>, _: Duration) {}
 
 fn run_inner(
@@ -204,11 +204,21 @@ fn run_inner(
             identity_scan_started.elapsed(),
         );
         if identity_scan.is_err() {
+            write_test_process_start_trace(
+                "identity_cleanup_started",
+                Some(root_pid),
+                process_start.elapsed(),
+            );
             let cleaned = cleanup_child_tree(
                 &mut child,
                 root_pid,
                 &mut observed_processes,
                 request.shutdown_grace,
+            );
+            write_test_process_start_trace(
+                "identity_cleanup_completed",
+                Some(root_pid),
+                process_start.elapsed(),
             );
             return Err(if cleaned {
                 ProcessError::Inspection("cannot record the started process identity".into())
@@ -648,8 +658,12 @@ unsafe extern "C" {
 
 #[cfg(target_os = "linux")]
 fn inspect_linux_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
+    const MAX_TRACE_ENTRIES: usize = 8192;
+
     let entries = std::fs::read_dir("/proc").map_err(ProcessError::Io)?;
+    let scan_started = Instant::now();
     let mut processes = Vec::new();
+    let mut trace_entries = 0;
     for entry in entries {
         let entry = entry.map_err(ProcessError::Io)?;
         let Some(pid) = entry
@@ -659,7 +673,24 @@ fn inspect_linux_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
         else {
             continue;
         };
-        if let Some(identity) = inspect_linux_process_identity(pid)? {
+        let trace_entry = trace_entries < MAX_TRACE_ENTRIES;
+        trace_entries += 1;
+        if trace_entry {
+            write_test_process_start_trace(
+                "proc_stat_read_started",
+                Some(pid),
+                scan_started.elapsed(),
+            );
+        }
+        let identity = inspect_linux_process_identity(pid)?;
+        if trace_entry {
+            write_test_process_start_trace(
+                "proc_stat_read_completed",
+                Some(pid),
+                scan_started.elapsed(),
+            );
+        }
+        if let Some(identity) = identity {
             processes.push(identity);
         }
     }
@@ -917,8 +948,20 @@ fn collect_tree(
     root_pid: u32,
     observed: &mut Vec<ProcessIdentity>,
 ) -> Result<Vec<ProcessIdentity>, ProcessError> {
+    let table_scan_started = Instant::now();
+    write_test_process_start_trace("process_table_started", Some(root_pid), Duration::ZERO);
     let current = inspect_process_table()?;
+    write_test_process_start_trace(
+        "process_table_completed",
+        Some(root_pid),
+        table_scan_started.elapsed(),
+    );
     if let Some(root) = current.iter().find(|item| item.pid == root_pid) {
+        write_test_process_start_trace(
+            "root_identity_check_started",
+            Some(root_pid),
+            Duration::ZERO,
+        );
         if root.process_group_id != root_pid
             || root.quality != ProcessIdentityQuality::KernelBirthToken
             || observed
@@ -930,12 +973,29 @@ fn collect_tree(
                 "root process identity changed during observation".into(),
             ));
         }
+        write_test_process_start_trace(
+            "root_identity_check_completed",
+            Some(root_pid),
+            Duration::ZERO,
+        );
+        let capture_started = Instant::now();
+        write_test_process_start_trace(
+            "process_tree_capture_started",
+            Some(root_pid),
+            Duration::ZERO,
+        );
         for item in capture_process_tree(root_pid, &current) {
             if !observed.iter().any(|known| known == &item) {
                 observed.push(item);
             }
         }
+        write_test_process_start_trace(
+            "process_tree_capture_completed",
+            Some(root_pid),
+            capture_started.elapsed(),
+        );
     } else {
+        write_test_process_start_trace("root_process_absent", Some(root_pid), Duration::ZERO);
         for member in current
             .iter()
             .filter(|item| item.process_group_id == root_pid)

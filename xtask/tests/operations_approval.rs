@@ -47,10 +47,8 @@ impl Drop for XdgStateHomeGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
 struct ProcessStartTraceGuard(Option<std::ffi::OsString>);
 
-#[cfg(target_os = "linux")]
 impl ProcessStartTraceGuard {
     fn set(path: &std::path::Path) -> Self {
         let prior = std::env::var_os("REX_TEST_PROCESS_START_TRACE_PATH");
@@ -59,7 +57,6 @@ impl ProcessStartTraceGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for ProcessStartTraceGuard {
     fn drop(&mut self) {
         match self.0.take() {
@@ -74,9 +71,7 @@ impl Drop for ProcessStartTraceGuard {
 #[test]
 fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
     let temp = tempfile::tempdir().expect("temporary operation state");
-    #[cfg(target_os = "linux")]
     let process_start_trace = temp.path().join("process-start-diagnostic");
-    #[cfg(target_os = "linux")]
     let _process_start_trace = ProcessStartTraceGuard::set(&process_start_trace);
     let isolated_xdg = temp.path().join("xdg-state");
     let _xdg_state_home = XdgStateHomeGuard::set(&isolated_xdg);
@@ -241,6 +236,10 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
             std::ffi::OsString::from("XDG_STATE_HOME"),
             isolated_xdg.as_os_str().to_owned(),
         ),
+        (
+            std::ffi::OsString::from("REX_TEST_PROCESS_START_TRACE_PATH"),
+            process_start_trace.as_os_str().to_owned(),
+        ),
     ]
     .into_iter()
     .collect();
@@ -346,7 +345,6 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
     let invoke_job =
         rex_projects::host_jobs::stable_host_job_id(operation_id.as_str(), "operation.invoke", 1);
     let invoke_deadline = Instant::now() + Duration::from_secs(10);
-    #[cfg(target_os = "linux")]
     let _ = std::fs::remove_file(&process_start_trace);
     loop {
         let mut context = EffectContext {
@@ -372,6 +370,12 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
                 .state
                 == DurableOperationState::Unknown
         {
+            #[cfg(debug_assertions)]
+            {
+                let trace = std::fs::read_to_string(&process_start_trace)
+                    .expect("host process startup writes the opt-in trace file");
+                assert!(trace.contains("stage="), "process-start trace is empty");
+            }
             break;
         }
         if Instant::now() >= invoke_deadline {
