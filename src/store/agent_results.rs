@@ -749,6 +749,58 @@ pub fn ingest_next_spooled_agent_result(
             Err(error) if error == "run-step spool file is not present" => continue,
             Err(error) => return Err(format!("Agent {} result spool: {error}", run_id)),
         };
+        if !matches!(terminal_result.receipt.outcome, TurnOutcome::Completed) {
+            // A provider failure is not a role result. Validate that the failure spool still
+            // belongs to this immutable launch, then let the regular recovery tick reconcile
+            // Rex block loss and process absence without releasing capacity here. Continue
+            // scanning this bounded batch so one unresolved run cannot hide later results.
+            start.validate()?;
+            terminal_result.validate_for(&start)?;
+            let authority = store
+                .agent_launch_authority(&run_id)?
+                .ok_or("Agent terminal has no persisted launch authority")?;
+            validate_request_authority(&authority, &start)?;
+            let qualification = load_qualification(&store.connection, &authority)?;
+            if terminal_result.receipt.attempt != authority.attempt
+                || terminal_result.receipt.provider != qualification.adapter
+                || terminal_result.receipt.capability_receipt_digest.as_ref()
+                    != Some(&authority.qualification_receipt_digest)
+            {
+                return Err(
+                    "provider failure receipt does not match immutable launch authority".into(),
+                );
+            }
+            validate_descriptor_and_projection(&authority, &terminal_result, &qualification)?;
+            let launch_state: Option<(String, Option<String>, Option<String>)> = store
+                .connection
+                .query_row(
+                    "SELECT state,start_request_digest,provider_process_tree_json FROM agent_launch_state WHERE agent_run_id=?1",
+                    [run_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((state, start_digest, process_tree_json)) = launch_state else {
+                return Err("AgentRun has no persisted launch state".into());
+            };
+            if !matches!(state.as_str(), "running" | "unknown")
+                || start_digest.as_deref() != Some(start.request_digest.as_str())
+            {
+                return Err(
+                    "Agent failure receipt does not match the persisted active start request"
+                        .into(),
+                );
+            }
+            if let Some(process_tree_json) = process_tree_json {
+                verify_provider_start_observation(
+                    &authority,
+                    &Some(process_tree_json),
+                    &terminal_result,
+                    &qualification,
+                )?;
+            }
+            continue;
+        }
         let terminal =
             record_and_verify_agent_terminal(store, owner_generation, &start, &terminal_result)?;
         let message: RoleResultMessage = serde_json::from_value(
@@ -2563,6 +2615,367 @@ pub(crate) mod tests {
             "SELECT reducer_revision || ':' || disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
             [worker_evidence_id], |row| row.get::<_, String>(0),
         ).unwrap(), "12:applied");
+    }
+
+    fn spooled_candidate(
+        store: &rusqlite::Connection,
+        root: &std::path::Path,
+        run_id: &str,
+        updated_at: i64,
+        outcome: TurnOutcome,
+        structured_result: Option<serde_json::Value>,
+    ) -> AgentRunId {
+        use crate::domain::types::AgentAdapter;
+        use crate::launch::{
+            AgentLaunchReceipt, LaunchDecision, ObservedProviderStart, ProviderProcessIdentity,
+        };
+        use crate::run_step::{
+            CleanupState, ObservedProcess, ProviderResultFailure, RunReceipt, TurnResult,
+        };
+        use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunFamilyRecord};
+        use sha2::{Digest as _, Sha256};
+
+        let root = root.join(run_id);
+        let control_dir = root.join("control");
+        let workspace_path = root.join("workspace");
+        std::fs::create_dir_all(&control_dir).unwrap();
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let mut authority = test_authority();
+        authority.agent_run_id = AgentRunId::parse(run_id).unwrap();
+        authority.role = Role::Reviewer;
+        authority.role_session_id = format!("ticket_run:ticket-run:reviewer:{run_id}");
+        authority.control_dir = control_dir;
+        authority.workspace_path = workspace_path;
+        authority.descriptor_path = root.join("package.json");
+        let schema: serde_json::Value = crate::protocol::parse_unique(include_bytes!(
+            "../../schemas/agent-results/reviewer-v1.json"
+        ))
+        .unwrap();
+        authority.result_schema_digest = crate::providers::project_result_schema(&schema)
+            .unwrap()
+            .identity
+            .source_schema_digest;
+        let package = reviewer_run_step_package(&authority, schema.clone());
+        authority.profile_digest = package.descriptor.profile_digest.clone();
+        let qualification = reviewer_qualification(&authority);
+        authority.qualification_receipt_digest = qualification.canonical_digest().unwrap();
+        let package = reviewer_run_step_package(&authority, schema.clone());
+        authority.descriptor_digest = package.publish_once(&authority.descriptor_path).unwrap();
+        let authority_digest = authority.digest().unwrap();
+        authority.validate().unwrap();
+        store.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,authority_json,descriptor_digest,authority_digest,controller_generation,control_dir) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                authority.agent_run_id.as_str(),
+                serde_json::to_string(&authority).unwrap(),
+                authority.descriptor_digest.as_str(),
+                authority_digest.as_str(),
+                authority.controller_generation,
+                authority.control_dir.display().to_string(),
+            ],
+        ).unwrap();
+        store
+            .execute(
+                "INSERT INTO provider_qualifications(receipt_digest,receipt_json) VALUES (?1,?2)",
+                rusqlite::params![
+                    authority.qualification_receipt_digest.as_str(),
+                    serde_json::to_string(&qualification).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let wrapper_pid = 10_000 + updated_at as u32;
+        let provider_pid = wrapper_pid + 1;
+        let wrapper_start_identity = format!("wrapper-{run_id}");
+        let provider_start_identity = format!("provider-{run_id}");
+        let spool = crate::run_step_spool::RunStepSpool::open(&authority.control_dir).unwrap();
+        let start = spool
+            .publish_start_once(crate::launch::AgentStartRequest {
+                schema_version: 1,
+                operation_id: authority.operation_id.clone(),
+                agent_run_id: authority.agent_run_id.clone(),
+                project_id: authority.project_id.clone(),
+                controller_generation: authority.controller_generation,
+                descriptor_digest: authority.descriptor_digest.clone(),
+                runtime_binary_digest: authority.runtime_binary_digest.clone(),
+                environment_snapshot_id: authority.environment_snapshot_id.clone(),
+                qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+                wrapper_pid,
+                wrapper_start_identity: wrapper_start_identity.clone(),
+                rex_session_id: authority.rex_session_id.clone(),
+                rex_block_id: authority.rex_block_id.clone(),
+            })
+            .unwrap();
+        let process = crate::process::ProcessIdentity {
+            pid: provider_pid,
+            parent_pid: wrapper_pid,
+            process_group_id: wrapper_pid,
+            start_identity: provider_start_identity.clone(),
+            command: "/bin/codex".into(),
+            quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+        };
+        let process_tree = vec![process.clone()];
+        let process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+        ))
+        .unwrap();
+        let binding = RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: authority.agent_run_id.clone(),
+            reservation_epoch: 1,
+            authority_digest: authority_digest.clone(),
+            descriptor_digest: authority.descriptor_digest.clone(),
+            wrapper_pid,
+            wrapper_start_identity: wrapper_start_identity.clone(),
+        };
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let family = |coverage| RunFamilyRecord {
+            schema_version: 2,
+            binding: binding.clone(),
+            observed_at_unix: if coverage == RunFamilyCoverage::Complete {
+                2
+            } else {
+                1
+            },
+            coverage,
+            wrapper_process: crate::process::ProcessIdentity {
+                pid: wrapper_pid,
+                parent_pid: 1,
+                process_group_id: wrapper_pid,
+                start_identity: wrapper_start_identity.clone(),
+                command: "/usr/local/bin/rex-projects".into(),
+                quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            },
+            provider_root: process.clone(),
+            provider_executable_path: "/bin/codex".into(),
+            provider_executable_digest: qualification.executable_digest.clone(),
+            process_tree: process_tree.clone(),
+            process_tree_digest: process_tree_digest.clone(),
+        };
+        spool
+            .write_run_family_record(&family(RunFamilyCoverage::Observing))
+            .unwrap();
+        spool
+            .write_run_family_record(&family(RunFamilyCoverage::Complete))
+            .unwrap();
+        spool
+            .publish_start_receipt(
+                &start,
+                AgentLaunchReceipt {
+                    schema_version: 1,
+                    operation_id: authority.operation_id.clone(),
+                    agent_run_id: authority.agent_run_id.clone(),
+                    controller_generation: authority.controller_generation,
+                    descriptor_digest: authority.descriptor_digest.clone(),
+                    runtime_binary_digest: authority.runtime_binary_digest.clone(),
+                    qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+                    decision: LaunchDecision::Accepted,
+                    reason: None,
+                },
+            )
+            .unwrap();
+        let projection = crate::providers::project_result_schema(&schema)
+            .unwrap()
+            .identity;
+        let result = TurnResult {
+            receipt: RunReceipt {
+                run_id: authority.agent_run_id.clone(),
+                attempt: authority.attempt,
+                provider: AgentAdapter::Codex,
+                effective_permission_mode: "workspace_write".into(),
+                conversation_id: None,
+                provider_version: Some("fixture-1".into()),
+                capability_receipt_digest: Some(authority.qualification_receipt_digest.clone()),
+                schema_projection: projection,
+                launch_pid_hint: Some(provider_pid),
+                exit_code: Some(0),
+                timed_out: false,
+                cancellation_signal: None,
+                cleanup: if matches!(&outcome, TurnOutcome::Completed) {
+                    CleanupState::Confirmed
+                } else {
+                    CleanupState::Unknown
+                },
+                cleanup_detail: None,
+                processes: vec![ObservedProcess {
+                    pid: process.pid,
+                    parent_pid: process.parent_pid,
+                    process_group_id: process.process_group_id,
+                    start_identity: process.start_identity.clone(),
+                    command: process.command.clone(),
+                    identity_quality: "kernel_birth_token".into(),
+                }],
+                result_digest: None,
+                provider_result_failure: Some(ProviderResultFailure::StructuredOutputMissing),
+                provider_process_failure: None,
+                outcome,
+            },
+            structured_result,
+        };
+        spool.publish_turn_result_once(&start, result).unwrap();
+
+        let observed = ObservedProviderStart {
+            agent_run_id: authority.agent_run_id.clone(),
+            operation_id: authority.operation_id.clone(),
+            provider_pid,
+            provider_start_identity,
+            executable_digest: qualification.executable_digest,
+            process_tree_digest: process_tree_digest.clone(),
+            process_tree_confirmed: true,
+            process_tree: vec![ProviderProcessIdentity {
+                pid: process.pid,
+                parent_pid: process.parent_pid,
+                process_group_id: process.process_group_id,
+                start_identity: process.start_identity,
+                identity_quality: process.quality,
+            }],
+        };
+        store.execute(
+            "INSERT INTO agent_launch_state(agent_run_id,state,start_request_digest,provider_process_tree_json,updated_at_unix) VALUES (?1,'running',?2,?3,?4)",
+            rusqlite::params![
+                authority.agent_run_id.as_str(),
+                start.request_digest,
+                serde_json::to_string(&observed).unwrap(),
+                updated_at,
+            ],
+        ).unwrap();
+        store.execute(
+            "INSERT INTO execution_slots(owner_kind,owner_id,disposition,reservation_epoch) VALUES ('agent_run',?1,'live',1)",
+            [authority.agent_run_id.as_str()],
+        ).unwrap();
+        authority.agent_run_id
+    }
+
+    fn spooled_result_test_store() -> ConfigStore {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT,controller_generation INTEGER,control_dir TEXT);
+                 CREATE TABLE agent_launch_state(agent_run_id TEXT,state TEXT,start_request_digest TEXT,provider_process_tree_json TEXT,updated_at_unix INTEGER);
+                 CREATE TABLE agent_terminal_receipts(agent_run_id TEXT);
+                 CREATE TABLE provider_qualifications(receipt_digest TEXT,receipt_json TEXT);
+                 CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,message_id TEXT,result_json TEXT,received_at_unix INTEGER);
+                 CREATE TABLE agent_result_reducer_ack(evidence_id TEXT);
+                 CREATE TABLE execution_slots(owner_kind TEXT,owner_id TEXT,disposition TEXT,reservation_epoch INTEGER);",
+            )
+            .unwrap();
+        ConfigStore {
+            connection,
+            _machine_lock: crate::store::MachineLock { _file: None },
+        }
+    }
+
+    #[test]
+    fn missing_result_spool_is_deferred_without_releasing_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = spooled_result_test_store();
+        let run_id = spooled_candidate(
+            &store.connection,
+            temp.path(),
+            "missing-result-run",
+            1,
+            TurnOutcome::MissingResult,
+            None,
+        );
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+
+        let result = ingest_next_spooled_agent_result(&mut store, &artifacts, 7, 8).unwrap();
+
+        assert!(result.is_none());
+        let disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "live");
+        let terminal_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_terminal_receipts WHERE agent_run_id=?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_count, 0);
+    }
+
+    #[test]
+    fn missing_result_candidate_does_not_hide_later_completed_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = spooled_result_test_store();
+        spooled_candidate(
+            &store.connection,
+            temp.path(),
+            "missing-result-run",
+            1,
+            TurnOutcome::MissingResult,
+            None,
+        );
+        spooled_candidate(
+            &store.connection,
+            temp.path(),
+            "completed-without-result-run",
+            2,
+            TurnOutcome::Completed,
+            None,
+        );
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+
+        let error = ingest_next_spooled_agent_result(&mut store, &artifacts, 7, 8).unwrap_err();
+
+        assert!(error.contains("completed provider receipt has no structured result"));
+        let missing_result_slot: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id='missing-result-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing_result_slot, "live");
+    }
+
+    #[test]
+    fn missing_result_without_provider_observation_defers_to_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = spooled_result_test_store();
+        let run_id = spooled_candidate(
+            &store.connection,
+            temp.path(),
+            "unobserved-missing-result-run",
+            1,
+            TurnOutcome::MissingResult,
+            None,
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE agent_launch_state SET provider_process_tree_json=NULL WHERE agent_run_id=?1",
+                [run_id.as_str()],
+            )
+            .unwrap();
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+
+        let result = ingest_next_spooled_agent_result(&mut store, &artifacts, 7, 8).unwrap();
+
+        assert!(result.is_none());
+        let disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "live");
     }
 }
 #[allow(clippy::items_after_test_module)]
