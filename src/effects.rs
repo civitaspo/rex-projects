@@ -284,6 +284,7 @@ impl EffectDispatcher {
                         &request.intent.operation_id,
                         owner_generation,
                         Some(&receipt),
+                        None,
                         now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                     )
                     .map_err(EffectDispatchError::Store)?;
@@ -291,12 +292,15 @@ impl EffectDispatcher {
                     operation_id: request.intent.operation_id,
                 })
             }
-            Err(_) => {
+            Err(error) => {
+                let diagnostic =
+                    (request.intent.kind == "start_agent").then(|| bounded_handler_error(&error));
                 store
                     .defer_effect_reconciliation(
                         &request.intent.operation_id,
                         owner_generation,
                         None,
+                        diagnostic.as_deref(),
                         now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                     )
                     .map_err(EffectDispatchError::Store)?;
@@ -313,6 +317,7 @@ impl EffectDispatcher {
                             &request.intent.operation_id,
                             owner_generation,
                             Some("{\"error\":\"invalid absence proof\"}"),
+                            None,
                             now_unix
                                 .saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                         )
@@ -392,4 +397,32 @@ fn retry_delay_for_age(limits: EffectLimits, age_secs: u64) -> Duration {
 
 fn duration_seconds(duration: Duration) -> i64 {
     duration.as_secs().min(i64::MAX as u64) as i64
+}
+
+fn bounded_handler_error(error: &str) -> String {
+    let mut diagnostic = String::new();
+    for character in error.chars() {
+        if diagnostic.len() + character.len_utf8() > 512 {
+            break;
+        }
+        diagnostic.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    diagnostic
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_handler_error;
+
+    #[test]
+    fn handler_error_diagnostic_is_bounded_and_single_line() {
+        let error = format!("{}\nend", "x".repeat(600));
+        let diagnostic = bounded_handler_error(&error);
+        assert_eq!(diagnostic.len(), 512);
+        assert!(!diagnostic.chars().any(char::is_control));
+    }
 }

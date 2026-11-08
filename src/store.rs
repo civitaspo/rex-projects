@@ -2026,11 +2026,15 @@ impl ConfigStore {
         operation_id: &str,
         owner_generation: u64,
         receipt: Option<&str>,
+        last_error: Option<&str>,
         next_reconciliation_at_unix: i64,
     ) -> Result<(), String> {
+        if last_error.is_some_and(|diagnostic| diagnostic.len() > 512) {
+            return Err("effect error diagnostic exceeds 512 bytes".into());
+        }
         let changed = self.connection.execute(
-            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
-            params![operation_id, owner_generation, receipt, next_reconciliation_at_unix],
+            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json),last_error=COALESCE(?5,last_error) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
+            params![operation_id, owner_generation, receipt, next_reconciliation_at_unix, last_error],
         ).map_err(|error| error.to_string())?;
         if changed != 1 {
             return Err("effect reconciliation claim is stale or no longer active".into());
@@ -5201,6 +5205,123 @@ mod tests {
                 .unwrap()
         );
         assert!(!store.should_stop(second_generation).unwrap());
+    }
+
+    #[test]
+    fn start_agent_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("start-error-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "start-error-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "start-error-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let request_json = r#"{"agent_run_id":"agent-1"}"#;
+        let intent = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "project".into(),
+            subject_id: project_id.as_str().into(),
+            operation_id: "start-error-operation".into(),
+            logical_key: "start-error-intent".into(),
+            kind: crate::engine::reducer::effect_name(
+                &crate::engine::reducer::EffectKind::StartAgent,
+            )
+            .into(),
+            request_json: request_json.into(),
+            request_digest: content_digest(request_json),
+            expected_revision: Some(0),
+        };
+        store.enqueue_effect(generation, &intent).unwrap();
+        let prior_receipt = r#"{"kind":"start_request","request_id":"request-1"}"#;
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![&intent.operation_id, prior_receipt],
+            )
+            .unwrap();
+        struct ErrorHandler;
+        impl crate::effects::EffectHandler for ErrorHandler {
+            fn kind(&self) -> crate::effects::EffectKind {
+                crate::effects::EffectKind::StartAgent
+            }
+
+            fn handle(
+                &self,
+                _mode: crate::effects::EffectMode,
+                _request: &crate::effects::EffectRequest,
+                _context: &mut crate::effects::EffectContext<'_>,
+            ) -> Result<crate::effects::EffectObservation, String> {
+                Err("Rex wrapper request was not observed".into())
+            }
+        }
+        let handler = ErrorHandler;
+        let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
+        let result = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            generation,
+            super::now_unix().unwrap(),
+            &handlers,
+            crate::effects::EffectLimits {
+                max_attempts: 3,
+                max_age: std::time::Duration::from_secs(300),
+                retry_base: std::time::Duration::from_secs(20),
+                retry_max: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            crate::effects::DispatchTick::WaitingForReconciliation {
+                operation_id: intent.operation_id.clone(),
+            }
+        );
+        let persisted: (String, Option<String>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT status,receipt_json,last_error FROM effects WHERE operation_id=?1",
+                [&intent.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "uncertain".into(),
+                Some(prior_receipt.into()),
+                Some("Rex wrapper request was not observed".into()),
+            )
+        );
     }
 
     #[test]
