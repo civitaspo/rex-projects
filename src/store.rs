@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
 use crate::config::{AppliedConfig, Config, Profile, SourceFile};
@@ -402,6 +402,82 @@ impl MachineLock {
 }
 
 impl ConfigStore {
+    /// Open an existing controller database for read-only inspection.
+    ///
+    /// This path never creates the state root or database and never runs migrations.
+    pub fn open_readonly(state_root: &Path) -> Result<Self, String> {
+        let root_metadata = fs::symlink_metadata(state_root)
+            .map_err(|error| format!("{}: {error}", state_root.display()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err("state root must be an existing non-symlink directory".into());
+        }
+        let state_root = fs::canonicalize(state_root)
+            .map_err(|error| format!("{}: {error}", state_root.display()))?;
+        let database = state_root.join("state.sqlite3");
+        let metadata = fs::symlink_metadata(&database)
+            .map_err(|error| format!("{}: {error}", database.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("state database must be an existing regular non-symlink file".into());
+        }
+        let wal = state_root.join("state.sqlite3-wal");
+        let wal_metadata = match fs::symlink_metadata(&wal) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err("state database WAL must be a regular non-symlink file".into());
+                }
+                Some(metadata)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("{}: {error}", wal.display())),
+        };
+        let flags = if wal_metadata.is_none() {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                | OpenFlags::SQLITE_OPEN_URI
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        };
+        let database_name = if wal_metadata.is_none() {
+            let path = database
+                .to_str()
+                .ok_or("state database path must be valid UTF-8 for read-only inspection")?;
+            format!("file:{}?immutable=1", Self::sqlite_uri_path(path))
+        } else {
+            database.to_string_lossy().into_owned()
+        };
+        let connection = Connection::open_with_flags(&database_name, flags).map_err(|error| {
+            format!(
+                "{}: read-only database open failed: {error}; start the foreground controller if WAL sidecars need reconciliation",
+                database.display()
+            )
+        })?;
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "read-only inspection requires schema {SCHEMA_VERSION}, found {schema_version}; run the foreground controller to initialize or migrate the database"
+            ));
+        }
+        Ok(Self {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        })
+    }
+
+    fn sqlite_uri_path(path: &str) -> String {
+        let mut uri_path = String::with_capacity(path.len());
+        for byte in path.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+                uri_path.push(char::from(byte));
+            } else {
+                use std::fmt::Write as _;
+                write!(uri_path, "%{byte:02X}").expect("writing to String cannot fail");
+            }
+        }
+        uri_path
+    }
+
     pub fn open(state_root: &Path) -> Result<Self, String> {
         Self::open_with_lock(state_root, MachineLock::acquire(state_root)?)
     }
@@ -5053,6 +5129,34 @@ mod tests {
                 .unwrap(),
             "released"
         );
+    }
+
+    #[test]
+    fn readonly_open_rejects_absent_state_and_cannot_change_existing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("absent-state");
+        assert!(ConfigStore::open_readonly(&absent).is_err());
+        assert!(!absent.exists());
+
+        let state_root = temp.path().join("state");
+        drop(ConfigStore::open_test(&state_root).unwrap());
+        let database = state_root.join("state.sqlite3");
+        let database_before = std::fs::read(&database).unwrap();
+        let files_before = std::fs::read_dir(&state_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+
+        let store = ConfigStore::open_readonly(&state_root).unwrap();
+        assert!(store.test_connection().execute("CREATE TABLE forbidden_write(id)", []).is_err());
+        drop(store);
+
+        let files_after = std::fs::read_dir(&state_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(files_after, files_before);
+        assert_eq!(std::fs::read(database).unwrap(), database_before);
     }
 
     #[test]
