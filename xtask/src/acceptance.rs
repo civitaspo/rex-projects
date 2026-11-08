@@ -1836,7 +1836,21 @@ fn recovery_state(
     run_id: &str,
     block_id: &str,
 ) -> Result<RecoveryState, String> {
-    let row: Option<(u64, u64, String, String, Option<u64>, Option<u64>, Option<u64>, bool, bool, bool, Option<String>)> = database
+    struct RecoveryStateRow {
+        generation: u64,
+        reservation_epoch: u64,
+        disposition: String,
+        state: String,
+        observed_generation: Option<u64>,
+        observed_epoch: Option<u64>,
+        order: Option<u64>,
+        event_received: bool,
+        exit_confirmed: bool,
+        slot_released: bool,
+        survived: Option<String>,
+    }
+
+    let row: Option<RecoveryStateRow> = database
         .query_row(
             "SELECT r.controller_generation,s.reservation_epoch,s.disposition,r.state,
                     o.controller_generation,o.reservation_epoch,o.observation_order,
@@ -1850,24 +1864,24 @@ fn recovery_state(
              WHERE r.agent_run_id=?1",
             params![run_id, block_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                ))
+                Ok(RecoveryStateRow {
+                    generation: row.get(0)?,
+                    reservation_epoch: row.get(1)?,
+                    disposition: row.get(2)?,
+                    state: row.get(3)?,
+                    observed_generation: row.get(4)?,
+                    observed_epoch: row.get(5)?,
+                    order: row.get(6)?,
+                    event_received: row.get(7)?,
+                    exit_confirmed: row.get(8)?,
+                    slot_released: row.get(9)?,
+                    survived: row.get(10)?,
+                })
             },
         )
         .optional()
         .map_err(|error| format!("read Coordinator recovery cursor: {error}"))?;
-    let (
+    let RecoveryStateRow {
         generation,
         reservation_epoch,
         disposition,
@@ -1879,7 +1893,7 @@ fn recovery_state(
         exit_confirmed,
         slot_released,
         survived,
-    ) = row.ok_or("Coordinator AgentRun slot was absent from fixture state")?;
+    } = row.ok_or("Coordinator AgentRun slot was absent from fixture state")?;
     match (observed_generation, observed_epoch, order) {
         (None, None, None) => {}
         (Some(observed_generation), Some(observed_epoch), Some(_))
