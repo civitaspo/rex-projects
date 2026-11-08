@@ -2391,6 +2391,10 @@ mod tests {
             )
             .unwrap();
         }
+        // On Linux, a signaled child remains visible in /proc as a zombie until
+        // its direct parent is reaped. This test owns the provider process, so
+        // reap it before treating process-table presence as a live survivor.
+        let _ = provider.wait();
         let stopped = wait_until_processes_absent(&cumulative);
         assert!(stopped);
         let current = inspect_process_table().unwrap();
@@ -2435,6 +2439,9 @@ mod tests {
             ProcessSignal::Terminate,
         )
         .unwrap();
+        // Reap the killed direct child before checking /proc absence; Linux
+        // retains unreaped children as zombies, which are not live providers.
+        let _ = provider.wait();
         assert!(wait_until_processes_absent(std::slice::from_ref(
             &provider_identity
         )));
