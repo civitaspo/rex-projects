@@ -595,6 +595,8 @@ pub(crate) struct DurableFamilyObserver<'a> {
     binding: RunFamilyBinding,
     inner: crate::run_step::SystemProcessObserver,
     provider_root: Option<ProcessIdentity>,
+    provider_executable_path: Option<std::path::PathBuf>,
+    provider_executable_digest: Option<Digest>,
     interrupted: bool,
 }
 
@@ -605,6 +607,8 @@ impl<'a> DurableFamilyObserver<'a> {
             binding,
             inner: crate::run_step::SystemProcessObserver,
             provider_root: None,
+            provider_executable_path: None,
+            provider_executable_digest: None,
             interrupted: false,
         }
     }
@@ -647,13 +651,35 @@ impl<'a> DurableFamilyObserver<'a> {
         process_tree.sort_by(|left, right| {
             (left.pid, &left.start_identity).cmp(&(right.pid, &right.start_identity))
         });
+        let wrapper_process = crate::process::process_identity_for_pid(self.binding.wrapper_pid)
+            .map_err(|error| error.to_string())?
+            .filter(|process| {
+                process.pid == self.binding.wrapper_pid
+                    && process.start_identity == self.binding.wrapper_start_identity
+                    && process.quality == ProcessIdentityQuality::KernelBirthToken
+            })
+            .ok_or("run-step wrapper birth identity is no longer observable")?;
+        if root.parent_pid != wrapper_process.pid {
+            return Err("provider root is not a direct child of the bound run-step wrapper".into());
+        }
+        let provider_executable_path = self
+            .provider_executable_path
+            .clone()
+            .ok_or("provider image identity was not observed while its root was live")?;
+        let provider_executable_digest = self
+            .provider_executable_digest
+            .clone()
+            .ok_or("provider image digest was not observed while its root was live")?;
         let bytes = serde_json::to_vec(&process_tree).map_err(|error| error.to_string())?;
         self.spool.write_run_family_record(&RunFamilyRecord {
-            schema_version: 1,
+            schema_version: 2,
             binding: self.binding.clone(),
             observed_at_unix: unix_now_seconds()?,
             coverage,
+            wrapper_process,
             provider_root: root,
+            provider_executable_path,
+            provider_executable_digest,
             process_tree_digest: Digest::parse(format!("{:x}", Sha256::digest(bytes)))?,
             process_tree,
         })
@@ -707,6 +733,46 @@ impl crate::run_step::ProcessObserver for DurableFamilyObserver<'_> {
             current,
             signal,
         )
+    }
+
+    fn observe_provider_image(
+        &mut self,
+        pid: u32,
+        start_identity: &str,
+        expected_path: &Path,
+        expected_digest: &Digest,
+    ) -> Result<(), String> {
+        let identity = crate::process::process_identity_for_pid(pid)
+            .map_err(|error| error.to_string())?
+            .filter(|process| {
+                process.pid == pid
+                    && process.start_identity == start_identity
+                    && process.quality == ProcessIdentityQuality::KernelBirthToken
+            })
+            .ok_or("provider root birth identity is not live during image inspection")?;
+        let observed_path = crate::process::executable_path_for_identity(&identity)
+            .map_err(|error| error.to_string())?
+            .ok_or("provider executable image is unavailable for the live root identity")?;
+        let expected_path = std::fs::canonicalize(expected_path).map_err(|e| e.to_string())?;
+        let observed_path = std::fs::canonicalize(observed_path).map_err(|e| e.to_string())?;
+        let observed_digest = digest_file(&observed_path)?;
+        if observed_path != expected_path || observed_digest != *expected_digest {
+            return Err("live provider image differs from the qualified executable".into());
+        }
+        match (
+            &self.provider_executable_path,
+            &self.provider_executable_digest,
+        ) {
+            (None, None) => {
+                self.provider_executable_path = Some(observed_path);
+                self.provider_executable_digest = Some(observed_digest);
+                Ok(())
+            }
+            (Some(path), Some(digest)) if path == &observed_path && digest == &observed_digest => {
+                Ok(())
+            }
+            _ => Err("provider image identity changed during one run".into()),
+        }
     }
     fn checkpoint_family(
         &mut self,
@@ -834,12 +900,14 @@ fn observe_wrapper_process(
         return Err("wrapper PID birth identity does not match the host observation".into());
     }
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let expected_path = std::fs::canonicalize(&executable).map_err(|error| error.to_string())?;
+    let observed_path = crate::process::executable_path_for_identity(identity)
+        .map_err(|error| error.to_string())?
+        .ok_or("wrapper executable image is unavailable for the live PID birth identity")?;
+    let observed_path = std::fs::canonicalize(observed_path).map_err(|error| error.to_string())?;
     if digest_file(&executable)? != *expected_executable_digest
-        || identity.command
-            != executable
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
+        || observed_path != expected_path
+        || digest_file(&observed_path)? != *expected_executable_digest
     {
         return Err("wrapper process does not match the pinned rex-projects executable".into());
     }
@@ -934,6 +1002,55 @@ mod tests {
             .find(|process| process.pid == pid)
             .unwrap();
         assert_eq!(identity, process.start_identity);
+    }
+
+    #[test]
+    fn wrapper_process_observation_accepts_kernel_truncated_executable_names() {
+        let pid = std::process::id();
+        let process = crate::process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let basename = executable.file_name().unwrap().to_str().unwrap();
+        assert_ne!(
+            process.command, basename,
+            "the test executable name is truncated by the kernel process table"
+        );
+        let expected_digest = super::digest_file(&executable).unwrap();
+
+        let observed = observe_wrapper_process(
+            pid,
+            &process.start_identity,
+            &expected_digest,
+            "fixture-session",
+            "fixture-block",
+        )
+        .unwrap();
+
+        assert_eq!(observed.pid, pid);
+        assert_eq!(observed.runtime_binary_digest, expected_digest);
+    }
+
+    #[test]
+    fn wrapper_process_observation_still_rejects_a_different_pinned_image_digest() {
+        let pid = std::process::id();
+        let process = crate::process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .unwrap();
+        assert!(
+            observe_wrapper_process(
+                pid,
+                &process.start_identity,
+                &digest('a'),
+                "fixture-session",
+                "fixture-block",
+            )
+            .is_err()
+        );
     }
 
     #[test]

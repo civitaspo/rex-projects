@@ -1765,7 +1765,8 @@ fn terminal_block(spec: &AgentBlockSpec) -> Result<Value, RexError> {
             "cwd": spec.cwd,
             "shell": "none",
             "login": false,
-            "path_prepend": spec.path_prepend
+            "path_prepend": spec.path_prepend,
+            "exit": {"on_completion": false}
         }
     }))
 }
@@ -1949,6 +1950,22 @@ mod tests {
             path_prepend: vec![],
         };
         assert!(super::terminal_block(&spec).is_err());
+    }
+
+    #[test]
+    fn completed_agent_blocks_remain_available_for_host_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = AgentBlockSpec {
+            run_id: "view-anchor-1".into(),
+            command: PathBuf::from("/usr/bin/true"),
+            args: vec![],
+            cwd: dir.path().to_path_buf(),
+            path_prepend: vec![PathBuf::from("/usr/bin")],
+        };
+
+        let terminal = super::terminal_block(&spec).unwrap();
+
+        assert_eq!(terminal["options"]["exit"]["on_completion"], false);
     }
 
     #[test]

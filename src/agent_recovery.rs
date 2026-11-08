@@ -1447,16 +1447,36 @@ fn observe_provider_start(
             });
         }
     };
+    let Some(expected_executable) = verified_qualification_executable(&qualification) else {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProviderIdentityMismatch,
+        });
+    };
+    if rex_observation.last_exit.is_some() {
+        if rex_observation
+            .child
+            .as_ref()
+            .is_some_and(|rex_wrapper| rex_wrapper.pid != wrapper.pid)
+        {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::WrapperIdentityMismatch,
+            });
+        }
+        return observe_completed_provider_start_from_family(
+            store,
+            owner_generation,
+            run,
+            wrapper,
+            &qualification,
+            &expected_executable,
+        );
+    }
     let Some(rex_wrapper) = rex_observation.child.as_ref() else {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::WrapperIdentityMismatch,
         });
     };
-    let expected_executable = verified_qualification_executable(&qualification);
-    if rex_observation.last_exit.is_some()
-        || rex_wrapper.pid != wrapper.pid
-        || expected_executable.is_none()
-    {
+    if rex_wrapper.pid != wrapper.pid {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProviderIdentityMismatch,
         });
@@ -1484,7 +1504,7 @@ fn observe_provider_start(
             .foreground
             .as_ref()
             .map(|process| process.pid),
-        expected_executable.as_deref(),
+        Some(expected_executable.as_path()),
         &tree,
         |process| executable_path_for_identity(process).map_err(|_| ()),
     ) {
@@ -1535,6 +1555,117 @@ fn observe_provider_start(
         process_tree,
     };
     observation.validate_complete_process_tree(&qualification)?;
+    store.confirm_provider_started(owner_generation, &observation)?;
+    Ok(AgentRecoveryDisposition::ProviderStarted)
+}
+
+/// Promote a provider whose Rex block finished before the controller's first live-process poll.
+/// Only the provider runner's complete, immutable run-family observation can bridge this race;
+/// terminal result verification and slot release remain on their existing separate path.
+fn observe_completed_provider_start_from_family(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &RecoverableAgentRun,
+    wrapper: &ObservedWrapperIdentity,
+    qualification: &crate::launch::ProviderQualification,
+    expected_executable: &Path,
+) -> Result<AgentRecoveryDisposition, String> {
+    let unresolved = || AgentRecoveryDisposition::Unresolved {
+        reason: RecoveryUnknown::ProviderIdentityMismatch,
+    };
+    let spool = match RunStepSpool::open(&run.authority.control_dir) {
+        Ok(spool) => spool,
+        Err(_) => return Ok(unresolved()),
+    };
+    let start = match spool.read_start_request() {
+        Ok(start) => start,
+        Err(_) => return Ok(unresolved()),
+    };
+    let request = &start.request;
+    if request.agent_run_id != run.agent_run_id
+        || request.operation_id != run.authority.operation_id
+        || request.controller_generation != owner_generation
+        || request.descriptor_digest != run.authority.descriptor_digest
+        || request.runtime_binary_digest != run.authority.runtime_binary_digest
+        || request.qualification_receipt_digest != run.authority.qualification_receipt_digest
+        || request.rex_session_id != run.authority.rex_session_id
+        || request.rex_block_id != run.authority.rex_block_id
+        || request.wrapper_pid != wrapper.pid
+        || request.wrapper_start_identity != wrapper.start_identity
+    {
+        return Ok(unresolved());
+    }
+    let published_receipt = match spool.read_start_receipt(&start) {
+        Ok(Some(receipt)) if receipt.decision == crate::launch::LaunchDecision::Accepted => receipt,
+        _ => return Ok(unresolved()),
+    };
+    if store.persisted_start_receipt(request)?.as_ref() != Some(&published_receipt) {
+        return Ok(unresolved());
+    }
+    let family = match spool.read_run_family_record() {
+        Ok(Some(family)) => family,
+        Ok(None) | Err(_) => return Ok(unresolved()),
+    };
+    let expected_binding = crate::run_step_spool::RunFamilyBinding {
+        schema_version: 1,
+        agent_run_id: run.agent_run_id.clone(),
+        reservation_epoch: run.reservation_epoch,
+        authority_digest: run.authority_digest.clone(),
+        descriptor_digest: run.authority.descriptor_digest.clone(),
+        wrapper_pid: wrapper.pid,
+        wrapper_start_identity: wrapper.start_identity.clone(),
+    };
+    if family.binding != expected_binding
+        || family.coverage != RunFamilyCoverage::Complete
+        || family.provider_executable_path != expected_executable
+        || family.provider_executable_digest != qualification.executable_digest
+        || family.wrapper_process.pid != wrapper.pid
+        || family.wrapper_process.start_identity != wrapper.start_identity
+        || family.provider_root.parent_pid != wrapper.pid
+        || !family.process_tree.iter().any(|process| {
+            process.pid == family.provider_root.pid
+                && process.start_identity == family.provider_root.start_identity
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+        })
+    {
+        return Ok(unresolved());
+    }
+
+    let mut exact_tree = Vec::with_capacity(family.process_tree.len() + 1);
+    exact_tree.push(family.wrapper_process.clone());
+    exact_tree.extend(family.process_tree.iter().cloned());
+    let current = match inspect_process_table() {
+        Ok(current) => current,
+        Err(_) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProcessInspectionUnavailable,
+            });
+        }
+    };
+    if !crate::process::matching_processes(&exact_tree, &current).is_empty() {
+        return Ok(unresolved());
+    }
+    let process_tree = exact_tree
+        .iter()
+        .map(|process| crate::launch::ProviderProcessIdentity {
+            pid: process.pid,
+            parent_pid: process.parent_pid,
+            process_group_id: process.process_group_id,
+            start_identity: process.start_identity.clone(),
+            identity_quality: process.quality,
+        })
+        .collect::<Vec<_>>();
+    let observation = ObservedProviderStart {
+        agent_run_id: run.authority.agent_run_id.clone(),
+        operation_id: run.authority.operation_id.clone(),
+        provider_pid: family.provider_root.pid,
+        provider_start_identity: family.provider_root.start_identity.clone(),
+        executable_digest: qualification.executable_digest.clone(),
+        process_tree_digest: digest_json(&process_tree)?,
+        process_tree_confirmed: true,
+        process_tree,
+    };
+    observation.validate_complete_process_tree(qualification)?;
     store.confirm_provider_started(owner_generation, &observation)?;
     Ok(AgentRecoveryDisposition::ProviderStarted)
 }

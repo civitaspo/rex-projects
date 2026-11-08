@@ -319,6 +319,15 @@ pub fn render_role_prompt(
             ProjectMode::Operations => "operations",
         }
     ));
+    let effective_role_profiles = resolved_roles
+        .iter()
+        .map(|(role, profile)| (role_name(*role), profile.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let role_profiles_json = serde_json::to_string_pretty(&effective_role_profiles)
+        .map_err(|error| format!("serialize effective Project role profiles: {error}"))?;
+    prompt.push_str(&format!(
+        "\nApplied Project role profiles (trusted applied configuration; use the exact profile ID when requesting a role):\n```json\n{role_profiles_json}\n```\n"
+    ));
     if let Some(goal) = &project.goal {
         prompt.push_str(&format!(
             "Goal (revision {}): {}\n",
@@ -1039,6 +1048,13 @@ mod tests {
             assert!(rendered.text.contains("agent inbox --run"));
             assert!(rendered.text.contains("$REX_PROJECTS_RUN_ID"));
             assert!(rendered.text.contains("$REX_PROJECTS_CONTROL_DIR"));
+            if role == Role::Supervisor {
+                assert!(
+                    rendered
+                        .text
+                        .contains("\"coordinator\": \"judgment_claude\"")
+                );
+            }
             assert!(
                 rendered
                     .text

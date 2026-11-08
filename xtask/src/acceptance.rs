@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use rex_projects::adapters::rex::{owned_supervisor_window_label, owned_ticket_window_label};
 use rex_projects::process::{ProcessOutput, ProcessRequest, run as run_process};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -15,6 +16,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const POLL_LIMIT: Duration = Duration::from_secs(20);
 const FULL_FLOW_LIMIT: Duration = Duration::from_secs(30 * 60);
 const QUALIFICATION_LIMIT: Duration = Duration::from_secs(180);
+const COORDINATOR_STAGE_LIMIT: Duration = Duration::from_secs(180);
+const ACCEPTANCE_STAGE_ENV: &str = "REX_PROJECTS_ACCEPTANCE_STAGE";
+const COORDINATOR_INBOX_STAGE: &str = "supervisor_coordinator_inbox";
+const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
+const FIXTURE_PROJECT_ID: &str = "operations_project";
+const FIXTURE_TICKET_NAMESPACE: &str = "fixture/acceptance";
+const FIXTURE_TICKET_ID: &str = "ticket-1";
 const PROVIDER_ROLES: [&str; 8] = [
     "supervisor",
     "coordinator",
@@ -45,6 +53,21 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         return Err("fixture root must be a new absolute path".into());
     }
     verify_owned_session(&request)?;
+    let bounded_coordinator_stage = match std::env::var(ACCEPTANCE_STAGE_ENV) {
+        Ok(stage) if stage == COORDINATOR_INBOX_STAGE => true,
+        Ok(_) => {
+            return Err(format!(
+                "unsupported acceptance stage in {ACCEPTANCE_STAGE_ENV}"
+            ));
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => return Err(format!("read {ACCEPTANCE_STAGE_ENV}: {error}")),
+    };
+    let provider_roles: &[&str] = if bounded_coordinator_stage {
+        &["supervisor", "coordinator"]
+    } else {
+        &PROVIDER_ROLES
+    };
     fs::create_dir_all(request.fixture_root).map_err(|error| error.to_string())?;
     let state_root = request.fixture_root.join("state");
     fs::create_dir(&state_root).map_err(|error| error.to_string())?;
@@ -59,7 +82,12 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
 
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     prepare_local_repository(&request, &executable)?;
-    prepare_profiles(&request, &executable, request.cli)?;
+    prepare_profiles(
+        &request,
+        &executable,
+        request.cli,
+        bounded_coordinator_stage,
+    )?;
     trace.push(json!({"step":"local_bare_repository_and_profiles","status":"passed","provider":"EMULATED"}));
 
     let config_path = request.fixture_root.join("config.toml");
@@ -94,7 +122,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         OsString::from("--shell=none"),
         OsString::from("--keep-open"),
         OsString::from("--json"),
-        OsString::from("rex-projects-controller"),
+        OsString::from(CONTROLLER_WINDOW_LABEL),
         OsString::from("--"),
     ];
     // `rex window new` receives the absolute executable after `--`; PATH gives the controller
@@ -166,7 +194,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let mut terminal_qualifications = BTreeMap::new();
     let qualification_deadline = Instant::now() + QUALIFICATION_LIMIT;
     let mut qualification_failure = false;
-    for role in PROVIDER_ROLES {
+    for role in provider_roles.iter().copied() {
         let phase_start = qualifications.len();
         for project in ["operations_project"] {
             let request_id = format!("acceptance-{project}-{role}");
@@ -266,7 +294,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         }
     }
     let all_verified = !qualification_failure
-        && qualifications.len() == PROVIDER_ROLES.len()
+        && qualifications.len() == provider_roles.len()
         && qualifications.iter().all(|(_, _, request_id, _, _)| {
             terminal_qualifications
                 .get(request_id)
@@ -302,12 +330,17 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
 
     let deadline = Instant::now()
         + if all_verified {
-            FULL_FLOW_LIMIT
+            if bounded_coordinator_stage {
+                COORDINATOR_STAGE_LIMIT
+            } else {
+                FULL_FLOW_LIMIT
+            }
         } else {
             Duration::ZERO
         };
     let mut first_dashboard = true;
     let mut lifecycle_traced = false;
+    let mut coordinator_boundary_reached = false;
     loop {
         let status = product(&request, &state_root, &["status", "--json"])?;
         if !status.status.is_some_and(|status| status.success()) {
@@ -347,9 +380,26 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             trace.push(json!({"step":"project_lifecycle_observed","status":"running","evidence":last_status}));
             lifecycle_traced = true;
         }
+        if bounded_coordinator_stage {
+            let observations = read_public_inbox_observations(request.fixture_root)?;
+            if let Some(coordinator) = observations
+                .iter()
+                .find(|observation| is_coordinator_dispatch_observation(observation))
+            {
+                trace.push(json!({"step":"coordinator_inbox_boundary_observed","status":"passed","evidence":coordinator}));
+                let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
+                if !stop.status.is_some_and(|status| status.success()) {
+                    trace.push(json!({"step":"bounded_stage_stop_request","status":"rejected","evidence":json_stdout(&stop)}));
+                    break;
+                }
+                trace.push(json!({"step":"bounded_stage_stop_request","status":"queued","evidence":json_stdout(&stop)}));
+                coordinator_boundary_reached = true;
+                break;
+            }
+        }
         if Instant::now() >= deadline {
             trace.push(
-                json!({"step":"project_lifecycle_poll","status":"timed_out","status_snapshot":last_status,"dashboard_snapshot":dashboard}),
+                json!({"step":if bounded_coordinator_stage {"coordinator_inbox_poll"} else {"project_lifecycle_poll"},"status":"timed_out","status_snapshot":last_status,"dashboard_snapshot":dashboard}),
             );
             break;
         }
@@ -418,15 +468,35 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             "external ticket remains {external_ticket_status}; no public Agent inbox turn was observed"
         )
     };
+    let coordinator_observation = inbox_observations
+        .iter()
+        .find(|observation| is_coordinator_dispatch_observation(observation));
+    let supervisor_observation = inbox_observations
+        .iter()
+        .find(|observation| observation["role"] == "supervisor");
+    let stage_valid = bounded_coordinator_stage
+        && coordinator_boundary_reached
+        && stopped
+        && coordinator_observation.is_some()
+        && supervisor_observation.is_some_and(|observation| {
+            observation
+                .pointer("/input_files/effective_role_profiles/coordinator")
+                .and_then(Value::as_str)
+                == Some("fixture_coordinator")
+        });
+    if bounded_coordinator_stage {
+        trace.push(json!({"step":"supervisor_coordinator_contract","status":if stage_valid {"passed"} else {"failed"},"evidence":{"supervisor_prompt_role_profiles":supervisor_observation.and_then(|observation|observation.pointer("/input_files/effective_role_profiles").cloned()),"coordinator_dispatch_observation":coordinator_observation,"coordinator_process_held_until_stop":coordinator_boundary_reached}}));
+    }
     let report = json!({
-        "status":"UNSUPPORTED",
+        "status":if stage_valid {"STAGE_PASSED"} else {"UNSUPPORTED"},
+        "stage":if bounded_coordinator_stage {Some(COORDINATOR_INBOX_STAGE)} else {None},
         "product_cli_identity":cli_identity,
         "trace":trace,
         "last_dashboard":dashboard,
         "furthest_stage":furthest_role.unwrap_or("project_started"),
         "external_ticket_status":external_ticket_status,
         "current_stop":current_stop,
-        "missing_capabilities":["This emulated lane does not establish host-verified completion of every required role stage and external Done."],
+        "missing_capabilities":if bounded_coordinator_stage {vec!["This bounded emulated stage stops after the first Coordinator inbox read and does not claim downstream completion."]} else {vec!["This emulated lane does not establish host-verified completion of every required role stage and external Done."]},
         "fixture_provider":"EMULATED",
         "resources_created":true,
         "owned_rex_session":request.rex_session,
@@ -434,7 +504,35 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         "fixture_root":request.fixture_root
     });
     emit_report(request.fixture_root, &report)?;
+    if bounded_coordinator_stage && !stage_valid {
+        return Err("bounded Supervisor-to-Coordinator connection stage did not reach its contract boundary".into());
+    }
     Ok(())
+}
+
+fn is_coordinator_dispatch_observation(observation: &Value) -> bool {
+    observation["role"] == "coordinator"
+        && observation["ticket_run_id"]
+            .as_str()
+            .is_some_and(|ticket_run_id| {
+                observation["ticket_run_dispatch_id"].as_str() == Some(ticket_run_id)
+            })
+        && observation
+            .pointer("/input_files/package_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| Path::new(path).is_absolute())
+        && observation
+            .pointer("/input_files/package_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| digest.len() == 64)
+        && observation
+            .pointer("/input_files/snapshot_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| Path::new(path).is_absolute())
+        && observation
+            .pointer("/input_files/snapshot_digest")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| digest.len() == 64)
 }
 
 fn read_public_inbox_observations(fixture_root: &Path) -> Result<Vec<Value>, String> {
@@ -544,6 +642,7 @@ fn prepare_profiles(
     request: &Request<'_>,
     executable: &Path,
     runtime_binary: &Path,
+    hold_coordinator_after_inbox: bool,
 ) -> Result<(), String> {
     let profiles = request.fixture_root.join("profiles");
     let contexts = request.fixture_root.join("contexts");
@@ -573,18 +672,38 @@ fn prepare_profiles(
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        let hold = hold_coordinator_after_inbox && role == "coordinator";
+        let command = if hold {
+            format!(
+                "[\"/usr/bin/env\", \"REX_PROJECTS_FIXTURE_HOLD_AFTER_INBOX=1\", {:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]",
+                executable.display().to_string(),
+                role,
+                scenario,
+                context.display().to_string(),
+                request
+                    .fixture_root
+                    .join("agent-state")
+                    .display()
+                    .to_string(),
+                runtime_binary.display().to_string()
+            )
+        } else {
+            format!(
+                "[{:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]",
+                executable.display().to_string(),
+                role,
+                scenario,
+                context.display().to_string(),
+                request
+                    .fixture_root
+                    .join("agent-state")
+                    .display()
+                    .to_string(),
+                runtime_binary.display().to_string()
+            )
+        };
         let config = format!(
-            "adapter = \"codex\"\ncommand = [{:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]\nmodel = \"fixture-emulator\"\n\n[options]\nsandbox = \"workspace_write\"\napproval = \"never\"\n",
-            executable.display().to_string(),
-            role,
-            scenario,
-            context.display().to_string(),
-            request
-                .fixture_root
-                .join("agent-state")
-                .display()
-                .to_string(),
-            runtime_binary.display().to_string()
+            "adapter = \"codex\"\ncommand = {command}\nmodel = \"fixture-emulator\"\n\n[options]\nsandbox = \"workspace_write\"\napproval = \"never\"\n"
         );
         fs::write(profile.join("config.toml"), config).map_err(|error| error.to_string())?;
     }
@@ -606,7 +725,7 @@ fn profile_messages(role: &str) -> Result<Vec<Value>, String> {
         "supervisor" => vec![message("supervisor", "dispatch_request", json!({
             "ticket_reference":{"$fixture_ref":"inbox.ticket_id"},
             "expected_ticket_revision":{"$fixture_ref":"inbox.external_revision"},
-            "coordinator_profile":"fixture_coordinator","priority":1,
+            "coordinator_profile":{"$fixture_ref":"inbox.coordinator_profile"},"priority":1,
             "rationale":"The actual normalized ticket observation is eligible for this configured Operations Project."
         }))],
         "coordinator" => vec![
@@ -929,6 +1048,32 @@ fn verify_owned_session(request: &Request<'_>) -> Result<(), String> {
     if value["session_id"].as_str() != Some(request.rex_session) {
         return Err("Rex session ID does not match the explicitly selected owned session".into());
     }
+    verify_fixture_session_is_fresh(&value)?;
+    Ok(())
+}
+
+fn verify_fixture_session_is_fresh(session: &Value) -> Result<(), String> {
+    let owned_labels = [
+        CONTROLLER_WINDOW_LABEL.to_owned(),
+        owned_supervisor_window_label(FIXTURE_PROJECT_ID),
+        owned_ticket_window_label(FIXTURE_TICKET_NAMESPACE, FIXTURE_TICKET_ID)
+            .map_err(|error| error.to_string())?,
+    ];
+    let windows = session
+        .get("windows")
+        .and_then(Value::as_array)
+        .ok_or("Rex session inspect omitted its windows array")?;
+    let has_existing_fixture_window = windows.iter().any(|window| {
+        window
+            .get("label")
+            .and_then(Value::as_str)
+            .is_some_and(|label| owned_labels.iter().any(|owned| owned == label))
+    });
+    if has_existing_fixture_window {
+        return Err(
+            "Rex session already contains resources from this acceptance fixture; select a fresh session".into(),
+        );
+    }
     Ok(())
 }
 
@@ -1194,6 +1339,22 @@ mod tests {
     use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
 
     #[test]
+    fn acceptance_preflight_rejects_reused_fixture_windows_but_allows_harmless_windows() {
+        let fixture_labels = [
+            CONTROLLER_WINDOW_LABEL.to_owned(),
+            owned_supervisor_window_label(FIXTURE_PROJECT_ID),
+            owned_ticket_window_label(FIXTURE_TICKET_NAMESPACE, FIXTURE_TICKET_ID).unwrap(),
+        ];
+        for label in fixture_labels {
+            let session = json!({"windows":[{"label":label,"layers":[]}]});
+            let error = verify_fixture_session_is_fresh(&session).unwrap_err();
+            assert!(error.contains("fresh session"), "{error}");
+        }
+        verify_fixture_session_is_fresh(&json!({"windows":[{"label":"Harmless","layers":[]}]}))
+            .unwrap();
+    }
+
+    #[test]
     fn generated_fixture_contexts_deserialize_with_the_agent_contract() {
         for role in PROVIDER_ROLES {
             let scenario = format!("acceptance_{role}");
@@ -1205,6 +1366,38 @@ mod tests {
             serde_json::from_value::<crate::fixtures::agent::AgentContext>(context)
                 .unwrap_or_else(|error| panic!("{role} fixture context is invalid: {error}"));
         }
+    }
+
+    #[test]
+    fn generated_supervisor_context_passes_the_actual_fixture_recipe_parser() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("acceptance");
+        fs::create_dir(&root).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        let executable = std::env::current_exe().unwrap();
+        prepare_profiles(&request, &executable, request.cli, false).unwrap();
+
+        let context =
+            crate::fixtures::agent::read_context(&root.join("contexts/supervisor.json")).unwrap();
+        let dispatch = context
+            .messages
+            .iter()
+            .find(|message| {
+                message.lane == Some(crate::fixtures::agent::FixtureLane::Workflow)
+                    && message.kind == RoleOutputKind::DispatchRequest
+            })
+            .expect("generated Supervisor dispatch recipe exists");
+        assert_eq!(
+            dispatch.recipe.structured_result["coordinator_profile"]["$fixture_ref"],
+            "inbox.coordinator_profile"
+        );
     }
 
     #[test]
@@ -1264,6 +1457,46 @@ mod tests {
     }
 
     #[test]
+    fn generated_supervisor_context_keeps_qualification_progress_separate_from_dispatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("acceptance");
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        let executable = std::env::current_exe().unwrap();
+        prepare_profiles(&request, &executable, request.cli, false).unwrap();
+        let context =
+            crate::fixtures::agent::read_context(&root.join("contexts/supervisor.json")).unwrap();
+        let supervisor_messages = context
+            .messages
+            .iter()
+            .filter(|message| message.role == rex_projects::domain::types::Role::Supervisor)
+            .collect::<Vec<_>>();
+        assert_eq!(supervisor_messages.len(), 2);
+        assert_eq!(
+            supervisor_messages[0].lane,
+            Some(crate::fixtures::agent::FixtureLane::Qualification)
+        );
+        assert_eq!(
+            supervisor_messages[0].kind,
+            rex_projects::engine::orchestration::RoleOutputKind::Progress
+        );
+        assert_eq!(
+            supervisor_messages[1].lane,
+            Some(crate::fixtures::agent::FixtureLane::Workflow)
+        );
+        assert_eq!(
+            supervisor_messages[1].kind,
+            rex_projects::engine::orchestration::RoleOutputKind::DispatchRequest
+        );
+    }
+
+    #[test]
     fn fake_forge_reads_the_owned_fixture_bare_repository() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("acceptance");
@@ -1299,7 +1532,7 @@ mod tests {
             fixture_root: &root,
         };
         let executable = std::env::current_exe().unwrap();
-        prepare_profiles(&request, &executable, request.cli).unwrap();
+        prepare_profiles(&request, &executable, request.cli, false).unwrap();
         let config = root.join("config.toml");
         fs::write(&config, config_text(&request, &executable)).unwrap();
         rex_projects::config::load(&config).unwrap();
@@ -1338,6 +1571,7 @@ mod tests {
                     "ticket_revision" => json!(1),
                     "inbox.ticket_id" => json!("T-1"),
                     "inbox.external_revision" => json!("rev-1"),
+                    "inbox.coordinator_profile" => json!("fixture_coordinator"),
                     "inbox.planner_result" => json!({
                         "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":"Create and commit a bounded acceptance fixture artifact.","depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
                         "unresolved_questions":[]

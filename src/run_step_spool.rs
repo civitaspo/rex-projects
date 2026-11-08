@@ -21,6 +21,7 @@ use crate::run_step::{RunReceipt, TurnResult};
 const PROTOCOL_VERSION: u32 = 1;
 pub(crate) const BLOCK_LOSS_SNAPSHOT_VERSION: u32 = 2;
 const RUN_FAMILY_VERSION: u32 = 1;
+const RUN_FAMILY_RECORD_VERSION: u32 = 2;
 const MAX_START_BYTES: usize = 32 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_BLOCK_LOSS_SNAPSHOT_BYTES: usize = 512 * 1024;
@@ -103,7 +104,10 @@ pub struct RunFamilyRecord {
     pub binding: RunFamilyBinding,
     pub observed_at_unix: i64,
     pub coverage: RunFamilyCoverage,
+    pub wrapper_process: ProcessIdentity,
     pub provider_root: ProcessIdentity,
+    pub provider_executable_path: PathBuf,
+    pub provider_executable_digest: Digest,
     pub process_tree: Vec<ProcessIdentity>,
     pub process_tree_digest: Digest,
 }
@@ -119,12 +123,22 @@ pub enum RunFamilyCoverage {
 impl RunFamilyRecord {
     pub fn validate(&self) -> Result<(), String> {
         self.binding.validate()?;
-        if self.schema_version != RUN_FAMILY_VERSION
+        if self.schema_version != RUN_FAMILY_RECORD_VERSION
             || self.observed_at_unix < 0
             || self.process_tree.is_empty()
             || self.process_tree.len() > MAX_BLOCK_LOSS_IDENTITIES
+            || !self.provider_executable_path.is_absolute()
         {
             return Err("run-family record is outside its bounds".into());
+        }
+        if self.wrapper_process.pid != self.binding.wrapper_pid
+            || self.wrapper_process.start_identity != self.binding.wrapper_start_identity
+            || self.wrapper_process.quality != ProcessIdentityQuality::KernelBirthToken
+            || self.wrapper_process.process_group_id == 0
+            || self.wrapper_process.start_identity.trim().is_empty()
+            || self.provider_root.parent_pid != self.wrapper_process.pid
+        {
+            return Err("run-family record does not identify the exact live wrapper parent".into());
         }
         if self.provider_root.pid == 0
             || self.provider_root.process_group_id == 0
@@ -304,6 +318,9 @@ impl RunStepSpool {
                 || previous.provider_root.start_identity != record.provider_root.start_identity
                 || previous.provider_root.process_group_id != record.provider_root.process_group_id
                 || previous.provider_root.quality != record.provider_root.quality
+                || previous.wrapper_process != record.wrapper_process
+                || previous.provider_executable_path != record.provider_executable_path
+                || previous.provider_executable_digest != record.provider_executable_digest
                 || record.observed_at_unix < previous.observed_at_unix
                 || !process_tree_contains(&record.process_tree, &previous.process_tree)
                 || previous.coverage != RunFamilyCoverage::Observing
@@ -411,9 +428,27 @@ impl RunStepSpool {
         result: TurnResult,
     ) -> Result<AgentTurnResult, String> {
         request.validate()?;
-        let family = self
-            .read_run_family_record()?
-            .ok_or("run-step producer has no durable process-family evidence")?;
+        let family = match self.read_run_family_record()? {
+            Some(family) => family,
+            None => {
+                let message = result
+                    .receipt
+                    .cleanup_detail
+                    .as_deref()
+                    .filter(|detail| {
+                        detail.starts_with("provider process-family checkpoint failed: ")
+                    })
+                    .map(|detail| {
+                        format!(
+                            "run-step producer has no durable process-family evidence: {detail}"
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "run-step producer has no durable process-family evidence".into()
+                    });
+                return Err(message);
+            }
+        };
         if family.binding.agent_run_id != request.request.agent_run_id
             || family.binding.descriptor_digest != request.request.descriptor_digest
             || family.binding.wrapper_pid != request.request.wrapper_pid
@@ -770,6 +805,7 @@ mod tests {
     use crate::process::{ProcessIdentity, ProcessIdentityQuality};
     use crate::run_step::{CleanupState, RunReceipt, TurnOutcome, TurnResult};
     use sha2::Digest as _;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -836,14 +872,27 @@ mod tests {
 
     fn family_record(
         binding: RunFamilyBinding,
-        process_tree: Vec<ProcessIdentity>,
+        mut process_tree: Vec<ProcessIdentity>,
     ) -> RunFamilyRecord {
+        let mut provider_root = process_tree[0].clone();
+        provider_root.parent_pid = binding.wrapper_pid;
+        process_tree[0] = provider_root.clone();
         RunFamilyRecord {
-            schema_version: 1,
+            schema_version: 2,
+            wrapper_process: ProcessIdentity {
+                pid: binding.wrapper_pid,
+                parent_pid: 1,
+                process_group_id: binding.wrapper_pid,
+                start_identity: binding.wrapper_start_identity.clone(),
+                command: String::new(),
+                quality: ProcessIdentityQuality::KernelBirthToken,
+            },
             binding,
             observed_at_unix: 10,
             coverage: RunFamilyCoverage::Observing,
-            provider_root: process_tree[0].clone(),
+            provider_root,
+            provider_executable_path: PathBuf::from("/bin/sleep"),
+            provider_executable_digest: digest('e'),
             process_tree_digest: Digest::parse(format!(
                 "{:x}",
                 sha2::Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
@@ -961,6 +1010,17 @@ mod tests {
             spool.read_turn_result(&request).unwrap_err(),
             "run-step spool file is not present"
         );
+        let mut failed_turn = turn_result(&request.request);
+        failed_turn.receipt.cleanup_detail = Some(
+            "provider process-family checkpoint failed: provider root exited during image inspection"
+                .into(),
+        );
+        assert_eq!(
+            spool
+                .publish_turn_result_once(&request, failed_turn)
+                .unwrap_err(),
+            "run-step producer has no durable process-family evidence: provider process-family checkpoint failed: provider root exited during image inspection"
+        );
         assert!(
             spool
                 .publish_turn_result_once(&request, turn_result(&request.request))
@@ -1020,6 +1080,15 @@ mod tests {
         let mut moved_root = cumulative.clone();
         moved_root.provider_root.process_group_id += 1;
         assert!(spool.write_run_family_record(&moved_root).is_err());
+        let mut reused_wrapper_pid = cumulative.clone();
+        reused_wrapper_pid.wrapper_process.start_identity = "different-wrapper-birth".into();
+        assert!(spool.write_run_family_record(&reused_wrapper_pid).is_err());
+        let mut wrong_executable = cumulative.clone();
+        wrong_executable.provider_executable_path = PathBuf::from("/tmp/unqualified-provider");
+        assert!(spool.write_run_family_record(&wrong_executable).is_err());
+        let mut wrong_root_parent = cumulative.clone();
+        wrong_root_parent.provider_root.parent_pid = 999;
+        assert!(spool.write_run_family_record(&wrong_root_parent).is_err());
 
         cumulative.coverage = RunFamilyCoverage::Interrupted;
         spool.write_run_family_record(&cumulative).unwrap();
@@ -1028,6 +1097,32 @@ mod tests {
         false_completion.coverage = RunFamilyCoverage::Complete;
         assert!(spool.write_run_family_record(&false_completion).is_err());
         assert_eq!(spool.read_run_family_record().unwrap(), Some(cumulative));
+    }
+
+    #[test]
+    fn legacy_run_family_record_without_image_proof_is_not_promoted() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let binding = family_binding(&request());
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let current = family_record(binding, vec![process(200, "birth-200", 200)]);
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy.as_object_mut().unwrap().remove("wrapper_process");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_executable_path");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_executable_digest");
+        std::fs::write(
+            spool.directory().join("run-family.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert!(spool.read_run_family_record().is_err());
     }
 
     #[test]

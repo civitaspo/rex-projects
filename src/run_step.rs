@@ -49,6 +49,15 @@ pub trait ProcessObserver {
         current: &[Self::Identity],
         signal: ProcessSignal,
     ) -> Result<bool, String>;
+    fn observe_provider_image(
+        &mut self,
+        _pid: u32,
+        _start_identity: &str,
+        _expected_path: &Path,
+        _expected_digest: &Digest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     fn checkpoint_family(
         &mut self,
         _provider_pid: u32,
@@ -843,7 +852,20 @@ fn run_prepared<O: ProcessObserver>(
     if !observed.iter().any(|item| O::pid(item) == pid) {
         observed.push(root_identity);
     }
-    if observer.checkpoint_family(pid, &observed).is_err() {
+    let family_start_error = observer
+        .observe_provider_image(
+            pid,
+            observed
+                .iter()
+                .find(|identity| O::pid(identity) == pid)
+                .map(|identity| identity.start_identity())
+                .unwrap_or_default(),
+            &prepared.executable,
+            &prepared.executable_digest,
+        )
+        .err()
+        .or_else(|| observer.checkpoint_family(pid, &observed).err());
+    if let Some(family_start_error) = family_start_error {
         let _ = stop_observed_groups(
             observer,
             &mut child,
@@ -856,7 +878,9 @@ fn run_prepared<O: ProcessObserver>(
         return Ok(unresolved_receipt(
             request,
             &prepared,
-            Some("provider process-family checkpoint failed".into()),
+            Some(format!(
+                "provider process-family checkpoint failed: {family_start_error}"
+            )),
             false,
             None,
             Some(pid),
@@ -951,8 +975,10 @@ fn run_prepared<O: ProcessObserver>(
             }
         };
         merge_observed(observer, pid, &table, &mut observed);
-        if observer.checkpoint_family(pid, &observed).is_err() {
-            inspection_error = Some("provider process-family checkpoint failed".into());
+        if let Err(error) = observer.checkpoint_family(pid, &observed) {
+            inspection_error = Some(format!(
+                "provider process-family checkpoint failed: {error}"
+            ));
             cleanup_known = match stop_observed_groups(
                 observer,
                 &mut child,
@@ -2771,23 +2797,24 @@ mod tests {
     fn durable_producer_checkpoints_late_own_group_child_before_completion() {
         use crate::run_step_cli::DurableFamilyObserver;
         use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunStepSpool};
-        use std::os::unix::fs::PermissionsExt;
 
         let _run_lock = TEST_RUN_LOCK.lock().unwrap();
         let root = tempdir().unwrap();
-        let executable = root.path().join("late child provider");
         let release = root.path().join("release");
         let child_pid_file = root.path().join("child-pid");
         let response = r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#;
-        fs::write(&executable, format!(
-            "#!/bin/sh\n/bin/sleep 0.4\nset -m\n/bin/sleep 8 &\necho $! > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 80 ]; do /bin/sleep 0.05; i=$((i+1)); done\nprintf '%s' '{}'\n",
-            child_pid_file.display(), release.display(), response,
-        )).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let turn = request(
-            root.path(),
-            AgentAdapter::ClaudeCode,
-            executable.to_str().unwrap(),
+        let script = format!(
+            "/bin/sleep 0.4\nset -m\n/bin/sleep 8 &\necho $! > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 80 ]; do /bin/sleep 0.05; i=$((i+1)); done\nprintf '%s' '{}'\n",
+            child_pid_file.display(),
+            release.display(),
+            response,
+        );
+        let mut turn = request(root.path(), AgentAdapter::ClaudeCode, "/bin/sh");
+        turn.profile.command = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        turn.descriptor.provider_capability = fixture_capability(
+            &turn.profile,
+            turn.descriptor.profile_digest.clone(),
+            &turn.descriptor.result_schema,
         );
         let spool = RunStepSpool::open(&turn.descriptor.control_dir).unwrap();
         let wrapper = process::inspect_process_table()
@@ -2873,6 +2900,76 @@ mod tests {
                 .is_empty()
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_producer_records_large_fast_executable_image_before_provider_decode() {
+        use crate::run_step_cli::DurableFamilyObserver;
+        use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunStepSpool};
+
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let mut turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        turn.profile.command = vec![
+            executable.to_string_lossy().into_owned().into(),
+            "--list".into(),
+        ];
+        turn.descriptor.provider_capability = fixture_capability(
+            &turn.profile,
+            turn.descriptor.profile_digest.clone(),
+            &turn.descriptor.result_schema,
+        );
+        let spool = RunStepSpool::open(&turn.descriptor.control_dir).unwrap();
+        let wrapper = process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .unwrap();
+        let binding = RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: turn.descriptor.run_id.clone(),
+            reservation_epoch: turn.descriptor.run_epoch,
+            authority_digest: Digest::parse("f".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("a".repeat(64)).unwrap(),
+            wrapper_pid: wrapper.pid,
+            wrapper_start_identity: wrapper.start_identity,
+        };
+        spool.publish_run_family_binding_once(&binding).unwrap();
+
+        let mut observer = DurableFamilyObserver::new(&spool, binding);
+        let result = run_fixture_turn(&turn, &mut observer).unwrap();
+        let family = spool.read_run_family_record().unwrap().unwrap_or_else(|| {
+            panic!(
+                "no durable family record; cleanup_detail={:?}",
+                result.receipt.cleanup_detail
+            )
+        });
+
+        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+        assert_eq!(family.coverage, RunFamilyCoverage::Complete);
+        assert_eq!(family.provider_executable_path, executable);
+        assert_eq!(
+            family.provider_executable_digest,
+            super::hash_file(&executable).unwrap()
+        );
+        assert_eq!(family.wrapper_process.pid, family.binding.wrapper_pid);
+        assert_eq!(
+            family.wrapper_process.start_identity,
+            family.binding.wrapper_start_identity
+        );
+        assert!(
+            family
+                .process_tree
+                .iter()
+                .any(|process| process.pid == family.provider_root.pid
+                    && process.start_identity == family.provider_root.start_identity)
+        );
     }
 
     #[cfg(unix)]

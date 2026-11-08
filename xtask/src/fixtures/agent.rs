@@ -187,6 +187,14 @@ pub fn run(
     } else {
         None
     };
+    if role == Role::Coordinator
+        && invocation.scope.lane == FixtureLane::Workflow
+        && std::env::var_os("REX_PROJECTS_FIXTURE_HOLD_AFTER_INBOX").is_some()
+    {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     let message = next_message(
         &context,
         &invocation,
@@ -411,7 +419,7 @@ fn parse_shell_words(command: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-fn read_context(path: &Path) -> Result<AgentContext, String> {
+pub(crate) fn read_context(path: &Path) -> Result<AgentContext, String> {
     if fs::metadata(path)
         .map_err(|error| format!("inspect Agent fixture context: {error}"))?
         .len()
@@ -478,6 +486,7 @@ fn validate_recipe_references(value: &Value) -> Result<(), String> {
                     | "ticket_revision"
                     | "inbox.ticket_id"
                     | "inbox.external_revision"
+                    | "inbox.coordinator_profile"
                     | "inbox.planner_result"
                     | "project_id"
                     | "worker_node_id"
@@ -1176,6 +1185,38 @@ fn next_message(
         return serde_json::from_str(&encoded)
             .map_err(|error| format!("parse persisted Agent fixture message: {error}"));
     }
+    if role == Role::Supervisor
+        && let Some(inbox) = inbox
+        && inbox.ticket_observation()?.is_none()
+    {
+        if !inbox.is_periodic_review_only() {
+            return Err("Supervisor fixture has no eligible normalized ticket observation in its public inbox".into());
+        }
+        // Leave the workflow recipe cursor for the ticket-triggered dispatch.
+        let progress = json!({
+            "summary":"The periodic review checked the public inbox and found no eligible ticket observation.",
+            "completed_node_keys":[],
+            "pending_node_keys":[],
+            "evidence":[],
+            "next_observation_at":null
+        });
+        validate_payload(RoleOutputKind::Progress, &progress)?;
+        ledger_tx.commit().map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec(&progress)
+            .map_err(|error| format!("serialize periodic Supervisor progress: {error}"))?;
+        return Ok(AgentMessage {
+            schema_version: 1,
+            message_id: format!(
+                "fixture-supervisor-periodic-{:x}",
+                Sha256::digest(invocation.run_id.as_bytes())
+            ),
+            kind: RoleOutputKind::Progress,
+            assertion: AgentAssertion::Succeeded,
+            structured_result: progress,
+            result_digest: format!("{:x}", Sha256::digest(bytes)),
+            artifact_refs: Vec::new(),
+        });
+    }
     let ordinal: i64 = ledger_tx
         .query_row(
             "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM invocations WHERE scope_digest=?1",
@@ -1196,9 +1237,6 @@ fn next_message(
         .ok_or_else(|| format!("scenario sequence is exhausted for role {:?}", role))?;
     if let Some(inbox) = inbox {
         match role {
-            Role::Supervisor if inbox.ticket_observation()?.is_none() => {
-                return Err("Supervisor fixture has no eligible normalized ticket observation in its public inbox".into());
-            }
             Role::Coordinator if ordinal == 0 => {
                 let ticket_run_id = invocation
                     .scope
@@ -1246,6 +1284,17 @@ fn next_message(
                 "inbox.external_revision".into(),
                 json!(ticket.external_revision),
             );
+        }
+        if role == Role::Supervisor {
+            let profile = inbox
+                .input_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.effective_role_profiles.get("coordinator"))
+                .filter(|profile| !profile.is_empty())
+                .ok_or("Supervisor prompt has no applied Coordinator profile binding")?;
+            facts
+                .values
+                .insert("inbox.coordinator_profile".into(), json!(profile));
         }
         if let Some(plan) = inbox.planner_result(
             &invocation.scope.project_id,
@@ -1301,6 +1350,17 @@ struct FixtureInbox {
     after: u64,
     next_after: u64,
     inputs: Vec<Value>,
+    #[serde(skip)]
+    input_evidence: Option<RunInputEvidence>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RunInputEvidence {
+    package_path: PathBuf,
+    package_digest: String,
+    snapshot_path: PathBuf,
+    snapshot_digest: String,
+    effective_role_profiles: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1344,6 +1404,38 @@ impl FixtureInbox {
             return Err("public Agent inbox next_after does not match its final wake".into());
         }
         Ok(inbox)
+    }
+
+    fn ticket_run_dispatch_id(&self) -> Result<Option<String>, String> {
+        let dispatches = self
+            .inputs
+            .iter()
+            .filter(|item| {
+                item.get("source_type").and_then(Value::as_str) == Some("ticket_run_dispatch")
+            })
+            .map(|item| {
+                item.pointer("/payload_json/ticket_run_id")
+                    .and_then(Value::as_str)
+                    .filter(|ticket_run_id| !ticket_run_id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| "TicketRun dispatch wake omitted its TicketRun ID".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match dispatches.as_slice() {
+            [] => Ok(None),
+            [ticket_run_id] => Ok(Some(ticket_run_id.clone())),
+            _ => Err("public Agent inbox contains multiple TicketRun dispatch wakes".into()),
+        }
+    }
+
+    fn is_periodic_review_only(&self) -> bool {
+        self.inputs.len() == 1
+            && self.inputs[0].get("source_type").and_then(Value::as_str)
+                == Some("periodic_supervisor_review")
+            && self.inputs[0]
+                .pointer("/payload_json/kind")
+                .and_then(Value::as_str)
+                == Some("periodic_supervisor_review")
     }
 
     fn ticket_observation(&self) -> Result<Option<TicketObservation>, String> {
@@ -1493,6 +1585,7 @@ fn read_public_inbox(
     {
         return Err("public Agent inbox request differs from the host-provided invocation".into());
     }
+    let evidence = read_run_input_evidence(&control_dir, binary, invocation)?;
     let output = run_process(ProcessRequest {
         executable: binary.to_path_buf(),
         args: [
@@ -1523,7 +1616,16 @@ fn read_public_inbox(
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("parse public Agent inbox response: {error}"))?;
-    let inbox = FixtureInbox::parse(value, &run_id)?;
+    let mut inbox = FixtureInbox::parse(value, &run_id)?;
+    if invocation.scope.role == Role::Coordinator {
+        let dispatch_ticket_run_id = inbox
+            .ticket_run_dispatch_id()?
+            .ok_or("Coordinator's public Agent inbox has no TicketRun dispatch wake")?;
+        if invocation.scope.ticket_run_id.as_deref() != Some(dispatch_ticket_run_id.as_str()) {
+            return Err("Coordinator dispatch wake differs from its host-bound TicketRun".into());
+        }
+    }
+    inbox.input_evidence = Some(evidence);
     let observation_dir = state_dir.join("inbox-observations");
     fs::create_dir_all(&observation_dir).map_err(|error| error.to_string())?;
     let observation_path =
@@ -1536,6 +1638,15 @@ fn read_public_inbox(
         "after": inbox.after,
         "next_after": inbox.next_after,
         "wake_input_ids": inbox.inputs.iter().filter_map(|item| item.get("wake_input_id").cloned()).collect::<Vec<_>>(),
+        "ticket_run_id": invocation.scope.ticket_run_id,
+        "ticket_run_dispatch_id": inbox.ticket_run_dispatch_id()?,
+        "input_files": inbox.input_evidence.as_ref().map(|evidence| json!({
+            "package_path":evidence.package_path,
+            "package_sha256":evidence.package_digest,
+            "snapshot_path":evidence.snapshot_path,
+            "snapshot_digest":evidence.snapshot_digest,
+            "effective_role_profiles":evidence.effective_role_profiles
+        })),
         "ticket_observation_count": inbox.inputs.iter().filter(|item| item.pointer("/payload_json/kind").and_then(Value::as_str) == Some("ticket_observation")).count(),
         "planner_result_count": inbox.inputs.iter().filter(|item| item.pointer("/payload_json/kind").and_then(Value::as_str) == Some("validated_agent_result") && item.pointer("/payload_json/source/role").and_then(Value::as_str) == Some("planner") && item.pointer("/payload_json/result/kind").and_then(Value::as_str) == Some("plan_ready")).count(),
     })).map_err(|error| error.to_string())?;
@@ -1557,6 +1668,102 @@ fn read_public_inbox(
         Err(error) => return Err(format!("persist public Agent inbox observation: {error}")),
     }
     Ok(inbox)
+}
+
+fn read_run_input_evidence(
+    control_dir: &Path,
+    cli: &Path,
+    invocation: &FixtureInvocation,
+) -> Result<RunInputEvidence, String> {
+    let run_root = control_dir
+        .parent()
+        .ok_or("Agent control directory has no run directory")?;
+    let package_path = run_root.join("run-step.package.json");
+    let package_bytes =
+        read_bounded_regular_file(&package_path, 8 * 1024 * 1024, "run-step package")?;
+    let package: Value = serde_json::from_slice(&package_bytes)
+        .map_err(|error| format!("parse host-generated run-step package: {error}"))?;
+    let descriptor = package
+        .get("descriptor")
+        .and_then(Value::as_object)
+        .ok_or("host-generated run-step package omitted its descriptor")?;
+    if descriptor.get("run_id").and_then(Value::as_str) != Some(invocation.run_id.as_str())
+        || descriptor.get("role").and_then(Value::as_str) != Some(role_name(invocation.scope.role))
+        || descriptor.get("control_dir").and_then(Value::as_str)
+            != Some(control_dir.to_string_lossy().as_ref())
+        || descriptor.get("ticket_run_id").and_then(Value::as_str)
+            != invocation.scope.ticket_run_id.as_deref()
+    {
+        return Err("run-step package descriptor differs from the host-provided invocation".into());
+    }
+    let prompt = package
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or("host-generated run-step package omitted its native prompt")?;
+    let inbox_command = format!(
+        "{} agent inbox --run \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --json",
+        shell_quote(&cli.to_string_lossy())
+    );
+    if !prompt.contains(&inbox_command) {
+        return Err("host-generated Agent prompt omitted the pinned public inbox command".into());
+    }
+    let effective_role_profiles = prompt_role_profiles(prompt)?;
+    if invocation.scope.role == Role::Supervisor
+        && effective_role_profiles
+            .get("coordinator")
+            .is_none_or(String::is_empty)
+    {
+        return Err("Supervisor prompt omitted the applied Coordinator profile binding".into());
+    }
+
+    let snapshot_path = control_dir.join("inbox/snapshot.json");
+    let snapshot_bytes =
+        read_bounded_regular_file(&snapshot_path, 1024 * 1024, "Agent inbox snapshot")?;
+    let snapshot: rex_projects::agent_api::AgentWakeSnapshot =
+        serde_json::from_slice(&snapshot_bytes)
+            .map_err(|error| format!("parse host-generated Agent inbox snapshot: {error}"))?;
+    snapshot.validate()?;
+    if snapshot.agent_run_id != invocation.run_id
+        || descriptor
+            .get("wake_snapshot_digest")
+            .and_then(Value::as_str)
+            != Some(snapshot.digest.as_str())
+    {
+        return Err("run-step package does not bind its host-generated inbox snapshot".into());
+    }
+    Ok(RunInputEvidence {
+        package_path,
+        package_digest: format!("{:x}", Sha256::digest(package_bytes)),
+        snapshot_path,
+        snapshot_digest: snapshot.digest.as_str().to_owned(),
+        effective_role_profiles,
+    })
+}
+
+fn read_bounded_regular_file(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("inspect {label}: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > limit {
+        return Err(format!("{label} is not a bounded regular file"));
+    }
+    fs::read(path).map_err(|error| format!("read {label}: {error}"))
+}
+
+fn prompt_role_profiles(
+    prompt: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    const HEADING: &str = "Applied Project role profiles (trusted applied configuration; use the exact profile ID when requesting a role):\n```json\n";
+    let json = prompt
+        .split_once(HEADING)
+        .and_then(|(_, remainder)| remainder.split_once("\n```"))
+        .map(|(json, _)| json)
+        .ok_or("host-generated prompt omitted applied Project role profiles")?;
+    serde_json::from_str(json)
+        .map_err(|error| format!("parse applied Project role profiles: {error}"))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn fixture_invocation(
@@ -1862,11 +2069,196 @@ fn role_name(role: Role) -> &'static str {
 mod tests {
     use super::Role;
     use super::{
-        FixtureAction, FixtureInbox, parse_shell_words, prompt_ticket, source_schema,
+        AgentContext, FixtureAction, FixtureInbox, FixtureInvocation, FixtureLane, FixtureScope,
+        RunInputEvidence, next_message, parse_shell_words, prompt_ticket, source_schema,
         validate_action, validate_recipe_references, validate_source_prompt, worker_assignment,
         worker_node_id, worker_node_id_for_lane,
     };
     use std::path::Path;
+
+    fn supervisor_context() -> AgentContext {
+        serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "scenario":"acceptance_supervisor",
+            "messages":[
+                {
+                    "role":"supervisor",
+                    "lane":"qualification",
+                    "kind":"progress",
+                    "assertion":{"assertion":"succeeded"},
+                    "structured_result":{
+                        "summary":"Qualification transport completed its real host-owned probe.",
+                        "completed_node_keys":[],"pending_node_keys":[],"evidence":[],"next_observation_at":null
+                    }
+                },
+                {
+                    "role":"supervisor",
+                    "lane":"workflow",
+                    "kind":"dispatch_request",
+                    "assertion":{"assertion":"succeeded"},
+                    "structured_result":{
+                        "ticket_reference":{"$fixture_ref":"inbox.ticket_id"},
+                        "expected_ticket_revision":{"$fixture_ref":"inbox.external_revision"},
+                        "coordinator_profile":{"$fixture_ref":"inbox.coordinator_profile"},
+                        "priority":1,
+                        "rationale":"The actual normalized ticket observation is eligible for this configured Operations Project."
+                    }
+                }
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn supervisor_invocation(run_id: &str) -> FixtureInvocation {
+        FixtureInvocation {
+            scope: FixtureScope {
+                scenario: "acceptance_supervisor".into(),
+                context: "supervisor.json".into(),
+                lane: FixtureLane::Workflow,
+                project_id: "operations_project".into(),
+                role: Role::Supervisor,
+                ticket_run_id: None,
+                work_node_id: None,
+            },
+            run_id: run_id.into(),
+            operation_id: None,
+            attempt: Some(1),
+            run_epoch: Some(1),
+            subject_revision: None,
+            prompt_digest: "a".repeat(64),
+        }
+    }
+
+    fn periodic_inbox(run_id: &str) -> FixtureInbox {
+        FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":run_id,"after":0,"next_after":1,
+                "inputs":[{
+                    "wake_input_id":1,"source_type":"periodic_supervisor_review",
+                    "source_id":"project-review","source_revision":1794138547,"priority":10,
+                    "payload_json":{"goal_revision":0,"kind":"periodic_supervisor_review","observed_at_unix":1794138547,"schema_version":1},
+                    "host_artifacts":[]
+                }]
+            }),
+            run_id,
+        )
+        .unwrap()
+    }
+
+    fn ticket_inbox(run_id: &str) -> FixtureInbox {
+        let mut inbox = FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":run_id,"after":0,"next_after":1,
+                "inputs":[{
+                    "wake_input_id":1,"source_type":"ticket_observation",
+                    "source_id":"fixture/acceptance:T-42:ready","source_revision":22,"priority":30,
+                    "payload_json":{
+                        "schema_version":1,"kind":"ticket_observation","ticket_namespace":"fixture/acceptance",
+                        "ticket_id":"T-42","status":"ready","title":"Acceptance ticket","labels":[],
+                        "external_revision":"rev-opaque-42","goal_revision":1
+                    },
+                    "host_artifacts":[]
+                }]
+            }),
+            run_id,
+        )
+        .unwrap();
+        inbox.input_evidence = Some(RunInputEvidence {
+            effective_role_profiles: [("coordinator".into(), "fixture_coordinator".into())]
+                .into_iter()
+                .collect(),
+            ..RunInputEvidence::default()
+        });
+        inbox
+    }
+
+    fn run_supervisor_message(
+        context: &AgentContext,
+        invocation: &FixtureInvocation,
+        inbox: &FixtureInbox,
+        state_dir: &Path,
+    ) -> super::AgentMessage {
+        next_message(
+            context,
+            invocation,
+            state_dir,
+            None,
+            "host prompt",
+            Some(inbox),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn periodic_only_wake_does_not_consume_dispatch_recipe_in_either_arrival_order() {
+        let context = supervisor_context();
+
+        let periodic_first = tempfile::tempdir().unwrap();
+        let progress = run_supervisor_message(
+            &context,
+            &supervisor_invocation("periodic-first"),
+            &periodic_inbox("periodic-first"),
+            periodic_first.path(),
+        );
+        assert_eq!(progress.kind, super::RoleOutputKind::Progress);
+        assert!(
+            progress.structured_result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("no eligible ticket observation")
+        );
+        let progress_retry = run_supervisor_message(
+            &context,
+            &supervisor_invocation("periodic-first"),
+            &periodic_inbox("periodic-first"),
+            periodic_first.path(),
+        );
+        assert_eq!(progress.message_id, progress_retry.message_id);
+        let later_progress = run_supervisor_message(
+            &context,
+            &supervisor_invocation("periodic-second"),
+            &periodic_inbox("periodic-second"),
+            periodic_first.path(),
+        );
+        assert_ne!(progress.message_id, later_progress.message_id);
+        let ledger =
+            rusqlite::Connection::open(periodic_first.path().join("invocations.sqlite")).unwrap();
+        let count: i64 = ledger
+            .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "periodic review must not advance the workflow cursor"
+        );
+        let dispatch = run_supervisor_message(
+            &context,
+            &supervisor_invocation("ticket-after-periodic"),
+            &ticket_inbox("ticket-after-periodic"),
+            periodic_first.path(),
+        );
+        assert_eq!(dispatch.kind, super::RoleOutputKind::DispatchRequest);
+        assert_eq!(dispatch.structured_result["ticket_reference"], "T-42");
+        assert_eq!(
+            dispatch.structured_result["expected_ticket_revision"],
+            "rev-opaque-42"
+        );
+
+        let ticket_first = tempfile::tempdir().unwrap();
+        let dispatch = run_supervisor_message(
+            &context,
+            &supervisor_invocation("ticket-first"),
+            &ticket_inbox("ticket-first"),
+            ticket_first.path(),
+        );
+        assert_eq!(dispatch.kind, super::RoleOutputKind::DispatchRequest);
+        let progress = run_supervisor_message(
+            &context,
+            &supervisor_invocation("periodic-after-ticket"),
+            &periodic_inbox("periodic-after-ticket"),
+            ticket_first.path(),
+        );
+        assert_eq!(progress.kind, super::RoleOutputKind::Progress);
+    }
 
     #[test]
     fn worker_scope_uses_the_visible_assigned_node_from_the_prompt() {
