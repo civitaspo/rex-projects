@@ -47,9 +47,37 @@ impl Drop for XdgStateHomeGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct ProcessStartTraceGuard(Option<std::ffi::OsString>);
+
+#[cfg(target_os = "linux")]
+impl ProcessStartTraceGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let prior = std::env::var_os("REX_TEST_PROCESS_START_TRACE_PATH");
+        unsafe { std::env::set_var("REX_TEST_PROCESS_START_TRACE_PATH", path) };
+        Self(prior)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProcessStartTraceGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => unsafe {
+                std::env::set_var("REX_TEST_PROCESS_START_TRACE_PATH", previous)
+            },
+            None => unsafe { std::env::remove_var("REX_TEST_PROCESS_START_TRACE_PATH") },
+        }
+    }
+}
+
 #[test]
 fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
     let temp = tempfile::tempdir().expect("temporary operation state");
+    #[cfg(target_os = "linux")]
+    let process_start_trace = temp.path().join("process-start-diagnostic");
+    #[cfg(target_os = "linux")]
+    let _process_start_trace = ProcessStartTraceGuard::set(&process_start_trace);
     let isolated_xdg = temp.path().join("xdg-state");
     let _xdg_state_home = XdgStateHomeGuard::set(&isolated_xdg);
     let fixture_state = temp.path().join("fixture-state");
@@ -318,6 +346,8 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
     let invoke_job =
         rex_projects::host_jobs::stable_host_job_id(operation_id.as_str(), "operation.invoke", 1);
     let invoke_deadline = Instant::now() + Duration::from_secs(10);
+    #[cfg(target_os = "linux")]
+    let _ = std::fs::remove_file(&process_start_trace);
     loop {
         let mut context = EffectContext {
             store: &mut store,
@@ -391,8 +421,19 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
             );
             #[cfg(not(target_os = "linux"))]
             let fixture_process_diagnostic = "not_applicable".to_owned();
+            #[cfg(target_os = "linux")]
+            let process_start_trace_diagnostic = std::fs::read(&process_start_trace)
+                .ok()
+                .map(|mut trace| {
+                    trace.truncate(256);
+                    String::from_utf8_lossy(&trace).trim().to_owned()
+                })
+                .filter(|trace| !trace.is_empty())
+                .unwrap_or_else(|| "unavailable".into());
+            #[cfg(not(target_os = "linux"))]
+            let process_start_trace_diagnostic = "not_applicable".to_owned();
             panic!(
-                "pooled invoke did not settle: fixture_receipt_exists={}, operation_state={:?}, operation_external_reference_present={}, operation_terminal_receipt_present={}, invoke_host_job={invoke_job_diagnostic}, fixture_process={fixture_process_diagnostic}",
+                "pooled invoke did not settle: fixture_receipt_exists={}, operation_state={:?}, operation_external_reference_present={}, operation_terminal_receipt_present={}, invoke_host_job={invoke_job_diagnostic}, fixture_process={fixture_process_diagnostic}, process_start_trace={process_start_trace_diagnostic}",
                 fixture_receipt.exists(),
                 operation.state,
                 operation.external_reference.is_some(),

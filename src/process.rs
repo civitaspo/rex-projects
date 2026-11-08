@@ -131,6 +131,22 @@ pub fn run_with_started_identity(
     run_inner(request, on_started, true, false)
 }
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn write_test_process_start_trace(stage: &str, pid: Option<u32>, elapsed: Duration) {
+    let Some(path) = std::env::var_os("REX_TEST_PROCESS_START_TRACE_PATH") else {
+        return;
+    };
+    let pid = pid.map_or_else(|| "none".to_owned(), |pid| pid.to_string());
+    let marker = format!(
+        "stage={stage},pid={pid},elapsed_ms={}\n",
+        elapsed.as_millis()
+    );
+    let _ = std::fs::write(path, marker.as_bytes());
+}
+
+#[cfg(not(all(target_os = "linux", debug_assertions)))]
+fn write_test_process_start_trace(_: &str, _: Option<u32>, _: Duration) {}
+
 fn run_inner(
     mut request: ProcessRequest,
     on_started: impl FnOnce(ProcessIdentity),
@@ -168,11 +184,26 @@ fn run_inner(
             command.process_group(0);
         }
     }
+    let process_start = Instant::now();
+    write_test_process_start_trace("spawn_started", None, Duration::ZERO);
     let mut child = command.spawn().map_err(ProcessError::Start)?;
     let root_pid = child.id();
+    write_test_process_start_trace("spawn_returned", Some(root_pid), process_start.elapsed());
     let mut observed_processes = Vec::new();
     if require_started_identity {
-        if collect_tree(root_pid, &mut observed_processes).is_err() {
+        let identity_scan_started = Instant::now();
+        write_test_process_start_trace(
+            "identity_scan_started",
+            Some(root_pid),
+            process_start.elapsed(),
+        );
+        let identity_scan = collect_tree(root_pid, &mut observed_processes);
+        write_test_process_start_trace(
+            "identity_scan_completed",
+            Some(root_pid),
+            identity_scan_started.elapsed(),
+        );
+        if identity_scan.is_err() {
             let cleaned = cleanup_child_tree(
                 &mut child,
                 root_pid,
@@ -202,7 +233,17 @@ fn run_inner(
                 ProcessError::CleanupUnconfirmed
             });
         };
+        write_test_process_start_trace(
+            "identity_captured",
+            Some(root_pid),
+            process_start.elapsed(),
+        );
         on_started(root_identity);
+        write_test_process_start_trace(
+            "started_callback_returned",
+            Some(root_pid),
+            process_start.elapsed(),
+        );
     }
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
