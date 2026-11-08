@@ -122,9 +122,18 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
                     .map(|authority| format!("{:?}", authority.role).to_lowercase())
                     .unwrap_or(logical_owner),
                 state,
-                rex_session_id: session,
-                rex_window_id: window,
-                rex_block_id: block,
+                rex_session_id: authority
+                    .as_ref()
+                    .map(|authority| authority.rex_session_id.clone())
+                    .or(session),
+                rex_window_id: authority
+                    .as_ref()
+                    .map(|authority| authority.rex_window_id.clone())
+                    .or(window),
+                rex_block_id: authority
+                    .as_ref()
+                    .map(|authority| authority.rex_block_id.clone())
+                    .or(block),
                 rex_view_id: authority.map(|authority| authority.rex_view_id),
             })
         })
@@ -398,5 +407,66 @@ mod tests {
             read_projection(temp.path()).unwrap_err(),
             "dashboard requires runtime schema version 8 or newer (found 7)"
         );
+    }
+
+    #[test]
+    fn agent_locations_prefer_registered_authority_and_fall_back_to_legacy_columns() {
+        use crate::domain::types::Role;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use sha2::Digest as _;
+
+        let payload = serde_json::json!({
+            "ticket_reference": "fixture:T-1",
+            "expected_ticket_revision": "4",
+            "coordinator_profile": "judgment_claude",
+            "priority": 3,
+            "rationale": "dashboard location fixture"
+        });
+        let fixture = crate::store::agent_results::host_validation_fixture::host_validated_result(
+            Role::Supervisor,
+            RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "dashboard-location-fixture".into(),
+                kind: RoleOutputKind::DispatchRequest,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: payload.clone(),
+                result_digest: Some(
+                    Digest::parse(format!(
+                        "{:x}",
+                        sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
+                    ))
+                    .unwrap(),
+                ),
+                artifact_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        let agent_run_id = fixture.ingested.validated.binding.agent_run_id.clone();
+        fixture.store.connection.execute(
+            "UPDATE agent_runs SET rex_session_id=NULL,rex_window_id=NULL,rex_block_id=NULL WHERE agent_run_id=?1",
+            [agent_run_id.as_str()],
+        ).unwrap();
+
+        let row = &read_projection(fixture._temp.path()).unwrap().agents[0];
+        let serialized = serde_json::to_value(row).unwrap();
+        assert_eq!(serialized["rex_session_id"], "fixture-session");
+        assert_eq!(serialized["rex_window_id"], "fixture-window");
+        assert_eq!(serialized["rex_block_id"], "fixture-block");
+
+        fixture.store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,state,controller_generation) SELECT 'legacy-agent-run',project_id,config_source,config_revision,config_digest,'legacy',1,'legacy-operation','legacy-session','legacy-window','legacy-block','running',controller_generation FROM agent_runs WHERE agent_run_id=?1",
+            [agent_run_id.as_str()],
+        ).unwrap();
+        let snapshot = read_projection(fixture._temp.path()).unwrap();
+        let row = snapshot
+            .agents
+            .iter()
+            .find(|row| row.agent_run_id == "legacy-agent-run")
+            .unwrap();
+        let serialized = serde_json::to_value(row).unwrap();
+        assert_eq!(serialized["rex_session_id"], "legacy-session");
+        assert_eq!(serialized["rex_window_id"], "legacy-window");
+        assert_eq!(serialized["rex_block_id"], "legacy-block");
     }
 }
