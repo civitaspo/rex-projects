@@ -1149,7 +1149,10 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         assert_eq!(report["state"], "queued");
     }
     let mut applied = false;
+    let mut apply_polls = 0;
+    let mut last_applied_state = String::from("no reload observation received");
     for _ in 0..100 {
+        apply_polls += 1;
         let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
         let revision: u64 = connection
             .query_row("SELECT revision FROM config_current", [], |row| row.get(0))
@@ -1165,6 +1168,9 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
             &std::fs::read(state.join("runtime-owner.json")).unwrap_or_default(),
         )
         .unwrap_or_default();
+        last_applied_state = format!(
+            "config_revision={revision}, project_revision={project_revision}, owner_projection={owner_projection}"
+        );
         if revision == 2 && project_revision == 2 && owner_projection["config_revision"] == 2 {
             applied = true;
             break;
@@ -1172,10 +1178,11 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     if !applied {
+        let controller_status = owner.try_wait().unwrap();
         owner.terminate();
         let stderr = owner.stderr_tail();
         panic!(
-            "active controller did not apply and load the durable config snapshot; stderr: {stderr}"
+            "active controller did not apply and load the durable config snapshot after {apply_polls} polls; last state: {last_applied_state}; controller status: {controller_status:?}; stderr: {stderr}"
         );
     }
 
