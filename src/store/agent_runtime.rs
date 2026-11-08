@@ -1047,11 +1047,11 @@ impl ConfigStore {
             }
         }
         if let Some(parent_id) = &reservation.parent_run_id {
-            let parent: Option<(String,String,String)> = tx
+            let parent: Option<(String,String,String,String,Option<String>,u64,String)> = tx
                 .query_row(
-                    "SELECT r.project_id,r.state,a.role FROM agent_runs r JOIN agent_launch_authority a USING(agent_run_id) WHERE r.agent_run_id=?1",
+                    "SELECT r.project_id,r.state,a.role,a.role_session_id,a.ticket_run_id,a.config_revision,a.config_digest FROM agent_runs r JOIN agent_launch_authority a USING(agent_run_id) WHERE r.agent_run_id=?1",
                     [parent_id.as_str()],
-                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
@@ -1060,10 +1060,47 @@ impl ConfigStore {
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned))
             });
-            if !matches!(parent,Some((ref parent_project,ref state,ref role)) if parent_project==reservation.project_id.as_str() && matches!(state.as_str(),"running"|"parked") && expected_parent_role.as_deref()==Some(role.as_str()))
-            {
+            let expected_parent_session = match reservation.parent_role {
+                Some(Role::Supervisor) => {
+                    Some(format!("project:{}:supervisor", reservation.project_id))
+                }
+                Some(Role::Coordinator) => reservation
+                    .ticket_run_id
+                    .as_ref()
+                    .map(|id| format!("ticket_run:{id}:coordinator")),
+                _ => None,
+            };
+            let expected_parent_ticket = match reservation.parent_role {
+                Some(Role::Supervisor) => None,
+                Some(Role::Coordinator) => reservation.ticket_run_id.as_ref().map(|id| id.as_str()),
+                _ => None,
+            };
+            let parent_scope = matches!(parent.as_ref(),Some((parent_project,_,role,session,ticket,config_revision,config))
+                if parent_project==reservation.project_id.as_str()
+                    && expected_parent_role.as_deref()==Some(role.as_str())
+                    && expected_parent_session.as_deref()==Some(session.as_str())
+                    && ticket.as_deref()==expected_parent_ticket
+                    && *config_revision==reservation.config_revision.0
+                    && config==reservation.config_digest.as_str());
+            let live_parent = parent_scope
+                && matches!(parent.as_ref(),Some((_,state,_,_,_,_,_)) if matches!(state.as_str(),"running"|"parked"));
+            let completed_parent = parent_scope
+                && matches!(parent.as_ref(),Some((_,state,_,_,_,_,_)) if state=="completed")
+                && completed_parent_has_trusted_source(
+                    &tx,
+                    &ParentSourceScope {
+                        project_id: reservation.project_id.as_str(),
+                        child_role: reservation.role,
+                        role_session_id: &reservation.role_session_id,
+                        ticket_run_id: reservation.ticket_run_id.as_ref().map(|id| id.as_str()),
+                        parent_role: reservation.parent_role,
+                    },
+                    parent_id,
+                    prepared_worker,
+                )?;
+            if !live_parent && !completed_parent {
                 return Err(
-                    "launch parent is not an active same-Project AgentRun with the expected role"
+                    "launch parent is not a same-Project AgentRun with the expected role and trusted provenance"
                         .into(),
                 );
             }
@@ -1131,6 +1168,80 @@ impl ConfigStore {
     }
 }
 
+/// Completed finite parents may authorize a child only through the durable source that
+/// selected them. The resolver validates the dispatch/result payload before constructing the
+/// reservation; this transaction rechecks that the same immutable evidence still anchors it.
+struct ParentSourceScope<'a> {
+    project_id: &'a str,
+    child_role: Role,
+    role_session_id: &'a str,
+    ticket_run_id: Option<&'a str>,
+    parent_role: Option<Role>,
+}
+
+fn completed_parent_has_trusted_source(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &ParentSourceScope<'_>,
+    parent_id: &crate::domain::ids::AgentRunId,
+    prepared_worker: Option<&crate::store::accepted_plans::PreparedWorkerLaunch>,
+) -> Result<bool, String> {
+    let evidence_exists: bool = match (scope.child_role, scope.parent_role) {
+        (Role::Coordinator, Some(Role::Supervisor)) => {
+            let Some(ticket_run_id) = scope.ticket_run_id else {
+                return Ok(false);
+            };
+            if scope.role_session_id != format!("ticket_run:{ticket_run_id}:coordinator") {
+                return Ok(false);
+            }
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM role_wake_inputs w JOIN ticket_runs t ON t.ticket_run_id=?3 AND t.project_id=w.project_id JOIN agent_result_evidence e ON e.evidence_id=json_extract(w.payload_json,'$.supervisor_evidence_id') WHERE w.project_id=?1 AND w.role_session_id=?2 AND w.source_type='ticket_run_dispatch' AND w.source_id=?3 AND e.agent_run_id=?4 AND e.project_id=w.project_id AND e.role='supervisor' AND e.ticket_run_id IS NULL AND e.outcome='completed')",
+                rusqlite::params![scope.project_id, format!("ticket_run:{ticket_run_id}:coordinator"), ticket_run_id, parent_id.as_str()],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?
+        }
+        (Role::Worker, Some(Role::Coordinator)) => prepared_worker.is_some_and(|prepared| {
+            prepared.coordinator_agent_run_id() == parent_id
+                && prepared.project_id().as_str() == scope.project_id
+                && Some(prepared.ticket_run_id().as_str()) == scope.ticket_run_id
+                && scope.role_session_id
+                    == format!(
+                        "ticket:{}:worker:{}",
+                        prepared.ticket_run_id(),
+                        prepared.node_id()
+                    )
+                && prepared.coordinator_role_session_id()
+                    == format!("ticket_run:{}:coordinator", prepared.ticket_run_id())
+        }),
+        (
+            Role::Planner
+            | Role::Reviewer
+            | Role::MergeDecision
+            | Role::Operator
+            | Role::Postmortem,
+            Some(Role::Coordinator),
+        ) => {
+            let Some(ticket_run_id) = scope.ticket_run_id else {
+                return Ok(false);
+            };
+            let role_name = serde_json::to_value(scope.child_role)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned));
+            if role_name.as_deref().is_none_or(|role| {
+                scope.role_session_id != format!("ticket_run:{ticket_run_id}:{role}")
+            }) {
+                return Ok(false);
+            }
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM role_wake_inputs w JOIN agent_result_evidence e ON e.evidence_id=w.source_id WHERE w.project_id=?1 AND w.role_session_id=?2 AND w.source_type='coordinator_child' AND e.agent_run_id=?3 AND e.project_id=w.project_id AND e.role='coordinator' AND e.ticket_run_id=?4 AND e.outcome='completed')",
+                rusqlite::params![scope.project_id, scope.role_session_id, parent_id.as_str(), ticket_run_id],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?
+        }
+        _ => false,
+    };
+    Ok(evidence_exists)
+}
+
 use super::ConfigStore;
 
 fn load_exact_wake_inputs(
@@ -1183,6 +1294,138 @@ mod tests {
         RexView, RexViewKind,
     };
     use sha2::Digest as _;
+
+    #[test]
+    fn completed_parent_requires_the_role_specific_durable_source() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE role_wake_inputs(project_id TEXT,role_session_id TEXT,source_type TEXT,source_id TEXT,payload_json TEXT);
+             CREATE TABLE ticket_runs(ticket_run_id TEXT,project_id TEXT);
+             CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,project_id TEXT,role TEXT,ticket_run_id TEXT,outcome TEXT);
+             INSERT INTO role_wake_inputs VALUES ('project-a','ticket_run:ticket-1:coordinator','ticket_run_dispatch','ticket-1','{\"supervisor_evidence_id\":\"dispatch-evidence\"}');
+             INSERT INTO ticket_runs VALUES ('ticket-1','project-a');
+             INSERT INTO agent_result_evidence VALUES ('dispatch-evidence','supervisor-1','project-a','supervisor',NULL,'completed');
+             INSERT INTO role_wake_inputs VALUES ('project-a','ticket_run:ticket-1:planner','coordinator_child','child-evidence','{}');
+             INSERT INTO agent_result_evidence VALUES ('child-evidence','coordinator-1','project-a','coordinator','ticket-1','completed');"
+        ).unwrap();
+        let tx = connection.unchecked_transaction().unwrap();
+        let coordinator = super::ParentSourceScope {
+            project_id: "project-a",
+            child_role: Role::Coordinator,
+            role_session_id: "ticket_run:ticket-1:coordinator",
+            ticket_run_id: Some("ticket-1"),
+            parent_role: Some(Role::Supervisor),
+        };
+        assert!(
+            super::completed_parent_has_trusted_source(
+                &tx,
+                &coordinator,
+                &AgentRunId::parse("supervisor-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::completed_parent_has_trusted_source(
+                &tx,
+                &super::ParentSourceScope {
+                    role_session_id: "ticket_run:ticket-1:planner",
+                    ..coordinator
+                },
+                &AgentRunId::parse("supervisor-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        let planner = super::ParentSourceScope {
+            project_id: "project-a",
+            child_role: Role::Planner,
+            role_session_id: "ticket_run:ticket-1:planner",
+            ticket_run_id: Some("ticket-1"),
+            parent_role: Some(Role::Coordinator),
+        };
+        assert!(
+            super::completed_parent_has_trusted_source(
+                &tx,
+                &planner,
+                &AgentRunId::parse("coordinator-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::completed_parent_has_trusted_source(
+                &tx,
+                &planner,
+                &AgentRunId::parse("wrong-parent").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::completed_parent_has_trusted_source(
+                &tx,
+                &super::ParentSourceScope {
+                    ticket_run_id: Some("other-ticket"),
+                    ..planner
+                },
+                &AgentRunId::parse("coordinator-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::completed_parent_has_trusted_source(
+                &tx,
+                &super::ParentSourceScope {
+                    role_session_id: "ticket_run:ticket-1:reviewer",
+                    ..planner
+                },
+                &AgentRunId::parse("coordinator-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::completed_parent_has_trusted_source(
+                &tx,
+                &super::ParentSourceScope {
+                    project_id: "other-project",
+                    ..planner
+                },
+                &AgentRunId::parse("coordinator-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::completed_parent_has_trusted_source(
+                &tx,
+                &super::ParentSourceScope {
+                    parent_role: Some(Role::Coordinator),
+                    ..coordinator
+                },
+                &AgentRunId::parse("coordinator-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+        let worker = super::ParentSourceScope {
+            child_role: Role::Worker,
+            role_session_id: "ticket:ticket-1:worker:node-1",
+            parent_role: Some(Role::Coordinator),
+            ..planner
+        };
+        assert!(
+            !super::completed_parent_has_trusted_source(
+                &tx,
+                &worker,
+                &AgentRunId::parse("coordinator-1").unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn coordinator_waits_for_active_or_ambiguous_ticket_agents_to_finish() {
