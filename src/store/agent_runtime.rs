@@ -480,7 +480,7 @@ impl ConfigStore {
         let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
         let request_digest =
             Digest::parse(format!("{:x}", Sha256::digest(request_json.as_bytes())))?;
-        let stored: Option<(String, String)> = self
+        let stored: Option<(Option<String>, Option<String>)> = self
             .connection
             .query_row(
                 "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
@@ -489,7 +489,7 @@ impl ConfigStore {
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((stored_digest, receipt_json)) = stored else {
+        let Some((stored_digest, receipt_json)) = super::persisted_start_ack(stored)? else {
             return Ok(None);
         };
         if stored_digest != request_digest.as_str() {
@@ -1648,6 +1648,7 @@ mod tests {
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
         };
+        assert_eq!(store.persisted_start_receipt(&start_request).unwrap(), None);
         let receipt = store
             .authorize_agent_start(
                 generation,
@@ -1662,6 +1663,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(receipt.decision, crate::launch::LaunchDecision::Accepted);
+        assert_eq!(
+            store.persisted_start_receipt(&start_request).unwrap(),
+            Some(receipt.clone())
+        );
         let wake_state: (String, Option<String>) = store.connection.query_row(
             "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=1",
             [], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1731,11 +1736,9 @@ mod tests {
         loaded_wake.validate().unwrap();
         assert_eq!(snapshot_digest, reservation.wake_snapshot.digest.as_str());
         assert_eq!(loaded_wake, reservation.wake_snapshot);
-        assert!(
-            reopened
-                .persisted_start_receipt(&start_request)
-                .unwrap()
-                .is_some()
+        assert_eq!(
+            reopened.persisted_start_receipt(&start_request).unwrap(),
+            Some(receipt)
         );
         assert!(matches!(
             reopened.prepare_role_launch(&reservation).unwrap(),
