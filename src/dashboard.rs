@@ -82,6 +82,28 @@ impl RuntimeDashboardBackend {
         )
         .map_err(|error| error.to_string())
     }
+
+    /// Apply a pin update against a caller's snapshot of the active controller generation.
+    pub fn set_pin_for_generation(
+        &mut self,
+        owner_generation: u64,
+        ticket_run: &TicketRunId,
+        expected_revision: u64,
+        expected_view_id: &Digest,
+        pinned: bool,
+    ) -> Result<(), String> {
+        if self.owner_generation()? != owner_generation {
+            return Err("controller generation changed; refresh the dashboard".into());
+        }
+        dashboard_projection::set_ticket_pin(
+            &self.state_root,
+            owner_generation,
+            ticket_run,
+            expected_revision,
+            expected_view_id,
+            pinned,
+        )
+    }
 }
 
 fn read_owner_rex_binding(state_root: &Path) -> Result<(String, String), String> {
@@ -120,12 +142,18 @@ impl DashboardBackend for RuntimeDashboardBackend {
     }
 
     fn focus_ticket(&mut self, ticket_run: &TicketRunId) -> Result<(), String> {
+        let generation = self.owner_generation()?;
         let snapshot = self.snapshot()?;
         let ticket = snapshot
             .tickets
             .iter()
             .find(|ticket| &ticket.ticket_run_id == ticket_run)
             .ok_or_else(|| "TicketRun is no longer in the dashboard snapshot".to_owned())?;
+        let expected_revision = ticket.revision;
+        let expected_project = ticket.project_id.clone();
+        let expected_namespace = ticket.namespace.clone();
+        let expected_ticket_id = ticket.ticket_id.clone();
+        let expected_view = ticket.rex_view_id.clone();
         let agent = snapshot
             .agents
             .iter()
@@ -137,9 +165,42 @@ impl DashboardBackend for RuntimeDashboardBackend {
                     ticket.namespace, ticket.ticket_id
                 )
             })?;
+        let agent_run_id = agent.agent_run_id.clone();
         let target = self
             .focus_target(&agent.agent_run_id)?
             .ok_or_else(|| "Agent has no active Rex block".to_owned())?;
+        let fresh = self.snapshot()?;
+        let current_ticket = fresh
+            .tickets
+            .iter()
+            .find(|row| &row.ticket_run_id == ticket_run)
+            .ok_or_else(|| "TicketRun disappeared before focus".to_owned())?;
+        let current_agent = fresh
+            .agents
+            .iter()
+            .find(|row| {
+                row.agent_run_id == agent_run_id && row.ticket_run_id.as_ref() == Some(ticket_run)
+            })
+            .ok_or_else(|| "Agent no longer belongs to this TicketRun".to_owned())?;
+        if self.owner_generation()? != generation
+            || current_ticket.revision != expected_revision
+            || current_ticket.project_id != expected_project
+            || current_ticket.namespace != expected_namespace
+            || current_ticket.ticket_id != expected_ticket_id
+            || current_ticket.rex_view_id != expected_view
+            || current_agent.rex_block_id.as_deref() != Some(target.block_id.as_str())
+        {
+            return Err(
+                "TicketRun, Rex view, or controller generation changed; refresh before focusing"
+                    .into(),
+            );
+        }
+        let current_target = self
+            .focus_target(&agent_run_id)?
+            .ok_or_else(|| "Agent block is no longer active".to_owned())?;
+        if current_target != target {
+            return Err("Rex focus target changed; refresh before focusing".into());
+        }
         self.focus_and_zoom(&target)
     }
 

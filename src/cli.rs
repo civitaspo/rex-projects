@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -5,13 +6,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::adapters::rex::RexCliTransport;
+use crate::adapters::tickets::{
+    NormalizedTicket, NormalizedTicketStatus, TicketGetRequest, TicketGetResult, TicketListRequest,
+    TicketScope,
+};
 use crate::config::{self, AppliedConfig, Config};
-use crate::dashboard::RuntimeDashboardBackend;
-use crate::domain::ids::{Digest, HumanRequestId, ProjectId, Revision};
+use crate::dashboard::{DashboardBackend, RuntimeDashboardBackend};
+use crate::domain::ids::{Digest, HumanRequestId, ProjectId, Revision, TicketRunId};
 use crate::process::{
     ProcessRequest, resolve_executable as resolve_process_executable, run as run_process,
 };
-use crate::protocol::{RequestEnvelope, ResponseEnvelope};
+use crate::protocol::{RequestEnvelope, RequestId, ResponseEnvelope};
 use crate::store::{ConfigStore, ControlCommand, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
 #[derive(Debug, Parser)]
@@ -139,6 +144,44 @@ enum HumanChoiceArg {
 
 #[derive(Debug, Subcommand)]
 enum TicketCommand {
+    /// List normalized tickets from the configured ticket CLI adapter.
+    List {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Show one normalized ticket from the configured ticket CLI adapter.
+    Show {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        id: String,
+    },
+    /// Select a ticket from a bounded list. Use --id for noninteractive selection.
+    Select {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Focus the current Rex Agent block for a TicketRun.
+    Focus { ticket_run: String },
+    /// Pin or unpin the current Rex view for a TicketRun.
+    View {
+        #[command(subcommand)]
+        command: TicketViewCommand,
+    },
     Instruct {
         #[arg(long)]
         run: String,
@@ -161,6 +204,24 @@ enum TicketCommand {
         disposition: ClaimDisposition,
         #[arg(long)]
         request_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TicketViewCommand {
+    Pin {
+        ticket_run: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        view_id: String,
+    },
+    Unpin {
+        ticket_run: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        view_id: String,
     },
 }
 
@@ -419,14 +480,19 @@ impl CliError {
 }
 
 fn require_human_context() -> Result<(), CliError> {
-    if std::env::var_os("REX_PROJECTS_AGENT").is_some()
-        || std::env::var_os("REX_PROJECTS_CONTEXT").is_some()
-    {
+    if factory_context_present(
+        std::env::var_os("REX_PROJECTS_AGENT").is_some(),
+        std::env::var_os("REX_PROJECTS_CONTEXT").is_some(),
+    ) {
         return Err(CliError::human_only(
             "this mutation is available only from a human host context; Agent blocks must submit scoped mailbox requests",
         ));
     }
     Ok(())
+}
+
+fn factory_context_present(agent_marker: bool, context_marker: bool) -> bool {
+    agent_marker || context_marker
 }
 
 impl std::fmt::Display for CliError {
@@ -1398,14 +1464,177 @@ fn ticket_command(
     command: TicketCommand,
     json: bool,
 ) -> Result<(), CliError> {
-    require_human_context()?;
     match command {
+        TicketCommand::List {
+            project,
+            status,
+            limit,
+            cursor,
+        } => {
+            let page = query_ticket_page(
+                config_path,
+                &project,
+                status.as_deref(),
+                limit,
+                cursor.as_deref(),
+            )?;
+            if json {
+                print_json(&page)
+            } else {
+                print_ticket_table(&page.tickets);
+                if let Some(cursor) = page.next_cursor {
+                    println!(
+                        "Next page: rex-projects ticket list --project {} --limit {} --cursor {}",
+                        project,
+                        limit,
+                        terminal_safe(&cursor)
+                    );
+                }
+                Ok(())
+            }
+        }
+        TicketCommand::Show { project, id } => {
+            let ticket = query_ticket(config_path, &project, &id)?;
+            if json {
+                print_json(&ticket)
+            } else {
+                print_ticket_detail(&ticket.ticket);
+                for event in ticket.timeline {
+                    println!(
+                        "{}  {}  {}",
+                        terminal_safe(&event.timestamp),
+                        terminal_safe(&event.actor),
+                        terminal_safe(&event.summary)
+                    );
+                }
+                Ok(())
+            }
+        }
+        TicketCommand::Select {
+            project,
+            status,
+            limit,
+            cursor,
+            id,
+        } => {
+            let page = query_ticket_page(
+                config_path,
+                &project,
+                status.as_deref(),
+                limit,
+                cursor.as_deref(),
+            )?;
+            if let Some(id) = id {
+                let ticket = page
+                    .tickets
+                    .into_iter()
+                    .find(|ticket| ticket.id == id || ticket.key.as_deref() == Some(&id))
+                    .ok_or_else(|| {
+                        CliError::not_found("selected ticket is not present in this bounded page")
+                    })?;
+                if json {
+                    print_json(&serde_json::json!({"selected": true, "ticket": ticket}))
+                } else {
+                    print_ticket_identity(&ticket);
+                    Ok(())
+                }
+            } else if json {
+                print_json(&ticket_candidates_report(
+                    &page.tickets,
+                    page.next_cursor.as_deref(),
+                ))
+            } else if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                Err(CliError::usage(
+                    "ticket select requires a terminal or --id; use --json to list bounded candidates",
+                ))
+            } else {
+                select_ticket_interactively(&page.tickets)
+            }
+        }
+        TicketCommand::Focus { ticket_run } => {
+            require_human_context()?;
+            let loaded = load_config(config_path)?.1;
+            let state_root =
+                config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)?;
+            let ticket_run = TicketRunId::parse(ticket_run).map_err(CliError::usage)?;
+            let mut backend =
+                RuntimeDashboardBackend::new(state_root, loaded.config.runtime.rex_binary);
+            backend
+                .focus_ticket(&ticket_run)
+                .map_err(CliError::conflict)?;
+            if json {
+                print_json(&serde_json::json!({"focused":true,"ticket_run_id":ticket_run}))
+            } else {
+                println!("Focused {ticket_run}");
+                Ok(())
+            }
+        }
+        TicketCommand::View { command } => {
+            require_human_context()?;
+            let loaded = load_config(config_path)?.1;
+            let state_root =
+                config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)?;
+            let mut backend =
+                RuntimeDashboardBackend::new(state_root.clone(), loaded.config.runtime.rex_binary);
+            let (ticket_run, expected_revision, view_id, pinned) = match command {
+                TicketViewCommand::Pin {
+                    ticket_run,
+                    expected_revision,
+                    view_id,
+                } => (ticket_run, expected_revision, view_id, true),
+                TicketViewCommand::Unpin {
+                    ticket_run,
+                    expected_revision,
+                    view_id,
+                } => (ticket_run, expected_revision, view_id, false),
+            };
+            let ticket_run = TicketRunId::parse(ticket_run).map_err(CliError::usage)?;
+            let view_id = Digest::parse(view_id).map_err(CliError::usage)?;
+            let owner_generation =
+                crate::store::dashboard_projection::active_owner_generation(&state_root)
+                    .map_err(CliError::unavailable)?
+                    .ok_or_else(|| CliError::unavailable("machine controller is not running"))?;
+            let snapshot = backend.snapshot().map_err(CliError::unavailable)?;
+            let row = snapshot
+                .tickets
+                .iter()
+                .find(|row| row.ticket_run_id == ticket_run)
+                .ok_or_else(|| {
+                    CliError::not_found("TicketRun is no longer in the dashboard snapshot")
+                })?;
+            if row.revision != expected_revision || row.rex_view_id.as_ref() != Some(&view_id) {
+                return Err(CliError::conflict(
+                    "TicketRun revision or Rex view changed; refresh the dashboard",
+                ));
+            }
+            backend
+                .set_pin_for_generation(
+                    owner_generation,
+                    &ticket_run,
+                    expected_revision,
+                    &view_id,
+                    pinned,
+                )
+                .map_err(CliError::conflict)?;
+            if json {
+                print_json(
+                    &serde_json::json!({"ticket_run_id":ticket_run,"view_id":view_id,"pinned":pinned}),
+                )
+            } else {
+                println!(
+                    "{} Rex view for {ticket_run}",
+                    if pinned { "Pinned" } else { "Unpinned" }
+                );
+                Ok(())
+            }
+        }
         TicketCommand::Instruct {
             run,
             expected_revision,
             message_file,
             request_id,
         } => {
+            require_human_context()?;
             let body = std::fs::read_to_string(&message_file).map_err(|error| {
                 CliError::usage(format!("cannot read instruction file: {error}"))
             })?;
@@ -1483,6 +1712,7 @@ fn ticket_command(
             disposition,
             request_id,
         } => {
+            require_human_context()?;
             let state_root = selected_state_root(config_path, explicit_state_root)?;
             let status = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
             let owner_generation = status.owner_generation.ok_or_else(|| CliError::unavailable("no foreground machine controller is running; start `rex-projects runtime run` first"))?;
@@ -1525,6 +1755,265 @@ fn ticket_command(
             }
         }
     }
+}
+
+fn ticket_scope_for_project(
+    loaded: &AppliedConfig,
+    project_text: &str,
+) -> Result<(ProjectId, TicketScope), CliError> {
+    let project_id = ProjectId::parse(project_text.to_owned()).map_err(CliError::usage)?;
+    let project = loaded
+        .config
+        .projects
+        .get(&project_id)
+        .ok_or_else(|| CliError::not_found(format!("unknown Project `{project_id}`")))?;
+    let values = project
+        .ticket_scope
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_owned()))
+                .ok_or_else(|| CliError::usage(format!("ticket scope `{key}` must be a string")))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    let scope = TicketScope::new(values).map_err(|error| CliError::usage(error.to_string()))?;
+    Ok((project_id, scope))
+}
+
+fn query_ticket_page(
+    config_path: Option<&Path>,
+    project: &str,
+    status: Option<&str>,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<crate::adapters::tickets::TicketPage, CliError> {
+    if !(1..=100).contains(&limit) {
+        return Err(CliError::usage(
+            "ticket list limit must be between 1 and 100",
+        ));
+    }
+    if cursor.is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control)) {
+        return Err(CliError::usage("ticket cursor is invalid or too long"));
+    }
+    let (path, loaded) = load_config(config_path)?;
+    let (project_id, scope) = ticket_scope_for_project(&loaded, project)?;
+    let environment = std::env::vars_os().collect();
+    let cwd = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .map_err(|error| {
+            CliError::usage(format!("configuration directory is unavailable: {error}"))
+        })?;
+    let adapter =
+        crate::adapters::tickets::build_ticket_adapter(&loaded.config, &environment, &cwd)
+            .map_err(|error| CliError::unavailable(error.to_string()))?;
+    let description = adapter
+        .describe(ticket_request_id("describe")?)
+        .map_err(ticket_adapter_error)?;
+    let normalized_status = status.map(parse_normalized_ticket_status).transpose()?;
+    adapter
+        .list(
+            ticket_request_id("list")?,
+            Some(project_id),
+            TicketListRequest {
+                scope,
+                status: normalized_status,
+                assignee: None,
+                project: None,
+                milestone: None,
+                release: None,
+                labels: None,
+                query: None,
+                cursor: cursor.map(str::to_owned),
+                page_size: Some(limit),
+                updated_since: None,
+            },
+        )
+        .map_err(ticket_adapter_error)
+        .and_then(|page| {
+            if page.ticket_namespace != description.ticket_namespace {
+                Err(CliError::conflict(
+                    "ticket adapter namespace changed during the query",
+                ))
+            } else {
+                Ok(page)
+            }
+        })
+}
+
+fn query_ticket(
+    config_path: Option<&Path>,
+    project: &str,
+    ticket_id: &str,
+) -> Result<TicketGetResult, CliError> {
+    if ticket_id.is_empty() || ticket_id.len() > 512 || ticket_id.chars().any(char::is_control) {
+        return Err(CliError::usage("ticket ID is invalid or too long"));
+    }
+    let (path, loaded) = load_config(config_path)?;
+    let (project_id, scope) = ticket_scope_for_project(&loaded, project)?;
+    let environment = std::env::vars_os().collect();
+    let cwd = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .map_err(|error| {
+            CliError::usage(format!("configuration directory is unavailable: {error}"))
+        })?;
+    let adapter =
+        crate::adapters::tickets::build_ticket_adapter(&loaded.config, &environment, &cwd)
+            .map_err(|error| CliError::unavailable(error.to_string()))?;
+    let description = adapter
+        .describe(ticket_request_id("describe")?)
+        .map_err(ticket_adapter_error)?;
+    let result = adapter
+        .get(
+            ticket_request_id("get")?,
+            Some(project_id),
+            TicketGetRequest {
+                scope,
+                ticket_id: ticket_id.to_owned(),
+                timeline_limit: Some(20),
+            },
+        )
+        .map_err(ticket_adapter_error)?;
+    if result.ticket_namespace != description.ticket_namespace {
+        return Err(CliError::conflict(
+            "ticket adapter namespace changed during the query",
+        ));
+    }
+    Ok(result)
+}
+
+fn ticket_request_id(operation: &str) -> Result<RequestId, CliError> {
+    RequestId::new(format!(
+        "ticket-cli-{}-{}-{operation}",
+        std::process::id(),
+        unix_now_i64()?
+    ))
+    .map_err(CliError::unexpected)
+}
+
+fn ticket_adapter_error(error: crate::adapters::tickets::TicketAdapterError) -> CliError {
+    match error {
+        crate::adapters::tickets::TicketAdapterError::Invalid(message)
+        | crate::adapters::tickets::TicketAdapterError::Protocol(message) => {
+            CliError::usage(message)
+        }
+        other => CliError::unavailable(other.to_string()),
+    }
+}
+
+fn parse_normalized_ticket_status(value: &str) -> Result<NormalizedTicketStatus, CliError> {
+    match value {
+        "triage" => Ok(NormalizedTicketStatus::Triage),
+        "backlog" => Ok(NormalizedTicketStatus::Backlog),
+        "ready" | "todo" => Ok(NormalizedTicketStatus::Ready),
+        "in-progress" | "in_progress" => Ok(NormalizedTicketStatus::InProgress),
+        "in-review" | "in_review" => Ok(NormalizedTicketStatus::InReview),
+        "done" => Ok(NormalizedTicketStatus::Done),
+        "canceled" | "cancelled" => Ok(NormalizedTicketStatus::Canceled),
+        _ => Err(CliError::usage(
+            "status must be triage, backlog, ready, in-progress, in-review, done, or canceled",
+        )),
+    }
+}
+
+fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn ticket_label(ticket: &NormalizedTicket) -> String {
+    terminal_safe(ticket.key.as_deref().unwrap_or(&ticket.id))
+}
+
+fn ticket_status_label(ticket: &NormalizedTicket) -> String {
+    terminal_safe(
+        ticket
+            .status
+            .label
+            .as_deref()
+            .unwrap_or(match ticket.status.value {
+                NormalizedTicketStatus::Triage => "Triage",
+                NormalizedTicketStatus::Backlog => "Backlog",
+                NormalizedTicketStatus::Ready => "ToDo",
+                NormalizedTicketStatus::InProgress => "In Progress",
+                NormalizedTicketStatus::InReview => "In Review",
+                NormalizedTicketStatus::Done => "Done",
+                NormalizedTicketStatus::Canceled => "Canceled",
+            }),
+    )
+}
+
+fn ticket_candidates_report(
+    tickets: &[NormalizedTicket],
+    next_cursor: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({"selected":false,"tickets":tickets,"next_cursor":next_cursor})
+}
+
+fn print_ticket_identity(ticket: &NormalizedTicket) {
+    println!(
+        "{}\t{}\t{}",
+        ticket_label(ticket),
+        ticket_status_label(ticket),
+        terminal_safe(&ticket.title)
+    );
+}
+
+fn print_ticket_table(tickets: &[NormalizedTicket]) {
+    for ticket in tickets {
+        print_ticket_identity(ticket);
+    }
+}
+
+fn print_ticket_detail(ticket: &NormalizedTicket) {
+    println!(
+        "{} — {}",
+        ticket_label(ticket),
+        terminal_safe(&ticket.title)
+    );
+    println!("Status: {}", ticket_status_label(ticket));
+    if let Some(url) = &ticket.url {
+        println!("URL: {}", terminal_safe(url));
+    }
+    println!("\n{}", terminal_safe(&ticket.body));
+}
+
+fn select_ticket_interactively(tickets: &[NormalizedTicket]) -> Result<(), CliError> {
+    if tickets.is_empty() {
+        return Err(CliError::not_found("no tickets in this page"));
+    }
+    print_ticket_table(tickets);
+    print!("Select ticket number (1-{}): ", tickets.len());
+    io::stdout()
+        .flush()
+        .map_err(|error| CliError::unavailable(error.to_string()))?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| CliError::unavailable(error.to_string()))?;
+    let index = input
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|index| (1..=tickets.len()).contains(index))
+        .ok_or_else(|| CliError::usage("selection must be a listed ticket number"))?;
+    let ticket = tickets
+        .get(index - 1)
+        .ok_or_else(|| CliError::not_found("selection no longer exists"))?;
+    print_ticket_identity(ticket);
+    Ok(())
 }
 
 fn provider_command(
@@ -3086,7 +3575,10 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ProviderCommand, read_effective_snapshot, resolve_executable};
+    use super::{
+        Cli, Command, ProviderCommand, factory_context_present, read_effective_snapshot,
+        resolve_executable, terminal_safe,
+    };
     use crate::config;
     use crate::store::{ConfigStore, ExpectedRevision};
 
@@ -3155,6 +3647,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ticket_cli_contract_requires_project_scope_and_accepts_bounded_pagination() {
+        let cli = Cli::try_parse_from([
+            "rex-projects",
+            "--json",
+            "ticket",
+            "list",
+            "--project",
+            "alpha",
+            "--status",
+            "in-progress",
+            "--limit",
+            "25",
+            "--cursor",
+            "page-2",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        assert!(Cli::try_parse_from(["rex-projects", "ticket", "list"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "rex-projects",
+                "ticket",
+                "select",
+                "--project",
+                "alpha",
+                "--id",
+                "T-1"
+            ])
+            .is_ok()
+        );
+    }
+
     fn minimal_config(command: &str) -> String {
         format!(
             "schema_version = 1\n\n[adapters.tickets]\nkind = 'command'\ncommand = ['{command}']\n\n[projects]\n"
@@ -3214,5 +3739,72 @@ mod tests {
         assert_eq!(revision, None);
         assert_eq!(effective.config.adapters.tickets.command, ["ticket-cli"]);
         assert!(!state_root.exists());
+    }
+
+    #[test]
+    fn selection_json_does_not_claim_candidates_were_selected() {
+        let report = super::ticket_candidates_report(&[], Some("next"));
+        assert_eq!(report["selected"], false);
+        assert_eq!(report["next_cursor"], "next");
+    }
+
+    #[test]
+    fn ticket_terminal_output_replaces_control_characters() {
+        assert_eq!(terminal_safe("safe\u{1b}[31m\ntext"), "safe�[31m�text");
+    }
+
+    #[test]
+    fn ticket_view_mutations_reject_any_factory_marker() {
+        assert!(factory_context_present(true, false));
+        assert!(factory_context_present(false, true));
+        assert!(!factory_context_present(false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_queries_the_generic_cli_adapter_and_preserves_its_page_cursor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let profiles = temp.path().join("profiles");
+        for profile in ["judgment_claude", "worker_codex"] {
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/fixture/profiles")
+                .join(profile);
+            let destination = profiles.join(profile);
+            std::fs::create_dir_all(&destination).unwrap();
+            std::fs::copy(source.join("config.toml"), destination.join("config.toml")).unwrap();
+            std::fs::copy(
+                source.join("instructions.md"),
+                destination.join("instructions.md"),
+            )
+            .unwrap();
+        }
+        let adapter = temp.path().join("ticket-adapter");
+        let result = r#"{"ticket_namespace":"example:repo","tickets":[{"ticket_namespace":"example:repo","scope":{"project":"example-goal"},"id":"ticket-1","key":"EX-1","title":"Fixture ticket","body":"Body","status":{"value":"ready","label":"Ready"}}],"applied_filters":{},"next_cursor":"cursor-next","observed_at":"2026-11-08T00:00:00Z","scan":{}}"#;
+        let description = r#"{"ticket_namespace":"example:repo","identity":{},"supported_schema_versions":[1],"native_value_convention":"exact","status_values":{"triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"},"capabilities":{"pagination":true,"filters":[],"revision_support":true,"conditional_revision_mutation":true,"atomic_scope_mutation":true,"remote_idempotency":[],"reconciliation":{},"visibility_grace_seconds":0,"supported_optional_methods":[]}}"#;
+        let script = format!(
+            "#!/bin/sh\ninput=$(cat)\nrequest_id=$(printf '%s' \"$input\" | sed -n 's/.*\\\"request_id\\\":\\\"//; s/\\\".*//; p')\nmethod=$(printf '%s' \"$input\" | sed -n 's/.*\\\"method\\\":\\\"//; s/\\\".*//; p')\ncase \"$method\" in\n adapter.describe) result='{}' ;;\n ticket.list) result='{}' ;;\n *) exit 9 ;;\nesac\nprintf '{{\"schema_version\":1,\"request_id\":\"%s\",\"result\":%s,\"error\":null}}\\n' \"$request_id\" \"$result\"\n",
+            description, result
+        );
+        std::fs::write(&adapter, script).unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = include_str!("../examples/fixture/config.toml").replace(
+            "/absolute/path/to/ticket-adapter",
+            adapter.to_str().unwrap(),
+        );
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, config).unwrap();
+
+        let page = super::query_ticket_page(
+            Some(&config_path),
+            "goal_project",
+            None,
+            10,
+            Some("cursor-prev"),
+        )
+        .unwrap();
+        assert_eq!(page.tickets[0].key.as_deref(), Some("EX-1"));
+        assert_eq!(page.next_cursor.as_deref(), Some("cursor-next"));
     }
 }
