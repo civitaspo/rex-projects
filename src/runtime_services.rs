@@ -64,6 +64,8 @@ pub struct RuntimeServices {
     host_environment: BTreeMap<OsString, OsString>,
     rex_identity: RexIdentity,
     rex: Arc<RexCliTransport>,
+    rex_events: Option<crate::adapters::rex::RexEventStream>,
+    rex_inventory_required: bool,
     rex_cli_path: PathBuf,
     rex_search_path: Vec<PathBuf>,
     state_root: PathBuf,
@@ -131,6 +133,7 @@ impl RuntimeServices {
             )
             .map_err(|error| error.to_string())?,
         );
+        let rex_events = rex.subscribe_events().ok();
         let artifact_root = state_root.join("artifacts");
         let artifacts = ArtifactStore::open(&artifact_root)?;
         let delivery = crate::runtime_delivery::build(
@@ -275,6 +278,8 @@ impl RuntimeServices {
             host_environment,
             rex_identity: rex_identity.clone(),
             rex,
+            rex_events,
+            rex_inventory_required: true,
             rex_cli_path: rex_binary,
             rex_search_path: search_path,
             state_root: state_root.to_owned(),
@@ -2424,6 +2429,42 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<crate::agent_recovery::AgentRecoveryReport, String> {
+        if self
+            .rex_events
+            .as_mut()
+            .is_some_and(|stream| !stream.is_alive().unwrap_or(false))
+        {
+            self.rex_events = None;
+            self.rex_inventory_required = true;
+        }
+        if self.rex_events.is_none() {
+            self.rex_events = self.rex.subscribe_events().ok();
+            self.rex_inventory_required = true;
+        }
+        if let Some(events) = &self.rex_events {
+            for signal in events.drain(128) {
+                match signal {
+                    crate::adapters::rex::RexEventSignal::BlockClosed { session_id, .. }
+                    | crate::adapters::rex::RexEventSignal::InventoryChanged { session_id }
+                        if session_id == self.rex_identity.session_id =>
+                    {
+                        self.rex_inventory_required = true;
+                    }
+                    crate::adapters::rex::RexEventSignal::RescanRequired => {
+                        self.rex_inventory_required = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if self.rex_inventory_required {
+            // This pinned inventory is only a wake/reconciliation input. The recovery
+            // runtime still verifies each persisted AgentRun and its process identities.
+            self.rex
+                .list_owned_windows_and_blocks()
+                .map_err(|error| error.to_string())?;
+            self.rex_inventory_required = false;
+        }
         let policy = crate::agent_recovery::RecoveryPolicy {
             rex_session_id: self.rex_identity.session_id.clone(),
             turn_timeout_seconds: self

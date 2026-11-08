@@ -1,6 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +21,211 @@ const OWNED_SUPERVISOR_WINDOW_PREFIX: &str = "rex-projects-supervisor-";
 const OWNED_BLOCK_PREFIX: &str = "rex-projects-run-";
 const QUALIFICATION_WINDOW_NAMESPACE: &str = "rex-projects-provider-qualification";
 const QUALIFICATION_SESSION_PREFIX: &str = "rex-projects-provider-qualification-";
+const MAX_REX_EVENT_FRAME_BYTES: usize = 64 * 1024;
+const REX_EVENT_QUEUE_CAPACITY: usize = 128;
+
+/// A scoped Rex event that only requests a fresh authoritative session inventory.
+/// It never proves that a process exited.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RexEventSignal {
+    BlockClosed {
+        session_id: String,
+        block_id: String,
+    },
+    InventoryChanged {
+        session_id: String,
+    },
+    RescanRequired,
+}
+
+/// Foreground-owned `rex events` stream. Dropping it terminates and reaps the CLI child.
+pub struct RexEventStream {
+    child: Child,
+    receiver: Receiver<RexEventSignal>,
+    overflowed: Arc<AtomicBool>,
+    reader_ended: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl RexEventStream {
+    fn spawn(transport: &RexCliTransport) -> Result<Self, RexError> {
+        transport.verify_identity()?;
+        let mut child = Command::new(&transport.executable)
+            .args([
+                "-S",
+                transport.endpoint.as_str(),
+                "events",
+                "-s",
+                transport.session_id.as_str(),
+                "--json",
+            ])
+            .envs(transport.environment.iter())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| RexError::Process)?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RexError::Process);
+        };
+        let (sender, receiver) = mpsc::sync_channel(REX_EVENT_QUEUE_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let reader_ended = Arc::new(AtomicBool::new(false));
+        let reader_overflow = Arc::clone(&overflowed);
+        let reader_finished = Arc::clone(&reader_ended);
+        let reader = match thread::Builder::new()
+            .name("rex-events-reader".into())
+            .spawn(move || {
+                read_rex_events(stdout, sender, reader_overflow);
+                reader_finished.store(true, Ordering::Release);
+            }) {
+            Ok(reader) => reader,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RexError::Process);
+            }
+        };
+        Ok(Self {
+            child,
+            receiver,
+            overflowed,
+            reader_ended,
+            reader: Some(reader),
+        })
+    }
+
+    /// Drain a bounded batch. Disconnect and queue overflow both require a full rescan.
+    pub fn drain(&self, limit: usize) -> Vec<RexEventSignal> {
+        let mut signals = Vec::new();
+        if self.overflowed.swap(false, Ordering::AcqRel) {
+            signals.push(RexEventSignal::RescanRequired);
+        }
+        for _ in 0..limit {
+            match self.receiver.try_recv() {
+                Ok(signal) => signals.push(signal),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    signals.push(RexEventSignal::RescanRequired);
+                    break;
+                }
+            }
+        }
+        signals
+    }
+
+    pub fn is_alive(&mut self) -> Result<bool, RexError> {
+        if self.reader_ended.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.child
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(|_| RexError::Process)
+    }
+}
+
+impl Drop for RexEventStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn read_rex_events(
+    stdout: impl std::io::Read,
+    sender: SyncSender<RexEventSignal>,
+    overflowed: Arc<AtomicBool>,
+) {
+    let mut reader = BufReader::new(stdout);
+    let mut frame = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok([]) | Err(_) => break,
+            Ok(available) => available,
+        };
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if !oversized {
+            if frame.len().saturating_add(consumed) > MAX_REX_EVENT_FRAME_BYTES {
+                frame.clear();
+                oversized = true;
+            } else {
+                frame.extend_from_slice(&available[..consumed]);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            let signal = if oversized {
+                Some(RexEventSignal::RescanRequired)
+            } else {
+                match parse_rex_event_frame(&frame) {
+                    Ok(signal) => signal,
+                    Err(()) => Some(RexEventSignal::RescanRequired),
+                }
+            };
+            if signal.is_some_and(|signal| sender.try_send(signal).is_err()) {
+                overflowed.store(true, Ordering::Release);
+            }
+            frame.clear();
+            oversized = false;
+        }
+    }
+    if !frame.is_empty() || oversized {
+        if sender.try_send(RexEventSignal::RescanRequired).is_err() {
+            overflowed.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn parse_rex_event_frame(frame: &[u8]) -> Result<Option<RexEventSignal>, ()> {
+    let value: Value = crate::protocol::parse_unique(frame).map_err(|_| ())?;
+    let event_type = value.get("type").and_then(Value::as_str).ok_or(())?;
+    match event_type {
+        "session_destroyed" => {
+            let session_id = value
+                .get("payload")
+                .and_then(|payload| payload.get("session_id"))
+                .and_then(Value::as_str)
+                .ok_or(())?;
+            Ok(Some(RexEventSignal::InventoryChanged {
+                session_id: session_id.to_owned(),
+            }))
+        }
+        "session_event" => {
+            let payload = value.get("payload").ok_or(())?;
+            let session_id = payload
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or(())?;
+            let event = payload.get("event").ok_or(())?;
+            match event.get("type").and_then(Value::as_str).ok_or(())? {
+                "block_closed" => Ok(Some(RexEventSignal::BlockClosed {
+                    session_id: session_id.to_owned(),
+                    block_id: event
+                        .get("payload")
+                        .and_then(|payload| payload.get("block_id"))
+                        .and_then(Value::as_str)
+                        .ok_or(())?
+                        .to_owned(),
+                })),
+                "window_closed" | "session_view_changed" => {
+                    Ok(Some(RexEventSignal::InventoryChanged {
+                        session_id: session_id.to_owned(),
+                    }))
+                }
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentBlockSpec {
@@ -434,6 +645,11 @@ impl RexCliTransport {
 
     pub fn capabilities(&self) -> &RexCapabilities {
         &self.capabilities
+    }
+
+    /// Start a foreground Rex event reader scoped to this pinned endpoint and session.
+    pub fn subscribe_events(&self) -> Result<RexEventStream, RexError> {
+        RexEventStream::spawn(self)
     }
 
     pub fn session_id(&self) -> &str {
@@ -1661,10 +1877,7 @@ fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, RexError>
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AgentBlockSpec, CreateDisposition, RexCliTransport, RexIdentity, TicketWindow,
-        owned_block_label, ticket_window_label,
-    };
+    use super::*;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1838,5 +2051,49 @@ mod tests {
                 .agent_block_matches_spec(&window, &changed, "anchor-1")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn rex_event_parser_accepts_only_scoped_close_and_inventory_events() {
+        assert_eq!(
+            parse_rex_event_frame(br#"{"type":"session_event","payload":{"session_id":"session-a","event":{"type":"block_closed","payload":{"block_id":"block-a"}}}}"#),
+            Ok(Some(RexEventSignal::BlockClosed {
+                session_id: "session-a".into(),
+                block_id: "block-a".into(),
+            }))
+        );
+        assert_eq!(
+            parse_rex_event_frame(
+                br#"{"type":"session_destroyed","payload":{"session_id":"session-a"}}"#
+            ),
+            Ok(Some(RexEventSignal::InventoryChanged {
+                session_id: "session-a".into()
+            }))
+        );
+        assert_eq!(
+            parse_rex_event_frame(br#"{"type":"session_event","payload":{"session_id":"session-a","event":{"type":"client_disconnected","payload":{}}}}"#),
+            Ok(None)
+        );
+        assert!(parse_rex_event_frame(b"not json").is_err());
+    }
+
+    #[test]
+    fn rex_event_reader_bounds_frames_and_requests_rescan_on_overflow() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let mut input = vec![b'x'; MAX_REX_EVENT_FRAME_BYTES + 1];
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"type":"session_event","payload":{"session_id":"s","event":{"type":"block_closed","payload":{"block_id":"b"}}}}"#);
+        input.push(b'\n');
+        read_rex_events(input.as_slice(), sender, Arc::clone(&overflowed));
+        assert_eq!(receiver.try_recv(), Ok(RexEventSignal::RescanRequired));
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(RexEventSignal::BlockClosed {
+                session_id: "s".into(),
+                block_id: "b".into()
+            })
+        );
+        assert!(!overflowed.load(Ordering::Acquire));
     }
 }
