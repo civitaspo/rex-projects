@@ -962,8 +962,13 @@ fn prepare_profiles(
                 .to_string(),
             runtime_binary.display().to_string()
         );
+        let commit_mode = if role == "worker" && hold_worker_after_inbox {
+            "host"
+        } else {
+            "native"
+        };
         let config = format!(
-            "adapter = \"codex\"\ncommand = {command}\nmodel = \"fixture-emulator\"\n\n[options]\nsandbox = \"workspace_write\"\napproval = \"never\"\n"
+            "adapter = \"codex\"\ncommand = {command}\nmodel = \"fixture-emulator\"\ncommit_mode = {commit_mode:?}\n\n[options]\nsandbox = \"workspace_write\"\napproval = \"never\"\n"
         );
         fs::write(profile.join("config.toml"), config).map_err(|error| error.to_string())?;
     }
@@ -2386,6 +2391,44 @@ mod tests {
             .output()
             .unwrap();
         assert!(probe.status.success());
+    }
+
+    #[test]
+    fn generated_worker_profile_resolves_the_stage_commit_contract() {
+        for (hold_worker, expected_mode) in [
+            (false, rex_projects::domain::types::CommitMode::Native),
+            (true, rex_projects::domain::types::CommitMode::Host),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("acceptance");
+            fs::create_dir(&root).unwrap();
+            let request = Request {
+                cli: Path::new("/usr/bin/true"),
+                rex: Path::new("/usr/bin/true"),
+                rex_server: "unix:///fixture.sock",
+                rex_session: "acceptance-session",
+                expected_instance: "fixture-instance",
+                fixture_root: &root,
+            };
+            let executable = std::env::current_exe().unwrap();
+            prepare_profiles(&request, &executable, request.cli, false, hold_worker).unwrap();
+            fs::write(root.join("config.toml"), config_text(&request, &executable)).unwrap();
+            let applied = rex_projects::config::load(&root.join("config.toml")).unwrap();
+            let worker = applied
+                .profiles
+                .iter()
+                .find(|(id, _)| id.as_str() == "fixture_worker")
+                .map(|(_, profile)| profile)
+                .unwrap();
+            assert_eq!(worker.commit_mode, expected_mode);
+            assert!(applied.profiles.iter().all(|(id, profile)| {
+                id.as_str() == "fixture_worker"
+                    || profile.commit_mode == rex_projects::domain::types::CommitMode::Native
+            }));
+            let context =
+                crate::fixtures::agent::read_context(&root.join("contexts/worker.json")).unwrap();
+            assert_eq!(context.hold_after_inbox, hold_worker);
+        }
     }
 
     #[test]
