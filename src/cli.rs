@@ -1548,7 +1548,7 @@ fn ticket_command(
                     "ticket select requires a terminal or --id; use --json to list bounded candidates",
                 ))
             } else {
-                select_ticket_interactively(&page.tickets)
+                select_ticket_interactively(&page.tickets, page.next_cursor.as_deref())
             }
         }
         TicketCommand::Focus { ticket_run } => {
@@ -1990,12 +1990,21 @@ fn print_ticket_detail(ticket: &NormalizedTicket) {
     println!("\n{}", terminal_safe(&ticket.body));
 }
 
-fn select_ticket_interactively(tickets: &[NormalizedTicket]) -> Result<(), CliError> {
+fn select_ticket_interactively(
+    tickets: &[NormalizedTicket],
+    next_cursor: Option<&str>,
+) -> Result<(), CliError> {
     if tickets.is_empty() {
         return Err(CliError::not_found("no tickets in this page"));
     }
-    print_ticket_table(tickets);
-    print!("Select ticket number (1-{}): ", tickets.len());
+    print!("{}", render_ticket_selection(tickets));
+    if let Some(cursor) = next_cursor {
+        println!(
+            "More tickets are available; rerun with --cursor {} to view the next page.",
+            terminal_safe(cursor)
+        );
+    }
+    print!("Select a numbered choice (1-{}): ", tickets.len());
     io::stdout()
         .flush()
         .map_err(|error| CliError::unavailable(error.to_string()))?;
@@ -2014,6 +2023,22 @@ fn select_ticket_interactively(tickets: &[NormalizedTicket]) -> Result<(), CliEr
         .ok_or_else(|| CliError::not_found("selection no longer exists"))?;
     print_ticket_identity(ticket);
     Ok(())
+}
+
+fn render_ticket_selection(tickets: &[NormalizedTicket]) -> String {
+    let mut output = String::new();
+    for (index, ticket) in tickets.iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "{:>2}) {}\t{}\t{}",
+            index + 1,
+            ticket_label(ticket),
+            ticket_status_label(ticket),
+            terminal_safe(&ticket.title)
+        );
+    }
+    output
 }
 
 fn provider_command(
@@ -3758,6 +3783,50 @@ mod tests {
         assert!(factory_context_present(true, false));
         assert!(factory_context_present(false, true));
         assert!(!factory_context_present(false, false));
+    }
+
+    #[test]
+    fn interactive_selection_displays_numbered_sanitized_choices() {
+        let scope = crate::adapters::tickets::TicketScope::new(
+            [("project".to_owned(), "alpha".to_owned())]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        let make_ticket =
+            |id: &str, key: &str, title: &str| crate::adapters::tickets::NormalizedTicket {
+                ticket_namespace: "fixture:repo".into(),
+                scope: scope.clone(),
+                id: id.into(),
+                key: Some(key.into()),
+                url: None,
+                revision: None,
+                title: title.into(),
+                body: String::new(),
+                status: crate::adapters::tickets::TicketStatusValue {
+                    value: crate::adapters::tickets::NormalizedTicketStatus::Ready,
+                    native_value: None,
+                    provider_id: None,
+                    label: None,
+                },
+                priority: None,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                created_at: None,
+                updated_at: None,
+                extensions: Default::default(),
+            };
+        let tickets = [
+            make_ticket("ticket-1", "T-1", "first\nline"),
+            make_ticket("ticket-2", "T-2", "second\u{1b}[31m"),
+        ];
+
+        let output = super::render_ticket_selection(&tickets);
+
+        assert_eq!(
+            output,
+            " 1) T-1\tToDo\tfirst�line\n 2) T-2\tToDo\tsecond�[31m\n"
+        );
     }
 
     #[cfg(unix)]
