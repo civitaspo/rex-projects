@@ -149,7 +149,7 @@ fn fixture(
         source.replacen(
             "schema_version = 1",
             &format!(
-                "schema_version = 1\nstate_root = \"{}\"",
+                "schema_version = 1\nstate_root = \"{}\"\n\n[runtime.environment]\nsource = \"inherit\"",
                 temp.path().join("runtime").display()
             ),
             1,

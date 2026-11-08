@@ -1,6 +1,6 @@
 //! Host-side queries and state transitions for finite role Agent turns.
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -14,6 +14,32 @@ const MAX_WAKE_SNAPSHOT_JSON_BYTES: usize = 1_048_576;
 const MAX_WAKE_CONTEXT_MIGRATION_ROWS: usize = 65_536;
 const MAX_WAKE_CONTEXT_MIGRATION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROFILE_QUALIFICATION_CANDIDATES: usize = 32;
+
+pub(crate) fn validate_project_launch_identity(
+    connection: &Connection,
+    project_id: &ProjectId,
+    expected_epoch: u64,
+    expected_revision: u64,
+    expected_digest: &Digest,
+) -> Result<(), String> {
+    let current: Option<(u64, String, u64, String, String)> = connection.query_row(
+        "SELECT r.project_epoch,p.config_digest,p.config_revision,p.desired_lifecycle,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+        [project_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((epoch, digest, revision, desired, observed)) = current else {
+        return Err("launch Project no longer exists".into());
+    };
+    if desired != "running"
+        || !matches!(observed.as_str(), "running" | "starting")
+        || epoch != expected_epoch
+    {
+        return Err("Project lifecycle or epoch changed".into());
+    }
+    if revision != expected_revision || digest != expected_digest.as_str() {
+        return Err("Project config changed".into());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -393,6 +419,56 @@ impl ConfigStore {
         Ok(qualifications)
     }
 
+    /// Revalidate the accepted launch before publishing a missing wrapper ACK.
+    pub fn validate_agent_launch_replay(
+        &self,
+        owner_generation: u64,
+        expected: &AgentLaunchReservation,
+    ) -> Result<(), String> {
+        expected.validate()?;
+        let active: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if active != Some(owner_generation) || expected.controller_generation != owner_generation {
+            return Err("controller owner generation is stale".into());
+        }
+        let stored: Option<(String, String, String)> = self.connection.query_row(
+            "SELECT reservation_digest,reservation_json,lifecycle FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [expected.agent_run_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((digest, json, lifecycle)) = stored else {
+            return Err("AgentRun has no persisted launch reservation".into());
+        };
+        let reservation: AgentLaunchReservation = crate::protocol::parse_unique(json.as_bytes())
+            .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+        if lifecycle != "authorized"
+            || digest != expected.digest()?.as_str()
+            || reservation != *expected
+        {
+            return Err("persisted launch reservation does not match the accepted launch".into());
+        }
+        let project: Option<(u64, String, u64, String, String)> = self.connection.query_row(
+            "SELECT r.project_epoch,p.config_digest,p.config_revision,p.desired_lifecycle,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+            [expected.project_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((epoch, config_digest, config_revision, desired, observed)) = project else {
+            return Err("launch Project no longer exists".into());
+        };
+        if desired != "running"
+            || !matches!(observed.as_str(), "running" | "starting")
+            || epoch != expected.project_epoch
+        {
+            return Err("Project lifecycle or epoch changed".into());
+        }
+        if config_revision != expected.config_revision.0
+            || config_digest != expected.config_digest.as_str()
+        {
+            return Err("Project config changed".into());
+        }
+        Ok(())
+    }
+
     /// Return a previously committed exact start ACK for an identical request. This is the
     /// crash-recovery path after the wrapper consumed its one-use environment and the provider
     /// has already exited; it never authorizes a new request.
@@ -488,6 +564,13 @@ impl ConfigStore {
         let reservation: AgentLaunchReservation =
             crate::protocol::parse_unique(reservation_json.as_bytes())
                 .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+        validate_project_launch_identity(
+            &tx,
+            &reservation.project_id,
+            reservation.project_epoch,
+            reservation.config_revision.0,
+            &reservation.config_digest,
+        )?;
         let expected = reservation.digest()?;
         if expected != *reservation_digest
             || authority.project_id != reservation.project_id
@@ -1092,8 +1175,8 @@ mod tests {
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
     use crate::launch::{
-        AgentLaunchReservation, LAUNCH_SCHEMA_VERSION, ProviderQualification, QualificationProof,
-        QualificationStatus, RexView, RexViewKind,
+        AgentLaunchReservation, LAUNCH_SCHEMA_VERSION, ObservedProviderStart,
+        ProviderQualification, QualificationProof, QualificationStatus, RexView, RexViewKind,
     };
 
     #[test]
@@ -1579,6 +1662,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(receipt.decision, crate::launch::LaunchDecision::Accepted);
+        let wake_state: (String, Option<String>) = store.connection.query_row(
+            "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=1",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(wake_state, ("assigned".into(), Some("run-1".into())));
+        let mut unconfirmed = ObservedProviderStart {
+            agent_run_id: authority.agent_run_id.clone(),
+            operation_id: authority.operation_id.clone(),
+            provider_pid: 100,
+            provider_start_identity: "provider-start".into(),
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest: digest('a'),
+            process_tree_confirmed: false,
+        };
+        assert!(
+            store
+                .confirm_provider_started(generation, &unconfirmed)
+                .is_err()
+        );
+        let unchanged: String = store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM role_wake_inputs WHERE wake_input_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, "assigned");
+        unconfirmed.process_tree_confirmed = true;
+        store
+            .confirm_provider_started(generation, &unconfirmed)
+            .unwrap();
+        let consumed: String = store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM role_wake_inputs WHERE wake_input_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, "consumed");
         let persisted_role: String = store
             .connection
             .query_row(

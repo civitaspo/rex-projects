@@ -15,10 +15,10 @@ use crate::domain::ids::{
 use crate::domain::types::Role;
 use crate::engine::reducer::{Input, Phase, TicketRun, WakeTarget, reduce};
 use crate::launch::{
-    AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, ObservedProviderStart,
-    ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle, RexFocusTarget, RexView,
-    RexViewAnchorRecord, RexViewBlock, RexViewBlockRecord, RexViewCleanupCandidate, RexViewKind,
-    RexViewRecord, authorize_start,
+    AgentLaunchAuthority, AgentLaunchReceipt, AgentLaunchReservation, AgentStartRequest,
+    ObservedProviderStart, ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle,
+    RexFocusTarget, RexView, RexViewAnchorRecord, RexViewBlock, RexViewBlockRecord,
+    RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
 pub mod agent_recovery;
@@ -4472,6 +4472,33 @@ impl ConfigStore {
         let authority: AgentLaunchAuthority =
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
+        let reservation: Option<(String, String)> = tx.query_row(
+            "SELECT reservation_json,lifecycle FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [request.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((reservation_json, lifecycle)) = reservation else {
+            return Err("Agent start request has no finalized launch reservation".into());
+        };
+        if lifecycle != "authorized" {
+            return Err("Agent launch reservation has not been finalized".into());
+        }
+        let reservation: AgentLaunchReservation =
+            crate::protocol::parse_unique(reservation_json.as_bytes())
+                .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+        if reservation.agent_run_id != request.agent_run_id
+            || reservation.operation_id != request.operation_id
+            || reservation.controller_generation != current_generation
+        {
+            return Err("launch reservation does not match the start request".into());
+        }
+        agent_runtime::validate_project_launch_identity(
+            &tx,
+            &reservation.project_id,
+            reservation.project_epoch,
+            reservation.config_revision.0,
+            &reservation.config_digest,
+        )?;
         authority.validate()?;
         let qualification_json: String = tx
             .query_row(
@@ -4558,6 +4585,101 @@ impl ConfigStore {
         let authority: AgentLaunchAuthority =
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
+        let reservation: Option<(String, String)> = tx.query_row(
+            "SELECT reservation_json,lifecycle FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [observation.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let reserved_wake_count = if let Some((reservation_json, lifecycle)) = reservation {
+            if lifecycle != "authorized" {
+                return Err("Agent launch reservation has not been finalized".into());
+            }
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(reservation_json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            reservation.wake_snapshot.validate()?;
+            if reservation.wake_snapshot.digest != authority.wake_snapshot_digest {
+                return Err("launch authority wake manifest does not match its reservation".into());
+            }
+            let current: Option<(u64, String, u64, String, String)> = tx.query_row(
+                "SELECT r.project_epoch,p.config_digest,p.config_revision,p.desired_lifecycle,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+                [authority.project_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let Some((epoch, config_digest, config_revision, desired, observed)) = current else {
+                return Err("launch Project no longer exists".into());
+            };
+            if desired != "running"
+                || !matches!(observed.as_str(), "running" | "starting")
+                || epoch != reservation.project_epoch
+            {
+                return Err("Project lifecycle or epoch changed".into());
+            }
+            if config_revision != reservation.config_revision.0
+                || config_digest != reservation.config_digest.as_str()
+            {
+                return Err("Project config changed".into());
+            }
+            let mut statement = tx.prepare("SELECT wake_input_id,project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle FROM role_wake_inputs WHERE consuming_agent_run_id=?1 ORDER BY wake_input_id").map_err(|error| error.to_string())?;
+            let owned_wakes = statement
+                .query_map([observation.agent_run_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, i32>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            drop(statement);
+            if owned_wakes.len() != reservation.wake_snapshot.inputs.len()
+                || owned_wakes.iter().any(
+                    |(
+                        wake_id,
+                        project_id,
+                        role_session_id,
+                        source_type,
+                        source_id,
+                        source_revision,
+                        priority,
+                        payload_json,
+                        lifecycle,
+                    )| {
+                        let Some(expected) = reservation
+                            .wake_snapshot
+                            .inputs
+                            .iter()
+                            .find(|input| input.wake_input_id == *wake_id)
+                        else {
+                            return true;
+                        };
+                        let stored_payload =
+                            crate::protocol::parse_unique(payload_json.as_bytes()).ok();
+                        project_id != authority.project_id.as_str()
+                            || role_session_id != &reservation.role_session_id
+                            || source_type != &expected.source_type
+                            || source_id != &expected.source_id
+                            || *source_revision != expected.source_revision
+                            || *priority != expected.priority
+                            || stored_payload.as_ref() != Some(&expected.payload_json)
+                            || lifecycle != "assigned"
+                    },
+                )
+            {
+                return Err(
+                    "assigned wake inputs do not match the immutable launch reservation".into(),
+                );
+            }
+            reservation.wake_snapshot.inputs.len()
+        } else {
+            0
+        };
         if authority.controller_generation != current_generation
             || authority.operation_id != observation.operation_id
         {
@@ -4602,6 +4724,10 @@ impl ConfigStore {
             return Err(
                 "AgentRun state changed before provider start observation was committed".into(),
             );
+        }
+        let consumed_wakes = tx.execute("UPDATE role_wake_inputs SET lifecycle='consumed' WHERE consuming_agent_run_id=?1 AND lifecycle='assigned'", [observation.agent_run_id.as_str()]).map_err(|error| error.to_string())?;
+        if consumed_wakes != reserved_wake_count {
+            return Err("assigned wake inputs changed before provider start was committed".into());
         }
         tx.commit().map_err(|error| error.to_string())
     }

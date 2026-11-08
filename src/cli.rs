@@ -2652,6 +2652,9 @@ fn run_controller(
         store
             .heartbeat_owner(generation)
             .map_err(CliError::unavailable)?;
+        if should_stop || STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         let tick_now = unix_now_i64()?;
         if once {
             crate::engine::factory_runtime::FactoryRuntime::tick_once(
@@ -2686,7 +2689,7 @@ fn run_controller(
             snapshot.config.digest.as_str(),
         )
         .map_err(CliError::unexpected)?;
-        if should_stop || once || STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        if once {
             break;
         }
         std::thread::sleep(Duration::from_millis(250));

@@ -327,7 +327,10 @@ pub fn reconcile_accepted_start(
         Some(_) => {
             return Err("published StartAgent receipt differs from durable host authority".into());
         }
-        None => spool.publish_start_receipt(&start, receipt)?,
+        None => {
+            store.validate_agent_launch_replay(owner_generation, reservation)?;
+            spool.publish_start_receipt(&start, receipt)?;
+        }
     }
     Ok(Some(authority))
 }
