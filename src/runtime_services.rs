@@ -363,22 +363,12 @@ impl RuntimeServices {
             .profiles
             .get(&job.request.profile_id)
             .ok_or("provider qualification profile is absent from applied configuration")?;
-        if digest_serialized(profile)? != job.request.profile_digest
-            || self.applied_config.digest != job.request.config_digest
-        {
-            return Err("provider qualification profile or config changed after request".into());
-        }
-        let shutdown_grace_seconds = self.config.runtime.shutdown_grace_seconds.clamp(1, 300);
-        let deadline_seconds = crate::run_step::qualification_deadline_seconds(
-            profile.turn_timeout_seconds,
-            shutdown_grace_seconds,
-        )?;
-        let deadline = std::time::Duration::from_secs(deadline_seconds);
-        std::time::Instant::now()
-            .checked_add(deadline)
-            .ok_or("provider qualification deadline cannot be represented by this platform")?;
-        crate::run_step::profile_runtime_identity(profile).map_err(|error| error.to_string())?;
-        Ok(deadline_seconds)
+        preflight_provider_qualification_job(
+            profile,
+            job,
+            &self.applied_config.digest,
+            self.config.runtime.shutdown_grace_seconds,
+        )
     }
 
     fn start_provider_qualification(
@@ -3223,6 +3213,30 @@ fn digest_serialized(value: &impl serde::Serialize) -> Result<Digest, String> {
     digest_bytes(&bytes)
 }
 
+fn preflight_provider_qualification_job(
+    profile: &crate::config::Profile,
+    job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
+    applied_config_digest: &Digest,
+    configured_shutdown_grace_seconds: u64,
+) -> Result<u64, String> {
+    if crate::store::agent_profile_digest(profile)? != job.request.profile_digest
+        || applied_config_digest != &job.request.config_digest
+    {
+        return Err("provider qualification profile or config changed after request".into());
+    }
+    let shutdown_grace_seconds = configured_shutdown_grace_seconds.clamp(1, 300);
+    let deadline_seconds = crate::run_step::qualification_deadline_seconds(
+        profile.turn_timeout_seconds,
+        shutdown_grace_seconds,
+    )?;
+    let deadline = std::time::Duration::from_secs(deadline_seconds);
+    std::time::Instant::now()
+        .checked_add(deadline)
+        .ok_or("provider qualification deadline cannot be represented by this platform")?;
+    crate::run_step::profile_runtime_identity(profile).map_err(|error| error.to_string())?;
+    Ok(deadline_seconds)
+}
+
 fn digest_bytes(bytes: &[u8]) -> Result<Digest, String> {
     use sha2::Digest as _;
     Digest::parse(format!("{:x}", sha2::Sha256::digest(bytes)))
@@ -3253,6 +3267,52 @@ fn role_name(role: Role) -> &'static str {
         Role::MergeDecision => "merge_decision",
         Role::Operator => "operator",
         Role::Postmortem => "postmortem",
+    }
+}
+
+#[cfg(test)]
+mod provider_qualification_preflight_tests {
+    use super::*;
+    use crate::domain::ids::{ProfileId, ProjectId};
+    use crate::store::provider_qualification_runtime::{
+        ProviderQualificationJob, ProviderQualificationJobStatus, ProviderQualificationRequest,
+    };
+
+    #[test]
+    fn preflight_accepts_the_canonical_digest_for_an_unchanged_qualification_job() {
+        let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
+            "adapter": "codex",
+            "command": [std::env::current_exe().unwrap().display().to_string()],
+            "turn_timeout_seconds": 60,
+            "commit_mode": "native"
+        }))
+        .unwrap();
+        let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
+        assert_ne!(digest_serialized(&profile).unwrap(), profile_digest);
+        let config_digest = Digest::parse("a".repeat(64)).unwrap();
+        let job = ProviderQualificationJob {
+            request: ProviderQualificationRequest {
+                request_id: "qualification-test".into(),
+                project_id: ProjectId::parse("project-a").unwrap(),
+                role: Role::Supervisor,
+                profile_id: ProfileId::parse("default-codex").unwrap(),
+                profile_digest,
+                config_revision: 1,
+                config_digest: config_digest.clone(),
+            },
+            request_digest: Digest::parse("b".repeat(64)).unwrap(),
+            status: ProviderQualificationJobStatus::Running,
+            controller_generation: 1,
+            rex_session_id: None,
+            rex_window_id: None,
+            rex_block_id: None,
+            result_json: None,
+            evidence_digest: None,
+            created_at_unix: 1,
+            updated_at_unix: 1,
+        };
+
+        assert!(preflight_provider_qualification_job(&profile, &job, &config_digest, 30).is_ok());
     }
 }
 
