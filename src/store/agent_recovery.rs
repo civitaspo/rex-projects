@@ -547,8 +547,8 @@ impl ConfigStore {
         Ok(Some(run_id))
     }
 
-    /// Record observations from a missing-block recovery. Capacity is released only when the
-    /// saved process tree and its process group are both absent from the current host snapshot.
+    /// Record surviving identities without requiring completed cleanup. Release additionally
+    /// requires the host's continuous fork-watch proof and a fresh absence observation.
     pub(crate) fn reconcile_missing_agent_block(
         &mut self,
         owner_generation: u64,
@@ -583,7 +583,7 @@ impl ConfigStore {
             || snapshot.reservation_epoch != run.reservation_epoch
             || snapshot.authority_digest != run.authority_digest
             || snapshot.launch_tree_digest != provider.process_tree_digest
-            || !snapshot.cleanup_covered
+            || (survivors.is_empty() && !snapshot.cleanup_covered)
         {
             return Err("Agent block cleanup snapshot is not bound to the active launch".into());
         }

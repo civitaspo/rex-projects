@@ -80,6 +80,7 @@ pub struct RuntimeServices {
     mailbox_cursor: Option<String>,
     rex_lifecycle_cursor: usize,
     rex_lifecycle_last_tick: Option<i64>,
+    agent_recovery: crate::agent_recovery::AgentRecoveryRuntime,
 }
 
 impl RuntimeServices {
@@ -296,6 +297,7 @@ impl RuntimeServices {
             mailbox_cursor: None,
             rex_lifecycle_cursor: 0,
             rex_lifecycle_last_tick: None,
+            agent_recovery: crate::agent_recovery::AgentRecoveryRuntime::default(),
         })
     }
 
@@ -2521,12 +2523,8 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
             max_observations_per_tick: 8,
             now_unix,
         };
-        crate::agent_recovery::AgentRecoveryRuntime::tick(
-            store,
-            owner_generation,
-            &self.rex,
-            &policy,
-        )
+        self.agent_recovery
+            .tick(store, owner_generation, &self.rex, &policy)
     }
 
     fn observe_publications(

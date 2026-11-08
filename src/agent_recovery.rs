@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::os::fd::RawFd;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -94,12 +96,291 @@ pub struct AgentRecoveryReport {
     pub more_pending: bool,
 }
 
-pub struct AgentRecoveryRuntime;
+const MAX_FORK_WATCH_RUNS: usize = 64;
+const MAX_FORK_WATCH_IDENTITIES: usize = 1024;
+
+pub struct AgentRecoveryRuntime {
+    fork_watches: BTreeMap<AgentRunId, RunForkWatch>,
+}
+
+impl Default for AgentRecoveryRuntime {
+    fn default() -> Self {
+        Self {
+            fork_watches: BTreeMap::new(),
+        }
+    }
+}
+
+struct RunForkWatch {
+    authority_digest: Digest,
+    reservation_epoch: u64,
+    launch_tree_digest: Digest,
+    watched: BTreeMap<(u32, String), ProcessIdentity>,
+    invalidated: bool,
+    #[cfg(target_os = "macos")]
+    queue_fd: Option<RawFd>,
+}
+
+impl RunForkWatch {
+    fn new(authority_digest: &Digest, reservation_epoch: u64, launch_tree_digest: &Digest) -> Self {
+        #[cfg(target_os = "macos")]
+        let queue_fd = unsafe {
+            let fd = libc::kqueue();
+            if fd < 0 || libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+                None
+            } else {
+                Some(fd)
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let invalidated = true;
+        #[cfg(target_os = "macos")]
+        let invalidated = queue_fd.is_none();
+        Self {
+            authority_digest: authority_digest.clone(),
+            reservation_epoch,
+            launch_tree_digest: launch_tree_digest.clone(),
+            watched: BTreeMap::new(),
+            invalidated,
+            #[cfg(target_os = "macos")]
+            queue_fd,
+        }
+    }
+
+    fn matches(
+        &self,
+        authority_digest: &Digest,
+        reservation_epoch: u64,
+        launch_tree_digest: &Digest,
+    ) -> bool {
+        self.authority_digest == *authority_digest
+            && self.reservation_epoch == reservation_epoch
+            && self.launch_tree_digest == *launch_tree_digest
+    }
+
+    fn unavailable(
+        authority_digest: &Digest,
+        reservation_epoch: u64,
+        launch_tree_digest: &Digest,
+    ) -> Self {
+        Self {
+            authority_digest: authority_digest.clone(),
+            reservation_epoch,
+            launch_tree_digest: launch_tree_digest.clone(),
+            watched: BTreeMap::new(),
+            invalidated: true,
+            #[cfg(target_os = "macos")]
+            queue_fd: None,
+        }
+    }
+
+    fn watches_identity(&self, pid: u32, birth_identity: &str) -> bool {
+        self.watched.contains_key(&(pid, birth_identity.to_owned()))
+    }
+
+    fn arm(&mut self, processes: &[ProcessIdentity], current: &[ProcessIdentity]) -> bool {
+        if self.invalidated || processes.len() > MAX_FORK_WATCH_IDENTITIES {
+            return false;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (processes, current);
+            self.invalidated = true;
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(queue_fd) = self.queue_fd else {
+                self.invalidated = true;
+                return false;
+            };
+            let mut newly_watched = Vec::new();
+            for process in processes {
+                if process.quality != ProcessIdentityQuality::KernelBirthToken
+                    || process.start_identity.trim().is_empty()
+                {
+                    self.invalidated = true;
+                    continue;
+                }
+                let key = (process.pid, process.start_identity.clone());
+                if self.watched.contains_key(&key) {
+                    continue;
+                }
+                if self.watched.keys().any(|(pid, _)| *pid == process.pid) {
+                    self.invalidated = true;
+                    continue;
+                }
+                let Some(actual) = kernel_identity(current, process.pid, &process.start_identity)
+                else {
+                    // An already-exited historical launch identity is outside this bounded
+                    // watch. Exact provider identity is required below; any identity selected
+                    // from a live sample is rechecked after registration.
+                    continue;
+                };
+                let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+                event.ident = actual.pid as libc::uintptr_t;
+                event.filter = libc::EVFILT_PROC;
+                event.flags = libc::EV_ADD | libc::EV_CLEAR;
+                event.fflags = libc::NOTE_FORK | libc::NOTE_EXIT;
+                let result = unsafe {
+                    libc::kevent(
+                        queue_fd,
+                        &event,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                    )
+                };
+                if result < 0 {
+                    self.invalidated = true;
+                    continue;
+                }
+                self.watched.insert(key.clone(), actual.clone());
+                newly_watched.push(key);
+            }
+            if !newly_watched.is_empty() {
+                match inspect_process_table() {
+                    Ok(after_register) => {
+                        for (pid, birth) in newly_watched {
+                            if kernel_identity(&after_register, pid, &birth).is_none() {
+                                self.invalidated = true;
+                            }
+                        }
+                    }
+                    Err(_) => self.invalidated = true,
+                }
+            }
+            self.drain_events() && !self.invalidated
+        }
+    }
+
+    fn drain_events(&mut self) -> bool {
+        if self.invalidated {
+            return false;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.invalidated = true;
+            false
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(queue_fd) = self.queue_fd else {
+                self.invalidated = true;
+                return false;
+            };
+            let mut events = [unsafe { std::mem::zeroed::<libc::kevent>() }; 64];
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            loop {
+                let count = unsafe {
+                    libc::kevent(
+                        queue_fd,
+                        std::ptr::null(),
+                        0,
+                        events.as_mut_ptr(),
+                        events.len() as libc::c_int,
+                        &timeout,
+                    )
+                };
+                if count < 0 {
+                    self.invalidated = true;
+                    return false;
+                }
+                if count == 0 {
+                    break;
+                }
+                for event in events.iter().take(count as usize) {
+                    let flags = unsafe { std::ptr::addr_of!(event.flags).read_unaligned() };
+                    let fflags = unsafe { std::ptr::addr_of!(event.fflags).read_unaligned() };
+                    if flags & libc::EV_ERROR != 0
+                        || fflags & libc::NOTE_FORK != 0
+                        || fflags & !(libc::NOTE_EXIT) != 0
+                    {
+                        self.invalidated = true;
+                    }
+                }
+                if self.invalidated || count < events.len() as libc::c_int {
+                    break;
+                }
+            }
+            !self.invalidated
+        }
+    }
+
+    fn seal_cleanup_if_absent(
+        &mut self,
+        snapshot: &mut BlockLossCleanupSnapshot,
+        fresh_process_table: &[ProcessIdentity],
+    ) -> bool {
+        if !self.drain_events()
+            || self.invalidated
+            || !crate::process::matching_processes(&snapshot.process_tree, fresh_process_table)
+                .is_empty()
+        {
+            return false;
+        }
+        snapshot.cleanup_covered = true;
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RunForkWatch {
+    fn drop(&mut self) {
+        if let Some(queue_fd) = self.queue_fd.take() {
+            unsafe { libc::close(queue_fd) };
+        }
+    }
+}
 
 impl AgentRecoveryRuntime {
+    fn run_fork_watch(
+        &mut self,
+        run: &RecoverableAgentRun,
+        launch_tree_digest: &Digest,
+        snapshot_exists: bool,
+    ) -> Option<&mut RunForkWatch> {
+        if !self.fork_watches.contains_key(&run.agent_run_id) {
+            if self.fork_watches.len() >= MAX_FORK_WATCH_RUNS {
+                return None;
+            }
+            let watch = if snapshot_exists {
+                RunForkWatch::unavailable(
+                    &run.authority_digest,
+                    run.reservation_epoch,
+                    launch_tree_digest,
+                )
+            } else {
+                RunForkWatch::new(
+                    &run.authority_digest,
+                    run.reservation_epoch,
+                    launch_tree_digest,
+                )
+            };
+            self.fork_watches.insert(run.agent_run_id.clone(), watch);
+        }
+        let watch = self.fork_watches.get_mut(&run.agent_run_id)?;
+        if !watch.matches(
+            &run.authority_digest,
+            run.reservation_epoch,
+            launch_tree_digest,
+        ) {
+            watch.invalidated = true;
+        }
+        Some(watch)
+    }
+
     /// Observe a finite, ordered subset of unknown/live runs. A failed or ambiguous observation
     /// never releases a slot and never authorizes a replacement turn.
     pub fn tick(
+        &mut self,
         store: &mut ConfigStore,
         owner_generation: u64,
         pinned_rex: &RexCliTransport,
@@ -108,6 +389,15 @@ impl AgentRecoveryRuntime {
         policy.validate()?;
         let runs =
             store.recoverable_agent_runs(owner_generation, policy.max_observations_per_tick + 1)?;
+        let active_runs = store.recoverable_agent_runs(owner_generation, 128)?;
+        if active_runs.len() < 128 {
+            let active_ids = active_runs
+                .iter()
+                .map(|run| run.agent_run_id.clone())
+                .collect::<BTreeSet<_>>();
+            self.fork_watches
+                .retain(|agent_run_id, _| active_ids.contains(agent_run_id));
+        }
         let more_pending = runs.len() > policy.max_observations_per_tick;
         let runs = runs
             .into_iter()
@@ -126,6 +416,7 @@ impl AgentRecoveryRuntime {
         for run in runs {
             let disposition = if let Some(processes) = &process_table {
                 Self::observe_one(
+                    self,
                     store,
                     owner_generation,
                     pinned_rex,
@@ -158,6 +449,7 @@ impl AgentRecoveryRuntime {
     }
 
     fn observe_one(
+        runtime: &mut Self,
         store: &mut ConfigStore,
         owner_generation: u64,
         pinned_rex: &RexCliTransport,
@@ -268,6 +560,7 @@ impl AgentRecoveryRuntime {
         ) {
             Ok(false) => {
                 return reconcile_missing_block(
+                    runtime,
                     store,
                     owner_generation,
                     run,
@@ -424,6 +717,7 @@ impl AgentRecoveryRuntime {
 }
 
 fn reconcile_missing_block(
+    runtime: &mut AgentRecoveryRuntime,
     store: &mut ConfigStore,
     owner_generation: u64,
     run: &RecoverableAgentRun,
@@ -489,6 +783,7 @@ fn reconcile_missing_block(
             });
         }
     };
+    let snapshot_exists = existing_snapshot.is_some();
     let mut snapshot = match existing_snapshot {
         Some(snapshot) => {
             if snapshot.agent_run_id != run.agent_run_id
@@ -501,49 +796,119 @@ fn reconcile_missing_block(
                     reason: RecoveryUnknown::ProcessInspectionUnavailable,
                 });
             }
-            snapshot
-        }
-        None => {
-            // The launch-time tree cannot prove that no later child escaped to a new PGID. A
-            // fresh capture is permitted only while the exact provider birth identity is live.
-            let Some(identities) = initial_cleanup_tree(
-                provider.provider_pid,
-                &provider.provider_start_identity,
-                &launch_tree,
-                current,
-            ) else {
-                return Ok(AgentRecoveryDisposition::Unresolved {
-                    reason: RecoveryUnknown::ProviderIdentityMismatch,
-                });
-            };
-            match make_block_loss_snapshot(run, provider, identities, policy.now_unix, false) {
-                Ok(snapshot) => snapshot,
-                Err(_) => {
+            if snapshot.cleanup_covered {
+                let Some(fresh) = inspect_process_table().ok() else {
                     return Ok(AgentRecoveryDisposition::Unresolved {
                         reason: RecoveryUnknown::ProcessInspectionUnavailable,
                     });
+                };
+                if cleanup_absence_confirmed(&snapshot, &fresh) {
+                    let released = store.reconcile_missing_agent_block(
+                        owner_generation,
+                        run,
+                        policy.now_unix,
+                        &snapshot,
+                        &[],
+                    )?;
+                    if released {
+                        runtime.fork_watches.remove(&run.agent_run_id);
+                        return Ok(AgentRecoveryDisposition::BlockLossTerminal);
+                    }
                 }
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                });
             }
+            snapshot
+        }
+        None => {
+            make_block_loss_snapshot(run, provider, launch_tree.clone(), policy.now_unix, false)?
         }
     };
-    let before_extend = snapshot.process_tree.len();
-    let Some(extended) = (match extend_process_tree(&snapshot.process_tree, current) {
+    if runtime
+        .run_fork_watch(run, &provider.process_tree_digest, snapshot_exists)
+        .is_none()
+    {
+        return stop_known_processes_without_watch(
+            store,
+            run,
+            owner_generation,
+            policy,
+            &spool,
+            snapshot,
+            current,
+            RecoveryUnknown::ProcessInspectionUnavailable,
+        );
+    }
+    let mut watch_healthy = !runtime
+        .fork_watches
+        .get(&run.agent_run_id)
+        .is_some_and(|watch| watch.invalidated);
+    let registration_table = inspect_process_table().unwrap_or_else(|_| current.to_vec());
+    let watch_seed = if snapshot_exists {
+        snapshot.process_tree.as_slice()
+    } else {
+        launch_tree.as_slice()
+    };
+    {
+        let watch = runtime.fork_watches.get_mut(&run.agent_run_id).unwrap();
+        watch_healthy &= watch.arm(watch_seed, &registration_table);
+    }
+    let fresh = match inspect_process_table() {
+        Ok(processes) => processes,
+        Err(_) => {
+            runtime
+                .fork_watches
+                .get_mut(&run.agent_run_id)
+                .unwrap()
+                .invalidated = true;
+            return stop_known_processes_without_watch(
+                store,
+                run,
+                owner_generation,
+                policy,
+                &spool,
+                snapshot,
+                current,
+                RecoveryUnknown::ProcessInspectionUnavailable,
+            );
+        }
+    };
+    {
+        let watch = runtime.fork_watches.get_mut(&run.agent_run_id).unwrap();
+        watch_healthy &= watch.arm(watch_seed, &fresh);
+        watch_healthy &= watch.drain_events();
+        if !watch.watches_identity(provider.provider_pid, &provider.provider_start_identity) {
+            watch_healthy = false;
+        }
+    }
+    let Some(extended) = (match extend_process_tree(&snapshot.process_tree, &fresh) {
         Ok(extended) => extended,
         Err(_) => None,
     }) else {
-        return Ok(AgentRecoveryDisposition::Unresolved {
-            reason: RecoveryUnknown::ProcessInspectionUnavailable,
-        });
+        if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
+            watch.invalidated = true;
+        }
+        return stop_known_processes_without_watch(
+            store,
+            run,
+            owner_generation,
+            policy,
+            &spool,
+            snapshot,
+            &fresh,
+            RecoveryUnknown::ProcessInspectionUnavailable,
+        );
     };
-    if extended.len() > 1024 {
+    if extended.len() > MAX_FORK_WATCH_IDENTITIES {
+        if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
+            watch.invalidated = true;
+        }
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
     snapshot.process_tree = extended;
-    if snapshot.process_tree.len() > before_extend {
-        snapshot.cleanup_covered = false;
-    }
     snapshot.observed_at_unix = policy.now_unix;
     snapshot.process_tree_digest = match digest_process_tree(&snapshot.process_tree) {
         Ok(digest) => digest,
@@ -558,66 +923,235 @@ fn reconcile_missing_block(
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
-    // Persist the cumulative identities before any signal can be sent.
+    // Watch every live identity discovered by this sample before persisting it or signalling.
+    if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
+        watch_healthy &= watch.arm(&snapshot.process_tree, &fresh);
+        watch_healthy &= watch.drain_events();
+    } else {
+        watch_healthy = false;
+    }
+    snapshot.cleanup_covered = false;
     if spool.write_block_loss_cleanup_snapshot(&snapshot).is_err() {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
-    let survivors = crate::process::matching_processes(&snapshot.process_tree, current);
-    if cleanup_absence_confirmed(&snapshot, current) {
-        let released = store.reconcile_missing_agent_block(
+    let mut survivors = crate::process::matching_processes(&snapshot.process_tree, &fresh);
+    if !survivors.is_empty() {
+        // Persist the observed survivor before signalling: a fast TERM exit must still leave
+        // the process-survived fact and the original escalation clock in the store.
+        store.reconcile_missing_agent_block(
             owner_generation,
             run,
             policy.now_unix,
             &snapshot,
             &survivors,
         )?;
-        if released {
-            return Ok(AgentRecoveryDisposition::BlockLossTerminal);
+        let groups = snapshot
+            .process_tree
+            .iter()
+            .map(|process| process.process_group_id)
+            .collect::<BTreeSet<_>>();
+        let signal = if store.missing_block_survival_age_seconds(run, policy.now_unix)? >= 3 {
+            ProcessSignal::Kill
+        } else {
+            ProcessSignal::Terminate
+        };
+        for group_id in groups {
+            if signal_process_group_if_observed(group_id, &snapshot.process_tree, &fresh, signal)
+                .is_err()
+            {
+                watch_healthy = false;
+            }
         }
     }
-    if survivors.is_empty() {
-        return Ok(AgentRecoveryDisposition::Unresolved {
-            reason: RecoveryUnknown::ProcessInspectionUnavailable,
-        });
-    }
-    let groups = snapshot
-        .process_tree
-        .iter()
-        .map(|process| process.process_group_id)
-        .collect::<BTreeSet<_>>();
-    let signal = if store.missing_block_survival_age_seconds(run, policy.now_unix)? >= 3 {
-        ProcessSignal::Kill
+    if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
+        watch_healthy &= watch.drain_events();
     } else {
-        ProcessSignal::Terminate
-    };
-    let mut signalled = false;
-    for group_id in groups {
-        signalled |=
-            signal_process_group_if_observed(group_id, &snapshot.process_tree, current, signal)
-                .map_err(|error| error.to_string())?;
+        watch_healthy = false;
     }
-    if !signalled {
+    let final_table = match inspect_process_table() {
+        Ok(processes) => processes,
+        Err(_) => {
+            return store_survival_or_unresolved(
+                store,
+                owner_generation,
+                run,
+                policy.now_unix,
+                &snapshot,
+                &survivors,
+            );
+        }
+    };
+    let Some(final_tree) = (match extend_process_tree(&snapshot.process_tree, &final_table) {
+        Ok(tree) => tree,
+        Err(_) => None,
+    }) else {
+        if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
+            watch.invalidated = true;
+        }
+        return store_survival_or_unresolved(
+            store,
+            owner_generation,
+            run,
+            policy.now_unix,
+            &snapshot,
+            &survivors,
+        );
+    };
+    if final_tree.len() > MAX_FORK_WATCH_IDENTITIES {
+        return store_survival_or_unresolved(
+            store,
+            owner_generation,
+            run,
+            policy.now_unix,
+            &snapshot,
+            &survivors,
+        );
+    }
+    snapshot.process_tree = final_tree;
+    survivors = crate::process::matching_processes(&snapshot.process_tree, &final_table);
+    if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
+        watch_healthy &= watch.arm(&snapshot.process_tree, &final_table);
+        watch_healthy &= watch.drain_events();
+        watch_healthy &= !watch.invalidated;
+    } else {
+        watch_healthy = false;
+    }
+    if !survivors.is_empty() {
+        snapshot.process_tree_digest = match digest_process_tree(&snapshot.process_tree) {
+            Ok(digest) => digest,
+            Err(_) => {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                });
+            }
+        };
+        snapshot.observed_at_unix = policy.now_unix;
+        if spool.write_block_loss_cleanup_snapshot(&snapshot).is_err() {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProcessInspectionUnavailable,
+            });
+        }
+        return store_survival_or_unresolved(
+            store,
+            owner_generation,
+            run,
+            policy.now_unix,
+            &snapshot,
+            &survivors,
+        );
+    }
+    let sealed = runtime
+        .fork_watches
+        .get_mut(&run.agent_run_id)
+        .is_some_and(|watch| {
+            watch_healthy && watch.seal_cleanup_if_absent(&mut snapshot, &final_table)
+        });
+    if !sealed {
+        snapshot.process_tree_digest = match digest_process_tree(&snapshot.process_tree) {
+            Ok(digest) => digest,
+            Err(_) => {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                });
+            }
+        };
+        snapshot.observed_at_unix = policy.now_unix;
+        let _ = spool.write_block_loss_cleanup_snapshot(&snapshot);
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
-    snapshot.cleanup_covered = true;
+    snapshot.process_tree_digest = match digest_process_tree(&snapshot.process_tree) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProcessInspectionUnavailable,
+            });
+        }
+    };
     snapshot.observed_at_unix = policy.now_unix;
     if spool.write_block_loss_cleanup_snapshot(&snapshot).is_err() {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
-    store.reconcile_missing_agent_block(
+    let released = store.reconcile_missing_agent_block(
         owner_generation,
         run,
         policy.now_unix,
         &snapshot,
-        &survivors,
+        &[],
     )?;
+    if released {
+        runtime.fork_watches.remove(&run.agent_run_id);
+        return Ok(AgentRecoveryDisposition::BlockLossTerminal);
+    }
     Ok(AgentRecoveryDisposition::BlockLossStopping)
+}
+
+fn stop_known_processes_without_watch(
+    store: &mut ConfigStore,
+    run: &RecoverableAgentRun,
+    owner_generation: u64,
+    policy: &RecoveryPolicy,
+    spool: &RunStepSpool,
+    mut snapshot: BlockLossCleanupSnapshot,
+    current: &[ProcessIdentity],
+    reason: RecoveryUnknown,
+) -> Result<AgentRecoveryDisposition, String> {
+    snapshot.cleanup_covered = false;
+    let _ = spool.write_block_loss_cleanup_snapshot(&snapshot);
+    let survivors = crate::process::matching_processes(&snapshot.process_tree, current);
+    if !survivors.is_empty() {
+        let signal = if store.missing_block_survival_age_seconds(run, policy.now_unix)? >= 3 {
+            ProcessSignal::Kill
+        } else {
+            ProcessSignal::Terminate
+        };
+        for group_id in snapshot
+            .process_tree
+            .iter()
+            .map(|process| process.process_group_id)
+            .collect::<BTreeSet<_>>()
+        {
+            let _ =
+                signal_process_group_if_observed(group_id, &snapshot.process_tree, current, signal);
+        }
+        return store_survival_or_unresolved(
+            store,
+            owner_generation,
+            run,
+            policy.now_unix,
+            &snapshot,
+            &survivors,
+        );
+    }
+    Ok(AgentRecoveryDisposition::Unresolved { reason })
+}
+
+fn store_survival_or_unresolved(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &RecoverableAgentRun,
+    observed_at_unix: i64,
+    snapshot: &BlockLossCleanupSnapshot,
+    survivors: &[ProcessIdentity],
+) -> Result<AgentRecoveryDisposition, String> {
+    if !survivors.is_empty() {
+        store.reconcile_missing_agent_block(
+            owner_generation,
+            run,
+            observed_at_unix,
+            snapshot,
+            survivors,
+        )?;
+        return Ok(AgentRecoveryDisposition::BlockLossStopping);
+    }
+    Ok(AgentRecoveryDisposition::Unresolved {
+        reason: RecoveryUnknown::ProcessInspectionUnavailable,
+    })
 }
 
 fn make_block_loss_snapshot(
@@ -628,7 +1162,7 @@ fn make_block_loss_snapshot(
     cleanup_covered: bool,
 ) -> Result<BlockLossCleanupSnapshot, String> {
     let snapshot = BlockLossCleanupSnapshot {
-        schema_version: 1,
+        schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
         agent_run_id: run.agent_run_id.clone(),
         reservation_epoch: run.reservation_epoch,
         authority_digest: run.authority_digest.clone(),
@@ -647,6 +1181,7 @@ fn digest_process_tree(process_tree: &[ProcessIdentity]) -> Result<Digest, Strin
     Digest::parse(format!("{:x}", Sha256::digest(bytes)))
 }
 
+#[cfg(test)]
 fn initial_cleanup_tree(
     provider_pid: u32,
     provider_start_identity: &str,
@@ -1268,7 +1803,7 @@ mod tests {
         let _ = provider.wait();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn block_loss_snapshot_can_miss_child_forked_before_cleanup_signal() {
         let root = tempfile::tempdir().unwrap();
@@ -1290,6 +1825,12 @@ mod tests {
         .unwrap();
         let mut snapshot = make_test_snapshot(sampled_tree, false);
         spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        let mut watch = RunForkWatch::new(
+            &snapshot.authority_digest,
+            snapshot.reservation_epoch,
+            &snapshot.launch_tree_digest,
+        );
+        assert!(watch.arm(&snapshot.process_tree, &sampled_process_table));
 
         // This creates the descendant strictly after the production capture, but before its
         // signal operation. Job control puts the child in a different process group.
@@ -1314,7 +1855,7 @@ mod tests {
             &inspect_process_table().unwrap(),
         )
         .is_empty();
-        snapshot.cleanup_covered = signal_observed;
+        let fork_invalidated_watch = !watch.drain_events();
         snapshot.observed_at_unix += 1;
         spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
 
@@ -1329,6 +1870,14 @@ mod tests {
         next_snapshot.process_tree = next_tree;
         next_snapshot.process_tree_digest =
             digest_process_tree(&next_snapshot.process_tree).unwrap();
+        assert!(
+            fork_invalidated_watch,
+            "NOTE_FORK must invalidate the proof"
+        );
+        assert!(
+            !watch.seal_cleanup_if_absent(&mut next_snapshot, &next_process_table),
+            "a forked run must not seal even if the old sample appears absent"
+        );
         let cleanup_would_release = cleanup_absence_confirmed(&next_snapshot, &next_process_table);
 
         // The test owns this child, including the deliberately uncovered race case.
@@ -1364,6 +1913,75 @@ mod tests {
             !cleanup_would_release,
             "cleanup must not release while the untracked child survives"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fork_watch_seals_only_fresh_absence_and_restart_cannot_rearm() {
+        use std::os::unix::process::CommandExt;
+
+        let mut provider = TrackedChild::new(
+            Command::new("/bin/sleep")
+                .arg("300")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let identity = wait_for_identity(provider.id());
+        let mut snapshot = make_test_snapshot(vec![identity.clone()], false);
+        let mut watch = RunForkWatch::new(
+            &snapshot.authority_digest,
+            snapshot.reservation_epoch,
+            &snapshot.launch_tree_digest,
+        );
+        assert!(watch.arm(&snapshot.process_tree, &inspect_process_table().unwrap()));
+        let before_stop = inspect_process_table().unwrap();
+        assert!(
+            signal_process_group_if_observed(
+                identity.process_group_id,
+                std::slice::from_ref(&identity),
+                &before_stop,
+                ProcessSignal::Terminate,
+            )
+            .unwrap()
+        );
+        assert!(wait_until_processes_absent(std::slice::from_ref(&identity)));
+        let after_stop = inspect_process_table().unwrap();
+        assert!(watch.seal_cleanup_if_absent(&mut snapshot, &after_stop));
+        assert!(cleanup_absence_confirmed(&snapshot, &after_stop));
+
+        let mut recovered = RunForkWatch::unavailable(
+            &snapshot.authority_digest,
+            snapshot.reservation_epoch,
+            &snapshot.launch_tree_digest,
+        );
+        snapshot.cleanup_covered = false;
+        assert!(!recovered.arm(&snapshot.process_tree, &after_stop));
+        assert!(!recovered.seal_cleanup_if_absent(&mut snapshot, &after_stop));
+        assert!(!cleanup_absence_confirmed(&snapshot, &after_stop));
+        let _ = provider.wait();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_fork_watch_platform_fails_closed() {
+        let process = ProcessIdentity {
+            pid: 42,
+            parent_pid: 1,
+            process_group_id: 42,
+            start_identity: "birth-42".into(),
+            command: String::new(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let mut snapshot = make_test_snapshot(vec![process.clone()], false);
+        let mut watch = RunForkWatch::new(
+            &snapshot.authority_digest,
+            snapshot.reservation_epoch,
+            &snapshot.launch_tree_digest,
+        );
+        assert!(!watch.arm(&snapshot.process_tree, std::slice::from_ref(&process)));
+        assert!(!watch.seal_cleanup_if_absent(&mut snapshot, &[]));
+        assert!(!cleanup_absence_confirmed(&snapshot, &[]));
     }
 
     #[cfg(unix)]
@@ -1488,7 +2106,7 @@ mod tests {
     ) -> BlockLossCleanupSnapshot {
         let process_tree_digest = digest_process_tree(&process_tree).unwrap();
         BlockLossCleanupSnapshot {
-            schema_version: 1,
+            schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
             agent_run_id: AgentRunId::parse("run-test").unwrap(),
             reservation_epoch: 1,
             authority_digest: Digest::parse("a".repeat(64)).unwrap(),

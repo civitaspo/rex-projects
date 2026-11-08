@@ -1785,7 +1785,7 @@ mod tests {
             ))
             .unwrap();
             crate::run_step_spool::BlockLossCleanupSnapshot {
-                schema_version: 1,
+                schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
                 agent_run_id: run.agent_run_id.clone(),
                 reservation_epoch: run.reservation_epoch,
                 authority_digest: run.authority_digest.clone(),
@@ -1932,7 +1932,7 @@ mod tests {
             quality: process.identity_quality,
         })
         .collect::<Vec<_>>();
-        let snapshot_with_survivor = make_cleanup_snapshot(&recoverable, launch_tree, true, 22);
+        let snapshot_with_survivor = make_cleanup_snapshot(&recoverable, launch_tree, false, 22);
         assert!(matches!(
             store
                 .reconcile_missing_agent_block(
@@ -1963,6 +1963,12 @@ mod tests {
             .unwrap();
         assert_eq!(retained, "launch_pending");
         assert_eq!(unrelated, "unknown");
+        assert_eq!(
+            store
+                .missing_block_survival_age_seconds(&recoverable, 26)
+                .unwrap(),
+            4
+        );
         assert!(
             store
                 .reconcile_missing_agent_block(
@@ -1970,6 +1976,19 @@ mod tests {
                     &recoverable,
                     26,
                     &snapshot_with_survivor,
+                    &[],
+                )
+                .is_err()
+        );
+        let mut completed_snapshot = snapshot_with_survivor;
+        completed_snapshot.cleanup_covered = true;
+        assert!(
+            store
+                .reconcile_missing_agent_block(
+                    generation,
+                    &recoverable,
+                    26,
+                    &completed_snapshot,
                     &[],
                 )
                 .unwrap()

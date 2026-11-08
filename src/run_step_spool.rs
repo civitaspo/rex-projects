@@ -19,6 +19,7 @@ use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::run_step::{RunReceipt, TurnResult};
 
 const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const BLOCK_LOSS_SNAPSHOT_VERSION: u32 = 2;
 const MAX_START_BYTES: usize = 32 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_BLOCK_LOSS_SNAPSHOT_BYTES: usize = 512 * 1024;
@@ -68,7 +69,7 @@ pub struct BlockLossCleanupSnapshot {
 
 impl BlockLossCleanupSnapshot {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != PROTOCOL_VERSION
+        if self.schema_version != BLOCK_LOSS_SNAPSHOT_VERSION
             || self.reservation_epoch == 0
             || self.observed_at_unix < 0
             || self.process_tree.is_empty()
@@ -569,8 +570,8 @@ fn sync_directory(_path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentTurnResult, BlockLossCleanupSnapshot, RunStepSpool, StartReceiptEnvelope,
-        StartRequestEnvelope,
+        AgentTurnResult, BLOCK_LOSS_SNAPSHOT_VERSION, BlockLossCleanupSnapshot, RunStepSpool,
+        StartReceiptEnvelope, StartRequestEnvelope,
     };
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId};
     use crate::launch::{AgentLaunchReceipt, AgentStartRequest, LaunchDecision};
@@ -616,7 +617,7 @@ mod tests {
     fn cleanup_snapshot(process_tree: Vec<ProcessIdentity>) -> BlockLossCleanupSnapshot {
         let bytes = serde_json::to_vec(&process_tree).unwrap();
         BlockLossCleanupSnapshot {
-            schema_version: 1,
+            schema_version: BLOCK_LOSS_SNAPSHOT_VERSION,
             agent_run_id: AgentRunId::parse("run-1").unwrap(),
             reservation_epoch: 2,
             authority_digest: digest('a'),
@@ -792,5 +793,24 @@ mod tests {
         let path = spool.directory().join("block-loss-cleanup.json");
         std::fs::write(path, b"{\"schema_version\":1}").unwrap();
         assert!(spool.read_block_loss_cleanup_snapshot().is_err());
+    }
+
+    #[test]
+    fn legacy_signal_only_snapshot_cannot_prove_cleanup() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let mut legacy = cleanup_snapshot(vec![process(20, "birth-20", 20)]);
+        legacy.schema_version = 1;
+        legacy.cleanup_covered = true;
+        let path = spool.directory().join("block-loss-cleanup.json");
+        std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(spool.read_block_loss_cleanup_snapshot().is_err());
+        let mut replacement = legacy;
+        replacement.schema_version = BLOCK_LOSS_SNAPSHOT_VERSION;
+        assert!(
+            spool
+                .write_block_loss_cleanup_snapshot(&replacement)
+                .is_err()
+        );
     }
 }
