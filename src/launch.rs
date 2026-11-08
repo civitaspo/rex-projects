@@ -143,7 +143,9 @@ impl AgentLaunchReservation {
             || self.mailbox_max_pending_requests == 0
             || self.global_capacity == 0
             || self.project_capacity == 0
-            || !matches!(self.pool.as_str(), "agent" | "rex_projects_hook")
+            || self.pool != "agent"
+            || self.role_session_id.trim().is_empty()
+            || self.role_session_id.chars().any(char::is_control)
         {
             return Err("Agent launch reservation has an invalid schema, counter, or limit".into());
         }
@@ -869,7 +871,7 @@ impl AgentLaunchAuthority {
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("parent AgentRun ID and role must be present together".into());
         }
-        validate_launch_parent_role(self.role, self.parent_role)?;
+        validate_historical_authority_parent_role(self.role, self.parent_role)?;
         if self.role == Role::Supervisor {
             if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {
                 return Err("Project Supervisor launch authority cannot have a TicketRun".into());
@@ -900,6 +902,12 @@ impl AgentLaunchAuthority {
             }
         }
         Ok(())
+    }
+
+    /// Validate topology for a newly-created authority. Persisted v7 authorities are read
+    /// through `validate`, which preserves their historical Operator/Supervisor edge.
+    pub(crate) fn validate_new_launch_topology(&self) -> Result<(), String> {
+        validate_launch_parent_role(self.role, self.parent_role)
     }
 
     pub fn digest(&self) -> Result<ContentDigest, String> {
@@ -988,6 +996,16 @@ fn validate_launch_parent_role(child_role: Role, parent_role: Option<Role>) -> R
         ));
     }
     Ok(())
+}
+
+fn validate_historical_authority_parent_role(
+    child_role: Role,
+    parent_role: Option<Role>,
+) -> Result<(), String> {
+    if child_role == Role::Operator && parent_role == Some(Role::Supervisor) {
+        return Ok(());
+    }
+    validate_launch_parent_role(child_role, parent_role)
 }
 
 /// The process wrapper's start observation. It contains identity facts only, never environment
@@ -1237,6 +1255,11 @@ mod tests {
         }
         assert!(validate_launch_parent_role(Role::Supervisor, Some(Role::Coordinator)).is_err());
         assert!(validate_launch_parent_role(Role::Coordinator, Some(Role::Planner)).is_err());
+        let mut historical = authority();
+        historical.role = Role::Operator;
+        historical.parent_role = Some(Role::Supervisor);
+        assert!(historical.validate().is_ok());
+        assert!(historical.validate_new_launch_topology().is_err());
     }
 
     fn qualification(status: QualificationStatus) -> ProviderQualification {

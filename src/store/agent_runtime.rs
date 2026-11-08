@@ -42,6 +42,24 @@ impl ConfigStore {
             );
         }
         reservation.validate()?;
+        let mailbox_descriptor = crate::mailbox::MailboxDescriptor {
+            schema_version: 1,
+            run_id: reservation.agent_run_id.as_str().to_owned(),
+            expires_at_unix: reservation.mailbox_expires_at_unix,
+            max_request_bytes: usize::try_from(reservation.mailbox_max_request_bytes)
+                .map_err(|error| error.to_string())?,
+            max_pending_requests: usize::try_from(reservation.mailbox_max_pending_requests)
+                .map_err(|error| error.to_string())?,
+        };
+        let mailbox_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&mailbox_descriptor).map_err(|error| error.to_string())?
+            )
+        ))?;
+        if mailbox_digest != reservation.mailbox_capability_digest {
+            return Err("mailbox capability digest does not match the launch descriptor".into());
+        }
         let reservation_digest = reservation.digest()?;
         let control_dir = std::fs::canonicalize(&reservation.control_dir)
             .map_err(|error| format!("canonicalize control directory: {error}"))?;
@@ -194,6 +212,7 @@ impl ConfigStore {
             return Err("provider qualification does not match launch Project/profile".into());
         }
         qualification.validate_for_unattended_launch()?;
+        validate_qualification_profile(&qualification, profile)?;
 
         let prior: Option<(String,String)> = tx.query_row(
             "SELECT reservation_digest,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
@@ -345,7 +364,7 @@ impl ConfigStore {
             ));
         }
         let mut statement = self.connection.prepare(
-            "SELECT wake_input_id,source_type,source_id,source_revision,priority,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND lifecycle='pending' ORDER BY priority DESC,wake_input_id ASC LIMIT ?3",
+            "SELECT wake_input_id,source_type,source_id,source_revision,priority,payload_json FROM (SELECT wake_input_id,source_type,source_id,source_revision,priority,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND lifecycle='pending' ORDER BY priority DESC,wake_input_id ASC LIMIT ?3) ORDER BY wake_input_id ASC",
         ).map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(
@@ -472,6 +491,7 @@ impl ConfigStore {
         }
         let reservation: AgentLaunchReservation = crate::protocol::parse_unique(json.as_bytes())
             .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+        validate_project_launch_epoch(&tx, &reservation.project_id, reservation.project_epoch)?;
         if reservation.digest()? != *reservation_digest
             || !authority_matches_reservation(authority, &reservation)
         {
@@ -517,6 +537,26 @@ impl ConfigStore {
     }
 }
 
+pub(super) fn validate_project_launch_epoch(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    expected_epoch: u64,
+) -> Result<(), String> {
+    let state: Option<(String, String, u64)> = tx
+        .query_row(
+            "SELECT p.desired_lifecycle,r.observed_lifecycle,r.project_epoch FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+            [project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if !matches!(state, Some((ref desired, ref observed, epoch)) if desired == "running" && matches!(observed.as_str(), "running" | "starting") && epoch == expected_epoch)
+    {
+        return Err("Project lifecycle or epoch changed before Agent launch authorization".into());
+    }
+    Ok(())
+}
+
 fn load_exact_wake_inputs(
     tx: &rusqlite::Transaction<'_>,
     reservation: &AgentLaunchReservation,
@@ -547,7 +587,27 @@ fn load_exact_wake_inputs(
     Ok(inputs)
 }
 
-fn authority_matches_reservation(
+pub(super) fn validate_qualification_profile(
+    qualification: &crate::launch::ProviderQualification,
+    profile: &crate::config::Profile,
+) -> Result<(), String> {
+    let identity = crate::run_step::profile_runtime_identity(profile)
+        .map_err(|error| format!("derive launch profile runtime identity: {error}"))?;
+    if qualification.adapter != identity.adapter
+        || qualification.executable_path != identity.executable_path.to_string_lossy()
+        || qualification.executable_digest != identity.executable_digest
+        || qualification.commit_mode != identity.commit_mode
+        || qualification.invocation_options_digest != identity.invocation_options_digest
+        || qualification.permission_mode != identity.effective_permission_mode
+    {
+        return Err(
+            "provider qualification does not match the applied profile runtime identity".into(),
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn authority_matches_reservation(
     authority: &AgentLaunchAuthority,
     reservation: &AgentLaunchReservation,
 ) -> bool {
@@ -588,7 +648,7 @@ mod tests {
     use super::{ConfigStore, LaunchPreparationOutcome};
     use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision};
-    use crate::domain::types::{AgentAdapter, CommitMode, Role};
+    use crate::domain::types::Role;
     use crate::launch::{
         AgentLaunchAuthority, AgentLaunchReservation, AgentStartRequest, ObservedWrapperIdentity,
         ProviderQualification, QualificationProof, QualificationStatus, RexBlockLifecycle,
@@ -596,8 +656,69 @@ mod tests {
     };
     use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
 
+    #[test]
+    fn priority_selection_returns_snapshot_compatible_ascending_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot("factory", &applied(), ExpectedRevision::Bootstrap)
+            .unwrap();
+        let project = ProjectId::parse("project-a").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: digest('b'),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        for (id, priority) in [(10, 1), (20, 9), (30, 0)] {
+            store.connection.execute(
+                "INSERT INTO role_wake_inputs(wake_input_id,project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'session','human',?3,1,?4,'{}','pending',0)",
+                rusqlite::params![id, project.as_str(), format!("source-{id}"), priority],
+            ).unwrap();
+        }
+        let selected = store
+            .pending_role_wake_inputs(&project, "session", 2)
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|input| (input.wake_input_id, input.priority))
+                .collect::<Vec<_>>(),
+            vec![(10, 1), (20, 9)]
+        );
+    }
+
     fn digest(ch: char) -> Digest {
         Digest::parse(ch.to_string().repeat(64)).unwrap()
+    }
+
+    fn set_project_lifecycle(
+        store: &ConfigStore,
+        project: &ProjectId,
+        desired: &str,
+        observed: &str,
+        epoch: u64,
+    ) {
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET desired_lifecycle=?2 WHERE project_id=?1",
+                rusqlite::params![project.as_str(), desired],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE project_runtimes SET desired_lifecycle=?2,observed_lifecycle=?3,project_epoch=?4 WHERE project_id=?1",
+                rusqlite::params![project.as_str(), desired, observed, epoch],
+            )
+            .unwrap();
     }
 
     fn applied() -> AppliedConfig {
@@ -607,7 +728,7 @@ mod tests {
             "projects":{"project-a":{"mode":"operations","ticket_adapter":"tickets","roles":{"supervisor":"supervisor","reviewer":"reviewer"}}}
         })).unwrap();
         let profile = serde_json::from_value::<Profile>(serde_json::json!({
-            "adapter":"codex","command":["/usr/bin/codex"],"model":"fixture",
+            "adapter":"codex","command":[std::env::current_exe().unwrap().display().to_string()],"model":"fixture",
             "commit_mode":"native","turn_timeout_seconds":60
         }))
         .unwrap();
@@ -697,36 +818,33 @@ mod tests {
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
         let profile_id = ProfileId::parse("supervisor").unwrap();
+        let profile = store
+            .load_snapshot("factory")
+            .unwrap()
+            .unwrap()
+            .config
+            .profiles
+            .get(&profile_id)
+            .unwrap()
+            .clone();
         let profile_digest = Digest::parse(format!(
             "{:x}",
-            sha2::Sha256::digest(
-                crate::store::canonical_json(
-                    store
-                        .load_snapshot("factory")
-                        .unwrap()
-                        .unwrap()
-                        .config
-                        .profiles
-                        .get(&profile_id)
-                        .unwrap()
-                )
-                .unwrap()
-                .as_bytes()
-            )
+            sha2::Sha256::digest(crate::store::canonical_json(&profile).unwrap().as_bytes())
         ))
         .unwrap();
+        let profile_identity = crate::run_step::profile_runtime_identity(&profile).unwrap();
         let qualification = ProviderQualification {
             schema_version: 1,
             project_id: project.clone(),
             profile_id: profile_id.clone(),
             profile_digest: profile_digest.clone(),
-            adapter: AgentAdapter::Codex,
-            executable_path: "/usr/bin/codex".into(),
-            executable_digest: digest('c'),
+            adapter: profile_identity.adapter,
+            executable_path: profile_identity.executable_path.display().to_string(),
+            executable_digest: profile_identity.executable_digest.clone(),
             provider_version: "fixture-1".into(),
-            permission_mode: "workspace_write".into(),
-            invocation_options_digest: digest('d'),
-            commit_mode: CommitMode::Native,
+            permission_mode: profile_identity.effective_permission_mode.into(),
+            invocation_options_digest: profile_identity.invocation_options_digest.clone(),
+            commit_mode: profile_identity.commit_mode,
             proof: QualificationProof {
                 schema_version: 1,
                 probe_id: "probe-a".into(),
@@ -739,7 +857,7 @@ mod tests {
                 automatic_turn_result_digest: digest('2'),
                 automatic_turn_completed: true,
                 structured_result_valid: true,
-                observed_permission_mode: "workspace_write".into(),
+                observed_permission_mode: profile_identity.effective_permission_mode.into(),
                 permission_prompt_count: 0,
                 cleanup_process_tree_digest: digest('3'),
                 process_tree_absent: true,
@@ -761,6 +879,19 @@ mod tests {
         };
         let mut wake_snapshot = wake_snapshot;
         wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+        let mailbox_expires_at_unix = (crate::store::now_unix().unwrap() + 86_400) as u64;
+        let mailbox_descriptor = crate::mailbox::MailboxDescriptor {
+            schema_version: 1,
+            run_id: run_id.as_str().to_owned(),
+            expires_at_unix: mailbox_expires_at_unix,
+            max_request_bytes: 1_048_576,
+            max_pending_requests: 32,
+        };
+        let mailbox_capability_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&mailbox_descriptor).unwrap())
+        ))
+        .unwrap();
         let reservation = AgentLaunchReservation {
             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
             agent_run_id: run_id.clone(),
@@ -793,8 +924,8 @@ mod tests {
             workspace_path: temp.path().join("workspace"),
             control_dir: temp.path().join("control"),
             mailbox_directory: temp.path().join("control"),
-            mailbox_capability_digest: digest('8'),
-            mailbox_expires_at_unix: (crate::store::now_unix().unwrap() + 86_400) as u64,
+            mailbox_capability_digest,
+            mailbox_expires_at_unix,
             mailbox_max_request_bytes: 1_048_576,
             mailbox_max_pending_requests: 32,
             pool: "agent".into(),
@@ -802,6 +933,57 @@ mod tests {
             global_capacity: 1,
             project_capacity: 1,
         };
+
+        let mut qualification_mismatch = qualification.clone();
+        qualification_mismatch.executable_digest = digest('c');
+        let mismatched_qualification_digest = store
+            .store_provider_qualification(generation, &qualification_mismatch)
+            .unwrap();
+        let mut mismatched_provider = reservation.clone();
+        mismatched_provider.qualification_receipt_digest = mismatched_qualification_digest;
+        assert!(
+            store
+                .prepare_role_launch(&mismatched_provider)
+                .unwrap_err()
+                .contains("applied profile runtime identity")
+        );
+
+        let mut hook_pool = reservation.clone();
+        hook_pool.pool = "rex_projects_hook".into();
+        assert!(
+            store
+                .prepare_role_launch(&hook_pool)
+                .unwrap_err()
+                .contains("invalid schema")
+        );
+        let mut wrong_mailbox = reservation.clone();
+        wrong_mailbox.mailbox_capability_digest = digest('8');
+        assert!(
+            store
+                .prepare_role_launch(&wrong_mailbox)
+                .unwrap_err()
+                .contains("mailbox capability digest")
+        );
+        let mut control_session = reservation.clone();
+        control_session.role_session_id = "supervisor\n".into();
+        control_session.wake_snapshot.role_session_id = control_session.role_session_id.clone();
+        control_session.wake_snapshot.digest =
+            control_session.wake_snapshot.content_digest().unwrap();
+        assert!(
+            store
+                .prepare_role_launch(&control_session)
+                .unwrap_err()
+                .contains("invalid schema")
+        );
+        let launch_side_effects: u64 = store
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM agent_launch_reservations) + (SELECT COUNT(*) FROM execution_slots) + (SELECT COUNT(*) FROM effects WHERE kind='start_agent')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(launch_side_effects, 0);
 
         // A real reservation with a database-backed Planner parent must not accept the
         // impossible Reviewer -> Planner edge or leave any durable launch side effects.
@@ -991,7 +1173,7 @@ mod tests {
 
         let authority = AgentLaunchAuthority {
             agent_run_id: run_id.clone(),
-            project_id: project,
+            project_id: project.clone(),
             role: Role::Supervisor,
             role_session_id: reservation.role_session_id.clone(),
             parent_run_id: None,
@@ -1024,6 +1206,25 @@ mod tests {
             control_dir: reservation.control_dir.clone(),
             mailbox_capability_digest: reservation.mailbox_capability_digest.clone(),
         };
+        for inconsistent in [
+            {
+                let mut changed = authority.clone();
+                changed.wake_snapshot_digest = digest('1');
+                changed
+            },
+            {
+                let mut changed = authority.clone();
+                changed.attempt += 1;
+                changed
+            },
+        ] {
+            assert!(
+                store
+                    .register_agent_launch_authority(generation, &inconsistent)
+                    .unwrap_err()
+                    .contains("immutable reservation")
+            );
+        }
         store
             .register_agent_launch_authority(generation, &authority)
             .unwrap();
@@ -1096,6 +1297,23 @@ mod tests {
                 },
             )
             .unwrap();
+        for (desired, observed_lifecycle, epoch) in
+            [("paused", "paused", 1), ("running", "running", 2)]
+        {
+            set_project_lifecycle(&store, &project, desired, observed_lifecycle, epoch);
+            assert!(
+                store
+                    .finalize_agent_launch_reservation(
+                        generation,
+                        &run_id,
+                        &reservation_digest,
+                        &authority,
+                    )
+                    .unwrap_err()
+                    .contains("Project lifecycle or epoch changed")
+            );
+        }
+        set_project_lifecycle(&store, &project, "running", "running", 1);
         assert!(
             store
                 .authorize_agent_start(generation, &request, &observed)
@@ -1128,6 +1346,18 @@ mod tests {
                 .authorize_agent_start(generation, &request, &wrong_pid_observation)
                 .is_err()
         );
+        for (desired, observed_lifecycle, epoch) in
+            [("paused", "paused", 1), ("running", "running", 2)]
+        {
+            set_project_lifecycle(&store, &project, desired, observed_lifecycle, epoch);
+            assert!(
+                store
+                    .authorize_agent_start(generation, &request, &observed)
+                    .unwrap_err()
+                    .contains("Project lifecycle or epoch changed")
+            );
+        }
+        set_project_lifecycle(&store, &project, "running", "running", 1);
         assert_eq!(
             store
                 .authorize_agent_start(generation, &request, &observed)

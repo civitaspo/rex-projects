@@ -82,6 +82,7 @@ impl AgentWakeSnapshot {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1
             || self.role_session_id.trim().is_empty()
+            || self.role_session_id.chars().any(char::is_control)
             || self.agent_run_id.trim().is_empty()
         {
             return Err("unsupported or incomplete Agent inbox snapshot".into());
@@ -147,5 +148,24 @@ impl AgentWakeSnapshot {
         ))
         .map_err(|error| error.to_string())?;
         Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentWakeSnapshot;
+    use crate::domain::ids::{Digest, ProjectId};
+
+    #[test]
+    fn wake_snapshot_rejects_control_characters_in_role_session_id() {
+        let snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role_session_id: "supervisor\n".into(),
+            agent_run_id: "run-1".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: Vec::new(),
+        };
+        assert!(snapshot.validate().unwrap_err().contains("incomplete"));
     }
 }
