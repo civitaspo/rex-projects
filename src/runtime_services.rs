@@ -71,7 +71,6 @@ pub struct RuntimeServices {
     rex_cli_path: PathBuf,
     rex_search_path: Vec<PathBuf>,
     state_root: PathBuf,
-    config_dir: PathBuf,
     owner_generation: u64,
     runtime_binary: PathBuf,
     runtime_binary_digest: Digest,
@@ -288,7 +287,6 @@ impl RuntimeServices {
             rex_cli_path: rex_binary,
             rex_search_path: search_path,
             state_root: state_root.to_owned(),
-            config_dir: config_dir.to_owned(),
             owner_generation,
             runtime_binary: runtime_binary.to_owned(),
             runtime_binary_digest: runtime_binary_digest.clone(),
@@ -2210,7 +2208,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             .profiles
             .get(profile_id)
             .ok_or("Supervisor profile is absent from the applied configuration")?;
-        let profile_digest = crate::store::agent_profile_digest(&profile)?;
+        let profile_digest = crate::store::agent_profile_digest(profile)?;
         let runtime_identity = crate::run_step::profile_runtime_identity(profile)
             .map_err(|error| error.to_string())?;
         let qualifications = store.verified_provider_qualifications(
@@ -2904,31 +2902,33 @@ impl RuntimeServices {
         if wake_inputs.is_empty() {
             return Ok(false);
         }
-        let parent_authority = if candidate.role == Role::Coordinator {
-            store.supervisor_parent_for_ticket_run(&candidate.project_id, ticket_run_id)?
-        } else {
-            store.coordinator_child_parent(&candidate.project_id, &candidate.role_session_id)?
+        let expected_parent_role = match candidate.role {
+            Role::Coordinator => Some(Role::Supervisor),
+            Role::Worker => None,
+            _ => Some(Role::Coordinator),
         };
-        let expected_parent_role = if candidate.role == Role::Coordinator {
-            Role::Supervisor
-        } else {
-            Role::Coordinator
-        };
-        if parent_authority.role != expected_parent_role
-            || parent_authority.project_id != candidate.project_id
-            || parent_authority.config_revision != runnable.record.config_revision
-            || parent_authority.config_digest != runnable.record.config_digest
-            || parent_authority
-                .ticket_run_id
-                .as_ref()
-                .is_some_and(|id| id != ticket_run_id)
-            || parent_authority
-                .ticket_revision
-                .is_some_and(|revision| revision.0 != active_run.revision)
-        {
-            return Err(
-                "ticket role parent authority is stale or outside the current TicketRun".into(),
-            );
+        if let Some(expected_parent_role) = expected_parent_role {
+            let parent_authority = if candidate.role == Role::Coordinator {
+                store.supervisor_parent_for_ticket_run(&candidate.project_id, ticket_run_id)?
+            } else {
+                store.coordinator_child_parent(&candidate.project_id, &candidate.role_session_id)?
+            };
+            if parent_authority.role != expected_parent_role
+                || parent_authority.project_id != candidate.project_id
+                || parent_authority.config_revision != runnable.record.config_revision
+                || parent_authority.config_digest != runnable.record.config_digest
+                || parent_authority
+                    .ticket_run_id
+                    .as_ref()
+                    .is_some_and(|id| id != ticket_run_id)
+                || parent_authority
+                    .ticket_revision
+                    .is_some_and(|revision| revision.0 != active_run.revision)
+            {
+                return Err(
+                    "ticket role parent authority is stale or outside the current TicketRun".into(),
+                );
+            }
         }
         let seed = serde_json::to_vec(&(
             "rex-projects-agent-run-v1",
