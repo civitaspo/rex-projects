@@ -1771,10 +1771,49 @@ mod tests {
             .into_iter()
             .find(|run| run.agent_run_id == authority.agent_run_id)
             .unwrap();
+        let make_cleanup_snapshot = |run: &super::super::agent_recovery::RecoverableAgentRun,
+                                     process_tree: Vec<crate::process::ProcessIdentity>,
+                                     cleanup_covered: bool,
+                                     observed_at_unix: i64| {
+            let provider: ObservedProviderStart = crate::protocol::parse_unique(
+                run.provider_tree_json.as_deref().unwrap().as_bytes(),
+            )
+            .unwrap();
+            let process_tree_digest = Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+            ))
+            .unwrap();
+            crate::run_step_spool::BlockLossCleanupSnapshot {
+                schema_version: 1,
+                agent_run_id: run.agent_run_id.clone(),
+                reservation_epoch: run.reservation_epoch,
+                authority_digest: run.authority_digest.clone(),
+                launch_tree_digest: provider.process_tree_digest,
+                observed_at_unix,
+                cleanup_covered,
+                process_tree,
+                process_tree_digest,
+            }
+        };
         let invalid_digest = Digest::parse("f".repeat(64)).unwrap();
+        let mut invalid_snapshot = make_cleanup_snapshot(
+            &recoverable,
+            vec![crate::process::ProcessIdentity {
+                pid: 42,
+                parent_pid: 1,
+                process_group_id: 42,
+                start_identity: "wrapper-start-1".into(),
+                command: String::new(),
+                quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            }],
+            true,
+            22,
+        );
+        invalid_snapshot.process_tree_digest = invalid_digest;
         assert!(
             store
-                .reconcile_missing_agent_block(generation, &recoverable, 22, &[], &invalid_digest,)
+                .reconcile_missing_agent_block(generation, &recoverable, 22, &invalid_snapshot, &[])
                 .is_err()
         );
         let mut without_provider = recoverable.clone();
@@ -1792,16 +1831,28 @@ mod tests {
             sha2::Sha256::digest(serde_json::to_vec(&provider.process_tree).unwrap())
         ))
         .unwrap();
-        let providerless_digest = provider.process_tree_digest.clone();
         without_provider.provider_tree_json = Some(serde_json::to_string(&provider).unwrap());
+        let providerless_snapshot = make_cleanup_snapshot(
+            &without_provider,
+            vec![crate::process::ProcessIdentity {
+                pid: 42,
+                parent_pid: 1,
+                process_group_id: 42,
+                start_identity: "wrapper-start-1".into(),
+                command: String::new(),
+                quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            }],
+            true,
+            22,
+        );
         assert!(
             store
                 .reconcile_missing_agent_block(
                     generation,
                     &without_provider,
                     22,
+                    &providerless_snapshot,
                     &[],
-                    &providerless_digest,
                 )
                 .is_err()
         );
@@ -1820,16 +1871,28 @@ mod tests {
             sha2::Sha256::digest(serde_json::to_vec(&provider.process_tree).unwrap())
         ))
         .unwrap();
-        let wrapperless_digest = provider.process_tree_digest.clone();
         without_wrapper.provider_tree_json = Some(serde_json::to_string(&provider).unwrap());
+        let wrapperless_snapshot = make_cleanup_snapshot(
+            &without_wrapper,
+            vec![crate::process::ProcessIdentity {
+                pid: 100,
+                parent_pid: 42,
+                process_group_id: 100,
+                start_identity: "provider-start".into(),
+                command: String::new(),
+                quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            }],
+            true,
+            22,
+        );
         assert!(
             store
                 .reconcile_missing_agent_block(
                     generation,
                     &without_wrapper,
                     22,
+                    &wrapperless_snapshot,
                     &[],
-                    &wrapperless_digest,
                 )
                 .is_err()
         );
@@ -1850,14 +1913,34 @@ mod tests {
             command: "/usr/bin/codex".into(),
             quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
         };
+        let launch_tree = crate::protocol::parse_unique::<ObservedProviderStart>(
+            recoverable
+                .provider_tree_json
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap()
+        .process_tree
+        .iter()
+        .map(|process| crate::process::ProcessIdentity {
+            pid: process.pid,
+            parent_pid: process.parent_pid,
+            process_group_id: process.process_group_id,
+            start_identity: process.start_identity.clone(),
+            command: String::new(),
+            quality: process.identity_quality,
+        })
+        .collect::<Vec<_>>();
+        let snapshot_with_survivor = make_cleanup_snapshot(&recoverable, launch_tree, true, 22);
         assert!(matches!(
             store
                 .reconcile_missing_agent_block(
                     generation,
                     &recoverable,
                     22,
+                    &snapshot_with_survivor,
                     &[surviving_provider],
-                    &unconfirmed.process_tree_digest,
                 )
                 .unwrap(),
             false
@@ -1886,8 +1969,8 @@ mod tests {
                     generation,
                     &recoverable,
                     26,
+                    &snapshot_with_survivor,
                     &[],
-                    &unconfirmed.process_tree_digest,
                 )
                 .unwrap()
         );

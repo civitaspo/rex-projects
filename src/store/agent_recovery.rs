@@ -7,6 +7,7 @@ use sha2::{Digest as _, Sha256};
 use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, TicketRunId};
 use crate::launch::{AgentLaunchAuthority, ObservedProviderStart, ObservedWrapperIdentity};
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
+use crate::run_step_spool::BlockLossCleanupSnapshot;
 
 use super::{ConfigStore, validate_active_generation};
 
@@ -553,8 +554,8 @@ impl ConfigStore {
         owner_generation: u64,
         run: &RecoverableAgentRun,
         observed_at_unix: i64,
+        snapshot: &BlockLossCleanupSnapshot,
         survivors: &[ProcessIdentity],
-        tree_digest: &Digest,
     ) -> Result<bool, String> {
         if observed_at_unix < 0 {
             return Err("Agent block recovery timestamp is invalid".into());
@@ -572,10 +573,19 @@ impl ConfigStore {
         if !provider.process_tree_confirmed
             || provider.agent_run_id != run.agent_run_id
             || provider.process_tree.is_empty()
-            || provider.process_tree_digest != *tree_digest
-            || stored_tree_digest != *tree_digest
+            || provider.process_tree_digest != snapshot.launch_tree_digest
+            || stored_tree_digest != snapshot.launch_tree_digest
         {
             return Err("Agent block recovery has no exact saved provider tree".into());
+        }
+        snapshot.validate()?;
+        if snapshot.agent_run_id != run.agent_run_id
+            || snapshot.reservation_epoch != run.reservation_epoch
+            || snapshot.authority_digest != run.authority_digest
+            || snapshot.launch_tree_digest != provider.process_tree_digest
+            || !snapshot.cleanup_covered
+        {
+            return Err("Agent block cleanup snapshot is not bound to the active launch".into());
         }
         let wrapper_json = run
             .wrapper_identity_json
@@ -598,13 +608,21 @@ impl ConfigStore {
         {
             return Err("saved Agent process tree does not match its provider or wrapper".into());
         }
+        if !provider.process_tree.iter().all(|saved| {
+            snapshot.process_tree.iter().any(|observed| {
+                observed.pid == saved.pid
+                    && observed.start_identity == saved.start_identity
+                    && observed.quality == saved.identity_quality
+            })
+        }) {
+            return Err("Agent block cleanup snapshot omits launch identities".into());
+        }
         if survivors.iter().any(|survivor| {
             survivor.quality != ProcessIdentityQuality::KernelBirthToken
-                || !provider.process_tree.iter().any(|saved| {
+                || !snapshot.process_tree.iter().any(|saved| {
                     saved.pid == survivor.pid
                         && saved.start_identity == survivor.start_identity
-                        && saved.process_group_id == survivor.process_group_id
-                        && saved.identity_quality == survivor.quality
+                        && saved.quality == survivor.quality
                 })
         }) {
             return Err("surviving Agent process is outside the saved process tree".into());
@@ -641,27 +659,27 @@ impl ConfigStore {
         if !survivors.is_empty() {
             let detail_json = serde_json::to_string(&serde_json::json!({
                 "surviving_processes": survivors.iter().map(|process| process.pid).collect::<Vec<_>>(),
-                "process_tree_digest": tree_digest,
+                "process_tree_digest": snapshot.process_tree_digest,
             }))
             .map_err(|error| error.to_string())?;
             tx.execute(
                 "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
                  VALUES (?1,?2,?3,'process_survived',?4,?5,?6) ON CONFLICT DO NOTHING",
-                params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, tree_digest.as_str(), detail_json],
+                params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, snapshot.process_tree_digest.as_str(), detail_json],
             )
             .map_err(|error| error.to_string())?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(false);
         }
         let detail_json = serde_json::to_string(&serde_json::json!({
-            "process_tree_digest": tree_digest,
+            "process_tree_digest": snapshot.process_tree_digest,
             "process_tree_absent": true,
         }))
         .map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
              VALUES (?1,?2,?3,'exit_confirmed',?4,?5,?6) ON CONFLICT DO NOTHING",
-            params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, tree_digest.as_str(), detail_json],
+            params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, snapshot.process_tree_digest.as_str(), detail_json],
         )
         .map_err(|error| error.to_string())?;
         let run_changed = tx.execute(
@@ -689,13 +707,13 @@ impl ConfigStore {
         }
         let released_detail = serde_json::to_string(&serde_json::json!({
             "reservation_epoch": reservation_epoch,
-            "process_tree_digest": tree_digest,
+            "process_tree_digest": snapshot.process_tree_digest,
         }))
         .map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
              VALUES (?1,?2,?3,'slot_released',?4,?5,?6) ON CONFLICT DO NOTHING",
-            params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, tree_digest.as_str(), released_detail],
+            params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, snapshot.process_tree_digest.as_str(), released_detail],
         ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)

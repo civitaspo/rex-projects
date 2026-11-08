@@ -17,6 +17,7 @@ use crate::process::{
     ProcessIdentity, ProcessIdentityQuality, ProcessSignal, capture_process_tree,
     inspect_process_table, signal_process_group_if_observed,
 };
+use crate::run_step_spool::{BlockLossCleanupSnapshot, RunStepSpool};
 use crate::store::ConfigStore;
 use crate::store::agent_recovery::{
     AdoptedProcessIdentity, AgentAdoptionEvidence, RecoverableAgentRun,
@@ -441,7 +442,7 @@ fn reconcile_missing_block(
             reason: RecoveryUnknown::ProviderIdentityMismatch,
         });
     }
-    let saved = provider
+    let launch_tree = provider
         .process_tree
         .iter()
         .map(|identity| ProcessIdentity {
@@ -453,17 +454,17 @@ fn reconcile_missing_block(
             quality: identity.identity_quality,
         })
         .collect::<Vec<_>>();
-    if saved.is_empty() {
+    if launch_tree.is_empty() {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
-    let groups = saved
+    let launch_groups = launch_tree
         .iter()
         .map(|process| process.process_group_id)
         .collect::<BTreeSet<_>>();
-    if groups.contains(&0)
-        || saved.iter().any(|process| {
+    if launch_groups.contains(&0)
+        || launch_tree.iter().any(|process| {
             process.quality != ProcessIdentityQuality::KernelBirthToken
                 || process.start_identity.trim().is_empty()
         })
@@ -472,61 +473,302 @@ fn reconcile_missing_block(
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
-    let survivors = saved
+    let spool = match RunStepSpool::open(&run.authority.control_dir) {
+        Ok(spool) => spool,
+        Err(_) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProcessInspectionUnavailable,
+            });
+        }
+    };
+    let existing_snapshot = match spool.read_block_loss_cleanup_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProcessInspectionUnavailable,
+            });
+        }
+    };
+    let mut snapshot = match existing_snapshot {
+        Some(snapshot) => {
+            if snapshot.agent_run_id != run.agent_run_id
+                || snapshot.reservation_epoch != run.reservation_epoch
+                || snapshot.authority_digest != run.authority_digest
+                || snapshot.launch_tree_digest != provider.process_tree_digest
+                || !contains_process_identities(&snapshot.process_tree, &launch_tree)
+            {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                });
+            }
+            snapshot
+        }
+        None => {
+            // The launch-time tree cannot prove that no later child escaped to a new PGID. A
+            // fresh capture is permitted only while the exact provider birth identity is live.
+            let Some(identities) = initial_cleanup_tree(
+                provider.provider_pid,
+                &provider.provider_start_identity,
+                &launch_tree,
+                current,
+            ) else {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::ProviderIdentityMismatch,
+                });
+            };
+            match make_block_loss_snapshot(run, provider, identities, policy.now_unix, false) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    return Ok(AgentRecoveryDisposition::Unresolved {
+                        reason: RecoveryUnknown::ProcessInspectionUnavailable,
+                    });
+                }
+            }
+        }
+    };
+    let before_extend = snapshot.process_tree.len();
+    let Some(extended) = (match extend_process_tree(&snapshot.process_tree, current) {
+        Ok(extended) => extended,
+        Err(_) => None,
+    }) else {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    };
+    if extended.len() > 1024 {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    snapshot.process_tree = extended;
+    if snapshot.process_tree.len() > before_extend {
+        snapshot.cleanup_covered = false;
+    }
+    snapshot.observed_at_unix = policy.now_unix;
+    snapshot.process_tree_digest = match digest_process_tree(&snapshot.process_tree) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProcessInspectionUnavailable,
+            });
+        }
+    };
+    if snapshot.validate().is_err() {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    // Persist the cumulative identities before any signal can be sent.
+    if spool.write_block_loss_cleanup_snapshot(&snapshot).is_err() {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let survivors = crate::process::matching_processes(&snapshot.process_tree, current);
+    if cleanup_absence_confirmed(&snapshot, current) {
+        let released = store.reconcile_missing_agent_block(
+            owner_generation,
+            run,
+            policy.now_unix,
+            &snapshot,
+            &survivors,
+        )?;
+        if released {
+            return Ok(AgentRecoveryDisposition::BlockLossTerminal);
+        }
+    }
+    if survivors.is_empty() {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    let groups = snapshot
+        .process_tree
         .iter()
-        .filter(|expected| {
-            current.iter().any(|actual| {
-                actual.pid == expected.pid
-                    && actual.start_identity == expected.start_identity
-                    && actual.quality == ProcessIdentityQuality::KernelBirthToken
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let identity_downgrade = saved.iter().any(|expected| {
-        current.iter().any(|actual| {
-            actual.pid == expected.pid
-                && actual.start_identity == expected.start_identity
-                && actual.quality != ProcessIdentityQuality::KernelBirthToken
-        })
-    });
-    if identity_downgrade {
-        return Ok(AgentRecoveryDisposition::Unresolved {
-            reason: RecoveryUnknown::ProcessInspectionUnavailable,
-        });
-    }
-    let unrecorded_group_members = current.iter().any(|actual| {
-        groups.contains(&actual.process_group_id)
-            && !saved.iter().any(|expected| {
-                expected.pid == actual.pid && expected.start_identity == actual.start_identity
-            })
-    });
-    if unrecorded_group_members {
-        return Ok(AgentRecoveryDisposition::Unresolved {
-            reason: RecoveryUnknown::ProcessInspectionUnavailable,
-        });
-    }
-    let digest = provider.process_tree_digest.clone();
-    let released = store.reconcile_missing_agent_block(
-        owner_generation,
-        run,
-        policy.now_unix,
-        &survivors,
-        &digest,
-    )?;
-    if released {
-        return Ok(AgentRecoveryDisposition::BlockLossTerminal);
-    }
+        .map(|process| process.process_group_id)
+        .collect::<BTreeSet<_>>();
     let signal = if store.missing_block_survival_age_seconds(run, policy.now_unix)? >= 3 {
         ProcessSignal::Kill
     } else {
         ProcessSignal::Terminate
     };
+    let mut signalled = false;
     for group_id in groups {
-        signal_process_group_if_observed(group_id, &saved, current, signal)
-            .map_err(|error| error.to_string())?;
+        signalled |=
+            signal_process_group_if_observed(group_id, &snapshot.process_tree, current, signal)
+                .map_err(|error| error.to_string())?;
     }
+    if !signalled {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    snapshot.cleanup_covered = true;
+    snapshot.observed_at_unix = policy.now_unix;
+    if spool.write_block_loss_cleanup_snapshot(&snapshot).is_err() {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    store.reconcile_missing_agent_block(
+        owner_generation,
+        run,
+        policy.now_unix,
+        &snapshot,
+        &survivors,
+    )?;
     Ok(AgentRecoveryDisposition::BlockLossStopping)
+}
+
+fn make_block_loss_snapshot(
+    run: &RecoverableAgentRun,
+    provider: &ObservedProviderStart,
+    process_tree: Vec<ProcessIdentity>,
+    observed_at_unix: i64,
+    cleanup_covered: bool,
+) -> Result<BlockLossCleanupSnapshot, String> {
+    let snapshot = BlockLossCleanupSnapshot {
+        schema_version: 1,
+        agent_run_id: run.agent_run_id.clone(),
+        reservation_epoch: run.reservation_epoch,
+        authority_digest: run.authority_digest.clone(),
+        launch_tree_digest: provider.process_tree_digest.clone(),
+        observed_at_unix,
+        cleanup_covered,
+        process_tree_digest: digest_process_tree(&process_tree)?,
+        process_tree,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn digest_process_tree(process_tree: &[ProcessIdentity]) -> Result<Digest, String> {
+    let bytes = serde_json::to_vec(process_tree).map_err(|error| error.to_string())?;
+    Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn initial_cleanup_tree(
+    provider_pid: u32,
+    provider_start_identity: &str,
+    launch_tree: &[ProcessIdentity],
+    current: &[ProcessIdentity],
+) -> Option<Vec<ProcessIdentity>> {
+    let live_provider = kernel_identity(current, provider_pid, provider_start_identity)?;
+    let captured = capture_process_tree(live_provider.pid, current);
+    if captured.is_empty()
+        || captured.iter().any(|process| {
+            process.quality != ProcessIdentityQuality::KernelBirthToken
+                || process.start_identity.trim().is_empty()
+                || process.process_group_id == 0
+        })
+    {
+        return None;
+    }
+    let mut identities = launch_tree.to_vec();
+    merge_process_tree(&mut identities, &captured);
+    (identities.len() <= 1024).then_some(identities)
+}
+
+fn cleanup_absence_confirmed(
+    snapshot: &BlockLossCleanupSnapshot,
+    current: &[ProcessIdentity],
+) -> bool {
+    snapshot.cleanup_covered
+        && crate::process::matching_processes(&snapshot.process_tree, current).is_empty()
+}
+
+fn contains_process_identities(tree: &[ProcessIdentity], required: &[ProcessIdentity]) -> bool {
+    required.iter().all(|expected| {
+        tree.iter().any(|actual| {
+            actual.pid == expected.pid
+                && actual.start_identity == expected.start_identity
+                && actual.quality == expected.quality
+        })
+    })
+}
+
+fn merge_process_tree(target: &mut Vec<ProcessIdentity>, observed: &[ProcessIdentity]) {
+    for process in observed {
+        if let Some(existing) = target.iter_mut().find(|existing| {
+            existing.pid == process.pid && existing.start_identity == process.start_identity
+        }) {
+            *existing = process.clone();
+        } else {
+            target.push(process.clone());
+        }
+    }
+    target.sort_by(|left, right| {
+        (left.pid, &left.start_identity).cmp(&(right.pid, &right.start_identity))
+    });
+}
+
+fn extend_process_tree(
+    cumulative: &[ProcessIdentity],
+    current: &[ProcessIdentity],
+) -> Result<Option<Vec<ProcessIdentity>>, String> {
+    let mut extended = cumulative.to_vec();
+    let mut known = cumulative
+        .iter()
+        .map(|process| (process.pid, process.start_identity.clone()))
+        .collect::<BTreeSet<_>>();
+    let historical_groups = cumulative
+        .iter()
+        .map(|process| process.process_group_id)
+        .collect::<BTreeSet<_>>();
+    let mut observed_groups = historical_groups.clone();
+    loop {
+        let before = extended.len();
+        let live_roots = crate::process::matching_processes(&extended, current);
+        if extended.iter().any(|expected| {
+            current.iter().any(|actual| {
+                actual.pid == expected.pid
+                    && actual.start_identity == expected.start_identity
+                    && actual.quality != ProcessIdentityQuality::KernelBirthToken
+            })
+        }) {
+            return Ok(None);
+        }
+        let mut anchored_groups = BTreeSet::new();
+        for root in &live_roots {
+            if root.quality != ProcessIdentityQuality::KernelBirthToken {
+                return Ok(None);
+            }
+            anchored_groups.insert(root.process_group_id);
+            observed_groups.insert(root.process_group_id);
+            merge_process_tree(&mut extended, &[root.clone()]);
+            let captured = capture_process_tree(root.pid, current);
+            if captured.iter().any(|process| {
+                process.quality != ProcessIdentityQuality::KernelBirthToken
+                    || process.start_identity.trim().is_empty()
+                    || process.process_group_id == 0
+            }) {
+                return Ok(None);
+            }
+            for process in captured {
+                observed_groups.insert(process.process_group_id);
+                known.insert((process.pid, process.start_identity.clone()));
+                merge_process_tree(&mut extended, &[process]);
+            }
+        }
+        for process in current.iter().filter(|process| {
+            historical_groups.contains(&process.process_group_id)
+                || observed_groups.contains(&process.process_group_id)
+        }) {
+            let identity = (process.pid, process.start_identity.clone());
+            if !known.contains(&identity) && !anchored_groups.contains(&process.process_group_id) {
+                // A numeric PGID can be recycled. Without a live exact tracked member anchoring
+                // the group, its occupants are ambiguous: retain ownership and never adopt/signal.
+                return Ok(None);
+            }
+        }
+        if extended.len() > 1024 {
+            return Ok(None);
+        }
+        if extended.len() == before {
+            break;
+        }
+    }
+    Ok(Some(extended))
 }
 
 fn provider_tree_contains_wrapper(
@@ -785,6 +1027,8 @@ struct StoredProviderIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn provider_tree_must_include_the_exact_wrapper_birth_identity() {
@@ -892,5 +1136,217 @@ mod tests {
             read_heartbeat(&control_dir, "run-1", 1_000, 30),
             HeartbeatStatus::Fresh
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_loss_cleanup_tracks_late_new_group_child_and_leaves_unrelated_process_alone() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("start-child");
+        let child_pid_path = root.path().join("child.pid");
+        let mut provider = spawn_late_child_provider(&marker, &child_pid_path);
+        let provider_identity = wait_for_identity(provider.id());
+        let launch_tree = vec![provider_identity.clone()];
+        let initial = initial_cleanup_tree(
+            provider.id(),
+            &provider_identity.start_identity,
+            &launch_tree,
+            &inspect_process_table().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&marker, b"go").unwrap();
+        let child_pid = wait_for_pid_file(&child_pid_path);
+        let child_identity = wait_for_identity(child_pid);
+        assert_ne!(
+            child_identity.process_group_id,
+            provider_identity.process_group_id
+        );
+
+        let mut unrelated = Command::new("/bin/sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let unrelated_identity = wait_for_identity(unrelated.id());
+        let current = inspect_process_table().unwrap();
+        let cumulative = extend_process_tree(&initial, &current).unwrap().unwrap();
+        assert!(contains_process_identities(
+            &cumulative,
+            &[child_identity.clone()]
+        ));
+        let snapshot = make_test_snapshot(cumulative.clone(), false);
+        assert!(!cleanup_absence_confirmed(&snapshot, &current));
+
+        for group_id in cumulative
+            .iter()
+            .map(|process| process.process_group_id)
+            .collect::<BTreeSet<_>>()
+        {
+            signal_process_group_if_observed(
+                group_id,
+                &cumulative,
+                &current,
+                ProcessSignal::Terminate,
+            )
+            .unwrap();
+        }
+        let stopped = wait_until_processes_absent(&cumulative);
+        assert!(stopped);
+        let current = inspect_process_table().unwrap();
+        let mut covered = snapshot;
+        covered.cleanup_covered = true;
+        assert!(cleanup_absence_confirmed(&covered, &current));
+        assert!(
+            !crate::process::matching_processes(
+                std::slice::from_ref(&unrelated_identity),
+                &current
+            )
+            .is_empty()
+        );
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        let _ = provider.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_loss_without_live_provider_capture_keeps_late_child_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("start-child");
+        let child_pid_path = root.path().join("child.pid");
+        let mut provider = spawn_late_child_provider(&marker, &child_pid_path);
+        let provider_identity = wait_for_identity(provider.id());
+        let launch_tree = vec![provider_identity.clone()];
+        let _initial_launch_capture = initial_cleanup_tree(
+            provider.id(),
+            &provider_identity.start_identity,
+            &launch_tree,
+            &inspect_process_table().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&marker, b"go").unwrap();
+        let child_pid = wait_for_pid_file(&child_pid_path);
+        let child_identity = wait_for_identity(child_pid);
+        signal_process_group_if_observed(
+            provider_identity.process_group_id,
+            std::slice::from_ref(&provider_identity),
+            &inspect_process_table().unwrap(),
+            ProcessSignal::Terminate,
+        )
+        .unwrap();
+        assert!(wait_until_processes_absent(std::slice::from_ref(
+            &provider_identity
+        )));
+        let current = inspect_process_table().unwrap();
+        assert!(
+            crate::process::matching_processes(std::slice::from_ref(&child_identity), &current)
+                .len()
+                == 1
+        );
+        assert!(
+            initial_cleanup_tree(
+                provider.id(),
+                &provider_identity.start_identity,
+                &launch_tree,
+                &current,
+            )
+            .is_none()
+        );
+        // The fixture owns this deliberately unresolved child; explicitly clean it up.
+        signal_process_group_if_observed(
+            child_identity.process_group_id,
+            std::slice::from_ref(&child_identity),
+            &current,
+            ProcessSignal::Kill,
+        )
+        .unwrap();
+        assert!(wait_until_processes_absent(std::slice::from_ref(
+            &child_identity
+        )));
+        let _ = provider.wait();
+    }
+
+    #[cfg(unix)]
+    fn spawn_late_child_provider(marker: &std::path::Path, child_pid: &std::path::Path) -> Child {
+        use std::os::unix::process::CommandExt;
+
+        let script = format!(
+            "while [ ! -f '{}' ]; do :; done; set -m; /bin/sleep 300 & echo $! > '{}'; wait",
+            marker.display(),
+            child_pid.display(),
+        );
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_identity(pid: u32) -> ProcessIdentity {
+        wait_until(|| {
+            inspect_process_table().ok()?.into_iter().find(|process| {
+                process.pid == pid && process.quality == ProcessIdentityQuality::KernelBirthToken
+            })
+        })
+        .expect("process identity should become observable")
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        wait_until(|| std::fs::read_to_string(path).ok()?.trim().parse().ok())
+            .expect("child PID should be published")
+    }
+
+    #[cfg(unix)]
+    fn wait_until<T>(mut observe: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(value) = observe() {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_until_processes_absent(processes: &[ProcessIdentity]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let Ok(current) = inspect_process_table() else {
+                return false;
+            };
+            if crate::process::matching_processes(processes, &current).is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn make_test_snapshot(
+        process_tree: Vec<ProcessIdentity>,
+        cleanup_covered: bool,
+    ) -> BlockLossCleanupSnapshot {
+        let process_tree_digest = digest_process_tree(&process_tree).unwrap();
+        BlockLossCleanupSnapshot {
+            schema_version: 1,
+            agent_run_id: AgentRunId::parse("run-test").unwrap(),
+            reservation_epoch: 1,
+            authority_digest: Digest::parse("a".repeat(64)).unwrap(),
+            launch_tree_digest: Digest::parse("b".repeat(64)).unwrap(),
+            observed_at_unix: 1,
+            cleanup_covered,
+            process_tree,
+            process_tree_digest,
+        }
     }
 }

@@ -13,12 +13,16 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::domain::ids::{AgentRunId, Digest};
 use crate::launch::{AgentLaunchReceipt, AgentStartRequest};
+use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::run_step::{RunReceipt, TurnResult};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_START_BYTES: usize = 32 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_BLOCK_LOSS_SNAPSHOT_BYTES: usize = 512 * 1024;
+const MAX_BLOCK_LOSS_IDENTITIES: usize = 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -45,6 +49,52 @@ pub struct AgentTurnResult {
     pub receipt: RunReceipt,
     pub structured_result: Option<serde_json::Value>,
     pub result_digest: String,
+}
+
+/// Host-owned cumulative process evidence used only after a managed Rex block disappears.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockLossCleanupSnapshot {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub reservation_epoch: u64,
+    pub authority_digest: Digest,
+    pub launch_tree_digest: Digest,
+    pub observed_at_unix: i64,
+    pub cleanup_covered: bool,
+    pub process_tree: Vec<ProcessIdentity>,
+    pub process_tree_digest: Digest,
+}
+
+impl BlockLossCleanupSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != PROTOCOL_VERSION
+            || self.reservation_epoch == 0
+            || self.observed_at_unix < 0
+            || self.process_tree.is_empty()
+            || self.process_tree.len() > MAX_BLOCK_LOSS_IDENTITIES
+        {
+            return Err("block-loss cleanup snapshot is outside its bounds".into());
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for process in &self.process_tree {
+            if process.pid == 0
+                || process.process_group_id == 0
+                || process.quality != ProcessIdentityQuality::KernelBirthToken
+                || process.start_identity.trim().is_empty()
+                || !identities.insert((process.pid, process.start_identity.as_str()))
+            {
+                return Err("block-loss cleanup snapshot has invalid process identities".into());
+            }
+        }
+        let bytes = serde_json::to_vec(&self.process_tree).map_err(|error| error.to_string())?;
+        if self.process_tree_digest != Digest::parse(sha256(&bytes))? {
+            return Err(
+                "block-loss cleanup snapshot digest does not match its process tree".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Files scoped to one immutable launch authority's control directory.
@@ -221,6 +271,59 @@ impl RunStepSpool {
         read_bounded(&self.directory.join("turn.result.json"), MAX_RESULT_BYTES)
     }
 
+    pub fn read_block_loss_cleanup_snapshot(
+        &self,
+    ) -> Result<Option<BlockLossCleanupSnapshot>, String> {
+        match read_bounded(
+            &self.directory.join("block-loss-cleanup.json"),
+            MAX_BLOCK_LOSS_SNAPSHOT_BYTES,
+        ) {
+            Ok(bytes) => {
+                let snapshot: BlockLossCleanupSnapshot = parse_unique(&bytes)?;
+                snapshot.validate()?;
+                Ok(Some(snapshot))
+            }
+            Err(error) if error == "run-step spool file is not present" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Atomically replaces the private cumulative cleanup snapshot after validating its binding.
+    pub fn write_block_loss_cleanup_snapshot(
+        &self,
+        snapshot: &BlockLossCleanupSnapshot,
+    ) -> Result<(), String> {
+        snapshot.validate()?;
+        if let Some(previous) = self.read_block_loss_cleanup_snapshot()? {
+            if previous.agent_run_id != snapshot.agent_run_id
+                || previous.reservation_epoch != snapshot.reservation_epoch
+                || previous.authority_digest != snapshot.authority_digest
+                || previous.launch_tree_digest != snapshot.launch_tree_digest
+                || snapshot.observed_at_unix < previous.observed_at_unix
+                || !process_tree_contains(&snapshot.process_tree, &previous.process_tree)
+            {
+                return Err(
+                    "block-loss cleanup snapshot changed its binding or lost identities".into(),
+                );
+            }
+            if snapshot.cleanup_covered && !previous.cleanup_covered {
+                let same_identities = snapshot.process_tree.len() == previous.process_tree.len();
+                if !same_identities {
+                    return Err(
+                        "block-loss cleanup coverage cannot include unobserved identities".into(),
+                    );
+                }
+            }
+        }
+        let bytes = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+        replace_bounded(
+            &self.directory,
+            "block-loss-cleanup.json",
+            &bytes,
+            MAX_BLOCK_LOSS_SNAPSHOT_BYTES,
+        )
+    }
+
     pub fn read_turn_result(
         &self,
         request: &StartRequestEnvelope,
@@ -231,6 +334,16 @@ impl RunStepSpool {
         envelope.validate_for(request)?;
         Ok(envelope)
     }
+}
+
+fn process_tree_contains(tree: &[ProcessIdentity], required: &[ProcessIdentity]) -> bool {
+    required.iter().all(|process| {
+        tree.iter().any(|candidate| {
+            candidate.pid == process.pid
+                && candidate.start_identity == process.start_identity
+                && candidate.quality == process.quality
+        })
+    })
 }
 
 impl StartRequestEnvelope {
@@ -331,6 +444,34 @@ fn publish_once(directory: &Path, name: &str, bytes: &[u8], limit: usize) -> Res
     }
 }
 
+fn replace_bounded(directory: &Path, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
+    if bytes.len() > limit {
+        return Err("run-step spool payload exceeds its byte limit".into());
+    }
+    let temporary = directory.join(format!(".{name}.{}.tmp", nonce()));
+    let destination = directory.join(name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    set_private_file_options(&mut options);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create run-step temporary file: {error}"))?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write run-step spool file: {error}"));
+    drop(file);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("replace run-step spool file: {error}"));
+    }
+    sync_directory(directory)
+}
+
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -427,9 +568,13 @@ fn sync_directory(_path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentTurnResult, RunStepSpool, StartReceiptEnvelope, StartRequestEnvelope};
+    use super::{
+        AgentTurnResult, BlockLossCleanupSnapshot, RunStepSpool, StartReceiptEnvelope,
+        StartRequestEnvelope,
+    };
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId};
     use crate::launch::{AgentLaunchReceipt, AgentStartRequest, LaunchDecision};
+    use crate::process::{ProcessIdentity, ProcessIdentityQuality};
     use crate::run_step::{CleanupState, RunReceipt, TurnOutcome, TurnResult};
     use sha2::Digest as _;
     use std::time::Duration;
@@ -455,6 +600,33 @@ mod tests {
 
     fn digest(c: char) -> Digest {
         Digest::parse(c.to_string().repeat(64)).unwrap()
+    }
+
+    fn process(pid: u32, start_identity: &str, group_id: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            parent_pid: 1,
+            process_group_id: group_id,
+            start_identity: start_identity.into(),
+            command: "/bin/sleep".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        }
+    }
+
+    fn cleanup_snapshot(process_tree: Vec<ProcessIdentity>) -> BlockLossCleanupSnapshot {
+        let bytes = serde_json::to_vec(&process_tree).unwrap();
+        BlockLossCleanupSnapshot {
+            schema_version: 1,
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            reservation_epoch: 2,
+            authority_digest: digest('a'),
+            launch_tree_digest: digest('b'),
+            observed_at_unix: 10,
+            cleanup_covered: false,
+            process_tree,
+            process_tree_digest: Digest::parse(format!("{:x}", sha2::Sha256::digest(bytes)))
+                .unwrap(),
+        }
     }
 
     fn receipt(request: &AgentStartRequest) -> AgentLaunchReceipt {
@@ -571,5 +743,54 @@ mod tests {
             serde_json::from_slice(&spool.read_result().unwrap()).unwrap();
         forged.receipt.exit_code = Some(99);
         assert!(forged.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn block_loss_snapshot_is_atomic_bound_and_cumulative() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let first = process(20, "birth-20", 20);
+        let mut snapshot = cleanup_snapshot(vec![first]);
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            spool.read_block_loss_cleanup_snapshot().unwrap(),
+            Some(snapshot.clone())
+        );
+
+        let second = process(21, "birth-21", 21);
+        snapshot.process_tree.push(second);
+        snapshot.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&snapshot.process_tree).unwrap())
+        ))
+        .unwrap();
+        snapshot.observed_at_unix = 11;
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            spool.read_block_loss_cleanup_snapshot().unwrap(),
+            Some(snapshot.clone())
+        );
+
+        let mut truncated = snapshot.clone();
+        truncated.process_tree.pop();
+        truncated.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&truncated.process_tree).unwrap())
+        ))
+        .unwrap();
+        assert!(spool.write_block_loss_cleanup_snapshot(&truncated).is_err());
+
+        let mut rebound = snapshot;
+        rebound.authority_digest = digest('c');
+        assert!(spool.write_block_loss_cleanup_snapshot(&rebound).is_err());
+    }
+
+    #[test]
+    fn block_loss_snapshot_corruption_stays_an_error() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let path = spool.directory().join("block-loss-cleanup.json");
+        std::fs::write(path, b"{\"schema_version\":1}").unwrap();
+        assert!(spool.read_block_loss_cleanup_snapshot().is_err());
     }
 }
