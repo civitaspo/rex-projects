@@ -44,6 +44,8 @@ enum Command {
     },
     #[command(subcommand)]
     Config(ConfigCommand),
+    #[command(subcommand)]
+    Policy(PolicyCommand),
     Doctor {
         #[arg(long)]
         project: Option<String>,
@@ -201,6 +203,7 @@ enum RuntimeCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
+    List,
     Start {
         id: String,
         #[arg(long)]
@@ -344,6 +347,18 @@ enum SchemaKind {
 enum ConfigCommand {
     Validate,
     Apply(ApplyArgs),
+    Diff {
+        #[arg(long, value_name = "PATH")]
+        candidate: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    Explain {
+        #[arg(long)]
+        repository: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -460,6 +475,18 @@ pub fn run() -> Result<i32, CliError> {
         Command::Config(ConfigCommand::Apply(args)) => {
             apply_config(cli.config.as_deref(), cli.state_root.as_deref(), args, json)
         }
+        Command::Config(ConfigCommand::Diff { candidate }) => config_diff(
+            cli.config.as_deref(),
+            cli.state_root.as_deref(),
+            &candidate,
+            json,
+        ),
+        Command::Policy(command) => policy_command(
+            cli.config.as_deref(),
+            cli.state_root.as_deref(),
+            command,
+            json,
+        ),
         Command::Doctor { project } => doctor(cli.config.as_deref(), project.as_deref(), json),
         Command::Runtime { command } => runtime_command(
             cli.config.as_deref(),
@@ -595,6 +622,514 @@ fn validate_config(path: Option<&Path>, json: bool) -> Result<(), CliError> {
         );
         Ok(())
     }
+}
+
+fn project_list(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    json: bool,
+) -> Result<(), CliError> {
+    let state_root = selected_state_root(config_path, explicit_state_root)?;
+    let status = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
+    #[derive(Serialize)]
+    struct ProjectEntry {
+        id: String,
+        mode: String,
+        desired_lifecycle: String,
+        observed_lifecycle: String,
+        project_epoch: u64,
+        next_due_at_unix: i64,
+        last_error: Option<String>,
+    }
+    #[derive(Serialize)]
+    struct ProjectListReport {
+        schema_version: u32,
+        source: &'static str,
+        freshness: &'static str,
+        observed_at_unix: i64,
+        external_services_queried: bool,
+        projects: Vec<ProjectEntry>,
+    }
+    let report = ProjectListReport {
+        schema_version: 1,
+        source: "local_state_snapshot",
+        freshness: "local_snapshot",
+        observed_at_unix: status.observed_at_unix,
+        external_services_queried: false,
+        projects: status
+            .projects
+            .iter()
+            .map(|project| ProjectEntry {
+                id: project.id.to_string(),
+                mode: project.mode.clone(),
+                desired_lifecycle: project.desired_lifecycle.clone(),
+                observed_lifecycle: project.observed_lifecycle.clone(),
+                project_epoch: project.project_epoch,
+                next_due_at_unix: project.next_due_at_unix,
+                last_error: project.last_error.clone(),
+            })
+            .collect(),
+    };
+    if json {
+        print_json(&report)
+    } else {
+        println!(
+            "Projects from local snapshot observed at Unix {} (external services not queried):",
+            report.observed_at_unix
+        );
+        for project in &status.projects {
+            println!(
+                "{} [{}] desired={} observed={}",
+                project.id, project.mode, project.desired_lifecycle, project.observed_lifecycle
+            );
+        }
+        Ok(())
+    }
+}
+
+fn policy_command(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    command: PolicyCommand,
+    json: bool,
+) -> Result<(), CliError> {
+    match command {
+        PolicyCommand::Explain { repository } => {
+            #[derive(Serialize)]
+            struct EffectiveRole {
+                role: String,
+                profile_id: String,
+                profile_digest: String,
+                instruction_files: Vec<InstructionSource>,
+            }
+            #[derive(Serialize)]
+            struct ProjectRoles {
+                project_id: String,
+                project_auto_merge: bool,
+                effective_roles: Vec<EffectiveRole>,
+            }
+            #[derive(Serialize)]
+            struct MergePolicyReport {
+                auto_merge: bool,
+                method: Option<crate::domain::types::MergeMethod>,
+                executor: Option<crate::domain::types::MergeExecutor>,
+                required_checks: Vec<String>,
+                required_approvals: u32,
+                allowed_check_conclusions: Vec<crate::domain::types::CommitConclusion>,
+                minimum_reliability_score: u8,
+                hard_gates: [&'static str; 4],
+                instructions: Option<String>,
+                instructions_sha256: Option<String>,
+                instruction_files: Vec<InstructionSource>,
+                repository_instruction_files: Vec<InstructionSource>,
+            }
+            #[derive(Serialize)]
+            struct PolicyExplainReport {
+                schema_version: u32,
+                repository: String,
+                snapshot_source: &'static str,
+                applied_revision: Option<u64>,
+                configuration_digest: String,
+                merge_policy: MergePolicyReport,
+                projects: Vec<ProjectRoles>,
+                capabilities: CapabilityObservation,
+                external_services_queried: bool,
+            }
+            #[derive(Serialize)]
+            struct CapabilityObservation {
+                status: &'static str,
+                reason: &'static str,
+            }
+            let (_, configured) = load_config(config_path)?;
+            let (config, snapshot_source, applied_revision) =
+                read_effective_snapshot(config_path, explicit_state_root, configured)?;
+            let repository_id =
+                crate::domain::ids::RepositoryId::parse(repository).map_err(CliError::usage)?;
+            let repo = config
+                .config
+                .repositories
+                .get(&repository_id)
+                .ok_or_else(|| {
+                    CliError::not_found(format!("Repository `{repository_id}` is not configured"))
+                })?;
+            let projects = config
+                .config
+                .projects
+                .iter()
+                .filter(|(_, project)| project.repositories.contains(&repository_id))
+                .map(|(project_id, project)| {
+                    let roles =
+                        config::effective_project_roles(project_id, &config.config.projects)
+                            .map_err(CliError::unexpected)?;
+                    let profiles = roles
+                        .into_iter()
+                        .map(|(role, profile_id)| {
+                            let profile = config.profiles.get(&profile_id).ok_or_else(|| {
+                                CliError::unexpected(
+                                    "effective profile is missing from applied snapshot",
+                                )
+                            })?;
+                            let profile_digest = canonical_digest(profile)?;
+                            let mut instruction_files = profile
+                                .instruction_files
+                                .iter()
+                                .map(|path| instruction_source(&config, path))
+                                .collect::<Vec<_>>();
+                            if let Some(paths) = repo.role_instruction_files.get(&role) {
+                                instruction_files.extend(
+                                    paths.iter().map(|path| instruction_source(&config, path)),
+                                );
+                            }
+                            Ok(EffectiveRole {
+                                role: format!("{role:?}"),
+                                profile_id: profile_id.to_string(),
+                                profile_digest,
+                                instruction_files,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, CliError>>()?;
+                    Ok(ProjectRoles {
+                        project_id: project_id.to_string(),
+                        project_auto_merge: project.auto_merge,
+                        effective_roles: profiles,
+                    })
+                })
+                .collect::<Result<Vec<_>, CliError>>()?;
+            let instruction_paths = repo
+                .merge
+                .instruction_files
+                .iter()
+                .map(|path| instruction_source(&config, path))
+                .collect::<Vec<_>>();
+            let repository_instruction_paths = repo
+                .instruction_files
+                .iter()
+                .map(|path| instruction_source(&config, path))
+                .collect::<Vec<_>>();
+            let inline_digest = repo.merge.instructions.as_deref().map(text_digest);
+            let report = PolicyExplainReport {
+                schema_version: 1,
+                repository: repository_id.to_string(),
+                snapshot_source,
+                applied_revision,
+                configuration_digest: config.digest.to_string(),
+                merge_policy: MergePolicyReport {
+                    auto_merge: repo.merge.auto_merge,
+                    method: repo.merge.method,
+                    executor: repo.merge.executor,
+                    required_checks: repo.merge.required_checks.clone(),
+                    required_approvals: repo.merge.required_approvals,
+                    allowed_check_conclusions: repo.merge.allowed_check_conclusions.clone(),
+                    minimum_reliability_score: repo.merge.minimum_reliability_score,
+                    hard_gates: [
+                        "project_and_repository_auto_merge_enabled",
+                        "required_checks_succeeded_for_current_revision",
+                        "required_approvals_met",
+                        "reviewed_revision_matches_merge_revision",
+                    ],
+                    instructions: repo.merge.instructions.clone(),
+                    instructions_sha256: inline_digest,
+                    instruction_files: instruction_paths,
+                    repository_instruction_files: repository_instruction_paths,
+                },
+                projects,
+                capabilities: CapabilityObservation {
+                    status: "not_observed",
+                    reason: "policy explain does not contact the forge or inspect a live capability receipt",
+                },
+                external_services_queried: false,
+            };
+            if json {
+                print_json(&report)
+            } else {
+                println!(
+                    "Repository {} policy from {} snapshot (no external services queried)",
+                    repository_id, snapshot_source
+                );
+                println!(
+                    "Automatic merge: {}; method: {:?}; executor: {:?}",
+                    repo.merge.auto_merge, repo.merge.method, repo.merge.executor
+                );
+                println!(
+                    "Checks: {:?}; approvals: {}; capabilities: not observed",
+                    repo.merge.required_checks, repo.merge.required_approvals
+                );
+                for source in &report.merge_policy.instruction_files {
+                    println!(
+                        "Merge instruction: {} ({})",
+                        source.path,
+                        source.sha256.as_deref().unwrap_or("digest unavailable")
+                    );
+                }
+                for project in &report.projects {
+                    for role in &project.effective_roles {
+                        println!(
+                            "Project {} role {}: profile {} ({})",
+                            project.project_id, role.role, role.profile_id, role.profile_digest
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn config_diff(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    candidate_path: &Path,
+    json: bool,
+) -> Result<(), CliError> {
+    let (source_path, configured) = load_config(config_path)?;
+    let (baseline, snapshot_source, applied_revision) =
+        read_effective_snapshot(Some(&source_path), explicit_state_root, configured)?;
+    let candidate = config::load(candidate_path).map_err(CliError::usage)?;
+    #[derive(Serialize)]
+    struct SnapshotVersion {
+        source: &'static str,
+        applied: bool,
+        applied_revision: Option<u64>,
+        digest: String,
+    }
+    #[derive(Serialize)]
+    struct AssessmentInvalidation {
+        status: &'static str,
+        reason: &'static str,
+    }
+    #[derive(Serialize)]
+    struct ConfigDiffReport {
+        schema_version: u32,
+        baseline: SnapshotVersion,
+        candidate: SnapshotVersion,
+        changes: Vec<ConfigDiffChange>,
+        assessment_invalidation: AssessmentInvalidation,
+        state_written: bool,
+        candidate_applied: bool,
+        external_services_queried: bool,
+    }
+    let mut changes = Vec::<ConfigDiffChange>::new();
+    diff_map(
+        "project",
+        &baseline.config.projects,
+        &candidate.config.projects,
+        &mut changes,
+    )?;
+    diff_map(
+        "repository",
+        &baseline.config.repositories,
+        &candidate.config.repositories,
+        &mut changes,
+    )?;
+    diff_map(
+        "profile",
+        &baseline.profiles,
+        &candidate.profiles,
+        &mut changes,
+    )?;
+    diff_map(
+        "instruction",
+        &instruction_digest_map(&baseline),
+        &instruction_digest_map(&candidate),
+        &mut changes,
+    )?;
+    let changes_count = changes.len();
+    let report = ConfigDiffReport {
+        schema_version: 1,
+        baseline: SnapshotVersion {
+            source: snapshot_source,
+            applied: applied_revision.is_some(),
+            applied_revision,
+            digest: baseline.digest.to_string(),
+        },
+        candidate: SnapshotVersion {
+            source: "candidate_file",
+            applied: false,
+            applied_revision: None,
+            digest: candidate.digest.to_string(),
+        },
+        changes,
+        assessment_invalidation: AssessmentInvalidation {
+            status: "not_established",
+            reason: "available read APIs do not expose durable assessment dependencies",
+        },
+        state_written: false,
+        candidate_applied: false,
+        external_services_queried: false,
+    };
+    if json {
+        print_json(&report)
+    } else {
+        println!(
+            "Configuration diff: {} changes; baseline={} candidate={}",
+            changes_count, snapshot_source, report.candidate.digest
+        );
+        println!(
+            "No configuration or state was changed; assessment invalidation is not established."
+        );
+        for change in &report.changes {
+            println!(
+                "{} {}: {} -> {}",
+                change.kind,
+                change.id,
+                change.before_digest.as_deref().unwrap_or("absent"),
+                change.candidate_digest.as_deref().unwrap_or("absent")
+            );
+        }
+        Ok(())
+    }
+}
+
+fn instruction_digest_map(config: &AppliedConfig) -> std::collections::BTreeMap<String, String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for repository in config.config.repositories.values() {
+        paths.extend(repository.instruction_files.iter().cloned());
+        paths.extend(repository.merge.instruction_files.iter().cloned());
+        for files in repository.role_instruction_files.values() {
+            paths.extend(files.iter().cloned());
+        }
+        if let Some(operations) = &repository.operations {
+            paths.extend(operations.instruction_files.iter().cloned());
+        }
+    }
+    for profile in config.profiles.values() {
+        paths.extend(profile.instruction_files.iter().cloned());
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let resolved = Path::new(&path);
+            let source = config.source_files.iter().find(|source| {
+                source.path == path
+                    || source.canonical_path == path
+                    || source.canonical_path.ends_with(&path)
+                    || resolved.is_absolute() && Path::new(&source.canonical_path) == resolved
+            });
+            let digest = source.map_or_else(
+                || "unavailable".to_owned(),
+                |source| source.sha256.to_string(),
+            );
+            (path, digest)
+        })
+        .collect()
+}
+
+fn read_effective_snapshot(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    configured: AppliedConfig,
+) -> Result<(AppliedConfig, &'static str, Option<u64>), CliError> {
+    let source_path = selected_config_path(config_path)?;
+    let source_identity = source_path
+        .canonicalize()
+        .map_err(|error| CliError::usage(error.to_string()))?
+        .display()
+        .to_string();
+    let state_root =
+        config::state_root(&configured.config, explicit_state_root).map_err(CliError::usage)?;
+    let db = state_root.join("state.sqlite3");
+    match std::fs::symlink_metadata(&db) {
+        Ok(_) => {
+            let snapshot = ConfigStore::open_readonly(&state_root)
+                .and_then(|store| store.load_snapshot(&source_identity))
+                .map_err(CliError::unavailable)?;
+            if let Some(snapshot) = snapshot {
+                Ok((
+                    snapshot.config,
+                    "applied_snapshot",
+                    Some(snapshot.revision.0),
+                ))
+            } else {
+                Ok((configured, "configured_snapshot", None))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((configured, "configured_snapshot", None))
+        }
+        Err(error) => Err(CliError::unavailable(error.to_string())),
+    }
+}
+
+fn canonical_digest<T: Serialize>(value: &T) -> Result<String, CliError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|error| CliError::unexpected(error.to_string()))?;
+    Ok(text_digest_bytes(&bytes))
+}
+
+fn text_digest(text: &str) -> String {
+    text_digest_bytes(text.as_bytes())
+}
+
+fn text_digest_bytes(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+#[derive(Serialize)]
+struct InstructionSource {
+    path: String,
+    sha256: Option<String>,
+    digest_status: &'static str,
+}
+
+fn instruction_source(config: &AppliedConfig, path: &str) -> InstructionSource {
+    let source = config.source_files.iter().find(|source| {
+        source.path == path
+            || source.canonical_path == path
+            || source.canonical_path.ends_with(path)
+    });
+    InstructionSource {
+        path: path.to_owned(),
+        sha256: source.map(|source| source.sha256.to_string()),
+        digest_status: if source.is_some() {
+            "captured"
+        } else {
+            "unavailable"
+        },
+    }
+}
+
+#[derive(Serialize)]
+struct ConfigDiffChange {
+    kind: String,
+    id: String,
+    before_digest: Option<String>,
+    candidate_digest: Option<String>,
+}
+
+fn diff_map<K: Ord + std::fmt::Display, T: Serialize>(
+    kind: &str,
+    before: &std::collections::BTreeMap<K, T>,
+    after: &std::collections::BTreeMap<K, T>,
+    changes: &mut Vec<ConfigDiffChange>,
+) -> Result<(), CliError> {
+    let before = before
+        .iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let after = after
+        .iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    for key in keys {
+        let old = before.get(key);
+        let new = after.get(key);
+        let old_digest = old.map(canonical_digest).transpose()?;
+        let new_digest = new.map(canonical_digest).transpose()?;
+        if old_digest != new_digest {
+            changes.push(ConfigDiffChange {
+                kind: kind.to_owned(),
+                id: key.clone(),
+                before_digest: old_digest,
+                candidate_digest: new_digest,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn apply_config(
@@ -789,6 +1324,7 @@ fn project_command(
     json: bool,
 ) -> Result<(), CliError> {
     match command {
+        ProjectCommand::List => project_list(config_path, explicit_state_root, json),
         ProjectCommand::Status { id } => {
             runtime_status(config_path, explicit_state_root, id.as_deref(), json)
         }
@@ -2521,7 +3057,9 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ProviderCommand, resolve_executable};
+    use super::{Cli, Command, ProviderCommand, read_effective_snapshot, resolve_executable};
+    use crate::config;
+    use crate::store::{ConfigStore, ExpectedRevision};
 
     #[test]
     fn doctor_resolves_a_path_with_spaces_without_splitting_it() {
@@ -2559,5 +3097,93 @@ mod tests {
             } if request_id == "qualification-123"
         ));
         assert!(Cli::try_parse_from(["rex-projects", "provider", "status"]).is_err());
+    }
+
+    #[test]
+    fn read_projections_accept_the_public_command_shapes() {
+        assert!(Cli::try_parse_from(["rex-projects", "project", "list", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "rex-projects",
+                "policy",
+                "explain",
+                "--repository",
+                "repo-a",
+                "--json"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rex-projects",
+                "config",
+                "diff",
+                "--candidate",
+                "candidate.toml",
+                "--json"
+            ])
+            .is_ok()
+        );
+    }
+
+    fn minimal_config(command: &str) -> String {
+        format!(
+            "schema_version = 1\n\n[adapters.tickets]\nkind = 'command'\ncommand = ['{command}']\n\n[projects]\n"
+        )
+    }
+
+    #[test]
+    fn projections_use_durable_applied_config_when_local_files_have_moved_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = temp.path().canonicalize().unwrap();
+        let config_file = canonical_root.join("config.toml");
+        let state_root = canonical_root.join("state");
+        std::fs::write(&config_file, minimal_config("ticket-cli-a")).unwrap();
+        let applied = config::load(&config_file).unwrap();
+        let source_identity = config_file.canonicalize().unwrap().display().to_string();
+        ConfigStore::open_test(&state_root)
+            .unwrap()
+            .apply_snapshot(&source_identity, &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let db = state_root.join("state.sqlite3");
+        let before_db = std::fs::read(&db).unwrap();
+        let before_entries = std::fs::read_dir(&state_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "state.sqlite3-wal" && name != "state.sqlite3-shm")
+            .collect::<std::collections::BTreeSet<_>>();
+        ConfigStore::open_readonly(&state_root).unwrap();
+
+        std::fs::write(&config_file, minimal_config("ticket-cli-b")).unwrap();
+        let configured_now = config::load(&config_file).unwrap();
+        let (effective, source, revision) =
+            read_effective_snapshot(Some(&config_file), Some(&state_root), configured_now).unwrap();
+
+        assert_eq!(source, "applied_snapshot");
+        assert_eq!(revision, Some(1));
+        assert_eq!(effective.config.adapters.tickets.command, ["ticket-cli-a"]);
+        assert_eq!(std::fs::read(&db).unwrap(), before_db);
+        assert!(!state_root.join("state.sqlite3-journal").exists());
+        let after_entries = std::fs::read_dir(&state_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "state.sqlite3-wal" && name != "state.sqlite3-shm")
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after_entries, before_entries);
+    }
+
+    #[test]
+    fn configured_only_projection_does_not_create_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_file = temp.path().join("config.toml");
+        let state_root = temp.path().join("state");
+        std::fs::write(&config_file, minimal_config("ticket-cli")).unwrap();
+        let configured = config::load(&config_file).unwrap();
+        let (effective, source, revision) =
+            read_effective_snapshot(Some(&config_file), Some(&state_root), configured).unwrap();
+        assert_eq!(source, "configured_snapshot");
+        assert_eq!(revision, None);
+        assert_eq!(effective.config.adapters.tickets.command, ["ticket-cli"]);
+        assert!(!state_root.exists());
     }
 }

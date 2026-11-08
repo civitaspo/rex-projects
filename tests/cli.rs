@@ -204,6 +204,21 @@ esac
     (config, state, home)
 }
 
+fn projection_fixture(
+    temp: &tempfile::TempDir,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let config = temp.path().join("factory.toml");
+    std::fs::write(
+        &config,
+        "schema_version = 1\n\n[adapters.tickets]\nkind = 'command'\ncommand = ['ticket-cli']\n\n[repositories.example]\nclone_url = 'https://github.com/example/repo.git'\nbase_branch = 'main'\nforge = 'github'\n\n[repositories.example.merge]\ninstructions = 'Follow the repository merge procedure.'\n\n[projects]\n",
+    )
+    .unwrap();
+    let state = temp.path().join("state");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(home.join("bin")).unwrap();
+    (config, state, home)
+}
+
 #[test]
 fn version_reports_the_cargo_package_version() {
     let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
@@ -514,6 +529,120 @@ fn config_validation_works_without_creating_state() {
         String::from_utf8(output.stdout)
             .unwrap()
             .contains("\"valid\": true")
+    );
+    assert!(!state.exists());
+}
+
+#[test]
+fn project_list_reports_local_snapshot_and_does_not_initialize_missing_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = projection_fixture(&temp);
+    let output = command(&config, &state, &home)
+        .args(["--json", "project", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    assert!(!state.exists());
+}
+
+#[test]
+fn project_list_identifies_applied_data_as_a_local_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = projection_fixture(&temp);
+    let applied = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let output = command(&config, &state, &home)
+        .args(["--json", "project", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["freshness"], "local_snapshot");
+    assert_eq!(report["source"], "local_state_snapshot");
+    assert_eq!(report["external_services_queried"], false);
+    assert!(report["observed_at_unix"].as_i64().unwrap() > 0);
+}
+
+#[test]
+fn policy_explain_marks_capabilities_unobserved_and_emits_merge_instruction_digest() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = projection_fixture(&temp);
+    let output = command(&config, &state, &home)
+        .args(["--json", "policy", "explain", "--repository", "example"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["snapshot_source"], "configured_snapshot");
+    assert_eq!(report["capabilities"]["status"], "not_observed");
+    assert_eq!(report["external_services_queried"], false);
+    assert_eq!(
+        report["merge_policy"]["instructions"],
+        "Follow the repository merge procedure."
+    );
+    assert_eq!(
+        report["merge_policy"]["instructions_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(!state.exists());
+}
+
+#[test]
+fn config_diff_is_read_only_and_reports_normalized_candidate_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = projection_fixture(&temp);
+    let candidate = temp.path().join("candidate.toml");
+    let source = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &candidate,
+        source.replace("base_branch = 'main'", "base_branch = 'trunk'"),
+    )
+    .unwrap();
+    let output = command(&config, &state, &home)
+        .args(["--json", "config", "diff", "--candidate"])
+        .arg(&candidate)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["baseline"]["source"], "configured_snapshot");
+    assert_eq!(report["baseline"]["applied"], false);
+    assert_eq!(report["candidate"]["applied"], false);
+    assert_eq!(report["candidate_applied"], false);
+    assert_eq!(report["state_written"], false);
+    assert_eq!(
+        report["assessment_invalidation"]["status"],
+        "not_established"
+    );
+    assert!(
+        report["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["kind"] == "repository" && entry["id"] == "example" }),
+        "{report:#}"
     );
     assert!(!state.exists());
 }
