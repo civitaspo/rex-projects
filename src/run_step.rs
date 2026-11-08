@@ -2810,7 +2810,7 @@ mod tests {
             response,
         );
         let mut turn = request(root.path(), AgentAdapter::ClaudeCode, "/bin/sh");
-        turn.profile.command = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        turn.profile.command = vec!["/bin/sh".into(), "-c".into(), script];
         turn.descriptor.provider_capability = fixture_capability(
             &turn.profile,
             turn.descriptor.profile_digest.clone(),
@@ -2916,10 +2916,7 @@ mod tests {
             AgentAdapter::ClaudeCode,
             executable.to_str().unwrap(),
         );
-        turn.profile.command = vec![
-            executable.to_string_lossy().into_owned().into(),
-            "--list".into(),
-        ];
+        turn.profile.command = vec![executable.to_string_lossy().into_owned(), "--list".into()];
         turn.descriptor.provider_capability = fixture_capability(
             &turn.profile,
             turn.descriptor.profile_digest.clone(),
