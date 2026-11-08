@@ -474,9 +474,7 @@
                   "type": "string"
                 },
                 "expected_ticket_revision": {
-                  "format": "uint64",
-                  "minimum": 0,
-                  "type": "integer"
+                  "type": "string"
                 },
                 "priority": {
                   "format": "int32",

@@ -1872,7 +1872,7 @@ pub(crate) mod tests {
         authority.run_epoch = 1;
         let dispatch = crate::engine::orchestration::DispatchRequestPayload {
             ticket_reference: crate::domain::ids::TicketId::parse("ticket-42").unwrap(),
-            expected_ticket_revision: Revision(8),
+            expected_ticket_revision: crate::domain::ids::TicketRevision::parse("rev-8").unwrap(),
             coordinator_profile: ProfileId::parse("planner").unwrap(),
             priority: 1,
             rationale: "matches dispatch policy".into(),
@@ -1896,7 +1896,7 @@ pub(crate) mod tests {
                 "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, payload_json TEXT);
                  INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:coordinator','ticket_run_dispatch','ticket-run','{\"supervisor_evidence_id\":\"dispatch-evidence\"}');
                  CREATE TABLE ticket_runs(ticket_run_id TEXT, project_id TEXT, ticket_id TEXT, external_revision TEXT);
-                 INSERT INTO ticket_runs VALUES ('ticket-run','project-a','ticket-42','8');
+                 INSERT INTO ticket_runs VALUES ('ticket-run','project-a','ticket-42','rev-8');
                  CREATE TABLE agent_result_evidence(evidence_id TEXT, agent_run_id TEXT, project_id TEXT, role TEXT, ticket_run_id TEXT, outcome TEXT, result_json TEXT);
                  CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT, descriptor_digest TEXT, authority_digest TEXT);",
             )
@@ -2000,8 +2000,7 @@ pub(crate) mod tests {
                 operation_id: authority.operation_id.clone(),
                 expected_subject_revision: authority
                     .ticket_revision
-                    .expect("ticket-scoped result fixture")
-                    .0,
+                    .map_or(0, |revision| revision.0),
                 attempt: authority.attempt,
                 run_epoch: authority.run_epoch,
                 controller_generation: authority.controller_generation,
@@ -2892,28 +2891,40 @@ pub(crate) mod host_validation_fixture {
             Role::Worker => ("implementing", "in_progress", 4_u64),
             _ => ("reviewing", "in_review", 1_u64),
         };
-        store.connection.execute(
+        if role != Role::Supervisor {
+            store.connection.execute(
             "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision) VALUES (?1,?2,'fixture',?3,?4,'fixture','T-1',1,?5,'running',?6,?6,?7)",
             rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), applied.revision.0, config_digest, phase, external_status, ticket_revision],
         ).map_err(|error| error.to_string())?;
-        let recipe_id = if role == Role::Worker {
-            Some("fixture-recipe")
-        } else {
-            None
-        };
-        store.connection.execute(
+            let recipe_id = if role == Role::Worker {
+                Some("fixture-recipe")
+            } else {
+                None
+            };
+            store.connection.execute(
             "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,?3,1,1)",
             rusqlite::params![ticket_run_id.as_str(), project_id.as_str(), recipe_id],
         ).map_err(|error| error.to_string())?;
-        let evidence = host_validated_result_in(
-            &mut store,
-            &root,
-            owner_generation,
-            project_id,
-            ticket_run_id,
-            role,
-            message,
-        )?;
+        }
+        let evidence = if role == Role::Supervisor {
+            host_validated_supervisor_result_in(
+                &mut store,
+                &root,
+                owner_generation,
+                project_id,
+                message,
+            )?
+        } else {
+            host_validated_result_in(
+                &mut store,
+                &root,
+                owner_generation,
+                project_id,
+                ticket_run_id,
+                role,
+                message,
+            )?
+        };
         Ok(TestValidatedResultFixture {
             _temp: temp,
             store,
@@ -2935,6 +2946,45 @@ pub(crate) mod host_validation_fixture {
         project_id: ProjectId,
         ticket_run_id: TicketRunId,
         role: Role,
+        message: RoleResultMessage,
+    ) -> Result<InPlaceValidatedResultFixture, String> {
+        host_validated_result_inner(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            Some(ticket_run_id),
+            role,
+            message,
+        )
+    }
+
+    /// Builds a host-validated Project-scoped Supervisor result without a TicketRun binding.
+    pub(crate) fn host_validated_supervisor_result_in(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        message: RoleResultMessage,
+    ) -> Result<InPlaceValidatedResultFixture, String> {
+        host_validated_result_inner(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            None,
+            Role::Supervisor,
+            message,
+        )
+    }
+
+    fn host_validated_result_inner(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: Option<TicketRunId>,
+        role: Role,
         mut message: RoleResultMessage,
     ) -> Result<InPlaceValidatedResultFixture, String> {
         let project = store
@@ -2943,21 +2993,32 @@ pub(crate) mod host_validation_fixture {
         let config_source = project.config_source.clone();
         let config_revision = project.config_revision;
         let config_digest = project.config_digest.as_str().to_owned();
-        let (ticket_revision, namespace, ticket_id): (u64, String, String) = store.connection
+        let ticket_snapshot: Option<(u64, String, String)> = ticket_run_id.as_ref().map(|ticket_run_id| store.connection
             .query_row(
                 "SELECT revision,namespace,ticket_id FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
                 rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(|error| error.to_string())?;
-        let agent_run_id = AgentRunId::parse("fixture-agent-run")?;
+            .map_err(|error| error.to_string())).transpose()?;
+        let (ticket_revision, namespace, ticket_id) =
+            ticket_snapshot.unwrap_or((1, "fixture".into(), "T-1".into()));
+        let supervisor_suffix = (role == Role::Supervisor)
+            .then(|| format!("{:x}", Sha256::digest(message.message_id.as_bytes())));
+        let agent_run_id = AgentRunId::parse(supervisor_suffix.as_ref().map_or_else(
+            || "fixture-agent-run".to_owned(),
+            |suffix| format!("fixture-agent-{}", &suffix[..16]),
+        ))?;
         let mut authority = crate::store::agent_results::tests::test_authority();
         authority.agent_run_id = agent_run_id.clone();
+        if let Some(suffix) = &supervisor_suffix {
+            authority.operation_id = OperationId::parse(format!("fixture-op-{}", &suffix[..16]))?;
+        }
         authority.project_id = project_id.clone();
         authority.role = role;
         authority.role_session_id = match role {
             Role::Worker => "ticket:fixture-ticket-run:worker:node-a".into(),
             Role::Coordinator => "ticket_run:fixture-ticket-run:coordinator".into(),
+            Role::Supervisor => format!("project:{}:supervisor", project_id.as_str()),
             _ => format!("fixture-{:?}", role).to_lowercase(),
         };
         let parent_run_id = AgentRunId::parse("fixture-parent-run")?;
@@ -2966,15 +3027,26 @@ pub(crate) mod host_validation_fixture {
         } else {
             Role::Coordinator
         };
-        let parent_role_session_id = if parent_role == Role::Supervisor {
-            format!("project:{project_id}:supervisor")
+        let parent_role_session_id = if role == Role::Supervisor {
+            None
+        } else if parent_role == Role::Supervisor {
+            Some(format!("project:{project_id}:supervisor"))
         } else {
-            format!("ticket_run:{ticket_run_id}:coordinator")
+            ticket_run_id
+                .as_ref()
+                .map(|ticket_run_id| format!("ticket_run:{ticket_run_id}:coordinator"))
         };
-        authority.parent_run_id = Some(parent_run_id.clone());
-        authority.parent_role = Some(parent_role);
-        authority.ticket_run_id = Some(ticket_run_id.clone());
-        authority.ticket_revision = Some(Revision(ticket_revision));
+        if role == Role::Supervisor {
+            authority.parent_run_id = None;
+            authority.parent_role = None;
+            authority.ticket_run_id = None;
+            authority.ticket_revision = None;
+        } else {
+            authority.parent_run_id = Some(parent_run_id.clone());
+            authority.parent_role = Some(parent_role);
+            authority.ticket_run_id = ticket_run_id.clone();
+            authority.ticket_revision = ticket_run_id.map(|_| Revision(ticket_revision));
+        }
         authority.config_revision = config_revision;
         authority.config_digest = Digest::parse(config_digest.clone())?;
         authority.controller_generation = owner_generation;
@@ -2982,9 +3054,9 @@ pub(crate) mod host_validation_fixture {
         authority.rex_session_id = "fixture-session".into();
         authority.rex_window_id = "fixture-window".into();
         authority.rex_block_id = "fixture-block".into();
-        authority.descriptor_path = root.join("run-step-package.json");
-        authority.workspace_path = root.join("workspace");
-        authority.control_dir = root.join("control");
+        authority.descriptor_path = root.join(format!("{}-run-step-package.json", agent_run_id));
+        authority.workspace_path = root.join(format!("{}-workspace", agent_run_id));
+        authority.control_dir = root.join(format!("{}-control", agent_run_id));
         std::fs::create_dir(&authority.workspace_path).map_err(|error| error.to_string())?;
         std::fs::create_dir(&authority.control_dir).map_err(|error| error.to_string())?;
         let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
@@ -2994,12 +3066,14 @@ pub(crate) mod host_validation_fixture {
         authority.profile_digest = crate::store::agent_profile_digest(&profile)?;
         let schema_name = match role {
             Role::Coordinator => "coordinator-v1.json",
+            Role::Supervisor => "supervisor-v1.json",
             Role::Worker => "worker-v1.json",
             Role::Reviewer => "reviewer-v1.json",
             Role::Postmortem => "postmortem-v1.json",
             _ => {
                 return Err(
-                    "fixture currently supports Worker, Reviewer, and Postmortem roles".into(),
+                    "fixture currently supports Supervisor, Worker, Reviewer, and Postmortem roles"
+                        .into(),
                 );
             }
         };
@@ -3027,16 +3101,27 @@ pub(crate) mod host_validation_fixture {
             "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,?6,'fixture-owner',1,?7,?8,?9,?10,'running',?11)",
             rusqlite::params![run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, authority.role_session_id, authority.operation_id.as_str(), authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, owner_generation],
         ).map_err(|error| error.to_string())?;
+        let view_kind = if role == Role::Supervisor {
+            crate::launch::RexViewKind::Supervisor
+        } else {
+            crate::launch::RexViewKind::Ticket
+        };
+        let view_kind_name = match view_kind {
+            crate::launch::RexViewKind::Supervisor => "supervisor",
+            crate::launch::RexViewKind::Ticket => "ticket",
+        };
+        let view_namespace = (role != Role::Supervisor).then_some(namespace.as_str());
+        let view_ticket = (role != Role::Supervisor).then_some(ticket_id.as_str());
         let view_id = crate::launch::RexView::derive_id(
             &project_id,
-            crate::launch::RexViewKind::Ticket,
-            Some(&namespace),
-            Some(&ticket_id),
+            view_kind,
+            view_namespace,
+            view_ticket,
             1,
         )?;
         store.connection.execute(
-            "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'ticket',?3,?4,1,'fixture-rex','fixture-session','fixture-window',0,'active',?5,?5)",
-            rusqlite::params![view_id.as_str(), project_id.as_str(), namespace, ticket_id, now],
+            "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,1,'fixture-rex','fixture-session','fixture-window',0,'active',?6,?6) ON CONFLICT(view_id) DO NOTHING",
+            rusqlite::params![view_id.as_str(), project_id.as_str(), view_kind_name, view_namespace, view_ticket, now],
         ).map_err(|error| error.to_string())?;
         if parent_role == Role::Supervisor {
             let supervisor_view_id = crate::launch::RexView::derive_id(
@@ -3052,55 +3137,58 @@ pub(crate) mod host_validation_fixture {
             ).map_err(|error| error.to_string())?;
         }
         authority.rex_view_id = view_id;
-        authority.descriptor_path = root.join("run-step-package-final.json");
+        authority.descriptor_path =
+            root.join(format!("{}-run-step-package-final.json", agent_run_id));
         let package = crate::store::agent_results::tests::reviewer_run_step_package(
             &authority,
             schema.clone(),
         );
         authority.descriptor_digest = package.publish_once(&authority.descriptor_path)?;
-        let parent_run_id_str = parent_run_id.as_str();
-        let mut parent_authority = authority.clone();
-        parent_authority.agent_run_id = parent_run_id.clone();
-        parent_authority.role = parent_role;
-        parent_authority.role_session_id = parent_role_session_id.clone();
-        parent_authority.parent_run_id = None;
-        parent_authority.parent_role = None;
-        if parent_role == Role::Supervisor {
-            parent_authority.ticket_run_id = None;
-            parent_authority.ticket_revision = None;
-            parent_authority.rex_view_id = crate::launch::RexView::derive_id(
-                &project_id,
-                crate::launch::RexViewKind::Supervisor,
-                None,
-                None,
-                1,
-            )?;
-        }
-        parent_authority.operation_id = OperationId::parse("fixture-parent-operation")?;
-        parent_authority.rex_block_id = "fixture-parent-block".into();
-        parent_authority.descriptor_path = root.join("parent-package.json");
-        parent_authority.workspace_path = root.join("parent-workspace");
-        parent_authority.control_dir = root.join("parent-control");
-        parent_authority.validate()?;
-        let parent_authority_json =
-            serde_json::to_string(&parent_authority).map_err(|error| error.to_string())?;
-        let parent_authority_digest = parent_authority.digest()?;
-        let parent_role_json = serde_json::to_value(parent_role)
-            .map_err(|error| error.to_string())?
-            .as_str()
-            .unwrap()
-            .to_owned();
-        store.connection.execute(
-            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,?6,?7,'fixture-owner',1,'fixture-parent-operation','completed',?8)",
-            rusqlite::params![parent_run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, parent_role_session_id, parent_role_json, owner_generation],
-        ).map_err(|error| error.to_string())?;
-        store.connection.execute(
-            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)",
+        if role != Role::Supervisor {
+            let parent_run_id_str = parent_run_id.as_str();
+            let mut parent_authority = authority.clone();
+            parent_authority.agent_run_id = parent_run_id.clone();
+            parent_authority.role = parent_role;
+            parent_authority.role_session_id = parent_role_session_id.clone().unwrap_or_default();
+            parent_authority.parent_run_id = None;
+            parent_authority.parent_role = None;
+            if parent_role == Role::Supervisor {
+                parent_authority.ticket_run_id = None;
+                parent_authority.ticket_revision = None;
+                parent_authority.rex_view_id = crate::launch::RexView::derive_id(
+                    &project_id,
+                    crate::launch::RexViewKind::Supervisor,
+                    None,
+                    None,
+                    1,
+                )?;
+            }
+            parent_authority.operation_id = OperationId::parse("fixture-parent-operation")?;
+            parent_authority.rex_block_id = "fixture-parent-block".into();
+            parent_authority.descriptor_path = root.join("parent-package.json");
+            parent_authority.workspace_path = root.join("parent-workspace");
+            parent_authority.control_dir = root.join("parent-control");
+            parent_authority.validate()?;
+            let parent_authority_json =
+                serde_json::to_string(&parent_authority).map_err(|error| error.to_string())?;
+            let parent_authority_digest = parent_authority.digest()?;
+            let parent_role_json = serde_json::to_value(parent_role)
+                .map_err(|error| error.to_string())?
+                .as_str()
+                .unwrap()
+                .to_owned();
+            store.connection.execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,?6,?7,'fixture-owner',1,'fixture-parent-operation','completed',?8)",
+                rusqlite::params![parent_run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, parent_role_session_id, parent_role_json, owner_generation],
+            ).map_err(|error| error.to_string())?;
+            store.connection.execute(
+                "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)",
             rusqlite::params![parent_authority.agent_run_id.as_str(), parent_authority.project_id.as_str(), parent_role_json, parent_authority.role_session_id, parent_authority.ticket_run_id.as_ref().map(TicketRunId::as_str), parent_authority.ticket_revision.map(|revision| revision.0), parent_authority.config_revision.0, parent_authority.config_digest.as_str(), parent_authority.attempt, parent_authority.run_epoch, parent_authority.controller_generation, parent_authority.operation_id.as_str(), parent_authority.rex_view_id.as_str(), parent_authority.descriptor_digest.as_str(), parent_authority.runtime_binary_digest.as_str(), parent_authority.descriptor_path.display().to_string(), parent_authority.environment_snapshot_id.as_str(), parent_authority.profile_id.as_str(), parent_authority.profile_digest.as_str(), parent_authority.instruction_digest.as_str(), parent_authority.result_schema_digest.as_str(), parent_authority.qualification_receipt_digest.as_str(), parent_authority.rex_server_identity, parent_authority.rex_session_id, parent_authority.rex_window_id, parent_authority.rex_block_id, parent_authority.workspace_path.display().to_string(), parent_authority.control_dir.display().to_string(), parent_authority.mailbox_capability_digest.as_str(), parent_authority_json, parent_authority_digest.as_str(), now],
         ).map_err(|error| error.to_string())?;
+        }
         store.connection.execute(
             "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
-            rusqlite::params![run_id_str, project_id.as_str(), role_str, authority.role_session_id, parent_run_id_str, parent_role_json, ticket_run_id.as_str(), ticket_revision, authority.config_revision.0, authority.config_digest.as_str(), authority.attempt, authority.run_epoch, owner_generation, authority.operation_id.as_str(), authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.runtime_binary_digest.as_str(), authority.descriptor_path.display().to_string(), authority.environment_snapshot_id.as_str(), authority.profile_id.as_str(), authority.profile_digest.as_str(), authority.instruction_digest.as_str(), authority.result_schema_digest.as_str(), authority.qualification_receipt_digest.as_str(), authority.rex_server_identity, authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, authority.workspace_path.display().to_string(), authority.control_dir.display().to_string(), authority.mailbox_capability_digest.as_str(), serde_json::to_string(&authority).map_err(|error| error.to_string())?, authority.digest()?.as_str(), now],
+            rusqlite::params![run_id_str, project_id.as_str(), role_str, authority.role_session_id, authority.parent_run_id.as_ref().map(AgentRunId::as_str), authority.parent_role.map(|role| serde_json::to_value(role).unwrap().as_str().unwrap().to_owned()), authority.ticket_run_id.as_ref().map(TicketRunId::as_str), authority.ticket_revision.map(|revision| revision.0), authority.config_revision.0, authority.config_digest.as_str(), authority.attempt, authority.run_epoch, owner_generation, authority.operation_id.as_str(), authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.runtime_binary_digest.as_str(), authority.descriptor_path.display().to_string(), authority.environment_snapshot_id.as_str(), authority.profile_id.as_str(), authority.profile_digest.as_str(), authority.instruction_digest.as_str(), authority.result_schema_digest.as_str(), authority.qualification_receipt_digest.as_str(), authority.rex_server_identity, authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, authority.workspace_path.display().to_string(), authority.control_dir.display().to_string(), authority.mailbox_capability_digest.as_str(), serde_json::to_string(&authority).map_err(|error| error.to_string())?, authority.digest()?.as_str(), now],
         ).map_err(|error| error.to_string())?;
         let child = Command::new("/bin/sleep")
             .arg("0.2")
@@ -3576,9 +3664,9 @@ impl ConfigStore {
         else {
             return Err("Supervisor dispatch evidence has a different typed payload".into());
         };
-        let expected_revision = request.expected_ticket_revision.0.to_string();
+        let expected_revision = request.expected_ticket_revision.as_str();
         if request.ticket_reference.as_str() != ticket.0
-            || ticket.1.as_deref() != Some(expected_revision.as_str())
+            || ticket.1.as_deref() != Some(expected_revision)
         {
             return Err(
                 "TicketRun dispatch does not match its Supervisor's exact ticket observation"

@@ -133,7 +133,7 @@ fn valid_payloads() -> Vec<(RoleOutputKind, Value)> {
         ),
         (
             RoleOutputKind::DispatchRequest,
-            json!({"ticket_reference":"TICKET-1","expected_ticket_revision":1,"coordinator_profile":"default","priority":1,"rationale":"unblocks work"}),
+            json!({"ticket_reference":"TICKET-1","expected_ticket_revision":"rev-1","coordinator_profile":"default","priority":1,"rationale":"unblocks work"}),
         ),
         (
             RoleOutputKind::Intervention,

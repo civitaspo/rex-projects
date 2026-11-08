@@ -1166,9 +1166,7 @@ fn apply_supervisor_dispatch_request(
             .into_iter()
             .find(|ticket| ticket.ticket_id == dispatch.ticket_reference)
         {
-            if observation.revision.as_deref()
-                != Some(dispatch.expected_ticket_revision.0.to_string().as_str())
-            {
+            if observation.revision.as_deref() != Some(dispatch.expected_ticket_revision.as_str()) {
                 return Err(
                     "Supervisor dispatch references a stale external ticket revision".into(),
                 );
@@ -1190,7 +1188,7 @@ fn apply_supervisor_dispatch_request(
     let authority = crate::store::scheduler::SupervisorDispatchAuthority {
         evidence_id: result.receipt.evidence_id().to_owned(),
         priority: dispatch.priority,
-        expected_external_revision: dispatch.expected_ticket_revision.0.to_string(),
+        expected_external_revision: dispatch.expected_ticket_revision.as_str().to_owned(),
     };
     let run_id = store.create_dispatched_ticket_run(
         owner_generation,
@@ -3087,6 +3085,140 @@ pub(crate) mod tests {
             &mut services,
             result,
         )
+    }
+
+    #[test]
+    fn host_validated_supervisor_dispatch_allocates_only_the_exact_opaque_ticket_revision() {
+        use crate::domain::ids::{Digest, ProjectId, TicketId, TicketNamespace};
+        use crate::domain::types::{Role, TicketStatus};
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use crate::store::scheduler::{ObservedTicket, TicketScanKey};
+        use rusqlite::params;
+        use serde_json::json;
+
+        fn run(expected_revision: &str) -> (Result<bool, String>, usize) {
+            let payload = json!({
+                "ticket_reference": "T-1",
+                "expected_ticket_revision": expected_revision,
+                "coordinator_profile": "judgment_claude",
+                "priority": 3,
+                "rationale": "dispatch the exact observed ticket revision"
+            });
+            let result_digest = Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
+            ))
+            .unwrap();
+            let mut fixture =
+                crate::store::agent_results::host_validation_fixture::host_validated_result(
+                    Role::Supervisor,
+                    RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: format!("supervisor-dispatch-{expected_revision}"),
+                        kind: RoleOutputKind::DispatchRequest,
+                        assertion: AgentAssertion::Succeeded,
+                        structured_result: payload,
+                        result_digest,
+                        artifact_refs: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let project_id = ProjectId::parse("fixture-project").unwrap();
+            fixture
+                .store
+                .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
+                .unwrap();
+            let mut config: Config =
+                toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+            let mut project = config
+                .projects
+                .remove(&ProjectId::parse("goal_project").unwrap())
+                .unwrap();
+            project.dispatch_states = vec![TicketStatus::Ready];
+            config.projects.insert(project_id.clone(), project);
+            let project = config.projects.get(&project_id).unwrap();
+            let namespace = TicketNamespace::parse("fixture").unwrap();
+            let key = TicketScanKey::for_project(
+                &project_id,
+                &project.ticket_adapter,
+                &namespace,
+                project,
+                TicketStatus::Ready,
+            )
+            .unwrap();
+            fixture
+                .store
+                .record_ticket_scan_page(
+                    fixture.owner_generation,
+                    &key,
+                    None,
+                    0,
+                    0,
+                    None,
+                    &[ObservedTicket {
+                        id: TicketId::parse("T-1").unwrap(),
+                        revision: Some("rev-1".into()),
+                        status: TicketStatus::Ready,
+                        title: "Fixture ticket".into(),
+                        labels: Vec::new(),
+                        created_at: None,
+                        observed_at_unix: 1,
+                    }],
+                    1,
+                    60,
+                )
+                .unwrap();
+            let binding = &fixture.ingested.validated.binding;
+            fixture
+                .store
+                .test_connection()
+                .execute(
+                    "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,1,?5,'{}','authorized',1,1)",
+                    params![
+                        binding.agent_run_id.as_str(),
+                        binding.project_id.as_str(),
+                        binding.operation_id.as_str(),
+                        fixture.owner_generation,
+                        "d".repeat(64),
+                    ],
+                )
+                .unwrap();
+            let mut services = WorkerPublicationFixtureServices {
+                configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+                published_effect: None,
+            };
+            let applied = super::apply_agent_result(
+                &mut fixture.store,
+                fixture.owner_generation,
+                2,
+                &config,
+                &mut services,
+                &fixture.ingested,
+            );
+            let count = fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM ticket_runs WHERE project_id=?1 AND ticket_id='T-1'",
+                    [project_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (applied, count)
+        }
+
+        let (allocated, allocated_count) = run("rev-1");
+        assert!(allocated.unwrap());
+        assert_eq!(allocated_count, 1);
+
+        let (stale, stale_count) = run("rev-stale");
+        assert!(
+            stale
+                .unwrap_err()
+                .contains("stale external ticket revision")
+        );
+        assert_eq!(stale_count, 0);
     }
 
     #[test]

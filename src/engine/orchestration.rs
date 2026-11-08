@@ -9,7 +9,7 @@ use sha2::{Digest as _, Sha256};
 use crate::config::{Config, OperationRecipe, ProjectConfig, SuccessPredicate};
 use crate::domain::ids::{
     AgentRunId, ArtifactId, Digest, OperationId, ProfileId, ProjectId, RepositoryId, Revision,
-    TicketId, TicketNamespace, TicketRunId,
+    TicketId, TicketNamespace, TicketRevision, TicketRunId,
 };
 use crate::domain::types::CommitMode;
 use crate::domain::types::{ProjectMode, RecipeStage, Role, TicketStatus};
@@ -568,7 +568,7 @@ role_payload!(TicketProposalPayload {
 });
 role_payload!(DispatchRequestPayload {
     ticket_reference: TicketId,
-    expected_ticket_revision: Revision,
+    expected_ticket_revision: TicketRevision,
     coordinator_profile: ProfileId,
     priority: i32,
     rationale: String,
@@ -2558,7 +2558,7 @@ mod tests {
             ),
             (
                 RoleOutputKind::DispatchRequest,
-                json!({"ticket_reference":"TICKET-1", "expected_ticket_revision":1, "coordinator_profile":"default", "priority":1, "rationale":"unblocks work"}),
+                json!({"ticket_reference":"TICKET-1", "expected_ticket_revision":"rev-1", "coordinator_profile":"default", "priority":1, "rationale":"unblocks work"}),
             ),
             (
                 RoleOutputKind::Intervention,
