@@ -2947,12 +2947,20 @@ impl RuntimeServices {
             Role::Worker => None,
             _ => Some(Role::Coordinator),
         };
+        let parent_authority = if candidate.role == Role::Coordinator {
+            Some(store.supervisor_parent_for_ticket_run(&candidate.project_id, ticket_run_id)?)
+        } else if candidate.role == Role::Worker {
+            None
+        } else {
+            Some(
+                store
+                    .coordinator_child_parent(&candidate.project_id, &candidate.role_session_id)?,
+            )
+        };
         if let Some(expected_parent_role) = expected_parent_role {
-            let parent_authority = if candidate.role == Role::Coordinator {
-                store.supervisor_parent_for_ticket_run(&candidate.project_id, ticket_run_id)?
-            } else {
-                store.coordinator_child_parent(&candidate.project_id, &candidate.role_session_id)?
-            };
+            let parent_authority = parent_authority
+                .as_ref()
+                .ok_or("ticket role parent authority is missing")?;
             if parent_authority.role != expected_parent_role
                 || parent_authority.project_id != candidate.project_id
                 || parent_authority.config_revision != runnable.record.config_revision
@@ -3052,8 +3060,16 @@ impl RuntimeServices {
             role_session_id: candidate.role_session_id.clone(),
             parent_run_id: worker_context
                 .as_ref()
-                .map(|context| context.token.coordinator_agent_run_id().clone()),
-            parent_role: worker_context.as_ref().map(|_| Role::Coordinator),
+                .map(|context| context.token.coordinator_agent_run_id().clone())
+                .or_else(|| {
+                    parent_authority
+                        .as_ref()
+                        .map(|authority| authority.agent_run_id.clone())
+                }),
+            parent_role: worker_context
+                .as_ref()
+                .map(|_| Role::Coordinator)
+                .or_else(|| parent_authority.as_ref().map(|authority| authority.role)),
             ticket_run_id: Some(ticket_run_id.clone()),
             ticket_revision: Some(crate::domain::ids::Revision(active_run.revision)),
             config_revision: runnable.record.config_revision,
