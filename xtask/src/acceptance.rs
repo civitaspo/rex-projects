@@ -1220,6 +1220,7 @@ fn rex_capture(request: &Request<'_>, block: &str) -> Result<ProcessOutput, Stri
             "--block",
             block,
             "--trim",
+            "--unwrap",
         ],
     )
 }
@@ -1514,6 +1515,7 @@ fn observe_coordinator_qualification_wait(
             && state.verified_qualification_count == 0
             && state.agent_run_count == 0
             && state.active_slot_count == 0;
+        let mut diagnostic_observed = false;
         if at_boundary {
             let baseline = *heartbeat_baseline.get_or_insert(state.heartbeat_at_unix);
             if last_heartbeat.is_none_or(|last| state.heartbeat_at_unix > last) {
@@ -1525,7 +1527,7 @@ fn observe_coordinator_qualification_wait(
                 }
             }
             let capture = rex_capture(request, block).ok();
-            let diagnostic_observed = capture.as_ref().is_some_and(|output| {
+            diagnostic_observed = capture.as_ref().is_some_and(|output| {
                 output.status.is_some_and(|status| status.success())
                     && String::from_utf8_lossy(&output.stdout).contains(&diagnostic)
             });
@@ -1561,7 +1563,7 @@ fn observe_coordinator_qualification_wait(
         if Instant::now() >= deadline {
             return json!({
                 "status":"timed_out",
-                "reason":"Supervisor dispatch did not leave an unqualified Coordinator wake pending",
+                "reason":"Coordinator qualification wait was not proven",
                 "owner_generation":state.generation,
                 "owner_active":true,
                 "ticket_run_id":state.ticket_run_id,
@@ -1569,6 +1571,8 @@ fn observe_coordinator_qualification_wait(
                 "coordinator_qualifications":state.verified_qualification_count,
                 "coordinator_agent_runs":state.agent_run_count,
                 "coordinator_active_slots":state.active_slot_count,
+                "parked_diagnostic_observed":diagnostic_observed,
+                "project_running":projects_running(&status),
                 "heartbeat_baseline":heartbeat_baseline,
                 "distinct_heartbeat_advances":heartbeat_advances
             });
