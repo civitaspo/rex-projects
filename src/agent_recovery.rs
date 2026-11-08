@@ -395,6 +395,92 @@ impl AgentRecoveryRuntime {
         Some(watch)
     }
 
+    fn watch_live_run_tree(
+        &mut self,
+        run: &RecoverableAgentRun,
+        provider: &ObservedProviderStart,
+        process_tree: &[ProcessIdentity],
+        current: &[ProcessIdentity],
+    ) -> bool {
+        // A controller restart cannot prove continuous coverage across a cleanup snapshot.
+        // Existing in-memory watches remain valid: they are the proof that preceded it.
+        let snapshot_exists = RunStepSpool::open(&run.authority.control_dir)
+            .and_then(|spool| spool.read_block_loss_cleanup_snapshot())
+            .map(|snapshot| snapshot.is_some())
+            .unwrap_or(true);
+        let Some(watch) = self.run_fork_watch(run, &provider.process_tree_digest, snapshot_exists)
+        else {
+            return false;
+        };
+        if watch.invalidated || !watch.arm(process_tree, current) {
+            watch.invalidated = true;
+            return false;
+        }
+        let mut tracked = process_tree.to_vec();
+        for _ in 0..16 {
+            let fresh = match inspect_process_table() {
+                Ok(processes) => processes,
+                Err(_) => {
+                    watch.invalidated = true;
+                    return false;
+                }
+            };
+            let Some(extended) = extend_process_tree(&tracked, &fresh).unwrap_or_default() else {
+                watch.invalidated = true;
+                return false;
+            };
+            if extended.len() > MAX_FORK_WATCH_IDENTITIES
+                || !watch.arm(&extended, &fresh)
+                || !watch.drain_events()
+            {
+                watch.invalidated = true;
+                return false;
+            }
+            tracked = extended;
+            let after = match inspect_process_table() {
+                Ok(processes) => processes,
+                Err(_) => {
+                    watch.invalidated = true;
+                    return false;
+                }
+            };
+            let Some(after_tree) = extend_process_tree(&tracked, &after).unwrap_or_default() else {
+                watch.invalidated = true;
+                return false;
+            };
+            if after_tree.len() > MAX_FORK_WATCH_IDENTITIES {
+                watch.invalidated = true;
+                return false;
+            }
+            let all_live_identities_watched = after_tree.iter().all(|process| {
+                kernel_identity(&after, process.pid, &process.start_identity).is_none()
+                    || watch
+                        .watched
+                        .contains_key(&(process.pid, process.start_identity.clone()))
+            });
+            let provider_watched = watch.watched.contains_key(&(
+                provider.provider_pid,
+                provider.provider_start_identity.clone(),
+            ));
+            if after_tree.len() == tracked.len()
+                && all_live_identities_watched
+                && provider_watched
+                && watch.drain_events()
+                && watch.covers_sample(
+                    provider.provider_pid,
+                    &provider.provider_start_identity,
+                    &tracked,
+                    &after,
+                )
+            {
+                return true;
+            }
+            tracked = after_tree;
+        }
+        watch.invalidated = true;
+        false
+    }
+
     /// Observe a finite, ordered subset of unknown/live runs. A failed or ambiguous observation
     /// never releases a slot and never authorizes a replacement turn.
     pub fn tick(
@@ -662,6 +748,10 @@ impl AgentRecoveryRuntime {
                 reason: RecoveryUnknown::ProcessInspectionUnavailable,
             });
         }
+        // Establish continuous fork/exit observation while Rex still confirms the block and
+        // every identity is present. A missing, malformed, or already-existing cleanup snapshot
+        // prevents a newly created watch from being treated as continuous proof.
+        self.watch_live_run_tree(run, &provider, &process_tree, process_table);
         let process_tree = process_tree
             .iter()
             .map(|process| AdoptedProcessIdentity {
@@ -2010,6 +2100,178 @@ mod tests {
             max_observations_per_tick: 8,
             now_unix: 1_000,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_run_observation_arms_watch_before_block_loss() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let control_dir = root.path().join("control");
+        fs::create_dir_all(&control_dir).unwrap();
+        let spool = RunStepSpool::open(&control_dir).unwrap();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let identity = wait_for_identity(child.id());
+        let (run, provider) = watch_test_run(&control_dir, &identity);
+        let current = inspect_process_table().unwrap();
+        let mut runtime = AgentRecoveryRuntime::default();
+
+        assert!(runtime.watch_live_run_tree(
+            &run,
+            &provider,
+            std::slice::from_ref(&identity),
+            &current,
+        ));
+        let watch = runtime.fork_watches.get(&run.agent_run_id).unwrap();
+        assert!(!watch.invalidated);
+        assert!(
+            watch
+                .watched
+                .contains_key(&(identity.pid, identity.start_identity.clone()))
+        );
+
+        let mut snapshot = make_test_snapshot(vec![identity.clone()], false);
+        snapshot.agent_run_id = run.agent_run_id.clone();
+        snapshot.reservation_epoch = run.reservation_epoch;
+        snapshot.authority_digest = run.authority_digest.clone();
+        snapshot.launch_tree_digest = provider.process_tree_digest.clone();
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        assert!(runtime.watch_live_run_tree(
+            &run,
+            &provider,
+            std::slice::from_ref(&identity),
+            &inspect_process_table().unwrap(),
+        ));
+        assert!(!runtime.fork_watches[&run.agent_run_id].invalidated);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_run_observation_does_not_recreate_watch_after_cleanup_snapshot() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let control_dir = root.path().join("control");
+        fs::create_dir_all(&control_dir).unwrap();
+        let spool = RunStepSpool::open(&control_dir).unwrap();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let identity = wait_for_identity(child.id());
+        let (run, provider) = watch_test_run(&control_dir, &identity);
+        let mut snapshot = make_test_snapshot(vec![identity.clone()], false);
+        snapshot.agent_run_id = run.agent_run_id.clone();
+        snapshot.reservation_epoch = run.reservation_epoch;
+        snapshot.authority_digest = run.authority_digest.clone();
+        snapshot.launch_tree_digest = provider.process_tree_digest.clone();
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        let current = inspect_process_table().unwrap();
+        let mut runtime = AgentRecoveryRuntime::default();
+
+        assert!(!runtime.watch_live_run_tree(
+            &run,
+            &provider,
+            std::slice::from_ref(&identity),
+            &current,
+        ));
+        assert!(runtime.fork_watches[&run.agent_run_id].invalidated);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn watch_test_run(
+        control_dir: &Path,
+        identity: &ProcessIdentity,
+    ) -> (RecoverableAgentRun, ObservedProviderStart) {
+        use crate::domain::ids::{OperationId, ProjectId, Revision};
+        use crate::domain::types::Role;
+
+        let run_id = AgentRunId::parse("run-watch-test").unwrap();
+        let digest = Digest::parse("a".repeat(64)).unwrap();
+        let authority = crate::launch::AgentLaunchAuthority {
+            agent_run_id: run_id.clone(),
+            project_id: ProjectId::parse("project-watch-test").unwrap(),
+            role: Role::Supervisor,
+            role_session_id: "role-session".into(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: Revision(1),
+            config_digest: digest.clone(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: 1,
+            operation_id: OperationId::parse("operation-watch-test").unwrap(),
+            operation_recipe_id: None,
+            rex_view_id: digest.clone(),
+            descriptor_digest: digest.clone(),
+            runtime_binary_digest: digest.clone(),
+            descriptor_path: control_dir.join("descriptor.json"),
+            environment_snapshot_id: digest.clone(),
+            profile_id: ProfileId::parse("profile-watch-test").unwrap(),
+            profile_digest: digest.clone(),
+            instruction_digest: digest.clone(),
+            result_schema_digest: digest.clone(),
+            wake_snapshot_digest: digest.clone(),
+            qualification_receipt_digest: digest.clone(),
+            rex_server_identity: "rex-instance".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+            rex_block_id: "block".into(),
+            workspace_path: control_dir.to_path_buf(),
+            control_dir: control_dir.to_path_buf(),
+            mailbox_capability_digest: digest.clone(),
+        };
+        let process = crate::launch::ProviderProcessIdentity {
+            pid: identity.pid,
+            parent_pid: identity.parent_pid,
+            process_group_id: identity.process_group_id,
+            start_identity: identity.start_identity.clone(),
+            identity_quality: identity.quality,
+        };
+        let provider = ObservedProviderStart {
+            agent_run_id: run_id.clone(),
+            operation_id: authority.operation_id.clone(),
+            provider_pid: identity.pid,
+            provider_start_identity: identity.start_identity.clone(),
+            executable_digest: digest.clone(),
+            process_tree_digest: digest.clone(),
+            process_tree_confirmed: true,
+            process_tree: vec![process],
+        };
+        (
+            RecoverableAgentRun {
+                agent_run_id: run_id,
+                current_generation: 1,
+                previous_generation: 0,
+                authority,
+                authority_digest: digest,
+                agent_state: "unknown".into(),
+                started_at_unix: Some(1),
+                launch_state: "running".into(),
+                process_identity_json: None,
+                wrapper_identity_json: None,
+                provider_tree_json: None,
+                pool: "agent".into(),
+                slot_index: 0,
+                reservation_epoch: 1,
+                slot_disposition: "live".into(),
+            },
+            provider,
+        )
     }
 
     #[test]
