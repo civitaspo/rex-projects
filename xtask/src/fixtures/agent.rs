@@ -183,13 +183,20 @@ pub fn run(
     let invocation = fixture_invocation(role, scenario, &prompt)?;
     run_qualification_tool_if_requested(runtime_binary, &prompt, state_dir)?;
     let inbox = if invocation.scope.lane == FixtureLane::Workflow
-        && matches!(role, Role::Supervisor | Role::Coordinator | Role::Planner)
-    {
-        Some(read_public_inbox(runtime_binary, &invocation, state_dir)?)
+        && matches!(
+            role,
+            Role::Supervisor | Role::Coordinator | Role::Planner | Role::Worker
+        ) {
+        Some(read_public_inbox(
+            runtime_binary,
+            &invocation,
+            state_dir,
+            &prompt,
+        )?)
     } else {
         None
     };
-    if role == Role::Coordinator
+    if matches!(role, Role::Coordinator | Role::Worker)
         && invocation.scope.lane == FixtureLane::Workflow
         && context.hold_after_inbox
     {
@@ -847,6 +854,7 @@ fn execute_actions(
 struct WorkerAssignment {
     node_id: String,
     repository_id: String,
+    plan_digest: String,
     base_sha: String,
     commit_mode: Value,
 }
@@ -884,6 +892,10 @@ fn worker_assignment(prompt: &str, cwd: &Path) -> Result<WorkerAssignment, Strin
         repository_id: plan["assigned_node"]["repository_id"]
             .as_str()
             .ok_or("accepted plan lacks repository ID")?
+            .to_owned(),
+        plan_digest: plan["accepted_plan_digest"]
+            .as_str()
+            .ok_or("accepted plan lacks accepted plan digest")?
             .to_owned(),
         base_sha: plan["prepared_worktree"]["base_sha"]
             .as_str()
@@ -1572,6 +1584,7 @@ fn read_public_inbox(
     runtime_binary: Option<&Path>,
     invocation: &FixtureInvocation,
     state_dir: &Path,
+    prompt: &str,
 ) -> Result<FixtureInbox, String> {
     let binary = runtime_binary
         .ok_or("workflow fixture requires the pinned product CLI for public Agent inbox reads")?;
@@ -1619,6 +1632,12 @@ fn read_public_inbox(
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("parse public Agent inbox response: {error}"))?;
     let mut inbox = FixtureInbox::parse(value, &run_id)?;
+    let worker_assignment = if invocation.scope.role == Role::Worker {
+        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        Some((worker_assignment(prompt, &cwd)?, cwd))
+    } else {
+        None
+    };
     if invocation.scope.role == Role::Coordinator {
         let dispatch_ticket_run_id = inbox
             .ticket_run_dispatch_id()?
@@ -1626,12 +1645,61 @@ fn read_public_inbox(
         if invocation.scope.ticket_run_id.as_deref() != Some(dispatch_ticket_run_id.as_str()) {
             return Err("Coordinator dispatch wake differs from its host-bound TicketRun".into());
         }
+    } else if invocation.scope.role == Role::Worker {
+        let ticket_run_id = invocation
+            .scope
+            .ticket_run_id
+            .as_deref()
+            .ok_or("Worker fixture has no host-bound TicketRun ID")?;
+        let (assignment, _) = worker_assignment
+            .as_ref()
+            .ok_or("Worker assignment was not captured from the native prompt")?;
+        let matching = inbox
+            .inputs
+            .iter()
+            .filter(|item| {
+                item["source_type"] == "work_node_ready"
+                    && item.pointer("/payload_json/kind").and_then(Value::as_str)
+                        == Some("work_node_ready")
+                    && item
+                        .pointer("/payload_json/ticket_run_id")
+                        .and_then(Value::as_str)
+                        == Some(ticket_run_id)
+                    && item
+                        .pointer("/payload_json/work_node_id")
+                        .and_then(Value::as_str)
+                        == Some(assignment.node_id.as_str())
+                    && item
+                        .pointer("/payload_json/accepted_plan_digest")
+                        .and_then(Value::as_str)
+                        == Some(assignment.plan_digest.as_str())
+                    && item
+                        .pointer("/payload_json/source_message_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id.starts_with("prepare-worktrees:"))
+            })
+            .count();
+        if matching != 1 {
+            return Err(
+                "Worker public inbox lacks its unique Coordinator PlanReady work-node wake".into(),
+            );
+        }
     }
     inbox.input_evidence = Some(evidence);
     let observation_dir = state_dir.join("inbox-observations");
     fs::create_dir_all(&observation_dir).map_err(|error| error.to_string())?;
     let observation_path =
         observation_dir.join(format!("{:x}.json", Sha256::digest(run_id.as_bytes())));
+    let worker_assignment_evidence = worker_assignment.as_ref().map(|(assignment, cwd)| {
+        json!({
+            "node_id":assignment.node_id,
+            "repository_id":assignment.repository_id,
+            "accepted_plan_digest":assignment.plan_digest,
+            "base_sha":assignment.base_sha,
+            "commit_mode":assignment.commit_mode,
+            "worktree_path":cwd
+        })
+    });
     let encoded = serde_json::to_vec(&json!({
         "run_id": inbox.run_id,
         "project_id": std::env::var("REX_PROJECTS_PROJECT_ID").ok(),
@@ -1651,6 +1719,8 @@ fn read_public_inbox(
         })),
         "ticket_observation_count": inbox.inputs.iter().filter(|item| item.pointer("/payload_json/kind").and_then(Value::as_str) == Some("ticket_observation")).count(),
         "planner_result_count": inbox.inputs.iter().filter(|item| item.pointer("/payload_json/kind").and_then(Value::as_str) == Some("validated_agent_result") && item.pointer("/payload_json/source/role").and_then(Value::as_str) == Some("planner") && item.pointer("/payload_json/result/kind").and_then(Value::as_str) == Some("plan_ready")).count(),
+        "inbox_inputs": inbox.inputs,
+        "worker_assignment": worker_assignment_evidence,
     })).map_err(|error| error.to_string())?;
     match OpenOptions::new()
         .write(true)
@@ -2515,6 +2585,7 @@ mod tests {
     fn worker_actions_require_prompt_path_to_equal_actual_provider_worktree() {
         let root = tempfile::tempdir().unwrap();
         let assignment = serde_json::json!({
+            "accepted_plan_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "assigned_node":{"node_id":"node-alpha","repository_id":"repo"},
             "prepared_worktree":{"path":root.path(),"base_sha":"0123456789abcdef0123456789abcdef01234567","commit_mode":"native"}
         });

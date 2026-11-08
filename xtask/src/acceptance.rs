@@ -24,6 +24,7 @@ const COORDINATOR_STAGE_LIMIT: Duration = Duration::from_secs(180);
 const ACCEPTANCE_STAGE_ENV: &str = "REX_PROJECTS_ACCEPTANCE_STAGE";
 const COORDINATOR_INBOX_STAGE: &str = "supervisor_coordinator_inbox";
 const COORDINATOR_BLOCK_LOSS_STAGE: &str = "supervisor_coordinator_block_loss";
+const COORDINATOR_WORKER_INBOX_STAGE: &str = "supervisor_coordinator_worker_inbox";
 const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
 const FIXTURE_PROJECT_ID: &str = "operations_project";
 const FIXTURE_TICKET_NAMESPACE: &str = "fixture/acceptance";
@@ -53,7 +54,9 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
     match value {
         None => Ok(None),
         Some(stage)
-            if stage == COORDINATOR_INBOX_STAGE || stage == COORDINATOR_BLOCK_LOSS_STAGE =>
+            if stage == COORDINATOR_INBOX_STAGE
+                || stage == COORDINATOR_BLOCK_LOSS_STAGE
+                || stage == COORDINATOR_WORKER_INBOX_STAGE =>
         {
             Ok(Some(stage))
         }
@@ -80,7 +83,10 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let stage = parse_acceptance_stage(stage_value)?;
     let bounded_coordinator_stage = stage.is_some();
     let coordinator_block_loss_stage = stage.as_deref() == Some(COORDINATOR_BLOCK_LOSS_STAGE);
-    let provider_roles: &[&str] = if bounded_coordinator_stage {
+    let coordinator_worker_inbox_stage = stage.as_deref() == Some(COORDINATOR_WORKER_INBOX_STAGE);
+    let provider_roles: &[&str] = if coordinator_worker_inbox_stage {
+        &["supervisor", "coordinator", "planner", "worker"]
+    } else if bounded_coordinator_stage {
         &["supervisor", "coordinator"]
     } else {
         &PROVIDER_ROLES
@@ -103,7 +109,8 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         &request,
         &executable,
         request.cli,
-        bounded_coordinator_stage,
+        bounded_coordinator_stage && !coordinator_worker_inbox_stage,
+        coordinator_worker_inbox_stage,
     )?;
     trace.push(json!({"step":"local_bare_repository_and_profiles","status":"passed","provider":"EMULATED"}));
 
@@ -388,6 +395,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let mut first_dashboard = true;
     let mut lifecycle_traced = false;
     let mut coordinator_boundary_reached = false;
+    let mut worker_boundary_reached = false;
     let mut coordinator_block_loss_proof = None;
     loop {
         let status = product(&request, &state_root, &["status", "--json"])?;
@@ -430,12 +438,36 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         }
         if bounded_coordinator_stage {
             let observations = read_public_inbox_observations(request.fixture_root)?;
+            if coordinator_worker_inbox_stage {
+                let mut worker_evidence = None;
+                for observation in &observations {
+                    if let Some(evidence) =
+                        is_prepared_worker_inbox_observation(observation, &state_root)?
+                    {
+                        worker_evidence = Some(evidence);
+                        break;
+                    }
+                }
+                if let Some(worker_evidence) = worker_evidence {
+                    trace.push(json!({"step":"prepared_worker_inbox_boundary_observed","status":"passed","evidence":worker_evidence}));
+                    worker_boundary_reached = true;
+                    let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
+                    if !stop.status.is_some_and(|status| status.success()) {
+                        trace.push(json!({"step":"bounded_stage_stop_request","status":"rejected","evidence":json_stdout(&stop)}));
+                    } else {
+                        trace.push(json!({"step":"bounded_stage_stop_request","status":"queued","evidence":json_stdout(&stop)}));
+                    }
+                    break;
+                }
+            }
             if let Some(coordinator) = observations
                 .iter()
                 .find(|observation| is_coordinator_dispatch_observation(observation))
             {
-                trace.push(json!({"step":"coordinator_inbox_boundary_observed","status":"passed","evidence":coordinator}));
-                coordinator_boundary_reached = true;
+                if !coordinator_boundary_reached {
+                    trace.push(json!({"step":"coordinator_inbox_boundary_observed","status":"passed","evidence":coordinator}));
+                    coordinator_boundary_reached = true;
+                }
                 if coordinator_block_loss_stage {
                     let proof = observe_coordinator_block_loss(&request, &state_root, coordinator);
                     let proof = proof.unwrap_or_else(
@@ -445,13 +477,15 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                     coordinator_block_loss_proof = Some(proof);
                     break;
                 }
-                let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
-                if !stop.status.is_some_and(|status| status.success()) {
-                    trace.push(json!({"step":"bounded_stage_stop_request","status":"rejected","evidence":json_stdout(&stop)}));
+                if !coordinator_worker_inbox_stage {
+                    let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
+                    if !stop.status.is_some_and(|status| status.success()) {
+                        trace.push(json!({"step":"bounded_stage_stop_request","status":"rejected","evidence":json_stdout(&stop)}));
+                        break;
+                    }
+                    trace.push(json!({"step":"bounded_stage_stop_request","status":"queued","evidence":json_stdout(&stop)}));
                     break;
                 }
-                trace.push(json!({"step":"bounded_stage_stop_request","status":"queued","evidence":json_stdout(&stop)}));
-                break;
             }
         }
         if Instant::now() >= deadline {
@@ -536,6 +570,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             .as_ref()
             .is_some_and(|proof| proof["status"] == "passed")
         && coordinator_boundary_reached
+        && (!coordinator_worker_inbox_stage || worker_boundary_reached)
         && stopped
         && coordinator_observation.is_some()
         && (!coordinator_block_loss_stage
@@ -614,6 +649,164 @@ fn is_coordinator_dispatch_observation(observation: &Value) -> bool {
             .pointer("/input_files/snapshot_digest")
             .and_then(Value::as_str)
             .is_some_and(|digest| digest.len() == 64)
+}
+
+fn is_prepared_worker_inbox_observation(
+    observation: &Value,
+    state_root: &Path,
+) -> Result<Option<Value>, String> {
+    if observation["role"] != "worker"
+        || observation["ticket_run_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || observation
+            .pointer("/input_files/package_path")
+            .and_then(Value::as_str)
+            .is_none_or(|path| !Path::new(path).is_absolute())
+        || observation
+            .pointer("/input_files/package_sha256")
+            .and_then(Value::as_str)
+            .is_none_or(|digest| digest.len() != 64)
+        || observation
+            .pointer("/input_files/snapshot_path")
+            .and_then(Value::as_str)
+            .is_none_or(|path| !Path::new(path).is_absolute())
+        || observation
+            .pointer("/input_files/snapshot_digest")
+            .and_then(Value::as_str)
+            .is_none_or(|digest| digest.len() != 64)
+    {
+        return Ok(None);
+    }
+    let assignment = &observation["worker_assignment"];
+    let (Some(node_id), Some(plan_digest), Some(worktree_path)) = (
+        assignment["node_id"].as_str(),
+        assignment["accepted_plan_digest"].as_str(),
+        assignment["worktree_path"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    let ticket_run_id = observation["ticket_run_id"].as_str().unwrap_or_default();
+    let inputs = observation["inbox_inputs"].as_array();
+    let Some(input) = inputs.and_then(|inputs| {
+        inputs.iter().find(|input| {
+            input["source_type"] == "work_node_ready"
+                && input.pointer("/payload_json/kind").and_then(Value::as_str)
+                    == Some("work_node_ready")
+                && input
+                    .pointer("/payload_json/ticket_run_id")
+                    .and_then(Value::as_str)
+                    == Some(ticket_run_id)
+                && input
+                    .pointer("/payload_json/work_node_id")
+                    .and_then(Value::as_str)
+                    == Some(node_id)
+                && input
+                    .pointer("/payload_json/accepted_plan_digest")
+                    .and_then(Value::as_str)
+                    == Some(plan_digest)
+                && input
+                    .pointer("/payload_json/source_message_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("prepare-worktrees:"))
+                && input
+                    .pointer("/payload_json/revision")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        })
+    }) else {
+        return Ok(None);
+    };
+    let run_id = observation["run_id"]
+        .as_str()
+        .ok_or("Worker inbox observation omitted its run ID")?;
+    let database = Connection::open_with_flags(
+        state_root.join("state.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("open acceptance state read-only for Worker authority: {error}"))?;
+    let authority_row: Option<(String, String)> = database
+        .query_row(
+            "SELECT a.authority_json,r.reservation_json FROM agent_launch_authority a JOIN agent_launch_reservations r USING(agent_run_id) WHERE a.agent_run_id=?1 AND a.role='worker'",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("read registered Worker launch authority: {error}"))?;
+    let Some((authority_json, reservation_json)) = authority_row else {
+        return Ok(None);
+    };
+    let authority: rex_projects::launch::AgentLaunchAuthority =
+        serde_json::from_str(&authority_json)
+            .map_err(|error| format!("parse registered Worker launch authority: {error}"))?;
+    let reservation: rex_projects::launch::AgentLaunchReservation =
+        serde_json::from_str(&reservation_json)
+            .map_err(|error| format!("parse registered Worker launch reservation: {error}"))?;
+    let Some(binding) = reservation.worker_assignment.as_ref() else {
+        return Ok(None);
+    };
+    let expected_source_message = format!("prepare-worktrees:{}", binding.prepare_operation_id);
+    let source_message_id = input
+        .pointer("/payload_json/source_message_id")
+        .and_then(Value::as_str);
+    let coordinator_row: (String, String) = database
+        .query_row(
+            "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+            params![binding.coordinator_agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("read registered Coordinator parent authority: {error}"))?
+        .ok_or("Worker binding references an unregistered Coordinator authority")?;
+    let (coordinator_json, coordinator_digest) = coordinator_row;
+    let coordinator: rex_projects::launch::AgentLaunchAuthority =
+        serde_json::from_str(&coordinator_json)
+            .map_err(|error| format!("parse registered Coordinator authority: {error}"))?;
+    let worker_run_id = observation["run_id"].as_str().unwrap_or_default();
+    let ticket_revision = input
+        .pointer("/payload_json/revision")
+        .and_then(Value::as_u64);
+    let authority_matches = authority.agent_run_id.as_str() == worker_run_id
+        && authority.role == rex_projects::domain::types::Role::Worker
+        && authority.parent_role == Some(rex_projects::domain::types::Role::Coordinator)
+        && authority.parent_run_id.as_ref().map(|id| id.as_str())
+            == Some(binding.coordinator_agent_run_id.as_str())
+        && authority.ticket_run_id.as_ref().map(|id| id.as_str()) == Some(ticket_run_id)
+        && reservation.role == rex_projects::domain::types::Role::Worker
+        && reservation.ticket_run_id.as_ref().map(|id| id.as_str()) == Some(ticket_run_id)
+        && coordinator.role == rex_projects::domain::types::Role::Coordinator
+        && coordinator.parent_role == Some(rex_projects::domain::types::Role::Supervisor)
+        && coordinator.ticket_run_id.as_ref().map(|id| id.as_str()) == Some(ticket_run_id)
+        && binding.coordinator_authority_digest.as_str() == coordinator_digest
+        && binding.node_id.as_str() == node_id
+        && binding.plan_digest.as_str() == plan_digest
+        && binding.repository_id.as_str()
+            == assignment["repository_id"].as_str().unwrap_or_default()
+        && binding.base_sha == assignment["base_sha"].as_str().unwrap_or_default()
+        && binding.worktree_path == PathBuf::from(worktree_path)
+        && Path::new(worktree_path).is_absolute()
+        && binding.ticket_revision == ticket_revision.unwrap_or_default()
+        && source_message_id == Some(expected_source_message.as_str());
+    if !authority_matches {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "run_id":worker_run_id,
+        "parent_run_id":authority.parent_run_id.as_ref().map(|id| id.as_str()),
+        "parent_role":authority.parent_role,
+        "ticket_run_id":ticket_run_id,
+        "source_message_id":source_message_id,
+        "plan_ready_source_message_id":binding.source_message_id,
+        "plan_ready_source_agent_run_id":binding.source_agent_run_id.as_str(),
+        "accepted_plan_digest":plan_digest,
+        "accepted_revision":binding.accepted_revision,
+        "work_node_id":node_id,
+        "repository_id":binding.repository_id.as_str(),
+        "worktree_path":worktree_path,
+        "base_sha":binding.base_sha,
+        "prepare_operation_id":binding.prepare_operation_id,
+        "prepare_receipt_digest":binding.prepare_receipt_digest.as_str()
+    })))
 }
 
 fn read_public_inbox_observations(fixture_root: &Path) -> Result<Vec<Value>, String> {
@@ -724,6 +917,7 @@ fn prepare_profiles(
     executable: &Path,
     runtime_binary: &Path,
     hold_coordinator_after_inbox: bool,
+    hold_worker_after_inbox: bool,
 ) -> Result<(), String> {
     let profiles = request.fixture_root.join("profiles");
     let contexts = request.fixture_root.join("contexts");
@@ -745,7 +939,8 @@ fn prepare_profiles(
         let scenario = format!("acceptance_{role}");
         let context = contexts.join(format!("{role}.json"));
         let messages = profile_messages(role)?;
-        let hold = hold_coordinator_after_inbox && role == "coordinator";
+        let hold = (hold_coordinator_after_inbox && role == "coordinator")
+            || (hold_worker_after_inbox && role == "worker");
         fs::write(
             &context,
             serde_json::to_vec(
@@ -800,11 +995,6 @@ fn profile_messages(role: &str) -> Result<Vec<Value>, String> {
                 "allowed_repositories":["fixture"],"artifact_inputs":[],"parent_run_id":null
             })),
             message("coordinator", "plan_ready", json!({"$fixture_ref":"inbox.planner_result"})),
-            message("coordinator", "spawn_request", json!({
-                "work_node":"acceptance-node","role":"worker","profile_id":"fixture_worker",
-                "plan_digest":{"$fixture_ref":"prompt.accepted_plan_digest"},
-                "allowed_repositories":["fixture"],"artifact_inputs":[],"parent_run_id":null
-            })),
             message("coordinator", "spawn_request", json!({
                 "work_node":"acceptance-node","role":"reviewer","profile_id":"fixture_reviewer",
                 "plan_digest":{"$fixture_ref":"prompt.accepted_plan_digest"},
@@ -1974,6 +2164,10 @@ mod tests {
             parse_acceptance_stage(Some(COORDINATOR_BLOCK_LOSS_STAGE.into())).unwrap(),
             Some(COORDINATOR_BLOCK_LOSS_STAGE.into())
         );
+        assert_eq!(
+            parse_acceptance_stage(Some(COORDINATOR_WORKER_INBOX_STAGE.into())).unwrap(),
+            Some(COORDINATOR_WORKER_INBOX_STAGE.into())
+        );
         assert!(parse_acceptance_stage(Some("unknown".into())).is_err());
     }
 
@@ -2166,7 +2360,7 @@ mod tests {
             fixture_root: &root,
         };
         let executable = std::env::current_exe().unwrap();
-        prepare_profiles(&request, &executable, request.cli, true).unwrap();
+        prepare_profiles(&request, &executable, request.cli, true, false).unwrap();
         fs::write(root.join("config.toml"), config_text(&request, &executable)).unwrap();
 
         let applied = rex_projects::config::load(&root.join("config.toml")).unwrap();
@@ -2208,7 +2402,7 @@ mod tests {
             fixture_root: &root,
         };
         let executable = std::env::current_exe().unwrap();
-        prepare_profiles(&request, &executable, request.cli, false).unwrap();
+        prepare_profiles(&request, &executable, request.cli, false, false).unwrap();
 
         let context =
             crate::fixtures::agent::read_context(&root.join("contexts/supervisor.json")).unwrap();
@@ -2295,7 +2489,7 @@ mod tests {
             fixture_root: &root,
         };
         let executable = std::env::current_exe().unwrap();
-        prepare_profiles(&request, &executable, request.cli, false).unwrap();
+        prepare_profiles(&request, &executable, request.cli, false, false).unwrap();
         let context =
             crate::fixtures::agent::read_context(&root.join("contexts/supervisor.json")).unwrap();
         let supervisor_messages = context
@@ -2358,7 +2552,7 @@ mod tests {
             fixture_root: &root,
         };
         let executable = std::env::current_exe().unwrap();
-        prepare_profiles(&request, &executable, request.cli, false).unwrap();
+        prepare_profiles(&request, &executable, request.cli, false, false).unwrap();
         let config = root.join("config.toml");
         fs::write(&config, config_text(&request, &executable)).unwrap();
         rex_projects::config::load(&config).unwrap();
