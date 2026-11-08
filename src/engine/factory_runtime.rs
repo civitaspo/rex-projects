@@ -3119,7 +3119,7 @@ pub(crate) mod tests {
                         kind: RoleOutputKind::DispatchRequest,
                         assertion: AgentAssertion::Succeeded,
                         structured_result: payload,
-                        result_digest,
+                        result_digest: Some(result_digest),
                         artifact_refs: Vec::new(),
                     },
                 )
@@ -3256,7 +3256,7 @@ pub(crate) mod tests {
                     kind: RoleOutputKind::ImplementationReady,
                     assertion: AgentAssertion::Succeeded,
                     structured_result,
-                    result_digest,
+                    result_digest: Some(result_digest),
                     artifact_refs: Vec::new(),
                 },
             )
@@ -3370,7 +3370,7 @@ pub(crate) mod tests {
                     kind: RoleOutputKind::SpawnRequest,
                     assertion: AgentAssertion::Succeeded,
                     structured_result,
-                    result_digest,
+                    result_digest: Some(result_digest),
                     artifact_refs: Vec::new(),
                 },
             )
@@ -3472,7 +3472,7 @@ pub(crate) mod tests {
                         kind: RoleOutputKind::SpawnRequest,
                         assertion: AgentAssertion::Succeeded,
                         structured_result,
-                        result_digest,
+                        result_digest: Some(result_digest),
                         artifact_refs: Vec::new(),
                     },
                 )
@@ -3583,7 +3583,7 @@ pub(crate) mod tests {
                     kind: RoleOutputKind::ImplementationReady,
                     assertion: AgentAssertion::Succeeded,
                     structured_result,
-                    result_digest,
+                    result_digest: Some(result_digest),
                     artifact_refs: Vec::new(),
                 },
             )

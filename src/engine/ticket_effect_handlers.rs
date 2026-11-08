@@ -1969,7 +1969,7 @@ mod tests {
             kind: RoleOutputKind::PostmortemReady,
             assertion: AgentAssertion::Succeeded,
             structured_result,
-            result_digest,
+            result_digest: Some(result_digest),
             artifact_refs: vec![],
         };
         let mut fixture =

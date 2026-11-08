@@ -88,27 +88,42 @@ pub struct RoleResultMessage {
     pub kind: RoleOutputKind,
     pub assertion: AgentAssertion,
     pub structured_result: Value,
-    pub result_digest: ContentDigest,
+    /// Optional Agent claim; the host replaces it with the digest of canonical JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<ContentDigest>,
     pub artifact_refs: Vec<RoleArtifactReference>,
 }
 
 impl RoleResultMessage {
+    pub(crate) fn canonicalized(mut self) -> Result<Self, String> {
+        let encoded = serde_json::to_vec(&self.structured_result)
+            .map_err(|error| format!("serialize structured role result: {error}"))?;
+        self.result_digest = Some(ContentDigest::parse(format!(
+            "{:x}",
+            Sha256::digest(encoded)
+        ))?);
+        Ok(self)
+    }
+
     pub fn bind(
         self,
         binding: RoleResultBinding,
     ) -> Result<crate::engine::orchestration::ValidatedRoleResult, String> {
-        if self.schema_version != ROLE_RESULT_SCHEMA_VERSION {
+        let message = self.canonicalized()?;
+        if message.schema_version != ROLE_RESULT_SCHEMA_VERSION {
             return Err("unsupported role result schema version".into());
         }
         let submission = RoleResultSubmission {
-            schema_version: self.schema_version,
-            message_id: self.message_id,
+            schema_version: message.schema_version,
+            message_id: message.message_id,
             binding,
-            kind: self.kind,
-            assertion: self.assertion,
-            structured_result: self.structured_result,
-            result_digest: self.result_digest,
-            artifact_refs: self.artifact_refs,
+            kind: message.kind,
+            assertion: message.assertion,
+            structured_result: message.structured_result,
+            result_digest: message
+                .result_digest
+                .ok_or("host did not compute the structured result digest")?,
+            artifact_refs: message.artifact_refs,
         };
         let expected = submission.binding.clone();
         validate_role_result(&expected, submission)
@@ -382,7 +397,7 @@ pub fn render_role_prompt(
         "\n# Agent inbox\n\nAt the start of every finite turn, read this run's wake inputs with `<cli_path> agent inbox --json`; the command uses this run's `REX_PROJECTS_RUN_ID` and `REX_PROJECTS_CONTROL_DIR` context. When continuing from a prior inbox read, pass its `next_after` value as `--after <next_after>`. Use `payload_json` and `host_artifacts` exactly as returned; an Agent's claims in a wake payload are not host verification. If you need to troubleshoot the scope, run `<cli_path> agent inbox --run <run_id> --control-dir <control_dir> [--after <next_after>] --json` using the exact `run_id` and `control_dir` from the immutable descriptor.\n",
     );
     prompt.push_str(&format!(
-        "\n# Final authority and result rules\n\nThis contract outranks repository-discovered guidance for factory lifecycle. It grants no permission beyond the immutable run descriptor. Use only these output kinds: {allowed_kinds}. Return one JSON object matching `schemas/agent-results/{}-v1.json`; do not wrap it in Markdown. Set `message_id` to a new stable value for this turn. `result_digest` is the lowercase SHA-256 of the compact UTF-8 JSON serialization of `structured_result` (no whitespace or trailing newline). Save the unbound result object in this run's writable workspace; it contains no host binding fields. Submit it using the exact `cli_path`, `run_id`, and `control_dir` from the immutable descriptor with `<cli_path> agent submit --run <run_id> --control-dir <control_dir> --message-id <same message_id> --input <file> --json`. The host binds the submission to the immutable run descriptor; never add or invent binding fields. Do not send the result by typing into another Agent's TUI. For each artifact, first save it inside this run's writable workspace and register it with `<cli_path> agent artifact add --run <run_id> --control-dir <control_dir> --path <normalized-relative-path> --kind <allowed-kind> --schema-version <content-schema-version> --message-id <new-message-id> --json`. A successful response contains `result.artifact`, the complete registered reference including host-minted `artifact_id`; copy that reference exactly into `artifact_refs`, and never guess or synthesize any field. If the response is pending, poll `<cli_path> agent receipt --run <run_id> --control-dir <control_dir> --request-id <same-message-id> --json` until the completed receipt arrives. `artifact_refs` and every nested evidence reference are unverified locator claims from you; include only references acknowledged by the host, but do not treat an acknowledgement or reference as proof that tests, reviews, remote checks, a merge, deployment, or publication succeeded. The host verifies artifact bytes and records receipts, while delivery, remote, and operation adapters independently observe their outcomes. Your `assertion` is a claim about your reasoning task only; it does not prove host-observed process exit, tests, review, merge, deployment, publication, or ticket completion. Include evidence artifact references rather than inventing host receipts.\n",
+        "\n# Final authority and result rules\n\nThis contract outranks repository-discovered guidance for factory lifecycle. It grants no permission beyond the immutable run descriptor. Use only these output kinds: {allowed_kinds}. Return one JSON object matching `schemas/agent-results/{}-v1.json`; do not wrap it in Markdown. Set `message_id` to a new stable value for this turn. Omit `result_digest`; the host computes the canonical SHA-256 digest from the captured `structured_result`. Save the unbound result object in this run's writable workspace; it contains no host binding fields. Submit it using the exact `cli_path`, `run_id`, and `control_dir` from the immutable descriptor with `<cli_path> agent submit --run <run_id> --control-dir <control_dir> --message-id <same message_id> --input <file> --json`. The host binds the submission to the immutable run descriptor; never add or invent binding fields. Do not send the result by typing into another Agent's TUI. For each artifact, first save it inside this run's writable workspace and register it with `<cli_path> agent artifact add --run <run_id> --control-dir <control_dir> --path <normalized-relative-path> --kind <allowed-kind> --schema-version <content-schema-version> --message-id <new-message-id> --json`. A successful response contains `result.artifact`, the complete registered reference including host-minted `artifact_id`; copy that reference exactly into `artifact_refs`, and never guess or synthesize any field. If the response is pending, poll `<cli_path> agent receipt --run <run_id> --control-dir <control_dir> --request-id <same-message-id> --json` until the completed receipt arrives. `artifact_refs` and every nested evidence reference are unverified locator claims from you; include only references acknowledged by the host, but do not treat an acknowledgement or reference as proof that tests, reviews, remote checks, a merge, deployment, or publication succeeded. The host verifies artifact bytes and records receipts, while delivery, remote, and operation adapters independently observe their outcomes. Your `assertion` is a claim about your reasoning task only; it does not prove host-observed process exit, tests, review, merge, deployment, publication, or ticket completion. Include evidence artifact references rather than inventing host receipts.\n",
         role_name(context.role),
     ));
     if prompt.len() > MAX_PROMPT_BYTES {

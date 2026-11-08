@@ -6849,11 +6849,13 @@ mod tests {
             message_id: "reviewer-published-snapshot".into(),
             kind: crate::engine::orchestration::RoleOutputKind::ReviewReady,
             assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
-            result_digest: Digest::parse(format!(
-                "{:x}",
-                sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
-            ))
-            .unwrap(),
+            result_digest: Some(
+                Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+                ))
+                .unwrap(),
+            ),
             structured_result,
             artifact_refs: Vec::new(),
         };

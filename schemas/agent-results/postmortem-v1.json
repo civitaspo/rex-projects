@@ -483,7 +483,6 @@
     "kind",
     "assertion",
     "structured_result",
-    "result_digest",
     "artifact_refs"
   ],
   "title": "rex-projects postmortem result message",

@@ -412,7 +412,7 @@ pub fn ingest_agent_result(
         return Err("verified terminal no longer matches launch authority".into());
     }
     let binding = binding_for(&authority)?;
-    let validated = message.clone().bind(binding.clone())?;
+    let message = message.canonicalized()?;
     let terminal_role_message: RoleResultMessage = serde_json::from_value(
         terminal
             .result
@@ -421,11 +421,13 @@ pub fn ingest_agent_result(
             .ok_or("completed Agent terminal has no structured result")?,
     )
     .map_err(|error| format!("provider result is not a role result message: {error}"))?;
+    let terminal_role_message = terminal_role_message.canonicalized()?;
     if terminal_role_message != message {
         return Err(
             "submitted role result differs from the persisted provider terminal payload".into(),
         );
     }
+    let validated = message.clone().bind(binding.clone())?;
     let content_bytes = serde_json::to_vec(&(
         "rex-projects-role-result-v1",
         &binding,
@@ -586,7 +588,7 @@ pub fn pending_agent_results(
             kind: submission.kind,
             assertion: submission.assertion,
             structured_result: submission.structured_result,
-            result_digest: submission.result_digest,
+            result_digest: Some(submission.result_digest),
             artifact_refs: submission.artifact_refs,
         };
         if binding_for(&authority)? != submission.binding {
@@ -660,7 +662,7 @@ pub fn agent_result_for_wake(
         kind: submission.kind,
         assertion: submission.assertion,
         structured_result: submission.structured_result,
-        result_digest: submission.result_digest,
+        result_digest: Some(submission.result_digest),
         artifact_refs: submission.artifact_refs,
     };
     let replayed =
@@ -3345,10 +3347,10 @@ pub(crate) mod host_validation_fixture {
                 &artifact.reference,
                 &artifact.object_path,
             )?;
-            message.result_digest = digest(
+            message.result_digest = Some(digest(
                 &serde_json::to_vec(&message.structured_result)
                     .map_err(|error| error.to_string())?,
-            )?;
+            )?);
         }
         let structured = serde_json::to_value(&message).map_err(|error| error.to_string())?;
         let structured_digest =

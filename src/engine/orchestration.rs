@@ -3264,6 +3264,56 @@ mod tests {
     }
 
     #[test]
+    fn agent_wire_digest_is_optional_and_host_canonicalized_before_strict_validation() {
+        let binding = worker_result_binding();
+        let payload = worker_implementation_ready_payload();
+        let actual_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        ))
+        .unwrap();
+        let message = crate::roles::RoleResultMessage {
+            schema_version: ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "result-1".into(),
+            kind: RoleOutputKind::ImplementationReady,
+            assertion: AgentAssertion::Succeeded,
+            structured_result: payload.clone(),
+            result_digest: Some(test_digest('0')),
+            artifact_refs: vec![],
+        };
+        let validated = message.clone().bind(binding.clone()).unwrap();
+        assert_eq!(validated.result_digest, actual_digest);
+        let canonical_terminal = message.clone().canonicalized().unwrap();
+        let persisted_message = crate::roles::RoleResultMessage {
+            result_digest: Some(validated.result_digest.clone()),
+            ..message.clone()
+        };
+        assert_eq!(
+            canonical_terminal,
+            persisted_message.canonicalized().unwrap()
+        );
+        let omitted_digest = crate::roles::RoleResultMessage {
+            result_digest: None,
+            ..message
+        };
+        assert!(
+            serde_json::to_value(&omitted_digest)
+                .unwrap()
+                .get("result_digest")
+                .is_none()
+        );
+
+        let mut forged_host_submission =
+            worker_result_submission(RoleOutputKind::ImplementationReady, payload);
+        forged_host_submission.result_digest = test_digest('0');
+        assert!(validate_role_result(&binding, forged_host_submission).is_err());
+
+        let schema = crate::roles::result_schema(Role::Worker);
+        let required = schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|field| field == "result_digest"));
+    }
+
+    #[test]
     fn implementation_ready_rejects_empty_and_inconsistent_change_payloads() {
         let binding = worker_result_binding();
         assert!(
