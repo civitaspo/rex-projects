@@ -1269,6 +1269,156 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn block_loss_snapshot_can_miss_child_forked_before_cleanup_signal() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("start-child");
+        let child_pid_path = root.path().join("child.pid");
+        let spool_dir = root.path().join("control");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let spool = RunStepSpool::open(&spool_dir).unwrap();
+        let mut provider = TrackedChild::new(spawn_late_child_provider(&marker, &child_pid_path));
+        let provider_identity = wait_for_identity(provider.id());
+        let launch_tree = vec![provider_identity.clone()];
+        let sampled_process_table = inspect_process_table().unwrap();
+        let sampled_tree = initial_cleanup_tree(
+            provider.id(),
+            &provider_identity.start_identity,
+            &launch_tree,
+            &sampled_process_table,
+        )
+        .unwrap();
+        let mut snapshot = make_test_snapshot(sampled_tree, false);
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+
+        // This creates the descendant strictly after the production capture, but before its
+        // signal operation. Job control puts the child in a different process group.
+        std::fs::write(&marker, b"go").unwrap();
+        let child_identity =
+            TrackedProcess::new(wait_for_identity(wait_for_pid_file(&child_pid_path)));
+        let distinct_group =
+            child_identity.identity.process_group_id != provider_identity.process_group_id;
+
+        // Match the production ordering: use the earlier process-table sample to signal only
+        // identities visible when the snapshot was taken.
+        let signal_observed = signal_process_group_if_observed(
+            provider_identity.process_group_id,
+            &snapshot.process_tree,
+            &sampled_process_table,
+            ProcessSignal::Terminate,
+        )
+        .unwrap();
+        let provider_gone = wait_until_processes_absent(std::slice::from_ref(&provider_identity));
+        let child_survives = !crate::process::matching_processes(
+            std::slice::from_ref(&child_identity.identity),
+            &inspect_process_table().unwrap(),
+        )
+        .is_empty();
+        snapshot.cleanup_covered = signal_observed;
+        snapshot.observed_at_unix += 1;
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+
+        // Match the next production observation: extend from a fresh process table and apply
+        // the same release predicate.
+        let stored = spool.read_block_loss_cleanup_snapshot().unwrap().unwrap();
+        let next_process_table = inspect_process_table().unwrap();
+        let next_tree = extend_process_tree(&stored.process_tree, &next_process_table)
+            .unwrap()
+            .unwrap();
+        let mut next_snapshot = stored;
+        next_snapshot.process_tree = next_tree;
+        next_snapshot.process_tree_digest =
+            digest_process_tree(&next_snapshot.process_tree).unwrap();
+        let cleanup_would_release = cleanup_absence_confirmed(&next_snapshot, &next_process_table);
+
+        // The test owns this child, including the deliberately uncovered race case.
+        signal_process_group_if_observed(
+            child_identity.identity.process_group_id,
+            std::slice::from_ref(&child_identity.identity),
+            &inspect_process_table().unwrap(),
+            ProcessSignal::Kill,
+        )
+        .unwrap();
+        let child_cleaned =
+            wait_until_processes_absent(std::slice::from_ref(&child_identity.identity));
+        let _ = provider.wait();
+
+        assert!(
+            distinct_group,
+            "child must be outside the sampled process group"
+        );
+        assert!(
+            signal_observed,
+            "sampled provider group should receive cleanup signal"
+        );
+        assert!(
+            provider_gone,
+            "the tracked provider should exit after the signal"
+        );
+        assert!(
+            child_survives,
+            "the new-group child should survive the stale-sample signal"
+        );
+        assert!(child_cleaned, "the test must explicitly clean up its child");
+        assert!(
+            !cleanup_would_release,
+            "cleanup must not release while the untracked child survives"
+        );
+    }
+
+    #[cfg(unix)]
+    struct TrackedChild(Child);
+
+    #[cfg(unix)]
+    impl TrackedChild {
+        fn new(child: Child) -> Self {
+            Self(child)
+        }
+
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            self.0.wait()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TrackedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    struct TrackedProcess {
+        identity: ProcessIdentity,
+    }
+
+    #[cfg(unix)]
+    impl TrackedProcess {
+        fn new(identity: ProcessIdentity) -> Self {
+            Self { identity }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TrackedProcess {
+        fn drop(&mut self) {
+            if let Ok(current) = inspect_process_table() {
+                let _ = signal_process_group_if_observed(
+                    self.identity.process_group_id,
+                    std::slice::from_ref(&self.identity),
+                    &current,
+                    ProcessSignal::Kill,
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn spawn_late_child_provider(marker: &std::path::Path, child_pid: &std::path::Path) -> Child {
         use std::os::unix::process::CommandExt;
 
