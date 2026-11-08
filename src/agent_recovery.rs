@@ -171,8 +171,18 @@ impl RunForkWatch {
         }
     }
 
-    fn watches_identity(&self, pid: u32, birth_identity: &str) -> bool {
-        self.watched.contains_key(&(pid, birth_identity.to_owned()))
+    fn covers_sample(
+        &self,
+        provider_pid: u32,
+        provider_birth: &str,
+        tracked: &[ProcessIdentity],
+        current: &[ProcessIdentity],
+    ) -> bool {
+        !self.invalidated
+            && (self
+                .watched
+                .contains_key(&(provider_pid, provider_birth.to_owned()))
+                || crate::process::matching_processes(tracked, current).is_empty())
     }
 
     fn arm(&mut self, processes: &[ProcessIdentity], current: &[ProcessIdentity]) -> bool {
@@ -209,9 +219,7 @@ impl RunForkWatch {
                 }
                 let Some(actual) = kernel_identity(current, process.pid, &process.start_identity)
                 else {
-                    // An already-exited historical launch identity is outside this bounded
-                    // watch. Exact provider identity is required below; any identity selected
-                    // from a live sample is rechecked after registration.
+                    // Exited identities cannot fork; live identities are rechecked after registration.
                     continue;
                 };
                 let mut event: libc::kevent = unsafe { std::mem::zeroed() };
@@ -877,7 +885,12 @@ fn reconcile_missing_block(
         let watch = runtime.fork_watches.get_mut(&run.agent_run_id).unwrap();
         watch_healthy &= watch.arm(watch_seed, &fresh);
         watch_healthy &= watch.drain_events();
-        if !watch.watches_identity(provider.provider_pid, &provider.provider_start_identity) {
+        if !watch.covers_sample(
+            provider.provider_pid,
+            &provider.provider_start_identity,
+            &snapshot.process_tree,
+            &fresh,
+        ) {
             watch_healthy = false;
         }
     }
@@ -2090,6 +2103,70 @@ mod tests {
             !cleanup_would_release,
             "cleanup must not release while the untracked child survives"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn already_exited_family_can_be_confirmed_without_watching_a_dead_provider() {
+        use std::os::unix::process::CommandExt;
+
+        let mut provider = TrackedChild::new(
+            Command::new("/bin/sleep")
+                .arg("300")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let identity = wait_for_identity(provider.id());
+        let mut snapshot = make_test_snapshot(vec![identity.clone()], false);
+        let mut watch = RunForkWatch::new(
+            &snapshot.authority_digest,
+            snapshot.reservation_epoch,
+            &snapshot.launch_tree_digest,
+        );
+        let live = inspect_process_table().unwrap();
+        assert!(!watch.covers_sample(
+            identity.pid,
+            &identity.start_identity,
+            &snapshot.process_tree,
+            &live,
+        ));
+        provider.0.kill().unwrap();
+        provider.wait().unwrap();
+        assert!(wait_until_processes_absent(std::slice::from_ref(&identity)));
+        let absent = inspect_process_table().unwrap();
+        snapshot.process_tree = extend_process_tree(&snapshot.process_tree, &absent)
+            .unwrap()
+            .unwrap();
+        assert!(watch.arm(&snapshot.process_tree, &absent));
+        assert!(watch.covers_sample(
+            identity.pid,
+            &identity.start_identity,
+            &snapshot.process_tree,
+            &absent,
+        ));
+        assert!(watch.seal_cleanup_if_absent(&mut snapshot, &absent));
+        assert!(cleanup_absence_confirmed(&snapshot, &absent));
+
+        let ambiguous_group_member = ProcessIdentity {
+            pid: u32::MAX - 2,
+            start_identity: "unknown-group-member".into(),
+            ..identity.clone()
+        };
+        let mut ambiguous = absent;
+        ambiguous.push(ambiguous_group_member);
+        assert!(
+            extend_process_tree(&snapshot.process_tree, &ambiguous)
+                .unwrap()
+                .is_none()
+        );
+        watch.invalidated = true;
+        assert!(!watch.covers_sample(
+            identity.pid,
+            &identity.start_identity,
+            &snapshot.process_tree,
+            &[],
+        ));
     }
 
     #[cfg(target_os = "macos")]
