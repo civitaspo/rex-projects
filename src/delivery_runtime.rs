@@ -2662,7 +2662,7 @@ impl EffectHandler for PrepareWorktreesEffectHandler {
         }
         let receipt = self.effects.prepare_worktrees(request)?;
         Ok(EffectObservation::Applied {
-            receipt: serde_json::to_string(&receipt).map_err(|error| error.to_string())?,
+            receipt: crate::store::canonical_json(&receipt)?,
         })
     }
 }
@@ -3298,6 +3298,13 @@ mod tests {
             panic!("worktree preparation should replay its durable receipt");
         };
         assert_eq!(first, second);
+        assert_eq!(
+            first,
+            crate::store::canonical_json(
+                &serde_json::from_str::<serde_json::Value>(&first).unwrap()
+            )
+            .unwrap()
+        );
         let receipt: PreparedWorktreesEffectReceipt = serde_json::from_str(&first).unwrap();
         assert_eq!(receipt.work_nodes.len(), 1);
         assert!(
