@@ -29,6 +29,53 @@ type TicketScanCursorRow = (
     u64,
 );
 
+fn confirm_ticket_claim_repolled_tx(
+    tx: &rusqlite::Transaction<'_>,
+    owner_generation: u64,
+    namespace: &TicketNamespace,
+    ticket: &TicketId,
+    eligible_for_claim: bool,
+    observed_status: &str,
+    external_revision: Option<&str>,
+    repolled_at_unix: i64,
+) -> Result<bool, String> {
+    if observed_status.is_empty() || observed_status.len() > 255 {
+        return Err("repolled external status is required".into());
+    }
+    validate_active_generation(tx, owner_generation)?;
+    let state = if eligible_for_claim {
+        "repolled_open"
+    } else {
+        "repolled_closed"
+    };
+    tx.execute(
+        "UPDATE ticket_claim_reconciliations SET state=?3,observed_status=?4,external_revision=?5,repolled_by_generation=?6,repolled_at_unix=?7 WHERE namespace=?1 AND ticket_id=?2",
+        params![namespace.as_str(),ticket.as_str(),state,observed_status,external_revision,owner_generation,repolled_at_unix],
+    )
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
+pub(super) fn ticket_claim_reconciliation_origin_project(
+    connection: &Connection,
+    namespace: &TicketNamespace,
+    ticket: &TicketId,
+) -> Result<Option<ProjectId>, String> {
+    connection
+        .query_row(
+            "SELECT run.project_id FROM ticket_claim_reconciliations reconciliation JOIN human_claim_release_commands release ON release.request_id=reconciliation.release_request_id AND release.state='applied' JOIN ticket_runs run ON run.ticket_run_id=json_extract(release.payload_json,'$.ticket_run_id') WHERE reconciliation.namespace=?1 AND reconciliation.ticket_id=?2",
+            params![namespace.as_str(), ticket.as_str()],
+            |row| {
+                let project_id: String = row.get(0)?;
+                Ok(project_id)
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .map(ProjectId::parse)
+        .transpose()
+}
+
 /// Cursor and timing information for one Project/status scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TicketScanCursor {
@@ -509,12 +556,23 @@ impl ConfigStore {
             "goal_revision": goal_revision,
         })
         .to_string();
-        let source_id = format!(
+        let regular_source_id = format!(
             "{}:{}:{}",
             key.namespace.as_str(),
             ticket.ticket_id.as_str(),
             status_key(ticket.status)
         );
+        let release_request_id: Option<String> = tx
+            .query_row(
+                "SELECT reconciliation.release_request_id FROM ticket_claim_reconciliations reconciliation JOIN human_claim_release_commands release ON release.request_id=reconciliation.release_request_id AND release.state='applied' JOIN ticket_runs run ON run.ticket_run_id=json_extract(release.payload_json,'$.ticket_run_id') WHERE reconciliation.namespace=?1 AND reconciliation.ticket_id=?2 AND reconciliation.state='repolled_open' AND run.project_id=?3",
+                params![key.namespace.as_str(), ticket.ticket_id.as_str(), key.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let source_id = release_request_id.map_or(regular_source_id.clone(), |release_id| {
+            format!("{regular_source_id}:resume:{release_id}")
+        });
         let revision_digest = content_digest(&payload);
         let source_revision = u64::from_str_radix(&revision_digest[..16], 16)
             .map_err(|error| error.to_string())?
@@ -675,7 +733,18 @@ impl ConfigStore {
                 if !regular_consumed {
                     continue;
                 }
-                let source_id = format!("{regular_source_id}:resume:{project_epoch}");
+                let release_request_id: Option<String> = connection
+                    .query_row(
+                        "SELECT reconciliation.release_request_id FROM ticket_claim_reconciliations reconciliation JOIN human_claim_release_commands release ON release.request_id=reconciliation.release_request_id AND release.state='applied' JOIN ticket_runs run ON run.ticket_run_id=json_extract(release.payload_json,'$.ticket_run_id') WHERE reconciliation.namespace=?1 AND reconciliation.ticket_id=?2 AND reconciliation.state='repolled_open' AND run.project_id=?3",
+                        params![namespace.as_str(), ticket_id.as_str(), project_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let source_id = release_request_id.map_or_else(
+                    || format!("{regular_source_id}:resume:{project_epoch}"),
+                    |release_id| format!("{regular_source_id}:resume:{release_id}"),
+                );
                 let inserted = connection.execute(
                 "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_observation',?3,?4,30,?5,'pending',?6) ON CONFLICT(role_session_id,source_type,source_id,source_revision) DO NOTHING",
                 params![project_id.as_str(),format!("project:{}:supervisor",project_id.as_str()),source_id,source_revision.max(1),payload,now_unix],
@@ -2041,6 +2110,45 @@ impl ConfigStore {
                 "INSERT INTO ticket_observations(project_id,adapter_id,namespace,ticket_id,scope_digest,filter_digest,external_revision,status,title,labels_json,created_at,last_seen_at_unix,scan_generation) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(project_id,adapter_id,namespace,ticket_id) DO UPDATE SET scope_digest=excluded.scope_digest,filter_digest=excluded.filter_digest,external_revision=excluded.external_revision,status=excluded.status,title=excluded.title,labels_json=excluded.labels_json,created_at=COALESCE(ticket_observations.created_at,excluded.created_at),last_seen_at_unix=excluded.last_seen_at_unix,scan_generation=excluded.scan_generation,dispatch_state=CASE WHEN ticket_observations.scope_digest != excluded.scope_digest OR ticket_observations.filter_digest != excluded.filter_digest OR ticket_observations.external_revision IS NOT excluded.external_revision OR ticket_observations.status != excluded.status OR ticket_observations.title != excluded.title OR ticket_observations.labels_json != excluded.labels_json THEN 'pending' ELSE ticket_observations.dispatch_state END,ticket_run_id=CASE WHEN ticket_observations.scope_digest != excluded.scope_digest OR ticket_observations.filter_digest != excluded.filter_digest OR ticket_observations.external_revision IS NOT excluded.external_revision OR ticket_observations.status != excluded.status OR ticket_observations.title != excluded.title OR ticket_observations.labels_json != excluded.labels_json THEN NULL ELSE ticket_observations.ticket_run_id END",
                 params![key.project_id.as_str(),key.adapter_id.as_str(),key.namespace.as_str(),ticket.id.as_str(),key.scope_digest.as_str(),key.filter_digest.as_str(),ticket.revision,status_key(ticket.status),ticket.title,labels,ticket.created_at,ticket.observed_at_unix,generation],
             ).map_err(|error| error.to_string())?;
+
+            let reconciliation: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM ticket_claim_reconciliations WHERE namespace=?1 AND ticket_id=?2",
+                    params![key.namespace.as_str(), ticket.id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let reconciliation_origin = if reconciliation.is_some() {
+                ticket_claim_reconciliation_origin_project(&tx, &key.namespace, &ticket.id)?
+            } else {
+                None
+            };
+            if matches!(
+                reconciliation.as_deref(),
+                Some("pending" | "repolled_closed" | "repolled_open")
+            ) && reconciliation_origin.as_ref() == Some(&key.project_id)
+            {
+                confirm_ticket_claim_repolled_tx(
+                    &tx,
+                    owner_generation,
+                    &key.namespace,
+                    &ticket.id,
+                    true,
+                    status_key(ticket.status),
+                    ticket.revision.as_deref(),
+                    now_unix,
+                )?;
+                if matches!(
+                    reconciliation.as_deref(),
+                    Some("pending" | "repolled_closed")
+                ) {
+                    tx.execute(
+                        "UPDATE ticket_observations SET dispatch_state='pending',ticket_run_id=NULL WHERE project_id=?1 AND adapter_id=?2 AND namespace=?3 AND ticket_id=?4 AND scope_digest=?5 AND filter_digest=?6",
+                        params![key.project_id.as_str(),key.adapter_id.as_str(),key.namespace.as_str(),ticket.id.as_str(),key.scope_digest.as_str(),key.filter_digest.as_str()],
+                    ).map_err(|error| error.to_string())?;
+                }
+            }
         }
 
         let complete = next_cursor.is_none();
@@ -2153,6 +2261,30 @@ impl ConfigStore {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
+        let reconciliation: Option<(String, Option<String>, Option<String>, String)> = tx
+            .query_row(
+                "SELECT reconciliation.state,reconciliation.observed_status,reconciliation.external_revision,reconciliation.release_request_id FROM ticket_claim_reconciliations reconciliation WHERE reconciliation.namespace=?1 AND reconciliation.ticket_id=?2",
+                params![key.namespace.as_str(), ticket.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((state, repolled_status, repolled_revision, _release_request_id)) =
+            &reconciliation
+            && (state != "repolled_open"
+                || repolled_status.as_deref() != Some(status_key(external_status))
+                || repolled_revision.as_deref() != observed_revision.as_deref())
+        {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        if reconciliation.is_some()
+            && ticket_claim_reconciliation_origin_project(&tx, &key.namespace, ticket)?.as_ref()
+                != Some(&key.project_id)
+        {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
         let status = enum_string(&external_status)?;
         let (
             config_source,
@@ -2209,6 +2341,17 @@ impl ConfigStore {
             "INSERT INTO ticket_claims(namespace,ticket_id,project_id,ticket_run_id,generation,claimed_at_unix) VALUES (?1,?2,?3,?4,?5,?6)",
             params![key.namespace.as_str(),ticket.as_str(),key.project_id.as_str(),ticket_run_id.as_str(),generation,now_unix],
         ).map_err(|error| error.to_string())?;
+        if let Some((_, _, _, release_request_id)) = &reconciliation {
+            let consumed = tx
+                .execute(
+                    "DELETE FROM ticket_claim_reconciliations WHERE namespace=?1 AND ticket_id=?2 AND release_request_id=?3 AND state='repolled_open' AND observed_status=?4 AND external_revision IS ?5",
+                    params![key.namespace.as_str(),ticket.as_str(),release_request_id,status_key(external_status),observed_revision],
+                )
+                .map_err(|error| error.to_string())?;
+            if consumed != 1 {
+                return Err("ticket claim reconciliation changed during TicketRun creation".into());
+            }
+        }
         tx.execute(
             "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,?3,?4,(SELECT goal_revision FROM projects WHERE project_id=?2),?5)",
             params![ticket_run_id.as_str(),key.project_id.as_str(),project_epoch,recipe_id,now_unix],

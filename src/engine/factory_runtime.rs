@@ -2940,6 +2940,7 @@ pub(crate) mod tests {
         configuration_digest: Digest,
         published_effect: Option<crate::store::EffectIntent>,
         pending_artifacts: Option<crate::artifacts::ArtifactStore>,
+        ticket_page: Option<super::ExternalTicketPage>,
     }
 
     impl super::FactoryRuntimeServices for WorkerPublicationFixtureServices {
@@ -3055,10 +3056,13 @@ pub(crate) mod tests {
             _: Option<&str>,
             _: usize,
         ) -> Result<super::ExternalTicketPage, String> {
-            Ok(super::ExternalTicketPage {
-                tickets: Vec::new(),
-                next_cursor: None,
-            })
+            Ok(self
+                .ticket_page
+                .clone()
+                .unwrap_or(super::ExternalTicketPage {
+                    tickets: Vec::new(),
+                    next_cursor: None,
+                }))
         }
 
         fn observe_publications(
@@ -3098,6 +3102,7 @@ pub(crate) mod tests {
             configuration_digest,
             published_effect: None,
             pending_artifacts: None,
+            ticket_page: None,
         };
         super::apply_agent_result(
             store,
@@ -3215,6 +3220,7 @@ pub(crate) mod tests {
                 configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
                 published_effect: None,
                 pending_artifacts: None,
+                ticket_page: None,
             };
             let applied = super::apply_agent_result(
                 &mut fixture.store,
@@ -3256,6 +3262,735 @@ pub(crate) mod tests {
                 .contains("stale external ticket revision")
         );
         assert_eq!(stale_count, 0);
+    }
+
+    #[test]
+    fn production_scan_rearms_same_ticket_after_release_and_dispatches_new_generation() {
+        use crate::domain::ids::{Digest, ProjectId, TicketId, TicketNamespace};
+        use crate::domain::types::{Role, TicketStatus};
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use crate::store::scheduler::{ObservedTicket, TicketScanKey, TicketScanPage};
+        use crate::store::{ConfigStore, HumanClaimRelease};
+        use rusqlite::params;
+        use serde_json::json;
+
+        fn dispatch_message(message_id: &str, revision: &str) -> RoleResultMessage {
+            let payload = json!({
+                "ticket_reference": "43",
+                "expected_ticket_revision": revision,
+                "coordinator_profile": "judgment_claude",
+                "priority": 3,
+                "rationale": "resume the exact ticket after a successful fresh scan"
+            });
+            let result_digest = Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
+            ))
+            .unwrap();
+            RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: message_id.into(),
+                kind: RoleOutputKind::DispatchRequest,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: payload,
+                result_digest: Some(result_digest),
+                artifact_refs: Vec::new(),
+            }
+        }
+
+        let revision = "rev-43-stable";
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Supervisor,
+                dispatch_message("supervisor-dispatch-generation-one", revision),
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("fixture-project").unwrap();
+        let namespace = TicketNamespace::parse("fixture").unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
+            .unwrap();
+
+        let mut config: Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let mut project = config
+            .projects
+            .remove(&ProjectId::parse("operations_project").unwrap())
+            .unwrap();
+        project.dispatch_states = vec![TicketStatus::Ready];
+        config.projects.insert(project_id.clone(), project);
+        let project = config.projects.get(&project_id).unwrap();
+        let key = TicketScanKey::for_project(
+            &project_id,
+            &project.ticket_adapter,
+            &namespace,
+            project,
+            TicketStatus::Ready,
+        )
+        .unwrap();
+        let observed_ticket = ObservedTicket {
+            id: TicketId::parse("43").unwrap(),
+            revision: Some(revision.into()),
+            status: TicketStatus::Ready,
+            title: "Fixture ticket".into(),
+            labels: vec!["docs".into()],
+            created_at: None,
+            observed_at_unix: 1,
+        };
+        fixture
+            .store
+            .record_ticket_scan_page(
+                fixture.owner_generation,
+                TicketScanPage {
+                    key: &key,
+                    expected_cursor: None,
+                    expected_generation: 0,
+                    expected_page_count: 0,
+                    next_cursor: None,
+                    tickets: std::slice::from_ref(&observed_ticket),
+                    now_unix: 1,
+                    poll_seconds: 60,
+                },
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .enqueue_supervisor_ticket_observation(
+                    fixture.owner_generation,
+                    &key,
+                    &crate::store::scheduler::PendingTicketObservation {
+                        ticket_id: observed_ticket.id.clone(),
+                        revision: observed_ticket.revision.clone(),
+                        status: observed_ticket.status,
+                        title: observed_ticket.title.clone(),
+                        labels: observed_ticket.labels.clone(),
+                        observed_at_unix: observed_ticket.observed_at_unix,
+                    },
+                    1,
+                )
+                .unwrap()
+        );
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE source_type='ticket_observation' AND source_id='fixture:43:ready'",
+                [],
+            )
+            .unwrap();
+
+        let first_binding = &fixture.ingested.validated.binding;
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,1,?5,'{}','authorized',1,1)",
+                params![
+                    first_binding.agent_run_id.as_str(),
+                    first_binding.project_id.as_str(),
+                    first_binding.operation_id.as_str(),
+                    fixture.owner_generation,
+                    "d".repeat(64),
+                ],
+            )
+            .unwrap();
+        let mut result_services = WorkerPublicationFixtureServices {
+            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: None,
+        };
+        assert!(
+            super::apply_agent_result(
+                &mut fixture.store,
+                fixture.owner_generation,
+                2,
+                &config,
+                &mut result_services,
+                &fixture.ingested,
+            )
+            .unwrap()
+        );
+
+        let old_run = fixture
+            .store
+            .active_ticket_runs(fixture.owner_generation, 10)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.ticket_id.as_str() == "43")
+            .unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "paused")
+            .unwrap();
+        ConfigStore::append_human_claim_release(
+            fixture._temp.path(),
+            "release-cycle-one",
+            &HumanClaimRelease {
+                namespace: namespace.as_str().into(),
+                ticket: "43".into(),
+                ticket_run_id: old_run.ticket_run_id.as_str().into(),
+                generation: 1,
+                expected_revision: old_run.revision,
+                reason: "replace the incompatible assigned repository base".into(),
+                disposition: "cancel".into(),
+            },
+            fixture.owner_generation,
+        )
+        .unwrap();
+        fixture
+            .store
+            .process_next_control(fixture.owner_generation)
+            .unwrap()
+            .unwrap();
+        let reconciliation_state: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT state FROM ticket_claim_reconciliations WHERE namespace='fixture' AND ticket_id='43'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reconciliation_state, "pending");
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
+            .unwrap();
+
+        let mut scan_services = WorkerPublicationFixtureServices {
+            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: Some(super::ExternalTicketPage {
+                tickets: Vec::new(),
+                next_cursor: None,
+            }),
+        };
+        let absent_report = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            100,
+            &config,
+            &mut scan_services,
+        )
+        .unwrap();
+        assert!(
+            absent_report.scanned.is_some(),
+            "the production tick must poll the configured ticket port"
+        );
+        let absent_reconciliation_state: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT state FROM ticket_claim_reconciliations WHERE namespace='fixture' AND ticket_id='43'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(absent_reconciliation_state, "pending");
+        let wakes_after_absent_poll = fixture
+            .store
+            .pending_role_wake_inputs(&project_id, "project:fixture-project:supervisor", 16)
+            .unwrap();
+        assert!(
+            wakes_after_absent_poll
+                .iter()
+                .all(|wake| !wake.source_id.ends_with("release-cycle-one")),
+            "an absent external ticket must not create a release-cycle Supervisor wake: {wakes_after_absent_poll:?}"
+        );
+
+        // A second Project may share the same external namespace and have a
+        // cached observation/wake for this ticket. Its fresh page must not
+        // satisfy the release gate or receive the release-specific wake.
+        let other_project_id = ProjectId::parse("fixture-other-project").unwrap();
+        let mut other_project_record = fixture.store.project(&project_id).unwrap().unwrap();
+        other_project_record.id = other_project_id.clone();
+        fixture.store.insert_project(&other_project_record).unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &other_project_id, "running")
+            .unwrap();
+        let other_key = TicketScanKey::for_project(
+            &other_project_id,
+            &project.ticket_adapter,
+            &namespace,
+            project,
+            TicketStatus::Ready,
+        )
+        .unwrap();
+        fixture
+            .store
+            .record_ticket_scan_page(
+                fixture.owner_generation,
+                TicketScanPage {
+                    key: &other_key,
+                    expected_cursor: None,
+                    expected_generation: 0,
+                    expected_page_count: 0,
+                    next_cursor: None,
+                    tickets: std::slice::from_ref(&observed_ticket),
+                    now_unix: 150,
+                    poll_seconds: 60,
+                },
+            )
+            .unwrap();
+        fixture
+            .store
+            .enqueue_supervisor_ticket_observation(
+                fixture.owner_generation,
+                &other_key,
+                &crate::store::scheduler::PendingTicketObservation {
+                    ticket_id: observed_ticket.id.clone(),
+                    revision: observed_ticket.revision.clone(),
+                    status: observed_ticket.status,
+                    title: observed_ticket.title.clone(),
+                    labels: observed_ticket.labels.clone(),
+                    observed_at_unix: 150,
+                },
+                150,
+            )
+            .unwrap();
+        let cross_project_wakes = fixture
+            .store
+            .pending_role_wake_inputs(
+                &other_project_id,
+                "project:fixture-other-project:supervisor",
+                16,
+            )
+            .unwrap();
+        assert!(cross_project_wakes.iter().any(|wake| {
+            wake.source_id == "fixture:43:ready"
+                && wake.payload_json["external_revision"] == revision
+        }));
+        let other_project_claim = fixture
+            .store
+            .create_dispatched_ticket_run(
+                fixture.owner_generation,
+                &other_key,
+                &TicketId::parse("43").unwrap(),
+                Some("docs_only"),
+                &[TicketStatus::Ready],
+                1,
+                &crate::store::scheduler::SupervisorDispatchAuthority {
+                    evidence_id: "other-project-cached-wake".into(),
+                    priority: 3,
+                    expected_external_revision: revision.into(),
+                },
+                151,
+            )
+            .unwrap();
+        assert!(other_project_claim.is_none());
+        let still_pending: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT state FROM ticket_claim_reconciliations WHERE namespace='fixture' AND ticket_id='43'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_pending, "pending");
+
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_observations SET dispatch_state='pending' WHERE project_id='fixture-project' AND ticket_id='43'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .create_dispatched_ticket_run(
+                    fixture.owner_generation,
+                    &key,
+                    &TicketId::parse("43").unwrap(),
+                    Some("docs_only"),
+                    &[TicketStatus::Ready],
+                    1,
+                    &crate::store::scheduler::SupervisorDispatchAuthority {
+                        evidence_id: "stale-cached-observation".into(),
+                        priority: 3,
+                        expected_external_revision: revision.into(),
+                    },
+                    101,
+                )
+                .unwrap()
+                .is_none()
+        );
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_observations SET dispatch_state='started' WHERE project_id='fixture-project' AND ticket_id='43'",
+                [],
+            )
+            .unwrap();
+
+        scan_services.ticket_page = Some(super::ExternalTicketPage {
+            tickets: vec![ObservedTicket {
+                observed_at_unix: 200,
+                ..observed_ticket.clone()
+            }],
+            next_cursor: None,
+        });
+        let report = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            200,
+            &config,
+            &mut scan_services,
+        )
+        .unwrap();
+        assert!(report.scanned.is_some());
+        let pending_supervisor_wakes = fixture
+            .store
+            .pending_role_wake_inputs(&project_id, "project:fixture-project:supervisor", 16)
+            .unwrap();
+        let release_wakes = pending_supervisor_wakes
+            .iter()
+            .filter(|wake| wake.source_id.ends_with("release-cycle-one"))
+            .collect::<Vec<_>>();
+        assert_eq!(release_wakes.len(), 1);
+        assert_eq!(
+            release_wakes[0].source_id,
+            "fixture:43:ready:resume:release-cycle-one"
+        );
+        assert_eq!(release_wakes[0].payload_json["external_revision"], revision);
+        let repolled_state: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT state FROM ticket_claim_reconciliations WHERE namespace='fixture' AND ticket_id='43'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repolled_state, "repolled_open");
+        let other_project_claim_after_origin_repoll = fixture
+            .store
+            .create_dispatched_ticket_run(
+                fixture.owner_generation,
+                &other_key,
+                &TicketId::parse("43").unwrap(),
+                Some("docs_only"),
+                &[TicketStatus::Ready],
+                1,
+                &crate::store::scheduler::SupervisorDispatchAuthority {
+                    evidence_id: "other-project-same-revision-after-repoll".into(),
+                    priority: 3,
+                    expected_external_revision: revision.into(),
+                },
+                201,
+            )
+            .unwrap();
+        assert!(other_project_claim_after_origin_repoll.is_none());
+        let other_project_resume_wakes = fixture
+            .store
+            .pending_role_wake_inputs(
+                &other_project_id,
+                "project:fixture-other-project:supervisor",
+                16,
+            )
+            .unwrap();
+        assert!(
+            other_project_resume_wakes
+                .iter()
+                .all(|wake| { !wake.source_id.ends_with("release-cycle-one") })
+        );
+        let legacy_other_run =
+            crate::domain::ids::TicketRunId::parse("fixture-other-project-ticket-43-g1").unwrap();
+        fixture
+            .store
+            .create_ticket_run(
+                fixture.owner_generation,
+                &other_project_id,
+                &namespace,
+                &TicketId::parse("43").unwrap(),
+                &legacy_other_run,
+                1,
+                "queued",
+                "ready",
+            )
+            .unwrap();
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,NULL,0,1)",
+                params![legacy_other_run.as_str(), other_project_id.as_str()],
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .claim_ticket(
+                    fixture.owner_generation,
+                    &namespace,
+                    &TicketId::parse("43").unwrap(),
+                    &other_project_id,
+                    &legacy_other_run,
+                    1,
+                )
+                .is_err()
+        );
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &other_project_id, "stopped")
+            .unwrap();
+
+        // A later successful authoritative page may report a new external
+        // revision while this same reconciliation remains open. The release
+        // gate must advance atomically with the observation or no dispatch
+        // revision can satisfy both records.
+        let refreshed_revision = "rev-43-updated-after-release";
+        scan_services.ticket_page = Some(super::ExternalTicketPage {
+            tickets: vec![ObservedTicket {
+                revision: Some(refreshed_revision.into()),
+                observed_at_unix: 300,
+                ..observed_ticket.clone()
+            }],
+            next_cursor: None,
+        });
+        let refreshed_report = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            300,
+            &config,
+            &mut scan_services,
+        )
+        .unwrap();
+        assert!(refreshed_report.scanned.is_some());
+        let (reconciliation_revision, observation_revision): (Option<String>, Option<String>) =
+            fixture.store.test_connection().query_row(
+                "SELECT r.external_revision,o.external_revision FROM ticket_claim_reconciliations r JOIN ticket_observations o ON o.namespace=r.namespace AND o.ticket_id=r.ticket_id WHERE r.namespace='fixture' AND r.ticket_id='43'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+        assert_eq!(reconciliation_revision.as_deref(), Some(refreshed_revision));
+        assert_eq!(observation_revision.as_deref(), Some(refreshed_revision));
+        let refreshed_wakes = fixture
+            .store
+            .pending_role_wake_inputs(&project_id, "project:fixture-project:supervisor", 16)
+            .unwrap();
+        assert!(refreshed_wakes.iter().any(|wake| {
+            wake.source_id == "fixture:43:ready:resume:release-cycle-one"
+                && wake.payload_json["external_revision"] == refreshed_revision
+        }));
+
+        let fixture_root = std::fs::canonicalize(fixture._temp.path()).unwrap();
+        let second =
+            crate::store::agent_results::host_validation_fixture::host_validated_result_in(
+                &mut fixture.store,
+                &fixture_root,
+                fixture.owner_generation,
+                project_id.clone(),
+                old_run.ticket_run_id.clone(),
+                Role::Supervisor,
+                dispatch_message("supervisor-dispatch-generation-two", refreshed_revision),
+            )
+            .unwrap();
+        let second_binding = &second.ingested.validated.binding;
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,1,?5,'{}','authorized',1,1)",
+                params![
+                    second_binding.agent_run_id.as_str(),
+                    second_binding.project_id.as_str(),
+                    second_binding.operation_id.as_str(),
+                    fixture.owner_generation,
+                    "e".repeat(64),
+                ],
+            )
+            .unwrap();
+        assert!(
+            super::apply_agent_result(
+                &mut fixture.store,
+                fixture.owner_generation,
+                101,
+                &config,
+                &mut result_services,
+                &second.ingested,
+            )
+            .unwrap()
+        );
+
+        let generations: Vec<(u64, String, String)> = fixture
+            .store
+            .test_connection()
+            .prepare(
+                "SELECT generation,internal_phase,ticket_run_id FROM ticket_runs WHERE project_id='fixture-project' AND ticket_id='43' ORDER BY generation",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            generations
+                .iter()
+                .map(|(generation, phase, _)| (*generation, phase.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "canceled"), (2, "planning")]
+        );
+        let claim_generation: u64 = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT generation FROM ticket_claims WHERE namespace='fixture' AND ticket_id='43'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_generation, 2);
+        let reconciliation_count: u64 = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM ticket_claim_reconciliations WHERE namespace='fixture' AND ticket_id='43'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reconciliation_count, 0);
+        let coordinator_wakes = fixture
+            .store
+            .pending_role_wake_inputs(
+                &project_id,
+                &format!("ticket_run:{}:coordinator", generations[1].2),
+                8,
+            )
+            .unwrap();
+        assert_eq!(coordinator_wakes.len(), 1);
+        assert_eq!(coordinator_wakes[0].source_type, "ticket_run_dispatch");
+
+        // A second release exercises a same-Project scope change: only an
+        // observation written under the new current scope may satisfy the
+        // release gate. The former scan key cannot dispatch it.
+        let generation_two =
+            crate::domain::ids::TicketRunId::parse(generations[1].2.clone()).unwrap();
+        let generation_two_revision: u64 = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT revision FROM ticket_runs WHERE ticket_run_id=?1",
+                [generation_two.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "paused")
+            .unwrap();
+        ConfigStore::append_human_claim_release(
+            fixture._temp.path(),
+            "release-cycle-two",
+            &HumanClaimRelease {
+                namespace: namespace.as_str().into(),
+                ticket: "43".into(),
+                ticket_run_id: generation_two.as_str().into(),
+                generation: 2,
+                expected_revision: generation_two_revision,
+                reason: "exercise the changed scan scope after release".into(),
+                disposition: "cancel".into(),
+            },
+            fixture.owner_generation,
+        )
+        .unwrap();
+        fixture
+            .store
+            .process_next_control(fixture.owner_generation)
+            .unwrap()
+            .unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
+            .unwrap();
+        let mut current_scope_key = key.clone();
+        current_scope_key.scope_digest = Digest::parse("c".repeat(64)).unwrap();
+        let current_scope_ticket = ObservedTicket {
+            revision: Some(refreshed_revision.into()),
+            observed_at_unix: 400,
+            ..observed_ticket.clone()
+        };
+        fixture
+            .store
+            .record_ticket_scan_page(
+                fixture.owner_generation,
+                TicketScanPage {
+                    key: &current_scope_key,
+                    expected_cursor: None,
+                    expected_generation: 0,
+                    expected_page_count: 0,
+                    next_cursor: None,
+                    tickets: std::slice::from_ref(&current_scope_ticket),
+                    now_unix: 400,
+                    poll_seconds: 60,
+                },
+            )
+            .unwrap();
+        let current_scope_observation = crate::store::scheduler::PendingTicketObservation {
+            ticket_id: current_scope_ticket.id.clone(),
+            revision: current_scope_ticket.revision.clone(),
+            status: current_scope_ticket.status,
+            title: current_scope_ticket.title.clone(),
+            labels: current_scope_ticket.labels.clone(),
+            observed_at_unix: 400,
+        };
+        fixture
+            .store
+            .enqueue_supervisor_ticket_observation(
+                fixture.owner_generation,
+                &current_scope_key,
+                &current_scope_observation,
+                400,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .create_dispatched_ticket_run(
+                    fixture.owner_generation,
+                    &key,
+                    &current_scope_ticket.id,
+                    Some("docs_only"),
+                    &[TicketStatus::Ready],
+                    1,
+                    &crate::store::scheduler::SupervisorDispatchAuthority {
+                        evidence_id: "old-scope-cannot-consume-new-scope-observation".into(),
+                        priority: 3,
+                        expected_external_revision: refreshed_revision.into(),
+                    },
+                    401,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let current_scope_run = fixture
+            .store
+            .create_dispatched_ticket_run(
+                fixture.owner_generation,
+                &current_scope_key,
+                &current_scope_ticket.id,
+                Some("docs_only"),
+                &[TicketStatus::Ready],
+                1,
+                &crate::store::scheduler::SupervisorDispatchAuthority {
+                    evidence_id: "new-current-scope-can-consume-release".into(),
+                    priority: 3,
+                    expected_external_revision: refreshed_revision.into(),
+                },
+                402,
+            )
+            .unwrap();
+        assert!(current_scope_run.is_some());
     }
 
     #[test]
@@ -3382,6 +4117,7 @@ pub(crate) mod tests {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
             published_effect: None,
             pending_artifacts: Some(fixture.artifacts),
+            ticket_page: None,
         };
 
         let tick = super::FactoryRuntime::tick(
@@ -3500,6 +4236,7 @@ pub(crate) mod tests {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
             published_effect: None,
             pending_artifacts: None,
+            ticket_page: None,
         };
 
         assert!(
@@ -3625,6 +4362,7 @@ pub(crate) mod tests {
             configuration_digest,
             published_effect: None,
             pending_artifacts: None,
+            ticket_page: None,
         };
 
         assert!(
@@ -3744,6 +4482,7 @@ pub(crate) mod tests {
                 configuration_digest: configuration_digest.clone(),
                 published_effect: None,
                 pending_artifacts: None,
+                ticket_page: None,
             };
             let wake_count_before: u32 = fixture
                 .store
@@ -3893,6 +4632,7 @@ pub(crate) mod tests {
             configuration_digest: current_digest.clone(),
             published_effect: None,
             pending_artifacts: None,
+            ticket_page: None,
         };
 
         assert!(
