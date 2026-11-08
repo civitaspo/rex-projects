@@ -632,17 +632,36 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let (authority_json, reservation_epoch, disposition): (String, u64, String) = tx
+        if run.current_generation != owner_generation {
+            return Err("Agent block recovery is fenced to a stale AgentRun generation".into());
+        }
+        let (authority_json, reservation_epoch, slot_generation, agent_state, disposition): (
+            String,
+            u64,
+            u64,
+            String,
+            String,
+        ) = tx
             .query_row(
-                "SELECT a.authority_json,s.reservation_epoch,s.disposition
+                "SELECT a.authority_json,s.reservation_epoch,s.controller_generation,r.state,s.disposition
                  FROM agent_launch_authority a JOIN execution_slots s
                    ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id
-                 WHERE a.agent_run_id=?1 AND s.controller_generation=?2",
-                params![run.agent_run_id.as_str(), owner_generation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                 JOIN agent_runs r ON r.agent_run_id=a.agent_run_id
+                 WHERE a.agent_run_id=?1 AND r.controller_generation=?2
+                   AND s.controller_generation=?3 AND s.reservation_epoch=?4",
+                params![
+                    run.agent_run_id.as_str(),
+                    owner_generation,
+                    run.previous_generation,
+                    run.reservation_epoch
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .map_err(|error| error.to_string())?;
         if reservation_epoch != run.reservation_epoch
+            || slot_generation != run.previous_generation
+            || agent_state != run.agent_state
+            || disposition != run.slot_disposition
             || !matches!(disposition.as_str(), "launch_pending" | "live" | "unknown")
         {
             return Err("Agent block recovery lost its exact active reservation".into());
@@ -694,11 +713,12 @@ impl ConfigStore {
             .execute(
                 "UPDATE execution_slots SET disposition='released',controller_generation=?3
              WHERE owner_kind='agent_run' AND owner_id=?1 AND reservation_epoch=?2
-               AND controller_generation=?3 AND disposition IN ('launch_pending','live','unknown')",
+               AND controller_generation=?4 AND disposition IN ('launch_pending','live','unknown')",
                 params![
                     run.agent_run_id.as_str(),
                     reservation_epoch,
-                    owner_generation
+                    owner_generation,
+                    run.previous_generation
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -2122,5 +2142,284 @@ mod tests {
             )
             .unwrap();
         assert_eq!(observation_table, "agent_run_recovery_observations");
+    }
+
+    #[test]
+    fn startup_missing_block_reconciles_prior_generation_slot_only_after_exit_proof() {
+        use crate::domain::ids::{AgentRunId, OperationId, ProfileId, ProjectId, Revision};
+        use crate::domain::types::Role;
+        use crate::launch::{AgentLaunchAuthority, ObservedProviderStart, ObservedWrapperIdentity};
+        use crate::store::OwnerMetadata;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().display().to_string(),
+            config_source: "test".into(),
+            process_start_identity: format!("owner-{nonce}"),
+            executable_path: "/tmp/rex-test".into(),
+            executable_digest: "c".repeat(64),
+            rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+            rex_server_identity: Some("server".into()),
+            rex_session_id: Some("session".into()),
+            rex_block_id: Some("controller-block".into()),
+        };
+        let first_generation = store.start_owner(&owner("first")).unwrap();
+        let digest = |byte: char| Digest::parse(byte.to_string().repeat(64)).unwrap();
+        let agent_run_id = AgentRunId::parse("agent-run-startup").unwrap();
+        let project_id = ProjectId::parse("project-startup").unwrap();
+        let operation_id = OperationId::parse("operation-startup").unwrap();
+        let authority = AgentLaunchAuthority {
+            agent_run_id: agent_run_id.clone(),
+            project_id: project_id.clone(),
+            role: Role::Supervisor,
+            role_session_id: "role-session".into(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: Revision(1),
+            config_digest: digest('a'),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: first_generation,
+            operation_id,
+            operation_recipe_id: None,
+            rex_view_id: digest('b'),
+            descriptor_digest: digest('c'),
+            runtime_binary_digest: digest('d'),
+            descriptor_path: "/tmp/descriptor".into(),
+            environment_snapshot_id: digest('e'),
+            profile_id: ProfileId::parse("test-profile").unwrap(),
+            profile_digest: digest('f'),
+            instruction_digest: digest('1'),
+            result_schema_digest: digest('2'),
+            wake_snapshot_digest: digest('3'),
+            qualification_receipt_digest: digest('4'),
+            rex_server_identity: "server".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+            rex_block_id: "agent-block".into(),
+            workspace_path: "/tmp/workspace".into(),
+            control_dir: "/tmp/control".into(),
+            mailbox_capability_digest: digest('5'),
+        };
+        let identities = vec![
+            crate::launch::ProviderProcessIdentity {
+                pid: 42,
+                parent_pid: 1,
+                process_group_id: 42,
+                start_identity: "wrapper-birth".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+            crate::launch::ProviderProcessIdentity {
+                pid: 100,
+                parent_pid: 42,
+                process_group_id: 100,
+                start_identity: "provider-birth".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+        ];
+        let launch_tree_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&identities).unwrap())
+        ))
+        .unwrap();
+        let provider = ObservedProviderStart {
+            agent_run_id: agent_run_id.clone(),
+            operation_id: authority.operation_id.clone(),
+            provider_pid: 100,
+            provider_start_identity: "provider-birth".into(),
+            executable_digest: digest('6'),
+            process_tree_digest: launch_tree_digest.clone(),
+            process_tree_confirmed: true,
+            process_tree: identities.clone(),
+        };
+        let wrapper = ObservedWrapperIdentity {
+            pid: 42,
+            start_identity: "wrapper-birth".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+        };
+        let authority_json = serde_json::to_string(&authority).unwrap();
+        let authority_digest = authority.digest().unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,logical_owner,finite_turn,launch_operation_id,state,controller_generation)
+                 VALUES (?1,?2,'test',1,?3,'test',1,?4,'launch_pending',?5)",
+                rusqlite::params![agent_run_id.as_str(), project_id.as_str(), authority.config_digest.as_str(), authority.operation_id.as_str(), first_generation],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO execution_slots(pool,slot_index,owner_kind,owner_id,reservation_epoch,controller_generation,disposition)
+                 VALUES ('agent',0,'agent_run',?1,7,?2,'launch_pending')",
+                rusqlite::params![agent_run_id.as_str(), first_generation],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO execution_slots(pool,slot_index,owner_kind,owner_id,reservation_epoch,controller_generation,disposition)
+                 VALUES ('rex_projects_hook',1,'agent_run','unrelated-run',99,?1,'unknown')",
+                [first_generation],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix)
+                 VALUES (?1,?2,'supervisor','role-session',1,?3,1,1,?4,?5,?6,?7,?8,'/tmp/descriptor',?9,'test-profile',?10,?11,?12,?13,'server','session','window','agent-block','/tmp/workspace','/tmp/control',?14,?15,?16,1)",
+                rusqlite::params![
+                    agent_run_id.as_str(), project_id.as_str(), authority.config_digest.as_str(),
+                    first_generation, authority.operation_id.as_str(), authority.rex_view_id.as_str(),
+                    authority.descriptor_digest.as_str(), authority.runtime_binary_digest.as_str(),
+                    authority.environment_snapshot_id.as_str(), authority.profile_digest.as_str(),
+                    authority.instruction_digest.as_str(), authority.result_schema_digest.as_str(),
+                    authority.qualification_receipt_digest.as_str(), authority.mailbox_capability_digest.as_str(),
+                    authority_json, authority_digest.as_str()
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_state(agent_run_id,state,wrapper_process_identity_json,provider_process_tree_json,last_observed_at_unix,updated_at_unix)
+                 VALUES (?1,'running',?2,?3,1,1)",
+                rusqlite::params![agent_run_id.as_str(), serde_json::to_string(&wrapper).unwrap(), serde_json::to_string(&provider).unwrap()],
+            )
+            .unwrap();
+
+        store.stop_owner(first_generation).unwrap();
+        let second_generation = store.start_owner(&owner("second")).unwrap();
+        let recovered_after_first_restart = store
+            .recoverable_agent_runs(second_generation, 8)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            recovered_after_first_restart.current_generation,
+            second_generation
+        );
+        assert_eq!(
+            recovered_after_first_restart.previous_generation,
+            first_generation
+        );
+        assert_eq!(recovered_after_first_restart.slot_disposition, "unknown");
+        store.stop_owner(second_generation).unwrap();
+        let generation = store.start_owner(&owner("third")).unwrap();
+        let run = store
+            .recoverable_agent_runs(generation, 8)
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.current_generation, generation);
+        assert_eq!(run.previous_generation, first_generation);
+        assert_eq!(run.slot_disposition, "unknown");
+        let snapshot = |cleanup_covered| {
+            let process_tree = identities
+                .iter()
+                .map(|process| ProcessIdentity {
+                    pid: process.pid,
+                    parent_pid: process.parent_pid,
+                    process_group_id: process.process_group_id,
+                    start_identity: process.start_identity.clone(),
+                    command: String::new(),
+                    quality: process.identity_quality,
+                })
+                .collect::<Vec<_>>();
+            BlockLossCleanupSnapshot {
+                schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
+                agent_run_id: agent_run_id.clone(),
+                reservation_epoch: 7,
+                authority_digest: authority_digest.clone(),
+                launch_tree_digest: launch_tree_digest.clone(),
+                observed_at_unix: 2,
+                cleanup_covered,
+                process_tree_digest: Digest::parse(format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+                ))
+                .unwrap(),
+                process_tree,
+            }
+        };
+        assert!(
+            store
+                .reconcile_missing_agent_block(second_generation, &run, 2, &snapshot(false), &[])
+                .is_err()
+        );
+        let unproven_absence = snapshot(false);
+        assert!(
+            store
+                .reconcile_missing_agent_block(generation, &run, 2, &unproven_absence, &[])
+                .is_err()
+        );
+        let slot_before_exit: (String, u64) = store
+            .connection
+            .query_row(
+                "SELECT disposition,controller_generation FROM execution_slots WHERE owner_id=?1",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(slot_before_exit, ("unknown".into(), first_generation));
+        let surviving_provider = ProcessIdentity {
+            pid: 100,
+            parent_pid: 42,
+            process_group_id: 100,
+            start_identity: "provider-birth".into(),
+            command: String::new(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        assert!(
+            !store
+                .reconcile_missing_agent_block(
+                    generation,
+                    &run,
+                    3,
+                    &snapshot(false),
+                    &[surviving_provider],
+                )
+                .unwrap()
+        );
+        let retained: (String, u64) = store
+            .connection
+            .query_row(
+                "SELECT disposition,controller_generation FROM execution_slots WHERE owner_id=?1",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("unknown".into(), first_generation));
+        assert!(
+            store
+                .reconcile_missing_agent_block(generation, &run, 4, &snapshot(true), &[])
+                .unwrap()
+        );
+        let released: (String, u64) = store
+            .connection
+            .query_row(
+                "SELECT disposition,controller_generation FROM execution_slots WHERE owner_id=?1",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(released, ("released".into(), generation));
+        let unrelated: (String, u64) = store
+            .connection
+            .query_row(
+                "SELECT disposition,controller_generation FROM execution_slots WHERE owner_id='unrelated-run'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unrelated, ("unknown".into(), first_generation));
     }
 }
