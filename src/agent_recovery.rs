@@ -209,7 +209,7 @@ impl RunForkWatch {
         {
             let _ = (processes, current);
             self.invalidated = true;
-            return false;
+            false
         }
         #[cfg(target_os = "macos")]
         {
@@ -2712,10 +2712,10 @@ mod tests {
         assert!(!cleanup_absence_confirmed(&snapshot, &[]));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     struct TrackedChild(Child);
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     impl TrackedChild {
         fn new(child: Child) -> Self {
             Self(child)
@@ -2730,7 +2730,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     impl Drop for TrackedChild {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -2738,19 +2738,19 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     struct TrackedProcess {
         identity: ProcessIdentity,
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     impl TrackedProcess {
         fn new(identity: ProcessIdentity) -> Self {
             Self { identity }
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     impl Drop for TrackedProcess {
         fn drop(&mut self) {
             if let Ok(current) = inspect_process_table() {
@@ -2773,7 +2773,7 @@ mod tests {
             marker.display(),
             child_pid.display(),
         );
-        Command::new("/bin/sh")
+        Command::new("/bin/bash")
             .arg("-c")
             .arg(script)
             .process_group(0)

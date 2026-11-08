@@ -2809,8 +2809,8 @@ mod tests {
             release.display(),
             response,
         );
-        let mut turn = request(root.path(), AgentAdapter::ClaudeCode, "/bin/sh");
-        turn.profile.command = vec!["/bin/sh".into(), "-c".into(), script];
+        let mut turn = request(root.path(), AgentAdapter::ClaudeCode, "/bin/bash");
+        turn.profile.command = vec!["/bin/bash".into(), "-c".into(), script];
         turn.descriptor.provider_capability = fixture_capability(
             &turn.profile,
             turn.descriptor.profile_digest.clone(),

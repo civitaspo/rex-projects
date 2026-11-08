@@ -942,6 +942,13 @@ mod pool_tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    fn git_executable() -> PathBuf {
+        let search_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .collect::<Vec<_>>();
+        crate::process::resolve_executable(Path::new("git"), &search_path)
+            .expect("host job tests require Git on PATH")
+    }
+
     fn request() -> ProcessRequest {
         ProcessRequest {
             executable: std::env::current_exe().unwrap(),
@@ -1018,7 +1025,7 @@ mod pool_tests {
         let manager = WorktreeManager::new(
             &state_root,
             GitOptions {
-                executable: PathBuf::from("/run/current-system/sw/bin/git"),
+                executable: git_executable(),
                 environment: Default::default(),
                 timeout: Duration::from_secs(2),
             },
@@ -1126,7 +1133,7 @@ mod pool_tests {
         let manager = WorktreeManager::new(
             &state_root,
             GitOptions {
-                executable: PathBuf::from("/run/current-system/sw/bin/git"),
+                executable: git_executable(),
                 environment: Default::default(),
                 timeout: Duration::from_secs(2),
             },
