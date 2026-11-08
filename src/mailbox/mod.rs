@@ -47,6 +47,32 @@ pub struct MailboxDescriptor {
     pub max_pending_requests: usize,
 }
 
+impl MailboxDescriptor {
+    pub fn serialized(
+        run_id: &str,
+        expires_at_unix: u64,
+        limits: MailboxLimits,
+    ) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&Self {
+            schema_version: 1,
+            run_id: run_id.to_owned(),
+            expires_at_unix,
+            max_request_bytes: limits.max_request_bytes,
+            max_pending_requests: limits.max_pending_requests,
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn capability_digest(
+        run_id: &str,
+        expires_at_unix: u64,
+        limits: MailboxLimits,
+    ) -> Result<String, String> {
+        let bytes = Self::serialized(run_id, expires_at_unix, limits)?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum QueueResult {
     Queued { digest: String },
@@ -84,14 +110,7 @@ impl MailboxCapability {
         }
         #[cfg(not(unix))]
         set_private_directory_permissions(&capability.directory)?;
-        let descriptor = MailboxDescriptor {
-            schema_version: 1,
-            run_id: capability.run_id.clone(),
-            expires_at_unix: expires_at,
-            max_request_bytes: limits.max_request_bytes,
-            max_pending_requests: limits.max_pending_requests,
-        };
-        let descriptor = serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?;
+        let descriptor = MailboxDescriptor::serialized(&capability.run_id, expires_at, limits)?;
         match capability.atomic_publish("descriptor.json", &descriptor) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -746,7 +765,8 @@ fn atomic_publish_at(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), s
 
 #[cfg(test)]
 mod tests {
-    use super::{MailboxCapability, MailboxLimits, QueueResult};
+    use super::{MailboxCapability, MailboxDescriptor, MailboxLimits, QueueResult};
+    use sha2::Digest as _;
     use std::fs;
 
     fn request(id: &str, value: &str) -> Vec<u8> {
@@ -755,6 +775,21 @@ mod tests {
 
     fn capability(path: &std::path::Path) -> MailboxCapability {
         MailboxCapability::create("agent-run-1", path, 10, MailboxLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn descriptor_digest_is_for_the_exact_published_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = MailboxLimits {
+            max_request_bytes: 4096,
+            max_pending_requests: 7,
+        };
+        MailboxCapability::create("agent-run-1", root.path(), 10, limits).unwrap();
+        let descriptor = fs::read(root.path().join("descriptor.json")).unwrap();
+        assert_eq!(
+            MailboxDescriptor::capability_digest("agent-run-1", 10, limits).unwrap(),
+            format!("{:x}", sha2::Sha256::digest(&descriptor))
+        );
     }
 
     #[test]

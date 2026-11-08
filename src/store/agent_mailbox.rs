@@ -9,6 +9,33 @@ use crate::artifacts::ArtifactStore;
 use crate::domain::ids::{AgentRunId, Digest};
 use crate::mailbox::{MailboxCapability, MailboxLimits};
 
+#[derive(Debug)]
+pub enum AgentMailboxProcessingError {
+    Authority(String),
+    LocalMailbox(String),
+}
+
+impl From<String> for AgentMailboxProcessingError {
+    fn from(error: String) -> Self {
+        Self::Authority(error)
+    }
+}
+
+impl From<&str> for AgentMailboxProcessingError {
+    fn from(error: &str) -> Self {
+        Self::Authority(error.to_owned())
+    }
+}
+
+impl std::fmt::Display for AgentMailboxProcessingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authority(error) => write!(f, "authority or storage error: {error}"),
+            Self::LocalMailbox(error) => write!(f, "local mailbox error: {error}"),
+        }
+    }
+}
+
 impl crate::store::ConfigStore {
     /// Process at most one request for `agent_run_id`. The launch must still be active and all
     /// mailbox scope is resolved from durable host records, never from Agent-selected authority.
@@ -18,7 +45,15 @@ impl crate::store::ConfigStore {
         agent_run_id: &str,
         now_unix: i64,
         artifact_store: &ArtifactStore,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, AgentMailboxProcessingError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| AgentMailboxProcessingError::Authority(error.to_string()))?;
+        super::validate_active_generation(&tx, owner_generation)
+            .map_err(AgentMailboxProcessingError::Authority)?;
+        tx.commit()
+            .map_err(|error| AgentMailboxProcessingError::Authority(error.to_string()))?;
         let active: Option<(String, u64)> = self
             .connection
             .query_row(
@@ -27,10 +62,11 @@ impl crate::store::ConfigStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| error.to_string())?;
-        if !matches!(active, Some((ref state, generation)) if state == "running" && generation == owner_generation)
-        {
-            return Ok(false);
+            .map_err(|error| AgentMailboxProcessingError::Authority(error.to_string()))?;
+        match active {
+            Some((state, generation)) if state == "running" && generation == owner_generation => {}
+            // Recovery must reconcile a previous owner's run before its mailbox is eligible.
+            _ => return Ok(false),
         }
         let run_id = AgentRunId::parse(agent_run_id.to_owned())?;
         let Some(authority) = self.agent_launch_authority(&run_id)? else {
@@ -166,7 +202,13 @@ impl crate::store::ConfigStore {
         let registration = self
             .agent_mailbox_registration(agent_run_id)?
             .ok_or("mailbox run has no registered mailbox capability")?;
-        if registration.canonical_directory != reservation.mailbox_directory.display().to_string()
+        let canonical_mailbox_directory = std::fs::canonicalize(&reservation.mailbox_directory)
+            .map_err(|error| {
+                AgentMailboxProcessingError::LocalMailbox(format!(
+                    "canonicalize registered mailbox directory: {error}"
+                ))
+            })?;
+        if registration.canonical_directory != canonical_mailbox_directory.display().to_string()
             || registration.capability_digest != reservation.mailbox_capability_digest.as_str()
             || authority.control_dir != reservation.control_dir
             || authority.mailbox_capability_digest.as_str() != registration.capability_digest
@@ -181,8 +223,13 @@ impl crate::store::ConfigStore {
                 max_pending_requests: registration.max_pending_requests,
             },
             &registration.capability_digest,
-        )?;
-        let Some(mailbox_request) = mailbox.pending(now_unix.max(0) as u64)?.into_iter().next()
+        )
+        .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+        let Some(mailbox_request) = mailbox
+            .pending(now_unix.max(0) as u64)
+            .map_err(AgentMailboxProcessingError::LocalMailbox)?
+            .into_iter()
+            .next()
         else {
             return Ok(false);
         };
@@ -205,13 +252,18 @@ impl crate::store::ConfigStore {
                 extensions: Default::default(),
             };
             let bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
-            mailbox.publish_receipt(&mailbox_request.request_id, &bytes, now_unix.max(0) as u64)?;
+            mailbox
+                .publish_receipt(&mailbox_request.request_id, &bytes, now_unix.max(0) as u64)
+                .map_err(AgentMailboxProcessingError::LocalMailbox)?;
             return Ok(true);
         }
 
         let request: crate::engine::orchestration::ArtifactAddRequest =
-            serde_json::from_value(mailbox_request.envelope.params.clone())
-                .map_err(|error| format!("invalid artifact.add params: {error}"))?;
+            serde_json::from_value(mailbox_request.envelope.params.clone()).map_err(|error| {
+                AgentMailboxProcessingError::LocalMailbox(format!(
+                    "invalid artifact.add params: {error}"
+                ))
+            })?;
         let expected_subject_revision = authority.ticket_revision.map(|value| value.0).unwrap_or(0);
         if mailbox_request.envelope.operation_id.as_ref() != Some(&authority.operation_id)
             || mailbox_request.envelope.project_id.as_ref() != Some(&authority.project_id)
@@ -221,11 +273,16 @@ impl crate::store::ConfigStore {
             || mailbox_request.envelope.run_epoch != Some(authority.run_epoch)
             || mailbox_request.envelope.expected_subject_revision != Some(expected_subject_revision)
         {
-            return Err("mailbox request scope differs from immutable launch authority".into());
+            return Err(AgentMailboxProcessingError::LocalMailbox(
+                "mailbox request scope differs from immutable launch authority".into(),
+            ));
         }
-        let digest = Digest::parse(mailbox_request.digest.clone())?;
+        let digest = Digest::parse(mailbox_request.digest.clone())
+            .map_err(AgentMailboxProcessingError::LocalMailbox)?;
         if digest.as_str().is_empty() {
-            return Err("mailbox request digest is empty".into());
+            return Err(AgentMailboxProcessingError::LocalMailbox(
+                "mailbox request digest is empty".into(),
+            ));
         }
         self.process_artifact_add(
             owner_generation,
@@ -250,6 +307,8 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,state TEXT NOT NULL,controller_generation INTEGER NOT NULL);
+             CREATE TABLE controller_owners(singleton INTEGER PRIMARY KEY,generation INTEGER NOT NULL,stopped_at_unix INTEGER);
+             INSERT INTO controller_owners VALUES (1,7,NULL);
                  INSERT INTO agent_runs VALUES ('run-a','completed',7);
                  INSERT INTO agent_runs VALUES ('run-b','running',8);",
             )
@@ -270,6 +329,11 @@ mod tests {
             !store
                 .process_one_agent_mailbox_request(7, "run-b", 1, &artifact_store)
                 .unwrap()
+        );
+        assert!(
+            store
+                .process_one_agent_mailbox_request(8, "run-a", 1, &artifact_store)
+                .is_err()
         );
     }
 }

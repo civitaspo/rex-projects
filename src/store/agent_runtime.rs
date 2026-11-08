@@ -1500,7 +1500,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let reservation = AgentLaunchReservation {
+        let mut reservation = AgentLaunchReservation {
             schema_version: LAUNCH_SCHEMA_VERSION,
             agent_run_id: run_id,
             project_id: project.clone(),
@@ -1541,6 +1541,20 @@ mod tests {
             global_capacity: 1,
             project_capacity: 1,
         };
+        reservation.mailbox_capability_digest = Digest::parse(
+            crate::mailbox::MailboxDescriptor::capability_digest(
+                reservation.agent_run_id.as_str(),
+                reservation.mailbox_expires_at_unix,
+                crate::mailbox::MailboxLimits {
+                    max_request_bytes: usize::try_from(reservation.mailbox_max_request_bytes)
+                        .unwrap(),
+                    max_pending_requests: usize::try_from(reservation.mailbox_max_pending_requests)
+                        .unwrap(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let runtime_state: (String, String, u64, String, u64, String) = store.connection.query_row(
             "SELECT p.desired_lifecycle,r.observed_lifecycle,r.project_epoch,p.config_digest,p.config_revision,p.mode FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id='project-a'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))
@@ -1571,6 +1585,64 @@ mod tests {
             store.prepare_role_launch(&reservation).unwrap(),
             LaunchPreparationOutcome::Prepared { .. }
         ));
+        crate::start_agent::register_reserved_mailbox(&mut store, generation, &reservation)
+            .unwrap();
+        let mailbox_descriptor =
+            std::fs::read(reservation.mailbox_directory.join("descriptor.json")).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&mailbox_descriptor)),
+            reservation.mailbox_capability_digest.as_str()
+        );
+        let registration = store
+            .agent_mailbox_registration(reservation.agent_run_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registration.capability_digest,
+            reservation.mailbox_capability_digest.as_str()
+        );
+        assert_eq!(
+            registration.canonical_directory,
+            std::fs::canonicalize(&reservation.mailbox_directory)
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        crate::start_agent::register_reserved_mailbox(&mut store, generation, &reservation)
+            .unwrap();
+        assert!(!reservation.descriptor_path.exists());
+        assert!(
+            crate::start_agent::register_reserved_mailbox(&mut store, generation + 1, &reservation)
+                .is_err()
+        );
+        let mut conflicting_mailbox = reservation.clone();
+        conflicting_mailbox.mailbox_max_request_bytes += 1;
+        conflicting_mailbox.mailbox_capability_digest = Digest::parse(
+            crate::mailbox::MailboxDescriptor::capability_digest(
+                conflicting_mailbox.agent_run_id.as_str(),
+                conflicting_mailbox.mailbox_expires_at_unix,
+                crate::mailbox::MailboxLimits {
+                    max_request_bytes: usize::try_from(
+                        conflicting_mailbox.mailbox_max_request_bytes,
+                    )
+                    .unwrap(),
+                    max_pending_requests: usize::try_from(
+                        conflicting_mailbox.mailbox_max_pending_requests,
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::start_agent::register_reserved_mailbox(
+                &mut store,
+                generation,
+                &conflicting_mailbox
+            )
+            .is_err()
+        );
 
         // A launch authority binds the semantic wake snapshot digest. The serialized envelope
         // includes that digest field itself, so hashing the JSON would produce a different value.
@@ -1669,6 +1741,61 @@ mod tests {
             store.persisted_start_receipt(&start_request).unwrap(),
             Some(receipt.clone())
         );
+        store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET state='running' WHERE agent_run_id=?1",
+                [reservation.agent_run_id.as_str()],
+            )
+            .unwrap();
+        std::fs::remove_file(reservation.mailbox_directory.join("descriptor.json")).unwrap();
+        let artifact_store =
+            crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+        let mut mailbox_cursor = None;
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut store,
+                generation,
+                crate::store::now_unix().unwrap(),
+                &artifact_store,
+                &mut mailbox_cursor,
+            )
+            .unwrap()
+        );
+        assert!(
+            crate::runtime_services::process_one_registered_agent_request(
+                &mut store,
+                generation + 1,
+                crate::store::now_unix().unwrap(),
+                &artifact_store,
+                &mut mailbox_cursor,
+            )
+            .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET controller_generation=?2 WHERE agent_run_id=?1",
+                rusqlite::params![reservation.agent_run_id.as_str(), generation + 1],
+            )
+            .unwrap();
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut store,
+                generation,
+                crate::store::now_unix().unwrap(),
+                &artifact_store,
+                &mut mailbox_cursor,
+            )
+            .unwrap()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET state='launch_pending',controller_generation=?2 WHERE agent_run_id=?1",
+                rusqlite::params![reservation.agent_run_id.as_str(), generation],
+            )
+            .unwrap();
         let wake_state: (String, Option<String>) = store.connection.query_row(
             "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=1",
             [], |row| Ok((row.get(0)?, row.get(1)?)),

@@ -1624,42 +1624,13 @@ impl FactoryRuntimeServices for RuntimeServices {
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<bool, String> {
-        let mailboxes = store.registered_agent_mailboxes()?;
-        if mailboxes.is_empty() {
-            return Ok(false);
-        }
-        let start = self
-            .mailbox_cursor
-            .as_ref()
-            .and_then(|cursor| {
-                mailboxes
-                    .iter()
-                    .position(|entry| &entry.agent_run_id > cursor)
-            })
-            .unwrap_or(0);
-        let mut first_error = None;
-        for offset in 0..mailboxes.len() {
-            let registration = &mailboxes[(start + offset) % mailboxes.len()];
-            self.mailbox_cursor = Some(registration.agent_run_id.clone());
-            match store.process_one_agent_mailbox_request(
-                owner_generation,
-                &registration.agent_run_id,
-                now_unix,
-                &self.artifacts,
-            ) {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
-                Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        format!("AgentRun {} mailbox: {error}", registration.agent_run_id)
-                    });
-                }
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(false),
-        }
+        process_one_registered_agent_request(
+            store,
+            owner_generation,
+            now_unix,
+            &self.artifacts,
+            &mut self.mailbox_cursor,
+        )
     }
 
     fn recover_agents(
@@ -2368,6 +2339,21 @@ impl FactoryRuntimeServices for RuntimeServices {
         if now_unix < 0 {
             return Err("controller clock is before the Unix epoch".into());
         }
+        let mailbox_expires_at_unix = u64::try_from(
+            now_unix
+                .checked_add(profile.turn_timeout_seconds as i64)
+                .and_then(|value| value.checked_add(86_400))
+                .ok_or("Agent mailbox expiration overflow")?,
+        )
+        .map_err(|_| "Agent mailbox expiration is negative")?;
+        let mailbox_max_request_bytes = 1_048_576_u64;
+        let mailbox_max_pending_requests = 32_u32;
+        let mailbox_capability_digest = mailbox_capability_digest(
+            &run_id,
+            mailbox_expires_at_unix,
+            mailbox_max_request_bytes,
+            mailbox_max_pending_requests,
+        )?;
         let reservation = crate::launch::AgentLaunchReservation {
             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
             agent_run_id: run_id,
@@ -2400,16 +2386,10 @@ impl FactoryRuntimeServices for RuntimeServices {
             workspace_path: workspace,
             control_dir: control_dir.clone(),
             mailbox_directory: control_dir,
-            mailbox_capability_digest: digest_bytes(seed_digest.as_str().as_bytes())?,
-            mailbox_expires_at_unix: u64::try_from(
-                now_unix
-                    .checked_add(profile.turn_timeout_seconds as i64)
-                    .and_then(|value| value.checked_add(86_400))
-                    .ok_or("Agent mailbox expiration overflow")?,
-            )
-            .map_err(|_| "Agent mailbox expiration is negative")?,
-            mailbox_max_request_bytes: 1_048_576,
-            mailbox_max_pending_requests: 32,
+            mailbox_capability_digest,
+            mailbox_expires_at_unix,
+            mailbox_max_request_bytes,
+            mailbox_max_pending_requests,
             pool: "agent".into(),
             slot_index,
             global_capacity: capacity,
@@ -2426,6 +2406,53 @@ impl FactoryRuntimeServices for RuntimeServices {
         handlers.extend(self.handlers.iter().map(Box::as_ref));
         handlers
     }
+}
+
+pub(crate) fn process_one_registered_agent_request(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    artifacts: &ArtifactStore,
+    mailbox_cursor: &mut Option<String>,
+) -> Result<bool, String> {
+    let mailboxes = store.registered_agent_mailboxes(owner_generation)?;
+    if mailboxes.is_empty() {
+        return Ok(false);
+    }
+    let start = mailbox_cursor
+        .as_ref()
+        .and_then(|cursor| {
+            mailboxes
+                .iter()
+                .position(|entry| &entry.agent_run_id > cursor)
+        })
+        .unwrap_or(0);
+    for offset in 0..mailboxes.len() {
+        let registration = &mailboxes[(start + offset) % mailboxes.len()];
+        *mailbox_cursor = Some(registration.agent_run_id.clone());
+        match store.process_one_agent_mailbox_request(
+            owner_generation,
+            &registration.agent_run_id,
+            now_unix,
+            artifacts,
+        ) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(crate::store::agent_mailbox::AgentMailboxProcessingError::LocalMailbox(error)) => {
+                eprintln!(
+                    "rex-projects: AgentRun {} mailbox needs attention: {error}",
+                    registration.agent_run_id
+                );
+            }
+            Err(crate::store::agent_mailbox::AgentMailboxProcessingError::Authority(error)) => {
+                return Err(format!(
+                    "AgentRun {} mailbox authority/storage failure: {error}",
+                    registration.agent_run_id
+                ));
+            }
+        }
+    }
+    Ok(false)
 }
 
 impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for RuntimeServices {
@@ -2968,6 +2995,15 @@ impl RuntimeServices {
         else {
             return Ok(false);
         };
+        let mailbox_expires_at_unix = mailbox_expiration(now_unix, profile.turn_timeout_seconds)?;
+        let mailbox_max_request_bytes = 1_048_576_u64;
+        let mailbox_max_pending_requests = 32_u32;
+        let mailbox_capability_digest = mailbox_capability_digest(
+            &agent_run_id,
+            mailbox_expires_at_unix,
+            mailbox_max_request_bytes,
+            mailbox_max_pending_requests,
+        )?;
         let reservation = crate::launch::AgentLaunchReservation {
             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
             agent_run_id,
@@ -3004,10 +3040,10 @@ impl RuntimeServices {
             workspace_path: workspace,
             control_dir: control_dir.clone(),
             mailbox_directory: control_dir,
-            mailbox_capability_digest: digest_bytes(seed_digest.as_str().as_bytes())?,
-            mailbox_expires_at_unix: mailbox_expiration(now_unix, profile.turn_timeout_seconds)?,
-            mailbox_max_request_bytes: 1_048_576,
-            mailbox_max_pending_requests: 32,
+            mailbox_capability_digest,
+            mailbox_expires_at_unix,
+            mailbox_max_request_bytes,
+            mailbox_max_pending_requests,
             pool: "agent".into(),
             slot_index,
             global_capacity: capacity,
@@ -3323,6 +3359,25 @@ fn preflight_provider_qualification_job(
 fn digest_bytes(bytes: &[u8]) -> Result<Digest, String> {
     use sha2::Digest as _;
     Digest::parse(format!("{:x}", sha2::Sha256::digest(bytes)))
+}
+
+fn mailbox_capability_digest(
+    agent_run_id: &crate::domain::ids::AgentRunId,
+    expires_at_unix: u64,
+    max_request_bytes: u64,
+    max_pending_requests: u32,
+) -> Result<Digest, String> {
+    let limits = crate::mailbox::MailboxLimits {
+        max_request_bytes: usize::try_from(max_request_bytes)
+            .map_err(|_| "Agent mailbox request limit exceeds this platform")?,
+        max_pending_requests: usize::try_from(max_pending_requests)
+            .map_err(|_| "Agent mailbox pending limit exceeds this platform")?,
+    };
+    Digest::parse(crate::mailbox::MailboxDescriptor::capability_digest(
+        agent_run_id.as_str(),
+        expires_at_unix,
+        limits,
+    )?)
 }
 
 fn create_private_dir(path: &Path) -> Result<(), String> {

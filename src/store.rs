@@ -1737,17 +1737,11 @@ impl ConfigStore {
             limits,
         )?;
         let canonical_directory = capability.directory().display().to_string();
-        let descriptor = crate::mailbox::MailboxDescriptor {
-            schema_version: 1,
-            run_id: agent_run_id.to_owned(),
+        let capability_digest = crate::mailbox::MailboxDescriptor::capability_digest(
+            agent_run_id,
             expires_at_unix,
-            max_request_bytes: limits.max_request_bytes,
-            max_pending_requests: limits.max_pending_requests,
-        };
-        let capability_digest = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?)
-        );
+            limits,
+        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1817,11 +1811,19 @@ impl ConfigStore {
             .map_err(|error| error.to_string())
     }
 
-    pub fn registered_agent_mailboxes(&self) -> Result<Vec<AgentMailboxRegistration>, String> {
-        let mut statement = self.connection.prepare(
+    pub fn registered_agent_mailboxes(
+        &mut self,
+        owner_generation: u64,
+    ) -> Result<Vec<AgentMailboxRegistration>, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let mut statement = tx.prepare(
             "SELECT agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests FROM agent_mailboxes ORDER BY agent_run_id",
         ).map_err(|error| error.to_string())?;
-        statement
+        let registrations = statement
             .query_map([], |row| {
                 Ok(AgentMailboxRegistration {
                     agent_run_id: row.get(0)?,
@@ -1834,7 +1836,10 @@ impl ConfigStore {
             })
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(registrations)
     }
 
     pub fn record_input(

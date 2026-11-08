@@ -153,6 +153,7 @@ impl EffectHandler for StartAgentEffectHandler {
             &observed_block,
             &environment_handoff,
         )?;
+        register_reserved_mailbox(context.store, context.owner_generation, &reservation)?;
         let authority = finalize_and_ack_start(
             context.store,
             context.owner_generation,
@@ -174,4 +175,38 @@ impl EffectHandler for StartAgentEffectHandler {
             .to_string(),
         })
     }
+}
+
+pub(crate) fn register_reserved_mailbox(
+    store: &mut crate::store::ConfigStore,
+    owner_generation: u64,
+    reservation: &AgentLaunchReservation,
+) -> Result<(), String> {
+    let limits = crate::mailbox::MailboxLimits {
+        max_request_bytes: usize::try_from(reservation.mailbox_max_request_bytes)
+            .map_err(|_| "Agent mailbox request limit exceeds this platform")?,
+        max_pending_requests: usize::try_from(reservation.mailbox_max_pending_requests)
+            .map_err(|_| "Agent mailbox pending limit exceeds this platform")?,
+    };
+    let mailbox = store.register_agent_mailbox(
+        owner_generation,
+        reservation.agent_run_id.as_str(),
+        &reservation.mailbox_directory,
+        reservation.mailbox_expires_at_unix,
+        limits,
+    )?;
+    let canonical_mailbox_directory = std::fs::canonicalize(&reservation.mailbox_directory)
+        .map_err(|error| format!("canonicalize Agent mailbox directory: {error}"))?;
+    if mailbox.agent_run_id != reservation.agent_run_id.as_str()
+        || mailbox.canonical_directory != canonical_mailbox_directory.display().to_string()
+        || mailbox.capability_digest != reservation.mailbox_capability_digest.as_str()
+        || mailbox.expires_at_unix != reservation.mailbox_expires_at_unix
+        || mailbox.max_request_bytes != limits.max_request_bytes
+        || mailbox.max_pending_requests != limits.max_pending_requests
+    {
+        return Err(
+            "registered Agent mailbox differs from the immutable launch reservation".into(),
+        );
+    }
+    Ok(())
 }
