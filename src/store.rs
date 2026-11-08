@@ -3366,6 +3366,14 @@ impl ConfigStore {
         tx.execute("UPDATE execution_slots SET disposition='unknown' WHERE disposition IN ('launch_pending','live')", []).map_err(|e| e.to_string())?;
         tx.execute("UPDATE agent_runs SET state='unknown', controller_generation=?1 WHERE state IN ('launch_pending','running','unknown')", [generation]).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO controller_owners(singleton, owner_nonce, generation, state_root, config_source, pid, process_start_identity, executable_path, executable_digest, rex_endpoint, rex_server_identity, rex_session_id, rex_block_id, started_at_unix, heartbeat_at_unix, stopped_at_unix) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, NULL) ON CONFLICT(singleton) DO UPDATE SET owner_nonce=excluded.owner_nonce, generation=excluded.generation, state_root=excluded.state_root, config_source=excluded.config_source, pid=excluded.pid, process_start_identity=excluded.process_start_identity, executable_path=excluded.executable_path, executable_digest=excluded.executable_digest, rex_endpoint=excluded.rex_endpoint, rex_server_identity=excluded.rex_server_identity, rex_session_id=excluded.rex_session_id, rex_block_id=excluded.rex_block_id, started_at_unix=excluded.started_at_unix, heartbeat_at_unix=excluded.heartbeat_at_unix, stopped_at_unix=NULL", params![owner.owner_nonce, generation, owner.state_root, owner.config_source, std::process::id(), owner.process_start_identity, owner.executable_path, owner.executable_digest, owner.rex_endpoint, owner.rex_server_identity, owner.rex_session_id, owner.rex_block_id, now]).map_err(|e| e.to_string())?;
+        // A new machine owner must reclaim Projects whose durable desired state is still
+        // running. Keep their epoch and all execution-slot evidence intact: only lifecycle
+        // ownership moves to this controller, which activates them on its first tick.
+        tx.execute(
+            "UPDATE project_runtimes SET desired_lifecycle='running',observed_lifecycle='starting',controller_generation=?1 WHERE project_id IN (SELECT project_id FROM projects WHERE desired_lifecycle='running')",
+            [generation],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(generation)
     }
@@ -8486,6 +8494,106 @@ mod tests {
             "running"
         );
         assert_eq!(store.activate_starting_projects(generation).unwrap(), 0);
+    }
+
+    #[test]
+    fn controller_restart_reattaches_only_desired_running_projects_without_advancing_epoch() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let ids = ["running", "paused", "stopped"].map(|id| ProjectId::parse(id).unwrap());
+        for (id, lifecycle) in ids.iter().zip(["running", "paused", "stopped"]) {
+            store
+                .insert_project(&ProjectRecord {
+                    id: id.clone(),
+                    config_source: "factory".into(),
+                    config_revision: applied.revision,
+                    config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                    mode: "goal".into(),
+                    goal_revision: 1,
+                    desired_lifecycle: lifecycle.into(),
+                    state_revision: Revision(0),
+                })
+                .unwrap();
+        }
+        let first = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "first-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start-1".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        for (id, lifecycle) in ids.iter().zip(["running", "paused", "stopped"]) {
+            store.set_project_lifecycle(first, id, lifecycle).unwrap();
+        }
+        let epochs = ids
+            .iter()
+            .map(|id| {
+                store
+                    .connection
+                    .query_row(
+                        "SELECT project_epoch FROM project_runtimes WHERE project_id=?1",
+                        [id.as_str()],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.stop_owner(first).unwrap();
+
+        let second = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "second-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start-2".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT desired_lifecycle,observed_lifecycle,controller_generation,project_epoch FROM project_runtimes WHERE project_id='running'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?)),
+            ).unwrap(),
+            ("running".into(), "starting".into(), second, epochs[0])
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT desired_lifecycle,observed_lifecycle,controller_generation,project_epoch FROM project_runtimes WHERE project_id='paused'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?)),
+            ).unwrap(),
+            ("paused".into(), "paused".into(), first, epochs[1])
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT desired_lifecycle,observed_lifecycle,controller_generation,project_epoch FROM project_runtimes WHERE project_id='stopped'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?)),
+            ).unwrap(),
+            ("stopped".into(), "stopped".into(), first, epochs[2])
+        );
+        assert_eq!(store.activate_starting_projects(second).unwrap(), 1);
     }
 
     #[test]

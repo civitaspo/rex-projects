@@ -1116,6 +1116,17 @@ fn apply_supervisor_dispatch_request(
     let authority = store
         .agent_launch_authority(&binding.agent_run_id)?
         .ok_or("Supervisor result has no launch authority")?;
+    if binding.controller_generation != owner_generation
+        || authority.controller_generation != owner_generation
+    {
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            current.state_revision.0.max(1),
+            crate::store::agent_results::ResultDisposition::RejectedByHost,
+        )?;
+        return Ok(true);
+    }
     let runnable = store
         .runnable_projects(owner_generation)?
         .into_iter()
@@ -2928,6 +2939,7 @@ pub(crate) mod tests {
     struct WorkerPublicationFixtureServices {
         configuration_digest: Digest,
         published_effect: Option<crate::store::EffectIntent>,
+        pending_artifacts: Option<crate::artifacts::ArtifactStore>,
     }
 
     impl super::FactoryRuntimeServices for WorkerPublicationFixtureServices {
@@ -2955,11 +2967,18 @@ pub(crate) mod tests {
 
         fn ingest_one_agent_result(
             &mut self,
-            _: &mut crate::store::ConfigStore,
-            _: u64,
+            store: &mut crate::store::ConfigStore,
+            owner_generation: u64,
             _: i64,
         ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> {
-            Ok(None)
+            self.pending_artifacts
+                .as_ref()
+                .map(|artifacts| {
+                    store
+                        .pending_validated_agent_results(artifacts, owner_generation, 1)
+                        .map(|mut results| results.pop())
+                })
+                .unwrap_or(Ok(None))
         }
 
         fn observe_base_heads(
@@ -3078,6 +3097,7 @@ pub(crate) mod tests {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
             published_effect: None,
+            pending_artifacts: None,
         };
         super::apply_agent_result(
             store,
@@ -3194,6 +3214,7 @@ pub(crate) mod tests {
             let mut services = WorkerPublicationFixtureServices {
                 configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
                 published_effect: None,
+                pending_artifacts: None,
             };
             let applied = super::apply_agent_result(
                 &mut fixture.store,
@@ -3235,6 +3256,202 @@ pub(crate) mod tests {
                 .contains("stale external ticket revision")
         );
         assert_eq!(stale_count, 0);
+    }
+
+    #[test]
+    fn controller_restart_rejects_stale_supervisor_dispatch_during_production_tick() {
+        use crate::domain::ids::{Digest, ProjectId, TicketNamespace};
+        use crate::domain::types::{Role, TicketStatus};
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use crate::store::OwnerMetadata;
+        use crate::store::scheduler::{ObservedTicket, TicketScanKey, TicketScanPage};
+        use serde_json::json;
+
+        let revision = "3ef900fc1927e9ad609e95b52b74a048fd9baa76194eb0ba60d738df088727b4";
+        let payload = json!({
+            "ticket_reference": "github:civitaspo/rex-projects:43",
+            "expected_ticket_revision": revision,
+            "coordinator_profile": "judgment_claude",
+            "priority": 3,
+            "rationale": "dispatch the exact observed ticket revision"
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Supervisor,
+                RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "supervisor-dispatch-old-generation".into(),
+                    kind: RoleOutputKind::DispatchRequest,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result: payload,
+                    result_digest: Some(result_digest),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("fixture-project").unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
+            .unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let mut project = config
+            .projects
+            .remove(&ProjectId::parse("goal_project").unwrap())
+            .unwrap();
+        project.dispatch_states = vec![TicketStatus::Ready];
+        config.projects.insert(project_id.clone(), project);
+        let project = config.projects.get(&project_id).unwrap();
+        let namespace = TicketNamespace::parse("github:civitaspo/rex-projects").unwrap();
+        let key = TicketScanKey::for_project(
+            &project_id,
+            &project.ticket_adapter,
+            &namespace,
+            project,
+            TicketStatus::Ready,
+        )
+        .unwrap();
+        fixture
+            .store
+            .record_ticket_scan_page(
+                fixture.owner_generation,
+                TicketScanPage {
+                    key: &key,
+                    expected_cursor: None,
+                    expected_generation: 0,
+                    expected_page_count: 0,
+                    next_cursor: None,
+                    tickets: &[ObservedTicket {
+                        id: crate::domain::ids::TicketId::parse("43").unwrap(),
+                        revision: Some(revision.into()),
+                        status: TicketStatus::Ready,
+                        title: "Fixture ticket".into(),
+                        labels: Vec::new(),
+                        created_at: None,
+                        observed_at_unix: 1,
+                    }],
+                    now_unix: 1,
+                    poll_seconds: 60,
+                },
+            )
+            .unwrap();
+
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE execution_slots SET disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.ingested.validated.binding.agent_run_id.as_str()],
+            )
+            .unwrap();
+        fixture.store.stop_owner(fixture.owner_generation).unwrap();
+        let owner_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "fixture-restarted-owner".into(),
+                state_root: fixture._temp.path().display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: "fixture-restarted-process".into(),
+                executable_path: "/test/fixture".into(),
+                executable_digest: "c".repeat(64),
+                rex_endpoint: Some("http://fixture".into()),
+                rex_server_identity: Some("fixture-rex".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        let slot_disposition: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.ingested.validated.binding.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slot_disposition, "unknown");
+        let artifacts = fixture.artifacts.clone();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            published_effect: None,
+            pending_artifacts: Some(fixture.artifacts),
+        };
+
+        let tick = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            owner_generation,
+            2,
+            &config,
+            &mut services,
+        );
+        assert!(
+            tick.is_ok(),
+            "stale result must not stop controller: {tick:?}"
+        );
+        let ticket_runs: u64 = fixture
+            .store
+            .test_connection()
+            .query_row("SELECT COUNT(*) FROM ticket_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ticket_runs, 0);
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                fixture.ingested.receipt.evidence_id(),
+            )
+            .unwrap()
+            .map(|(_, disposition)| disposition),
+            Some("rejected_by_host".to_owned())
+        );
+        let slot_disposition: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.ingested.validated.binding.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slot_disposition, "unknown");
+
+        let pending = fixture
+            .store
+            .pending_validated_agent_results(&artifacts, owner_generation, 1)
+            .unwrap();
+        assert!(pending.is_empty());
+        let second_tick = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            owner_generation,
+            3,
+            &config,
+            &mut services,
+        );
+        assert!(
+            second_tick.is_ok(),
+            "acknowledged stale result must remain idempotent: {second_tick:?}"
+        );
+        let ticket_runs: u64 = fixture
+            .store
+            .test_connection()
+            .query_row("SELECT COUNT(*) FROM ticket_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ticket_runs, 0);
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                fixture.ingested.receipt.evidence_id(),
+            )
+            .unwrap()
+            .map(|(_, disposition)| disposition),
+            Some("rejected_by_host".to_owned())
+        );
     }
 
     #[test]
@@ -3282,6 +3499,7 @@ pub(crate) mod tests {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
             published_effect: None,
+            pending_artifacts: None,
         };
 
         assert!(
@@ -3406,6 +3624,7 @@ pub(crate) mod tests {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
             published_effect: None,
+            pending_artifacts: None,
         };
 
         assert!(
@@ -3524,6 +3743,7 @@ pub(crate) mod tests {
             let mut services = WorkerPublicationFixtureServices {
                 configuration_digest: configuration_digest.clone(),
                 published_effect: None,
+                pending_artifacts: None,
             };
             let wake_count_before: u32 = fixture
                 .store
@@ -3672,6 +3892,7 @@ pub(crate) mod tests {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: current_digest.clone(),
             published_effect: None,
+            pending_artifacts: None,
         };
 
         assert!(
