@@ -136,7 +136,6 @@ pub fn maintain_view(
         anchor.as_ref(),
         anchor_spec,
         transport,
-        now_unix,
     )?;
     records = store.rex_view_blocks(&view.view.view_id)?;
 
@@ -315,7 +314,6 @@ fn maintain_anchor(
     anchor: Option<&crate::launch::RexViewAnchorRecord>,
     anchor_spec: Option<&AgentBlockSpec>,
     transport: &RexCliTransport,
-    now_unix: u64,
 ) -> Result<(), String> {
     let Some(anchor) = anchor else {
         return Ok(());
@@ -415,7 +413,6 @@ fn maintain_anchor(
             )?;
         }
     }
-    let _ = now_unix;
     Ok(())
 }
 

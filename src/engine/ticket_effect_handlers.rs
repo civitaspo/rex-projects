@@ -27,7 +27,7 @@ use crate::engine::ticket_effects::{
     CreateGoalTicket, PublishTicketStatus, ResolveDuplicateTicket,
 };
 use crate::protocol::RequestId;
-use crate::store::scheduler::GoalTicketCandidateRecord;
+use crate::store::scheduler::{GoalTicketCandidateRecord, GoalTicketDuplicateResolution};
 use crate::store::{DurableInput, EffectIntent, durable_input_digest};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -457,12 +457,14 @@ impl ResolveDuplicateHandler {
         if progress.phase == "resolved" {
             let _ = context.store.mark_goal_ticket_duplicate_resolved(
                 context.owner_generation,
-                &payload.project_id,
-                payload.goal_revision,
-                &payload.request_key,
-                &payload.namespace,
-                &payload.duplicate_ticket_id,
-                context.now_unix,
+                GoalTicketDuplicateResolution {
+                    project_id: &payload.project_id,
+                    goal_revision: payload.goal_revision,
+                    request_key: &payload.request_key,
+                    namespace: &payload.namespace,
+                    duplicate: &payload.duplicate_ticket_id,
+                    now_unix: context.now_unix,
+                },
             )?;
             return Ok(EffectObservation::Applied {
                 receipt: "{\"resolved\":true}".into(),
@@ -621,12 +623,14 @@ impl ResolveDuplicateHandler {
         save_duplicate_progress(context, request, progress)?;
         let _ = context.store.mark_goal_ticket_duplicate_resolved(
             context.owner_generation,
-            &payload.project_id,
-            payload.goal_revision,
-            &payload.request_key,
-            &payload.namespace,
-            &payload.duplicate_ticket_id,
-            context.now_unix,
+            GoalTicketDuplicateResolution {
+                project_id: &payload.project_id,
+                goal_revision: payload.goal_revision,
+                request_key: &payload.request_key,
+                namespace: &payload.namespace,
+                duplicate: &payload.duplicate_ticket_id,
+                now_unix: context.now_unix,
+            },
         )?;
         let receipt = receipt
             .map(serde_json::to_value)
@@ -1386,14 +1390,16 @@ mod tests {
         let reservation = store
             .reserve_goal_ticket_creation(
                 owner,
-                &project,
-                &namespace,
-                &key,
-                &proposal_digest,
-                &proposal_json,
-                &ticket_request,
-                5,
-                1,
+                crate::store::scheduler::GoalTicketCreation {
+                    project_id: &project,
+                    namespace: &namespace,
+                    request_key: &key,
+                    request_digest: &proposal_digest,
+                    proposal_json: &proposal_json,
+                    ticket_request: &ticket_request,
+                    maximum: 5,
+                    now_unix: 1,
+                },
             )
             .unwrap();
         store
@@ -1621,14 +1627,16 @@ mod tests {
         let reservation = store
             .reserve_goal_ticket_creation(
                 owner,
-                &project,
-                &namespace,
-                &request_key,
-                &proposal_digest,
-                &proposal_json,
-                &payload,
-                5,
-                1,
+                crate::store::scheduler::GoalTicketCreation {
+                    project_id: &project,
+                    namespace: &namespace,
+                    request_key: &request_key,
+                    request_digest: &proposal_digest,
+                    proposal_json: &proposal_json,
+                    ticket_request: &payload,
+                    maximum: 5,
+                    now_unix: 1,
+                },
             )
             .unwrap();
         let adapter = Arc::new(FakeAdapter::new(

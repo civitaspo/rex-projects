@@ -114,6 +114,18 @@ pub struct OperationInvocation {
     pub subject_digest: Digest,
 }
 
+pub struct RecordInvoking<'a> {
+    pub operation_id: &'a OperationId,
+    pub project_id: &'a ProjectId,
+    pub ticket_run_id: &'a TicketRunId,
+    pub ticket_revision: Revision,
+    pub config_revision: Revision,
+    pub config_digest: &'a Digest,
+    pub attempt_count: u32,
+    pub invocation: &'a OperationInvocation,
+    pub now: i64,
+}
+
 /// Apply migration 11 only to a database whose predecessor migrations have
 /// reached version 10. This lets each feature branch own its migration without
 /// skipping migrations owned by the controller, human, pipeline, or learning
@@ -440,16 +452,19 @@ impl<'a> OperationsStore<'a> {
     pub fn record_invoking(
         &mut self,
         owner_generation: u64,
-        operation_id: &OperationId,
-        project_id: &ProjectId,
-        ticket_run_id: &TicketRunId,
-        ticket_revision: Revision,
-        config_revision: Revision,
-        config_digest: &Digest,
-        attempt_count: u32,
-        invocation: &OperationInvocation,
-        now: i64,
+        request: RecordInvoking<'_>,
     ) -> Result<(), String> {
+        let RecordInvoking {
+            operation_id,
+            project_id,
+            ticket_run_id,
+            ticket_revision,
+            config_revision,
+            config_digest,
+            attempt_count,
+            invocation,
+            now,
+        } = request;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)

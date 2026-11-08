@@ -15,7 +15,8 @@ use crate::effects::{DispatchTick, EffectDispatcher, EffectHandler, EffectLimits
 use crate::engine::reducer::{Activity, Input, Phase, TicketRun};
 use crate::store::scheduler::RunnableProject;
 use crate::store::scheduler::{
-    ObservedTicket, PendingRoleWakeSession, TicketObservationClassification, TicketScanKey,
+    ObservedTicket, PendingRoleWakeSession, TicketObservationClassification,
+    TicketScanErrorBackoff, TicketScanKey, TicketScanPage,
 };
 use crate::store::{ConfigStore, DurableInput, EffectIntent, durable_input_digest};
 
@@ -421,12 +422,14 @@ impl FactoryRuntime {
             Err(error) => {
                 store.defer_ticket_scan_after_error(
                     owner_generation,
-                    &key,
-                    cursor.cursor.as_deref(),
-                    cursor.generation,
-                    cursor.page_count,
-                    now_unix,
-                    config.runtime.external_poll_seconds.clamp(2, 3600),
+                    TicketScanErrorBackoff {
+                        key: &key,
+                        expected_cursor: cursor.cursor.as_deref(),
+                        expected_generation: cursor.generation,
+                        expected_page_count: cursor.page_count,
+                        now_unix,
+                        retry_after_seconds: config.runtime.external_poll_seconds.clamp(2, 3600),
+                    },
                 )?;
                 external_errors.push(error);
                 return Ok(FactoryTickReport {
@@ -455,14 +458,16 @@ impl FactoryRuntime {
         }
         store.record_ticket_scan_page(
             owner_generation,
-            &key,
-            cursor.cursor.as_deref(),
-            cursor.generation,
-            cursor.page_count,
-            page.next_cursor.as_deref(),
-            &page.tickets,
-            now_unix,
-            config.runtime.external_poll_seconds,
+            TicketScanPage {
+                key: &key,
+                expected_cursor: cursor.cursor.as_deref(),
+                expected_generation: cursor.generation,
+                expected_page_count: cursor.page_count,
+                next_cursor: page.next_cursor.as_deref(),
+                tickets: &page.tickets,
+                now_unix,
+                poll_seconds: config.runtime.external_poll_seconds,
+            },
         )?;
         for ticket in &page.tickets {
             let status_key = TicketScanKey {
@@ -1426,14 +1431,16 @@ fn apply_supervisor_ticket_proposal(
     request.validate()?;
     let reservation = store.reserve_goal_ticket_creation(
         owner_generation,
-        &binding.project_id,
-        &namespace,
-        &prepared.request_key,
-        &proposal_digest,
-        &proposal_json,
-        &request,
-        project.max_created_tickets_per_goal_revision,
-        now_unix,
+        crate::store::scheduler::GoalTicketCreation {
+            project_id: &binding.project_id,
+            namespace: &namespace,
+            request_key: &prepared.request_key,
+            request_digest: &proposal_digest,
+            proposal_json: &proposal_json,
+            ticket_request: &request,
+            maximum: project.max_created_tickets_per_goal_revision,
+            now_unix,
+        },
     )?;
     if reservation.request_digest != request.request_digest.as_str() {
         return Err("reserved Goal ticket digest differs from the typed create request".into());
@@ -3093,7 +3100,7 @@ pub(crate) mod tests {
         use crate::domain::types::{Role, TicketStatus};
         use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
         use crate::roles::RoleResultMessage;
-        use crate::store::scheduler::{ObservedTicket, TicketScanKey};
+        use crate::store::scheduler::{ObservedTicket, TicketScanKey, TicketScanPage};
         use rusqlite::params;
         use serde_json::json;
 
@@ -3151,22 +3158,24 @@ pub(crate) mod tests {
                 .store
                 .record_ticket_scan_page(
                     fixture.owner_generation,
-                    &key,
-                    None,
-                    0,
-                    0,
-                    None,
-                    &[ObservedTicket {
-                        id: TicketId::parse("T-1").unwrap(),
-                        revision: Some("rev-1".into()),
-                        status: TicketStatus::Ready,
-                        title: "Fixture ticket".into(),
-                        labels: Vec::new(),
-                        created_at: None,
-                        observed_at_unix: 1,
-                    }],
-                    1,
-                    60,
+                    TicketScanPage {
+                        key: &key,
+                        expected_cursor: None,
+                        expected_generation: 0,
+                        expected_page_count: 0,
+                        next_cursor: None,
+                        tickets: &[ObservedTicket {
+                            id: TicketId::parse("T-1").unwrap(),
+                            revision: Some("rev-1".into()),
+                            status: TicketStatus::Ready,
+                            title: "Fixture ticket".into(),
+                            labels: Vec::new(),
+                            created_at: None,
+                            observed_at_unix: 1,
+                        }],
+                        now_unix: 1,
+                        poll_seconds: 60,
+                    },
                 )
                 .unwrap();
             let binding = &fixture.ingested.validated.binding;

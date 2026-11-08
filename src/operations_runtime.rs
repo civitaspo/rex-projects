@@ -32,7 +32,7 @@ use crate::operations::{
 };
 use crate::store::{
     EffectIntent,
-    operations::{DurableOperationState, OperationEffectRequest},
+    operations::{DurableOperationState, OperationEffectRequest, RecordInvoking},
 };
 
 pub fn operation_review_bundle(
@@ -633,15 +633,17 @@ impl OperationEffectHandler {
             };
             store.record_invoking(
                 context.owner_generation,
-                operation_id,
-                &request.project_id,
-                &request.ticket_run_id,
-                request.ticket_revision,
-                request.config_revision,
-                &request.config_digest,
-                attempt_count,
-                &invocation,
-                context.now_unix.max(now),
+                RecordInvoking {
+                    operation_id,
+                    project_id: &request.project_id,
+                    ticket_run_id: &request.ticket_run_id,
+                    ticket_revision: request.ticket_revision,
+                    config_revision: request.config_revision,
+                    config_digest: &request.config_digest,
+                    attempt_count,
+                    invocation: &invocation,
+                    now: context.now_unix.max(now),
+                },
             )?;
             invocation_attempt
         };
@@ -1311,15 +1313,17 @@ mod tests {
             operations
                 .record_invoking(
                     generation,
-                    &operation_id,
-                    &project_id,
-                    &ticket_run_id,
-                    request.ticket_revision,
-                    request.config_revision,
-                    &request.config_digest,
-                    first_effect.attempt_count,
-                    &invocation(1),
-                    101,
+                    RecordInvoking {
+                        operation_id: &operation_id,
+                        project_id: &project_id,
+                        ticket_run_id: &ticket_run_id,
+                        ticket_revision: request.ticket_revision,
+                        config_revision: request.config_revision,
+                        config_digest: &request.config_digest,
+                        attempt_count: first_effect.attempt_count,
+                        invocation: &invocation(1),
+                        now: 101,
+                    },
                 )
                 .unwrap();
             operations
@@ -1329,15 +1333,17 @@ mod tests {
                 operations
                     .record_invoking(
                         generation,
-                        &operation_id,
-                        &project_id,
-                        &ticket_run_id,
-                        request.ticket_revision,
-                        request.config_revision,
-                        &request.config_digest,
-                        first_effect.attempt_count,
-                        &invocation(2),
-                        103,
+                        RecordInvoking {
+                            operation_id: &operation_id,
+                            project_id: &project_id,
+                            ticket_run_id: &ticket_run_id,
+                            ticket_revision: request.ticket_revision,
+                            config_revision: request.config_revision,
+                            config_digest: &request.config_digest,
+                            attempt_count: first_effect.attempt_count,
+                            invocation: &invocation(2),
+                            now: 103,
+                        },
                     )
                     .is_err(),
                 "a caller cannot create a second invoke without an accepted Find absence"
@@ -1372,15 +1378,17 @@ mod tests {
             .unwrap()
             .record_invoking(
                 generation,
-                &operation_id,
-                &project_id,
-                &ticket_run_id,
-                request.ticket_revision,
-                request.config_revision,
-                &request.config_digest,
-                second_effect.attempt_count,
-                &invocation(2),
-                201,
+                RecordInvoking {
+                    operation_id: &operation_id,
+                    project_id: &project_id,
+                    ticket_run_id: &ticket_run_id,
+                    ticket_revision: request.ticket_revision,
+                    config_revision: request.config_revision,
+                    config_digest: &request.config_digest,
+                    attempt_count: second_effect.attempt_count,
+                    invocation: &invocation(2),
+                    now: 201,
+                },
             )
             .unwrap();
         assert_eq!(

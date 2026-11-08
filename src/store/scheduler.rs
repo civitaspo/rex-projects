@@ -66,6 +66,46 @@ pub struct TicketScanKey {
     pub status: TicketStatus,
 }
 
+pub struct TicketScanErrorBackoff<'a> {
+    pub key: &'a TicketScanKey,
+    pub expected_cursor: Option<&'a str>,
+    pub expected_generation: u64,
+    pub expected_page_count: u64,
+    pub now_unix: i64,
+    pub retry_after_seconds: u64,
+}
+
+pub struct GoalTicketDuplicateResolution<'a> {
+    pub project_id: &'a ProjectId,
+    pub goal_revision: u64,
+    pub request_key: &'a str,
+    pub namespace: &'a TicketNamespace,
+    pub duplicate: &'a TicketId,
+    pub now_unix: i64,
+}
+
+pub struct GoalTicketCreation<'a> {
+    pub project_id: &'a ProjectId,
+    pub namespace: &'a TicketNamespace,
+    pub request_key: &'a str,
+    pub request_digest: &'a str,
+    pub proposal_json: &'a str,
+    pub ticket_request: &'a crate::engine::ticket_effects::CreateGoalTicket,
+    pub maximum: usize,
+    pub now_unix: i64,
+}
+
+pub struct TicketScanPage<'a> {
+    pub key: &'a TicketScanKey,
+    pub expected_cursor: Option<&'a str>,
+    pub expected_generation: u64,
+    pub expected_page_count: u64,
+    pub next_cursor: Option<&'a str>,
+    pub tickets: &'a [ObservedTicket],
+    pub now_unix: i64,
+    pub poll_seconds: u64,
+}
+
 /// Ticket candidate durable in the local scan ledger, before it is claimed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingTicketObservation {
@@ -1147,13 +1187,16 @@ impl ConfigStore {
     pub fn defer_ticket_scan_after_error(
         &mut self,
         owner_generation: u64,
-        key: &TicketScanKey,
-        expected_cursor: Option<&str>,
-        expected_generation: u64,
-        expected_page_count: u64,
-        now_unix: i64,
-        retry_after_seconds: u64,
+        backoff: TicketScanErrorBackoff<'_>,
     ) -> Result<(), String> {
+        let TicketScanErrorBackoff {
+            key,
+            expected_cursor,
+            expected_generation,
+            expected_page_count,
+            now_unix,
+            retry_after_seconds,
+        } = backoff;
         key.validate()?;
         if retry_after_seconds == 0 || retry_after_seconds > 3600 {
             return Err("ticket scan error backoff is outside bounds".into());
@@ -1396,13 +1439,16 @@ impl ConfigStore {
     pub fn mark_goal_ticket_duplicate_resolved(
         &mut self,
         owner_generation: u64,
-        project_id: &ProjectId,
-        goal_revision: u64,
-        request_key: &str,
-        namespace: &TicketNamespace,
-        duplicate: &TicketId,
-        now_unix: i64,
+        resolution: GoalTicketDuplicateResolution<'_>,
     ) -> Result<bool, String> {
+        let GoalTicketDuplicateResolution {
+            project_id,
+            goal_revision,
+            request_key,
+            namespace,
+            duplicate,
+            now_unix,
+        } = resolution;
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1428,15 +1474,18 @@ impl ConfigStore {
     pub fn reserve_goal_ticket_creation(
         &mut self,
         owner_generation: u64,
-        project_id: &ProjectId,
-        namespace: &TicketNamespace,
-        request_key: &str,
-        request_digest: &str,
-        proposal_json: &str,
-        ticket_request: &crate::engine::ticket_effects::CreateGoalTicket,
-        maximum: usize,
-        now_unix: i64,
+        request: GoalTicketCreation<'_>,
     ) -> Result<GoalTicketReservation, String> {
+        let GoalTicketCreation {
+            project_id,
+            namespace,
+            request_key,
+            request_digest,
+            proposal_json,
+            ticket_request,
+            maximum,
+            now_unix,
+        } = request;
         if request_key.is_empty()
             || request_key.len() > 255
             || maximum == 0
@@ -1748,15 +1797,18 @@ impl ConfigStore {
     pub fn record_ticket_scan_page(
         &mut self,
         owner_generation: u64,
-        key: &TicketScanKey,
-        expected_cursor: Option<&str>,
-        expected_generation: u64,
-        expected_page_count: u64,
-        next_cursor: Option<&str>,
-        tickets: &[ObservedTicket],
-        now_unix: i64,
-        poll_seconds: u64,
+        page: TicketScanPage<'_>,
     ) -> Result<TicketScanCursor, String> {
+        let TicketScanPage {
+            key,
+            expected_cursor,
+            expected_generation,
+            expected_page_count,
+            next_cursor,
+            tickets,
+            now_unix,
+            poll_seconds,
+        } = page;
         key.validate()?;
         if tickets.len() > 100 || poll_seconds == 0 {
             return Err("ticket page or poll interval exceeds configured limits".into());

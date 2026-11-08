@@ -2876,8 +2876,6 @@ pub(crate) mod host_validation_fixture {
 
     pub(crate) struct InPlaceValidatedResultFixture {
         pub artifacts: crate::artifacts::ArtifactStore,
-        pub start: StartRequestEnvelope,
-        pub terminal: VerifiedAgentTerminal,
         pub ingested: IngestedAgentResult,
     }
 
@@ -3427,8 +3425,6 @@ pub(crate) mod host_validation_fixture {
             store.store_validated_agent_result(&artifacts, owner_generation, &terminal, message)?;
         Ok(InPlaceValidatedResultFixture {
             artifacts,
-            start,
-            terminal,
             ingested,
         })
     }
