@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{ArtifactId, Digest, OperationId, ProjectId, TicketId, TicketRunId};
 use crate::engine::orchestration::{
-    RoleArtifactKind, RoleArtifactReference, WorkerRecoveryAuthorization,
+    ReviewReadyPayload, RoleArtifactKind, RoleArtifactReference, WorkerRecoveryAuthorization,
 };
 
 const MAX_INBOX_BYTES: usize = 1024 * 1024;
@@ -28,6 +28,47 @@ pub struct AgentWakeSnapshot {
     pub agent_run_id: String,
     pub digest: Digest,
     pub inputs: Vec<AgentWakeItem>,
+    /// Host-validated guidance frozen when a Worker launch is reserved. It is contextual input,
+    /// not a change to the accepted plan or launch authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_correction_context: Option<WorkerCorrectionContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCorrectionContext {
+    pub schema_version: u32,
+    pub project_id: ProjectId,
+    pub ticket_run_id: TicketRunId,
+    pub ticket_revision: u64,
+    pub configuration_digest: Digest,
+    pub accepted_plan_digest: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_instruction: Option<WorkerCoordinatorInstruction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_correction: Option<WorkerReviewerCorrection>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCoordinatorInstruction {
+    pub wake_input_id: u64,
+    pub request_id: String,
+    pub source_revision: u64,
+    pub body_digest: Digest,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReviewerCorrection {
+    pub evidence_id: String,
+    pub result_digest: Digest,
+    pub source_revision: u64,
+    pub accepted_revision: u64,
+    pub publication_revision: u64,
+    pub publication_subject_digest: Digest,
+    pub assessment: ReviewReadyPayload,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -215,6 +256,9 @@ impl AgentWakeSnapshot {
         {
             return Err("unsupported or incomplete Agent inbox snapshot".into());
         }
+        if let Some(context) = &self.worker_correction_context {
+            context.validate_for_snapshot(self)?;
+        }
         if self.inputs.len() > MAX_WAKE_ITEMS {
             return Err("Agent inbox snapshot exceeds the 256 item limit".into());
         }
@@ -382,15 +426,107 @@ impl AgentWakeSnapshot {
     }
 
     pub fn content_digest(&self) -> Result<Digest, String> {
-        let bytes = serde_json::to_vec(&(
-            self.schema_version,
-            &self.project_id,
-            &self.role_session_id,
-            &self.agent_run_id,
-            &self.inputs,
-        ))
+        let bytes = match &self.worker_correction_context {
+            Some(context) => serde_json::to_vec(&(
+                self.schema_version,
+                &self.project_id,
+                &self.role_session_id,
+                &self.agent_run_id,
+                &self.inputs,
+                context,
+            )),
+            None => serde_json::to_vec(&(
+                self.schema_version,
+                &self.project_id,
+                &self.role_session_id,
+                &self.agent_run_id,
+                &self.inputs,
+            )),
+        }
         .map_err(|error| error.to_string())?;
         Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+impl WorkerCorrectionContext {
+    pub fn validate_for_snapshot(&self, snapshot: &AgentWakeSnapshot) -> Result<(), String> {
+        let session_prefix = format!("ticket:{}:worker:", self.ticket_run_id.as_str());
+        let encoded = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        if self.schema_version != 1
+            || self.project_id != snapshot.project_id
+            || !snapshot.role_session_id.starts_with(&session_prefix)
+            || snapshot.role_session_id.len() == session_prefix.len()
+            || self.ticket_revision == 0
+            || (self.coordinator_instruction.is_none() && self.reviewer_correction.is_none())
+            || encoded.len() > 256 * 1024
+        {
+            return Err(
+                "Worker correction context is incomplete, out of scope, or oversized".into(),
+            );
+        }
+        if let Some(instruction) = &self.coordinator_instruction
+            && (instruction.wake_input_id == 0
+                || instruction.request_id.is_empty()
+                || instruction.request_id.len() > 128
+                || instruction.source_revision > self.ticket_revision
+                || instruction.body.is_empty()
+                || instruction.body.len() > 64 * 1024
+                || instruction.body.contains('\0')
+                || sha256(instruction.body.as_bytes())? != instruction.body_digest)
+        {
+            return Err("Worker correction context has an invalid Coordinator instruction".into());
+        }
+        if let Some(review) = &self.reviewer_correction {
+            let coverage = review
+                .assessment
+                .evidence_coverage
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            if review.evidence_id.is_empty()
+                || review.source_revision.checked_add(1) != Some(review.accepted_revision)
+                || review.accepted_revision != self.ticket_revision
+                || review.publication_revision > review.source_revision
+                || review.publication_subject_digest != review.assessment.subject_digest
+                || review.assessment.subject_kind != "implementation_publication_set"
+                || coverage.len() != review.assessment.evidence_coverage.len()
+                || (review.assessment.findings.is_empty() && review.assessment.unknowns.is_empty())
+            {
+                return Err(
+                    "Worker correction context has an invalid accepted Reviewer result".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_assignment(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        ticket_revision: u64,
+        configuration_digest: &Digest,
+        accepted_plan_digest: &Digest,
+    ) -> Result<(), String> {
+        let snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: format!("ticket:{}:worker:assigned", ticket_run_id.as_str()),
+            agent_run_id: "worker-assignment-validation".into(),
+            digest: Digest::parse("0".repeat(64))?,
+            inputs: Vec::new(),
+            worker_correction_context: Some(self.clone()),
+        };
+        self.validate_for_snapshot(&snapshot)?;
+        if self.project_id != *project_id
+            || self.ticket_run_id != *ticket_run_id
+            || self.ticket_revision != ticket_revision
+            || self.configuration_digest != *configuration_digest
+            || self.accepted_plan_digest != *accepted_plan_digest
+        {
+            return Err("Worker correction context differs from the current assignment".into());
+        }
+        Ok(())
     }
 }
 
@@ -857,6 +993,8 @@ mod tests {
                 host_artifacts: vec![locator],
                 host_completion_context: None,
             }],
+
+            worker_correction_context: None,
         };
         snapshot.digest = snapshot.content_digest().unwrap();
         snapshot.validate().unwrap();
@@ -888,6 +1026,61 @@ mod tests {
     }
 
     #[test]
+    fn legacy_wake_digest_stays_stable_and_frozen_correction_context_is_bound() {
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let role_session_id = "ticket:ticket-run-a:worker:node-a".to_owned();
+        let agent_run_id = "worker-run-a".to_owned();
+        let legacy_bytes = serde_json::to_vec(&(
+            1_u32,
+            &project_id,
+            &role_session_id,
+            &agent_run_id,
+            &Vec::<AgentWakeItem>::new(),
+        ))
+        .unwrap();
+        let legacy_digest = sha256(&legacy_bytes).unwrap();
+        let legacy_json = serde_json::json!({
+            "schema_version":1,
+            "project_id":project_id,
+            "role_session_id":role_session_id,
+            "agent_run_id":agent_run_id,
+            "digest":legacy_digest,
+            "inputs":[],
+        });
+        let mut legacy: AgentWakeSnapshot = serde_json::from_value(legacy_json).unwrap();
+        legacy.validate().unwrap();
+        assert!(legacy.worker_correction_context.is_none());
+
+        legacy.worker_correction_context = Some(WorkerCorrectionContext {
+            schema_version: 1,
+            project_id: ProjectId::parse("project-a").unwrap(),
+            ticket_run_id: TicketRunId::parse("ticket-run-a").unwrap(),
+            ticket_revision: 2,
+            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            accepted_plan_digest: Digest::parse("b".repeat(64)).unwrap(),
+            coordinator_instruction: Some(WorkerCoordinatorInstruction {
+                wake_input_id: 7,
+                request_id: "human-7".into(),
+                source_revision: 0,
+                body_digest: sha256(b"Keep the plan.").unwrap(),
+                body: "Keep the plan.".into(),
+            }),
+            reviewer_correction: None,
+        });
+        legacy.digest = legacy.content_digest().unwrap();
+        legacy.validate().unwrap();
+        legacy
+            .worker_correction_context
+            .as_mut()
+            .unwrap()
+            .coordinator_instruction
+            .as_mut()
+            .unwrap()
+            .body = "Change the plan.".into();
+        assert!(legacy.validate().is_err());
+    }
+
+    #[test]
     fn postmortem_completion_context_is_revision_scoped_to_the_public_wake() {
         let mut snapshot = AgentWakeSnapshot {
             schema_version: 1,
@@ -914,7 +1107,8 @@ mod tests {
                     "implementation_publication":{"accepted_plan_digest":"c".repeat(64), "configuration_digest":"a".repeat(64), "merge_work_id":"1".repeat(64), "assessed_revision":6, "awaiting_merge_revision":7, "prepared_receipt_digest":"2".repeat(64), "publication_set_digest":"3".repeat(64), "assessment_id":"assessment-a", "assessment_evidence_id":"e".repeat(64), "assessment_result_digest":"f".repeat(64), "intent_evidence_id":"5".repeat(64), "intent_result_digest":"6".repeat(64), "assessment":{}, "verification":null, "merge_verification":{"work_id":"1".repeat(64), "configuration_digest":"a".repeat(64), "accepted_plan_digest":"c".repeat(64), "assessment_id":"assessment-a", "source_revision":7, "merge_commit_sha":"2".repeat(40), "included_head_sha":"3".repeat(40), "receipt_digest":"4".repeat(64), "receipt":{}}}
                 })).unwrap()),
             }],
-        };
+
+            worker_correction_context: None,};
         snapshot.digest = snapshot.content_digest().unwrap();
         snapshot.validate().unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -962,6 +1156,8 @@ mod tests {
                 host_artifacts: Vec::new(),
                 host_completion_context: None,
             }],
+
+            worker_correction_context: None,
         };
         snapshot.digest = snapshot.content_digest().unwrap();
         snapshot.validate().unwrap();

@@ -248,6 +248,8 @@ fn read_legacy_wake_context_rows(
             agent_run_id: legacy.agent_run_id,
             digest: Digest::parse("0".repeat(64))?,
             inputs,
+
+            worker_correction_context: None,
         };
         snapshot.digest = snapshot.content_digest()?;
         snapshot.validate()?;
@@ -1820,7 +1822,7 @@ pub(crate) mod tests {
         root: &std::path::Path,
         complete_family: bool,
     ) -> CompletedBlockLossFixture {
-        match completed_block_loss_fixture_inner(root, complete_family, true, false) {
+        match completed_block_loss_fixture_inner(root, complete_family, true, false, false) {
             BlockLossFixtureOutcome::Completed(fixture) => *fixture,
             BlockLossFixtureOutcome::Prepared(_) => unreachable!(),
         }
@@ -1829,7 +1831,7 @@ pub(crate) mod tests {
     pub(crate) fn completed_family_without_terminal_fixture(
         root: &std::path::Path,
     ) -> CompletedBlockLossFixture {
-        match completed_block_loss_fixture_inner(root, true, false, false) {
+        match completed_block_loss_fixture_inner(root, true, false, false, false) {
             BlockLossFixtureOutcome::Completed(fixture) => *fixture,
             BlockLossFixtureOutcome::Prepared(_) => unreachable!(),
         }
@@ -1838,7 +1840,16 @@ pub(crate) mod tests {
     pub(crate) fn prepared_anchored_block_loss_fixture(
         root: &std::path::Path,
     ) -> PreparedBlockLossFixture {
-        match completed_block_loss_fixture_inner(root, false, false, true) {
+        match completed_block_loss_fixture_inner(root, false, false, true, false) {
+            BlockLossFixtureOutcome::Prepared(fixture) => *fixture,
+            BlockLossFixtureOutcome::Completed(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn prepared_anchored_block_loss_fixture_exiting_one(
+        root: &std::path::Path,
+    ) -> PreparedBlockLossFixture {
+        match completed_block_loss_fixture_inner(root, false, false, true, true) {
             BlockLossFixtureOutcome::Prepared(fixture) => *fixture,
             BlockLossFixtureOutcome::Completed(_) => unreachable!(),
         }
@@ -1849,6 +1860,7 @@ pub(crate) mod tests {
         complete_family: bool,
         publish_cancelled_terminal: bool,
         prepare_anchored_only: bool,
+        exit_one_on_cancellation: bool,
     ) -> BlockLossFixtureOutcome {
         use crate::domain::ids::{AgentRunId, OperationId, ProfileId, ProjectId, Revision};
         use crate::domain::types::{AgentAdapter, Role};
@@ -1884,10 +1896,15 @@ pub(crate) mod tests {
             profile.options = Some(crate::config::ProfileOptions::ClaudeCode(
                 crate::config::ClaudeCodeOptions::default(),
             ));
+            let provider_script = if exit_one_on_cancellation {
+                "$SIG{TERM}=sub { exit 1 }; $SIG{INT}=sub { exit 1 }; while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }"
+            } else {
+                "$SIG{TERM}='IGNORE'; $SIG{INT}='IGNORE'; while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }"
+            };
             profile.command = vec![
                 "/usr/bin/perl".into(),
                 "-e".into(),
-                "$SIG{TERM}='IGNORE'; $SIG{INT}='IGNORE'; while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }".into(),
+                provider_script.into(),
                 marker.display().to_string(),
             ];
             std::fs::canonicalize("/usr/bin/perl").unwrap()
@@ -2050,6 +2067,8 @@ pub(crate) mod tests {
             agent_run_id: run_id.as_str().into(),
             digest: digest('0'),
             inputs: Vec::new(),
+
+            worker_correction_context: None,
         };
         wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
         authority_base.wake_snapshot_digest = wake_snapshot.digest.clone();
@@ -2466,6 +2485,33 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    pub(crate) fn test_lifecycle_fact_counts(
+        store: &ConfigStore,
+        owner_id: &str,
+        reservation_epoch: u64,
+    ) -> (u64, u64) {
+        store
+            .connection
+            .query_row(
+                "SELECT SUM(fact_type='exit_confirmed'),SUM(fact_type='slot_released')
+                 FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=?2",
+                rusqlite::params![owner_id, reservation_epoch],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn test_terminal_receipt_count(store: &ConfigStore, owner_id: &str) -> u64 {
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_terminal_receipts WHERE agent_run_id=?1",
+                [owner_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     pub(crate) fn test_provider_tree_json(
         store: &ConfigStore,
         agent_run_id: &str,
@@ -2647,6 +2693,8 @@ pub(crate) mod tests {
             agent_run_id: run_id.as_str().into(),
             digest: digest('0'),
             inputs: vec![wake],
+
+            worker_correction_context: None,
         };
         wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
         let profile_id = ProfileId::parse("supervisor").unwrap();

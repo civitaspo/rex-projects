@@ -6318,6 +6318,8 @@ pub(crate) mod tests {
             agent_run_id: wake_run_id.as_str().into(),
             digest: Digest::parse("0".repeat(64)).unwrap(),
             inputs: wake_items,
+
+            worker_correction_context: None,
         };
         wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
         let workspace = fixture._temp.path().join("coordinator-replan-workspace");

@@ -235,6 +235,16 @@ pub struct AcceptedImplementationPublicationSnapshot {
     verification: Option<AcceptedWorkerVerification>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedReviewerCorrection {
+    pub evidence_id: String,
+    pub result_digest: Digest,
+    pub source_revision: u64,
+    pub accepted_revision: u64,
+    pub publication_revision: u64,
+    pub assessment: crate::engine::orchestration::ReviewReadyPayload,
+}
+
 /// A Worker check-only completion bound to an already accepted implementation publication.
 /// The publication provenance stays at its original revision; this record describes only the
 /// later review evidence that was verified against that exact published tree.
@@ -716,6 +726,166 @@ impl ConfigStore {
             coordinator_agent_run_id: AgentRunId::parse(coordinator_agent_run_id)?,
             coordinator_role_session_id,
             coordinator_authority_digest: Digest::parse(coordinator_authority_digest)?,
+        }))
+    }
+
+    /// Read only the current host-accepted Reviewer corrections that reopened an accepted
+    /// implementation plan. The publication snapshot validates the complete correction chain.
+    pub fn latest_worker_reviewer_correction(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        ticket_revision: u64,
+        configuration_digest: &Digest,
+        accepted_plan_digest: &Digest,
+    ) -> Result<Option<AcceptedReviewerCorrection>, String> {
+        let current: Option<(String, u64, String)> = self
+            .connection
+            .query_row(
+                "SELECT project_id,revision,internal_phase FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((stored_project, revision, phase)) = current else {
+            return Err("Reviewer correction TicketRun is missing".into());
+        };
+        if stored_project != project_id.as_str() || revision != ticket_revision {
+            return Err(
+                "Reviewer correction context is stale or belongs to another Project".into(),
+            );
+        }
+        if phase != "implementing" {
+            return Ok(None);
+        }
+        let evidence_json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision=?3",
+                params![ticket_run_id.as_str(), project_id.as_str(), ticket_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(evidence_json) = evidence_json else {
+            return Ok(None);
+        };
+        let evidence: serde_json::Value =
+            crate::protocol::parse_unique(evidence_json.as_bytes())
+                .map_err(|error| format!("accepted review transition is invalid: {error}"))?;
+        if evidence["kind"] != "review_assessment" || evidence["transition"] != "corrections_remain"
+        {
+            return Ok(None);
+        }
+        if evidence["schema_version"].as_u64() != Some(1)
+            || evidence["accepted_revision"].as_u64() != Some(ticket_revision)
+            || evidence["source_revision"].as_u64() != ticket_revision.checked_sub(1)
+        {
+            return Err("accepted Reviewer correction transition has invalid revisions".into());
+        }
+        let evidence_id = evidence["evidence_id"]
+            .as_str()
+            .ok_or("accepted Reviewer correction has no source evidence ID")?
+            .to_owned();
+        let result_digest = Digest::parse(
+            evidence["result_digest"]
+                .as_str()
+                .ok_or("accepted Reviewer correction has no result digest")?,
+        )?;
+        let source_revision = evidence["source_revision"].as_u64().unwrap();
+        let accepted_revision = evidence["accepted_revision"].as_u64().unwrap();
+        let publication_subject: crate::delivery_runtime::ImplementationPublicationSetSubject =
+            serde_json::from_value(
+                evidence
+                    .get("publication_subject")
+                    .cloned()
+                    .ok_or("accepted Reviewer correction has no publication subject")?,
+            )
+            .map_err(|error| {
+                format!("accepted Reviewer publication subject is invalid: {error}")
+            })?;
+        let assessment: crate::engine::orchestration::ReviewReadyPayload = serde_json::from_value(
+            evidence
+                .get("assessment")
+                .cloned()
+                .ok_or("accepted Reviewer correction has no assessment")?,
+        )
+        .map_err(|error| format!("accepted Reviewer assessment is invalid: {error}"))?;
+
+        let publication = self.accepted_implementation_publication_snapshot(
+            owner_generation,
+            project_id,
+            ticket_run_id,
+            ticket_revision,
+        )?;
+        if publication.accepted_plan().configuration_digest != *configuration_digest
+            || publication.accepted_plan().plan_digest != *accepted_plan_digest
+            || publication_subject.ticket_run_id != *ticket_run_id
+            || publication_subject.accepted_plan_digest != *accepted_plan_digest
+            || publication_subject.publication_revision != publication.publication_revision()
+            || publication_subject.publication_revision > source_revision
+            || publication_subject.digest()? != assessment.subject_digest
+        {
+            return Err("accepted Reviewer correction is not bound to the current publication, plan, or configuration".into());
+        }
+
+        let source: Option<(String, String, String, String, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT project_id,role,ticket_run_id,result_digest,result_json,outcome FROM agent_result_evidence WHERE evidence_id=?1",
+                [&evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((source_project, source_role, source_ticket, source_digest, result_json, outcome)) =
+            source
+        else {
+            return Err("accepted Reviewer correction lost its result evidence".into());
+        };
+        if source_project != project_id.as_str()
+            || source_role != "reviewer"
+            || source_ticket != ticket_run_id.as_str()
+            || source_digest != result_digest.as_str()
+            || outcome != "completed"
+        {
+            return Err("accepted Reviewer correction source evidence is out of scope".into());
+        }
+        let submission: crate::engine::orchestration::RoleResultSubmission =
+            crate::protocol::parse_unique(result_json.as_bytes()).map_err(|error| {
+                format!("accepted Reviewer result evidence is invalid: {error}")
+            })?;
+        if submission.kind != crate::engine::orchestration::RoleOutputKind::ReviewReady
+            || submission.result_digest != result_digest
+            || submission.structured_result
+                != serde_json::to_value(&assessment).map_err(|error| error.to_string())?
+        {
+            return Err("accepted Reviewer transition differs from its result evidence".into());
+        }
+        let acknowledgement: Option<(u64, String)> = self
+            .connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [&evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if acknowledgement != Some((accepted_revision, "applied".into())) {
+            return Err(
+                "accepted Reviewer correction has no matching applied result acknowledgement"
+                    .into(),
+            );
+        }
+        Ok(Some(AcceptedReviewerCorrection {
+            evidence_id,
+            result_digest,
+            source_revision,
+            accepted_revision,
+            publication_revision: publication_subject.publication_revision,
+            assessment,
         }))
     }
 

@@ -569,7 +569,7 @@ fn validate_cancelled_result_for_start(
         || !matches!(receipt.cleanup, CleanupState::Confirmed)
         || receipt.timed_out
         || !(signal_cancellation || anchor_cancellation)
-        || receipt.exit_code.is_some()
+        || (receipt.exit_code.is_some() && !anchor_cancellation)
         || receipt.result_digest.is_some()
         || result.structured_result.is_some()
     {
@@ -761,6 +761,13 @@ mod cancelled_cleanup_tests {
                 .is_ok()
         );
 
+        let mut signal_exit = result.clone();
+        signal_exit.receipt.exit_code = Some(1);
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &signal_exit, &qualification)
+                .is_err()
+        );
+
         let unknown_cleanup = cancelled_result(&authority, &start, CleanupState::Unknown);
         assert!(
             validate_cancelled_result_for_start(
@@ -795,9 +802,41 @@ mod cancelled_cleanup_tests {
             pid: 7001,
             start_identity: "shim-birth".into(),
         });
+        result.receipt.exit_code = Some(1);
         assert!(
             validate_cancelled_result_for_start(&authority, &start, &result, &qualification)
                 .is_ok()
+        );
+
+        let mut timed_out = result.clone();
+        timed_out.receipt.timed_out = true;
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &timed_out, &qualification)
+                .is_err()
+        );
+
+        let mut unconfirmed_cleanup = result.clone();
+        unconfirmed_cleanup.receipt.cleanup = CleanupState::Unknown;
+        assert!(
+            validate_cancelled_result_for_start(
+                &authority,
+                &start,
+                &unconfirmed_cleanup,
+                &qualification
+            )
+            .is_err()
+        );
+
+        let mut structured_output = result.clone();
+        structured_output.structured_result = Some(serde_json::json!({"assertion":"success"}));
+        assert!(
+            validate_cancelled_result_for_start(
+                &authority,
+                &start,
+                &structured_output,
+                &qualification
+            )
+            .is_err()
         );
 
         result.receipt.cancellation_cause = Some(CancellationCause::RexLaunchAnchorClosed {
@@ -4851,6 +4890,7 @@ pub(crate) mod tests {
             agent_run_id: worker_id.to_string(),
             digest: prior_authority.wake_snapshot_digest.clone(),
             inputs: Vec::new(),
+            worker_correction_context: None,
         };
         let mailbox_directory = prior_authority.control_dir.join("mailbox");
         let descriptor_bytes = std::fs::read(mailbox_directory.join("descriptor.json")).unwrap();
@@ -6692,6 +6732,7 @@ pub(crate) mod host_validation_fixture {
             agent_run_id: agent_run_id.to_string(),
             digest: Digest::parse("0".repeat(64))?,
             inputs: wake_inputs,
+            worker_correction_context: None,
         };
         wake_snapshot.digest = wake_snapshot.content_digest()?;
         authority.wake_snapshot_digest = wake_snapshot.digest.clone();

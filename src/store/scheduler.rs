@@ -242,6 +242,15 @@ pub struct CoordinatorInstructionReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedCoordinatorInstruction {
+    pub wake_input_id: u64,
+    pub request_id: String,
+    pub source_revision: u64,
+    pub body_digest: Digest,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunnableProject {
     pub record: super::ProjectRecord,
     pub project_epoch: u64,
@@ -1173,6 +1182,98 @@ impl ConfigStore {
             ticket_id: TicketId::parse(ticket_id)?,
             external_revision,
         })
+    }
+
+    /// Return the newest accepted public instruction for this exact TicketRun that was current
+    /// no later than the launch revision. Consumed wake rows remain the durable source.
+    pub fn latest_coordinator_instruction(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        ticket_revision: u64,
+    ) -> Result<Option<PersistedCoordinatorInstruction>, String> {
+        let current: Option<(String, String, u64, String)> = self
+            .connection
+            .query_row(
+                "SELECT namespace,ticket_id,revision,project_id FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((namespace, ticket_id, current_revision, stored_project)) = current else {
+            return Err("Coordinator instruction TicketRun is missing".into());
+        };
+        if stored_project != project_id.as_str() || current_revision != ticket_revision {
+            return Err(
+                "Coordinator instruction context is stale or belongs to another Project".into(),
+            );
+        }
+        let role_session_id = format!("ticket_run:{}:coordinator", ticket_run_id.as_str());
+        let row: Option<(u64, String, u64, String)> = self
+            .connection
+            .query_row(
+                "SELECT wake_input_id,source_id,source_revision,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='human_instruction' AND source_revision<=?3 ORDER BY source_revision DESC,wake_input_id DESC LIMIT 1",
+                params![project_id.as_str(), role_session_id, ticket_revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((wake_input_id, source_id, source_revision, payload_json)) = row else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = crate::protocol::parse_unique(payload_json.as_bytes())
+            .map_err(|error| format!("stored Coordinator instruction is invalid: {error}"))?;
+        let request_id = payload["request_id"]
+            .as_str()
+            .ok_or("Coordinator instruction has no request ID")?;
+        let payload_revision = payload["expected_revision"]
+            .as_u64()
+            .ok_or("Coordinator instruction has no expected revision")?;
+        let payload_project = payload["project_id"]
+            .as_str()
+            .ok_or("Coordinator instruction has no Project ID")?;
+        let payload_ticket_run = payload["ticket_run_id"]
+            .as_str()
+            .ok_or("Coordinator instruction has no TicketRun ID")?;
+        let payload_namespace = payload["namespace"]
+            .as_str()
+            .ok_or("Coordinator instruction has no ticket namespace")?;
+        let payload_ticket = payload["ticket_id"]
+            .as_str()
+            .ok_or("Coordinator instruction has no ticket ID")?;
+        let body = payload["body"]
+            .as_str()
+            .ok_or("Coordinator instruction has no body")?;
+        let body_digest = Digest::parse(
+            payload["body_digest"]
+                .as_str()
+                .ok_or("Coordinator instruction has no body digest")?,
+        )?;
+        if payload["schema_version"].as_u64() != Some(1)
+            || source_id != request_id
+            || payload_revision != source_revision
+            || source_revision > ticket_revision
+            || payload_project != project_id.as_str()
+            || payload_ticket_run != ticket_run_id.as_str()
+            || payload_namespace != namespace
+            || payload_ticket != ticket_id
+            || body.is_empty()
+            || body.len() > 64 * 1024
+            || body.contains('\0')
+            || content_digest(body) != body_digest.as_str()
+        {
+            return Err(
+                "stored Coordinator instruction is stale, malformed, or out of scope".into(),
+            );
+        }
+        Ok(Some(PersistedCoordinatorInstruction {
+            wake_input_id,
+            request_id: request_id.to_owned(),
+            source_revision,
+            body_digest,
+            body: body.to_owned(),
+        }))
     }
 
     /// Enqueue a dashboard instruction as a high-priority Coordinator wake. The request is
