@@ -1862,6 +1862,11 @@ pub fn acknowledge_committed_role_result(
             "worker",
             &["worker_implementation_ready"],
         ),
+        "worker_verification_completed" => (
+            "worker-verification:",
+            "worker",
+            &["worker_verification_completed"],
+        ),
         "review_assessment" => (
             "review-ready:",
             "reviewer",
@@ -4609,6 +4614,90 @@ pub(crate) mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn verification_source_replays_real_terminal_and_registered_test_receipt() {
+        use crate::domain::ids::{OperationId, RepositoryId};
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+
+        let head = "2".repeat(40);
+        let payload = serde_json::json!({
+            "work_node_id":"node-a",
+            "repository":"repo-a",
+            "publication_operation_id":"publish-worker-1",
+            "published_head":head,
+            "test_receipt_artifact_ids":[]
+        });
+        let mut result = host_validation_fixture::host_validated_result(
+            Role::Worker,
+            RoleResultMessage {
+                schema_version: 1,
+                message_id: "verification-ready-result".into(),
+                kind: RoleOutputKind::VerificationReady,
+                assertion: AgentAssertion::Succeeded,
+                result_digest: Some(digest(&serde_json::to_vec(&payload).unwrap()).unwrap()),
+                structured_result: payload,
+                artifact_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        let binding = &result.ingested.validated.binding;
+        let ticket_run_id = binding.ticket_run_id.clone().unwrap();
+        let source_revision = binding.ticket_revision.unwrap().0;
+        let test_receipts = result
+            .ingested
+            .verified_artifacts
+            .iter()
+            .map(|artifact| artifact.reference().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(test_receipts.len(), 1);
+        let verification = crate::store::accepted_plans::AcceptedWorkerVerification {
+            review_revision: source_revision + 1,
+            source_revision,
+            source_evidence_id: result.ingested.receipt.evidence_id().to_owned(),
+            source_agent_run_id: binding.agent_run_id.clone(),
+            source_result_digest: result.ingested.validated.result_digest.clone(),
+            publication_revision: source_revision - 1,
+            publication_operation_id: OperationId::parse("publish-worker-1").unwrap(),
+            published_head: crate::engine::orchestration::GitCommitId::parse(head).unwrap(),
+            work_node_id: crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap(),
+            repository_id: RepositoryId::parse("repo-a").unwrap(),
+            test_receipt_artifacts: test_receipts.clone(),
+        };
+        let replayed = result
+            .store
+            .validated_worker_verification_source(
+                &result.artifacts,
+                result.owner_generation,
+                &binding.project_id,
+                &ticket_run_id,
+                &verification,
+            )
+            .unwrap();
+        assert_eq!(
+            replayed.receipt.evidence_id(),
+            verification.source_evidence_id
+        );
+        assert_eq!(
+            replayed.verified_artifacts[0].reference(),
+            &test_receipts[0]
+        );
+
+        let mut stale_receipt = verification;
+        stale_receipt.test_receipt_artifacts[0].digest = digest(b"changed receipt").unwrap();
+        assert!(
+            result
+                .store
+                .validated_worker_verification_source(
+                    &result.artifacts,
+                    result.owner_generation,
+                    &binding.project_id,
+                    &ticket_run_id,
+                    &stale_receipt,
+                )
+                .is_err()
+        );
+    }
 }
 fn accepted_correction_publication_head(
     store: &ConfigStore,
@@ -5044,6 +5133,111 @@ impl ConfigStore {
             );
         }
         Ok(ingested)
+    }
+
+    /// Revalidate the exact Worker result bound to a durable verification transition. This
+    /// reloads the terminal, launch authority, result bytes, and registered artifacts through
+    /// the ordinary ingestion path instead of treating transition JSON as artifact authority.
+    pub fn validated_worker_verification_source(
+        &mut self,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        verification: &crate::store::accepted_plans::AcceptedWorkerVerification,
+    ) -> Result<IngestedAgentResult, String> {
+        let (agent_run_raw, result_json, stored_digest): (String, String, String) = self
+            .connection
+            .query_row(
+                "SELECT agent_run_id,result_json,result_digest FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND ticket_run_id=?3 AND role='worker' AND outcome='completed'",
+                params![
+                    verification.source_evidence_id,
+                    project_id.as_str(),
+                    ticket_run_id.as_str()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| format!("Worker verification source evidence is missing: {error}"))?;
+        let agent_run_id = AgentRunId::parse(agent_run_raw)?;
+        let submission: RoleResultSubmission =
+            crate::protocol::parse_unique(result_json.as_bytes())?;
+        if submission.binding.project_id != *project_id
+            || submission.binding.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || submission.binding.ticket_revision != Some(Revision(verification.source_revision))
+            || submission.binding.role != Role::Worker
+            || submission.binding.agent_run_id != agent_run_id
+            || submission.result_digest != verification.source_result_digest
+            || stored_digest != verification.source_result_digest.as_str()
+        {
+            return Err(
+                "Worker verification source differs from its immutable evidence binding".into(),
+            );
+        }
+        let expected_session = format!(
+            "ticket:{ticket_run_id}:worker:{}",
+            verification.work_node_id
+        );
+        let authority = self
+            .agent_launch_authority(&agent_run_id)?
+            .ok_or("Worker verification source has no immutable launch authority")?;
+        if authority.project_id != *project_id
+            || authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || authority.ticket_revision != Some(Revision(verification.source_revision))
+            || authority.role != Role::Worker
+            || authority.role_session_id != expected_session
+            || binding_for(&authority)? != submission.binding
+        {
+            return Err("Worker verification source no longer matches its launch authority".into());
+        }
+        let terminal = verify_agent_terminal(self, owner_generation, &agent_run_id)?;
+        let message = RoleResultMessage {
+            schema_version: submission.schema_version,
+            message_id: submission.message_id,
+            kind: submission.kind,
+            assertion: submission.assertion,
+            structured_result: submission.structured_result,
+            result_digest: Some(submission.result_digest),
+            artifact_refs: submission.artifact_refs,
+        };
+        let replayed =
+            ingest_agent_result(self, artifact_store, owner_generation, &terminal, message)?;
+        if replayed.receipt.evidence_id() != verification.source_evidence_id {
+            return Err("Worker verification source replay resolved to different evidence".into());
+        }
+        let crate::engine::orchestration::RoleResultPayload::VerificationReady(claim) =
+            &replayed.validated.typed_payload
+        else {
+            return Err("Worker verification source has another result kind".into());
+        };
+        let actual_receipts = replayed
+            .verified_artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.reference().kind
+                    == crate::engine::orchestration::RoleArtifactKind::TestReceipt
+            })
+            .map(|artifact| artifact.reference().clone())
+            .collect::<Vec<_>>();
+        let actual_ids = actual_receipts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let claimed_ids = claim
+            .test_receipt_artifact_ids
+            .iter()
+            .map(|artifact_id| artifact_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if claim.work_node_id != verification.work_node_id
+            || claim.repository != verification.repository_id
+            || claim.publication_operation_id != verification.publication_operation_id
+            || claim.published_head != verification.published_head
+            || actual_receipts.len() != claim.test_receipt_artifact_ids.len()
+            || actual_ids != claimed_ids
+            || actual_receipts != verification.test_receipt_artifacts
+        {
+            return Err("Worker verification result differs from its accepted publication or TestReceipt set".into());
+        }
+        Ok(replayed)
     }
 
     pub fn ingest_next_spooled_agent_result(
@@ -5764,6 +5958,48 @@ pub(crate) mod host_validation_fixture {
                 owner_generation,
                 &authority,
                 "fixture-postmortem-artifact",
+                &request_digest,
+                &artifact.reference,
+                &artifact.object_path,
+            )?;
+            message.result_digest = Some(digest(
+                &serde_json::to_vec(&message.structured_result)
+                    .map_err(|error| error.to_string())?,
+            )?);
+        } else if role == Role::Worker
+            && message.kind == crate::engine::orchestration::RoleOutputKind::VerificationReady
+        {
+            let source_path = "checks/test-receipt.md";
+            let source_file = authority.workspace_path.join(source_path);
+            std::fs::create_dir_all(
+                source_file
+                    .parent()
+                    .ok_or("Worker TestReceipt path has no parent")?,
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(
+                &source_file,
+                b"# Test receipt\n\nAll configured checks passed.\n",
+            )
+            .map_err(|error| error.to_string())?;
+            let artifact = artifacts.register(
+                &authority.workspace_path,
+                &authority.project_id,
+                authority.agent_run_id.as_str(),
+                role,
+                source_path,
+                crate::engine::orchestration::RoleArtifactKind::TestReceipt,
+                1,
+            )?;
+            message.artifact_refs = vec![artifact.reference.clone()];
+            message.structured_result["test_receipt_artifact_ids"] =
+                serde_json::json!([artifact.reference.artifact_id]);
+            let request_digest = digest(b"fixture Worker TestReceipt ArtifactAdd request")?;
+            crate::store::artifact_registry::persist_registration(
+                &mut store.connection,
+                owner_generation,
+                &authority,
+                "fixture-worker-test-receipt-artifact",
                 &request_digest,
                 &artifact.reference,
                 &artifact.object_path,

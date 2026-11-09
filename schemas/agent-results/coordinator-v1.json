@@ -251,6 +251,7 @@
         "prepare_worktrees",
         "plan_ready",
         "implementation_ready",
+        "verification_ready",
         "review_ready",
         "merge_assessment",
         "merge_intent",

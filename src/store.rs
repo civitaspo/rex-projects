@@ -6409,6 +6409,37 @@ mod tests {
 
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
+        let worker_worktree = temp.path().join("worker-worktree");
+        std::fs::create_dir_all(&worker_worktree).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&worker_worktree)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        run_git(&["init", "--quiet", "--initial-branch=main"]);
+        run_git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "published implementation",
+        ]);
+        let corrected_head = run_git(&["rev-parse", "HEAD"]);
         let mut applied = snapshot(&"a".repeat(64));
         let project_id = ProjectId::parse("project-a").unwrap();
         let repository_id = RepositoryId::parse("repo-a").unwrap();
@@ -6464,7 +6495,7 @@ mod tests {
         assert_eq!(owner_generation, 1);
         let ticket_namespace = TicketNamespace::parse("github:acme/repo-a").unwrap();
         let ticket_id = TicketId::parse("PAY-12").unwrap();
-        let ticket_run_id = TicketRunId::parse("run-staged-1").unwrap();
+        let ticket_run_id = TicketRunId::parse("fixture-ticket-run").unwrap();
         store
             .create_ticket_run(
                 owner_generation,
@@ -6493,7 +6524,7 @@ mod tests {
             .unwrap();
 
         let root_id = crate::engine::orchestration::WorkNodeId::parse("root").unwrap();
-        let stacked_id = crate::engine::orchestration::WorkNodeId::parse("stacked").unwrap();
+        let stacked_id = crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap();
         let plan = WorkPlan {
             nodes: vec![
                 PlannedWorkNode {
@@ -6519,6 +6550,33 @@ mod tests {
             ],
             requested_investigation_children: 0,
         };
+        let coordinator_run_id =
+            crate::domain::ids::AgentRunId::parse("verification-coordinator-run").unwrap();
+        let coordinator_payload = serde_json::json!({
+            "plan": plan.clone(),
+            "unresolved_questions": [],
+        });
+        let coordinator_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+            &mut store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Coordinator,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "coordinator-plan-result".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::PlanReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&coordinator_payload.to_string())).unwrap(),
+                ),
+                structured_result: coordinator_payload,
+                artifact_refs: Vec::new(),
+            },
+            coordinator_run_id.clone(),
+        )
+        .unwrap();
         let observed_base = "b".repeat(40);
         let persisted = crate::store::accepted_plans::PersistedWorkPlan {
             schema_version: 1,
@@ -6527,18 +6585,26 @@ mod tests {
         };
         let plan_json = serde_json::to_string(&serde_json::to_value(&persisted).unwrap()).unwrap();
         let plan_digest = content_digest(&plan_json);
+        let coordinator_authority = store
+            .agent_launch_authority(&coordinator_run_id)
+            .unwrap()
+            .unwrap();
         store
             .connection
             .execute(
-                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,2,?3,?4,?5,'evidence-1','coordinator-run-1','message-1',?6,'coordinator-run-1',?7,?6,1)",
+                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,2,?3,?4,?5,?6,?7,?8,?9,?7,?10,?11,1)",
                 rusqlite::params![
                     project_id.as_str(),
                     ticket_run_id.as_str(),
                     config_digest.as_str(),
                     plan_digest,
                     plan_json,
-                    "c".repeat(64),
-                    format!("ticket_run:{}:coordinator", ticket_run_id.as_str()),
+                    coordinator_result.ingested.receipt.evidence_id(),
+                    coordinator_run_id.as_str(),
+                    coordinator_result.ingested.validated.message_id,
+                    coordinator_result.ingested.validated.result_digest.as_str(),
+                    coordinator_authority.role_session_id,
+                    coordinator_authority.digest().unwrap().as_str(),
                 ],
             )
             .unwrap();
@@ -6718,14 +6784,14 @@ mod tests {
             Phase::Preparing
         );
 
-        let staged_branch = "rex/run-staged-1/stacked";
+        let staged_branch = "rex/run-staged-1/node-a";
         let staged_prepared = PreparedWorktreesEffectReceipt {
             schema_version: 1,
             ticket_run_id: ticket_run_id.clone(),
             work_nodes: vec![PreparedWorktreeReceiptNode {
                 work_node_id: stacked_id.clone(),
                 repository_id: repository_id.clone(),
-                worktree_path: std::path::PathBuf::from("/tmp/run-staged-1/stacked"),
+                worktree_path: worker_worktree.clone(),
                 branch: staged_branch.into(),
                 base_sha: first_head.clone(),
                 commit_mode: CommitMode::Native,
@@ -6953,7 +7019,6 @@ mod tests {
             )
             .unwrap();
         let correcting = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
-        let corrected_head = "f".repeat(40);
         let (corrected_intent, corrected_receipt) = publication(
             &stacked_id,
             &first_head,
@@ -7026,24 +7091,336 @@ mod tests {
                 .any(|receipt| receipt.intent().operation_id == corrected_intent.operation_id)
         );
 
-        let accepted = corrected_snapshot.accepted_plan();
+        let verification_correction_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review_assessment",
+            "source_revision": corrected_review.revision,
+            "accepted_revision": corrected_review.revision + 1,
+            "transition": "corrections_remain",
+        })
+        .to_string();
+        let verification_correction = DurableInput {
+            producer_id: "reviewer-test".into(),
+            message_id: "review-corrections-before-verification".into(),
+            content_digest: durable_input_digest("ticket_run", &verification_correction_payload),
+            recipient: "ticket_run".into(),
+            payload: verification_correction_payload.clone(),
+        };
+        store
+            .commit_ticket_transition(
+                owner_generation,
+                &ticket_run_id,
+                Revision(corrected_review.revision),
+                &verification_correction,
+                Input::CorrectionsRemain,
+                "reviewer requested verification of the accepted correction",
+                &verification_correction_payload,
+                &[],
+            )
+            .unwrap();
+        let verification_run = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(verification_run.phase, Phase::Implementing);
+
+        let prepared_receipt = store
+            .succeeded_effect_receipt(&staged_intent.operation_id)
+            .unwrap()
+            .unwrap();
+        let project_config = config.projects.get(&project_id).unwrap();
+        let prepared_worker = store
+            .prepared_worker_launch(
+                owner_generation,
+                2,
+                &stacked_id,
+                &prepared_receipt,
+                project_config,
+                &config_digest,
+            )
+            .unwrap()
+            .expect("the correction Worker must have a host-prepared assignment");
+        let worker_assignment = prepared_worker.reservation_binding();
+        assert_eq!(worker_assignment.expected_head(), corrected_head);
+
+        let worker_agent_run_id =
+            crate::domain::ids::AgentRunId::parse("verification-worker-run").unwrap();
+        let worker_payload = serde_json::json!({
+            "work_node_id": stacked_id,
+            "repository": repository_id,
+            "publication_operation_id": corrected_intent.operation_id,
+            "published_head": corrected_head,
+            "test_receipt_artifact_ids": [],
+        });
+        let worker_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+            &mut store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Worker,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "worker-verification-result".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::VerificationReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(Digest::parse("0".repeat(64)).unwrap()),
+                structured_result: worker_payload,
+                artifact_refs: Vec::new(),
+            },
+            worker_agent_run_id.clone(),
+        )
+        .unwrap();
+        let authority = store
+            .agent_launch_authority(&worker_agent_run_id)
+            .unwrap()
+            .unwrap();
+        let mut worker_wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: authority.role_session_id.clone(),
+            agent_run_id: worker_agent_run_id.to_string(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: Vec::new(),
+        };
+        worker_wake_snapshot.digest = worker_wake_snapshot.content_digest().unwrap();
+        let project_epoch: u64 = store
+            .connection
+            .query_row(
+                "SELECT project_epoch FROM project_runtimes WHERE project_id=?1",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let worker_reservation = crate::launch::AgentLaunchReservation {
+            schema_version: 1,
+            agent_run_id: worker_agent_run_id.clone(),
+            project_id: project_id.clone(),
+            role: crate::domain::types::Role::Worker,
+            role_session_id: authority.role_session_id.clone(),
+            parent_run_id: authority.parent_run_id.clone(),
+            parent_role: authority.parent_role,
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(verification_run.revision)),
+            config_revision: authority.config_revision,
+            config_digest: authority.config_digest.clone(),
+            attempt: authority.attempt,
+            run_epoch: authority.run_epoch,
+            controller_generation: owner_generation,
+            project_epoch,
+            operation_id: authority.operation_id.clone(),
+            operation_recipe_id: authority.operation_recipe_id.clone(),
+            worker_assignment: Some(worker_assignment),
+            rex_view_id: authority.rex_view_id.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            profile_id: authority.profile_id.clone(),
+            profile_digest: authority.profile_digest.clone(),
+            instruction_digest: authority.instruction_digest.clone(),
+            result_schema_digest: authority.result_schema_digest.clone(),
+            wake_snapshot: worker_wake_snapshot,
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            descriptor_path: authority.descriptor_path.clone(),
+            workspace_path: authority.workspace_path.clone(),
+            control_dir: authority.control_dir.clone(),
+            mailbox_directory: authority.control_dir.clone(),
+            mailbox_capability_digest: authority.mailbox_capability_digest.clone(),
+            mailbox_expires_at_unix: 9_999_999_999,
+            mailbox_max_request_bytes: 1_048_576,
+            mailbox_max_pending_requests: 32,
+            pool: "agent".into(),
+            slot_index: 3,
+            global_capacity: 4,
+            project_capacity: 4,
+        };
+        let reservation_json = crate::store::canonical_json(&worker_reservation).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'authorized',1,1)",
+                rusqlite::params![
+                    worker_agent_run_id.as_str(),
+                    project_id.as_str(),
+                    worker_reservation.operation_id.as_str(),
+                    owner_generation,
+                    project_epoch,
+                    worker_reservation.digest().unwrap().as_str(),
+                    reservation_json,
+                ],
+            )
+            .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &worker_result.ingested,
+            )
+            .unwrap()
+        );
+        let verification_review =
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(verification_review.phase, Phase::Reviewing);
+        assert_eq!(verification_review.revision, corrected_review.revision + 2);
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                17,
+                &config,
+                config_digest.clone(),
+                &worker_result.ingested,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].revision,
+            verification_review.revision
+        );
+        let verification_snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                verification_review.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            verification_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        let accepted_verification = verification_snapshot
+            .verification()
+            .expect("host-accepted VerificationReady should be in the Reviewer subject");
+        assert_eq!(
+            accepted_verification.review_revision,
+            verification_review.revision
+        );
+        assert_eq!(
+            accepted_verification.published_head.as_str(),
+            corrected_head
+        );
+        assert_eq!(
+            accepted_verification.publication_operation_id.as_str(),
+            corrected_intent.operation_id
+        );
+        assert_eq!(accepted_verification.test_receipt_artifacts.len(), 1);
+        let worker_verification_ack: (u64, String) = store
+            .connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [worker_result.ingested.receipt.evidence_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            worker_verification_ack,
+            (verification_review.revision, "applied".into())
+        );
+
+        let second_correction_state = temp.path().join("second-correction-state");
+        std::fs::create_dir_all(&second_correction_state).unwrap();
+        let second_correction_database = second_correction_state.join("state.sqlite3");
+        store
+            .connection
+            .execute(
+                "VACUUM INTO ?1",
+                [second_correction_database.to_str().unwrap()],
+            )
+            .unwrap();
+        let mut second_correction_store = ConfigStore::open_test(&second_correction_state).unwrap();
+        let second_correction_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review_assessment",
+            "source_revision": verification_review.revision,
+            "accepted_revision": verification_review.revision + 1,
+            "transition": "corrections_remain",
+        })
+        .to_string();
+        let second_correction_input = DurableInput {
+            producer_id: "reviewer-test".into(),
+            message_id: "review-corrections-after-verification".into(),
+            content_digest: durable_input_digest("ticket_run", &second_correction_payload),
+            recipient: "ticket_run".into(),
+            payload: second_correction_payload.clone(),
+        };
+        second_correction_store
+            .commit_ticket_transition(
+                owner_generation,
+                &ticket_run_id,
+                Revision(verification_review.revision),
+                &second_correction_input,
+                Input::CorrectionsRemain,
+                "test second correction after VerificationReady",
+                &second_correction_payload,
+                &[],
+            )
+            .unwrap();
+        let second_correcting = second_correction_store
+            .active_ticket_runs(owner_generation, 10)
+            .unwrap()[0]
+            .clone();
+        assert_eq!(second_correcting.phase, Phase::Implementing);
+        let second_correction_snapshot = second_correction_store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                second_correcting.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            second_correction_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        let second_correction_prepare_receipt = second_correction_store
+            .succeeded_effect_receipt(&staged_intent.operation_id)
+            .unwrap()
+            .unwrap();
+        let second_correction_prepared = second_correction_store
+            .prepared_worker_launch(
+                owner_generation,
+                2,
+                &stacked_id,
+                &second_correction_prepare_receipt,
+                project_config,
+                &config_digest,
+            )
+            .unwrap()
+            .expect("second correction must retain the host-accepted publication assignment");
+        assert_eq!(second_correction_prepared.expected_head(), corrected_head);
+
+        let accepted = verification_snapshot.accepted_plan();
         let validated_publications =
             crate::delivery_runtime::validate_implementation_publication_receipt(
                 &accepted.proposal,
-                corrected_snapshot.prepared_receipt(),
+                verification_snapshot.prepared_receipt(),
                 &project_id,
                 &config.repositories,
-                corrected_snapshot.publication_receipts(),
+                verification_snapshot.publication_receipts(),
             )
             .unwrap();
-        let subject = crate::delivery_runtime::implementation_publication_set_subject(
+        let mut subject = crate::delivery_runtime::implementation_publication_set_subject(
             &accepted.plan_digest,
             &accepted.proposal,
             &validated_publications,
-            corrected_snapshot.publication_receipts(),
-            corrected_snapshot.publication_revision(),
+            verification_snapshot.publication_receipts(),
+            verification_snapshot.publication_revision(),
         )
         .unwrap();
+        subject.verification = verification_snapshot.verification().map(|verification| {
+            crate::delivery_runtime::WorkerVerificationSubject {
+                review_revision: verification.review_revision,
+                source_evidence_id: verification.source_evidence_id.clone(),
+                source_agent_run_id: verification.source_agent_run_id.clone(),
+                source_result_digest: verification.source_result_digest.clone(),
+                publication_revision: verification.publication_revision,
+                publication_operation_id: verification.publication_operation_id.clone(),
+                published_head: verification.published_head.as_str().into(),
+                work_node_id: verification.work_node_id.clone(),
+                repository_id: verification.repository_id.clone(),
+                test_receipt_artifacts: verification.test_receipt_artifacts.clone(),
+            }
+        });
         let subject_digest = subject.digest().unwrap().to_string();
         let evidence_coverage = subject
             .coverage
@@ -7141,7 +7518,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result_ack,
-            (corrected_review.revision + 1, "applied".into())
+            (verification_review.revision + 1, "applied".into())
         );
         let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
         let merge_snapshot = store
@@ -7178,11 +7555,13 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert!(
-            store
-                .pending_validated_agent_results(&reviewer_evidence.artifacts, owner_generation, 10)
-                .unwrap()
-                .is_empty()
+        let pending = store
+            .pending_validated_agent_results(&reviewer_evidence.artifacts, owner_generation, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].receipt.evidence_id(),
+            coordinator_result.ingested.receipt.evidence_id()
         );
         drop(reviewer_evidence);
         drop(store);
@@ -7191,15 +7570,17 @@ mod tests {
             reopened.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
             Phase::Assessing
         );
-        assert!(
-            reopened
-                .pending_validated_agent_results(
-                    &crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap(),
-                    owner_generation,
-                    10,
-                )
-                .unwrap()
-                .is_empty()
+        let reopened_pending = reopened
+            .pending_validated_agent_results(
+                &crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap(),
+                owner_generation,
+                10,
+            )
+            .unwrap();
+        assert_eq!(reopened_pending.len(), 1);
+        assert_eq!(
+            reopened_pending[0].receipt.evidence_id(),
+            coordinator_result.ingested.receipt.evidence_id()
         );
     }
 

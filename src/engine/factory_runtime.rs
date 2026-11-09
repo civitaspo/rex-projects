@@ -227,6 +227,16 @@ pub trait FactoryRuntimeServices {
         now_unix: i64,
     ) -> Result<bool, String>;
 
+    /// Validate a correction Worker checkout before it can return its bounded test evidence.
+    /// Implementations must compare the exact expected HEAD and reject tracked or untracked edits.
+    fn verify_worker_verification_worktree(
+        &self,
+        _path: &std::path::Path,
+        _expected_head: &str,
+    ) -> Result<(), String> {
+        Err("Worker verification worktree observation is unavailable".into())
+    }
+
     fn effect_handlers(&self) -> Vec<&dyn EffectHandler>;
 }
 
@@ -586,6 +596,18 @@ fn apply_agent_result(
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
     {
         return apply_worker_result(store, owner_generation, config, services, result);
+    }
+    if result.validated.kind == RoleOutputKind::VerificationReady
+        && binding.role == Role::Worker
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return crate::worker_verification::apply_worker_verification_result(
+            store,
+            owner_generation,
+            config,
+            services,
+            result,
+        );
     }
     if result.validated.kind == RoleOutputKind::ReviewReady
         && binding.role == Role::Reviewer
@@ -1549,7 +1571,11 @@ fn apply_reviewer_result(
         return Err("accepted work plan belongs to a stale configuration snapshot".into());
     }
     let _validated_plan = accepted.validate_for(project, &configuration_digest)?;
-    if snapshot.publication_revision() != run.revision {
+    if snapshot.publication_revision() != run.revision
+        && snapshot
+            .verification()
+            .is_none_or(|verification| verification.review_revision != run.revision)
+    {
         return Err("Reviewer result does not match the current publication transition".into());
     }
     let publications = snapshot.publication_receipts();
@@ -1567,13 +1593,27 @@ fn apply_reviewer_result(
     if assessment.subject_kind != "implementation_publication_set" {
         return Err("Reviewer assessment names a different subject kind".into());
     }
-    let subject = crate::delivery_runtime::implementation_publication_set_subject(
+    let mut subject = crate::delivery_runtime::implementation_publication_set_subject(
         &accepted.plan_digest,
         &accepted.proposal,
         &validated_publications,
         publications,
         snapshot.publication_revision(),
     )?;
+    subject.verification = snapshot.verification().map(|verification| {
+        crate::delivery_runtime::WorkerVerificationSubject {
+            review_revision: verification.review_revision,
+            source_evidence_id: verification.source_evidence_id.clone(),
+            source_agent_run_id: verification.source_agent_run_id.clone(),
+            source_result_digest: verification.source_result_digest.clone(),
+            publication_revision: verification.publication_revision,
+            publication_operation_id: verification.publication_operation_id.clone(),
+            published_head: verification.published_head.as_str().to_owned(),
+            work_node_id: verification.work_node_id.clone(),
+            repository_id: verification.repository_id.clone(),
+            test_receipt_artifacts: verification.test_receipt_artifacts.clone(),
+        }
+    });
     let expected_subject_digest = subject.digest()?.to_string();
     if assessment.subject_digest.as_str() != expected_subject_digest {
         return Err(
@@ -3183,6 +3223,62 @@ pub(crate) mod tests {
             _: i64,
         ) -> Result<bool, String> {
             Ok(false)
+        }
+
+        fn verify_worker_verification_worktree(
+            &self,
+            path: &std::path::Path,
+            expected_head: &str,
+        ) -> Result<(), String> {
+            use std::ffi::OsString;
+            use std::time::Duration;
+
+            let search_path = std::env::var_os("PATH")
+                .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let git = crate::process::resolve_executable(std::path::Path::new("git"), &search_path)
+                .ok_or("test fixture could not resolve git")?;
+            let run = |args: &[&str]| -> Result<String, String> {
+                let mut environment = BTreeMap::new();
+                if let Some(path) = std::env::var_os("PATH") {
+                    environment.insert(OsString::from("PATH"), path);
+                }
+                let output = crate::process::run(crate::process::ProcessRequest {
+                    executable: git.clone(),
+                    args: args.iter().map(OsString::from).collect(),
+                    stdin: Vec::new(),
+                    cwd: Some(path.to_owned()),
+                    clear_environment: true,
+                    environment,
+                    timeout: Duration::from_secs(5),
+                    shutdown_grace: Duration::from_secs(1),
+                    stdout_limit: 64 * 1024,
+                    stderr_tail_limit: 8 * 1024,
+                })
+                .map_err(|error| error.to_string())?;
+                if output.timed_out
+                    || !output.cleanup_confirmed
+                    || !output
+                        .status
+                        .as_ref()
+                        .is_some_and(std::process::ExitStatus::success)
+                {
+                    return Err("test fixture Git worktree observation failed".into());
+                }
+                String::from_utf8(output.stdout)
+                    .map_err(|_| "test fixture Git output was not UTF-8".into())
+            };
+            let observed_head = run(&["rev-parse", "--verify", "HEAD"])?;
+            if observed_head.trim() != expected_head {
+                return Err("test fixture Worker worktree HEAD changed".into());
+            }
+            if !run(&["status", "--porcelain=v1", "--untracked-files=normal"])?
+                .trim()
+                .is_empty()
+            {
+                return Err("test fixture Worker verification worktree is dirty".into());
+            }
+            Ok(())
         }
 
         fn effect_handlers(&self) -> Vec<&dyn crate::effects::EffectHandler> {

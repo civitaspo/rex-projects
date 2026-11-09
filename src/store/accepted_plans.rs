@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ProjectConfig;
 use crate::delivery_runtime::{PrepareWorktreesEffectPayload, PreparedWorktreesEffectReceipt};
-use crate::domain::ids::{AgentRunId, Digest, ProjectId, RepositoryId, TicketRunId};
+use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RepositoryId, TicketRunId};
 use crate::domain::types::CommitMode;
 use crate::engine::orchestration::{ValidatedPlan, WorkNodeId, WorkPlan};
 use crate::store::{ConfigStore, SucceededEffectReceipt};
@@ -205,6 +205,25 @@ pub struct AcceptedImplementationPublicationSnapshot {
     publication_revision: u64,
     prepared_receipt: PreparedWorktreesEffectReceipt,
     publication_receipts: Vec<SucceededEffectReceipt>,
+    verification: Option<AcceptedWorkerVerification>,
+}
+
+/// A Worker check-only completion bound to an already accepted implementation publication.
+/// The publication provenance stays at its original revision; this record describes only the
+/// later review evidence that was verified against that exact published tree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceptedWorkerVerification {
+    pub review_revision: u64,
+    pub source_revision: u64,
+    pub source_evidence_id: String,
+    pub source_agent_run_id: AgentRunId,
+    pub source_result_digest: Digest,
+    pub publication_revision: u64,
+    pub publication_operation_id: OperationId,
+    pub published_head: crate::engine::orchestration::GitCommitId,
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub test_receipt_artifacts: Vec<crate::engine::orchestration::RoleArtifactReference>,
 }
 
 impl AcceptedImplementationPublicationSnapshot {
@@ -222,6 +241,10 @@ impl AcceptedImplementationPublicationSnapshot {
 
     pub fn publication_receipts(&self) -> &[SucceededEffectReceipt] {
         &self.publication_receipts
+    }
+
+    pub fn verification(&self) -> Option<&AcceptedWorkerVerification> {
+        self.verification.as_ref()
     }
 }
 
@@ -696,7 +719,7 @@ impl ConfigStore {
             return Err("publication snapshot requires the active controller generation".into());
         }
         let mut stmt = self.connection.prepare(
-            "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC LIMIT 2",
+            "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC LIMIT 4",
         ).map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map(
@@ -738,6 +761,30 @@ impl ConfigStore {
             consumer_revision.checked_sub(publication_revision),
         ) {
             ("reviewing", Some(0)) => {}
+            ("reviewing", Some(2))
+                if rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "worker_verification_completed"
+                                    && value["transition"] == "worker_verification_completed"
+                                    && value["accepted_revision"].as_u64()
+                                        == Some(consumer_revision)
+                                    && value["publication_revision"].as_u64()
+                                        == Some(publication_revision)
+                            },
+                        )
+                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision - 1
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "corrections_remain"
+                                    && value["source_revision"].as_u64()
+                                        == Some(publication_revision)
+                            },
+                        )
+                }) => {}
             ("assessing", Some(1))
                 if rows.iter().any(|(_, next_revision, next_evidence)| {
                     *next_revision == consumer_revision
@@ -748,6 +795,36 @@ impl ConfigStore {
                             },
                         )
                 }) => {}
+            ("assessing", Some(3))
+                if rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "review_converged"
+                            },
+                        )
+                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision - 1
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "worker_verification_completed"
+                                    && value["transition"] == "worker_verification_completed"
+                                    && value["publication_revision"].as_u64()
+                                        == Some(publication_revision)
+                            },
+                        )
+                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision - 2
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "corrections_remain"
+                                    && value["source_revision"].as_u64()
+                                        == Some(publication_revision)
+                            },
+                        )
+                }) => {}
             ("implementing", Some(1))
                 if rows.iter().any(|(_, next_revision, next_evidence)| {
                     *next_revision == consumer_revision
@@ -755,6 +832,46 @@ impl ConfigStore {
                             |value| {
                                 value["kind"] == "review_assessment"
                                     && value["transition"] == "corrections_remain"
+                            },
+                        )
+                }) => {}
+            ("implementing", Some(3))
+                if rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "corrections_remain"
+                                    && value["source_revision"].as_u64()
+                                        == consumer_revision.checked_sub(1)
+                                    && value["accepted_revision"].as_u64()
+                                        == Some(consumer_revision)
+                            },
+                        )
+                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision - 1
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "worker_verification_completed"
+                                    && value["transition"] == "worker_verification_completed"
+                                    && value["source_revision"].as_u64()
+                                        == consumer_revision.checked_sub(2)
+                                    && value["accepted_revision"].as_u64()
+                                        == Some(consumer_revision - 1)
+                                    && value["publication_revision"].as_u64()
+                                        == Some(publication_revision)
+                            },
+                        )
+                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision - 2
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "corrections_remain"
+                                    && value["source_revision"].as_u64()
+                                        == Some(publication_revision)
+                                    && value["accepted_revision"].as_u64()
+                                        == Some(consumer_revision - 2)
                             },
                         )
                 }) => {}
@@ -910,11 +1027,102 @@ impl ConfigStore {
                 "publication snapshot digest does not match its committed receipt bindings".into(),
             );
         }
+        let verification_revision = match (
+            phase.as_str(),
+            consumer_revision.checked_sub(publication_revision),
+        ) {
+            ("reviewing", Some(2)) => Some(consumer_revision),
+            ("assessing", Some(3)) => consumer_revision.checked_sub(1),
+            _ => None,
+        };
+        let verification = if let Some(verification_revision) = verification_revision {
+            let (_, _, transition_json) = rows
+                .iter()
+                .find(|(_, next_revision, _)| *next_revision == verification_revision)
+                .ok_or("verification transition is missing from the current review subject")?;
+            let transition: serde_json::Value =
+                crate::protocol::parse_unique(transition_json.as_bytes())?;
+            let value = &transition["verification"];
+            let parsed: AcceptedWorkerVerification = serde_json::from_value(serde_json::json!({
+                "review_revision": value["review_revision"],
+                "source_revision": value["source_revision"],
+                "source_evidence_id": value["source_evidence_id"],
+                "source_agent_run_id": value["source_agent_run_id"],
+                "source_result_digest": value["source_result_digest"],
+                "publication_revision": value["publication_revision"],
+                "publication_operation_id": value["publication_operation_id"],
+                "published_head": value["published_head"],
+                "work_node_id": value["work_node_id"],
+                "repository_id": value["repository_id"],
+                "test_receipt_artifacts": value["test_receipt_artifacts"],
+            }))
+            .map_err(|error| {
+                format!("stored Worker verification transition is invalid: {error}")
+            })?;
+            if transition["source_revision"].as_u64() != Some(parsed.source_revision)
+                || transition["accepted_revision"].as_u64() != Some(parsed.review_revision)
+                || transition["evidence_id"].as_str() != Some(parsed.source_evidence_id.as_str())
+                || transition["result_digest"].as_str()
+                    != Some(parsed.source_result_digest.as_str())
+                || transition["kind"] != "worker_verification_completed"
+                || transition["transition"] != "worker_verification_completed"
+                || parsed.review_revision != verification_revision
+                || parsed.source_revision.checked_add(1) != Some(verification_revision)
+                || parsed.publication_revision != publication_revision
+                || parsed.test_receipt_artifacts.is_empty()
+                || parsed
+                    .test_receipt_artifacts
+                    .iter()
+                    .map(|artifact| artifact.artifact_id.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != parsed.test_receipt_artifacts.len()
+                || parsed.test_receipt_artifacts.iter().any(|artifact| {
+                    artifact.kind != crate::engine::orchestration::RoleArtifactKind::TestReceipt
+                })
+            {
+                return Err(
+                    "Worker verification transition is not bound to its accepted review revision"
+                        .into(),
+                );
+            }
+            let matching_publication = publication_receipts
+                .iter()
+                .filter_map(|receipt| {
+                    let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                        crate::protocol::parse_unique(receipt.intent().request_json.as_bytes())
+                            .ok()?;
+                    (request.work_node_id == parsed.work_node_id).then_some((receipt, request))
+                })
+                .collect::<Vec<_>>();
+            if matching_publication.len() != 1 {
+                return Err(
+                    "Worker verification does not identify exactly one accepted publication".into(),
+                );
+            }
+            let (receipt, request) = &matching_publication[0];
+            let published: crate::delivery_runtime::ImplementationPublicationReceipt =
+                crate::protocol::parse_unique(receipt.receipt_json().as_bytes())?;
+            if receipt.intent().operation_id != parsed.publication_operation_id.as_str()
+                || request.repository_id != parsed.repository_id
+                || published.commit.head() != parsed.published_head.as_str()
+                || published.repository_id != parsed.repository_id
+            {
+                return Err(
+                    "Worker verification differs from the exact accepted publication receipt"
+                        .into(),
+                );
+            }
+            Some(parsed)
+        } else {
+            None
+        };
         Ok(AcceptedImplementationPublicationSnapshot {
             accepted_plan: accepted,
             publication_revision,
             prepared_receipt,
             publication_receipts,
+            verification,
         })
     }
 

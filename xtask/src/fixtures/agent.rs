@@ -78,6 +78,8 @@ pub enum FixtureAction {
         kind: FixtureArtifactKind,
         schema_version: u32,
         message_id: String,
+        #[serde(default)]
+        remove_after_registration: bool,
     },
     /// Invoke the production host manifest and commit commands for the files created earlier in
     /// this turn. This action never runs `git commit` itself.
@@ -526,6 +528,8 @@ fn validate_recipe_references(value: &Value) -> Result<(), String> {
                     | "prompt.pr_reference"
                     | "prompt.policy_digest"
                     | "prompt.prepared_body_digest"
+                    | "prompt.publication_operation_id"
+                    | "prompt.published_head"
             ) && !name.strip_prefix("artifact.").is_some_and(|value| {
                 !value.is_empty()
                     && value.bytes().all(|byte| {
@@ -563,6 +567,7 @@ pub(crate) fn validate_payload(kind: RoleOutputKind, value: &Value) -> Result<()
         RoleOutputKind::PrepareWorktrees => parse!(schema::PrepareWorktreesPayload),
         RoleOutputKind::PlanReady => parse!(schema::PlanReadyPayload),
         RoleOutputKind::ImplementationReady => parse!(schema::ImplementationReadyPayload),
+        RoleOutputKind::VerificationReady => parse!(schema::VerificationReadyPayload),
         RoleOutputKind::ReviewReady => parse!(schema::ReviewReadyPayload),
         RoleOutputKind::MergeAssessment => parse!(schema::MergeAssessmentPayload),
         RoleOutputKind::MergeIntent => parse!(schema::MergeIntentPayload),
@@ -1033,6 +1038,7 @@ fn execute_actions(
                 kind,
                 schema_version,
                 message_id,
+                remove_after_registration,
             } => {
                 let binary = runtime_binary
                     .ok_or("artifact registration needs the pinned product CLI path")?;
@@ -1094,6 +1100,16 @@ fn execute_actions(
                 if !role_may_submit_artifact(invocation_role()?, parsed.kind) {
                     return Err("artifact-add response kind is not allowed for this role".into());
                 }
+                if *remove_after_registration {
+                    if !writes.contains(path) {
+                        return Err("fixture cleanup requires a file created by this turn".into());
+                    }
+                    remove_registered_fixture_file(cwd, path, &parsed)?;
+                }
+                facts.values.insert(
+                    format!("artifact.{action_id}.artifact_id"),
+                    json!(parsed.artifact_id),
+                );
                 facts
                     .values
                     .insert(format!("artifact.{action_id}"), reference);
@@ -1101,6 +1117,27 @@ fn execute_actions(
         }
     }
     Ok(facts)
+}
+
+fn remove_registered_fixture_file(
+    cwd: &Path,
+    path: &str,
+    reference: &RoleArtifactReference,
+) -> Result<(), String> {
+    let target = cwd.join(path);
+    let metadata = fs::symlink_metadata(&target)
+        .map_err(|error| format!("inspect registered fixture receipt: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("registered fixture receipt is not a regular workspace file".into());
+    }
+    let bytes =
+        fs::read(&target).map_err(|error| format!("read registered fixture receipt: {error}"))?;
+    if bytes.len() as u64 != reference.bytes
+        || format!("{:x}", Sha256::digest(&bytes)) != reference.digest.as_str()
+    {
+        return Err("registered fixture receipt differs from its host-returned artifact".into());
+    }
+    fs::remove_file(target).map_err(|error| format!("remove registered fixture receipt: {error}"))
 }
 
 struct WorkerAssignment {
@@ -2481,6 +2518,28 @@ fn role_name(role: Role) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registered_receipt_cleanup_preserves_unregistered_or_changed_bytes() {
+        use sha2::{Digest as _, Sha256};
+        use std::fs;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("checks.txt");
+        let bytes = b"exact check-only evidence\n";
+        fs::write(&path, bytes).unwrap();
+        let reference = serde_json::from_value(serde_json::json!({
+            "artifact_id":"a".repeat(64),"kind":"test_receipt","schema_version":1,"path":"artifacts/checks.txt",
+            "digest":format!("{:x}",Sha256::digest(bytes)),"bytes":bytes.len()
+        }))
+        .unwrap();
+        fs::write(&path, b"changed check evidence\n").unwrap();
+        assert!(
+            super::remove_registered_fixture_file(root.path(), "checks.txt", &reference).is_err()
+        );
+        assert!(path.exists());
+        fs::write(&path, bytes).unwrap();
+        super::remove_registered_fixture_file(root.path(), "checks.txt", &reference).unwrap();
+        assert!(!path.exists());
+    }
     use super::Role;
     use super::{
         AgentContext, FixtureAction, FixtureInbox, FixtureInvocation, FixtureLane, FixtureScope,
@@ -3268,6 +3327,7 @@ mod tests {
             }],
             coverage: vec![WorkNodeId::parse("acceptance-node").unwrap()],
             publication_revision: 7,
+            verification: None,
         };
         let expected_digest = subject.digest().unwrap();
         let prompt = render_role_prompt(

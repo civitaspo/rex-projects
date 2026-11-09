@@ -96,9 +96,16 @@ struct WorkerAssignmentContext<'a> {
     branch: &'a str,
     base_sha: &'a str,
     expected_head: &'a str,
+    verification: Option<&'a WorkerVerificationAssignment>,
     recovery_authorization: Option<&'a crate::engine::orchestration::WorkerRecoveryAuthorization>,
     commit_mode: crate::domain::types::CommitMode,
     repository_id: &'a crate::domain::ids::RepositoryId,
+}
+
+struct WorkerVerificationAssignment {
+    publication_revision: u64,
+    publication_operation_id: String,
+    published_head: String,
 }
 
 struct ReviewerPublicationConfig<'a> {
@@ -107,7 +114,7 @@ struct ReviewerPublicationConfig<'a> {
     repositories: &'a BTreeMap<crate::domain::ids::RepositoryId, crate::config::RepositoryConfig>,
 }
 
-fn reviewer_publication_subject(
+fn accepted_publication_subject(
     store: &ConfigStore,
     owner_generation: u64,
     project_id: &crate::domain::ids::ProjectId,
@@ -121,9 +128,16 @@ fn reviewer_publication_subject(
         ticket_run_id,
         revision,
     )?;
-    if snapshot.publication_revision() != revision {
+    let subject_matches_current_revision = snapshot.publication_revision() == revision
+        || snapshot.publication_revision().checked_add(1) == Some(revision)
+            && snapshot.verification().is_none()
+        || snapshot.verification().is_some_and(|verification| {
+            verification.review_revision == revision
+                || verification.review_revision.checked_add(1) == Some(revision)
+        });
+    if !subject_matches_current_revision {
         return Err(
-            "Reviewer prompt is not at the current implementation publication revision".into(),
+            "review or merge prompt is not at the current accepted publication or verification revision".into(),
         );
     }
     let accepted = snapshot.accepted_plan();
@@ -138,13 +152,28 @@ fn reviewer_publication_subject(
         config.repositories,
         snapshot.publication_receipts(),
     )?;
-    crate::delivery_runtime::implementation_publication_set_subject(
+    let mut subject = crate::delivery_runtime::implementation_publication_set_subject(
         &accepted.plan_digest,
         &accepted.proposal,
         &validated,
         snapshot.publication_receipts(),
         snapshot.publication_revision(),
-    )
+    )?;
+    subject.verification = snapshot.verification().map(|verification| {
+        crate::delivery_runtime::WorkerVerificationSubject {
+            review_revision: verification.review_revision,
+            source_evidence_id: verification.source_evidence_id.clone(),
+            source_agent_run_id: verification.source_agent_run_id.clone(),
+            source_result_digest: verification.source_result_digest.clone(),
+            publication_revision: verification.publication_revision,
+            publication_operation_id: verification.publication_operation_id.clone(),
+            published_head: verification.published_head.as_str().to_owned(),
+            work_node_id: verification.work_node_id.clone(),
+            repository_id: verification.repository_id.clone(),
+            test_receipt_artifacts: verification.test_receipt_artifacts.clone(),
+        }
+    });
+    Ok(subject)
 }
 
 impl RuntimeServices {
@@ -1503,25 +1532,26 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             None
         };
         let worker_node = worker_context.as_ref().map(|context| context.node.clone());
-        let implementation_publication_subject = if reservation.role == Role::Reviewer {
-            let run = active_run
-                .as_ref()
-                .ok_or("Reviewer reservation has no TicketRun")?;
-            Some(reviewer_publication_subject(
-                store,
-                self.owner_generation,
-                &run.project_id,
-                &run.ticket_run_id,
-                run.revision,
-                &ReviewerPublicationConfig {
-                    project,
-                    configuration_digest: &self.applied_config.digest,
-                    repositories: &self.applied_config.config.repositories,
-                },
-            )?)
-        } else {
-            None
-        };
+        let implementation_publication_subject =
+            if matches!(reservation.role, Role::Reviewer | Role::MergeDecision) {
+                let run = active_run
+                    .as_ref()
+                    .ok_or("review or MergeDecision reservation has no TicketRun")?;
+                Some(accepted_publication_subject(
+                    store,
+                    self.owner_generation,
+                    &run.project_id,
+                    &run.ticket_run_id,
+                    run.revision,
+                    &ReviewerPublicationConfig {
+                        project,
+                        configuration_digest: &self.applied_config.digest,
+                        repositories: &self.applied_config.config.repositories,
+                    },
+                )?)
+            } else {
+                None
+            };
         let accepted_plan = if let Some(run) = active_run.as_ref() {
             let accepted = store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?;
             if let Some(plan) = &accepted {
@@ -1565,6 +1595,16 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
         } else {
             None
         };
+        let worker_verification = match (&worker_context, &worker_node) {
+            (Some(context), Some(node)) => worker_verification_assignment(
+                store,
+                self.owner_generation,
+                &context.token,
+                node,
+                worker_recovery_authorization.as_ref(),
+            )?,
+            _ => None,
+        };
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
@@ -1604,6 +1644,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                                 .as_ref()
                                 .map(|authorization| authorization.expected_head.as_str())
                                 .unwrap_or_else(|| context.token.expected_head()),
+                            verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
@@ -1901,6 +1942,16 @@ impl FactoryRuntimeServices for RuntimeServices {
             .effects()
             .observe_local_head_at(&candidate.worktree_path)
             .map(Some)
+    }
+
+    fn verify_worker_verification_worktree(
+        &self,
+        path: &Path,
+        expected_head: &str,
+    ) -> Result<(), String> {
+        self.delivery
+            .effects()
+            .verify_clean_published_worktree_at(path, expected_head)
     }
 
     fn configuration_digest(&self) -> &Digest {
@@ -2904,9 +2955,13 @@ impl RuntimeServices {
                     &ticket_run_id,
                     input.source_revision,
                 )?;
-                if snapshot.publication_revision() != input.source_revision {
+                if snapshot.publication_revision() != input.source_revision
+                    && snapshot.verification().is_none_or(|verification| {
+                        verification.review_revision != input.source_revision
+                    })
+                {
                     return Err(
-                        "Reviewer wake does not name the current implementation publication".into(),
+                        "Reviewer wake does not name the current publication or verification subject".into(),
                     );
                 }
                 for publication in snapshot.publication_receipts() {
@@ -2951,6 +3006,33 @@ impl RuntimeServices {
                         format!(
                             "cannot stage published Worker check evidence for Reviewer: {error}"
                         )
+                    })?;
+                    host_artifacts.extend(staged);
+                }
+                if let Some(verification) = snapshot.verification() {
+                    let source = store.validated_worker_verification_source(
+                        artifact_store,
+                        owner_generation,
+                        project_id,
+                        &ticket_run_id,
+                        verification,
+                    )?;
+                    let source_authority = store
+                        .agent_launch_authority(&source.validated.binding.agent_run_id)?
+                        .ok_or("verified Worker check evidence lost its launch authority")?;
+                    let staged = crate::parent_artifacts::stage_verified_parent_artifacts(
+                        store,
+                        artifact_store,
+                        &source_authority,
+                        source.receipt.evidence_id(),
+                        project_id,
+                        config_revision,
+                        config_digest,
+                        workspace,
+                        &verification.test_receipt_artifacts,
+                    )
+                    .map_err(|error| {
+                        format!("cannot stage verification-only Worker TestReceipt evidence for Reviewer: {error}")
                     })?;
                     host_artifacts.extend(staged);
                 }
@@ -3177,22 +3259,23 @@ impl RuntimeServices {
             worker_node_id.as_ref(),
             accepted_plan.as_ref(),
         )?;
-        let implementation_publication_subject = if candidate.role == Role::Reviewer {
-            Some(reviewer_publication_subject(
-                store,
-                self.owner_generation,
-                &active_run.project_id,
-                ticket_run_id,
-                active_run.revision,
-                &ReviewerPublicationConfig {
-                    project: &project,
-                    configuration_digest: &self.configuration_digest,
-                    repositories: &self.applied_config.config.repositories,
-                },
-            )?)
-        } else {
-            None
-        };
+        let implementation_publication_subject =
+            if matches!(candidate.role, Role::Reviewer | Role::MergeDecision) {
+                Some(accepted_publication_subject(
+                    store,
+                    self.owner_generation,
+                    &active_run.project_id,
+                    ticket_run_id,
+                    active_run.revision,
+                    &ReviewerPublicationConfig {
+                        project: &project,
+                        configuration_digest: &self.configuration_digest,
+                        repositories: &self.applied_config.config.repositories,
+                    },
+                )?)
+            } else {
+                None
+            };
         let worker_node = worker_context
             .as_ref()
             .and_then(|context| {
@@ -3206,6 +3289,18 @@ impl RuntimeServices {
         if candidate.role == Role::Worker && worker_node.is_none() {
             return Err("prepared Worker token does not resolve to an accepted plan node".into());
         }
+        let worker_verification = match (&worker_context, &worker_node) {
+            (Some(context), Some(node)) if candidate.role == Role::Worker => {
+                worker_verification_assignment(
+                    store,
+                    self.owner_generation,
+                    &context.token,
+                    node,
+                    worker_recovery_authorization.as_ref(),
+                )?
+            }
+            _ => None,
+        };
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
@@ -3299,6 +3394,7 @@ impl RuntimeServices {
                             branch: context.token.branch(),
                             base_sha: context.token.base_sha(),
                             expected_head,
+                            verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
@@ -4185,6 +4281,70 @@ fn ensure_worker_worktree_at_expected_head(
     Ok(())
 }
 
+fn worker_verification_assignment(
+    store: &ConfigStore,
+    owner_generation: u64,
+    token: &crate::store::accepted_plans::PreparedWorkerLaunch,
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    recovery_authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Result<Option<WorkerVerificationAssignment>, String> {
+    let expected_head = recovery_authorization
+        .map(|authorization| authorization.expected_head.as_str())
+        .unwrap_or_else(|| token.expected_head());
+    if expected_head == token.base_sha() {
+        return Ok(None);
+    }
+    let snapshot = store.accepted_implementation_publication_snapshot(
+        owner_generation,
+        token.project_id(),
+        token.ticket_run_id(),
+        token.ticket_revision(),
+    )?;
+    let matching = snapshot
+        .publication_receipts()
+        .iter()
+        .filter_map(|publication| {
+            let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                crate::protocol::parse_unique(publication.intent().request_json.as_bytes()).ok()?;
+            (request.work_node_id == node.id).then_some((publication, request))
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(
+            "correction Worker publication must cover its accepted node exactly once".into(),
+        );
+    }
+    let (publication, request) = &matching[0];
+    let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+        crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+    if request.ticket_run_id != *token.ticket_run_id()
+        || request.repository_id != node.repository
+        || request.configuration_digest != *token.configuration_digest()
+        || request.source_revision.checked_add(1) != Some(snapshot.publication_revision())
+        || receipt.ticket_run_id != *token.ticket_run_id()
+        || receipt.work_node_id != node.id
+        || receipt.repository_id != node.repository
+        || receipt.configuration_digest != *token.configuration_digest()
+        || receipt.commit.head() != expected_head
+        || recovery_authorization.is_some_and(|authorization| {
+            authorization.ticket_run_id != *token.ticket_run_id()
+                || authorization.ticket_revision != token.ticket_revision()
+                || authorization.work_node_id != node.id
+                || authorization.accepted_plan_digest != *token.plan_digest()
+                || authorization.expected_head != expected_head
+        })
+    {
+        return Err(
+            "correction Worker publication differs from its host-prepared assignment".into(),
+        );
+    }
+    Ok(Some(WorkerVerificationAssignment {
+        publication_revision: snapshot.publication_revision(),
+        publication_operation_id: publication.intent().operation_id.as_str().to_owned(),
+        published_head: receipt.commit.head().to_owned(),
+    }))
+}
+
 fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<String, String> {
     let WorkerAssignmentContext {
         plan_record,
@@ -4194,6 +4354,7 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         branch,
         base_sha,
         expected_head,
+        verification,
         recovery_authorization,
         commit_mode,
         repository_id,
@@ -4250,6 +4411,12 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
             "branch":branch,
             "base_sha":base_sha,
             "expected_head":expected_head,
+            "verification_only":verification.is_some(),
+            "accepted_publication":verification.map(|value| serde_json::json!({
+                "publication_revision":value.publication_revision,
+                "publication_operation_id":value.publication_operation_id,
+                "published_head":value.published_head,
+            })),
             "commit_mode":commit_mode,
             "repository_id":repository_id,
         },
@@ -4710,6 +4877,7 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &base_sha,
+            verification: None,
             recovery_authorization: None,
             commit_mode: CommitMode::Host,
             repository_id: &repository,
@@ -4726,7 +4894,47 @@ mod worker_assignment_context_tests {
         );
         assert_eq!(context["prepared_worktree"]["base_sha"], base_sha);
         assert_eq!(context["prepared_worktree"]["expected_head"], base_sha);
+        assert_eq!(context["prepared_worktree"]["verification_only"], false);
         assert_eq!(context["prepared_worktree"]["repository_id"], "repo-a");
+
+        let publication_head = "3".repeat(40);
+        let verification = WorkerVerificationAssignment {
+            publication_revision: 5,
+            publication_operation_id: "publish-worker-1".into(),
+            published_head: publication_head.clone(),
+        };
+        let verification_context = worker_assignment_context(&WorkerAssignmentContext {
+            plan_record: &plan_record,
+            validated_plan: &validated,
+            node: &node,
+            worktree_path: Path::new("/state/worktree"),
+            branch: "agent/run-a/worker-b",
+            base_sha: &base_sha,
+            expected_head: &publication_head,
+            verification: Some(&verification),
+            recovery_authorization: None,
+            commit_mode: CommitMode::Host,
+            repository_id: &repository,
+        })
+        .unwrap();
+        let verification_context: serde_json::Value =
+            serde_json::from_str(&verification_context).unwrap();
+        assert_eq!(
+            verification_context["prepared_worktree"]["verification_only"],
+            true
+        );
+        assert_eq!(
+            verification_context["prepared_worktree"]["accepted_publication"]["publication_operation_id"],
+            "publish-worker-1"
+        );
+        assert_eq!(
+            verification_context["prepared_worktree"]["accepted_publication"]["publication_revision"],
+            5
+        );
+        assert_eq!(
+            verification_context["prepared_worktree"]["accepted_publication"]["published_head"],
+            publication_head
+        );
 
         let prior_operation = crate::domain::ids::OperationId::parse("host-commit-prior").unwrap();
         let recovery = crate::engine::orchestration::WorkerRecoveryAuthorization {
@@ -4753,6 +4961,7 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &recovery.expected_head,
+            verification: Some(&verification),
             recovery_authorization: Some(&recovery),
             commit_mode: CommitMode::Host,
             repository_id: &repository,
@@ -4763,6 +4972,14 @@ mod worker_assignment_context_tests {
         assert_eq!(
             recovery_context["prepared_worktree"]["expected_head"],
             recovery.expected_head
+        );
+        assert_eq!(
+            recovery_context["prepared_worktree"]["verification_only"],
+            true
+        );
+        assert_eq!(
+            recovery_context["prepared_worktree"]["accepted_publication"]["publication_operation_id"],
+            "publish-worker-1"
         );
         assert_eq!(
             recovery_context["worker_recovery_authorization"]["prior_worker_agent_run_id"],
