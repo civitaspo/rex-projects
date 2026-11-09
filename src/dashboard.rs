@@ -1417,6 +1417,8 @@ mod tests {
         command
             .args(["--exact", "dashboard::tests::pty_child", "--nocapture"])
             .env("REX_PROJECTS_DASHBOARD_PTY_LOG", log.path())
+            .env_remove("REX_PROJECTS_AGENT")
+            .env_remove("REX_PROJECTS_CONTEXT")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
