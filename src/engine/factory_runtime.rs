@@ -5888,6 +5888,22 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn operator_spawn_in_operating_persists_candidate_and_coordinator_parent() {
+        assert_judgment_spawn_persists_candidate_and_coordinator_parent(
+            Role::Operator,
+            "operating",
+        );
+    }
+
+    #[test]
+    fn postmortem_spawn_in_postmortem_persists_candidate_and_coordinator_parent() {
+        assert_judgment_spawn_persists_candidate_and_coordinator_parent(
+            Role::Postmortem,
+            "postmortem",
+        );
+    }
+
     fn assert_judgment_spawn_persists_candidate_and_coordinator_parent(
         child_role: Role,
         phase: &str,
@@ -6094,7 +6110,7 @@ pub(crate) mod tests {
                 "ticket_adapter": "tickets",
                 "repositories": ["repo-a"],
                 "goal": {"revision": 1, "statement": "fixture goal", "acceptance": ["produce a valid review request"]},
-                "roles": {"coordinator": "fixture-profile", "reviewer": "fixture-profile", "merge_decision": "fixture-profile"}
+                "roles": {"coordinator": "fixture-profile", "reviewer": "fixture-profile", "merge_decision": "fixture-profile", "operator": "fixture-profile", "postmortem": "fixture-profile"}
             }}
         }))
         .unwrap();

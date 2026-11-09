@@ -2274,6 +2274,20 @@ mod tests {
             .unwrap();
         assert_eq!(operating.phase, super::Phase::Operating);
         assert_eq!(operating.revision, 7);
+        for (role, target) in [("operator", "operator"), ("coordinator", "coordinator")] {
+            let wake_session = format!("ticket_run:{ticket_run_id}:{role}");
+            let wakes = store
+                .pending_role_wake_inputs(&project_id, &wake_session, 256)
+                .unwrap();
+            assert!(
+                wakes.iter().any(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == 7
+                        && wake.payload_json["target"] == target
+                }),
+                "MergeVerified must durably wake {role} at the Operating revision"
+            );
+        }
         let verified_receipts = store
             .list_succeeded_effect_receipts(
                 generation,
@@ -2474,6 +2488,21 @@ mod tests {
             .unwrap();
         assert_eq!(postmortem.phase, super::Phase::Postmortem);
         assert_eq!(postmortem.revision, 8);
+        let coordinator_wakes = store
+            .pending_role_wake_inputs(
+                &project_id,
+                &format!("ticket_run:{ticket_run_id}:coordinator"),
+                256,
+            )
+            .unwrap();
+        assert!(
+            coordinator_wakes.iter().any(|wake| {
+                wake.source_type == "ticket_run_transition"
+                    && wake.source_revision == 8
+                    && wake.payload_json["target"] == "coordinator"
+            }),
+            "OperationsNotRequired must durably wake Coordinator at Postmortem revision"
+        );
         let completion_context = crate::runtime_services::postmortem_completion_context_for_test(
             &mut store,
             generation,
