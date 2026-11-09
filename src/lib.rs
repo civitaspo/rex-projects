@@ -25,6 +25,7 @@ pub mod learning_trials;
 pub mod mailbox;
 pub mod merge_executor;
 pub mod merge_policy;
+pub mod merge_runtime;
 pub mod operations;
 pub mod operations_runtime;
 pub mod parent_artifacts;

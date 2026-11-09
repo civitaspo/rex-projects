@@ -102,6 +102,17 @@ pub trait FactoryRuntimeServices {
         now_unix: i64,
     ) -> Result<bool, String>;
 
+    /// Drain one queued exact-scope merge review response. TicketReview decisions are host inputs,
+    /// so they are not delivered to an Agent role session.
+    fn process_one_merge_human_response(
+        &mut self,
+        _store: &mut ConfigStore,
+        _owner_generation: u64,
+        _now_unix: i64,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn recover_agents(
         &mut self,
         store: &mut ConfigStore,
@@ -179,6 +190,43 @@ pub trait FactoryRuntimeServices {
         result: &crate::store::agent_results::IngestedAgentResult,
         effect_revision: u64,
     ) -> Result<Option<EffectIntent>, String>;
+
+    /// Build a fresh host observation for an accepted, exact publication subject before
+    /// persisting a MergeDecision assessment. Implementations fail closed when the Forge snapshot
+    /// is incomplete or unsupported.
+    fn observe_merge_assessment(
+        &mut self,
+        _subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        _result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<Option<crate::merge_runtime::MergeEvidenceObservation>, String> {
+        Err("host MergeDecision evidence observation is unavailable".into())
+    }
+
+    /// Construct the exact immutable PR-body target from the same fresh host observation and
+    /// accepted Worker plan. Implementations fail closed unless the proposal is host-derived.
+    fn prepare_merge_body_proposal(
+        &self,
+        _project_id: &ProjectId,
+        _subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        _accepted_plan: &crate::engine::orchestration::WorkPlan,
+        _assessment_id: &crate::domain::ids::Digest,
+        _observation: &crate::merge_runtime::MergeEvidenceObservation,
+    ) -> Result<crate::store::merge_work::PreparedMergeBodyProposal, String> {
+        Err("host MergeDecision PR-body proposal is unavailable".into())
+    }
+
+    /// Resolve an authenticated MergeIntent into the exact repository procedure. The default
+    /// keeps implementations fail-closed until they provide the host instruction resolver.
+    fn resolve_merge_work_document(
+        &mut self,
+        _subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        _accepted_plan: &crate::engine::orchestration::WorkPlan,
+        _assessment: &crate::store::merge_work::TrustedMergeAssessment,
+        _intent: &crate::engine::orchestration::MergeIntentPayload,
+        _result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<crate::store::merge_work::MergeWorkDocument, String> {
+        Err("host MergeIntent procedure resolution is unavailable".into())
+    }
 
     /// Accept at most one due profile-trial approval or queue its next run/side.
     /// Implementations reserve from the same bounded execution-slot pool as Agent launches.
@@ -303,6 +351,8 @@ impl FactoryRuntime {
         store.activate_starting_projects(owner_generation)?;
         let _processed_agent_request =
             services.process_one_agent_request(store, owner_generation, now_unix)?;
+        let _processed_merge_human_response =
+            services.process_one_merge_human_response(store, owner_generation, now_unix)?;
         let agent_result = services.ingest_one_agent_result(store, owner_generation, now_unix)?;
         let ingested_agent_result = if let Some(result) = &agent_result {
             apply_agent_result(store, owner_generation, now_unix, config, services, result)?
@@ -614,6 +664,18 @@ fn apply_agent_result(
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
     {
         return apply_reviewer_result(store, owner_generation, now_unix, config, services, result);
+    }
+    if result.validated.kind == RoleOutputKind::MergeAssessment
+        && binding.role == Role::MergeDecision
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return apply_merge_assessment(store, owner_generation, now_unix, config, services, result);
+    }
+    if result.validated.kind == RoleOutputKind::MergeIntent
+        && binding.role == Role::MergeDecision
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        return apply_merge_intent(store, owner_generation, now_unix, config, services, result);
     }
     if result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
         && binding.role == Role::Postmortem
@@ -1691,6 +1753,455 @@ fn apply_reviewer_result(
     )?;
     let _ = now_unix;
     Ok(true)
+}
+
+fn apply_merge_assessment(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::RoleResultPayload;
+
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("MergeAssessment result lacks TicketRun scope")?;
+    let source_revision = binding
+        .ticket_revision
+        .ok_or("MergeAssessment result lacks TicketRun revision")?;
+    let run = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("MergeAssessment result references no active TicketRun")?;
+    if binding.role != Role::MergeDecision
+        || run.project_id != binding.project_id
+        || run.revision != source_revision.0
+        || run.phase != Phase::Assessing
+        || run.activity != Activity::Running
+    {
+        return Err("MergeAssessment result is stale, blocked, or outside active Assessing".into());
+    }
+    if crate::store::agent_results::acknowledge_obsolete_configuration_result(
+        store,
+        owner_generation,
+        binding,
+        result.receipt.evidence_id(),
+        services.configuration_digest(),
+    )? {
+        return Ok(true);
+    }
+    let configuration_digest = services.configuration_digest().clone();
+    let project_record = store
+        .project(&binding.project_id)?
+        .ok_or("MergeDecision Project has no durable configuration record")?;
+    if binding.config_digest != configuration_digest
+        || project_record.config_digest != configuration_digest
+        || binding.config_revision != project_record.config_revision
+    {
+        return Err("MergeAssessment result belongs to a stale Project configuration".into());
+    }
+    let project = config
+        .projects
+        .get(&binding.project_id)
+        .ok_or("MergeDecision Project is no longer configured")?;
+    let snapshot = store.accepted_implementation_publication_snapshot(
+        owner_generation,
+        &run.project_id,
+        ticket_run_id,
+        run.revision,
+    )?;
+    let accepted = snapshot.accepted_plan();
+    if accepted.configuration_digest != configuration_digest {
+        return Err("accepted work plan belongs to a stale configuration snapshot".into());
+    }
+    accepted.validate_for(project, &configuration_digest)?;
+    let expected_assessing_revision = match snapshot.verification() {
+        Some(verification) => verification
+            .review_revision
+            .checked_add(1)
+            .ok_or("verification review revision overflow")?,
+        None => snapshot
+            .publication_revision()
+            .checked_add(1)
+            .ok_or("publication review revision overflow")?,
+    };
+    if run.revision != expected_assessing_revision {
+        return Err(
+            "MergeDecision is not at the exact accepted review-convergence revision".into(),
+        );
+    }
+    let publications = snapshot.publication_receipts();
+    let validated_publications =
+        crate::delivery_runtime::validate_implementation_publication_receipt(
+            &accepted.proposal,
+            snapshot.prepared_receipt(),
+            &run.project_id,
+            &config.repositories,
+            publications,
+        )?;
+    let mut publication_subject = crate::delivery_runtime::implementation_publication_set_subject(
+        &accepted.plan_digest,
+        &accepted.proposal,
+        &validated_publications,
+        publications,
+        snapshot.publication_revision(),
+    )?;
+    publication_subject.verification = snapshot.verification().map(|verification| {
+        crate::delivery_runtime::WorkerVerificationSubject {
+            review_revision: verification.review_revision,
+            source_evidence_id: verification.source_evidence_id.clone(),
+            source_agent_run_id: verification.source_agent_run_id.clone(),
+            source_result_digest: verification.source_result_digest.clone(),
+            publication_revision: verification.publication_revision,
+            publication_operation_id: verification.publication_operation_id.clone(),
+            published_head: verification.published_head.as_str().to_owned(),
+            work_node_id: verification.work_node_id.clone(),
+            repository_id: verification.repository_id.clone(),
+            test_receipt_artifacts: verification.test_receipt_artifacts.clone(),
+        }
+    });
+    let publication_set_digest = publication_subject.digest()?;
+    let observation = services
+        .observe_merge_assessment(&publication_subject, result)?
+        .ok_or("fresh MergeDecision evidence is temporarily unavailable")?;
+    if observation.publication_set_digest != publication_set_digest {
+        return Err(
+            "host MergeDecision observation is bound to a different publication set".into(),
+        );
+    }
+    let RoleResultPayload::MergeAssessment(claim) = &result.validated.typed_payload else {
+        return Err("validated MergeAssessment kind has a different typed payload".into());
+    };
+    let trusted = crate::merge_runtime::assess_merge_claim(
+        claim,
+        &result.validated.result_digest,
+        &observation,
+    )?;
+    let assessment_id = crate::merge_runtime::assessment_id(
+        &run.project_id,
+        ticket_run_id,
+        Revision(run.revision),
+        result.receipt.evidence_id(),
+        &result.validated.result_digest,
+        &trusted.evidence,
+    )?;
+    let prepared_body_proposal = services.prepare_merge_body_proposal(
+        &run.project_id,
+        &publication_subject,
+        &accepted.proposal,
+        &assessment_id,
+        &observation,
+    )?;
+    let persisted = crate::store::merge_work::TrustedMergeAssessment {
+        schema_version: 1,
+        assessment_id,
+        project_id: run.project_id,
+        ticket_run_id: ticket_run_id.clone(),
+        revision: Revision(run.revision),
+        configuration_digest,
+        source_evidence_id: result.receipt.evidence_id().to_owned(),
+        source_result_digest: result.validated.result_digest.clone(),
+        publication_set_digest: trusted.publication_set_digest,
+        pull_request_reference: trusted.pull_request_reference,
+        policy_digest: trusted.policy_digest,
+        policy: observation.policy,
+        evidence: trusted.evidence,
+        assessment: trusted.assessment,
+        baseline_issue_comments: trusted.baseline_issue_comments,
+        prepared_body_proposal: Some(prepared_body_proposal),
+    };
+    store.persist_trusted_merge_assessment(owner_generation, result, &persisted, now_unix)?;
+    Ok(true)
+}
+
+fn apply_merge_intent(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    services: &mut impl FactoryRuntimeServices,
+    result: &crate::store::agent_results::IngestedAgentResult,
+) -> Result<bool, String> {
+    use crate::engine::orchestration::RoleResultPayload;
+
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("MergeIntent result lacks TicketRun scope")?;
+    let revision = binding
+        .ticket_revision
+        .ok_or("MergeIntent result lacks TicketRun revision")?;
+    let run = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id)
+        .ok_or("MergeIntent result references no active TicketRun")?;
+    if binding.role == Role::MergeDecision
+        && run.phase == Phase::WaitingHuman
+        && run.activity == Activity::Blocked
+        && let Some(accepted_revision) = run.revision.checked_add(1)
+        && let Some(item) =
+            store.merge_work_item(&run.project_id, ticket_run_id, Revision(accepted_revision))?
+        && merge_intent_replay_matches(
+            &run.project_id,
+            run.revision,
+            binding,
+            result,
+            &MergeIntentReplayIdentity {
+                assessed_revision: item.assessed_revision,
+                awaiting_merge_revision: item.awaiting_merge_revision,
+                configuration_digest: item.configuration_digest,
+                intent_evidence_id: item.document.intent_evidence_id,
+                intent_result_digest: item.document.intent_result_digest,
+            },
+        )
+    {
+        acknowledge_merge_intent_replay(store, owner_generation, result, run.revision)?;
+        return Ok(true);
+    }
+    if binding.role != Role::MergeDecision
+        || run.project_id != binding.project_id
+        || run.revision != revision.0
+        || run.phase != Phase::Assessing
+        || run.activity != Activity::Running
+    {
+        return Err("MergeIntent result is stale, blocked, or outside active Assessing".into());
+    }
+    let trusted = store
+        .trusted_merge_assessment(&run.project_id, ticket_run_id, Revision(run.revision))?
+        .ok_or("MergeIntent has no host-validated assessment for this exact revision")?;
+    let RoleResultPayload::MergeIntent(intent) = &result.validated.typed_payload else {
+        return Err("validated MergeIntent kind has a different typed payload".into());
+    };
+    let expected_pr = format!(
+        "{}#{}",
+        trusted.evidence.subject.repository_id, trusted.evidence.subject.pull_request_id
+    );
+    if trusted.project_id != run.project_id
+        || trusted.ticket_run_id != *ticket_run_id
+        || trusted.revision != Revision(run.revision)
+        || trusted.configuration_digest != binding.config_digest
+        || intent.assessment_id != trusted.assessment_id.as_str()
+        || intent.policy_digest != trusted.policy_digest
+        || intent.pr_identities != [expected_pr]
+        || trusted.evidence.subject.prepared_body_digest.is_none()
+    {
+        return Err("MergeIntent does not match the immutable host assessment, exact PR, policy, or reviewed body".into());
+    }
+    let project_record = store
+        .project(&run.project_id)?
+        .ok_or("MergeDecision Project has no durable configuration record")?;
+    if binding.config_digest != *services.configuration_digest()
+        || project_record.config_digest != *services.configuration_digest()
+        || binding.config_revision != project_record.config_revision
+    {
+        return Err("MergeIntent result belongs to a stale Project configuration".into());
+    }
+    let project = config
+        .projects
+        .get(&run.project_id)
+        .ok_or("MergeDecision Project is no longer configured")?;
+    let snapshot = store.accepted_implementation_publication_snapshot(
+        owner_generation,
+        &run.project_id,
+        ticket_run_id,
+        run.revision,
+    )?;
+    let accepted = snapshot.accepted_plan();
+    if accepted.configuration_digest != *services.configuration_digest() {
+        return Err("accepted work plan belongs to a stale configuration snapshot".into());
+    }
+    accepted.validate_for(project, services.configuration_digest())?;
+    let validated_publications =
+        crate::delivery_runtime::validate_implementation_publication_receipt(
+            &accepted.proposal,
+            snapshot.prepared_receipt(),
+            &run.project_id,
+            &config.repositories,
+            snapshot.publication_receipts(),
+        )?;
+    let mut publication_subject = crate::delivery_runtime::implementation_publication_set_subject(
+        &accepted.plan_digest,
+        &accepted.proposal,
+        &validated_publications,
+        snapshot.publication_receipts(),
+        snapshot.publication_revision(),
+    )?;
+    publication_subject.verification = snapshot.verification().map(|verification| {
+        crate::delivery_runtime::WorkerVerificationSubject {
+            review_revision: verification.review_revision,
+            source_evidence_id: verification.source_evidence_id.clone(),
+            source_agent_run_id: verification.source_agent_run_id.clone(),
+            source_result_digest: verification.source_result_digest.clone(),
+            publication_revision: verification.publication_revision,
+            publication_operation_id: verification.publication_operation_id.clone(),
+            published_head: verification.published_head.as_str().to_owned(),
+            work_node_id: verification.work_node_id.clone(),
+            repository_id: verification.repository_id.clone(),
+            test_receipt_artifacts: verification.test_receipt_artifacts.clone(),
+        }
+    });
+    if publication_subject.digest()? != trusted.publication_set_digest {
+        return Err(
+            "MergeIntent host assessment belongs to a different accepted publication set".into(),
+        );
+    }
+    let document = services.resolve_merge_work_document(
+        &publication_subject,
+        &accepted.proposal,
+        &trusted,
+        intent,
+        result,
+    )?;
+    let assessed_revision = Revision(run.revision);
+    let awaiting_merge_revision = Revision(
+        assessed_revision
+            .0
+            .checked_add(2)
+            .ok_or("MergeIntent human approval revision overflow")?,
+    );
+    let prepared_receipt_digest = crate::forge::canonical_digest(snapshot.prepared_receipt())
+        .map_err(|error| error.to_string())?;
+    let work_item = crate::store::merge_work::MergeWorkItem::new(
+        run.project_id.clone(),
+        ticket_run_id.clone(),
+        assessed_revision,
+        awaiting_merge_revision,
+        trusted.configuration_digest.clone(),
+        accepted.plan_digest.clone(),
+        prepared_receipt_digest,
+        trusted.publication_set_digest.clone(),
+        document,
+    )?;
+    store.persist_merge_work_item(owner_generation, &work_item, now_unix)?;
+    let review_revision = Revision(
+        assessed_revision
+            .0
+            .checked_add(1)
+            .ok_or("MergeIntent human review revision overflow")?,
+    );
+    let view_id = store
+        .active_ticket_view_id(owner_generation, &run.project_id, ticket_run_id)?
+        .ok_or("MergeIntent has no active TicketRun Rex view")?;
+    let request_id = crate::domain::ids::HumanRequestId::parse(format!(
+        "merge-review-{}",
+        result.receipt.evidence_id()
+    ))?;
+    let expires_at = u64::try_from(now_unix)
+        .map_err(|_| "controller time is before the Unix epoch")?
+        .saturating_add(7 * 24 * 60 * 60);
+    let work_id = work_item.work_id.clone();
+    let presentation = crate::human_runtime::HumanAuthorityMaterial::merge_work_review_effect(
+        request_id.clone(),
+        view_id,
+        work_item,
+        expires_at,
+    )?;
+    let request_json = crate::store::canonical_json(&presentation)?;
+    let review_effect = EffectIntent {
+        project_id: run.project_id.clone(),
+        subject_type: "ticket_run".into(),
+        subject_id: ticket_run_id.as_str().into(),
+        operation_id: OperationId::parse(format!("present-{}", request_id.as_str()))?
+            .as_str()
+            .into(),
+        logical_key: format!(
+            "{}:{}:merge-review:{}",
+            ticket_run_id, run.revision, request_id
+        ),
+        kind: "request_human_review".into(),
+        request_digest: durable_input_digest("human_presentation", &request_json),
+        request_json,
+        expected_revision: Some(review_revision.0),
+    };
+    let accepted_revision = review_revision;
+    let input_payload = crate::store::canonical_json(&serde_json::json!({
+        "schema_version": 1,
+        "kind": "merge_intent",
+        "evidence_id": result.receipt.evidence_id(),
+        "result_digest": result.validated.result_digest,
+        "assessment_id": trusted.assessment_id,
+        "work_id": work_id,
+        "source_revision": run.revision,
+        "accepted_revision": accepted_revision,
+    }))?;
+    let durable = DurableInput {
+        producer_id: "rex-projects-agent-result".into(),
+        message_id: format!("merge-intent:{}", result.receipt.evidence_id()),
+        content_digest: durable_input_digest("ticket_run", &input_payload),
+        recipient: "ticket_run".into(),
+        payload: input_payload.clone(),
+    };
+    store.commit_ticket_transition(
+        owner_generation,
+        ticket_run_id,
+        assessed_revision,
+        &durable,
+        Input::RequireHumanReview,
+        "host validated MergeIntent against the same-revision trusted assessment and persisted its exact review procedure",
+        &input_payload,
+        &[review_effect],
+    )?;
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        accepted_revision.0,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    Ok(true)
+}
+
+struct MergeIntentReplayIdentity {
+    assessed_revision: Revision,
+    awaiting_merge_revision: Revision,
+    configuration_digest: crate::domain::ids::Digest,
+    intent_evidence_id: String,
+    intent_result_digest: crate::domain::ids::Digest,
+}
+
+fn merge_intent_replay_matches(
+    run_project_id: &crate::domain::ids::ProjectId,
+    run_revision: u64,
+    binding: &crate::engine::orchestration::RoleResultBinding,
+    result: &crate::store::agent_results::IngestedAgentResult,
+    item: &MergeIntentReplayIdentity,
+) -> bool {
+    let Some(ticket_run_id) = binding.ticket_run_id.as_ref() else {
+        return false;
+    };
+    binding.role == Role::MergeDecision
+        && binding.project_id == *run_project_id
+        && binding.ticket_revision == Some(item.assessed_revision)
+        && item.assessed_revision.0.checked_add(1) == Some(run_revision)
+        && item.awaiting_merge_revision.0.checked_sub(1) == Some(run_revision)
+        && item.configuration_digest == binding.config_digest
+        && item.intent_evidence_id == result.receipt.evidence_id()
+        && item.intent_result_digest == result.validated.result_digest
+        && result.validated.binding.project_id == *run_project_id
+        && result.validated.binding.ticket_run_id.as_ref() == Some(ticket_run_id)
+        && result.validated.binding.ticket_revision == Some(item.assessed_revision)
+        && result.validated.kind == crate::engine::orchestration::RoleOutputKind::MergeIntent
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+}
+
+fn acknowledge_merge_intent_replay(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    result: &crate::store::agent_results::IngestedAgentResult,
+    accepted_revision: u64,
+) -> Result<(), String> {
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        accepted_revision,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )
 }
 
 fn review_transition(
@@ -3081,6 +3592,8 @@ pub(crate) mod tests {
         published_effect: Option<crate::store::EffectIntent>,
         pending_artifacts: Option<crate::artifacts::ArtifactStore>,
         ticket_page: Option<super::ExternalTicketPage>,
+        merge_observation: Option<crate::merge_runtime::MergeEvidenceObservation>,
+        merge_body_proposal: Option<crate::store::merge_work::PreparedMergeBodyProposal>,
     }
 
     impl super::FactoryRuntimeServices for WorkerPublicationFixtureServices {
@@ -3170,6 +3683,30 @@ pub(crate) mod tests {
             };
             self.published_effect = Some(effect.clone());
             Ok(Some(effect))
+        }
+
+        fn observe_merge_assessment(
+            &mut self,
+            _: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+            _: &crate::store::agent_results::IngestedAgentResult,
+        ) -> Result<Option<crate::merge_runtime::MergeEvidenceObservation>, String> {
+            self.merge_observation
+                .clone()
+                .map(Some)
+                .ok_or_else(|| "MergeAssessment fixture observation is missing".into())
+        }
+
+        fn prepare_merge_body_proposal(
+            &self,
+            _: &ProjectId,
+            _: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+            _: &crate::engine::orchestration::WorkPlan,
+            _: &Digest,
+            _: &crate::merge_runtime::MergeEvidenceObservation,
+        ) -> Result<crate::store::merge_work::PreparedMergeBodyProposal, String> {
+            self.merge_body_proposal
+                .clone()
+                .ok_or_else(|| "MergeAssessment fixture body proposal is missing".into())
         }
 
         fn tick_profile_trials(
@@ -3299,8 +3836,42 @@ pub(crate) mod tests {
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
         };
         super::apply_agent_result(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            &mut services,
+            result,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The fixture binds the exact host observation and proposal to one validated result"
+    )]
+    pub(crate) fn apply_merge_assessment_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        observation: crate::merge_runtime::MergeEvidenceObservation,
+        proposal: crate::store::merge_work::PreparedMergeBodyProposal,
+    ) -> Result<bool, String> {
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: None,
+            merge_observation: Some(observation),
+            merge_body_proposal: Some(proposal),
+        };
+        super::apply_merge_assessment(
             store,
             owner_generation,
             now_unix,
@@ -3417,6 +3988,8 @@ pub(crate) mod tests {
                 published_effect: None,
                 pending_artifacts: None,
                 ticket_page: None,
+                merge_observation: None,
+                merge_body_proposal: None,
             };
             let applied = super::apply_agent_result(
                 &mut fixture.store,
@@ -3458,6 +4031,187 @@ pub(crate) mod tests {
                 .contains("stale external ticket revision")
         );
         assert_eq!(stale_count, 0);
+    }
+
+    #[test]
+    fn merge_intent_without_same_revision_trusted_assessment_is_not_acknowledged() {
+        use crate::domain::ids::Digest;
+        use crate::domain::types::Role;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use serde_json::json;
+
+        let payload = json!({
+            "assessment_id": "assessment-1",
+            "pr_identities": ["repo-a#42"],
+            "policy_digest": "a".repeat(64),
+            "prepared_body_digest": "b".repeat(64),
+            "steps": [
+                {"kind":"request_merge", "instruction_reference":"merge.instructions#request", "rationale":"the repository requires a merge request"},
+                {"kind":"verify_merge_commit", "instruction_reference":"merge.instructions#verify", "rationale":"confirm the resulting commit"}
+            ],
+            "post_merge_verification": [
+                {"kind":"merge_commit_recorded", "instruction_reference":"merge.instructions#verify", "rationale":"verify the remote merge commit"}
+            ]
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::MergeDecision,
+                RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "merge-decision-intent".into(),
+                    kind: RoleOutputKind::MergeIntent,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result: payload,
+                    result_digest: Some(result_digest),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET internal_phase='assessing', external_status='in_progress', observed_status='in_progress' WHERE ticket_run_id='fixture-ticket-run'",
+                [],
+            )
+            .unwrap();
+        let config: Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            published_effect: None,
+            pending_artifacts: Some(fixture.artifacts),
+            ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
+        };
+
+        let error = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            2,
+            &config,
+            &mut services,
+        )
+        .unwrap_err();
+        assert!(error.contains("no host-validated assessment for this exact revision"));
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                fixture.ingested.receipt.evidence_id(),
+            )
+            .unwrap()
+            .map(|(_, disposition)| disposition),
+            None
+        );
+    }
+
+    #[test]
+    fn committed_merge_intent_replay_acknowledges_only_its_exact_work_identity() {
+        use crate::domain::ids::{Digest, Revision};
+        use crate::domain::types::Role;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use serde_json::json;
+
+        let payload = json!({
+            "assessment_id": "assessment-1",
+            "pr_identities": ["repo-a#42"],
+            "policy_digest": "a".repeat(64),
+            "prepared_body_digest": "b".repeat(64),
+            "steps": [
+                {"kind":"request_merge", "instruction_reference":"merge.instructions#request", "rationale":"request the configured merge"},
+                {"kind":"verify_merge_commit", "instruction_reference":"merge.instructions#verify", "rationale":"verify the resulting commit"}
+            ],
+            "post_merge_verification": [
+                {"kind":"merge_commit_recorded", "instruction_reference":"merge.instructions#verify", "rationale":"verify the remote merge commit"}
+            ]
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::MergeDecision,
+                RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "merge-decision-replay".into(),
+                    kind: RoleOutputKind::MergeIntent,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result: payload,
+                    result_digest: Some(result_digest),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let result = &fixture.ingested;
+        let binding = &result.validated.binding;
+        let assessed_revision = binding.ticket_revision.unwrap();
+        let run_revision = assessed_revision.0.checked_add(1).unwrap();
+        let identity = super::MergeIntentReplayIdentity {
+            assessed_revision,
+            awaiting_merge_revision: Revision(run_revision.checked_add(1).unwrap()),
+            configuration_digest: binding.config_digest.clone(),
+            intent_evidence_id: result.receipt.evidence_id().into(),
+            intent_result_digest: result.validated.result_digest.clone(),
+        };
+        assert!(super::merge_intent_replay_matches(
+            &binding.project_id,
+            run_revision,
+            binding,
+            result,
+            &identity,
+        ));
+        let mut wrong_identity = super::MergeIntentReplayIdentity {
+            intent_result_digest: Digest::parse("f".repeat(64)).unwrap(),
+            ..identity
+        };
+        assert!(!super::merge_intent_replay_matches(
+            &binding.project_id,
+            run_revision,
+            binding,
+            result,
+            &wrong_identity,
+        ));
+        wrong_identity.intent_result_digest = result.validated.result_digest.clone();
+        assert!(!super::merge_intent_replay_matches(
+            &binding.project_id,
+            run_revision.checked_add(1).unwrap(),
+            binding,
+            result,
+            &wrong_identity,
+        ));
+
+        super::acknowledge_merge_intent_replay(
+            &mut fixture.store,
+            fixture.owner_generation,
+            result,
+            run_revision,
+        )
+        .unwrap();
+        super::acknowledge_merge_intent_replay(
+            &mut fixture.store,
+            fixture.owner_generation,
+            result,
+            run_revision,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                result.receipt.evidence_id(),
+            )
+            .unwrap(),
+            Some((run_revision, "applied".into()))
+        );
     }
 
     #[test]
@@ -3598,6 +4352,8 @@ pub(crate) mod tests {
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
         };
         assert!(
             super::apply_agent_result(
@@ -3665,6 +4421,8 @@ pub(crate) mod tests {
                 tickets: Vec::new(),
                 next_cursor: None,
             }),
+            merge_observation: None,
+            merge_body_proposal: None,
         };
         let absent_report = super::FactoryRuntime::tick(
             &mut fixture.store,
@@ -4314,6 +5072,8 @@ pub(crate) mod tests {
             published_effect: None,
             pending_artifacts: Some(fixture.artifacts),
             ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
         };
 
         let tick = super::FactoryRuntime::tick(
@@ -4433,6 +5193,8 @@ pub(crate) mod tests {
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
         };
 
         assert!(
@@ -4559,6 +5321,8 @@ pub(crate) mod tests {
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
         };
 
         assert!(
@@ -4679,6 +5443,8 @@ pub(crate) mod tests {
                 published_effect: None,
                 pending_artifacts: None,
                 ticket_page: None,
+                merge_observation: None,
+                merge_body_proposal: None,
             };
             let wake_count_before: u32 = fixture
                 .store
@@ -4829,6 +5595,8 @@ pub(crate) mod tests {
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
         };
 
         assert!(

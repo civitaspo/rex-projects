@@ -5224,7 +5224,7 @@ fn now_unix() -> Result<i64, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
@@ -6481,6 +6481,15 @@ mod tests {
 
     #[test]
     fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
+        published_publication_fixture(false);
+    }
+
+    #[test]
+    fn single_publication_drives_host_merge_assessment_and_public_inbox() {
+        published_publication_fixture(true);
+    }
+
+    fn published_publication_fixture(single_publication: bool) {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
         use crate::delivery_runtime::{
@@ -6538,7 +6547,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "clone_url": "https://github.com/acme/repo-a.git",
                 "base_branch": "main",
-                "forge": "github"
+                "forge": "github",
+                "merge": {"instructions": "# Merge instructions\nPrepare the body, execute the configured merge, then verify the result.\n"}
             }))
             .unwrap(),
         );
@@ -6547,9 +6557,30 @@ mod tests {
             serde_json::from_value::<ProjectConfig>(serde_json::json!({
                 "mode": "goal",
                 "ticket_adapter": "tickets",
-                "repositories": ["repo-a"]
+                "repositories": ["repo-a"],
+                "roles": {
+                    "worker": "worker_codex",
+                    "reviewer": "worker_codex",
+                    "merge_decision": "worker_codex"
+                }
             }))
             .unwrap(),
+        );
+        applied.profiles.insert(
+            crate::domain::ids::ProfileId::parse("worker_codex").unwrap(),
+            crate::config::Profile {
+                adapter: crate::domain::types::AgentAdapter::Codex,
+                command: vec!["codex".into()],
+                description: None,
+                model: None,
+                effort: None,
+                turn_timeout_seconds: 60,
+                instruction_files: Vec::new(),
+                skill_paths: Vec::new(),
+                commit_mode: CommitMode::Native,
+                learned_guidance: None,
+                options: None,
+            },
         );
         let config_digest = applied.digest.clone();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
@@ -6615,29 +6646,30 @@ mod tests {
 
         let root_id = crate::engine::orchestration::WorkNodeId::parse("root").unwrap();
         let stacked_id = crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap();
+        let mut plan_nodes = vec![PlannedWorkNode {
+            id: root_id.clone(),
+            repository: repository_id.clone(),
+            task: "Implement the foundation".into(),
+            depends_on: Vec::new(),
+            required_evidence: vec!["foundation exists".into()],
+            investigation: false,
+        }];
+        if !single_publication {
+            plan_nodes.push(PlannedWorkNode {
+                id: stacked_id.clone(),
+                repository: repository_id.clone(),
+                task: "Build on the foundation".into(),
+                depends_on: vec![WorkDependency {
+                    node: root_id.clone(),
+                    kind: WorkDependencyKind::GitBase,
+                    affected_evidence: BTreeSet::from(["foundation exists".into()]),
+                }],
+                required_evidence: vec!["dependent change exists".into()],
+                investigation: false,
+            });
+        }
         let plan = WorkPlan {
-            nodes: vec![
-                PlannedWorkNode {
-                    id: root_id.clone(),
-                    repository: repository_id.clone(),
-                    task: "Implement the foundation".into(),
-                    depends_on: Vec::new(),
-                    required_evidence: vec!["foundation exists".into()],
-                    investigation: false,
-                },
-                PlannedWorkNode {
-                    id: stacked_id.clone(),
-                    repository: repository_id.clone(),
-                    task: "Build on the foundation".into(),
-                    depends_on: vec![WorkDependency {
-                        node: root_id.clone(),
-                        kind: WorkDependencyKind::GitBase,
-                        affected_evidence: BTreeSet::from(["foundation exists".into()]),
-                    }],
-                    required_evidence: vec!["dependent change exists".into()],
-                    investigation: false,
-                },
-            ],
+            nodes: plan_nodes,
             requested_investigation_children: 0,
         };
         let coordinator_run_id =
@@ -6856,6 +6888,323 @@ mod tests {
             )
             .unwrap()
         );
+        if single_publication {
+            let reviewing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+            assert_eq!(reviewing.phase, Phase::Reviewing);
+            let publication_snapshot = store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision,
+                )
+                .unwrap();
+            assert_eq!(publication_snapshot.publication_receipts().len(), 1);
+            let accepted = publication_snapshot.accepted_plan();
+            let validated_publications =
+                crate::delivery_runtime::validate_implementation_publication_receipt(
+                    &accepted.proposal,
+                    publication_snapshot.prepared_receipt(),
+                    &project_id,
+                    &config.repositories,
+                    publication_snapshot.publication_receipts(),
+                )
+                .unwrap();
+            let subject = crate::delivery_runtime::implementation_publication_set_subject(
+                &accepted.plan_digest,
+                &accepted.proposal,
+                &validated_publications,
+                publication_snapshot.publication_receipts(),
+                publication_snapshot.publication_revision(),
+            )
+            .unwrap();
+            let subject_digest = subject.digest().unwrap();
+            let coverage = subject
+                .coverage
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>();
+            let review_json = serde_json::json!({
+                "subject_kind": "implementation_publication_set",
+                "subject_digest": subject_digest,
+                "findings": [],
+                "evidence_coverage": coverage,
+                "disposition": "approved",
+                "unknowns": [],
+            });
+            let review_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-reviewer-result".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::ReviewReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&review_json.to_string())).unwrap(),
+                ),
+                structured_result: review_json,
+                artifact_refs: Vec::new(),
+            };
+            let reviewer =
+                crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::Reviewer,
+                    review_message,
+                    crate::domain::ids::AgentRunId::parse("single-publication-reviewer-run").unwrap(),
+                )
+                .unwrap();
+            assert!(
+                crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                    &mut store,
+                    owner_generation,
+                    10,
+                    &config,
+                    config_digest.clone(),
+                    &reviewer.ingested,
+                )
+                .unwrap()
+            );
+            let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+            assert_eq!(assessing.phase, Phase::Assessing);
+
+            let merge_result_json = serde_json::json!({
+                "pr_references": [format!("https://github.com/acme/repo-a/pull/{}", subject.publications[0].pull_request_number)],
+                "subject_digest": subject.digest().unwrap().as_str(),
+                "deterministic_gate_evidence": [
+                    {"gate_id":"pull_request_open","outcome":"pass","evidence_references":[]},
+                    {"gate_id":"review_threads_resolved","outcome":"pass","evidence_references":[]}
+                ],
+                "ratings": {
+                    "change_impact":{"rating":1,"source":"diff","rationale":"small change","evidence_references":[]},
+                    "complexity":{"rating":1,"source":"diff","rationale":"simple change","evidence_references":[]},
+                    "verification_gaps":{"rating":1,"source":"checks","rationale":"covered","evidence_references":[]},
+                    "review_uncertainty":{"rating":1,"source":"review","rationale":"reviewed","evidence_references":[]},
+                    "operational_exposure":{"rating":1,"source":"policy","rationale":"low exposure","evidence_references":[]}
+                },
+                "confidence":"high",
+                "rationale":"all current evidence is present",
+                "disposition":"eligible_for_automatic_merge"
+            });
+            let merge_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-merge-assessment".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&merge_result_json.to_string())).unwrap(),
+                ),
+                structured_result: merge_result_json,
+                artifact_refs: Vec::new(),
+            };
+            let merge_result =
+                crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    merge_message,
+                    crate::domain::ids::AgentRunId::parse("single-publication-merge-run").unwrap(),
+                )
+                .unwrap();
+            let publication = &subject.publications[0];
+            let head = publication.published_head.clone();
+            let replies = vec![
+                serde_json::json!({"id":7,"full_name":"acme/repo-a","default_branch":"main","allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}),
+                serde_json::json!({"node_id":publication.pull_request_node_id,"number":publication.pull_request_number,"state":"open","draft":false,"merged":false,"head":{"sha":head,"ref":"feature","repo":{"id":7}},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"body":null}),
+                serde_json::json!([]),
+                serde_json::json!({"check_runs":[]}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
+            ];
+            let (observation, proposal) =
+                crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &merge_result.ingested,
+                    &accepted.proposal,
+                    &project_id,
+                    replies,
+                )
+                .unwrap();
+            assert_eq!(
+                observation.publication_set_digest,
+                subject.digest().unwrap()
+            );
+            assert_eq!(proposal.publication_set_digest, subject.digest().unwrap());
+            assert!(
+                crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    &merge_result.ingested,
+                    observation,
+                    proposal,
+                )
+                .unwrap()
+            );
+            let trusted = store
+                .trusted_merge_assessment(&project_id, &ticket_run_id, Revision(assessing.revision))
+                .unwrap()
+                .unwrap();
+            assert_eq!(trusted.publication_set_digest, subject.digest().unwrap());
+            assert_eq!(
+                trusted
+                    .prepared_body_proposal
+                    .as_ref()
+                    .unwrap()
+                    .exact_target_body,
+                "Co-authored-by: Codex <noreply@openai.com>"
+            );
+            let wakes = store
+                .pending_role_wake_inputs(
+                    &project_id,
+                    &format!("ticket_run:{ticket_run_id}:merge_decision"),
+                    8,
+                )
+                .unwrap();
+            let matching_wakes = wakes
+                .iter()
+                .filter(|wake| {
+                    wake.payload_json["assessment"]["assessment_id"]
+                        == trusted.assessment_id.as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matching_wakes.len(), 1);
+            let wake = &matching_wakes[0];
+            let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+                schema_version: 1,
+                project_id: project_id.clone(),
+                role_session_id: format!("ticket_run:{ticket_run_id}:merge_decision"),
+                agent_run_id: merge_result
+                    .ingested
+                    .validated
+                    .binding
+                    .agent_run_id
+                    .to_string(),
+                digest: Digest::parse("0".repeat(64)).unwrap(),
+                inputs: vec![crate::agent_api::AgentWakeItem {
+                    wake_input_id: wake.wake_input_id,
+                    source_type: wake.source_type.clone(),
+                    source_id: wake.source_id.clone(),
+                    source_revision: wake.source_revision,
+                    priority: wake.priority,
+                    payload_json: wake.payload_json.clone(),
+                    host_artifact_source_evidence_ids: Vec::new(),
+                    host_artifacts: Vec::new(),
+                }],
+            };
+            wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+            let control_dir = temp.path().join("merge-agent-control");
+            std::fs::create_dir(&control_dir).unwrap();
+            crate::agent_api::publish_wake_snapshot(&control_dir, wake_snapshot).unwrap();
+            let public_inputs = crate::agent_api::read_inbox(
+                &control_dir,
+                &merge_result
+                    .ingested
+                    .validated
+                    .binding
+                    .agent_run_id
+                    .to_string(),
+                0,
+            )
+            .unwrap();
+            assert_eq!(public_inputs.len(), 1);
+            let public_assessment = &public_inputs[0].payload_json["assessment"];
+            let typed_intent = serde_json::json!({
+                "assessment_id": public_assessment["assessment_id"],
+                "pr_identities": [format!("{}#{}", public_assessment["evidence"]["subject"]["repository_id"].as_str().unwrap(), public_assessment["evidence"]["subject"]["pull_request_id"].as_str().unwrap())],
+                "policy_digest": public_assessment["policy_digest"],
+                "prepared_body_digest": public_assessment["prepared_body_proposal"]["target_body_digest"],
+                "steps": [
+                    {"kind":"update_pull_request_body","instruction_reference":"merge.instructions#body","rationale":"add the host-prepared authorship trailer"},
+                    {"kind":"direct_merge","instruction_reference":"merge.instructions#execute","rationale":"execute the configured merge"},
+                    {"kind":"verify_merge_commit","instruction_reference":"merge.instructions#verify","rationale":"verify the resulting merge commit"}
+                ],
+                "post_merge_verification": [
+                    {"kind":"merge_commit_recorded","instruction_reference":"merge.instructions#verify","rationale":"confirm the remote merge commit"}
+                ]
+            });
+            let intent_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-merge-intent".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: None,
+                structured_result: typed_intent.clone(),
+                artifact_refs: Vec::new(),
+            };
+            let bound_intent = intent_message
+                .bind(merge_result.ingested.validated.binding.clone())
+                .unwrap();
+            let crate::engine::orchestration::RoleResultPayload::MergeIntent(intent_payload) =
+                bound_intent.typed_payload
+            else {
+                panic!("public inbox intent did not bind to MergeIntent");
+            };
+            let host_intent = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::MergeDecision,
+                crate::roles::RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "single-publication-merge-intent-result".into(),
+                    kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                    assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                    result_digest: None,
+                    structured_result: typed_intent,
+                    artifact_refs: Vec::new(),
+                },
+                crate::domain::ids::AgentRunId::parse("single-publication-intent-run").unwrap(),
+            )
+            .unwrap();
+            let document_replies = vec![
+                serde_json::json!({"id":7,"full_name":"acme/repo-a","default_branch":"main","allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}),
+                serde_json::json!({"node_id":publication.pull_request_node_id,"number":publication.pull_request_number,"state":"open","draft":false,"merged":false,"head":{"sha":publication.published_head,"ref":"feature","repo":{"id":7}},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"body":null}),
+                serde_json::json!([]),
+                serde_json::json!({"check_runs":[]}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
+            ];
+            let document =
+                crate::runtime_services::merge::tests::prepare_merge_work_document_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &accepted.proposal,
+                    &trusted,
+                    &intent_payload,
+                    &host_intent.ingested,
+                    document_replies,
+                )
+                .unwrap();
+            let first_operation = &document.procedure.steps[0].operation;
+            assert!(matches!(
+                first_operation,
+                crate::merge_policy::MergeProcedureOperation::UpdatePullRequestBody {
+                    expected_prior_body_digest,
+                    ..
+                } if expected_prior_body_digest.as_str() == format!("{:x}", sha2::Sha256::digest(b""))
+            ));
+            return;
+        }
         let pending = store
             .connection
             .query_row(

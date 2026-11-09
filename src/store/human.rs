@@ -227,6 +227,24 @@ pub struct AcceptedPublicationAdoptionApproval {
     authority: crate::human_runtime::PublicationAdoptionAuthority,
 }
 
+/// Exact human approval of one immutable MergeWorkItem. The work item is reloaded and checked
+/// against the request before this capability is minted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedMergeWorkReviewApproval {
+    receipt: HumanApprovalReceipt,
+    work_item: crate::store::merge_work::MergeWorkItem,
+}
+
+impl AcceptedMergeWorkReviewApproval {
+    pub fn receipt(&self) -> &HumanApprovalReceipt {
+        &self.receipt
+    }
+
+    pub fn work_item(&self) -> &crate::store::merge_work::MergeWorkItem {
+        &self.work_item
+    }
+}
+
 impl AcceptedPublicationAdoptionApproval {
     pub fn receipt(&self) -> &HumanApprovalReceipt {
         &self.receipt
@@ -266,6 +284,40 @@ impl HumanApprovalReceipt {
         self.decided_at_unix
     }
     pub fn request_expires_at_unix(&self) -> u64 {
+        self.request_expires_at_unix
+    }
+}
+
+impl crate::merge_executor::HostValidatedHumanApprovalReceipt for HumanApprovalReceipt {
+    fn request_id(&self) -> &HumanRequestId {
+        &self.request_id
+    }
+
+    fn response_id(&self) -> &str {
+        &self.response_id
+    }
+
+    fn subject_digest(&self) -> &Digest {
+        &self.subject_digest
+    }
+
+    fn configuration_digest(&self) -> &Digest {
+        &self.configuration_digest
+    }
+
+    fn policy_digest(&self) -> &Digest {
+        &self.policy_digest
+    }
+
+    fn is_explicit_approval(&self) -> bool {
+        self.choice == crate::human_runtime::HumanDecisionChoice::Approve && self.approved
+    }
+
+    fn decided_at_unix(&self) -> u64 {
+        self.decided_at_unix
+    }
+
+    fn expires_at_unix(&self) -> u64 {
         self.request_expires_at_unix
     }
 }
@@ -516,7 +568,8 @@ impl ConfigStore {
                 | crate::human_runtime::HumanAuthorityMaterial::GoalCompletion { source, .. } => {
                     Some(source)
                 }
-                crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption { .. } => None,
+                crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption { .. }
+                | crate::human_runtime::HumanAuthorityMaterial::MergeWorkReview { .. } => None,
             };
             if let Some(source) = source
                 && !self.human_role_result_is_current_source(source)?
@@ -1298,6 +1351,54 @@ impl ConfigStore {
             authority: material,
         }))
     }
+
+    pub fn accepted_merge_work_review_approval(
+        &self,
+        request_id: &HumanRequestId,
+        expected_work_item: &crate::store::merge_work::MergeWorkItem,
+        now: u64,
+    ) -> Result<Option<AcceptedMergeWorkReviewApproval>, String> {
+        let Some(summary) = load_request(&self.connection, request_id)? else {
+            return Ok(None);
+        };
+        if summary.request.purpose != crate::human_runtime::HumanPurpose::TicketReview {
+            return Ok(None);
+        }
+        let Some(crate::human_runtime::HumanAuthorityMaterial::MergeWorkReview { work_item }) =
+            self.human_request_authority(request_id)?
+        else {
+            return Ok(None);
+        };
+        if work_item.as_ref() != expected_work_item
+            || crate::human_runtime::HumanAuthorityMaterial::merge_work_review_request(
+                request_id.clone(),
+                expected_work_item.clone(),
+                summary.request.expires_at_unix,
+            )? != summary.request
+            || self.merge_work_item(
+                &expected_work_item.project_id,
+                &expected_work_item.ticket_run_id,
+                expected_work_item.awaiting_merge_revision,
+            )? != Some(expected_work_item.clone())
+        {
+            return Ok(None);
+        }
+        let subject_digest = summary.request.subject.digest()?;
+        let Some(receipt) = self.accepted_human_approval(
+            request_id,
+            &subject_digest,
+            &summary.request.subject.configuration_digest,
+            &summary.request.subject.policy_digest,
+            now,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AcceptedMergeWorkReviewApproval {
+            receipt,
+            work_item: expected_work_item.clone(),
+        }))
+    }
 }
 
 fn validate_current_ticket(
@@ -1419,6 +1520,11 @@ fn insert_role_wake(
     if request.purpose == HumanPurpose::ProfileTrial {
         // Trial approvals are consumed by the controller's typed trial coordinator. They must
         // never wake an Agent role session or become semantic factory input.
+        return Ok(());
+    }
+    if request.purpose == HumanPurpose::TicketReview {
+        // TicketReview is a host-controlled merge approval. The controller consumes its durable
+        // receipt against the immutable MergeWorkItem and must not forward it to Coordinator.
         return Ok(());
     }
     let (role_session_id, role_name) = match request.wake_target() {

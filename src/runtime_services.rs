@@ -30,6 +30,8 @@ use crate::store::scheduler::{ObservedTicket, TicketScanKey};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) mod merge;
+
 struct PreparedWorkerContext {
     plan_record: crate::store::accepted_plans::AcceptedWorkPlanRecord,
     validated_plan: crate::engine::orchestration::ValidatedPlan,
@@ -83,6 +85,44 @@ pub struct RuntimeServices {
     agent_recovery: crate::agent_recovery::AgentRecoveryRuntime,
 }
 
+pub(crate) fn operator_plan_ready_for_launch(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    config: &Config,
+    configuration_digest: &Digest,
+    run: &crate::store::scheduler::ActiveTicketRun,
+) -> Result<bool, String> {
+    let current = store
+        .active_ticket_runs(owner_generation, 256)?
+        .into_iter()
+        .find(|candidate| candidate.ticket_run_id == run.ticket_run_id);
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    if current.project_id != run.project_id
+        || current.revision != run.revision
+        || current.phase != crate::engine::reducer::Phase::Operating
+        || current.activity != crate::engine::reducer::Activity::Running
+    {
+        return Ok(false);
+    }
+    let plan = store
+        .operations()?
+        .plan_state(&run.project_id, &run.ticket_run_id)?;
+    let Some(plan) = plan else {
+        return Ok(false);
+    };
+    Ok(plan.state == "required"
+        && crate::engine::host_transitions::validate_persisted_operation_plan(
+            store,
+            config,
+            configuration_digest,
+            run,
+            &plan,
+        )
+        .is_ok())
+}
+
 pub struct RuntimeExecutable<'a> {
     pub path: &'a Path,
     pub digest: &'a Digest,
@@ -100,6 +140,13 @@ struct WorkerAssignmentContext<'a> {
     recovery_authorization: Option<&'a crate::engine::orchestration::WorkerRecoveryAuthorization>,
     commit_mode: crate::domain::types::CommitMode,
     repository_id: &'a crate::domain::ids::RepositoryId,
+}
+
+fn register_merge_effect_handler(
+    handlers: &mut Vec<Box<dyn EffectHandler>>,
+    source: &Arc<merge::RuntimeMergeEvidenceSource>,
+) {
+    handlers.push(Box::new(source.effect_handler()));
 }
 
 struct WorkerVerificationAssignment {
@@ -293,6 +340,12 @@ impl RuntimeServices {
             )
             .into_handlers(),
         );
+        let merge_source = Arc::new(merge::RuntimeMergeEvidenceSource::new(
+            applied_config.clone(),
+            search_path.clone(),
+            host_environment.clone(),
+        ));
+        register_merge_effect_handler(&mut handlers, &merge_source);
         if let Some(human) = &applied_config.config.human {
             let declarative_root = host_environment
                 .get(std::ffi::OsStr::new("XDG_CONFIG_HOME"))
@@ -304,11 +357,13 @@ impl RuntimeServices {
                 })
                 .ok_or("captured environment has neither XDG_CONFIG_HOME nor HOME")?
                 .join("rex-projects");
-            let observer = crate::human_runtime::DurableHumanSubjectObserver::with_delivery(
-                declarative_root,
-                owner_generation,
-                delivery.shared_effects(),
-            )?;
+            let observer =
+                crate::human_runtime::DurableHumanSubjectObserver::with_merge_work_review(
+                    declarative_root,
+                    owner_generation,
+                    delivery.shared_effects(),
+                    merge_source.clone(),
+                )?;
             handlers.push(Box::new(
                 crate::human_runtime::HumanPresenterEffectHandler::new(
                     &human.kind,
@@ -1837,6 +1892,68 @@ impl FactoryRuntimeServices for RuntimeServices {
         )
     }
 
+    fn process_one_merge_human_response(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        let declarative_root = self
+            .host_environment
+            .get(std::ffi::OsStr::new("XDG_CONFIG_HOME"))
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.host_environment
+                    .get(std::ffi::OsStr::new("HOME"))
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .ok_or("captured environment has neither XDG_CONFIG_HOME nor HOME")?
+            .join("rex-projects");
+        let source = Arc::new(merge::RuntimeMergeEvidenceSource::new(
+            self.applied_config.clone(),
+            self.rex_search_path.clone(),
+            self.host_environment.clone(),
+        ));
+        let observer = crate::human_runtime::DurableHumanSubjectObserver::with_merge_work_review(
+            declarative_root,
+            owner_generation,
+            self.delivery.shared_effects(),
+            source,
+        )?;
+        let now =
+            u64::try_from(now_unix).map_err(|_| "controller clock is before the Unix epoch")?;
+        for queued in store.pending_human_decisions(owner_generation, 64)? {
+            if queued.request.purpose != crate::human_runtime::HumanPurpose::TicketReview {
+                continue;
+            }
+            match crate::human_runtime::HumanSubjectObserver::observe_current_subject(
+                &observer,
+                store,
+                &queued.request,
+            )? {
+                crate::human_runtime::HumanSubjectObservation::Current(subject) => {
+                    store.process_human_decision(
+                        owner_generation,
+                        &queued.intent.response_id,
+                        &subject,
+                        now,
+                    )?;
+                }
+                crate::human_runtime::HumanSubjectObservation::Gone(reason) => {
+                    store.reject_human_decision_stale(
+                        owner_generation,
+                        &queued.intent.response_id,
+                        &reason,
+                        now,
+                    )?;
+                }
+                crate::human_runtime::HumanSubjectObservation::TemporarilyUnavailable => continue,
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn recover_agents(
         &mut self,
         store: &mut ConfigStore,
@@ -2288,6 +2405,62 @@ impl FactoryRuntimeServices for RuntimeServices {
             request_digest,
             expected_revision: Some(effect_revision),
         }))
+    }
+
+    fn observe_merge_assessment(
+        &mut self,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<Option<crate::merge_runtime::MergeEvidenceObservation>, String> {
+        if result.validated.binding.config_digest != self.configuration_digest {
+            return Err("MergeAssessment source belongs to a stale runtime configuration".into());
+        }
+        let source = merge::RuntimeMergeEvidenceSource::new(
+            self.applied_config.clone(),
+            self.rex_search_path.clone(),
+            self.host_environment.clone(),
+        );
+        source
+            .observe_publication_subject(subject, result)
+            .map(Some)
+    }
+
+    fn prepare_merge_body_proposal(
+        &self,
+        project_id: &crate::domain::ids::ProjectId,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        accepted_plan: &crate::engine::orchestration::WorkPlan,
+        assessment_id: &Digest,
+        observation: &crate::merge_runtime::MergeEvidenceObservation,
+    ) -> Result<crate::store::merge_work::PreparedMergeBodyProposal, String> {
+        merge::RuntimeMergeEvidenceSource::new(
+            self.applied_config.clone(),
+            self.rex_search_path.clone(),
+            self.host_environment.clone(),
+        )
+        .prepare_body_proposal(
+            project_id,
+            subject,
+            accepted_plan,
+            assessment_id,
+            observation,
+        )
+    }
+
+    fn resolve_merge_work_document(
+        &mut self,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        accepted_plan: &crate::engine::orchestration::WorkPlan,
+        assessment: &crate::store::merge_work::TrustedMergeAssessment,
+        intent: &crate::engine::orchestration::MergeIntentPayload,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<crate::store::merge_work::MergeWorkDocument, String> {
+        merge::RuntimeMergeEvidenceSource::new(
+            self.applied_config.clone(),
+            self.rex_search_path.clone(),
+            self.host_environment.clone(),
+        )
+        .prepare_merge_work_document(subject, accepted_plan, assessment, intent, result)
     }
 
     fn tick_profile_trials(
@@ -3140,6 +3313,27 @@ impl RuntimeServices {
         {
             return Err("ticket Project configuration or epoch changed".into());
         }
+        if candidate.role == Role::Operator
+            && !operator_plan_ready_for_launch(
+                store,
+                self.owner_generation,
+                config,
+                &self.configuration_digest,
+                &active_run,
+            )?
+        {
+            return Ok(false);
+        }
+        if candidate.role == Role::Postmortem && self.applied_config.config.knowledge.is_none() {
+            crate::engine::host_transitions::block_run_for_host_readiness(
+                store,
+                self.owner_generation,
+                &active_run,
+                "postmortem_capability_unavailable",
+                "Postmortem publication requires a configured knowledge root and publisher",
+            )?;
+            return Ok(false);
+        }
         if candidate.role == Role::Coordinator
             && store.ticket_run_has_unsettled_implementation_publication(
                 &candidate.project_id,
@@ -3888,6 +4082,37 @@ mod view_anchor_args_tests {
     }
 }
 
+#[cfg(test)]
+mod merge_handler_registration_tests {
+    use super::{merge, register_merge_effect_handler};
+    use crate::effects::EffectHandler;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn merge_effect_handler_is_registered_without_a_human_presenter() {
+        let config_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let applied = crate::config::load(&config_path).unwrap();
+        assert!(applied.config.human.is_none());
+
+        let source = Arc::new(merge::RuntimeMergeEvidenceSource::new(
+            applied,
+            Vec::new(),
+            BTreeMap::new(),
+        ));
+        let mut handlers: Vec<Box<dyn EffectHandler>> = Vec::new();
+        register_merge_effect_handler(&mut handlers, &source);
+
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(
+            handlers[0].kind(),
+            crate::effects::EffectKind::Merge,
+            "automatic merge procedures need the merge handler even when no HumanPresenter is configured"
+        );
+    }
+}
+
 fn digest_serialized(value: &impl serde::Serialize) -> Result<Digest, String> {
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     digest_bytes(&bytes)
@@ -4094,7 +4319,8 @@ fn role_allowed_for_run(
     activity: crate::engine::reducer::Activity,
 ) -> bool {
     role_allowed_in_phase(role, phase)
-        && (role != Role::Reviewer || activity == crate::engine::reducer::Activity::Running)
+        && (!matches!(role, Role::Reviewer | Role::Operator | Role::Postmortem)
+            || activity == crate::engine::reducer::Activity::Running)
 }
 
 fn resolve_prepared_worker_context(

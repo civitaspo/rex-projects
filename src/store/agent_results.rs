@@ -1747,7 +1747,7 @@ pub fn acknowledge_agent_result(
     tx.commit().map_err(|error| error.to_string())
 }
 
-/// Acknowledge a host-validated Worker or Reviewer result when its Project configuration has
+/// Acknowledge a host-validated role result when its Project configuration has
 /// changed, provided the TicketRun is still at the exact revision and phase that launched it.
 /// Evidence is retained, and the ACK is scoped to the TicketRun revision so config reloads do not
 /// make the same stale result eligible for reduction again.
@@ -1758,10 +1758,11 @@ pub fn acknowledge_obsolete_configuration_result(
     evidence_id: &str,
     active_config_digest: &Digest,
 ) -> Result<bool, String> {
-    if !matches!(binding.role, Role::Worker | Role::Reviewer) {
-        return Err(
-            "obsolete configuration disposition only supports Worker and Reviewer results".into(),
-        );
+    if !matches!(
+        binding.role,
+        Role::Worker | Role::Reviewer | Role::MergeDecision
+    ) {
+        return Err("obsolete configuration disposition does not support this result role".into());
     }
     let ticket_run_id = binding
         .ticket_run_id
@@ -1803,6 +1804,7 @@ pub fn acknowledge_obsolete_configuration_result(
     let expected_role = match binding.role {
         Role::Worker => "worker",
         Role::Reviewer => "reviewer",
+        Role::MergeDecision => "merge_decision",
         _ => unreachable!(),
     };
     let authority: AgentLaunchAuthority = crate::protocol::parse_unique(authority_json.as_bytes())?;
@@ -1825,6 +1827,7 @@ pub fn acknowledge_obsolete_configuration_result(
     let expected_phase = match binding.role {
         Role::Worker => "implementing",
         Role::Reviewer => "reviewing",
+        Role::MergeDecision => "assessing",
         _ => unreachable!(),
     };
     if phase != expected_phase {
@@ -6372,6 +6375,60 @@ pub(crate) mod host_validation_fixture {
                 owner_generation,
                 &authority,
                 "fixture-postmortem-artifact",
+                &request_digest,
+                &artifact.reference,
+                &artifact.object_path,
+            )?;
+            message.result_digest = Some(digest(
+                &serde_json::to_vec(&message.structured_result)
+                    .map_err(|error| error.to_string())?,
+            )?);
+        } else if role == Role::MergeDecision
+            && message.kind == crate::engine::orchestration::RoleOutputKind::MergeAssessment
+        {
+            let source_path = "evidence/merge-assessment.md";
+            let source_file = authority.workspace_path.join(source_path);
+            std::fs::create_dir_all(
+                source_file
+                    .parent()
+                    .ok_or("MergeAssessment evidence path has no parent")?,
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(
+                &source_file,
+                b"# Merge assessment evidence\n\nHost fixture evidence for the exact accepted publication subject.\n",
+            )
+            .map_err(|error| error.to_string())?;
+            let artifact = artifacts.register(
+                &authority.workspace_path,
+                &authority.project_id,
+                authority.agent_run_id.as_str(),
+                role,
+                source_path,
+                crate::engine::orchestration::RoleArtifactKind::MergeAssessment,
+                1,
+            )?;
+            let reference =
+                serde_json::to_value(&artifact.reference).map_err(|error| error.to_string())?;
+            let gates = message.structured_result["deterministic_gate_evidence"]
+                .as_array_mut()
+                .ok_or("MergeAssessment fixture has no deterministic gate list")?;
+            for gate in gates {
+                gate["evidence_references"] = serde_json::json!([reference]);
+            }
+            let ratings = message.structured_result["ratings"]
+                .as_object_mut()
+                .ok_or("MergeAssessment fixture has no risk ratings")?;
+            for rating in ratings.values_mut() {
+                rating["evidence_references"] = serde_json::json!([reference]);
+            }
+            message.artifact_refs = vec![artifact.reference.clone()];
+            let request_digest = digest(b"fixture MergeAssessment ArtifactAdd request")?;
+            crate::store::artifact_registry::persist_registration(
+                &mut store.connection,
+                owner_generation,
+                &authority,
+                "fixture-merge-assessment-artifact",
                 &request_digest,
                 &artifact.reference,
                 &artifact.object_path,
