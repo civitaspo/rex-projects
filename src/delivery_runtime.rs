@@ -32,6 +32,7 @@ use crate::host_commit::{
     PreparedHostCommit,
 };
 use crate::host_jobs::{HostJobEnvironmentBinding, HostJobPool};
+use crate::parent_artifacts::VerifiedStagedHostArtifact;
 use crate::process::{self, ProcessOutput, ProcessRequest};
 use crate::worktrees::{
     GitOptions, ManagedRepository, ManagedWorktree, NativeCommitReceipt, TicketKey, WorktreeError,
@@ -443,6 +444,7 @@ impl RepositoryDelivery {
                         manifest,
                         &manifest_root,
                         message,
+                        &[],
                     )
                     .map_err(DeliveryError::HostCommit)?;
                 if prepared.intent.expected_head != expected_head {
@@ -452,7 +454,7 @@ impl RepositoryDelivery {
                 }
                 let receipt = match self
                     .commits
-                    .execute(&work.worktree, &prepared)
+                    .execute(&work.worktree, &prepared, &[])
                     .map_err(DeliveryError::HostCommit)
                 {
                     Ok(receipt) => receipt,
@@ -473,8 +475,8 @@ impl RepositoryDelivery {
         operation_id: OperationId,
         expected_head: &str,
         manifest: ChangeManifest,
-        manifest_root: &Path,
         message: String,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<PreparedHostCommit, DeliveryError> {
         if work.commit_mode != CommitMode::Host {
             return Err(DeliveryError::Invalid(
@@ -499,8 +501,9 @@ impl RepositoryDelivery {
                 &commit_worktree,
                 operation_id,
                 manifest,
-                manifest_root,
+                &work.worktree.path,
                 message,
+                host_artifacts,
             )
             .map_err(DeliveryError::HostCommit)
     }
@@ -511,8 +514,8 @@ impl RepositoryDelivery {
         operation_id: &OperationId,
         expected_head: &str,
         manifest: &ChangeManifest,
-        manifest_root: &Path,
         message: &str,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<Option<PreparedHostCommit>, DeliveryError> {
         if work.commit_mode != CommitMode::Host {
             return Err(DeliveryError::Invalid(
@@ -531,8 +534,9 @@ impl RepositoryDelivery {
                 &commit_worktree,
                 operation_id,
                 manifest,
-                manifest_root,
+                &work.worktree.path,
                 message,
+                host_artifacts,
             )
             .map_err(DeliveryError::HostCommit)
     }
@@ -558,6 +562,7 @@ impl RepositoryDelivery {
         &self,
         work: &PreparedRepositoryWork,
         prepared: &PreparedHostCommit,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<HostCommitReceipt, DeliveryError> {
         let _lease = self
             .worktrees
@@ -566,7 +571,7 @@ impl RepositoryDelivery {
         let mut commit_worktree = work.worktree.clone();
         commit_worktree.base_sha = prepared.intent.expected_head.clone();
         self.commits
-            .execute(&commit_worktree, prepared)
+            .execute(&commit_worktree, prepared, host_artifacts)
             .map_err(DeliveryError::HostCommit)
     }
 
@@ -575,6 +580,7 @@ impl RepositoryDelivery {
         &self,
         work: &PreparedRepositoryWork,
         prepared: &PreparedHostCommit,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<Option<HostCommitReceipt>, DeliveryError> {
         let _lease = self
             .worktrees
@@ -583,7 +589,37 @@ impl RepositoryDelivery {
         let mut commit_worktree = work.worktree.clone();
         commit_worktree.base_sha = prepared.intent.expected_head.clone();
         self.commits
-            .reconcile(&commit_worktree, prepared)
+            .reconcile(&commit_worktree, prepared, host_artifacts)
+            .map_err(DeliveryError::HostCommit)
+    }
+
+    pub fn validate_host_manifest_scope(
+        &self,
+        work: &PreparedRepositoryWork,
+        operation_id: &OperationId,
+        expected_head: &str,
+        manifest: &ChangeManifest,
+        host_artifacts: &[VerifiedStagedHostArtifact],
+    ) -> Result<(), DeliveryError> {
+        if work.commit_mode != CommitMode::Host {
+            return Err(DeliveryError::Invalid(
+                "host manifest scope does not match the selected commit mode".into(),
+            ));
+        }
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(work.worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        let mut commit_worktree = work.worktree.clone();
+        commit_worktree.base_sha = expected_head.to_owned();
+        self.commits
+            .validate_manifest_scope(
+                &commit_worktree,
+                operation_id,
+                manifest,
+                &work.worktree.path,
+                host_artifacts,
+            )
             .map_err(DeliveryError::HostCommit)
     }
 
@@ -2133,22 +2169,41 @@ impl RepositoryDeliveryEffects {
             }
             return Err(error_message);
         }
+        let artifact_locators = store.persisted_worker_host_artifacts(
+            &payload.project_id,
+            &payload.ticket_run_id,
+            assignment,
+        )?;
+        let verified_host_artifacts = crate::parent_artifacts::verify_staged_host_artifacts(
+            store,
+            artifacts,
+            &payload.project_id,
+            &payload.ticket_run_id,
+            &payload.configuration_digest,
+            &payload.worktree_path,
+            &artifact_locators,
+        )?;
         let operation_id = OperationId::parse(request.intent.operation_id.clone())?;
         let commit = match mode {
             EffectMode::Submit => {
-                let prepared = self
-                    .delivery
-                    .prepare_host_manifest(
-                        &work,
-                        operation_id.clone(),
-                        &payload.expected_head,
-                        payload.manifest.clone(),
-                        &work.worktree.path,
-                        payload.commit_message.clone(),
-                    )
-                    .map_err(|error| error.to_string())?;
+                let prepared = match self.delivery.prepare_host_manifest(
+                    &work,
+                    operation_id.clone(),
+                    &payload.expected_head,
+                    payload.manifest.clone(),
+                    payload.commit_message.clone(),
+                    &verified_host_artifacts,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        if let Some(observation) = rejected_manifest_scope(&error) {
+                            return Ok(observation);
+                        }
+                        return Err(error.to_string());
+                    }
+                };
                 self.delivery
-                    .execute_host_commit(&work, &prepared)
+                    .execute_host_commit(&work, &prepared, &verified_host_artifacts)
                     .map_err(|error| error.to_string())?
             }
             EffectMode::Reconcile => {
@@ -2159,11 +2214,23 @@ impl RepositoryDeliveryEffects {
                         &operation_id,
                         &payload.expected_head,
                         &payload.manifest,
-                        &work.worktree.path,
                         &payload.commit_message,
+                        &verified_host_artifacts,
                     )
                     .map_err(|error| error.to_string())?
                 else {
+                    if let Err(error) = self.delivery.validate_host_manifest_scope(
+                        &work,
+                        &operation_id,
+                        &payload.expected_head,
+                        &payload.manifest,
+                        &verified_host_artifacts,
+                    ) {
+                        if let Some(observation) = rejected_manifest_scope(&error) {
+                            return Ok(observation);
+                        }
+                        return Err(error.to_string());
+                    }
                     return absent_effect(
                         EffectKind::CommitWorkerManifest,
                         request,
@@ -2173,7 +2240,7 @@ impl RepositoryDeliveryEffects {
                 };
                 match self
                     .delivery
-                    .reconcile_host_commit(&work, &prepared)
+                    .reconcile_host_commit(&work, &prepared, &verified_host_artifacts)
                     .map_err(|error| error.to_string())?
                 {
                     Some(receipt) => receipt,
@@ -3510,6 +3577,15 @@ fn rejected_commit_trailer_validation(error: DeliveryError) -> Option<EffectObse
     match error {
         DeliveryError::HostCommit(HostCommitError::Invalid(message)) => {
             Some(rejected_delivery_effect(message))
+        }
+        _ => None,
+    }
+}
+
+fn rejected_manifest_scope(error: &DeliveryError) -> Option<EffectObservation> {
+    match error {
+        DeliveryError::HostCommit(HostCommitError::ManifestMismatch(message)) => {
+            Some(rejected_delivery_effect(message.clone()))
         }
         _ => None,
     }

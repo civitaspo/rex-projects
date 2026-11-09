@@ -9,7 +9,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::agent_api::HostArtifactLocator;
 use crate::domain::ids::{Digest, OperationId, RepositoryId};
+use crate::parent_artifacts::VerifiedStagedHostArtifact;
 use crate::process::{self, ProcessOutput, ProcessRequest};
 use crate::worktrees::ManagedWorktree;
 
@@ -82,6 +84,8 @@ pub struct HostCommitIntent {
     pub normal_index: IndexIdentity,
     pub normal_index_backup: PathBuf,
     pub staging_directory: PathBuf,
+    #[serde(default)]
+    pub host_artifact_allowlist: Vec<HostArtifactLocator>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -120,6 +124,7 @@ pub struct HostCommitReceipt {
 #[derive(Debug)]
 pub enum HostCommitError {
     Invalid(String),
+    ManifestMismatch(String),
     Io(String),
     Git(&'static str, String),
     Conflict(String),
@@ -133,9 +138,10 @@ pub enum HostCommitError {
 impl std::fmt::Display for HostCommitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid(message) | Self::Io(message) | Self::Conflict(message) => {
-                f.write_str(message)
-            }
+            Self::Invalid(message)
+            | Self::ManifestMismatch(message)
+            | Self::Io(message)
+            | Self::Conflict(message) => f.write_str(message),
             Self::Git(operation, message) => write!(f, "git {operation} failed: {message}"),
             Self::UnexpectedCommit { head, .. } => {
                 write!(f, "commit {head} differs from the requested tree")
@@ -186,6 +192,7 @@ impl HostCommitter {
         manifest: ChangeManifest,
         manifest_root: &Path,
         message: String,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<PreparedHostCommit, HostCommitError> {
         validate_manifest(&manifest)?;
         if message.trim().is_empty() || message.contains('\0') {
@@ -211,6 +218,15 @@ impl HostCommitter {
             ));
         }
         let _lock = self.repository_lock(&worktree.repository_id)?;
+        let staging_directory = self
+            .state_root
+            .join("host-commits")
+            .join(operation_id.as_str());
+        let operation_has_staging = match fs::symlink_metadata(&staging_directory) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(io_error(error)),
+        };
         let head = self.git_text(
             &repo,
             "resolve expected HEAD",
@@ -224,13 +240,18 @@ impl HostCommitter {
                 "host manifest commits require a clean worktree at its recorded base".into(),
             ));
         }
-        self.require_clean_index_and_manifest(&repo, &head, &manifest)?;
+        let host_artifact_allowlist = self
+            .validate_host_artifacts(&repo, &manifest, host_artifacts)
+            .map_err(|error| downgrade_manifest_mismatch(error, operation_has_staging))?;
+        self.require_clean_index_and_manifest(
+            &repo,
+            &head,
+            &manifest,
+            &host_artifact_allowlist,
+            !operation_has_staging,
+        )?;
         let normal_index = self.index_identity(&repo)?;
         let manifest_digest = manifest_digest(&manifest)?;
-        let staging_directory = self
-            .state_root
-            .join("host-commits")
-            .join(operation_id.as_str());
         let isolated_index = staging_directory.join("index");
         if staging_directory.exists() {
             let stage_metadata = fs::symlink_metadata(&staging_directory).map_err(io_error)?;
@@ -265,6 +286,7 @@ impl HostCommitter {
                 || intent.manifest_digest != manifest_digest
                 || intent.manifest != manifest
                 || intent.message != message
+                || intent.host_artifact_allowlist != host_artifact_allowlist
                 || intent.normal_index != normal_index
                 || intent.staging_directory != staging_directory
                 || intent.normal_index_backup != staging_directory.join("normal-index.backup")
@@ -377,6 +399,7 @@ impl HostCommitter {
             normal_index,
             normal_index_backup,
             staging_directory,
+            host_artifact_allowlist,
         };
         write_private_file(
             &intent.staging_directory.join("intent.json"),
@@ -388,6 +411,67 @@ impl HostCommitter {
             isolated_index,
             expected_tree,
         })
+    }
+
+    /// Validate the live workspace path set without creating a prepared intent or staging index.
+    /// Used only to distinguish a deterministic Submit mismatch from an absent Reconcile intent.
+    pub fn validate_manifest_scope(
+        &self,
+        worktree: &ManagedWorktree,
+        operation_id: &OperationId,
+        manifest: &ChangeManifest,
+        manifest_root: &Path,
+        host_artifacts: &[VerifiedStagedHostArtifact],
+    ) -> Result<(), HostCommitError> {
+        validate_manifest(manifest)?;
+        let repo = worktree.path.canonicalize().map_err(io_error)?;
+        let managed_root = self
+            .state_root
+            .join("worktrees")
+            .canonicalize()
+            .map_err(io_error)?;
+        if !repo.starts_with(managed_root) || !repo.is_dir() {
+            return Err(HostCommitError::Invalid(
+                "host commits are limited to managed worktrees".into(),
+            ));
+        }
+        self.validate_worktree_path(worktree, &repo)?;
+        if manifest_root.canonicalize().map_err(io_error)? != repo {
+            return Err(HostCommitError::Invalid(
+                "manifest source must be the verified managed worktree".into(),
+            ));
+        }
+        let _lock = self.repository_lock(&worktree.repository_id)?;
+        let staging_directory = self
+            .state_root
+            .join("host-commits")
+            .join(operation_id.as_str());
+        match fs::symlink_metadata(&staging_directory) {
+            Ok(_) => {
+                return Err(HostCommitError::Conflict(
+                    "host commit staging already exists and requires reconciliation".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(error)),
+        }
+        let head = self
+            .git_text(
+                &repo,
+                "resolve expected HEAD",
+                ["rev-parse", "--verify", "HEAD"],
+                None,
+                None,
+            )?
+            .trim()
+            .to_owned();
+        if head != worktree.base_sha {
+            return Err(HostCommitError::Conflict(
+                "host manifest commits require a clean worktree at its recorded base".into(),
+            ));
+        }
+        let allowlist = self.validate_host_artifacts(&repo, manifest, host_artifacts)?;
+        self.require_clean_index_and_manifest(&repo, &head, manifest, &allowlist, true)
     }
 
     pub fn validate_required_trailer(
@@ -430,6 +514,7 @@ impl HostCommitter {
         manifest: &ChangeManifest,
         manifest_root: &Path,
         message: &str,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<Option<PreparedHostCommit>, HostCommitError> {
         validate_manifest(manifest)?;
         if message.trim().is_empty() || message.contains('\0') {
@@ -487,6 +572,8 @@ impl HostCommitter {
             HostCommitError::Conflict("interrupted host-commit intent is invalid".into())
         })?;
         let expected_manifest_digest = manifest_digest(manifest)?;
+        let host_artifact_allowlist =
+            self.validate_host_artifacts(&repo, manifest, host_artifacts)?;
         if intent.operation_id != *operation_id
             || intent.repository_id != worktree.repository_id
             || intent.worktree_branch != worktree.branch
@@ -494,6 +581,7 @@ impl HostCommitter {
             || intent.manifest_digest != expected_manifest_digest
             || intent.manifest != *manifest
             || intent.message != message
+            || intent.host_artifact_allowlist != host_artifact_allowlist
             || intent.staging_directory != directory
             || intent.normal_index_backup != directory.join("normal-index.backup")
         {
@@ -519,11 +607,32 @@ impl HostCommitter {
             .trim()
             .to_owned();
         validate_object_id(&expected_tree)?;
+        let expected_head = intent.expected_head.clone();
+        let intent_allowlist = intent.host_artifact_allowlist.clone();
         let prepared = PreparedHostCommit {
             intent,
             isolated_index: index,
             expected_tree,
         };
+        let current_head = self
+            .git_text(
+                &repo,
+                "resolve current HEAD",
+                ["rev-parse", "--verify", "HEAD"],
+                None,
+                None,
+            )?
+            .trim()
+            .to_owned();
+        if current_head == expected_head {
+            self.require_clean_index_and_manifest(
+                &repo,
+                &expected_head,
+                manifest,
+                &intent_allowlist,
+                false,
+            )?;
+        }
         self.validate_prepared(worktree, &prepared, &repo)?;
         self.verify_prepared_tree(&repo, &prepared)?;
         Ok(Some(prepared))
@@ -533,12 +642,21 @@ impl HostCommitter {
         &self,
         worktree: &ManagedWorktree,
         prepared: &PreparedHostCommit,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<HostCommitReceipt, HostCommitError> {
         let repo = worktree.path.canonicalize().map_err(io_error)?;
+        self.require_intent_artifacts(&repo, prepared, host_artifacts)?;
         self.validate_prepared(worktree, prepared, &repo)?;
         let _lock = self.repository_lock(&worktree.repository_id)?;
         self.require_same_head(&repo, &prepared.intent.expected_head)?;
         self.require_same_index(&repo, &prepared.intent.normal_index)?;
+        self.require_clean_index_and_manifest(
+            &repo,
+            &prepared.intent.expected_head,
+            &prepared.intent.manifest,
+            &prepared.intent.host_artifact_allowlist,
+            false,
+        )?;
         self.verify_prepared_tree(&repo, prepared)?;
         let mut environment = IndexEnvironment::new(prepared.isolated_index.clone());
         let _commit_output = self.git_text(
@@ -582,14 +700,25 @@ impl HostCommitter {
         let post_hook_status = self.git_status(
             &repo,
             "verify post-commit worktree",
-            ["status", "--porcelain=v1", "--untracked-files=all"],
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             None,
             Some(&mut IndexEnvironment::new(prepared.isolated_index.clone())),
         )?;
-        if !post_hook_status.stdout.is_empty() {
+        if !self.status_contains_only_host_artifacts(
+            &repo,
+            &prepared.intent.host_artifact_allowlist,
+            &post_hook_status.stdout,
+        )? {
             return Err(HostCommitError::Conflict(
                 "Git hooks changed the worktree outside the requested tree".into(),
             ));
+        }
+        for artifact in host_artifacts {
+            artifact.verify_copy_in(&repo).map_err(|message| {
+                HostCommitError::Conflict(format!(
+                    "post-hook host artifact verification failed: {message}"
+                ))
+            })?;
         }
         self.git_status(
             &repo,
@@ -624,8 +753,10 @@ impl HostCommitter {
         &self,
         worktree: &ManagedWorktree,
         prepared: &PreparedHostCommit,
+        host_artifacts: &[VerifiedStagedHostArtifact],
     ) -> Result<Option<HostCommitReceipt>, HostCommitError> {
         let repo = worktree.path.canonicalize().map_err(io_error)?;
+        self.require_intent_artifacts(&repo, prepared, host_artifacts)?;
         self.validate_prepared(worktree, prepared, &repo)?;
         let _lock = self.repository_lock(&worktree.repository_id)?;
         self.verify_prepared_tree(&repo, prepared)?;
@@ -682,14 +813,25 @@ impl HostCommitter {
         let worktree_status = self.git_status(
             &repo,
             "verify reconciled worktree",
-            ["status", "--porcelain=v1", "--untracked-files=all"],
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             None,
             Some(&mut IndexEnvironment::new(prepared.isolated_index.clone())),
         )?;
-        if !worktree_status.stdout.is_empty() {
+        if !self.status_contains_only_host_artifacts(
+            &repo,
+            &prepared.intent.host_artifact_allowlist,
+            &worktree_status.stdout,
+        )? {
             return Err(HostCommitError::Conflict(
                 "interrupted Git hooks left uncommitted worktree changes".into(),
             ));
+        }
+        for artifact in host_artifacts {
+            artifact.verify_copy_in(&repo).map_err(|message| {
+                HostCommitError::Conflict(format!(
+                    "reconciled host artifact verification failed: {message}"
+                ))
+            })?;
         }
         self.git_status(
             &repo,
@@ -796,6 +938,8 @@ impl HostCommitter {
         repo: &Path,
         head: &str,
         manifest: &ChangeManifest,
+        host_artifacts: &[HostArtifactLocator],
+        terminal_mismatch: bool,
     ) -> Result<(), HostCommitError> {
         let index_result = self.git_status(
             repo,
@@ -823,19 +967,35 @@ impl HostCommitter {
             None,
             None,
         )?;
-        let mut changed = tracked
+        let tracked = tracked
             .as_bytes()
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
             .map(|path| String::from_utf8_lossy(path).into_owned())
-            .chain(
-                untracked
-                    .as_bytes()
-                    .split(|byte| *byte == 0)
-                    .filter(|path| !path.is_empty())
-                    .map(|path| String::from_utf8_lossy(path).into_owned()),
-            )
             .collect::<Vec<_>>();
+        let mut untracked = untracked
+            .as_bytes()
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+        let allowed = host_artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if tracked.iter().any(|path| allowed.contains(path.as_str()))
+            || manifest
+                .entries
+                .iter()
+                .any(|entry| allowed.contains(entry.path()))
+        {
+            return Err(HostCommitError::ManifestMismatch(
+                "verified host artifact path overlaps a tracked or manifested change".into(),
+            ));
+        }
+        untracked.retain(|path| !allowed.contains(path.as_str()));
+        let mut changed = tracked;
+        changed.extend(untracked);
         changed.sort();
         changed.dedup();
         let expected = manifest
@@ -844,12 +1004,86 @@ impl HostCommitter {
             .map(|entry| entry.path().to_owned())
             .collect::<Vec<_>>();
         if changed != expected {
-            return Err(HostCommitError::Conflict(
+            let message =
                 "manifest paths must cover every tracked and nonignored untracked change exactly"
-                    .into(),
+                    .into();
+            return Err(if terminal_mismatch {
+                HostCommitError::ManifestMismatch(message)
+            } else {
+                HostCommitError::Conflict(message)
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_host_artifacts(
+        &self,
+        repo: &Path,
+        manifest: &ChangeManifest,
+        artifacts: &[VerifiedStagedHostArtifact],
+    ) -> Result<Vec<HostArtifactLocator>, HostCommitError> {
+        let mut locators = Vec::with_capacity(artifacts.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for artifact in artifacts {
+            artifact.verify_copy_in(repo).map_err(|message| {
+                HostCommitError::Conflict(format!("verified host artifact copy changed: {message}"))
+            })?;
+            let locator = artifact.locator().clone();
+            if !seen.insert(locator.path.clone()) {
+                return Err(HostCommitError::ManifestMismatch(
+                    "verified host artifact allowlist repeats a path".into(),
+                ));
+            }
+            if manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path() == locator.path)
+            {
+                return Err(HostCommitError::ManifestMismatch(
+                    "verified host artifact path is also listed in the change manifest".into(),
+                ));
+            }
+            locators.push(locator);
+        }
+        locators.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(locators)
+    }
+
+    fn require_intent_artifacts(
+        &self,
+        repo: &Path,
+        prepared: &PreparedHostCommit,
+        artifacts: &[VerifiedStagedHostArtifact],
+    ) -> Result<(), HostCommitError> {
+        let actual = self.validate_host_artifacts(repo, &prepared.intent.manifest, artifacts)?;
+        if actual != prepared.intent.host_artifact_allowlist {
+            return Err(HostCommitError::Conflict(
+                "verified host artifacts differ from the prepared commit intent".into(),
             ));
         }
         Ok(())
+    }
+
+    fn status_contains_only_host_artifacts(
+        &self,
+        _repo: &Path,
+        host_artifacts: &[HostArtifactLocator],
+        status: &[u8],
+    ) -> Result<bool, HostCommitError> {
+        let mut allowed = std::collections::BTreeSet::new();
+        for artifact in host_artifacts {
+            artifact.validate().map_err(HostCommitError::Invalid)?;
+            allowed.insert(artifact.path.as_bytes());
+        }
+        for record in status
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            if record.len() < 4 || &record[..3] != b"?? " || !allowed.contains(&record[3..]) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn index_path(&self, repo: &Path) -> Result<PathBuf, HostCommitError> {
@@ -1945,6 +2179,20 @@ fn io_error(error: std::io::Error) -> HostCommitError {
     HostCommitError::Io(error.to_string())
 }
 
+fn downgrade_manifest_mismatch(
+    error: HostCommitError,
+    operation_has_staging: bool,
+) -> HostCommitError {
+    if operation_has_staging {
+        match error {
+            HostCommitError::ManifestMismatch(message) => HostCommitError::Conflict(message),
+            other => other,
+        }
+    } else {
+        error
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2151,6 +2399,186 @@ mod tests {
         }
     }
 
+    #[test]
+    fn manifest_allowlist_omits_only_verified_host_objects_and_rejects_other_paths() {
+        use crate::agent_api::HostArtifactLocator;
+        use crate::domain::ids::ArtifactId;
+        use crate::engine::orchestration::RoleArtifactKind;
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = fixture();
+        let source = b"manifested source\n";
+        fs::write(fixture.worktree.path.join("README.md"), source).unwrap();
+        let manifest = ChangeManifest {
+            schema_version: 1,
+            entries: vec![ManifestEntry::Write {
+                path: "README.md".into(),
+                mode: FileMode::Regular0644,
+                sha256: digest(source),
+                byte_count: source.len() as u64,
+            }],
+        };
+        let object = b"verified parent artifact\n";
+        let artifact_digest = format!("{:x}", Sha256::digest(object));
+        let artifact_id = ArtifactId::parse(artifact_digest.clone()).unwrap();
+        let artifact_path = format!(
+            ".rex-artifacts/sha256/{}/{}",
+            &artifact_digest[..2],
+            artifact_digest
+        );
+        let artifact_file = fixture.worktree.path.join(&artifact_path);
+        fs::create_dir_all(artifact_file.parent().unwrap()).unwrap();
+        write_private_file(&artifact_file, object).unwrap();
+        fs::set_permissions(&artifact_file, fs::Permissions::from_mode(0o400)).unwrap();
+        let locator = HostArtifactLocator {
+            artifact_id,
+            kind: RoleArtifactKind::TestReceipt,
+            schema_version: 1,
+            digest: Digest::parse(artifact_digest).unwrap(),
+            bytes: object.len() as u64,
+            path: artifact_path,
+            source_run_id: "fixture-worker".into(),
+            source_evidence_id: "a".repeat(64),
+            source_authority_digest: Digest::parse("b".repeat(64)).unwrap(),
+        };
+        let verified = VerifiedStagedHostArtifact::from_locator_for_test(locator);
+        let unknown = fixture.worktree.path.join("correction-test-receipt.txt");
+        fs::write(&unknown, b"not registered\n").unwrap();
+
+        assert!(matches!(
+            fixture.committer.validate_manifest_scope(
+                &fixture.worktree,
+                &OperationId::parse("manifest-boundary-test").unwrap(),
+                &manifest,
+                &fixture.worktree.path,
+                std::slice::from_ref(&verified),
+            ),
+            Err(HostCommitError::ManifestMismatch(_))
+        ));
+
+        fs::remove_file(&unknown).unwrap();
+        fixture
+            .committer
+            .validate_manifest_scope(
+                &fixture.worktree,
+                &OperationId::parse("manifest-boundary-test").unwrap(),
+                &manifest,
+                &fixture.worktree.path,
+                std::slice::from_ref(&verified),
+            )
+            .unwrap();
+
+        let overlapping_manifest = ChangeManifest {
+            schema_version: 1,
+            entries: vec![ManifestEntry::Write {
+                path: verified.path().into(),
+                mode: FileMode::Regular0644,
+                sha256: digest(object),
+                byte_count: object.len() as u64,
+            }],
+        };
+        assert!(matches!(
+            fixture.committer.validate_host_artifacts(
+                &fixture.worktree.path,
+                &overlapping_manifest,
+                std::slice::from_ref(&verified),
+            ),
+            Err(HostCommitError::ManifestMismatch(_))
+        ));
+
+        let changed_object = fixture.worktree.path.join(verified.path());
+        fs::set_permissions(&changed_object, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&changed_object, b"changed bytes\n").unwrap();
+        assert!(matches!(
+            fixture.committer.validate_manifest_scope(
+                &fixture.worktree,
+                &OperationId::parse("manifest-boundary-test").unwrap(),
+                &manifest,
+                &fixture.worktree.path,
+                std::slice::from_ref(&verified),
+            ),
+            Err(HostCommitError::Conflict(_))
+        ));
+
+        fs::set_permissions(&changed_object, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&changed_object, object).unwrap();
+        fs::set_permissions(&changed_object, fs::Permissions::from_mode(0o400)).unwrap();
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                OperationId::parse("verified-artifact-host-commit").unwrap(),
+                manifest,
+                &fixture.worktree.path,
+                "docs: commit with verified host artifact\n\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
+                std::slice::from_ref(&verified),
+            )
+            .unwrap();
+        let receipt = fixture
+            .committer
+            .execute(
+                &fixture.worktree,
+                &prepared,
+                std::slice::from_ref(&verified),
+            )
+            .unwrap();
+        assert!(receipt.signature_verified);
+        assert_eq!(
+            fs::read(fixture.worktree.path.join("README.md")).unwrap(),
+            source
+        );
+        let status = successful_git(
+            &fixture.worktree.path,
+            &["status", "--porcelain", "--untracked-files=all"],
+            &fixture.environment,
+        );
+        assert_eq!(status.trim(), format!("?? {}", verified.path()));
+    }
+
+    #[test]
+    fn existing_prepared_intent_keeps_manifest_mismatch_retryable() {
+        let fixture = fixture();
+        let source = b"manifested source\n";
+        fs::write(fixture.worktree.path.join("README.md"), source).unwrap();
+        let manifest = ChangeManifest {
+            schema_version: 1,
+            entries: vec![ManifestEntry::Write {
+                path: "README.md".into(),
+                mode: FileMode::Regular0644,
+                sha256: digest(source),
+                byte_count: source.len() as u64,
+            }],
+        };
+        let operation_id = OperationId::parse("prepared-manifest-retry").unwrap();
+        fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                &fixture.worktree.path,
+                "docs: prepared manifest\n\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
+                &[],
+            )
+            .unwrap();
+        fs::write(
+            fixture.worktree.path.join("correction-test-receipt.txt"),
+            b"appeared after the durable intent\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture.committer.prepare(
+                &fixture.worktree,
+                operation_id,
+                manifest,
+                &fixture.worktree.path,
+                "docs: prepared manifest\n\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
+                &[],
+            ),
+            Err(HostCommitError::Conflict(_))
+        ));
+    }
+
     fn write_entry(path: &str, bytes: &[u8], mode: FileMode) -> ManifestEntry {
         ManifestEntry::Write {
             path: path.into(),
@@ -2246,10 +2674,10 @@ mod tests {
             manifest(vec![write_entry("change.txt", b"configuration preserved\n", FileMode::Regular0644)]),
             repo,
             "fix: preserve configured Git environment\n\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
-        ).unwrap();
+        &[]).unwrap();
         let receipt = fixture
             .committer
-            .execute(&fixture.worktree, &prepared)
+            .execute(&fixture.worktree, &prepared, &[])
             .unwrap();
         assert!(
             receipt.signature_verified && receipt.hooks_completed && receipt.index_synchronized
@@ -2294,6 +2722,7 @@ mod tests {
                 manifest,
                 repo,
                 "feat: apply manifest\n\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
+                &[],
             )
             .unwrap();
         let recovered = fixture
@@ -2304,12 +2733,13 @@ mod tests {
                 prepared.intent.manifest.clone(),
                 repo,
                 prepared.intent.message.clone(),
+                &[],
             )
             .unwrap();
         assert_eq!(recovered.expected_tree, prepared.expected_tree);
         let receipt = fixture
             .committer
-            .execute(&fixture.worktree, &recovered)
+            .execute(&fixture.worktree, &recovered, &[])
             .unwrap();
         assert!(receipt.signature_verified);
         assert!(receipt.index_synchronized);
@@ -2342,7 +2772,8 @@ mod tests {
                     OperationId::parse("op-2").unwrap(),
                     manifest.clone(),
                     repo,
-                    "feat: apply manifest".into()
+                    "feat: apply manifest".into(),
+                    &[]
                 )
                 .is_err()
         );
@@ -2355,6 +2786,7 @@ mod tests {
                 manifest,
                 repo,
                 "feat: apply manifest".into(),
+                &[],
             )
             .unwrap();
         fs::write(repo.join("other.txt"), b"parallel change\n").unwrap();
@@ -2362,7 +2794,7 @@ mod tests {
         assert!(
             fixture
                 .committer
-                .execute(&fixture.worktree, &prepared)
+                .execute(&fixture.worktree, &prepared, &[])
                 .is_err()
         );
         let current = successful_git(repo, &["rev-parse", "HEAD"], &fixture.environment);
@@ -2392,7 +2824,8 @@ mod tests {
                     OperationId::parse("op-4").unwrap(),
                     manifest,
                     repo,
-                    "feat: apply manifest".into()
+                    "feat: apply manifest".into(),
+                    &[]
                 )
                 .is_err()
         );
@@ -2430,16 +2863,17 @@ mod tests {
                 manifest,
                 repo,
                 "feat: apply manifest".into(),
+                &[],
             )
             .unwrap();
         assert!(matches!(
-            fixture.committer.execute(&fixture.worktree, &prepared),
+            fixture.committer.execute(&fixture.worktree, &prepared, &[]),
             Err(HostCommitError::Conflict(_))
         ));
         assert!(
             fixture
                 .committer
-                .reconcile(&fixture.worktree, &prepared)
+                .reconcile(&fixture.worktree, &prepared, &[])
                 .is_err()
         );
     }
@@ -2465,6 +2899,7 @@ mod tests {
                 original_manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         assert_eq!(prepared.intent.expected_head, fixture.worktree.base_sha);
@@ -2473,7 +2908,7 @@ mod tests {
         // the effect receipt. Reconciliation must recover the immutable intent.
         let first_receipt = fixture
             .committer
-            .execute(&fixture.worktree, &prepared)
+            .execute(&fixture.worktree, &prepared, &[])
             .unwrap();
         let post_commit_head = successful_git(repo, &["rev-parse", "HEAD"], &fixture.environment);
         assert_eq!(post_commit_head.trim(), first_receipt.observed_head);
@@ -2518,6 +2953,7 @@ mod tests {
                 &original_manifest,
                 repo,
                 message,
+                &[],
             )
             .unwrap()
             .expect("persisted prepared intent should load at post-commit HEAD");
@@ -2525,7 +2961,7 @@ mod tests {
         assert_eq!(loaded.expected_tree, prepared.expected_tree);
         let recovered_receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should be recognized");
         assert_eq!(recovered_receipt.observed_head, first_receipt.observed_head);
@@ -2544,7 +2980,7 @@ mod tests {
         let synchronized_index = fixture.committer.index_identity(repo).unwrap();
         let replayed_receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("replaying reconciliation should return the same receipt");
         assert_eq!(replayed_receipt, recovered_receipt);
@@ -2577,6 +3013,7 @@ mod tests {
                 manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         let original_index = fs::read(&prepared.intent.normal_index.canonical_path).unwrap();
@@ -2588,12 +3025,19 @@ mod tests {
 
         let loaded = fixture
             .committer
-            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &manifest,
+                repo,
+                message,
+                &[],
+            )
             .unwrap()
             .expect("the durable host-commit intent should load");
         let receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should reconcile");
 
@@ -2636,6 +3080,7 @@ mod tests {
                 manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         create_interrupted_host_commit(&fixture, &prepared);
@@ -2646,12 +3091,19 @@ mod tests {
 
         let loaded = fixture
             .committer
-            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &manifest,
+                repo,
+                message,
+                &[],
+            )
             .unwrap()
             .expect("the durable host-commit intent should load");
         let receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should still be recognized");
 
@@ -2700,6 +3152,7 @@ mod tests {
                 manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         create_interrupted_host_commit(&fixture, &prepared);
@@ -2721,12 +3174,19 @@ mod tests {
 
         let loaded = fixture
             .committer
-            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &manifest,
+                repo,
+                message,
+                &[],
+            )
             .unwrap()
             .expect("the durable host-commit intent should load");
         let receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should still be recognized");
 
@@ -2759,11 +3219,12 @@ mod tests {
                 manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         fixture
             .committer
-            .execute(&fixture.worktree, &prepared)
+            .execute(&fixture.worktree, &prepared, &[])
             .unwrap();
         successful_git(
             repo,
@@ -2785,12 +3246,19 @@ mod tests {
 
         let loaded = fixture
             .committer
-            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &manifest,
+                repo,
+                message,
+                &[],
+            )
             .unwrap()
             .expect("the durable host-commit intent should load");
         let receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should still be recognized");
 
@@ -2847,6 +3315,7 @@ mod tests {
                 manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         create_interrupted_host_commit(&fixture, &prepared);
@@ -2879,12 +3348,19 @@ mod tests {
 
         let loaded = fixture
             .committer
-            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &manifest,
+                repo,
+                message,
+                &[],
+            )
             .unwrap()
             .expect("the durable host-commit intent should load");
         let receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should still be recognized");
 
@@ -2915,6 +3391,7 @@ mod tests {
                 manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         create_interrupted_host_commit(&fixture, &prepared);
@@ -2926,12 +3403,19 @@ mod tests {
 
         let loaded = fixture
             .committer
-            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &manifest,
+                repo,
+                message,
+                &[],
+            )
             .unwrap()
             .expect("the durable host-commit intent should load");
         let receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should still be recognized");
 
@@ -2966,6 +3450,7 @@ mod tests {
                 manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         create_interrupted_host_commit(&fixture, &prepared);
@@ -2977,12 +3462,19 @@ mod tests {
 
         let loaded = fixture
             .committer
-            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &manifest,
+                repo,
+                message,
+                &[],
+            )
             .unwrap()
             .expect("the durable host-commit intent should load");
         let receipt = fixture
             .committer
-            .reconcile(&fixture.worktree, &loaded)
+            .reconcile(&fixture.worktree, &loaded, &[])
             .unwrap()
             .expect("the exact interrupted commit should still be recognized");
 
@@ -3018,6 +3510,7 @@ mod tests {
                 original_manifest.clone(),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
 
@@ -3032,7 +3525,8 @@ mod tests {
                 &operation_id,
                 &changed_manifest,
                 repo,
-                message
+                message,
+                &[]
             ),
             Err(HostCommitError::Conflict(_))
         ));
@@ -3042,7 +3536,8 @@ mod tests {
                 &operation_id,
                 &original_manifest,
                 repo,
-                "feat: changed request"
+                "feat: changed request",
+                &[]
             ),
             Err(HostCommitError::Conflict(_))
         ));
@@ -3067,6 +3562,7 @@ mod tests {
                 )]),
                 repo,
                 "feat: expected message".into(),
+                &[],
             )
             .unwrap();
 
@@ -3102,7 +3598,9 @@ mod tests {
         );
 
         assert!(matches!(
-            fixture.committer.reconcile(&fixture.worktree, &prepared),
+            fixture
+                .committer
+                .reconcile(&fixture.worktree, &prepared, &[]),
             Err(HostCommitError::Conflict(_))
         ));
     }
@@ -3126,6 +3624,7 @@ mod tests {
                 )]),
                 repo,
                 "feat: expected message".into(),
+                &[],
             )
             .unwrap();
 
@@ -3185,7 +3684,9 @@ mod tests {
         );
 
         assert!(matches!(
-            fixture.committer.reconcile(&fixture.worktree, &prepared),
+            fixture
+                .committer
+                .reconcile(&fixture.worktree, &prepared, &[]),
             Err(HostCommitError::Conflict(_))
         ));
     }
@@ -3209,6 +3710,7 @@ mod tests {
                 )]),
                 repo,
                 "feat: expected message".into(),
+                &[],
             )
             .unwrap();
 
@@ -3270,7 +3772,9 @@ mod tests {
         );
 
         assert!(matches!(
-            fixture.committer.reconcile(&fixture.worktree, &prepared),
+            fixture
+                .committer
+                .reconcile(&fixture.worktree, &prepared, &[]),
             Err(HostCommitError::Conflict(_))
         ));
     }
@@ -3329,11 +3833,12 @@ mod tests {
                 )]),
                 repo,
                 message.into(),
+                &[],
             )
             .unwrap();
         let receipt = fixture
             .committer
-            .execute(&fixture.worktree, &prepared)
+            .execute(&fixture.worktree, &prepared, &[])
             .unwrap();
         let stored_message = successful_git(
             repo,
