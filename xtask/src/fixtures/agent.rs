@@ -1393,7 +1393,9 @@ fn prompt_json_field(prompt: &str, field: &str) -> Result<Value, String> {
 fn collect_prompt_field(value: &Value, field: &str, found: &mut Vec<Value>) {
     match value {
         Value::Object(object) => {
-            if let Some(value) = object.get(field) {
+            if let Some(value) = object.get(field)
+                && !found.contains(value)
+            {
                 found.push(value.clone());
             }
             for value in object.values() {
@@ -2995,7 +2997,17 @@ mod tests {
             Sha256::digest(accepted_plan_json.as_bytes())
         ))
         .unwrap();
-        let render_prompt = |digest| {
+        let recovery_summary = serde_json::to_string(&serde_json::json!([{
+            "work_node_id":"acceptance-node",
+            "ticket_revision":5,
+            "accepted_plan_digest":accepted_plan_digest.as_str(),
+            "prior_worker_agent_run_id":"worker-run-prior",
+            "prior_host_commit_operation_id":null,
+            "expected_head":"1".repeat(40),
+            "prior_terminal_digest":"2".repeat(64)
+        }]))
+        .unwrap();
+        let render_prompt = |digest, recovery_summary: Option<String>| {
             render_role_prompt(
                 &applied,
                 &PromptContext {
@@ -3011,7 +3023,7 @@ mod tests {
                         body: "Exercise the coordinator continuation.".into(),
                         acceptance: vec!["The reviewer spawn names the accepted plan.".into()],
                     }),
-                    recovery_summary: None,
+                    recovery_summary,
                     accepted_plan: Some(accepted_plan_json.clone()),
                     accepted_plan_digest: digest,
                     implementation_publication_subject: None,
@@ -3025,8 +3037,11 @@ mod tests {
             .unwrap()
             .text
         };
-        let missing_digest_prompt = render_prompt(None);
-        let prompt = render_prompt(Some(accepted_plan_digest.clone()));
+        let missing_digest_prompt = render_prompt(None, None);
+        let prompt = render_prompt(
+            Some(accepted_plan_digest.clone()),
+            Some(recovery_summary.clone()),
+        );
         let prompt_root = tempfile::tempdir().unwrap();
         let prompt_path = prompt_root.path().join("coordinator.prompt");
         std::fs::write(&prompt_path, &prompt).unwrap();
@@ -3035,13 +3050,51 @@ mod tests {
             prompt_json_field(&prompt, "accepted_plan_digest").unwrap(),
             serde_json::json!(accepted_plan_digest.as_str())
         );
+        let conflicting_summary = serde_json::to_string(&serde_json::json!([{
+            "work_node_id":"acceptance-node",
+            "ticket_revision":5,
+            "accepted_plan_digest":"f".repeat(64),
+            "prior_worker_agent_run_id":"worker-run-prior",
+            "prior_host_commit_operation_id":null,
+            "expected_head":"1".repeat(40),
+            "prior_terminal_digest":"2".repeat(64)
+        }]))
+        .unwrap();
+        let conflicting_prompt = render_prompt(
+            Some(accepted_plan_digest.clone()),
+            Some(conflicting_summary),
+        );
+        assert!(
+            prompt_json_field(&conflicting_prompt, "accepted_plan_digest")
+                .unwrap_err()
+                .contains("found 2")
+        );
 
         let context_root = tempfile::tempdir().unwrap();
         let context_path = context_root.path().join("coordinator.json");
+        let mut messages = crate::acceptance::profile_messages("coordinator", false).unwrap();
+        let recovery_spawn = messages
+            .iter_mut()
+            .find(|message| {
+                message["lane"] == "workflow"
+                    && message["kind"] == "spawn_request"
+                    && message["structured_result"]["role"] == "reviewer"
+            })
+            .unwrap();
+        recovery_spawn["structured_result"] = serde_json::json!({
+            "work_node":"acceptance-node",
+            "role":"worker",
+            "profile_id":"fixture_worker",
+            "plan_digest":{"$fixture_ref":"prompt.accepted_plan_digest"},
+            "worker_recovery":{"$fixture_ref":"prompt.recovery_candidate"},
+            "allowed_repositories":["example"],
+            "artifact_inputs":[],
+            "parent_run_id":null
+        });
         let context_json = serde_json::json!({
             "schema_version":1,
             "scenario":"acceptance_coordinator",
-            "messages":crate::acceptance::profile_messages("coordinator", false).unwrap()
+            "messages":messages
         });
         std::fs::write(&context_path, serde_json::to_vec(&context_json).unwrap()).unwrap();
         let context = super::read_context(&context_path).unwrap();
@@ -3168,13 +3221,21 @@ mod tests {
         );
 
         let complete_state = tempfile::tempdir().unwrap();
-        let reviewer = run_sequence(complete_state.path(), &prompt).unwrap();
-        assert_eq!(reviewer.kind, super::RoleOutputKind::SpawnRequest);
-        super::validate_payload(reviewer.kind, &reviewer.structured_result).unwrap();
-        assert_eq!(reviewer.structured_result["role"], "reviewer");
+        let recovery = run_sequence(complete_state.path(), &prompt).unwrap();
+        assert_eq!(recovery.kind, super::RoleOutputKind::SpawnRequest);
+        super::validate_payload(recovery.kind, &recovery.structured_result).unwrap();
+        assert_eq!(recovery.structured_result["role"], "worker");
         assert_eq!(
-            reviewer.structured_result["plan_digest"],
+            recovery.structured_result["plan_digest"],
             accepted_plan_digest.as_str()
+        );
+        assert_eq!(
+            recovery.structured_result["worker_recovery"]["prior_worker_agent_run_id"],
+            "worker-run-prior"
+        );
+        assert!(
+            recovery.structured_result["worker_recovery"]["prior_host_commit_operation_id"]
+                .is_null()
         );
     }
 
