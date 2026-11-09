@@ -941,8 +941,9 @@ pub fn record_and_verify_agent_terminal(
         .map_err(|error| error.to_string())?;
     super::validate_active_generation(&tx, owner_generation)?;
     verify_persisted_authority(&tx, &authority, &authority_digest)?;
-    verify_agent_run_snapshot(&tx, &authority)?;
+    verify_agent_run_snapshot(&tx, &authority, owner_generation)?;
     verify_ticket_snapshot(&tx, &authority)?;
+    let launch_reservation = terminal_agent_launch_reservation(&tx, &authority)?;
     let prior: Option<(String, String)> = tx
         .query_row(
             "SELECT terminal_digest,receipt_json FROM agent_terminal_receipts WHERE agent_run_id=?1",
@@ -995,26 +996,50 @@ pub fn record_and_verify_agent_terminal(
     }
     let run_changed = tx.execute(
         "UPDATE agent_runs SET state='completed',finished_at_unix=COALESCE(finished_at_unix,?2) WHERE agent_run_id=?1 AND state IN ('running','unknown') AND controller_generation=?3",
-        params![run_id.as_str(), now, authority.controller_generation],
+        params![run_id.as_str(), now, owner_generation],
     ).map_err(|error| error.to_string())?;
     if run_changed != 1 {
         return Err("AgentRun state changed before terminal evidence was recorded".into());
     }
-    let slot: Option<(String, u32, u64)> = tx
+    let latest_adoption_generation: Option<u64> = tx
         .query_row(
-            "SELECT pool,slot_index,reservation_epoch FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND project_id=?2 AND controller_generation=?3 AND disposition IN ('launch_pending','live','parked','unknown')",
-            params![run_id.as_str(), authority.project_id.as_str(), owner_generation],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT controller_generation FROM agent_run_adoptions WHERE agent_run_id=?1 ORDER BY controller_generation DESC LIMIT 1",
+            [run_id.as_str()],
+            |row| row.get(0),
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let Some((pool, slot_index, reservation_epoch)) = slot else {
+    let prior_slot_generation =
+        latest_adoption_generation.unwrap_or(authority.controller_generation);
+    let slot: Option<(String, u32, u64, u64)> = tx
+        .query_row(
+            "SELECT pool,slot_index,reservation_epoch,controller_generation FROM execution_slots
+             WHERE owner_kind='agent_run' AND owner_id=?1 AND project_id=?2
+               AND controller_generation IN (?3,?4,?5)
+               AND (?6 IS NULL OR (pool=?6 AND slot_index=?7 AND ticket_run_id IS ?8 AND reservation_epoch=?9))
+               AND disposition IN ('launch_pending','live','parked','unknown')",
+            params![
+                run_id.as_str(),
+                authority.project_id.as_str(),
+                authority.controller_generation,
+                prior_slot_generation,
+                owner_generation,
+                launch_reservation.as_ref().map(|reservation| reservation.pool.as_str()),
+                launch_reservation.as_ref().map(|reservation| reservation.slot_index),
+                launch_reservation.as_ref().and_then(|reservation| reservation.ticket_run_id.as_ref()).map(|ticket| ticket.as_str()),
+                launch_reservation.as_ref().map(|reservation| reservation.project_epoch),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((pool, slot_index, reservation_epoch, slot_generation)) = slot else {
         return Err("Agent terminal has no exact active execution slot to release".into());
     };
     let released = tx
         .execute(
-            "UPDATE execution_slots SET disposition='released',controller_generation=?5 WHERE pool=?1 AND slot_index=?2 AND owner_kind='agent_run' AND owner_id=?3 AND reservation_epoch=?4 AND project_id=?6 AND controller_generation=?5 AND disposition IN ('launch_pending','live','parked','unknown')",
-            params![pool, slot_index, run_id.as_str(), reservation_epoch, owner_generation, authority.project_id.as_str()],
+            "UPDATE execution_slots SET disposition='released',controller_generation=?5 WHERE pool=?1 AND slot_index=?2 AND owner_kind='agent_run' AND owner_id=?3 AND reservation_epoch=?4 AND project_id=?6 AND controller_generation=?7 AND disposition IN ('launch_pending','live','parked','unknown')",
+            params![pool, slot_index, run_id.as_str(), reservation_epoch, owner_generation, authority.project_id.as_str(), slot_generation],
         )
         .map_err(|error| error.to_string())?;
     if released != 1 {
@@ -1219,7 +1244,7 @@ pub fn ingest_agent_result(
     super::validate_active_generation(&tx, owner_generation)?;
     verify_persisted_authority(&tx, &authority, &terminal.authority_digest)?;
     verify_terminal_row(&tx, terminal)?;
-    verify_agent_run_snapshot(&tx, &authority)?;
+    verify_agent_run_snapshot(&tx, &authority, owner_generation)?;
     verify_registered_artifacts(
         &tx,
         &authority,
@@ -1475,7 +1500,9 @@ pub fn ingest_next_spooled_agent_result(
         let mut statement = store.connection.prepare(
             "SELECT a.agent_run_id,a.control_dir FROM agent_launch_authority a \
              JOIN agent_launch_state s USING(agent_run_id) \
-             WHERE a.controller_generation=?1 AND s.state IN ('running','unknown') \
+             JOIN agent_runs r USING(agent_run_id) \
+             WHERE r.controller_generation=?1 AND r.state IN ('running','unknown') \
+               AND s.state IN ('running','unknown') \
                AND NOT EXISTS(SELECT 1 FROM agent_terminal_receipts t WHERE t.agent_run_id=a.agent_run_id) \
              ORDER BY s.updated_at_unix,a.agent_run_id LIMIT ?2",
         ).map_err(|error| error.to_string())?;
@@ -2300,6 +2327,7 @@ fn verify_persisted_authority(
 fn verify_agent_run_snapshot(
     tx: &Transaction<'_>,
     authority: &AgentLaunchAuthority,
+    owner_generation: u64,
 ) -> Result<(), String> {
     let run: Option<(String, String, u64, String, u64, String, String)> = tx.query_row("SELECT project_id,config_source,config_revision,config_digest,controller_generation,state,logical_owner FROM agent_runs WHERE agent_run_id=?1", [authority.agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional().map_err(|error| error.to_string())?;
     let Some((project, _source, config_revision, config_digest, run_generation, state, _owner)) =
@@ -2307,11 +2335,25 @@ fn verify_agent_run_snapshot(
     else {
         return Err("AgentRun disappeared".into());
     };
+    let generation_matches = if state == "completed" {
+        let terminal_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1)",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        terminal_exists
+            && run_generation >= authority.controller_generation
+            && run_generation <= owner_generation
+    } else {
+        run_generation == owner_generation
+    };
     if project != authority.project_id.as_str()
         || config_revision != authority.config_revision.0
         || config_digest != authority.config_digest.as_str()
-        || run_generation != authority.controller_generation
-        || !matches!(state.as_str(), "running" | "completed")
+        || !generation_matches
+        || !matches!(state.as_str(), "running" | "unknown" | "completed")
     {
         return Err(
             "AgentRun project, config, generation, or lifecycle differs from launch authority"
@@ -2319,6 +2361,59 @@ fn verify_agent_run_snapshot(
         );
     }
     Ok(())
+}
+
+fn terminal_agent_launch_reservation(
+    tx: &Transaction<'_>,
+    authority: &AgentLaunchAuthority,
+) -> Result<Option<crate::launch::AgentLaunchReservation>, String> {
+    let row: Option<(String, String, String, String, u64, u64, String)> = tx
+        .query_row(
+            "SELECT reservation_json,lifecycle,project_id,operation_id,controller_generation,project_epoch,reservation_digest
+             FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [authority.agent_run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((json, lifecycle, project, operation, generation, epoch, reservation_digest)) = row
+    else {
+        // A persisted launch may predate immutable reservation records. Its terminal replay
+        // remains fenced by the persisted authority and exact active run/project-owned slot.
+        return Ok(None);
+    };
+    if lifecycle != "authorized" {
+        return Err("Agent terminal launch reservation is not authorized".into());
+    }
+    let reservation: crate::launch::AgentLaunchReservation =
+        crate::protocol::parse_unique(json.as_bytes())?;
+    if reservation.agent_run_id != authority.agent_run_id
+        || reservation.project_id.as_str() != project
+        || reservation.operation_id.as_str() != operation
+        || reservation.controller_generation != generation
+        || reservation.project_epoch != epoch
+        || reservation.digest()?.as_str() != reservation_digest
+        || reservation.project_id != authority.project_id
+        || reservation.operation_id != authority.operation_id
+        || reservation.role != authority.role
+        || reservation.role_session_id != authority.role_session_id
+        || reservation.ticket_run_id != authority.ticket_run_id
+        || reservation.ticket_revision != authority.ticket_revision
+        || reservation.controller_generation != authority.controller_generation
+    {
+        return Err("Agent terminal launch reservation differs from immutable authority".into());
+    }
+    Ok(Some(reservation))
 }
 
 fn verify_ticket_snapshot(
@@ -3995,6 +4090,10 @@ pub(crate) mod tests {
                 authority.control_dir.display().to_string(),
             ],
         ).unwrap();
+        store.execute(
+            "INSERT INTO agent_runs(agent_run_id,controller_generation,state) VALUES (?1,?2,'running')",
+            rusqlite::params![authority.agent_run_id.as_str(), authority.controller_generation],
+        ).unwrap();
         store
             .execute(
                 "INSERT INTO provider_qualifications(receipt_digest,receipt_json) VALUES (?1,?2)",
@@ -4173,6 +4272,7 @@ pub(crate) mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT,controller_generation INTEGER,control_dir TEXT);
+                 CREATE TABLE agent_runs(agent_run_id TEXT,controller_generation INTEGER,state TEXT);
                  CREATE TABLE agent_launch_state(agent_run_id TEXT,state TEXT,start_request_digest TEXT,provider_process_tree_json TEXT,updated_at_unix INTEGER);
                  CREATE TABLE agent_terminal_receipts(agent_run_id TEXT,terminal_digest TEXT,observed_at_unix INTEGER);
                  CREATE TABLE provider_qualifications(receipt_digest TEXT,receipt_json TEXT);
@@ -4408,6 +4508,56 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(replay.receipt.evidence_id(), result.receipt.evidence_id());
+
+        let previous_generation = fixture.owner_generation;
+        let owner_generation = fixture
+            .store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "result-replay-after-owner-restart".into(),
+                state_root: fixture._temp.path().display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: "test-owner-restarted".into(),
+                executable_path: "/test/fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("http://fixture".into()),
+                rex_server_identity: Some("fixture-rex".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        assert!(owner_generation > previous_generation);
+        let restarted_replay = ingest_next_spooled_agent_result(
+            &mut fixture.store,
+            &fixture.artifacts,
+            owner_generation,
+            8,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            restarted_replay.receipt.evidence_id(),
+            result.receipt.evidence_id()
+        );
+        let evidence_count: u64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_evidence WHERE agent_run_id=?1",
+                [fixture.terminal.agent_run_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_count, 1);
+        let slot_disposition: String = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [fixture.terminal.agent_run_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slot_disposition, "released");
     }
 
     #[test]

@@ -4678,18 +4678,44 @@ impl ConfigStore {
         let authority: AgentLaunchAuthority =
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
-        let reservation: Option<(String, String)> = tx.query_row(
-            "SELECT reservation_json,lifecycle FROM agent_launch_reservations WHERE agent_run_id=?1",
+        let reservation_row: Option<(String, String, String, String, u64, u64, String)> = tx.query_row(
+            "SELECT reservation_json,lifecycle,project_id,operation_id,controller_generation,project_epoch,reservation_digest FROM agent_launch_reservations WHERE agent_run_id=?1",
             [observation.agent_run_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let reserved_wake_count = if let Some((reservation_json, lifecycle)) = reservation {
+        let launch_reservation = if let Some((
+            reservation_json,
+            lifecycle,
+            project_id,
+            operation_id,
+            controller_generation,
+            project_epoch,
+            reservation_digest,
+        )) = reservation_row
+        {
             if lifecycle != "authorized" {
                 return Err("Agent launch reservation has not been finalized".into());
             }
             let reservation: AgentLaunchReservation =
                 crate::protocol::parse_unique(reservation_json.as_bytes())
                     .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            if reservation.agent_run_id != observation.agent_run_id
+                || reservation.project_id.as_str() != project_id
+                || reservation.operation_id.as_str() != operation_id
+                || reservation.controller_generation != controller_generation
+                || reservation.project_epoch != project_epoch
+                || reservation.digest()?.as_str() != reservation_digest
+                || reservation.project_id != authority.project_id
+                || reservation.operation_id != authority.operation_id
+                || reservation.controller_generation != authority.controller_generation
+            {
+                return Err("stored launch reservation binding is inconsistent".into());
+            }
+            Some(reservation)
+        } else {
+            None
+        };
+        let reserved_wake_count = if let Some(reservation) = launch_reservation.as_ref() {
             reservation.wake_snapshot.validate()?;
             if reservation.wake_snapshot.digest != authority.wake_snapshot_digest {
                 return Err("launch authority wake manifest does not match its reservation".into());
@@ -4837,14 +4863,39 @@ impl ConfigStore {
             "process_tree_digest": observation.process_tree_digest,
             "process_tree": &observation.process_tree,
         });
+        let process_identity_json =
+            serde_json::to_string(&process_identity).map_err(|error| error.to_string())?;
         let run_changed = tx.execute(
-            "UPDATE agent_runs SET state='running',process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state IN ('launch_pending','unknown') AND controller_generation=?4",
-            params![observation.agent_run_id.as_str(),serde_json::to_string(&process_identity).map_err(|error| error.to_string())?,now,current_generation],
+            "UPDATE agent_runs SET state=CASE WHEN controller_generation=?5 THEN 'running' ELSE 'unknown' END,process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state IN ('launch_pending','unknown') AND controller_generation=?4",
+            params![observation.agent_run_id.as_str(),process_identity_json,now,current_generation,authority.controller_generation],
         ).map_err(|error| error.to_string())?;
         if run_changed != 1 {
             return Err(
                 "AgentRun state changed before provider start observation was committed".into(),
             );
+        }
+        if let Some(reservation) = launch_reservation.as_ref() {
+            let slot_changed = tx.execute(
+                "UPDATE execution_slots SET disposition='live',process_identity_json=?1 WHERE pool=?2 AND slot_index=?3 AND project_id=?4 AND ticket_run_id IS ?5 AND owner_kind='agent_run' AND owner_id=?6 AND reservation_epoch=?7 AND controller_generation=?8 AND disposition IN ('launch_pending','unknown')",
+                params![process_identity_json,reservation.pool,reservation.slot_index,reservation.project_id.as_str(),reservation.ticket_run_id.as_ref().map(|id| id.as_str()),reservation.agent_run_id.as_str(),reservation.project_epoch,reservation.controller_generation],
+            ).map_err(|error| error.to_string())?;
+            if slot_changed != 1 {
+                return Err(
+                    "execution slot no longer matches the immutable Agent launch reservation"
+                        .into(),
+                );
+            }
+        } else {
+            let owns_active_slot: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND disposition!='released')",
+                [observation.agent_run_id.as_str()],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if owns_active_slot {
+                return Err(
+                    "active execution slot has no immutable Agent launch reservation".into(),
+                );
+            }
         }
         let consumed_wakes = tx.execute("UPDATE role_wake_inputs SET lifecycle='consumed' WHERE consuming_agent_run_id=?1 AND lifecycle='assigned'", [observation.agent_run_id.as_str()]).map_err(|error| error.to_string())?;
         if consumed_wakes != reserved_wake_count {

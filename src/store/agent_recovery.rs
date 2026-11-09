@@ -12,7 +12,7 @@ use crate::run_step_spool::BlockLossCleanupSnapshot;
 use super::agent_results::VerifiedAgentCleanup;
 use super::{ConfigStore, validate_active_generation};
 
-type AgentAdoptionLookupRow = (String, u64, u64, String, u64, String, String, String);
+type AgentAdoptionLookupRow = (String, u64, u64, u64, String, u32, String, String, String);
 const MAX_LIFECYCLE_PROCESS_SAMPLE: usize = 256;
 type CancelledAgentReconciliationRow = (
     String,
@@ -1728,8 +1728,8 @@ impl ConfigStore {
         validate_active_generation(&tx, evidence.controller_generation)?;
         let row: Option<AgentAdoptionLookupRow> = tx
             .query_row(
-                "SELECT a.authority_json,r.controller_generation,r.reservation_epoch,r.disposition,
-                        r.slot_index,r.pool,r.owner_id,r.owner_kind
+                "SELECT a.authority_json,g.controller_generation,r.controller_generation,
+                        r.reservation_epoch,r.disposition,r.slot_index,r.pool,r.owner_id,r.owner_kind
                  FROM agent_launch_authority a
                  JOIN agent_runs g ON g.agent_run_id=a.agent_run_id
                  JOIN execution_slots r ON r.owner_kind='agent_run' AND r.owner_id=a.agent_run_id
@@ -1745,6 +1745,7 @@ impl ConfigStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -1752,11 +1753,12 @@ impl ConfigStore {
             .map_err(|error| error.to_string())?;
         let Some((
             authority_json,
-            current_generation,
+            run_generation,
+            slot_generation,
             reservation_epoch,
             disposition,
-            _slot_index,
-            _pool,
+            slot_index,
+            pool,
             owner_id,
             owner_kind,
         )) = row
@@ -1780,10 +1782,12 @@ impl ConfigStore {
             || authority.digest()? != evidence.authority_digest
             || authority.descriptor_digest != evidence.descriptor_digest
             || evidence.previous_controller_generation != expected_previous_generation
-            || current_generation != evidence.controller_generation
+            || run_generation != evidence.controller_generation
+            || slot_generation != expected_previous_generation
             || reservation_epoch != expected_reservation_epoch
             || owner_kind != "agent_run"
             || owner_id != evidence.agent_run_id.as_str()
+            || pool != "agent"
             || !matches!(disposition.as_str(), "unknown" | "live")
         {
             return Err("AgentRun or execution-slot identity changed before adoption".into());
@@ -1824,8 +1828,9 @@ impl ConfigStore {
         let slot_changed = tx.execute(
             "UPDATE execution_slots SET disposition='live',controller_generation=?4,process_identity_json=?5
              WHERE pool='agent' AND owner_kind='agent_run' AND owner_id=?1 AND slot_index=?2
-               AND reservation_epoch=?3 AND disposition IN ('unknown','live')",
-            params![evidence.agent_run_id.as_str(),_slot_index,expected_reservation_epoch,evidence.controller_generation,serde_json::to_string(&serde_json::json!({"provider_pid":evidence.provider_pid,"provider_start_identity":evidence.provider_start_identity,"process_tree_digest":evidence.process_tree_digest,"process_tree":provider_start.process_tree})).map_err(|error| error.to_string())?],
+               AND project_id=?6 AND reservation_epoch=?3 AND controller_generation=?7
+               AND disposition IN ('unknown','live')",
+            params![evidence.agent_run_id.as_str(),slot_index,expected_reservation_epoch,evidence.controller_generation,serde_json::to_string(&serde_json::json!({"provider_pid":evidence.provider_pid,"provider_start_identity":evidence.provider_start_identity,"process_tree_digest":evidence.process_tree_digest,"process_tree":provider_start.process_tree})).map_err(|error| error.to_string())?,authority.project_id.as_str(),expected_previous_generation],
         ).map_err(|error| error.to_string())?;
         if run_changed != 1 || slot_changed != 1 {
             return Err("AgentRun or slot changed while adoption was being recorded".into());
@@ -1922,8 +1927,8 @@ mod tests {
             .store
             .connection
             .execute(
-                "UPDATE execution_slots SET controller_generation=?2,disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
-                rusqlite::params![fixture.run.agent_run_id.as_str(), current_generation],
+                "UPDATE execution_slots SET disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.run.agent_run_id.as_str()],
             )
             .unwrap();
         fixture

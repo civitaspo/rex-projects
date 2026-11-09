@@ -2678,6 +2678,12 @@ esac
             fixture.run.authority.controller_generation,
             launch_generation
         );
+        let slot_after_restart = crate::store::agent_runtime::tests::test_execution_slot_binding(
+            &fixture.store,
+            &fixture.slot_owner_id,
+        );
+        assert_eq!(slot_after_restart.0, "unknown");
+        assert_eq!(slot_after_restart.1, launch_generation);
         let wrapper_json = serde_json::to_string(&fixture.wrapper).unwrap();
         assert_eq!(
             fixture.run.wrapper_identity_json.as_deref(),
@@ -2710,18 +2716,76 @@ esac
         policy.rex_session_id = "session".into();
         let mut runtime = AgentRecoveryRuntime::default();
 
-        let start = runtime
-            .observe_one(
-                &mut fixture.store,
-                fixture.generation,
-                &rex,
-                &policy,
-                &fixture.run,
-                "rex-instance",
-                &[],
+        crate::store::agent_runtime::tests::test_set_execution_slot_epoch(
+            &mut fixture.store,
+            &fixture.slot_owner_id,
+            fixture.run.reservation_epoch + 1,
+        );
+        assert_eq!(
+            runtime
+                .observe_one(
+                    &mut fixture.store,
+                    fixture.generation,
+                    &rex,
+                    &policy,
+                    &fixture.run,
+                    "rex-instance",
+                    &[],
+                )
+                .unwrap_err(),
+            "execution slot no longer matches the immutable Agent launch reservation"
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            ),
+            "unknown"
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_agent_launch_states(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            ),
+            (
+                "unknown".into(),
+                current_generation,
+                "awaiting_provider".into()
             )
+        );
+        crate::store::agent_runtime::tests::test_set_execution_slot_epoch(
+            &mut fixture.store,
+            &fixture.slot_owner_id,
+            fixture.run.reservation_epoch,
+        );
+
+        let report = runtime
+            .tick(&mut fixture.store, fixture.generation, &rex, &policy)
             .unwrap();
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.observations.len(), 1);
+        let start = report.observations[0].disposition.clone();
         assert_eq!(start, AgentRecoveryDisposition::ProviderStarted);
+        let recovered_slot = crate::store::agent_runtime::tests::test_execution_slot_binding(
+            &fixture.store,
+            &fixture.slot_owner_id,
+        );
+        assert_eq!(recovered_slot.0, "live");
+        assert_eq!(recovered_slot.1, launch_generation);
+        let recovered_slot_identity: serde_json::Value =
+            crate::protocol::parse_unique(recovered_slot.2.as_deref().unwrap().as_bytes()).unwrap();
+        assert_eq!(
+            recovered_slot_identity["provider_pid"],
+            fixture.provider.provider_pid
+        );
+        let recovered_run = crate::store::agent_runtime::tests::test_agent_launch_states(
+            &fixture.store,
+            &fixture.slot_owner_id,
+        );
+        assert_eq!(
+            recovered_run,
+            ("unknown".into(), current_generation, "running".into())
+        );
         fixture.run = fixture
             .store
             .recoverable_agent_runs(fixture.generation, 8)
@@ -2768,6 +2832,360 @@ esac
             ),
             "unknown"
         );
+    }
+
+    #[test]
+    fn restarted_provider_can_record_a_successful_terminal_and_release_its_slot() {
+        use crate::store::OwnerMetadata;
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture =
+            crate::store::agent_runtime::tests::completed_family_without_terminal_fixture(
+                root.path(),
+            );
+        let launch_generation = fixture.generation;
+        crate::store::agent_runtime::tests::test_set_execution_slot_generation(
+            &mut fixture.store,
+            &fixture.slot_owner_id,
+            launch_generation,
+        );
+        let current_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "successful-terminal-after-restart-test".into(),
+                state_root: root.path().join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-restarted".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(current_generation > launch_generation);
+        fixture.generation = current_generation;
+        fixture.run = fixture
+            .store
+            .recoverable_agent_runs(current_generation, 8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let rex_script = root.path().join("rex-cli");
+        fs::write(
+            &rex_script,
+            r#"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/rex-test.sock","instance_id":"rex-instance","host_id":"fixture-host","rex_version":"1.2.3"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*) printf '%s\n' '{"session_id":"session","windows":[{"window_id":"window","layers":[]}]}' ;;
+  *) exit 3 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&rex_script, fs::Permissions::from_mode(0o755)).unwrap();
+        let rex = RexCliTransport::connect(
+            &rex_script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "rex-instance".into(),
+            "session".into(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let mut policy = policy();
+        policy.rex_session_id = "session".into();
+        let report = AgentRecoveryRuntime::default()
+            .tick(&mut fixture.store, current_generation, &rex, &policy)
+            .unwrap();
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.observations.len(), 1);
+        assert_eq!(
+            report.observations[0].disposition,
+            AgentRecoveryDisposition::ProviderStarted
+        );
+        fixture.run = fixture
+            .store
+            .recoverable_agent_runs(current_generation, 8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(fixture.run.previous_generation, launch_generation);
+        assert_eq!(fixture.run.current_generation, current_generation);
+        assert_eq!(fixture.run.slot_disposition, "live");
+
+        let adoption_process_tree = fixture
+            .provider
+            .process_tree
+            .iter()
+            .map(
+                |process| crate::store::agent_recovery::AdoptedProcessIdentity {
+                    pid: process.pid,
+                    parent_pid: process.parent_pid,
+                    process_group_id: process.process_group_id,
+                    start_identity: process.start_identity.clone(),
+                    identity_quality: "kernel_birth_token".into(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let adoption = crate::store::agent_recovery::AgentAdoptionEvidence {
+            schema_version: 1,
+            agent_run_id: fixture.run.agent_run_id.clone(),
+            controller_generation: current_generation,
+            previous_controller_generation: launch_generation,
+            authority_digest: fixture.run.authority_digest.clone(),
+            descriptor_digest: fixture.run.authority.descriptor_digest.clone(),
+            rex_process_observation_digest: digest_json(&fixture.provider).unwrap(),
+            process_tree_digest: digest_json(&adoption_process_tree).unwrap(),
+            provider_start_tree_digest: fixture.provider.process_tree_digest.clone(),
+            process_tree: adoption_process_tree,
+            wrapper_pid: fixture.wrapper.pid,
+            wrapper_start_identity: fixture.wrapper.start_identity.clone(),
+            provider_pid: fixture.provider.provider_pid,
+            provider_start_identity: fixture.provider.provider_start_identity.clone(),
+            observed_at_unix: 11,
+        };
+        let slot_before_stale_epoch =
+            crate::store::agent_runtime::tests::test_execution_slot_binding(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            );
+        let run_before_stale_epoch = crate::store::agent_runtime::tests::test_agent_launch_states(
+            &fixture.store,
+            &fixture.slot_owner_id,
+        );
+        assert!(
+            fixture
+                .store
+                .record_agent_run_adoption(&adoption, fixture.run.reservation_epoch + 1)
+                .is_err()
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_binding(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            ),
+            slot_before_stale_epoch
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_agent_launch_states(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            ),
+            run_before_stale_epoch
+        );
+        assert!(
+            fixture
+                .store
+                .record_agent_run_adoption(&adoption, fixture.run.reservation_epoch)
+                .unwrap()
+        );
+        let adopted_generation = current_generation;
+        let current_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "successful-terminal-after-adoption-restart-test".into(),
+                state_root: root.path().join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-restarted-again".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(current_generation > adopted_generation);
+        fixture.generation = current_generation;
+        fixture.run = fixture
+            .store
+            .recoverable_agent_runs(current_generation, 8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let slot_after_second_restart =
+            crate::store::agent_runtime::tests::test_execution_slot_binding(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            );
+        assert_eq!(slot_after_second_restart.0, "unknown");
+        assert_eq!(slot_after_second_restart.1, adopted_generation);
+
+        let authority = fixture.run.authority.clone();
+        let qualification = fixture
+            .store
+            .provider_qualification(&authority.qualification_receipt_digest)
+            .unwrap()
+            .unwrap();
+        let result_message = crate::roles::RoleResultMessage {
+            schema_version: 1,
+            message_id: "supervisor-progress-after-restart".into(),
+            kind: crate::engine::orchestration::RoleOutputKind::Progress,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            structured_result: serde_json::json!({
+                "summary":"recovered provider completed",
+                "completed_node_keys":[],
+                "pending_node_keys":[],
+                "evidence":[],
+                "next_observation_at":null
+            }),
+            result_digest: None,
+            artifact_refs: Vec::new(),
+        }
+        .canonicalized()
+        .unwrap();
+        let structured_result = serde_json::to_value(&result_message).unwrap();
+        let structured_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        );
+        let schema_projection = crate::providers::project_result_schema(&serde_json::json!({
+            "type": "object"
+        }))
+        .unwrap()
+        .identity;
+        let receipt = crate::run_step::RunReceipt {
+            run_id: authority.agent_run_id.clone(),
+            attempt: authority.attempt,
+            provider: qualification.adapter,
+            effective_permission_mode: qualification.permission_mode.clone(),
+            conversation_id: None,
+            provider_version: Some(qualification.provider_version.clone()),
+            capability_receipt_digest: Some(authority.qualification_receipt_digest.clone()),
+            schema_projection,
+            launch_pid_hint: Some(fixture.provider.provider_pid),
+            exit_code: Some(0),
+            timed_out: false,
+            cancellation_signal: None,
+            cleanup: crate::run_step::CleanupState::Confirmed,
+            cleanup_detail: None,
+            processes: vec![crate::run_step::ObservedProcess {
+                pid: fixture.provider.provider_pid,
+                parent_pid: fixture.wrapper.pid,
+                process_group_id: fixture.provider.provider_pid,
+                start_identity: fixture.provider.provider_start_identity.clone(),
+                command: qualification.executable_path.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            }],
+            result_digest: Some(Digest::parse(structured_digest).unwrap()),
+            provider_result_failure: None,
+            provider_process_failure: None,
+            outcome: crate::run_step::TurnOutcome::Completed,
+        };
+        let spool = RunStepSpool::open(&authority.control_dir).unwrap();
+        spool
+            .publish_turn_result_once(
+                &fixture.start,
+                crate::run_step::TurnResult {
+                    receipt,
+                    structured_result: Some(structured_result),
+                },
+            )
+            .unwrap();
+        let artifact_store =
+            crate::artifacts::ArtifactStore::open(&root.path().join("artifacts")).unwrap();
+        let result = crate::store::agent_results::ingest_next_spooled_agent_result(
+            &mut fixture.store,
+            &artifact_store,
+            current_generation,
+            8,
+        )
+        .unwrap()
+        .expect("current owner must discover and ingest the completed terminal");
+        assert_eq!(
+            result.validated.message_id,
+            "supervisor-progress-after-restart"
+        );
+
+        let (run_generation, terminal_generation, evidence_count) =
+            crate::store::agent_runtime::tests::test_agent_terminal_generations_and_result_count(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            );
+        assert_eq!(run_generation, current_generation);
+        assert_eq!(terminal_generation, launch_generation);
+        assert_eq!(evidence_count, 1);
+
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            ),
+            "released"
+        );
+    }
+
+    #[test]
+    fn provider_start_rejects_missing_or_released_slots_without_partial_state() {
+        for missing_slot in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut fixture = crate::store::agent_runtime::tests::completed_block_loss_fixture(
+                root.path(),
+                false,
+            );
+            if missing_slot {
+                crate::store::agent_runtime::tests::test_delete_execution_slot(
+                    &mut fixture.store,
+                    &fixture.slot_owner_id,
+                );
+            } else {
+                crate::store::agent_runtime::tests::test_set_execution_slot_disposition(
+                    &mut fixture.store,
+                    &fixture.slot_owner_id,
+                    "released",
+                );
+            }
+
+            assert!(
+                fixture
+                    .store
+                    .confirm_provider_started(fixture.generation, &fixture.provider)
+                    .is_err()
+            );
+            assert_eq!(
+                crate::store::agent_runtime::tests::test_agent_launch_states(
+                    &fixture.store,
+                    &fixture.slot_owner_id,
+                ),
+                (
+                    "unknown".into(),
+                    fixture.generation,
+                    "awaiting_provider".into()
+                )
+            );
+            assert!(
+                crate::store::agent_runtime::tests::test_provider_tree_json(
+                    &fixture.store,
+                    &fixture.slot_owner_id,
+                )
+                .is_none()
+            );
+            assert_eq!(
+                crate::store::agent_runtime::tests::test_execution_slot_exists(
+                    &fixture.store,
+                    &fixture.slot_owner_id,
+                ),
+                !missing_slot
+            );
+            if !missing_slot {
+                assert_eq!(
+                    crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                        &fixture.store,
+                        &fixture.slot_owner_id,
+                    ),
+                    "released"
+                );
+            }
+        }
     }
 
     #[test]
