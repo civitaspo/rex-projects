@@ -3738,6 +3738,8 @@ mod tests {
                     host_completion_context: None,
                 })
                 .collect(),
+
+            worker_correction_context: None,
         };
         inbox.digest = inbox.content_digest().unwrap();
         inbox.validate().unwrap();

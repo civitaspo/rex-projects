@@ -132,6 +132,8 @@ struct WorkerAssignmentContext<'a> {
     plan_record: &'a crate::store::accepted_plans::AcceptedWorkPlanRecord,
     validated_plan: &'a crate::engine::orchestration::ValidatedPlan,
     node: &'a crate::engine::orchestration::ValidatedWorkNode,
+    ticket_revision: u64,
+    correction_context: Option<&'a crate::agent_api::WorkerCorrectionContext>,
     worktree_path: &'a Path,
     branch: &'a str,
     base_sha: &'a str,
@@ -1872,36 +1874,13 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                     _ => None,
                 },
                 accepted_plan: match (&worker_context, &accepted_plan) {
-                    (Some(context), _) => {
-                        Some(worker_assignment_context(&WorkerAssignmentContext {
-                            plan_record: &context.plan_record,
-                            validated_plan: &context.validated_plan,
-                            node: &context.node,
-                            worktree_path: context.token.worktree_path(),
-                            branch: context.token.branch(),
-                            base_sha: context.token.base_sha(),
-                            expected_head: worker_recovery_authorization
-                                .as_ref()
-                                .map(|authorization| authorization.expected_head.as_str())
-                                .unwrap_or_else(|| context.token.expected_head()),
-                            host_artifacts: &store.persisted_worker_host_artifacts(
-                                context.token.project_id(),
-                                context.token.ticket_run_id(),
-                                &context.token.reservation_binding(),
-                            )?,
-                            verification: worker_verification.as_ref(),
-                            recovery_authorization: worker_recovery_authorization.as_ref(),
-                            retained_host_commit: retained_host_commit(
-                                store,
-                                &reservation.project_id,
-                                &reservation.config_digest,
-                                worker_recovery_authorization.as_ref(),
-                            )?
-                            .as_ref(),
-                            commit_mode: context.token.commit_mode(),
-                            repository_id: context.token.repository_id(),
-                        })?)
-                    }
+                    (Some(context), _) => Some(worker_assignment_for_reservation(
+                        store,
+                        reservation,
+                        context,
+                        worker_verification.as_ref(),
+                        worker_recovery_authorization.as_ref(),
+                    )?),
                     (None, Some(plan)) => Some(
                         serde_json::to_string(&plan.proposal).map_err(|error| error.to_string())?,
                     ),
@@ -2983,6 +2962,8 @@ impl FactoryRuntimeServices for RuntimeServices {
             agent_run_id: run_id.as_str().to_owned(),
             digest: Digest::parse("0".repeat(64))?,
             inputs: wake_items,
+
+            worker_correction_context: None,
         };
         let mut wake_snapshot = wake_snapshot;
         wake_snapshot.digest = wake_snapshot.content_digest()?;
@@ -3765,6 +3746,21 @@ impl RuntimeServices {
         if candidate.role == Role::Worker && worker_node.is_none() {
             return Err("prepared Worker token does not resolve to an accepted plan node".into());
         }
+        let worker_correction_context = if candidate.role == Role::Worker {
+            worker_correction_context_for_launch(
+                store,
+                self.owner_generation,
+                &active_run.project_id,
+                ticket_run_id,
+                active_run.revision,
+                &self.configuration_digest,
+                accepted_plan
+                    .as_ref()
+                    .ok_or("Worker correction context requires an accepted plan")?,
+            )?
+        } else {
+            None
+        };
         let worker_verification = match (&worker_context, &worker_node) {
             (Some(context), Some(node)) if candidate.role == Role::Worker => {
                 worker_verification_assignment(
@@ -3866,6 +3862,8 @@ impl RuntimeServices {
                             plan_record: plan,
                             validated_plan: validated,
                             node,
+                            ticket_revision: active_run.revision,
+                            correction_context: worker_correction_context.as_ref(),
                             worktree_path: context.token.worktree_path(),
                             branch: context.token.branch(),
                             base_sha: context.token.base_sha(),
@@ -4020,6 +4018,7 @@ impl RuntimeServices {
             agent_run_id: agent_run_id.as_str().to_owned(),
             digest: Digest::parse("0".repeat(64))?,
             inputs: wake_items,
+            worker_correction_context,
         };
         wake_snapshot.digest = wake_snapshot.content_digest()?;
         let capacity = u32::try_from(self.config.runtime.max_agent_runs)
@@ -4817,6 +4816,20 @@ pub(crate) fn prepared_worker_assignment_for_test(
     node: &crate::engine::orchestration::ValidatedWorkNode,
     recovery_authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
 ) -> Result<String, String> {
+    let run = store
+        .active_ticket_runs(owner_generation, 128)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *token.ticket_run_id())
+        .ok_or("Worker assignment test has no active TicketRun")?;
+    let correction_context = worker_correction_context_for_launch(
+        store,
+        owner_generation,
+        token.project_id(),
+        token.ticket_run_id(),
+        run.revision,
+        token.configuration_digest(),
+        plan_record,
+    )?;
     let verification = worker_verification_assignment(
         store,
         owner_generation,
@@ -4834,6 +4847,8 @@ pub(crate) fn prepared_worker_assignment_for_test(
         plan_record,
         validated_plan,
         node,
+        ticket_revision: run.revision,
+        correction_context: correction_context.as_ref(),
         worktree_path: token.worktree_path(),
         branch: token.branch(),
         base_sha: token.base_sha(),
@@ -4851,6 +4866,183 @@ pub(crate) fn prepared_worker_assignment_for_test(
         commit_mode: token.commit_mode(),
         repository_id: token.repository_id(),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_worker_assignment_from_reservation_for_test(
+    store: &ConfigStore,
+    reservation: &crate::launch::AgentLaunchReservation,
+    plan_record: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    validated_plan: &crate::engine::orchestration::ValidatedPlan,
+    token: &crate::store::accepted_plans::PreparedWorkerLaunch,
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    recovery_authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Result<String, String> {
+    let context = PreparedWorkerContext {
+        plan_record: plan_record.clone(),
+        validated_plan: validated_plan.clone(),
+        node: node.clone(),
+        token: token.clone(),
+    };
+    let verification = worker_verification_assignment(
+        store,
+        reservation.controller_generation,
+        token,
+        node,
+        recovery_authorization,
+    )?;
+    worker_assignment_for_reservation(
+        store,
+        reservation,
+        &context,
+        verification.as_ref(),
+        recovery_authorization,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn render_reserved_worker_prompt_for_test(
+    applied_config: &AppliedConfig,
+    reservation: &crate::launch::AgentLaunchReservation,
+    plan_record: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    validated_plan: &crate::engine::orchestration::ValidatedPlan,
+    token: &crate::store::accepted_plans::PreparedWorkerLaunch,
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    ticket: crate::roles::TicketBrief,
+) -> Result<String, String> {
+    let prepared_context = PreparedWorkerContext {
+        plan_record: plan_record.clone(),
+        validated_plan: validated_plan.clone(),
+        node: node.clone(),
+        token: token.clone(),
+    };
+    let assignment = worker_assignment_from_reserved_snapshot(
+        reservation,
+        &prepared_context,
+        &[],
+        None,
+        None,
+        None,
+    )?;
+    let mut render_config = applied_config.clone();
+    render_config.source_files.clear();
+    render_config.source_root = reservation.workspace_path.display().to_string();
+    let profile_id = render_config
+        .config
+        .projects
+        .get(&reservation.project_id)
+        .and_then(|project| project.roles.get(&Role::Worker))
+        .cloned()
+        .ok_or("Worker profile is missing from the applied Project")?;
+    let profile_root = reservation
+        .workspace_path
+        .join("profiles")
+        .join(profile_id.as_str());
+    std::fs::create_dir_all(&profile_root).map_err(|error| error.to_string())?;
+    let canonical_profile_root =
+        std::fs::canonicalize(&profile_root).map_err(|error| error.to_string())?;
+    use sha2::Digest as _;
+    let profile_root_digest = Digest::parse(format!(
+        "{:x}",
+        sha2::Sha256::digest(canonical_profile_root.display().to_string().as_bytes())
+    ))?;
+    render_config.source_files.push(crate::config::SourceFile {
+        kind: crate::config::SourceKind::Directory,
+        path: profile_root.display().to_string(),
+        canonical_path: canonical_profile_root.display().to_string(),
+        sha256: profile_root_digest,
+        bytes: 0,
+        contents: String::new(),
+    });
+    let rendered = crate::roles::render_role_prompt(
+        &render_config,
+        &crate::roles::PromptContext {
+            project_id: reservation.project_id.clone(),
+            profile_id: None,
+            role: Role::Worker,
+            operation_recipe: None,
+            repositories: vec![node.repository.clone()],
+            ticket: Some(ticket),
+            recovery_summary: None,
+            accepted_plan: Some(assignment),
+            accepted_plan_digest: None,
+            implementation_publication_subject: None,
+            completion_context: None,
+            previous_decisions: Vec::new(),
+            required_evidence: node.required_evidence.clone(),
+            stop_conditions: vec![
+                "Work only in the assigned repository worktree and follow the assigned node's base/dependency semantics.".into(),
+                "Do not push, create a pull request, request a merge, or merge; the host controls publication.".into(),
+            ],
+            assigned_commit_mode: Some(token.commit_mode()),
+        },
+        Path::new("/bin/true"),
+    )?;
+    Ok(rendered.text)
+}
+
+pub(crate) fn worker_correction_context_for_launch(
+    store: &ConfigStore,
+    owner_generation: u64,
+    project_id: &crate::domain::ids::ProjectId,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    ticket_revision: u64,
+    configuration_digest: &Digest,
+    plan_record: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+) -> Result<Option<crate::agent_api::WorkerCorrectionContext>, String> {
+    if plan_record.project_id != *project_id
+        || plan_record.ticket_run_id != *ticket_run_id
+        || plan_record.configuration_digest != *configuration_digest
+    {
+        return Err("Worker correction context does not match the accepted plan scope".into());
+    }
+    let instruction =
+        store.latest_coordinator_instruction(project_id, ticket_run_id, ticket_revision)?;
+    let review = store.latest_worker_reviewer_correction(
+        owner_generation,
+        project_id,
+        ticket_run_id,
+        ticket_revision,
+        configuration_digest,
+        &plan_record.plan_digest,
+    )?;
+    if instruction.is_none() && review.is_none() {
+        return Ok(None);
+    }
+    let context = crate::agent_api::WorkerCorrectionContext {
+        schema_version: 1,
+        project_id: project_id.clone(),
+        ticket_run_id: ticket_run_id.clone(),
+        ticket_revision,
+        configuration_digest: configuration_digest.clone(),
+        accepted_plan_digest: plan_record.plan_digest.clone(),
+        coordinator_instruction: instruction.map(|instruction| {
+            crate::agent_api::WorkerCoordinatorInstruction {
+                wake_input_id: instruction.wake_input_id,
+                request_id: instruction.request_id,
+                source_revision: instruction.source_revision,
+                body_digest: instruction.body_digest,
+                body: instruction.body,
+            }
+        }),
+        reviewer_correction: review.map(|review| crate::agent_api::WorkerReviewerCorrection {
+            evidence_id: review.evidence_id,
+            result_digest: review.result_digest,
+            source_revision: review.source_revision,
+            accepted_revision: review.accepted_revision,
+            publication_revision: review.publication_revision,
+            publication_subject_digest: review.assessment.subject_digest.clone(),
+            assessment: review.assessment,
+        }),
+    };
+    context.validate_for_assignment(
+        project_id,
+        ticket_run_id,
+        ticket_revision,
+        configuration_digest,
+        &plan_record.plan_digest,
+    )?;
+    Ok(Some(context))
 }
 
 fn worker_verification_assignment(
@@ -5001,6 +5193,8 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         plan_record,
         validated_plan,
         node,
+        ticket_revision,
+        correction_context,
         worktree_path,
         branch,
         base_sha,
@@ -5012,6 +5206,15 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         commit_mode,
         repository_id,
     } = context;
+    if let Some(correction_context) = correction_context {
+        correction_context.validate_for_assignment(
+            &plan_record.project_id,
+            &plan_record.ticket_run_id,
+            *ticket_revision,
+            &plan_record.configuration_digest,
+            &plan_record.plan_digest,
+        )?;
+    }
     let describe_base = |source: &crate::engine::orchestration::WorkBaseSource,
                          resolved_sha: Option<&str>| {
         match source {
@@ -5080,10 +5283,71 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
             "repository_id":repository_id,
         },
         "worker_recovery_authorization":recovery_authorization,
+        "worker_correction_context":correction_context,
         "retained_host_commit":retained_host_commit,
         "delivery_authority":"The host owns push, pull request creation, merge, and delivery."
     });
     serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn worker_assignment_for_reservation(
+    store: &ConfigStore,
+    reservation: &crate::launch::AgentLaunchReservation,
+    context: &PreparedWorkerContext,
+    verification: Option<&WorkerVerificationAssignment>,
+    recovery_authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Result<String, String> {
+    let host_artifacts = store.persisted_worker_host_artifacts(
+        context.token.project_id(),
+        context.token.ticket_run_id(),
+        &context.token.reservation_binding(),
+    )?;
+    let retained = retained_host_commit(
+        store,
+        &reservation.project_id,
+        &reservation.config_digest,
+        recovery_authorization,
+    )?;
+    worker_assignment_from_reserved_snapshot(
+        reservation,
+        context,
+        &host_artifacts,
+        verification,
+        recovery_authorization,
+        retained.as_ref(),
+    )
+}
+
+fn worker_assignment_from_reserved_snapshot(
+    reservation: &crate::launch::AgentLaunchReservation,
+    context: &PreparedWorkerContext,
+    host_artifacts: &[crate::agent_api::HostArtifactLocator],
+    verification: Option<&WorkerVerificationAssignment>,
+    recovery_authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+    retained_host_commit: Option<&crate::delivery_runtime::CommitWorkerManifestEffectReceipt>,
+) -> Result<String, String> {
+    worker_assignment_context(&WorkerAssignmentContext {
+        plan_record: &context.plan_record,
+        validated_plan: &context.validated_plan,
+        node: &context.node,
+        ticket_revision: reservation
+            .ticket_revision
+            .ok_or("Worker reservation lacks TicketRun revision")?
+            .0,
+        correction_context: reservation.wake_snapshot.worker_correction_context.as_ref(),
+        worktree_path: context.token.worktree_path(),
+        branch: context.token.branch(),
+        base_sha: context.token.base_sha(),
+        expected_head: recovery_authorization
+            .map(|authorization| authorization.expected_head.as_str())
+            .unwrap_or_else(|| context.token.expected_head()),
+        host_artifacts,
+        verification,
+        recovery_authorization,
+        retained_host_commit,
+        commit_mode: context.token.commit_mode(),
+        repository_id: context.token.repository_id(),
+    })
 }
 
 #[cfg(test)]
@@ -5711,6 +5975,8 @@ mod worker_assignment_context_tests {
             plan_record: &plan_record,
             validated_plan: &validated,
             node: &node,
+            ticket_revision: plan_record.accepted_revision,
+            correction_context: None,
             worktree_path: Path::new("/state/worktree"),
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
@@ -5755,6 +6021,8 @@ mod worker_assignment_context_tests {
             plan_record: &plan_record,
             validated_plan: &validated,
             node: &node,
+            ticket_revision: plan_record.accepted_revision,
+            correction_context: None,
             worktree_path: Path::new("/state/worktree"),
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
@@ -5819,6 +6087,8 @@ mod worker_assignment_context_tests {
             plan_record: &plan_record,
             validated_plan: &validated,
             node: &node,
+            ticket_revision: plan_record.accepted_revision,
+            correction_context: None,
             worktree_path: Path::new("/state/worktree"),
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,

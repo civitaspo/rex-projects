@@ -2859,6 +2859,7 @@ mod tests {
             role_session_id: "ticket_run:ticket-run-1:merge_decision".into(),
             agent_run_id: "agent-merge-decision".into(),
             digest: Digest::parse("0".repeat(64)).unwrap(),
+            worker_correction_context: None,
             inputs: vec![AgentWakeItem {
                 wake_input_id: 1,
                 source_type: "host_merge_assessment".into(),

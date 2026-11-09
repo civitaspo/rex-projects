@@ -1938,12 +1938,14 @@ mod tests {
         use crate::run_step_spool::BlockLossCleanupSnapshot;
         use crate::store::agent_recovery::RecoverableAgentRun;
         use crate::store::agent_runtime::tests::{
-            prepared_anchored_block_loss_fixture, test_execution_slot_disposition,
+            prepared_anchored_block_loss_fixture_exiting_one, test_agent_launch_states,
+            test_execution_slot_disposition, test_lifecycle_fact_counts,
+            test_terminal_receipt_count,
         };
         use sha2::{Digest as _, Sha256};
 
         let root = tempdir().unwrap();
-        let mut fixture = prepared_anchored_block_loss_fixture(root.path());
+        let mut fixture = prepared_anchored_block_loss_fixture_exiting_one(root.path());
         let package_path = fixture.authority.descriptor_path.clone();
         let marker = root.path().join("supervisor.identity");
         let shim_command = || {
@@ -2067,6 +2069,26 @@ mod tests {
             result.receipt.cancellation_cause,
             Some(crate::run_step::CancellationCause::RexLaunchAnchorClosed { .. })
         ));
+        assert_eq!(result.receipt.exit_code, Some(1));
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let current = crate::process::inspect_process_table().unwrap();
+            let identities = std::iter::once(&family.wrapper_process)
+                .chain(family.process_tree.iter())
+                .collect::<Vec<_>>();
+            if identities.iter().all(|saved| {
+                !current.iter().any(|observed| {
+                    observed.pid == saved.pid && observed.start_identity == saved.start_identity
+                })
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "producer emitted a terminal result before the complete process family was absent"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         let mut snapshot_processes = family.process_tree.clone();
         snapshot_processes.push(family.wrapper_process.clone());
@@ -2127,6 +2149,22 @@ mod tests {
         assert_eq!(
             test_execution_slot_disposition(&fixture.store, "unrelated-run"),
             "unknown"
+        );
+        assert_eq!(
+            test_agent_launch_states(&fixture.store, &fixture.slot_owner_id),
+            ("cancelled".into(), fixture.generation, "cancelled".into())
+        );
+        assert_eq!(
+            test_lifecycle_fact_counts(
+                &fixture.store,
+                &fixture.slot_owner_id,
+                fixture.reservation.project_epoch,
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            test_terminal_receipt_count(&fixture.store, &fixture.slot_owner_id),
+            0
         );
     }
 

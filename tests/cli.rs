@@ -246,6 +246,7 @@ fn inbox_fixture_snapshot(run_id: &str) -> rex_projects::agent_api::AgentWakeSna
         role_session_id: "ticket_run:ticket1:coordinator".into(),
         agent_run_id: run_id.into(),
         digest: rex_projects::domain::ids::Digest::parse("0".repeat(64)).unwrap(),
+        worker_correction_context: None,
         inputs: vec![rex_projects::agent_api::AgentWakeItem {
             wake_input_id: 5,
             source_type: "agent_result".into(),

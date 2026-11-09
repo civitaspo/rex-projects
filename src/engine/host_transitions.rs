@@ -2536,6 +2536,8 @@ mod tests {
                 host_artifacts: Vec::new(),
                 host_completion_context: Some(completion_context.clone()),
             }],
+
+            worker_correction_context: None,
         };
         inbox.digest = inbox.content_digest().unwrap();
         let inbox_root = tempfile::tempdir().unwrap();
