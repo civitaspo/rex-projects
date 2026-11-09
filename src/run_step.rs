@@ -2809,8 +2809,8 @@ mod tests {
             release.display(),
             response,
         );
-        let mut turn = request(root.path(), AgentAdapter::ClaudeCode, "/bin/sh");
-        turn.profile.command = vec!["/bin/sh".into(), "-c".into(), script];
+        let mut turn = request(root.path(), AgentAdapter::ClaudeCode, "/bin/bash");
+        turn.profile.command = vec!["/bin/bash".into(), "-c".into(), script];
         turn.descriptor.provider_capability = fixture_capability(
             &turn.profile,
             turn.descriptor.profile_digest.clone(),
@@ -2904,7 +2904,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn durable_producer_records_large_fast_executable_image_before_provider_decode() {
+    fn durable_producer_persists_large_executable_image_while_provider_is_live() {
         use crate::run_step_cli::DurableFamilyObserver;
         use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunStepSpool};
 
@@ -2916,12 +2916,29 @@ mod tests {
             AgentAdapter::ClaudeCode,
             executable.to_str().unwrap(),
         );
-        turn.profile.command = vec![executable.to_string_lossy().into_owned(), "--list".into()];
+        let release = root.path().join("provider-release");
+        turn.profile.command = vec![
+            executable.to_string_lossy().into_owned(),
+            "--exact".into(),
+            "run_step::tests::provider_image_fixture_waits_for_release".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+            "--".into(),
+        ];
+        turn.environment.insert(
+            OsString::from("REX_TEST_PROVIDER_RELEASE"),
+            release.as_os_str().to_owned(),
+        );
         turn.descriptor.provider_capability = fixture_capability(
             &turn.profile,
             turn.descriptor.profile_digest.clone(),
             &turn.descriptor.result_schema,
         );
+        let executable_digest = turn
+            .descriptor
+            .provider_capability
+            .executable_digest
+            .clone();
         let spool = RunStepSpool::open(&turn.descriptor.control_dir).unwrap();
         let wrapper = process::inspect_process_table()
             .unwrap()
@@ -2939,33 +2956,75 @@ mod tests {
         };
         spool.publish_run_family_binding_once(&binding).unwrap();
 
-        let mut observer = DurableFamilyObserver::new(&spool, binding);
-        let result = run_fixture_turn(&turn, &mut observer).unwrap();
-        let family = spool.read_run_family_record().unwrap().unwrap_or_else(|| {
-            panic!(
-                "no durable family record; cleanup_detail={:?}",
-                result.receipt.cleanup_detail
-            )
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                let mut observer = DurableFamilyObserver::new(&spool, binding);
+                run_fixture_turn(&turn, &mut observer).unwrap()
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let observing = loop {
+                if let Some(family) = spool.read_run_family_record().unwrap()
+                    && family.coverage == RunFamilyCoverage::Observing
+                {
+                    break family;
+                }
+                if std::time::Instant::now() >= deadline {
+                    fs::write(&release, "continue").unwrap();
+                    let result = producer.join().unwrap();
+                    panic!(
+                        "large executable family was not persisted while the provider was live; receipt={:?}; family={:?}",
+                        result.receipt,
+                        spool.read_run_family_record()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let current = process::inspect_process_table().unwrap();
+            let provider_is_live = current.iter().any(|process| {
+                process.pid == observing.provider_root.pid
+                    && process.start_identity == observing.provider_root.start_identity
+            });
+            let observing_executable_path = observing.provider_executable_path.clone();
+            let observing_executable_digest = observing.provider_executable_digest.clone();
+            fs::write(&release, "continue").unwrap();
+            let result = producer.join().unwrap();
+            assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+            let family = spool.read_run_family_record().unwrap().unwrap();
+            assert!(provider_is_live);
+            assert_eq!(observing_executable_path, executable);
+            assert_eq!(observing_executable_digest, executable_digest);
+            assert_eq!(family.coverage, RunFamilyCoverage::Complete);
+            assert_eq!(family.provider_executable_path, executable);
+            assert_eq!(family.provider_executable_digest, executable_digest);
+            assert_eq!(family.wrapper_process.pid, family.binding.wrapper_pid);
+            assert_eq!(
+                family.wrapper_process.start_identity,
+                family.binding.wrapper_start_identity
+            );
+            assert!(family.process_tree.iter().any(|process| {
+                process.pid == family.provider_root.pid
+                    && process.start_identity == family.provider_root.start_identity
+            }));
         });
+    }
 
-        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
-        assert_eq!(family.coverage, RunFamilyCoverage::Complete);
-        assert_eq!(family.provider_executable_path, executable);
-        assert_eq!(
-            family.provider_executable_digest,
-            super::hash_file(&executable).unwrap()
-        );
-        assert_eq!(family.wrapper_process.pid, family.binding.wrapper_pid);
-        assert_eq!(
-            family.wrapper_process.start_identity,
-            family.binding.wrapper_start_identity
-        );
-        assert!(
-            family
-                .process_tree
-                .iter()
-                .any(|process| process.pid == family.provider_root.pid
-                    && process.start_identity == family.provider_root.start_identity)
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture invoked by the durable provider image test"]
+    fn provider_image_fixture_waits_for_release() {
+        let release = std::env::var_os("REX_TEST_PROVIDER_RELEASE")
+            .expect("provider release path is provided by the parent test");
+        let release = PathBuf::from(release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !release.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent test did not release the provider fixture"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!(
+            r#"{{"type":"result","session_id":"session-a","is_error":false,"structured_output":{{"result":"{{\"ok\":true}}"}}}}"#
         );
     }
 

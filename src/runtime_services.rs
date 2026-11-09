@@ -2236,24 +2236,14 @@ impl FactoryRuntimeServices for RuntimeServices {
             .get(profile_id)
             .ok_or("Supervisor profile is absent from the applied configuration")?;
         let profile_digest = crate::store::agent_profile_digest(profile)?;
-        let runtime_identity = crate::run_step::profile_runtime_identity(profile)
-            .map_err(|error| error.to_string())?;
-        let qualifications = store.verified_provider_qualifications(
+        let Some(qualification) = exact_profile_qualification(
+            store,
             &candidate.project_id,
             profile_id,
+            profile,
             &profile_digest,
-            32,
-        )?;
-        let Some(qualification) = qualifications.into_iter().find(|qualification| {
-            qualification.adapter == runtime_identity.adapter
-                && qualification.executable_path
-                    == runtime_identity.executable_path.display().to_string()
-                && qualification.executable_digest == runtime_identity.executable_digest
-                && qualification.commit_mode == runtime_identity.commit_mode
-                && qualification.invocation_options_digest
-                    == runtime_identity.invocation_options_digest
-                && qualification.permission_mode == runtime_identity.effective_permission_mode
-        }) else {
+        )?
+        else {
             eprintln!(
                 "rex-projects: parked Supervisor launch for Project {}: profile {} has no exact verified provider qualification; run `rex-projects provider qualify --project {} --role supervisor`",
                 candidate.project_id, profile_id, candidate.project_id
@@ -3422,6 +3412,31 @@ fn digest_serialized(value: &impl serde::Serialize) -> Result<Digest, String> {
     digest_bytes(&bytes)
 }
 
+fn exact_profile_qualification(
+    store: &ConfigStore,
+    project_id: &crate::domain::ids::ProjectId,
+    profile_id: &crate::domain::ids::ProfileId,
+    profile: &crate::config::Profile,
+    profile_digest: &Digest,
+) -> Result<Option<crate::launch::ProviderQualification>, String> {
+    let qualifications =
+        store.verified_provider_qualifications(project_id, profile_id, profile_digest, 32)?;
+    if qualifications.is_empty() {
+        return Ok(None);
+    }
+    let runtime_identity =
+        crate::run_step::profile_runtime_identity(profile).map_err(|error| error.to_string())?;
+    Ok(qualifications.into_iter().find(|qualification| {
+        qualification.adapter == runtime_identity.adapter
+            && qualification.executable_path
+                == runtime_identity.executable_path.display().to_string()
+            && qualification.executable_digest == runtime_identity.executable_digest
+            && qualification.commit_mode == runtime_identity.commit_mode
+            && qualification.invocation_options_digest == runtime_identity.invocation_options_digest
+            && qualification.permission_mode == runtime_identity.effective_permission_mode
+    }))
+}
+
 fn preflight_provider_qualification_job(
     profile: &crate::config::Profile,
     job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
@@ -3444,6 +3459,40 @@ fn preflight_provider_qualification_job(
         .ok_or("provider qualification deadline cannot be represented by this platform")?;
     crate::run_step::profile_runtime_identity(profile).map_err(|error| error.to_string())?;
     Ok(deadline_seconds)
+}
+
+#[cfg(test)]
+mod provider_qualification_lookup_tests {
+    use super::exact_profile_qualification;
+    use crate::domain::ids::{ProfileId, ProjectId};
+    use crate::store::ConfigStore;
+
+    #[test]
+    fn unqualified_profile_parks_without_resolving_provider_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::open_test(temp.path()).unwrap();
+        let executable = temp.path().join("missing-provider");
+        let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
+            "adapter": "codex",
+            "command": [executable.display().to_string()],
+            "turn_timeout_seconds": 60,
+            "commit_mode": "native"
+        }))
+        .unwrap();
+
+        let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
+        let qualification = exact_profile_qualification(
+            &store,
+            &ProjectId::parse("project-a").unwrap(),
+            &ProfileId::parse("profile-a").unwrap(),
+            &profile,
+            &profile_digest,
+        )
+        .unwrap();
+
+        assert!(qualification.is_none());
+        assert!(!executable.exists());
+    }
 }
 
 fn digest_bytes(bytes: &[u8]) -> Result<Digest, String> {

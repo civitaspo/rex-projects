@@ -2359,6 +2359,17 @@ impl ConfigStore {
         {
             return Err("ticket was relinquished by a human and must be repolled as open before a new local claim".into());
         }
+        if reconcile_state.is_some()
+            && crate::store::scheduler::ticket_claim_reconciliation_origin_project(
+                &tx, namespace, ticket,
+            )?
+            .as_ref()
+                != Some(project)
+        {
+            return Err(
+                "ticket claim reconciliation belongs to a different or unknown Project".into(),
+            );
+        }
         let matching: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2 AND namespace=?3 AND ticket_id=?4 AND generation=?5)", params![ticket_run.as_str(), project.as_str(), namespace.as_str(), ticket.as_str(), generation], |row| row.get(0)).map_err(|e| e.to_string())?;
         if !matching {
             return Err("ticket run does not match claim identity".into());
@@ -2369,36 +2380,6 @@ impl ConfigStore {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted)
-    }
-
-    pub fn confirm_ticket_claim_repolled(
-        &mut self,
-        owner_generation: u64,
-        namespace: &TicketNamespace,
-        ticket: &TicketId,
-        eligible_for_claim: bool,
-        observed_status: &str,
-        external_revision: Option<&str>,
-    ) -> Result<bool, String> {
-        if observed_status.is_empty() || observed_status.len() > 255 {
-            return Err("repolled external status is required".into());
-        }
-        let state = if eligible_for_claim {
-            "repolled_open"
-        } else {
-            "repolled_closed"
-        };
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        validate_active_generation(&tx, owner_generation)?;
-        let changed = tx.execute(
-            "UPDATE ticket_claim_reconciliations SET state=?3,observed_status=?4,external_revision=?5,repolled_by_generation=?6,repolled_at_unix=?7 WHERE namespace=?1 AND ticket_id=?2",
-            params![namespace.as_str(),ticket.as_str(),state,observed_status,external_revision,owner_generation,now_unix()?],
-        ).map_err(|error| error.to_string())? == 1;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(changed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9037,18 +9018,6 @@ mod tests {
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &run, 1)
                 .is_err()
         );
-        assert!(
-            store
-                .confirm_ticket_claim_repolled(
-                    generation,
-                    &namespace,
-                    &ticket,
-                    true,
-                    "In Progress",
-                    Some("remote-7")
-                )
-                .unwrap()
-        );
         let next_run = TicketRunId::parse("payments-12-g2").unwrap();
         store
             .create_ticket_run(
@@ -9065,8 +9034,14 @@ mod tests {
         assert!(
             store
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &next_run, 2)
-                .unwrap()
+                .is_err()
         );
+        let reconciliation_state: String = store.connection.query_row(
+            "SELECT state FROM ticket_claim_reconciliations WHERE namespace=?1 AND ticket_id=?2",
+            rusqlite::params![namespace.as_str(), ticket.as_str()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(reconciliation_state, "pending");
         let audit: (String,String) = store.connection.query_row(
             "SELECT input_id,evidence_json FROM transitions WHERE entity_id=?1 AND new_revision=1",[run.as_str()],|row| Ok((row.get(0)?,row.get(1)?)),
         ).unwrap();

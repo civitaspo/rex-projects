@@ -28,6 +28,9 @@ tempfile = "3"
 [profile.release]
 strip = true
 
+[profile.dev.package.sha2]
+opt-level = 3
+
 [workspace]
 members = ["xtask"]
 resolver = "3"
