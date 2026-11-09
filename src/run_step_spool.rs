@@ -24,9 +24,9 @@ const RUN_FAMILY_VERSION: u32 = 1;
 const RUN_FAMILY_RECORD_VERSION: u32 = 2;
 const MAX_START_BYTES: usize = 32 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
-const MAX_BLOCK_LOSS_SNAPSHOT_BYTES: usize = 512 * 1024;
-const MAX_BLOCK_LOSS_IDENTITIES: usize = 1024;
-const MAX_RUN_FAMILY_BYTES: usize = 512 * 1024;
+const MAX_BLOCK_LOSS_SNAPSHOT_BYTES: usize = 33 * 1024 * 1024;
+const MAX_RUN_FAMILY_BYTES: usize = crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES;
+const MAX_AGENT_TURN_RESULT_BYTES: usize = crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -126,7 +126,6 @@ impl RunFamilyRecord {
         if self.schema_version != RUN_FAMILY_RECORD_VERSION
             || self.observed_at_unix < 0
             || self.process_tree.is_empty()
-            || self.process_tree.len() > MAX_BLOCK_LOSS_IDENTITIES
             || !self.provider_executable_path.is_absolute()
         {
             return Err("run-family record is outside its bounds".into());
@@ -152,6 +151,7 @@ impl RunFamilyRecord {
         {
             return Err("run-family record has no exact provider root anchor".into());
         }
+        crate::process::validate_process_evidence_tree(&self.process_tree)?;
         let mut identities = std::collections::BTreeSet::new();
         for process in &self.process_tree {
             if process.pid == 0
@@ -177,10 +177,10 @@ impl BlockLossCleanupSnapshot {
             || self.reservation_epoch == 0
             || self.observed_at_unix < 0
             || self.process_tree.is_empty()
-            || self.process_tree.len() > MAX_BLOCK_LOSS_IDENTITIES
         {
             return Err("block-loss cleanup snapshot is outside its bounds".into());
         }
+        crate::process::validate_process_evidence_tree(&self.process_tree)?;
         let mut identities = std::collections::BTreeSet::new();
         for process in &self.process_tree {
             if process.pid == 0
@@ -469,13 +469,15 @@ impl RunStepSpool {
         if envelope.receipt.run_id != request.request.agent_run_id {
             return Err("provider result belongs to a different AgentRun".into());
         }
+        envelope.result_digest = "0".repeat(64);
+        envelope.validate_payload_bounds()?;
         envelope.result_digest = envelope.payload_digest()?;
         let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
         publish_once(
             &self.directory,
             "turn.result.json",
             &bytes,
-            MAX_RESULT_BYTES,
+            MAX_AGENT_TURN_RESULT_BYTES,
         )?;
         Ok(envelope)
     }
@@ -543,7 +545,10 @@ impl RunStepSpool {
         request: &StartRequestEnvelope,
     ) -> Result<AgentTurnResult, String> {
         request.validate()?;
-        let bytes = self.read_result()?;
+        let bytes = read_bounded(
+            &self.directory.join("turn.result.json"),
+            MAX_AGENT_TURN_RESULT_BYTES,
+        )?;
         let family = self
             .read_run_family_record()?
             .ok_or("run-step producer has no durable process-family evidence")?;
@@ -605,9 +610,22 @@ impl AgentTurnResult {
         {
             return Err("Agent result is not bound to this acknowledged launch".into());
         }
+        self.validate_payload_bounds()?;
         if self.result_digest != self.payload_digest()? {
             return Err("Agent result digest does not match its payload".into());
         }
+        Ok(())
+    }
+
+    fn validate_payload_bounds(&self) -> Result<(), String> {
+        crate::process::validate_process_evidence_tree(&self.receipt.processes)?;
+        if let Some(result) = &self.structured_result
+            && crate::process::serialized_json_size_at_most(result, MAX_RESULT_BYTES).is_err()
+        {
+            return Err("Agent structured result exceeds the 1 MiB limit".into());
+        }
+        crate::process::serialized_json_size_at_most(self, MAX_AGENT_TURN_RESULT_BYTES)
+            .map_err(|_| "Agent turn result envelope exceeds the 34 MiB limit".to_owned())?;
         Ok(())
     }
 
@@ -803,7 +821,7 @@ mod tests {
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId};
     use crate::launch::{AgentLaunchReceipt, AgentStartRequest, LaunchDecision};
     use crate::process::{ProcessIdentity, ProcessIdentityQuality};
-    use crate::run_step::{CleanupState, RunReceipt, TurnOutcome, TurnResult};
+    use crate::run_step::{CleanupState, ObservedProcess, RunReceipt, TurnOutcome, TurnResult};
     use sha2::Digest as _;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1097,6 +1115,109 @@ mod tests {
         false_completion.coverage = RunFamilyCoverage::Complete;
         assert!(spool.write_run_family_record(&false_completion).is_err());
         assert_eq!(spool.read_run_family_record().unwrap(), Some(cumulative));
+    }
+
+    #[test]
+    fn producer_family_crosses_1024_and_interrupted_history_cannot_publish_result() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let request = spool.publish_start_once(request()).unwrap();
+        let binding = family_binding(&request.request);
+        spool.publish_run_family_binding_once(&binding).unwrap();
+
+        let initial = (200..1224)
+            .map(|pid| process(pid, &format!("birth-{pid}"), pid))
+            .collect::<Vec<_>>();
+        let mut family = family_record(binding, initial);
+        spool.write_run_family_record(&family).unwrap();
+        family.process_tree.push(process(1224, "birth-1224", 1224));
+        family.provider_root = family.process_tree[0].clone();
+        family.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&family.process_tree).unwrap())
+        ))
+        .unwrap();
+        family.observed_at_unix += 1;
+        spool.write_run_family_record(&family).unwrap();
+
+        let snapshot = cleanup_snapshot(family.process_tree.clone());
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            spool.read_block_loss_cleanup_snapshot().unwrap(),
+            Some(snapshot)
+        );
+
+        family.coverage = RunFamilyCoverage::Interrupted;
+        family.observed_at_unix += 1;
+        spool.write_run_family_record(&family).unwrap();
+        assert_eq!(spool.read_run_family_record().unwrap(), Some(family));
+        assert!(
+            spool
+                .publish_turn_result_once(&request, turn_result(&request.request))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn turn_result_envelope_allows_large_process_evidence_but_keeps_structured_result_bound() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let request = spool.publish_start_once(request()).unwrap();
+        let binding = family_binding(&request.request);
+        spool.publish_run_family_binding_once(&binding).unwrap();
+
+        let mut process_tree = (200..8_392)
+            .map(|pid| {
+                let mut process = process(pid, &format!("birth-{pid}"), pid);
+                process.command = format!("/provider/{}", "x".repeat(128));
+                process
+            })
+            .collect::<Vec<_>>();
+        let mut family = family_record(binding, std::mem::take(&mut process_tree));
+        spool.write_run_family_record(&family).unwrap();
+        family.coverage = RunFamilyCoverage::Complete;
+        family.observed_at_unix += 1;
+        spool.write_run_family_record(&family).unwrap();
+
+        let mut result = turn_result(&request.request);
+        result.receipt.processes = family
+            .process_tree
+            .iter()
+            .map(|process| ObservedProcess {
+                pid: process.pid,
+                parent_pid: process.parent_pid,
+                process_group_id: process.process_group_id,
+                start_identity: process.start_identity.clone(),
+                command: process.command.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            })
+            .collect();
+        spool.publish_turn_result_once(&request, result).unwrap();
+        assert!(
+            std::fs::metadata(spool.directory().join("turn.result.json"))
+                .unwrap()
+                .len()
+                > 1024 * 1024
+        );
+        assert!(spool.read_result().is_err());
+        let read = spool.read_turn_result(&request).unwrap();
+        assert_eq!(read.receipt.processes.len(), 8_192);
+
+        let mut too_large_result = turn_result(&request.request);
+        too_large_result.structured_result =
+            Some(serde_json::Value::String("x".repeat(1024 * 1024 + 1)));
+        let mut envelope = AgentTurnResult {
+            schema_version: 1,
+            start_request_digest: request.request_digest.clone(),
+            receipt: too_large_result.receipt,
+            structured_result: too_large_result.structured_result,
+            result_digest: String::new(),
+        };
+        envelope.result_digest = envelope.payload_digest().unwrap();
+        assert_eq!(
+            envelope.validate_for(&request).unwrap_err(),
+            "Agent structured result exceeds the 1 MiB limit"
+        );
     }
 
     #[test]

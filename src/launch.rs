@@ -22,7 +22,6 @@ use crate::engine::orchestration::WorkNodeId;
 pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_DATABASE_SCHEMA_VERSION: i64 = 7;
-const MAX_PROVIDER_PROCESS_TREE_IDENTITIES: usize = 1024;
 
 /// Minimal durable StartAgent intent. Handlers resolve authority from controller-owned state.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1048,6 +1047,7 @@ impl ObservedProviderStart {
             return Err("provider process start observation is incomplete or mismatched".into());
         }
         if !self.process_tree.is_empty() {
+            crate::process::validate_process_evidence_tree(&self.process_tree)?;
             let provider = self.process_tree.iter().find(|process| {
                 process.pid == self.provider_pid
                     && process.start_identity == self.provider_start_identity
@@ -1075,10 +1075,8 @@ impl ObservedProviderStart {
         qualification: &ProviderQualification,
     ) -> Result<(), String> {
         self.validate(qualification)?;
-        if self.process_tree.is_empty()
-            || self.process_tree.len() > MAX_PROVIDER_PROCESS_TREE_IDENTITIES
-        {
-            return Err("provider process tree is empty or exceeds its identity limit".into());
+        if self.process_tree.is_empty() {
+            return Err("provider process tree is empty".into());
         }
         let mut pids = BTreeSet::new();
         let mut provider_found = false;
@@ -1472,6 +1470,41 @@ mod tests {
         observation.process_tree_confirmed = true;
         observation.executable_digest = digest('5');
         assert!(observation.validate(&qualification).is_err());
+    }
+
+    #[test]
+    fn provider_start_accepts_process_tree_larger_than_1024_within_shared_budget() {
+        let qualification = qualification(QualificationStatus::Verified);
+        let process_tree = (1..=1_025)
+            .map(|pid| ProviderProcessIdentity {
+                pid,
+                parent_pid: pid.saturating_sub(1).max(1),
+                process_group_id: pid,
+                start_identity: format!("birth-{pid}"),
+                identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            })
+            .collect::<Vec<_>>();
+        let process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+        ))
+        .unwrap();
+        let observation = ObservedProviderStart {
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            operation_id: OperationId::parse("op-1").unwrap(),
+            provider_pid: 44,
+            provider_start_identity: "birth-44".into(),
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest,
+            process_tree_confirmed: true,
+            process_tree,
+        };
+
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_ok()
+        );
     }
 
     #[test]

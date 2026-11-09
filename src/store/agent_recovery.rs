@@ -13,6 +13,7 @@ use super::agent_results::VerifiedAgentCleanup;
 use super::{ConfigStore, validate_active_generation};
 
 type AgentAdoptionLookupRow = (String, u64, u64, String, u64, String, String, String);
+const MAX_LIFECYCLE_PROCESS_SAMPLE: usize = 256;
 type CancelledAgentReconciliationRow = (
     String,
     String,
@@ -255,7 +256,6 @@ impl AgentAdoptionEvidence {
             || self.wrapper_pid == 0
             || self.provider_pid == 0
             || self.process_tree.is_empty()
-            || self.process_tree.len() > 1024
             || self.wrapper_start_identity.trim().is_empty()
             || self.provider_start_identity.trim().is_empty()
             || self.wrapper_start_identity.chars().any(char::is_control)
@@ -263,6 +263,12 @@ impl AgentAdoptionEvidence {
         {
             return Err("Agent adoption evidence is incomplete".into());
         }
+        crate::process::validate_process_evidence_tree(&self.process_tree)?;
+        crate::process::serialized_json_size_at_most(
+            self,
+            crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES,
+        )
+        .map_err(|_| "Agent adoption evidence exceeds the 34 MiB limit".to_owned())?;
         let mut previous_pid = 0;
         for process in &self.process_tree {
             if process.pid == 0
@@ -462,6 +468,80 @@ fn validate_stop_process_snapshot(
 }
 
 impl ConfigStore {
+    pub(crate) fn migrate_v14_process_evidence(tx: &Transaction<'_>) -> Result<(), String> {
+        let previous_adoptions: i64 = tx
+            .query_row("SELECT COUNT(*) FROM agent_run_adoptions", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let previous_terminal_receipts: i64 = tx
+            .query_row("SELECT COUNT(*) FROM agent_terminal_receipts", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let maximum_json_bytes = crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES;
+        tx.execute_batch(&format!(
+            "CREATE TABLE agent_run_adoptions_v14 (
+                agent_run_id TEXT NOT NULL REFERENCES agent_runs(agent_run_id),
+                controller_generation INTEGER NOT NULL CHECK(controller_generation > 0),
+                previous_controller_generation INTEGER NOT NULL CHECK(previous_controller_generation > 0),
+                authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64),
+                descriptor_digest TEXT NOT NULL CHECK(length(descriptor_digest) = 64),
+                evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+                evidence_json TEXT NOT NULL CHECK(length(CAST(evidence_json AS BLOB)) <= {maximum_json_bytes}),
+                created_at_unix INTEGER NOT NULL,
+                PRIMARY KEY(agent_run_id, controller_generation)
+            );
+            INSERT INTO agent_run_adoptions_v14 SELECT * FROM agent_run_adoptions;
+            DROP TABLE agent_run_adoptions;
+            ALTER TABLE agent_run_adoptions_v14 RENAME TO agent_run_adoptions;
+            CREATE TRIGGER agent_run_adoptions_immutable_update
+            BEFORE UPDATE ON agent_run_adoptions
+            BEGIN SELECT RAISE(ABORT, 'Agent adoption evidence is immutable'); END;
+            CREATE TRIGGER agent_run_adoptions_immutable_delete
+            BEFORE DELETE ON agent_run_adoptions
+            BEGIN SELECT RAISE(ABORT, 'Agent adoption evidence is retained'); END;
+
+            CREATE TABLE agent_terminal_receipts_v14 (
+                agent_run_id TEXT PRIMARY KEY REFERENCES agent_launch_authority(agent_run_id),
+                project_id TEXT NOT NULL REFERENCES projects(project_id),
+                attempt INTEGER NOT NULL CHECK(attempt > 0),
+                controller_generation INTEGER NOT NULL CHECK(controller_generation > 0),
+                authority_digest TEXT NOT NULL CHECK(length(authority_digest)=64),
+                start_request_digest TEXT NOT NULL CHECK(length(start_request_digest)=64),
+                start_request_json TEXT NOT NULL CHECK(length(start_request_json)<=32768),
+                terminal_digest TEXT NOT NULL CHECK(length(terminal_digest)=64),
+                result_digest TEXT NOT NULL CHECK(length(result_digest)=64),
+                absence_digest TEXT NOT NULL CHECK(length(absence_digest)=64),
+                receipt_json TEXT NOT NULL CHECK(length(CAST(receipt_json AS BLOB))<={maximum_json_bytes}),
+                observed_at_unix INTEGER NOT NULL
+            );
+            INSERT INTO agent_terminal_receipts_v14 SELECT * FROM agent_terminal_receipts;
+            DROP TABLE agent_terminal_receipts;
+            ALTER TABLE agent_terminal_receipts_v14 RENAME TO agent_terminal_receipts;
+            CREATE TRIGGER agent_terminal_receipts_immutable_update
+            BEFORE UPDATE ON agent_terminal_receipts
+            BEGIN SELECT RAISE(ABORT,'Agent terminal receipts are immutable'); END;
+            CREATE TRIGGER agent_terminal_receipts_immutable_delete
+            BEFORE DELETE ON agent_terminal_receipts
+            BEGIN SELECT RAISE(ABORT,'Agent terminal receipts are retained'); END;"
+        )).map_err(|error| format!("migrate process evidence storage bounds: {error}"))?;
+        let adopted_rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM agent_run_adoptions", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let terminal_rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM agent_terminal_receipts", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        if adopted_rows != previous_adoptions || terminal_rows != previous_terminal_receipts {
+            return Err("process evidence migration did not preserve all existing rows".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn migrate_v13_block_lifecycle(tx: &Transaction<'_>) -> Result<(), String> {
         tx.execute_batch(
             "CREATE TABLE agent_block_lifecycle_facts (
@@ -636,13 +716,14 @@ impl ConfigStore {
         }) {
             return Err("Agent block cleanup snapshot omits launch identities".into());
         }
+        let snapshot_identities = snapshot
+            .process_tree
+            .iter()
+            .map(|process| (process.pid, process.start_identity.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
         if survivors.iter().any(|survivor| {
             survivor.quality != ProcessIdentityQuality::KernelBirthToken
-                || !snapshot.process_tree.iter().any(|saved| {
-                    saved.pid == survivor.pid
-                        && saved.start_identity == survivor.start_identity
-                        && saved.quality == survivor.quality
-                })
+                || !snapshot_identities.contains(&(survivor.pid, survivor.start_identity.as_str()))
         }) {
             return Err("surviving Agent process is outside the saved process tree".into());
         }
@@ -696,7 +777,9 @@ impl ConfigStore {
         }
         if !survivors.is_empty() {
             let detail_json = serde_json::to_string(&serde_json::json!({
-                "surviving_processes": survivors.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                "surviving_process_count": survivors.len(),
+                "surviving_process_sample": survivors.iter().take(MAX_LIFECYCLE_PROCESS_SAMPLE).map(|process| process.pid).collect::<Vec<_>>(),
+                "surviving_process_sample_truncated": survivors.len() > MAX_LIFECYCLE_PROCESS_SAMPLE,
                 "process_tree_digest": snapshot.process_tree_digest,
             }))
             .map_err(|error| error.to_string())?;
@@ -1804,6 +1887,198 @@ mod tests {
     use super::*;
 
     #[test]
+    fn store_adoption_accepts_large_exact_process_history_and_rejects_shared_budget_overflow() {
+        use crate::store::OwnerMetadata;
+        use sha2::{Digest as _, Sha256};
+
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture =
+            crate::store::agent_runtime::tests::completed_block_loss_fixture(root.path(), false);
+        let previous_generation = fixture.generation;
+        let current_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "large-adoption-evidence-test".into(),
+                state_root: root.path().join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-restarted".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET state='unknown',controller_generation=?2 WHERE agent_run_id=?1",
+                rusqlite::params![fixture.run.agent_run_id.as_str(), current_generation],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET controller_generation=?2,disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
+                rusqlite::params![fixture.run.agent_run_id.as_str(), current_generation],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_launch_state SET provider_process_tree_json=?2 WHERE agent_run_id=?1",
+                rusqlite::params![
+                    fixture.run.agent_run_id.as_str(),
+                    serde_json::to_string(&fixture.provider).unwrap(),
+                ],
+            )
+            .unwrap();
+        let run = fixture
+            .store
+            .recoverable_agent_runs(current_generation, 8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(run.previous_generation, previous_generation);
+
+        let make_tree = |fake_processes: u32| {
+            let mut process_tree = (1..=fake_processes)
+                .map(|pid| AdoptedProcessIdentity {
+                    pid,
+                    parent_pid: 1,
+                    process_group_id: 1,
+                    start_identity: format!("birth-{pid}-{}", "x".repeat(64)),
+                    identity_quality: "kernel_birth_token".into(),
+                })
+                .collect::<Vec<_>>();
+            process_tree.push(AdoptedProcessIdentity {
+                pid: fixture.wrapper.pid,
+                parent_pid: 1,
+                process_group_id: fixture.wrapper.pid,
+                start_identity: fixture.wrapper.start_identity.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            });
+            process_tree.push(AdoptedProcessIdentity {
+                pid: fixture.provider.provider_pid,
+                parent_pid: fixture.wrapper.pid,
+                process_group_id: fixture.provider.provider_pid,
+                start_identity: fixture.provider.provider_start_identity.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            });
+            process_tree
+        };
+        let tree_digest = |process_tree: &[AdoptedProcessIdentity]| {
+            Digest::parse(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(process_tree).unwrap())
+            ))
+            .unwrap()
+        };
+        let process_tree = make_tree(8_192);
+        let evidence = AgentAdoptionEvidence {
+            schema_version: 1,
+            agent_run_id: run.agent_run_id.clone(),
+            controller_generation: current_generation,
+            previous_controller_generation: previous_generation,
+            authority_digest: run.authority_digest.clone(),
+            descriptor_digest: run.authority.descriptor_digest.clone(),
+            rex_process_observation_digest: Digest::parse("a".repeat(64)).unwrap(),
+            process_tree_digest: tree_digest(&process_tree),
+            provider_start_tree_digest: fixture.provider.process_tree_digest.clone(),
+            process_tree,
+            wrapper_pid: fixture.wrapper.pid,
+            wrapper_start_identity: fixture.wrapper.start_identity.clone(),
+            provider_pid: fixture.provider.provider_pid,
+            provider_start_identity: fixture.provider.provider_start_identity.clone(),
+            observed_at_unix: 10,
+        };
+        let evidence_json = serde_json::to_string(&evidence).unwrap();
+        assert!(evidence_json.len() > 512 * 1024);
+        assert!(evidence_json.len() < crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES);
+        assert!(
+            fixture
+                .store
+                .record_agent_run_adoption(&evidence, run.reservation_epoch)
+                .unwrap()
+        );
+        let (persisted_json, persisted_digest): (String, String) = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT evidence_json,evidence_digest FROM agent_run_adoptions WHERE agent_run_id=?1 AND controller_generation=?2",
+                rusqlite::params![evidence.agent_run_id.as_str(), current_generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted_json, evidence_json);
+        assert_eq!(persisted_digest, evidence.digest().unwrap().as_str());
+        assert_eq!(
+            crate::protocol::parse_unique::<AgentAdoptionEvidence>(persisted_json.as_bytes())
+                .unwrap(),
+            evidence
+        );
+
+        let mut too_many = evidence.clone();
+        too_many.process_tree = make_tree(65_535);
+        too_many.process_tree_digest = tree_digest(&too_many.process_tree);
+        assert_eq!(
+            fixture
+                .store
+                .record_agent_run_adoption(&too_many, run.reservation_epoch)
+                .unwrap_err(),
+            "process evidence exceeds the 65,536 identity limit"
+        );
+
+        let mut too_large = evidence.clone();
+        too_large.process_tree = vec![
+            AdoptedProcessIdentity {
+                pid: 1,
+                parent_pid: 1,
+                process_group_id: 1,
+                start_identity: "x".repeat(crate::process::MAX_PROCESS_EVIDENCE_TREE_BYTES),
+                identity_quality: "kernel_birth_token".into(),
+            },
+            AdoptedProcessIdentity {
+                pid: fixture.wrapper.pid,
+                parent_pid: 1,
+                process_group_id: fixture.wrapper.pid,
+                start_identity: fixture.wrapper.start_identity.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            },
+            AdoptedProcessIdentity {
+                pid: fixture.provider.provider_pid,
+                parent_pid: fixture.wrapper.pid,
+                process_group_id: fixture.provider.provider_pid,
+                start_identity: fixture.provider.provider_start_identity.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            },
+        ];
+        too_large.process_tree_digest = tree_digest(&too_large.process_tree);
+        assert_eq!(
+            fixture
+                .store
+                .record_agent_run_adoption(&too_large, run.reservation_epoch)
+                .unwrap_err(),
+            "process evidence exceeds the 32 MiB serialized tree limit"
+        );
+        let adoption_count: i64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_run_adoptions WHERE agent_run_id=?1",
+                [evidence.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(adoption_count, 1);
+    }
+
+    #[test]
     fn stop_owned_runs_payload_is_bound_to_the_explicit_durable_effect() {
         let project_id = ProjectId::parse("project-a").unwrap();
         let ticket_run_id = TicketRunId::parse("ticket-run-a").unwrap();
@@ -2563,25 +2838,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(slot_before_exit, ("unknown".into(), first_generation));
-        let surviving_provider = ProcessIdentity {
-            pid: 100,
-            parent_pid: 42,
-            process_group_id: 100,
-            start_identity: "provider-birth".into(),
-            command: String::new(),
-            quality: ProcessIdentityQuality::KernelBirthToken,
-        };
+        let large_survivors = (0..8_192)
+            .map(|index| {
+                let pid = 3_000_000_000 + index;
+                ProcessIdentity {
+                    pid,
+                    parent_pid: 42,
+                    process_group_id: pid,
+                    start_identity: format!("survivor-birth-{index}"),
+                    command: String::new(),
+                    quality: ProcessIdentityQuality::KernelBirthToken,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut large_snapshot = snapshot(false);
+        large_snapshot
+            .process_tree
+            .extend(large_survivors.iter().cloned());
+        large_snapshot.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&large_snapshot.process_tree).unwrap())
+        ))
+        .unwrap();
         assert!(
             !store
                 .reconcile_missing_agent_block(
                     generation,
                     &run,
                     3,
-                    &snapshot(false),
-                    &[surviving_provider],
+                    &large_snapshot,
+                    &large_survivors,
                 )
                 .unwrap()
         );
+        let (survivor_proof_digest, survivor_detail_json): (String, String) = store
+            .connection
+            .query_row(
+                "SELECT proof_digest,detail_json FROM agent_block_lifecycle_facts
+                 WHERE agent_run_id=?1 AND reservation_epoch=7 AND fact_type='process_survived'",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            survivor_proof_digest,
+            large_snapshot.process_tree_digest.as_str()
+        );
+        assert!(survivor_detail_json.len() <= 65_536);
+        let survivor_detail: serde_json::Value =
+            serde_json::from_str(&survivor_detail_json).unwrap();
+        assert_eq!(
+            survivor_detail["surviving_process_count"].as_u64(),
+            Some(8_192)
+        );
+        assert_eq!(
+            survivor_detail["surviving_process_sample"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_LIFECYCLE_PROCESS_SAMPLE
+        );
+        assert_eq!(survivor_detail["surviving_process_sample_truncated"], true);
         let retained: (String, u64) = store
             .connection
             .query_row(

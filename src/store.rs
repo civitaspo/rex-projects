@@ -36,7 +36,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -541,6 +541,11 @@ impl ConfigStore {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
         }
+        if existing_version == 14 {
+            artifact_registry::validate_v12_schema(&connection)?;
+            artifact_registry::validate_v13_schema(&connection)?;
+            artifact_registry::validate_v14_schema(&connection)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
@@ -616,6 +621,13 @@ impl ConfigStore {
             artifact_registry::migrate_v13(&connection)?;
         }
         artifact_registry::validate_v13_schema(&connection)?;
+        if existing_version < 14 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            artifact_registry::migrate_v14(&connection)?;
+        }
+        artifact_registry::validate_v14_schema(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,

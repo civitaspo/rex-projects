@@ -234,9 +234,11 @@ fn seed_database(state_root: &Path, input: &PostmortemInput, receipt: &Publicati
                 manifest_json TEXT,
                 manifest_digest TEXT,
                 created_at_unix INTEGER NOT NULL
-            );
-            PRAGMA user_version = 13;",
+            );",
         )
+        .unwrap();
+    connection
+        .pragma_update(None, "user_version", rex_projects::store::SCHEMA_VERSION)
         .unwrap();
     let request_json = serde_json::to_string(input).unwrap();
     let request_digest = sha256(request_json.as_bytes());
