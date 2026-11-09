@@ -7389,6 +7389,238 @@ mod tests {
             .expect("second correction must retain the host-accepted publication assignment");
         assert_eq!(second_correction_prepared.expected_head(), corrected_head);
 
+        let second_worker_agent_run_id =
+            crate::domain::ids::AgentRunId::parse("verification-worker-run-second").unwrap();
+        let second_worker_payload = serde_json::json!({
+            "work_node_id": stacked_id,
+            "repository": repository_id,
+            "publication_operation_id": corrected_intent.operation_id,
+            "published_head": corrected_head,
+            "test_receipt_artifact_ids": [],
+        });
+        let second_worker_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+            &mut second_correction_store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Worker,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "worker-verification-result-second".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::VerificationReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(Digest::parse("0".repeat(64)).unwrap()),
+                structured_result: second_worker_payload,
+                artifact_refs: Vec::new(),
+            },
+            second_worker_agent_run_id.clone(),
+        )
+        .unwrap();
+        let second_worker_authority = second_correction_store
+            .agent_launch_authority(&second_worker_agent_run_id)
+            .unwrap()
+            .unwrap();
+        let mut second_worker_wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: second_worker_authority.role_session_id.clone(),
+            agent_run_id: second_worker_agent_run_id.to_string(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: Vec::new(),
+        };
+        second_worker_wake_snapshot.digest = second_worker_wake_snapshot.content_digest().unwrap();
+        let second_worker_reservation = crate::launch::AgentLaunchReservation {
+            schema_version: 1,
+            agent_run_id: second_worker_agent_run_id.clone(),
+            project_id: project_id.clone(),
+            role: crate::domain::types::Role::Worker,
+            role_session_id: second_worker_authority.role_session_id.clone(),
+            parent_run_id: second_worker_authority.parent_run_id.clone(),
+            parent_role: second_worker_authority.parent_role,
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(second_correcting.revision)),
+            config_revision: second_worker_authority.config_revision,
+            config_digest: second_worker_authority.config_digest.clone(),
+            attempt: second_worker_authority.attempt,
+            run_epoch: second_worker_authority.run_epoch,
+            controller_generation: owner_generation,
+            project_epoch,
+            operation_id: second_worker_authority.operation_id.clone(),
+            operation_recipe_id: second_worker_authority.operation_recipe_id.clone(),
+            worker_assignment: Some(second_correction_prepared.reservation_binding()),
+            rex_view_id: second_worker_authority.rex_view_id.clone(),
+            runtime_binary_digest: second_worker_authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: second_worker_authority.environment_snapshot_id.clone(),
+            profile_id: second_worker_authority.profile_id.clone(),
+            profile_digest: second_worker_authority.profile_digest.clone(),
+            instruction_digest: second_worker_authority.instruction_digest.clone(),
+            result_schema_digest: second_worker_authority.result_schema_digest.clone(),
+            wake_snapshot: second_worker_wake_snapshot,
+            qualification_receipt_digest: second_worker_authority
+                .qualification_receipt_digest
+                .clone(),
+            descriptor_path: second_worker_authority.descriptor_path.clone(),
+            workspace_path: second_worker_authority.workspace_path.clone(),
+            control_dir: second_worker_authority.control_dir.clone(),
+            mailbox_directory: second_worker_authority.control_dir.clone(),
+            mailbox_capability_digest: second_worker_authority.mailbox_capability_digest.clone(),
+            mailbox_expires_at_unix: 9_999_999_999,
+            mailbox_max_request_bytes: 1_048_576,
+            mailbox_max_pending_requests: 32,
+            pool: "agent".into(),
+            slot_index: 3,
+            global_capacity: 4,
+            project_capacity: 4,
+        };
+        let second_worker_reservation_json =
+            crate::store::canonical_json(&second_worker_reservation).unwrap();
+        second_correction_store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'authorized',1,1)",
+                rusqlite::params![
+                    second_worker_agent_run_id.as_str(),
+                    project_id.as_str(),
+                    second_worker_reservation.operation_id.as_str(),
+                    owner_generation,
+                    project_epoch,
+                    second_worker_reservation.digest().unwrap().as_str(),
+                    second_worker_reservation_json,
+                ],
+            )
+            .unwrap();
+        let publication_transition_count: u64 = second_correction_store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND json_extract(evidence_json,'$.kind')='implementation_published'",
+                [ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut second_correction_store,
+                owner_generation,
+                18,
+                &config,
+                config_digest.clone(),
+                &second_worker_result.ingested,
+            )
+            .unwrap()
+        );
+        let second_verification_review = second_correction_store
+            .active_ticket_runs(owner_generation, 10)
+            .unwrap()[0]
+            .clone();
+        assert_eq!(second_verification_review.phase, Phase::Reviewing);
+        assert_eq!(
+            second_verification_review.revision,
+            verification_review.revision + 2
+        );
+        let second_verification_snapshot = second_correction_store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                second_verification_review.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            second_verification_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        let second_verification = second_verification_snapshot
+            .verification()
+            .expect("second host-accepted VerificationReady should be in the Reviewer subject");
+        assert_eq!(
+            second_verification.review_revision,
+            second_verification_review.revision
+        );
+        assert_eq!(second_verification.published_head.as_str(), corrected_head);
+        assert_eq!(
+            second_verification.publication_operation_id.as_str(),
+            corrected_intent.operation_id
+        );
+        let second_verification_evidence: String = second_correction_store
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+                rusqlite::params![ticket_run_id.as_str(), second_verification_review.revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut wrong_verification_publication: serde_json::Value =
+            serde_json::from_str(&second_verification_evidence).unwrap();
+        wrong_verification_publication["publication_revision"] =
+            serde_json::json!(corrected_review.revision + 1);
+        second_correction_store
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+                rusqlite::params![
+                    ticket_run_id.as_str(),
+                    second_verification_review.revision,
+                    wrong_verification_publication.to_string(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            second_correction_store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    second_verification_review.revision,
+                )
+                .is_err()
+        );
+        second_correction_store
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+                rusqlite::params![
+                    ticket_run_id.as_str(),
+                    second_verification_review.revision,
+                    second_verification_evidence,
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            second_correction_store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    verification_review.revision,
+                )
+                .unwrap_err(),
+            "publication snapshot consumer revision or Project is stale"
+        );
+        assert_eq!(
+            second_correction_store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &ProjectId::parse("foreign-project").unwrap(),
+                    &ticket_run_id,
+                    second_verification_review.revision,
+                )
+                .unwrap_err(),
+            "publication snapshot consumer revision or Project is stale"
+        );
+        let publication_transition_count_after: u64 = second_correction_store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND json_extract(evidence_json,'$.kind')='implementation_published'",
+                [ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            publication_transition_count_after,
+            publication_transition_count
+        );
+
         let accepted = verification_snapshot.accepted_plan();
         let validated_publications =
             crate::delivery_runtime::validate_implementation_publication_receipt(

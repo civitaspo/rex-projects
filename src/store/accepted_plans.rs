@@ -13,6 +13,33 @@ use crate::engine::orchestration::{ValidatedPlan, WorkNodeId, WorkPlan};
 use crate::store::{ConfigStore, SucceededEffectReceipt};
 
 const MAX_PLAN_BYTES: usize = 1_048_576;
+
+fn accepted_transition_matches(
+    rows: &[(u64, u64, String)],
+    revision: u64,
+    kind: &str,
+    transition: &str,
+    source_revision: Option<u64>,
+    accepted_revision: Option<u64>,
+    publication_revision: Option<u64>,
+) -> bool {
+    rows.iter().any(|(_, next_revision, evidence)| {
+        *next_revision == revision
+            && serde_json::from_str::<serde_json::Value>(evidence).is_ok_and(|value| {
+                value["kind"] == kind
+                    && value["transition"] == transition
+                    && source_revision
+                        .is_none_or(|revision| value["source_revision"].as_u64() == Some(revision))
+                    && accepted_revision.is_none_or(|revision| {
+                        value["accepted_revision"].as_u64() == Some(revision)
+                    })
+                    && publication_revision.is_none_or(|revision| {
+                        value["publication_revision"].as_u64() == Some(revision)
+                    })
+            })
+    })
+}
+
 type AcceptedPlanRow = (
     String,
     String,
@@ -719,7 +746,7 @@ impl ConfigStore {
             return Err("publication snapshot requires the active controller generation".into());
         }
         let mut stmt = self.connection.prepare(
-            "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC LIMIT 4",
+            "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC",
         ).map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map(
@@ -756,35 +783,42 @@ impl ConfigStore {
         {
             return Err("committed implementation publication transition is malformed".into());
         }
-        match (
-            phase.as_str(),
-            consumer_revision.checked_sub(publication_revision),
-        ) {
+        let publication_delta = consumer_revision.checked_sub(publication_revision);
+        let transition_chain_matches = |through_offset: u64| {
+            (1..=through_offset).all(|offset| {
+                let revision = publication_revision + offset;
+                if offset % 2 == 1 {
+                    accepted_transition_matches(
+                        &rows,
+                        revision,
+                        "review_assessment",
+                        "corrections_remain",
+                        Some(revision - 1),
+                        Some(revision),
+                        None,
+                    )
+                } else {
+                    accepted_transition_matches(
+                        &rows,
+                        revision,
+                        "worker_verification_completed",
+                        "worker_verification_completed",
+                        Some(revision - 1),
+                        Some(revision),
+                        Some(publication_revision),
+                    )
+                }
+            })
+        };
+        match (phase.as_str(), publication_delta) {
             ("reviewing", Some(0)) => {}
-            ("reviewing", Some(2))
-                if rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "worker_verification_completed"
-                                    && value["transition"] == "worker_verification_completed"
-                                    && value["accepted_revision"].as_u64()
-                                        == Some(consumer_revision)
-                                    && value["publication_revision"].as_u64()
-                                        == Some(publication_revision)
-                            },
-                        )
-                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision - 1
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "review_assessment"
-                                    && value["transition"] == "corrections_remain"
-                                    && value["source_revision"].as_u64()
-                                        == Some(publication_revision)
-                            },
-                        )
-                }) => {}
+            ("reviewing", Some(delta)) if delta >= 2 && delta % 2 == 0 => {
+                if !transition_chain_matches(delta) {
+                    return Err(
+                        "publication snapshot is no longer the current review subject".into(),
+                    );
+                }
+            }
             ("assessing", Some(1))
                 if rows.iter().any(|(_, next_revision, next_evidence)| {
                     *next_revision == consumer_revision
@@ -795,36 +829,19 @@ impl ConfigStore {
                             },
                         )
                 }) => {}
-            ("assessing", Some(3))
-                if rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "review_assessment"
-                                    && value["transition"] == "review_converged"
-                            },
-                        )
-                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision - 1
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "worker_verification_completed"
-                                    && value["transition"] == "worker_verification_completed"
-                                    && value["publication_revision"].as_u64()
-                                        == Some(publication_revision)
-                            },
-                        )
-                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision - 2
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "review_assessment"
-                                    && value["transition"] == "corrections_remain"
-                                    && value["source_revision"].as_u64()
-                                        == Some(publication_revision)
-                            },
-                        )
-                }) => {}
+            ("assessing", Some(delta))
+                if delta >= 3
+                    && delta % 2 == 1
+                    && transition_chain_matches(delta - 1)
+                    && rows.iter().any(|(_, next_revision, next_evidence)| {
+                        *next_revision == consumer_revision
+                            && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                                |value| {
+                                    value["kind"] == "review_assessment"
+                                        && value["transition"] == "review_converged"
+                                },
+                            )
+                    }) => {}
             ("implementing", Some(1))
                 if rows.iter().any(|(_, next_revision, next_evidence)| {
                     *next_revision == consumer_revision
@@ -835,46 +852,19 @@ impl ConfigStore {
                             },
                         )
                 }) => {}
-            ("implementing", Some(3))
-                if rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "review_assessment"
-                                    && value["transition"] == "corrections_remain"
-                                    && value["source_revision"].as_u64()
-                                        == consumer_revision.checked_sub(1)
-                                    && value["accepted_revision"].as_u64()
-                                        == Some(consumer_revision)
-                            },
-                        )
-                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision - 1
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "worker_verification_completed"
-                                    && value["transition"] == "worker_verification_completed"
-                                    && value["source_revision"].as_u64()
-                                        == consumer_revision.checked_sub(2)
-                                    && value["accepted_revision"].as_u64()
-                                        == Some(consumer_revision - 1)
-                                    && value["publication_revision"].as_u64()
-                                        == Some(publication_revision)
-                            },
-                        )
-                }) && rows.iter().any(|(_, next_revision, next_evidence)| {
-                    *next_revision == consumer_revision - 2
-                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
-                            |value| {
-                                value["kind"] == "review_assessment"
-                                    && value["transition"] == "corrections_remain"
-                                    && value["source_revision"].as_u64()
-                                        == Some(publication_revision)
-                                    && value["accepted_revision"].as_u64()
-                                        == Some(consumer_revision - 2)
-                            },
-                        )
-                }) => {}
+            ("implementing", Some(delta))
+                if delta >= 3
+                    && delta % 2 == 1
+                    && transition_chain_matches(delta - 1)
+                    && accepted_transition_matches(
+                        &rows,
+                        consumer_revision,
+                        "review_assessment",
+                        "corrections_remain",
+                        Some(consumer_revision - 1),
+                        Some(consumer_revision),
+                        None,
+                    ) => {}
             _ => return Err("publication snapshot is no longer the current review subject".into()),
         }
         let accepted = self
@@ -1027,12 +1017,11 @@ impl ConfigStore {
                 "publication snapshot digest does not match its committed receipt bindings".into(),
             );
         }
-        let verification_revision = match (
-            phase.as_str(),
-            consumer_revision.checked_sub(publication_revision),
-        ) {
-            ("reviewing", Some(2)) => Some(consumer_revision),
-            ("assessing", Some(3)) => consumer_revision.checked_sub(1),
+        let verification_revision = match (phase.as_str(), publication_delta) {
+            ("reviewing", Some(delta)) if delta >= 2 && delta % 2 == 0 => Some(consumer_revision),
+            ("assessing", Some(delta)) if delta >= 3 && delta % 2 == 1 => {
+                consumer_revision.checked_sub(1)
+            }
             _ => None,
         };
         let verification = if let Some(verification_revision) = verification_revision {
