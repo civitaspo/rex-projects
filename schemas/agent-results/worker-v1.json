@@ -134,6 +134,7 @@
         },
         "worktree_id": {
           "$ref": "#/$defs/WorkNodeId",
+          "description": "New Worker results use the logical `assigned_node.node_id` in schema v1.\nHost validation also accepts the exact managed worktree directory ID\nderived from the same immutable assignment for existing schema-v1 results.",
           "maxLength": 80,
           "minLength": 1,
           "pattern": "^[A-Za-z0-9._-]+$"

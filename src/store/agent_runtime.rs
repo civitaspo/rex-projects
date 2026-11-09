@@ -6,7 +6,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{Digest, ProjectId};
 use crate::domain::types::Role;
-use crate::launch::{AgentLaunchReservation, StartAgentEffectPayload};
+use crate::launch::{AgentLaunchReservation, StartAgentEffectPayload, WorkerLaunchBinding};
 use crate::store::{EffectIntent, insert_effect, now_unix, validate_active_generation};
 
 const MAX_WAKE_SNAPSHOT_ITEMS: usize = 256;
@@ -237,6 +237,7 @@ fn read_legacy_wake_context_rows(
                     payload_json,
                     host_artifact_source_evidence_ids: Vec::new(),
                     host_artifacts: Vec::new(),
+                    host_completion_context: None,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -550,6 +551,140 @@ impl ConfigStore {
             return Ok(None);
         };
         self.agent_launch_reservation(agent_run_id, &Digest::parse(digest)?)
+    }
+
+    /// Recover only the host artifact locators previously staged into this exact prepared
+    /// Worker worktree/node. Reservation and wake digests make the locator set host-owned;
+    /// callers still revalidate each source registration and staged copy before use.
+    pub fn persisted_worker_host_artifacts(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &crate::domain::ids::TicketRunId,
+        assignment: &WorkerLaunchBinding,
+    ) -> Result<Vec<crate::agent_api::HostArtifactLocator>, String> {
+        assignment.validate()?;
+        let mut statement = self.connection.prepare(
+            "SELECT r.reservation_digest,r.reservation_json FROM agent_launch_reservations r JOIN agent_launch_authority a USING(agent_run_id) WHERE r.project_id=?1 AND a.ticket_run_id=?2 AND a.role='worker' AND r.lifecycle='authorized' ORDER BY r.created_at_unix DESC LIMIT ?3",
+        ).map_err(|error| error.to_string())?;
+        const MAX_CANDIDATE_RESERVATIONS: u64 = 4096;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    project_id.as_str(),
+                    ticket_run_id.as_str(),
+                    MAX_CANDIDATE_RESERVATIONS + 1
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if rows.len() as u64 > MAX_CANDIDATE_RESERVATIONS {
+            return Err(
+                "Worker host artifact provenance exceeds its reservation scan limit".into(),
+            );
+        }
+
+        let mut locators = std::collections::BTreeMap::new();
+        let mut total_bytes = 0u64;
+        for (stored_digest, json) in rows {
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            reservation.validate()?;
+            if reservation.digest()?.as_str() != stored_digest {
+                return Err("stored launch reservation digest is inconsistent".into());
+            }
+            let authority = self
+                .agent_launch_authority(&reservation.agent_run_id)?
+                .ok_or("persisted Worker host artifact reservation lost its launch authority")?;
+            if authority.agent_run_id != reservation.agent_run_id
+                || authority.project_id != reservation.project_id
+                || authority.role != reservation.role
+                || authority.role_session_id != reservation.role_session_id
+                || authority.parent_run_id != reservation.parent_run_id
+                || authority.parent_role != reservation.parent_role
+                || authority.ticket_run_id != reservation.ticket_run_id
+                || authority.ticket_revision != reservation.ticket_revision
+                || authority.config_revision != reservation.config_revision
+                || authority.config_digest != reservation.config_digest
+                || authority.attempt != reservation.attempt
+                || authority.run_epoch != reservation.run_epoch
+                || authority.controller_generation != reservation.controller_generation
+                || authority.operation_id != reservation.operation_id
+                || authority.operation_recipe_id != reservation.operation_recipe_id
+                || authority.rex_view_id != reservation.rex_view_id
+                || authority.runtime_binary_digest != reservation.runtime_binary_digest
+                || authority.environment_snapshot_id != reservation.environment_snapshot_id
+                || authority.profile_id != reservation.profile_id
+                || authority.profile_digest != reservation.profile_digest
+                || authority.instruction_digest != reservation.instruction_digest
+                || authority.result_schema_digest != reservation.result_schema_digest
+                || authority.qualification_receipt_digest
+                    != reservation.qualification_receipt_digest
+                || authority.descriptor_path != reservation.descriptor_path
+                || authority.workspace_path != reservation.workspace_path
+                || authority.control_dir != reservation.control_dir
+                || authority.mailbox_capability_digest != reservation.mailbox_capability_digest
+                || authority.role != Role::Worker
+                || authority.project_id != *project_id
+                || authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+                || authority.wake_snapshot_digest != reservation.wake_snapshot.digest
+            {
+                return Err(
+                    "persisted Worker reservation differs from its immutable launch authority"
+                        .into(),
+                );
+            }
+            if reservation.project_id != *project_id
+                || reservation.ticket_run_id.as_ref() != Some(ticket_run_id)
+                || reservation.role != Role::Worker
+            {
+                continue;
+            }
+            let Some(prior_assignment) = reservation.worker_assignment.as_ref() else {
+                continue;
+            };
+            if prior_assignment.configuration_digest != assignment.configuration_digest
+                || prior_assignment.plan_digest != assignment.plan_digest
+                || prior_assignment.node_id != assignment.node_id
+                || prior_assignment.repository_id != assignment.repository_id
+                || prior_assignment.worktree_path != assignment.worktree_path
+                || prior_assignment.branch != assignment.branch
+                || prior_assignment.base_sha != assignment.base_sha
+                || prior_assignment.commit_mode != assignment.commit_mode
+                || prior_assignment.prepare_operation_id != assignment.prepare_operation_id
+            {
+                continue;
+            }
+            if reservation.wake_snapshot.digest != reservation.wake_snapshot.content_digest()? {
+                return Err("stored Worker wake snapshot digest is inconsistent".into());
+            }
+            for locator in reservation
+                .wake_snapshot
+                .inputs
+                .iter()
+                .flat_map(|input| &input.host_artifacts)
+            {
+                locator.validate()?;
+                if let Some(previous) = locators.get(locator.artifact_id.as_str()) {
+                    if previous != locator {
+                        return Err(
+                            "Worker host artifact identity has conflicting staged locators".into(),
+                        );
+                    }
+                    continue;
+                }
+                total_bytes = total_bytes
+                    .checked_add(locator.bytes)
+                    .ok_or("Worker host artifact byte count overflow")?;
+                if total_bytes > 64 * 1024 * 1024 || locators.len() >= 256 {
+                    return Err("Worker host artifact provenance exceeds its staging limits".into());
+                }
+                locators.insert(locator.artifact_id.as_str().to_owned(), locator.clone());
+            }
+        }
+        Ok(locators.into_values().collect())
     }
 
     /// Close phase two after host authority and the real Rex block have both been
@@ -1662,18 +1797,64 @@ pub(crate) mod tests {
         pub run: crate::store::agent_recovery::RecoverableAgentRun,
         pub wrapper: crate::launch::ObservedWrapperIdentity,
         pub provider: ObservedProviderStart,
+        pub start: crate::run_step_spool::StartRequestEnvelope,
         pub slot_owner_id: String,
+    }
+
+    pub(crate) struct PreparedBlockLossFixture {
+        pub store: ConfigStore,
+        pub generation: u64,
+        pub authority: crate::launch::AgentLaunchAuthority,
+        pub authority_digest: Digest,
+        pub qualification: ProviderQualification,
+        pub reservation: AgentLaunchReservation,
+        pub slot_owner_id: String,
+    }
+
+    enum BlockLossFixtureOutcome {
+        Prepared(Box<PreparedBlockLossFixture>),
+        Completed(Box<CompletedBlockLossFixture>),
     }
 
     pub(crate) fn completed_block_loss_fixture(
         root: &std::path::Path,
         complete_family: bool,
     ) -> CompletedBlockLossFixture {
+        match completed_block_loss_fixture_inner(root, complete_family, true, false) {
+            BlockLossFixtureOutcome::Completed(fixture) => *fixture,
+            BlockLossFixtureOutcome::Prepared(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn completed_family_without_terminal_fixture(
+        root: &std::path::Path,
+    ) -> CompletedBlockLossFixture {
+        match completed_block_loss_fixture_inner(root, true, false, false) {
+            BlockLossFixtureOutcome::Completed(fixture) => *fixture,
+            BlockLossFixtureOutcome::Prepared(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn prepared_anchored_block_loss_fixture(
+        root: &std::path::Path,
+    ) -> PreparedBlockLossFixture {
+        match completed_block_loss_fixture_inner(root, false, false, true) {
+            BlockLossFixtureOutcome::Prepared(fixture) => *fixture,
+            BlockLossFixtureOutcome::Completed(_) => unreachable!(),
+        }
+    }
+
+    fn completed_block_loss_fixture_inner(
+        root: &std::path::Path,
+        complete_family: bool,
+        publish_cancelled_terminal: bool,
+        prepare_anchored_only: bool,
+    ) -> BlockLossFixtureOutcome {
         use crate::domain::ids::{AgentRunId, OperationId, ProfileId, ProjectId, Revision};
         use crate::domain::types::{AgentAdapter, Role};
         use crate::launch::{
-            AgentLaunchAuthority, AgentStartRequest, ObservedWrapperIdentity,
-            ProviderProcessIdentity, RexView, RexViewKind,
+            AgentLaunchAuthority, AgentLaunchReservation, AgentStartRequest, LAUNCH_SCHEMA_VERSION,
+            ObservedWrapperIdentity, ProviderProcessIdentity, RexView, RexViewKind,
         };
         use crate::process::ProcessIdentityQuality;
         use crate::run_step::{
@@ -1697,7 +1878,26 @@ pub(crate) mod tests {
         let mut config = applied();
         let profile_id = ProfileId::parse("supervisor").unwrap();
         let profile = config.profiles.get_mut(&profile_id).unwrap();
-        profile.command = vec!["/bin/sleep".into()];
+        let executable = if prepare_anchored_only {
+            let marker = root.join("provider-exit");
+            profile.adapter = AgentAdapter::ClaudeCode;
+            profile.options = Some(crate::config::ProfileOptions::ClaudeCode(
+                crate::config::ClaudeCodeOptions::default(),
+            ));
+            profile.command = vec![
+                "/usr/bin/perl".into(),
+                "-e".into(),
+                "$SIG{TERM}='IGNORE'; $SIG{INT}='IGNORE'; while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }".into(),
+                marker.display().to_string(),
+            ];
+            std::fs::canonicalize("/usr/bin/perl").unwrap()
+        } else {
+            profile.command = vec!["/bin/sleep".into()];
+            std::fs::canonicalize("/bin/sleep").unwrap()
+        };
+        let profile_commit_mode = profile.commit_mode;
+        let profile_invocation_options_digest =
+            crate::run_step::invocation_options_digest(profile).unwrap();
         let profile_digest = crate::store::agent_profile_digest(profile).unwrap();
         let applied_snapshot = store
             .apply_snapshot("factory", &config, ExpectedRevision::Bootstrap)
@@ -1732,7 +1932,7 @@ pub(crate) mod tests {
         store
             .connection
             .execute(
-                "UPDATE project_runtimes SET desired_lifecycle='running',observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+                "UPDATE project_runtimes SET desired_lifecycle='running',observed_lifecycle='running',controller_generation=?2,project_epoch=7 WHERE project_id=?1",
                 rusqlite::params![project_id.as_str(), generation],
             )
             .unwrap();
@@ -1745,9 +1945,15 @@ pub(crate) mod tests {
             .unwrap();
 
         let mut qualification = qualification();
-        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
         qualification.project_id = project_id.clone();
         qualification.profile_digest = profile_digest.clone();
+        if prepare_anchored_only {
+            qualification.adapter = AgentAdapter::ClaudeCode;
+            qualification.commit_mode = profile_commit_mode;
+            qualification.permission_mode = "auto; permission prompts denied unattended".into();
+            qualification.invocation_options_digest = profile_invocation_options_digest;
+            qualification.proof.observed_permission_mode = qualification.permission_mode.clone();
+        }
         qualification.executable_path = executable.display().to_string();
         qualification.executable_digest = Digest::parse(format!(
             "{:x}",
@@ -1784,7 +1990,16 @@ pub(crate) mod tests {
             start_identity: "wrapper-born-test".into(),
             rex_session_id: "session".into(),
             rex_block_id: "block-test".into(),
-            runtime_binary_digest: digest('4'),
+            runtime_binary_digest: if prepare_anchored_only {
+                Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(std::fs::read(std::env::current_exe().unwrap()).unwrap())
+                ))
+                .unwrap()
+            } else {
+                digest('4')
+            },
+            rex_launch_anchor: None,
         };
         let provider_pid = u32::MAX - 19;
         let provider_start_identity = "provider-born-test".to_owned();
@@ -1793,7 +2008,7 @@ pub(crate) mod tests {
             .unwrap()
             .identity;
         let result_schema_digest = schema_projection.source_schema_digest.clone();
-        let authority_base = AgentLaunchAuthority {
+        let mut authority_base = AgentLaunchAuthority {
             agent_run_id: run_id.clone(),
             project_id: project_id.clone(),
             role: Role::Supervisor,
@@ -1828,10 +2043,78 @@ pub(crate) mod tests {
             control_dir: control_dir.clone(),
             mailbox_capability_digest: digest('8'),
         };
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: authority_base.role_session_id.clone(),
+            agent_run_id: run_id.as_str().into(),
+            digest: digest('0'),
+            inputs: Vec::new(),
+        };
+        wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+        authority_base.wake_snapshot_digest = wake_snapshot.digest.clone();
+        let mailbox_expires_at_unix = 4_102_444_800;
+        let mailbox_max_request_bytes = 1_048_576;
+        let mailbox_max_pending_requests = 32;
+        let mailbox_capability_digest = Digest::parse(
+            crate::mailbox::MailboxDescriptor::capability_digest(
+                run_id.as_str(),
+                mailbox_expires_at_unix,
+                crate::mailbox::MailboxLimits {
+                    max_request_bytes: mailbox_max_request_bytes,
+                    max_pending_requests: mailbox_max_pending_requests,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        authority_base.mailbox_capability_digest = mailbox_capability_digest.clone();
+        let reservation = AgentLaunchReservation {
+            schema_version: LAUNCH_SCHEMA_VERSION,
+            agent_run_id: run_id.clone(),
+            project_id: project_id.clone(),
+            role: Role::Supervisor,
+            role_session_id: authority_base.role_session_id.clone(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: authority_base.config_revision,
+            config_digest: authority_base.config_digest.clone(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: generation,
+            project_epoch: 7,
+            operation_id: operation_id.clone(),
+            operation_recipe_id: None,
+            worker_assignment: None,
+            rex_view_id: view.view_id.clone(),
+            runtime_binary_digest: authority_base.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority_base.environment_snapshot_id.clone(),
+            profile_id: profile_id.clone(),
+            profile_digest: profile_digest.clone(),
+            instruction_digest: authority_base.instruction_digest.clone(),
+            result_schema_digest: result_schema_digest.clone(),
+            wake_snapshot: wake_snapshot.clone(),
+            qualification_receipt_digest: qualification_digest.clone(),
+            descriptor_path: root.join("run-step.package.json"),
+            workspace_path: workspace.clone(),
+            control_dir: control_dir.clone(),
+            mailbox_directory: control_dir.clone(),
+            mailbox_capability_digest: mailbox_capability_digest.clone(),
+            mailbox_expires_at_unix,
+            mailbox_max_request_bytes: mailbox_max_request_bytes as u64,
+            mailbox_max_pending_requests: mailbox_max_pending_requests as u32,
+            pool: "agent".into(),
+            slot_index: 0,
+            global_capacity: 1,
+            project_capacity: 1,
+        };
+        store.prepare_role_launch(&reservation).unwrap();
         let result_projection = schema_projection.clone();
         let package = crate::run_step_package::RunStepPackage {
             schema_version: 2,
-            execution_slot_epoch: 7,
+            execution_slot_epoch: reservation.project_epoch,
             descriptor: RunDescriptor {
                 schema_version: 1,
                 project_id: project_id.clone(),
@@ -1883,31 +2166,52 @@ pub(crate) mod tests {
             role_contract: "fixture".into(),
             prompt: "fixture".into(),
             continuation: None,
-            shutdown_grace_seconds: 30,
-            start_ack_timeout_seconds: 30,
+            shutdown_grace_seconds: if prepare_anchored_only { 1 } else { 30 },
+            start_ack_timeout_seconds: if prepare_anchored_only { 10 } else { 30 },
+            supervision_mode: prepare_anchored_only
+                .then_some(crate::run_step_package::RunStepSupervisionMode::AnchoredSupervisor),
         };
         let mut authority = authority_base;
         authority.descriptor_digest = package.publish_once(&authority.descriptor_path).unwrap();
         let authority_digest = authority.digest().unwrap();
-        store.connection.execute(
-            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,?5,'supervisor','test',1,?6,'launch_pending',?7)",
-            rusqlite::params![run_id.as_str(), project_id.as_str(), authority.config_revision.0, authority.config_digest.as_str(), authority.role_session_id, operation_id.as_str(), generation],
-        ).unwrap();
-        store.connection.execute(
-            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,4102444800,1048576,32)",
-            rusqlite::params![run_id.as_str(), control_dir.display().to_string(), authority.mailbox_capability_digest.as_str()],
-        ).unwrap();
         store
             .register_agent_launch_authority(generation, &authority)
             .unwrap();
-        store.connection.execute(
-            "INSERT INTO execution_slots(pool,slot_index,project_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',0,?1,'agent_run',?2,7,0,'unknown')",
-            rusqlite::params![project_id.as_str(), run_id.as_str()],
-        ).unwrap();
+        store
+            .register_rex_view_block(
+                generation,
+                &crate::launch::RexViewBlock {
+                    view_id: view.view_id.clone(),
+                    block_id: authority.rex_block_id.clone(),
+                    agent_run_id: Some(run_id.clone()),
+                    role: Some(Role::Supervisor),
+                    ownership: crate::launch::RexBlockOwnership::Factory,
+                    lifecycle: crate::launch::RexBlockLifecycle::Active,
+                    process_absent_confirmed: false,
+                    retained_until_unix: None,
+                },
+            )
+            .unwrap();
+        let reservation_digest = reservation.digest().unwrap();
+        store
+            .finalize_agent_launch_reservation(generation, &run_id, &reservation_digest, &authority)
+            .unwrap();
         store.connection.execute(
             "INSERT INTO execution_slots(pool,slot_index,project_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',1,?1,'agent_run','unrelated-run',99,0,'unknown')",
             [project_id.as_str()],
         ).unwrap();
+
+        if prepare_anchored_only {
+            return BlockLossFixtureOutcome::Prepared(Box::new(PreparedBlockLossFixture {
+                store,
+                generation,
+                authority,
+                authority_digest,
+                qualification,
+                reservation,
+                slot_owner_id: run_id.to_string(),
+            }));
+        }
 
         let start_request = AgentStartRequest {
             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
@@ -1921,29 +2225,19 @@ pub(crate) mod tests {
             qualification_receipt_digest: qualification_digest.clone(),
             wrapper_pid: wrapper.pid,
             wrapper_start_identity: wrapper.start_identity.clone(),
+            rex_launch_anchor: None,
             rex_session_id: wrapper.rex_session_id.clone(),
             rex_block_id: wrapper.rex_block_id.clone(),
         };
-        let start_receipt = crate::launch::authorize_start(
-            generation,
-            &authority.expectation(&qualification),
-            &qualification,
-            &start_request,
-        )
-        .unwrap();
-        let request_json = serde_json::to_string(&start_request).unwrap();
-        let request_digest = Digest::parse(format!(
-            "{:x}",
-            sha2::Sha256::digest(request_json.as_bytes())
-        ))
-        .unwrap();
-        store.connection.execute(
-            "UPDATE agent_launch_state SET state='awaiting_provider',start_request_id=?2,start_request_digest=?3,wrapper_process_identity_json=?4,launch_receipt_json=?5 WHERE agent_run_id=?1",
-            rusqlite::params![run_id.as_str(), operation_id.as_str(), request_digest.as_str(), serde_json::to_string(&wrapper).unwrap(), serde_json::to_string(&start_receipt).unwrap()],
-        ).unwrap();
+        let start_receipt = store
+            .authorize_agent_start(generation, &start_request, &wrapper)
+            .unwrap();
         let spool = RunStepSpool::open(&control_dir).unwrap();
         let start = spool.publish_start_once(start_request.clone()).unwrap();
         spool.publish_start_receipt(&start, start_receipt).unwrap();
+        store
+            .retain_agent_run_unknown(generation, &run_id, reservation.project_epoch)
+            .unwrap();
 
         let wrapper_process = crate::process::ProcessIdentity {
             pid: wrapper.pid,
@@ -1969,6 +2263,7 @@ pub(crate) mod tests {
             descriptor_digest: authority.descriptor_digest.clone(),
             wrapper_pid: wrapper.pid,
             wrapper_start_identity: wrapper.start_identity.clone(),
+            rex_launch_anchor: None,
         };
         spool.publish_run_family_binding_once(&binding).unwrap();
         let make_family = |coverage| RunFamilyRecord {
@@ -1986,9 +2281,10 @@ pub(crate) mod tests {
         spool
             .write_run_family_record(&make_family(RunFamilyCoverage::Observing))
             .unwrap();
-        let family = make_family(RunFamilyCoverage::Complete);
         if complete_family {
-            spool.write_run_family_record(&family).unwrap();
+            spool
+                .write_run_family_record(&make_family(RunFamilyCoverage::Complete))
+                .unwrap();
         }
         let provider_tree = vec![
             ProviderProcessIdentity {
@@ -2019,7 +2315,7 @@ pub(crate) mod tests {
         provider
             .validate_complete_process_tree(&qualification)
             .unwrap();
-        if complete_family {
+        if complete_family && publish_cancelled_terminal {
             let observed_process = crate::run_step::ObservedProcess {
                 pid: family_process.pid,
                 parent_pid: family_process.parent_pid,
@@ -2042,6 +2338,7 @@ pub(crate) mod tests {
                     exit_code: None,
                     timed_out: false,
                     cancellation_signal: Some(1),
+                    cancellation_cause: None,
                     cleanup: CleanupState::Confirmed,
                     cleanup_detail: None,
                     processes: vec![observed_process],
@@ -2057,16 +2354,16 @@ pub(crate) mod tests {
         }
         let slot_owner_id = run_id.to_string();
 
-        CompletedBlockLossFixture {
+        BlockLossFixtureOutcome::Completed(Box::new(CompletedBlockLossFixture {
             store,
             generation,
             run: crate::store::agent_recovery::RecoverableAgentRun {
                 agent_run_id: run_id,
                 current_generation: generation,
-                previous_generation: 0,
+                previous_generation: generation,
                 authority,
                 authority_digest,
-                agent_state: "launch_pending".into(),
+                agent_state: "unknown".into(),
                 started_at_unix: None,
                 launch_state: "awaiting_provider".into(),
                 process_identity_json: None,
@@ -2079,8 +2376,9 @@ pub(crate) mod tests {
             },
             wrapper,
             provider,
+            start,
             slot_owner_id,
-        }
+        }))
     }
 
     pub(crate) fn test_execution_slot_disposition(store: &ConfigStore, owner_id: &str) -> String {
@@ -2089,6 +2387,94 @@ pub(crate) mod tests {
             .query_row(
                 "SELECT disposition FROM execution_slots WHERE owner_id=?1",
                 [owner_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn test_set_execution_slot_disposition(
+        store: &mut ConfigStore,
+        owner_id: &str,
+        disposition: &str,
+    ) {
+        store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET disposition=?2 WHERE owner_id=?1",
+                rusqlite::params![owner_id, disposition],
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn test_delete_execution_slot(store: &mut ConfigStore, owner_id: &str) {
+        store
+            .connection
+            .execute("DELETE FROM execution_slots WHERE owner_id=?1", [owner_id])
+            .unwrap();
+    }
+
+    pub(crate) fn test_execution_slot_exists(store: &ConfigStore, owner_id: &str) -> bool {
+        store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM execution_slots WHERE owner_id=?1)",
+                [owner_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn test_agent_terminal_generations_and_result_count(
+        store: &ConfigStore,
+        agent_run_id: &str,
+    ) -> (u64, u64, u64) {
+        store
+            .connection
+            .query_row(
+                "SELECT r.controller_generation,t.controller_generation,(SELECT COUNT(*) FROM agent_result_evidence e WHERE e.agent_run_id=r.agent_run_id) FROM agent_runs r JOIN agent_terminal_receipts t USING(agent_run_id) WHERE r.agent_run_id=?1",
+                [agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn test_execution_slot_binding(
+        store: &ConfigStore,
+        owner_id: &str,
+    ) -> (String, u64, Option<String>) {
+        store
+            .connection
+            .query_row(
+                "SELECT disposition,controller_generation,process_identity_json FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1",
+                [owner_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn test_agent_launch_states(
+        store: &ConfigStore,
+        owner_id: &str,
+    ) -> (String, u64, String) {
+        store
+            .connection
+            .query_row(
+                "SELECT r.state,r.controller_generation,l.state FROM agent_runs r JOIN agent_launch_state l USING(agent_run_id) WHERE r.agent_run_id=?1",
+                [owner_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn test_provider_tree_json(
+        store: &ConfigStore,
+        agent_run_id: &str,
+    ) -> Option<String> {
+        store
+            .connection
+            .query_row(
+                "SELECT provider_process_tree_json FROM agent_launch_state WHERE agent_run_id=?1",
+                [agent_run_id],
                 |row| row.get(0),
             )
             .unwrap()
@@ -2104,6 +2490,20 @@ pub(crate) mod tests {
             .execute(
                 "UPDATE execution_slots SET disposition='launch_pending',controller_generation=?2 WHERE owner_id=?1",
                 rusqlite::params![owner_id, generation],
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn test_set_execution_slot_epoch(
+        store: &mut ConfigStore,
+        owner_id: &str,
+        reservation_epoch: u64,
+    ) {
+        store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET reservation_epoch=?2 WHERE owner_id=?1",
+                rusqlite::params![owner_id, reservation_epoch],
             )
             .unwrap();
     }
@@ -2238,6 +2638,7 @@ pub(crate) mod tests {
                 source_evidence_id,
                 source_authority_digest: digest('c'),
             }],
+            host_completion_context: None,
         };
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
@@ -2508,6 +2909,7 @@ pub(crate) mod tests {
             qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
             wrapper_pid: 42,
             wrapper_start_identity: "wrapper-start-1".into(),
+            rex_launch_anchor: None,
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
         };
@@ -2522,6 +2924,7 @@ pub(crate) mod tests {
                     rex_session_id: start_request.rex_session_id.clone(),
                     rex_block_id: start_request.rex_block_id.clone(),
                     runtime_binary_digest: start_request.runtime_binary_digest.clone(),
+                    rex_launch_anchor: None,
                 },
             )
             .unwrap();
@@ -2595,6 +2998,19 @@ pub(crate) mod tests {
             &start_request.wrapper_start_identity,
         )
         .unwrap();
+        let mut wrongly_anchored_package = wrapper_package.clone();
+        wrongly_anchored_package.supervision_mode =
+            Some(crate::run_step_package::RunStepSupervisionMode::AnchoredSupervisor);
+        assert!(
+            crate::run_step_cli::validate_run_family_binding(
+                &wrongly_anchored_package,
+                &family_binding,
+                &start_request,
+                start_request.wrapper_pid,
+                &start_request.wrapper_start_identity,
+            )
+            .is_err()
+        );
         let mut wrong_slot_binding = family_binding;
         wrong_slot_binding.reservation_epoch = reservation.run_epoch;
         assert!(
@@ -2719,6 +3135,15 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(unchanged, "assigned");
+        let slot_before_provider_start: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slot_before_provider_start, "launch_pending");
         unconfirmed.process_tree_confirmed = true;
         unconfirmed.process_tree = vec![
             ProviderProcessIdentity {
@@ -2741,9 +3166,81 @@ pub(crate) mod tests {
             sha2::Sha256::digest(serde_json::to_vec(&unconfirmed.process_tree).unwrap())
         ))
         .unwrap();
+        store.connection.execute(
+            "UPDATE execution_slots SET reservation_epoch=reservation_epoch+1 WHERE owner_id=?1",
+            [authority.agent_run_id.as_str()],
+        ).unwrap();
+        assert!(
+            store
+                .confirm_provider_started(generation, &unconfirmed)
+                .is_err()
+        );
+        let unchanged_after_stale_epoch: (String, String, String, String) = store.connection.query_row(
+            "SELECT r.state,l.state,w.lifecycle,s.disposition FROM agent_runs r JOIN agent_launch_state l USING(agent_run_id) JOIN role_wake_inputs w ON w.consuming_agent_run_id=r.agent_run_id JOIN execution_slots s ON s.owner_id=r.agent_run_id WHERE r.agent_run_id=?1",
+            [authority.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            unchanged_after_stale_epoch,
+            (
+                "launch_pending".into(),
+                "awaiting_provider".into(),
+                "assigned".into(),
+                "launch_pending".into()
+            )
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET reservation_epoch=?2 WHERE owner_id=?1",
+                rusqlite::params![authority.agent_run_id.as_str(), reservation.project_epoch],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET owner_kind='ready_work' WHERE owner_id=?1",
+                [authority.agent_run_id.as_str()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .confirm_provider_started(generation, &unconfirmed)
+                .is_err()
+        );
+        let unchanged_after_foreign_owner: (String, String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT r.state,l.state,w.lifecycle,s.disposition FROM agent_runs r JOIN agent_launch_state l USING(agent_run_id) JOIN role_wake_inputs w ON w.consuming_agent_run_id=r.agent_run_id JOIN execution_slots s ON s.owner_id=r.agent_run_id WHERE r.agent_run_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(unchanged_after_foreign_owner, unchanged_after_stale_epoch);
+        store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET owner_kind='agent_run' WHERE owner_id=?1",
+                [authority.agent_run_id.as_str()],
+            )
+            .unwrap();
         store
             .confirm_provider_started(generation, &unconfirmed)
             .unwrap();
+        let slot_after_provider_start: (String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT disposition,process_identity_json FROM execution_slots WHERE owner_id=?1",
+                [authority.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(slot_after_provider_start.0, "live");
+        let slot_identity: serde_json::Value = crate::protocol::parse_unique(
+            slot_after_provider_start.1.as_deref().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(slot_identity["provider_pid"], 100);
         let consumed: String = store
             .connection
             .query_row(
@@ -2925,7 +3422,7 @@ pub(crate) mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(state_before_valid_observation, "launch_pending");
+        assert_eq!(state_before_valid_observation, "live");
         let surviving_provider = crate::process::ProcessIdentity {
             pid: 100,
             parent_pid: 42,
@@ -2981,7 +3478,7 @@ pub(crate) mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(retained, "launch_pending");
+        assert_eq!(retained, "live");
         assert_eq!(unrelated, "unknown");
         assert_eq!(
             store
@@ -3136,5 +3633,201 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(slot_owner, "run-2");
+    }
+
+    #[test]
+    fn adopted_live_agent_mailbox_request_uses_current_owner_without_rewriting_authority() {
+        use crate::store::OwnerMetadata;
+        use sha2::{Digest as _, Sha256};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut fixture = completed_block_loss_fixture(temp.path(), false);
+        let launch_generation = fixture.generation;
+        let reservation = fixture
+            .store
+            .agent_launch_reservation_for_run(&fixture.run.agent_run_id)
+            .unwrap()
+            .unwrap();
+        let original_authority = fixture.run.authority.clone();
+        let original_reservation_digest = reservation.digest().unwrap();
+        let owner_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "mailbox-adoption-owner-restart".into(),
+                state_root: temp.path().join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "mailbox-owner-restarted".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(owner_generation > launch_generation);
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET state='unknown',controller_generation=?2 WHERE agent_run_id=?1",
+                rusqlite::params![fixture.run.agent_run_id.as_str(), owner_generation],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.run.agent_run_id.as_str()],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_launch_state SET provider_process_tree_json=?2 WHERE agent_run_id=?1",
+                rusqlite::params![
+                    fixture.run.agent_run_id.as_str(),
+                    serde_json::to_string(&fixture.provider).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let mut process_tree = fixture
+            .provider
+            .process_tree
+            .iter()
+            .map(
+                |process| crate::store::agent_recovery::AdoptedProcessIdentity {
+                    pid: process.pid,
+                    parent_pid: process.parent_pid,
+                    process_group_id: process.process_group_id,
+                    start_identity: process.start_identity.clone(),
+                    identity_quality: serde_json::to_value(process.identity_quality)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                },
+            )
+            .collect::<Vec<_>>();
+        process_tree.retain(|process| process.pid != fixture.wrapper.pid);
+        process_tree.push(crate::store::agent_recovery::AdoptedProcessIdentity {
+            pid: fixture.wrapper.pid,
+            parent_pid: 1,
+            process_group_id: fixture.wrapper.pid,
+            start_identity: fixture.wrapper.start_identity.clone(),
+            identity_quality: "kernel_birth_token".into(),
+        });
+        process_tree.sort_by_key(|process| process.pid);
+        let tree_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+        ))
+        .unwrap();
+        let evidence = crate::store::agent_recovery::AgentAdoptionEvidence {
+            schema_version: 1,
+            agent_run_id: fixture.run.agent_run_id.clone(),
+            controller_generation: owner_generation,
+            previous_controller_generation: launch_generation,
+            authority_digest: original_authority.digest().unwrap(),
+            descriptor_digest: original_authority.descriptor_digest.clone(),
+            rex_process_observation_digest: Digest::parse("c".repeat(64)).unwrap(),
+            process_tree_digest: tree_digest,
+            provider_start_tree_digest: fixture.provider.process_tree_digest.clone(),
+            process_tree,
+            wrapper_pid: fixture.wrapper.pid,
+            wrapper_start_identity: fixture.wrapper.start_identity.clone(),
+            provider_pid: fixture.provider.provider_pid,
+            provider_start_identity: fixture.provider.provider_start_identity.clone(),
+            observed_at_unix: 1,
+        };
+        assert!(
+            fixture
+                .store
+                .record_agent_run_adoption(&evidence, fixture.run.reservation_epoch)
+                .unwrap()
+        );
+
+        crate::mailbox::MailboxCapability::create(
+            fixture.run.agent_run_id.to_string(),
+            &reservation.mailbox_directory,
+            reservation.mailbox_expires_at_unix,
+            crate::mailbox::MailboxLimits {
+                max_request_bytes: reservation.mailbox_max_request_bytes as usize,
+                max_pending_requests: reservation.mailbox_max_pending_requests as usize,
+            },
+        )
+        .unwrap();
+        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
+            fixture.run.agent_run_id.to_string(),
+            &reservation.mailbox_directory,
+        )
+        .unwrap();
+        let request_id = "adopted-mailbox-unsupported";
+        let envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            operation_id: Some(original_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("test.unsupported").unwrap(),
+            project_id: Some(original_authority.project_id.clone()),
+            run_id: Some(fixture.run.agent_run_id.to_string()),
+            attempt: Some(original_authority.attempt),
+            run_epoch: Some(original_authority.run_epoch),
+            expected_subject_revision: None,
+            role: Some(original_authority.role),
+            request_type: None,
+            params: serde_json::json!({}),
+        };
+        mailbox
+            .queue(
+                request_id,
+                &serde_json::to_vec(&envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+        assert!(
+            fixture
+                .store
+                .process_one_agent_mailbox_request(
+                    owner_generation,
+                    fixture.run.agent_run_id.as_str(),
+                    crate::store::now_unix().unwrap(),
+                    &artifacts,
+                    &Default::default(),
+                )
+                .unwrap()
+        );
+        let response = mailbox
+            .read_receipt(request_id, crate::mailbox::unix_time_now().unwrap())
+            .unwrap()
+            .unwrap();
+        let response: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(&response).unwrap();
+        assert_eq!(
+            serde_json::to_value(response.error.unwrap().code).unwrap(),
+            serde_json::json!("unsupported")
+        );
+        assert_eq!(
+            fixture
+                .store
+                .agent_launch_authority(&fixture.run.agent_run_id)
+                .unwrap()
+                .unwrap(),
+            original_authority
+        );
+        assert_eq!(
+            fixture
+                .store
+                .agent_launch_reservation_for_run(&fixture.run.agent_run_id)
+                .unwrap()
+                .unwrap()
+                .digest()
+                .unwrap(),
+            original_reservation_digest
+        );
     }
 }

@@ -2146,16 +2146,31 @@ mod tests {
             )
             .unwrap();
 
-        let config: crate::config::Config = serde_json::from_value(json!({
+        let mut config: crate::config::Config = serde_json::from_value(json!({
             "schema_version": 1,
             "adapters": {"tickets": {"kind":"command", "command":["test"]}},
-            "projects": {}
+            "projects": {},
+            "knowledge": {"format":"okf", "root":"knowledge", "max_source_bytes":1024}
         }))
         .unwrap();
         let mut services = crate::engine::factory_runtime::tests::PostmortemTestServices {
             digest: Digest::parse("a".repeat(64)).unwrap(),
             artifacts: fixture.artifacts.clone(),
         };
+        config.knowledge.as_mut().unwrap().max_source_bytes = 1;
+        assert!(
+            crate::engine::factory_runtime::tests::apply_postmortem_result(
+                &mut fixture.store,
+                owner,
+                1_800_000_000,
+                &config,
+                &mut services,
+                &fixture.ingested,
+            )
+            .unwrap_err()
+            .contains("configured byte limit")
+        );
+        config.knowledge.as_mut().unwrap().max_source_bytes = 1024;
         assert!(
             crate::engine::factory_runtime::tests::apply_postmortem_result(
                 &mut fixture.store,

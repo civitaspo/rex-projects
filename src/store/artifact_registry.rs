@@ -744,10 +744,66 @@ fn read_table_layout(connection: &Connection, table: &str) -> Result<TableLayout
 }
 
 impl crate::store::ConfigStore {
+    /// Revalidate that one persisted host locator was included in the source Agent's accepted
+    /// durable result under its immutable launch authority.
+    pub fn validate_host_artifact_source_evidence(
+        &self,
+        evidence_id: &str,
+        authority: &AgentLaunchAuthority,
+        reference: &RoleArtifactReference,
+    ) -> Result<(), String> {
+        authority.validate()?;
+        if self
+            .agent_launch_authority(&authority.agent_run_id)?
+            .as_ref()
+            != Some(authority)
+        {
+            return Err(
+                "host artifact source authority is not the immutable stored authority".into(),
+            );
+        }
+        let row: Option<(String, String, Option<String>, String, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT agent_run_id,project_id,ticket_run_id,role,outcome,artifact_refs_json FROM agent_result_evidence WHERE evidence_id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((agent_run_id, project_id, ticket_run_id, role, outcome, references_json)) = row
+        else {
+            return Err("host artifact source evidence is missing".into());
+        };
+        let expected_role = serde_json::to_value(authority.role)
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or("Agent role did not serialize as a string")?
+            .to_owned();
+        if agent_run_id != authority.agent_run_id.as_str()
+            || project_id != authority.project_id.as_str()
+            || ticket_run_id.as_deref() != authority.ticket_run_id.as_ref().map(|id| id.as_str())
+            || role != expected_role
+            || outcome != "completed"
+        {
+            return Err("host artifact source evidence differs from its launch authority".into());
+        }
+        let references: Vec<RoleArtifactReference> =
+            crate::protocol::parse_unique(references_json.as_bytes())
+                .map_err(|error| format!("host artifact source references are invalid: {error}"))?;
+        if !references.iter().any(|stored| stored == reference) {
+            return Err(
+                "host artifact source evidence does not claim the registered artifact".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Process one ArtifactAdd mailbox request. The object is copied and synced before the short
     /// owner-fenced transaction; the mailbox receipt is published only after that transaction
     /// commits and the durable object has been re-read and verified.
-    pub fn process_artifact_add(
+    #[cfg(test)]
+    pub(crate) fn process_artifact_add(
         &mut self,
         owner_generation: u64,
         authority: &AgentLaunchAuthority,
@@ -756,8 +812,30 @@ impl crate::store::ConfigStore {
         mailbox_request: &MailboxRequest,
         request: &crate::engine::orchestration::ArtifactAddRequest,
     ) -> Result<VerifiedArtifact, String> {
+        self.process_artifact_add_for_agent(
+            owner_generation,
+            authority,
+            artifact_store,
+            mailbox,
+            mailbox_request,
+            request,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn process_artifact_add_for_agent(
+        &mut self,
+        owner_generation: u64,
+        authority: &AgentLaunchAuthority,
+        artifact_store: &ArtifactStore,
+        mailbox: &MailboxCapability,
+        mailbox_request: &MailboxRequest,
+        request: &crate::engine::orchestration::ArtifactAddRequest,
+    ) -> Result<VerifiedArtifact, crate::artifacts::ArtifactRegistrationError> {
         authority.validate()?;
-        request.validate()?;
+        request
+            .validate()
+            .map_err(crate::artifacts::ArtifactRegistrationError::AgentSource)?;
         let envelope = &mailbox_request.envelope;
         let expected_params = serde_json::to_value(request).map_err(|e| e.to_string())?;
         let method = serde_json::to_value(&envelope.method).map_err(|e| e.to_string())?;
@@ -777,10 +855,12 @@ impl crate::store::ConfigStore {
             );
         }
         if !crate::engine::orchestration::role_may_submit_artifact(authority.role, request.kind) {
-            return Err("Agent role is not authorized to register this artifact kind".into());
+            return Err(crate::artifacts::ArtifactRegistrationError::AgentSource(
+                "Agent role is not authorized to register this artifact kind".into(),
+            ));
         }
         let request_digest = Digest::parse(mailbox_request.digest.clone())?;
-        let stored: StoredArtifact = artifact_store.register(
+        let stored: StoredArtifact = artifact_store.register_for_agent(
             &authority.workspace_path,
             &authority.project_id,
             authority.agent_run_id.as_str(),
@@ -1052,12 +1132,17 @@ pub(crate) fn persist_registration(
         return Err("ArtifactAdd references an unknown AgentRun".into());
     };
     let stored: AgentLaunchAuthority = crate::protocol::parse_unique(authority_json.as_bytes())?;
-    if stored != *authority
-        || authority_digest != authority.digest()?.as_str()
-        || authority.controller_generation != owner_generation
-    {
+    if stored != *authority || authority_digest != authority.digest()?.as_str() {
         return Err("ArtifactAdd launch authority is stale or does not match the AgentRun".into());
     }
+    crate::store::agent_recovery::validate_agent_run_current_owner(
+        &tx,
+        &authority.agent_run_id,
+        authority.controller_generation,
+        owner_generation,
+        &authority.digest()?,
+        &authority.descriptor_digest,
+    )?;
     let expected_id = ArtifactId::from_registration_identity(
         &authority.project_id,
         &authority.agent_run_id,
@@ -1933,7 +2018,7 @@ mod tests {
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY);
-             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,controller_generation INTEGER NOT NULL);
              CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
              CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
              CREATE TABLE agent_launch_authority(agent_run_id TEXT PRIMARY KEY,authority_json TEXT NOT NULL,authority_digest TEXT NOT NULL);
@@ -1957,6 +2042,15 @@ mod tests {
             .execute(
                 "INSERT INTO ticket_runs(ticket_run_id) VALUES (?1)",
                 [authority.ticket_run_id.as_ref().unwrap().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,controller_generation) VALUES (?1,?2)",
+                rusqlite::params![
+                    authority.agent_run_id.as_str(),
+                    authority.controller_generation
+                ],
             )
             .unwrap();
         let authority_json = serde_json::to_string(&authority).unwrap();

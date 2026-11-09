@@ -29,6 +29,12 @@ pub trait GitHubCommandRunner: Send + Sync {
     fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError>;
 }
 
+impl<R: GitHubCommandRunner + ?Sized> GitHubCommandRunner for std::sync::Arc<R> {
+    fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+        (**self).run(request)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemGitHubCommandRunner;
 
@@ -474,7 +480,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         )
     }
 
-    fn current_actor(&self, repository: &RepositoryRef) -> Result<String, ForgeError> {
+    pub(crate) fn current_actor(&self, repository: &RepositoryRef) -> Result<String, ForgeError> {
         self.validate_target(repository)?;
         // `gh api user` is a global endpoint, so build it without repository path components.
         let response = self.run_api("GET", "user", None, false)?;
@@ -694,10 +700,64 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         }
     }
 
-    fn update_body(&self, _intent: &BodyUpdateIntent) -> Result<EffectAcknowledgement, ForgeError> {
-        Err(ForgeError(
-            "GitHub does not support atomic conditional PR-body updates; this effect requires human execution".into(),
-        ))
+    fn update_body(&self, intent: &BodyUpdateIntent) -> Result<EffectAcknowledgement, ForgeError> {
+        intent.pull.validate().map_err(ForgeError)?;
+        if !valid_sha(&intent.expected_head_sha)
+            || intent.operation_key.is_empty()
+            || hex_digest(intent.exact_body.as_bytes()) != intent.approved_body_digest.as_str()
+        {
+            return Err(ForgeError(
+                "PR body update has an invalid operation key, head, or approved body digest".into(),
+            ));
+        }
+        let before = self.observe_pull_for_effect(&intent.pull)?;
+        let current_body = before.body.as_deref().unwrap_or_default();
+        let request_digest = canonical_digest(intent).map_err(|error| ForgeError(error.0))?;
+        if before.state == PullRequestState::Open
+            && !before.merged
+            && before.head_sha == intent.expected_head_sha
+            && hex_digest(current_body.as_bytes()) == intent.approved_body_digest.as_str()
+        {
+            return Ok(EffectAcknowledgement {
+                operation_key: intent.operation_key.clone(),
+                request_digest,
+                certainty: EffectCertainty::Recovered,
+                external_id: None,
+                external_url: None,
+                resulting_head_sha: Some(before.head_sha),
+                resulting_merge_sha: None,
+                reason: Some("the exact approved PR body is already present".into()),
+            });
+        }
+        if before.state != PullRequestState::Open
+            || before.merged
+            || before.head_sha != intent.expected_head_sha
+            || hex_digest(current_body.as_bytes()) != intent.expected_prior_body_digest.as_str()
+        {
+            return Ok(EffectAcknowledgement {
+                operation_key: intent.operation_key.clone(),
+                request_digest,
+                certainty: EffectCertainty::DefinitelyAbsent,
+                external_id: None,
+                external_url: None,
+                resulting_head_sha: Some(before.head_sha),
+                resulting_merge_sha: None,
+                reason: Some(
+                    "PR state, head, or prior body changed before the approved body update".into(),
+                ),
+            });
+        }
+        let endpoint = self.endpoint(
+            &intent.pull.repository,
+            &format!("pulls/{}", intent.pull.number),
+        )?;
+        self.mutate(
+            "PATCH",
+            &endpoint,
+            serde_json::json!({"body": intent.exact_body}),
+            &intent.operation_key,
+            &request_digest,
+        )
     }
 
     fn post_comment(&self, intent: &CommentIntent) -> Result<EffectAcknowledgement, ForgeError> {
@@ -1589,6 +1649,82 @@ mod tests {
         assert!(!human_approval_current(Some(500), Some(500)));
         assert!(!human_approval_current(Some(500), None));
         assert!(human_approval_current(None, None));
+    }
+
+    #[test]
+    fn approved_body_update_rechecks_head_and_prior_body_before_patch() {
+        let prior_body = "original PR body";
+        let exact_body = "original PR body\n\nCo-authored-by: Agent <agent@example.com>";
+        let head_sha = "a".repeat(40);
+        let base_sha = "b".repeat(40);
+        let forge = fixture_forge_responses(vec![
+            serde_json::json!({
+                "id": 1,
+                "node_id": "PR_node",
+                "number": 7,
+                "state": "open",
+                "draft": false,
+                "merged": false,
+                "head": {"sha": head_sha, "ref": "feature", "repo": {"id": 1}},
+                "base": {"sha": base_sha, "ref": "main", "repo": {"id": 1}},
+                "body": prior_body
+            }),
+            serde_json::json!({"id": 7, "html_url": "https://github.com/octo/repo/pull/7"}),
+        ]);
+        let intent = BodyUpdateIntent {
+            pull: test_pull(),
+            operation_key: "body-op".into(),
+            expected_head_sha: head_sha,
+            expected_prior_body_digest: Digest::parse(hex_digest(prior_body.as_bytes())).unwrap(),
+            exact_body: exact_body.into(),
+            approved_body_digest: Digest::parse(hex_digest(exact_body.as_bytes())).unwrap(),
+        };
+
+        let acknowledgement = forge.update_body(&intent).unwrap();
+
+        assert_eq!(acknowledgement.certainty, EffectCertainty::Applied);
+        assert_eq!(acknowledgement.operation_key, "body-op");
+        assert_eq!(
+            acknowledgement.request_digest,
+            canonical_digest(&intent).unwrap()
+        );
+        let requests = forge.runner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let mutation = &requests[1];
+        assert!(mutation.args.iter().any(|arg| arg == "--method"));
+        assert!(mutation.args.iter().any(|arg| arg == "PATCH"));
+        let body: Value = serde_json::from_slice(&mutation.stdin).unwrap();
+        assert_eq!(body["body"], exact_body);
+    }
+
+    #[test]
+    fn body_update_does_not_patch_after_prior_body_changed() {
+        let head_sha = "a".repeat(40);
+        let base_sha = "b".repeat(40);
+        let forge = fixture_forge_responses(vec![serde_json::json!({
+            "id": 1,
+            "node_id": "PR_node",
+            "number": 7,
+            "state": "open",
+            "draft": false,
+            "merged": false,
+            "head": {"sha": head_sha, "ref": "feature", "repo": {"id": 1}},
+            "base": {"sha": base_sha, "ref": "main", "repo": {"id": 1}},
+            "body": "concurrently edited"
+        })]);
+        let intent = BodyUpdateIntent {
+            pull: test_pull(),
+            operation_key: "body-op".into(),
+            expected_head_sha: head_sha,
+            expected_prior_body_digest: Digest::parse(hex_digest(b"old body")).unwrap(),
+            exact_body: "approved body".into(),
+            approved_body_digest: Digest::parse(hex_digest(b"approved body")).unwrap(),
+        };
+
+        let acknowledgement = forge.update_body(&intent).unwrap();
+
+        assert_eq!(acknowledgement.certainty, EffectCertainty::DefinitelyAbsent);
+        assert_eq!(forge.runner.requests.lock().unwrap().len(), 1);
     }
 
     #[test]

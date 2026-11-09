@@ -19,7 +19,10 @@ use crate::effects::{
 use crate::engine::orchestration::{
     AgentAssertion, HumanRequestPayload, RoleArtifactReference, RoleResultBinding,
 };
-use crate::human::{ReviewBundle, ReviewEvidence, review_bundle_digest};
+use crate::human::{
+    RepositoryReview, ReviewBundle, ReviewEvidence, ReviewRisk, RiskConfidence,
+    review_bundle_digest,
+};
 use crate::protocol::{
     MethodName, ProtocolError, RequestEnvelope, RequestId as ProtocolRequestId, SCHEMA_VERSION,
     parse_unique,
@@ -644,6 +647,15 @@ pub trait PublicationAdoptionSource: Send + Sync {
     ) -> Result<crate::delivery_runtime::RepositoryPublicationObservation, String>;
 }
 
+/// Re-observes the complete current merge subject and its host-derived gates before a queued
+/// human merge decision is accepted. Returning an error leaves the response pending for retry.
+pub trait MergeWorkReviewSource: Send + Sync {
+    fn observe_merge_evidence(
+        &self,
+        work_item: &crate::store::merge_work::MergeWorkItem,
+    ) -> Result<crate::merge_policy::MergeEvidenceSnapshot, String>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HumanSubjectObservation {
     Current(HumanSubjectBinding),
@@ -663,6 +675,7 @@ pub struct DurableHumanSubjectObserver {
     delivery_effects: Option<std::sync::Arc<crate::delivery_runtime::RepositoryDeliveryEffects>>,
     owner_generation: Option<u64>,
     publication_source: Option<std::sync::Arc<dyn PublicationAdoptionSource>>,
+    merge_work_source: Option<std::sync::Arc<dyn MergeWorkReviewSource>>,
 }
 
 impl DurableHumanSubjectObserver {
@@ -675,6 +688,7 @@ impl DurableHumanSubjectObserver {
             delivery_effects: None,
             owner_generation: None,
             publication_source: None,
+            merge_work_source: None,
         })
     }
 
@@ -691,6 +705,7 @@ impl DurableHumanSubjectObserver {
             delivery_effects: Some(delivery_effects),
             owner_generation: Some(owner_generation),
             publication_source: None,
+            merge_work_source: None,
         })
     }
 
@@ -707,6 +722,25 @@ impl DurableHumanSubjectObserver {
             delivery_effects: None,
             owner_generation: Some(owner_generation),
             publication_source: Some(publication_source),
+            merge_work_source: None,
+        })
+    }
+
+    pub fn with_merge_work_review(
+        declarative_root: PathBuf,
+        owner_generation: u64,
+        delivery_effects: std::sync::Arc<crate::delivery_runtime::RepositoryDeliveryEffects>,
+        merge_work_source: std::sync::Arc<dyn MergeWorkReviewSource>,
+    ) -> Result<Self, String> {
+        if !declarative_root.is_absolute() || owner_generation == 0 {
+            return Err("human observer requires an absolute config root and active owner".into());
+        }
+        Ok(Self {
+            declarative_root,
+            delivery_effects: Some(delivery_effects),
+            owner_generation: Some(owner_generation),
+            publication_source: None,
+            merge_work_source: Some(merge_work_source),
         })
     }
 }
@@ -740,15 +774,122 @@ impl HumanSubjectObserver for DurableHumanSubjectObserver {
                 }
             }
             HumanPurpose::TicketReview => {
-                let _configured =
-                    self.delivery_effects.is_some() && self.owner_generation.is_some();
-                Err("ticket review is unavailable until the canonical durable MergeWorkItem observer is integrated".into())
+                match (
+                    &self.merge_work_source,
+                    self.delivery_effects.as_ref(),
+                    self.owner_generation,
+                ) {
+                    (Some(source), Some(_), Some(generation)) => observe_merge_work_review_subject(
+                        store,
+                        request,
+                        source.as_ref(),
+                        generation,
+                    ),
+                    _ => Err(
+                        "ticket review requires the configured fresh merge evidence observer"
+                            .into(),
+                    ),
+                }
             }
             purpose => Err(format!(
                 "no authoritative host observer is configured for {purpose:?}; decision remains queued"
             )),
         }
     }
+}
+
+fn observe_merge_work_review_subject(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+    source: &dyn MergeWorkReviewSource,
+    owner_generation: u64,
+) -> Result<HumanSubjectObservation, String> {
+    let Some(crate::human_runtime::HumanAuthorityMaterial::MergeWorkReview { work_item }) =
+        store.human_request_authority(&request.request_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the immutable merge review authority is missing".into(),
+        ));
+    };
+    let authority = HumanAuthorityMaterial::MergeWorkReview {
+        work_item: work_item.clone(),
+    };
+    authority.validate_for(request)?;
+    let Some(ticket_run_id) = request.subject.ticket_run_id.as_ref() else {
+        return Ok(HumanSubjectObservation::Gone(
+            "merge review request has no TicketRun scope".into(),
+        ));
+    };
+    if work_item.project_id != request.subject.project_id
+        || work_item.ticket_run_id != *ticket_run_id
+        || request.subject.subject_id != ticket_run_id.as_str()
+        || request.subject.revision.0 != work_item.assessed_revision.0.saturating_add(1)
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "merge review request no longer matches its immutable work item".into(),
+        ));
+    }
+    let Some((project_id, current_revision, phase, required_review_revision)) =
+        store.current_ticket_human_scope(ticket_run_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the merge review TicketRun no longer exists".into(),
+        ));
+    };
+    if project_id != request.subject.project_id
+        || current_revision != request.subject.revision.0
+        || phase != "waiting_human"
+        || required_review_revision != Some(request.subject.revision.0)
+        || work_item.awaiting_merge_revision.0 != current_revision.saturating_add(1)
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the merge review TicketRun phase or revision changed".into(),
+        ));
+    }
+    let Some(project) = store.project(&request.subject.project_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the merge review Project no longer exists".into(),
+        ));
+    };
+    let Some(snapshot) = store.load_snapshot(&project.config_source)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if project.config_revision != snapshot.revision
+        || project.config_digest != snapshot.config.digest
+        || request.subject.configuration_digest != snapshot.config.digest
+        || work_item.configuration_digest != snapshot.config.digest
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project configuration changed after the merge review was prepared".into(),
+        ));
+    }
+    if store.merge_work_item(
+        &work_item.project_id,
+        &work_item.ticket_run_id,
+        work_item.awaiting_merge_revision,
+    )? != Some(*work_item.clone())
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the durable merge work item changed".into(),
+        ));
+    }
+    let current_evidence = source.observe_merge_evidence(&work_item)?;
+    if current_evidence.subject != current_evidence.current_subject
+        || current_evidence != work_item.document.evidence
+        || crate::merge_policy::evaluate_merge_policy(
+            &work_item.document.policy,
+            &current_evidence,
+        )? != work_item.document.assessment
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the current PR, checks, reviews, or merge policy differ from the approved merge work item".into(),
+        ));
+    }
+    let active_generation = store.owner_generation()?;
+    if active_generation != Some(owner_generation) {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    }
+    Ok(HumanSubjectObservation::Current(request.subject.clone()))
 }
 
 fn observe_profile_trial_subject(
@@ -985,6 +1126,11 @@ fn observe_typed_role_authority(
                 "publication adoption is not a Planner or goal decision".into(),
             ));
         }
+        HumanAuthorityMaterial::MergeWorkReview { .. } => {
+            return Ok(HumanSubjectObservation::Gone(
+                "merge-work review authority requires the merge observer".into(),
+            ));
+        }
     };
     if !store.human_role_result_is_current_source(source)? {
         return Ok(HumanSubjectObservation::Gone(
@@ -1086,7 +1232,8 @@ fn observe_typed_role_authority(
                 ));
             }
         }
-        HumanAuthorityMaterial::PublicationAdoption { .. } => unreachable!("handled above"),
+        HumanAuthorityMaterial::PublicationAdoption { .. }
+        | HumanAuthorityMaterial::MergeWorkReview { .. } => unreachable!("handled above"),
     }
     Ok(HumanSubjectObservation::Current(request.subject.clone()))
 }
@@ -1131,6 +1278,9 @@ pub enum HumanAuthorityMaterial {
     },
     PublicationAdoption {
         material: PublicationAdoptionAuthority,
+    },
+    MergeWorkReview {
+        work_item: Box<crate::store::merge_work::MergeWorkItem>,
     },
 }
 
@@ -1453,6 +1603,92 @@ impl HumanAuthorityMaterial {
         })
     }
 
+    pub fn merge_work_review_request(
+        request_id: HumanRequestId,
+        work_item: crate::store::merge_work::MergeWorkItem,
+        expires_at_unix: u64,
+    ) -> Result<HumanRuntimeRequest, String> {
+        let authority = Self::MergeWorkReview {
+            work_item: Box::new(work_item.clone()),
+        };
+        let request =
+            Self::build_merge_work_review_request(request_id, work_item, expires_at_unix)?;
+        authority.validate_for(&request)?;
+        Ok(request)
+    }
+
+    fn build_merge_work_review_request(
+        request_id: HumanRequestId,
+        work_item: crate::store::merge_work::MergeWorkItem,
+        expires_at_unix: u64,
+    ) -> Result<HumanRuntimeRequest, String> {
+        let expected_review_revision = work_item
+            .assessed_revision
+            .0
+            .checked_add(1)
+            .ok_or("merge review revision overflow")?;
+        if work_item.awaiting_merge_revision.0 != expected_review_revision + 1 {
+            return Err(
+                "merge work item does not reserve exactly one human review revision".into(),
+            );
+        }
+        work_item.document.validate_for(
+            &work_item.configuration_digest,
+            &work_item.document.assessment_id,
+        )?;
+        let authority = Self::MergeWorkReview {
+            work_item: Box::new(work_item),
+        };
+        let Self::MergeWorkReview { work_item } = &authority else {
+            unreachable!("merge work review authority was just constructed")
+        };
+        let ticket_run_id = work_item.ticket_run_id.clone();
+        let review_bundle = authority.review_bundle()?;
+        let request = HumanRuntimeRequest {
+            request_id,
+            purpose: HumanPurpose::TicketReview,
+            subject: HumanSubjectBinding {
+                project_id: work_item.project_id.clone(),
+                kind: HumanSubjectKind::TicketRun,
+                subject_id: ticket_run_id.as_str().to_owned(),
+                ticket_run_id: Some(ticket_run_id),
+                revision: Revision(expected_review_revision),
+                material_digest: authority.material_digest()?,
+                configuration_digest: work_item.configuration_digest.clone(),
+                policy_digest: authority.policy_digest()?,
+                bundle_digest: review_bundle_digest(&review_bundle)?,
+            },
+            question: "Review the exact merge evidence and procedure. Approve only if the displayed subject, procedure, and risks are acceptable.".into(),
+            choices: vec![
+                HumanDecisionChoice::Approve,
+                HumanDecisionChoice::RequestChanges,
+                HumanDecisionChoice::Defer,
+                HumanDecisionChoice::Cancel,
+            ],
+            expires_at_unix,
+            review_bundle,
+        };
+        request.validate(expires_at_unix.saturating_sub(1))?;
+        Ok(request)
+    }
+
+    pub fn merge_work_review_effect(
+        request_id: HumanRequestId,
+        rex_view_id: Digest,
+        work_item: crate::store::merge_work::MergeWorkItem,
+        expires_at_unix: u64,
+    ) -> Result<HumanPresentationEffect, String> {
+        let request =
+            Self::merge_work_review_request(request_id, work_item.clone(), expires_at_unix)?;
+        Ok(HumanPresentationEffect {
+            request,
+            rex_view_id,
+            authority: Some(Self::MergeWorkReview {
+                work_item: Box::new(work_item),
+            }),
+        })
+    }
+
     pub fn validate_for(&self, request: &HumanRuntimeRequest) -> Result<(), String> {
         if let Self::PublicationAdoption { material } = self {
             if publication_adoption_request(request.request_id.clone(), material.clone())?
@@ -1461,6 +1697,17 @@ impl HumanAuthorityMaterial {
                 return Err(
                     "publication adoption authority does not match its human request".into(),
                 );
+            }
+            return Ok(());
+        }
+        if let Self::MergeWorkReview { work_item } = self {
+            if Self::build_merge_work_review_request(
+                request.request_id.clone(),
+                (**work_item).clone(),
+                request.expires_at_unix,
+            )? != *request
+            {
+                return Err("human review request differs from its immutable MergeWorkItem".into());
             }
             return Ok(());
         }
@@ -1580,7 +1827,9 @@ impl HumanAuthorityMaterial {
                     crate::domain::types::Role::Supervisor,
                 )
             }
-            Self::PublicationAdoption { .. } => unreachable!("handled above"),
+            Self::PublicationAdoption { .. } | Self::MergeWorkReview { .. } => {
+                unreachable!("handled above")
+            }
         };
         let binding = &source.binding;
         if request.purpose != required_purpose
@@ -1648,6 +1897,9 @@ impl HumanAuthorityMaterial {
             | Self::CoordinatorClarification { source, .. }
             | Self::GoalCompletion { source, .. } => &source.binding,
             Self::PublicationAdoption { material } => return Ok(material.policy_digest.clone()),
+            Self::MergeWorkReview { work_item } => {
+                return Ok(work_item.document.authority.policy_digest.clone());
+            }
         };
         let bytes = serde_json::to_vec(&(
             &binding.profile_digest,
@@ -1725,10 +1977,136 @@ impl HumanAuthorityMaterial {
                 ],
             },
             Self::PublicationAdoption { material } => material.review_bundle()?,
+            Self::MergeWorkReview { work_item } => merge_work_review_bundle(work_item)?,
         };
         bundle.validate()?;
         Ok(bundle)
     }
+}
+
+fn merge_work_review_bundle(
+    work_item: &crate::store::merge_work::MergeWorkItem,
+) -> Result<ReviewBundle, String> {
+    let document = &work_item.document;
+    let subject = &document.evidence.subject;
+    let confidence = match document.evidence.confidence {
+        crate::merge_policy::Confidence::Low => RiskConfidence::Low,
+        crate::merge_policy::Confidence::Medium => RiskConfidence::Medium,
+        crate::merge_policy::Confidence::High => RiskConfidence::High,
+    };
+    let unresolved_gates = document
+        .evidence
+        .gates
+        .iter()
+        .filter(|gate| gate.state != crate::merge_policy::EvidenceState::Pass)
+        .map(|gate| format!("{}: {} ({:?})", gate.key, gate.detail, gate.state))
+        .collect::<Vec<_>>();
+    let mut merge_steps = Vec::new();
+    for step in &document.procedure.steps {
+        use crate::merge_policy::MergeProcedureOperation as Operation;
+        let summary = match &step.operation {
+            Operation::UpdatePullRequestBody {
+                expected_prior_body_digest,
+                approved_body_digest,
+            } => format!(
+                "Update PR body from digest {expected_prior_body_digest} to exact approved digest {approved_body_digest}"
+            ),
+            Operation::RequestMerge { exact_comment } => {
+                format!("Request merge with exact comment: {exact_comment}")
+            }
+            Operation::ExecuteMerge {
+                expected_head_sha, ..
+            } => {
+                format!("Merge the exact head {expected_head_sha}")
+            }
+            Operation::VerifyMergeCommit { expected_trailers } => format!(
+                "Verify merge commit trailers: {}",
+                expected_trailers.join("; ")
+            ),
+        };
+        merge_steps.push(format!("{}: {summary}", step.key));
+    }
+    let unresolved_reasons = document.assessment.reasons.clone();
+    let summary = format!(
+        "Host assessment for {} PR #{} at head {} against {}. Policy disposition: {:?}; reliability score: {}.",
+        subject.repository_id,
+        subject.pull_request_id,
+        subject.head_sha,
+        subject.base_sha,
+        document.assessment.disposition,
+        document
+            .assessment
+            .reliability_score
+            .map_or_else(|| "unknown".into(), |score| score.to_string()),
+    );
+    let bundle = ReviewBundle {
+        title: format!(
+            "Merge decision: {} PR #{}",
+            subject.repository_id, subject.pull_request_id
+        ),
+        summary,
+        risk: Some(ReviewRisk {
+            rating: document.assessment.risk_index.unwrap_or(4),
+            confidence: if document.assessment.risk_index.is_some() {
+                confidence
+            } else {
+                RiskConfidence::Unknown
+            },
+            rationale: if unresolved_reasons.is_empty() {
+                "See the host-computed assessment and exact merge procedure below.".into()
+            } else {
+                unresolved_reasons.join("\n")
+            },
+            unresolved_gates: unresolved_gates.clone(),
+        }),
+        repositories: vec![RepositoryReview {
+            repository: subject.repository_id.clone(),
+            pull_request: format!("#{}", subject.pull_request_id),
+            url: Some(format!(
+                "https://{}/{}/pull/{}",
+                subject.forge_host, subject.repository_id, subject.pull_request_id
+            )),
+            base_ref: subject.base_ref.clone(),
+            base_sha: subject.base_sha.clone(),
+            head_ref: String::new(),
+            head_sha: subject.head_sha.clone(),
+            checks: document
+                .evidence
+                .gates
+                .iter()
+                .map(|gate| format!("{}: {:?} — {}", gate.key, gate.state, gate.detail))
+                .collect(),
+            review_receipts: vec![format!("review evidence digest: {}", subject.review_digest)],
+            merge_steps,
+        }],
+        evidence: document
+            .assessment
+            .reasons
+            .iter()
+            .map(|reason| ReviewEvidence {
+                title: "Host assessment reason".into(),
+                body: reason.clone(),
+                truncated: false,
+            })
+            .chain(document.evidence.risk.iter().map(|risk| ReviewEvidence {
+                title: format!("{:?} risk", risk.dimension),
+                body: format!(
+                    "rating: {}; rationale: {}",
+                    risk.rating.map_or_else(|| "unknown".into(), |rating| rating.to_string()),
+                    risk.rationale
+                ),
+                truncated: false,
+            }))
+            .chain(document.prepared_body.iter().map(|body| ReviewEvidence {
+                title: "Exact proposed pull request body".into(),
+                body: body.clone(),
+                truncated: false,
+            }))
+            .collect(),
+        unknowns: unresolved_gates,
+    };
+    bundle.validate()?;
+    Ok(bundle)
 }
 
 /// Configured host-side presenter. Its effect request contains only host-built typed review

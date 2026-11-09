@@ -240,7 +240,7 @@ pub fn reduce(
             next.activity = Activity::Running;
             wakes.push(WakeTarget::TicketRole(Role::Operator));
         }
-        Input::OperationFailed if current.phase == Phase::Operating => {
+        Input::OperationFailed if matches!(current.phase, Phase::Operating | Phase::Postmortem) => {
             next.activity = Activity::Blocked;
             wakes.push(WakeTarget::Supervisor);
         }

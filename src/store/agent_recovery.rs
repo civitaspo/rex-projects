@@ -12,7 +12,7 @@ use crate::run_step_spool::BlockLossCleanupSnapshot;
 use super::agent_results::VerifiedAgentCleanup;
 use super::{ConfigStore, validate_active_generation};
 
-type AgentAdoptionLookupRow = (String, u64, u64, String, u64, String, String, String);
+type AgentAdoptionLookupRow = (String, u64, u64, u64, String, u32, String, String, String);
 const MAX_LIFECYCLE_PROCESS_SAMPLE: usize = 256;
 type CancelledAgentReconciliationRow = (
     String,
@@ -70,6 +70,103 @@ pub struct AgentAdoptionEvidence {
     pub observed_at_unix: i64,
 }
 
+/// Verify that the mutable run is owned by the active generation and that any transfer from the
+/// immutable launch generation is backed by the complete durable adoption chain.
+pub(crate) fn validate_agent_run_current_owner(
+    connection: &rusqlite::Connection,
+    agent_run_id: &AgentRunId,
+    launch_generation: u64,
+    owner_generation: u64,
+    authority_digest: &Digest,
+    descriptor_digest: &Digest,
+) -> Result<(), String> {
+    let current_generation: Option<u64> = connection
+        .query_row(
+            "SELECT controller_generation FROM agent_runs WHERE agent_run_id=?1",
+            [agent_run_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_generation != Some(owner_generation) {
+        return Err("AgentRun is not owned by the active controller generation".into());
+    }
+    if launch_generation == owner_generation {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT controller_generation,previous_controller_generation,authority_digest,descriptor_digest,evidence_digest,evidence_json FROM agent_run_adoptions WHERE agent_run_id=?1 ORDER BY controller_generation",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([agent_run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut expected_previous_generation = launch_generation;
+    for row in rows {
+        let (
+            generation,
+            previous_generation,
+            digest,
+            stored_descriptor_digest,
+            stored_digest,
+            json,
+        ) = row.map_err(|error| error.to_string())?;
+        if generation <= launch_generation {
+            return Err("AgentRun adoption predates immutable launch authority".into());
+        }
+        if generation > owner_generation {
+            break;
+        }
+        let evidence: AgentAdoptionEvidence = crate::protocol::parse_unique(json.as_bytes())?;
+        if generation != evidence.controller_generation
+            || previous_generation != evidence.previous_controller_generation
+            || previous_generation != expected_previous_generation
+            || evidence.agent_run_id != *agent_run_id
+            || digest != authority_digest.as_str()
+            || stored_descriptor_digest != descriptor_digest.as_str()
+            || evidence.authority_digest != *authority_digest
+            || evidence.descriptor_digest.as_str() != descriptor_digest.as_str()
+            || evidence.digest()?.as_str() != stored_digest
+        {
+            return Err(
+                "AgentRun adoption evidence does not continue immutable launch ownership".into(),
+            );
+        }
+        expected_previous_generation = generation;
+    }
+    if expected_previous_generation != owner_generation {
+        return Err("AgentRun has no valid adoption to the active controller generation".into());
+    }
+    Ok(())
+}
+
+impl ConfigStore {
+    pub(crate) fn validate_active_agent_run_owner(
+        &self,
+        authority: &AgentLaunchAuthority,
+        owner_generation: u64,
+    ) -> Result<(), String> {
+        validate_agent_run_current_owner(
+            &self.connection,
+            &authority.agent_run_id,
+            authority.controller_generation,
+            owner_generation,
+            &authority.digest()?,
+            &authority.descriptor_digest,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdoptedProcessIdentity {
@@ -119,6 +216,10 @@ pub struct StopOwnedRunTarget {
     pub rex_block_id: String,
     pub wrapper: Option<StopProcessIdentity>,
     pub provider: Option<StopProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<crate::launch::LaunchAnchorIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binary_digest: Option<Digest>,
     pub lifecycle: StopTargetLifecycle,
 }
 
@@ -233,6 +334,16 @@ impl StopOwnedRunsIntent {
                         || process.start_identity.trim().is_empty()
                         || process.start_identity.chars().any(char::is_control)
                 })
+                || target.rex_launch_anchor.as_ref().is_some_and(|anchor| {
+                    anchor.pid == 0
+                        || anchor.start_identity.trim().is_empty()
+                        || anchor.start_identity.chars().any(char::is_control)
+                        || target
+                            .wrapper
+                            .as_ref()
+                            .is_some_and(|wrapper| wrapper.pid == anchor.pid)
+                })
+                || target.rex_launch_anchor.is_some() != target.runtime_binary_digest.is_some()
                 || (target.lifecycle == StopTargetLifecycle::NeedsReconciliation
                     && (target.wrapper.is_none() || target.provider.is_none()))
                 || (target.lifecycle == StopTargetLifecycle::IdentityUnknown
@@ -436,14 +547,13 @@ fn validate_stop_process_snapshot(
         return Err("StopOwnedRuns process snapshot is empty or exceeds its bound".into());
     }
     let mut last_pid = 0;
-    let group = processes[0].process_group_id;
     for process in processes {
         if process.pid <= last_pid
             || process.quality != ProcessIdentityQuality::KernelBirthToken
             || process.start_identity.trim().is_empty()
             || process.command.trim().is_empty()
             || process.command.chars().any(char::is_control)
-            || process.process_group_id != group
+            || process.process_group_id == 0
         {
             return Err(
                 "StopOwnedRuns process snapshot lacks a complete ordered process group".into(),
@@ -803,6 +913,16 @@ impl ConfigStore {
             params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, snapshot.process_tree_digest.as_str(), detail_json],
         )
         .map_err(|error| error.to_string())?;
+        let launch_changed = tx.execute(
+            "UPDATE agent_launch_state SET state='cancelled',last_observed_at_unix=?2,updated_at_unix=?2
+             WHERE agent_run_id=?1 AND state=?3 AND state IN ('running','unknown')
+               AND result_receipt_json IS NULL AND terminal_request_id IS NULL
+               AND terminal_request_digest IS NULL AND result_digest IS NULL",
+            params![run.agent_run_id.as_str(), observed_at_unix, run.launch_state],
+        ).map_err(|error| error.to_string())?;
+        if launch_changed != 1 {
+            return Err("Agent launch state changed before missing-block terminal proof".into());
+        }
         let run_changed = tx.execute(
             "UPDATE agent_runs SET state='cancelled',finished_at_unix=COALESCE(finished_at_unix,?2),controller_generation=?3
              WHERE agent_run_id=?1 AND controller_generation=?3 AND state IN ('launch_pending','running','unknown')",
@@ -1322,7 +1442,7 @@ impl ConfigStore {
                     "StopOwnedRuns scope does not match stored Agent launch authority".into(),
                 );
             }
-            let wrapper = wrapper_json
+            let observed_wrapper = wrapper_json
                 .as_deref()
                 .and_then(|json| {
                     crate::protocol::parse_unique::<ObservedWrapperIdentity>(json.as_bytes()).ok()
@@ -1331,11 +1451,21 @@ impl ConfigStore {
                     identity.rex_session_id == authority.rex_session_id
                         && identity.rex_block_id == authority.rex_block_id
                         && identity.runtime_binary_digest == authority.runtime_binary_digest
-                })
+                });
+            let wrapper = observed_wrapper
+                .as_ref()
                 .map(|identity| StopProcessIdentity {
                     pid: identity.pid,
-                    start_identity: identity.start_identity,
+                    start_identity: identity.start_identity.clone(),
                 });
+            let rex_launch_anchor = observed_wrapper
+                .as_ref()
+                .and_then(|identity| identity.rex_launch_anchor.clone());
+            let runtime_binary_digest = rex_launch_anchor.as_ref().and_then(|_| {
+                observed_wrapper
+                    .as_ref()
+                    .map(|identity| identity.runtime_binary_digest.clone())
+            });
             let provider = provider_json
                 .as_deref()
                 .and_then(|json| {
@@ -1365,6 +1495,8 @@ impl ConfigStore {
                 rex_block_id: authority.rex_block_id,
                 wrapper,
                 provider,
+                rex_launch_anchor,
+                runtime_binary_digest,
                 lifecycle,
             });
         }
@@ -1728,8 +1860,8 @@ impl ConfigStore {
         validate_active_generation(&tx, evidence.controller_generation)?;
         let row: Option<AgentAdoptionLookupRow> = tx
             .query_row(
-                "SELECT a.authority_json,r.controller_generation,r.reservation_epoch,r.disposition,
-                        r.slot_index,r.pool,r.owner_id,r.owner_kind
+                "SELECT a.authority_json,g.controller_generation,r.controller_generation,
+                        r.reservation_epoch,r.disposition,r.slot_index,r.pool,r.owner_id,r.owner_kind
                  FROM agent_launch_authority a
                  JOIN agent_runs g ON g.agent_run_id=a.agent_run_id
                  JOIN execution_slots r ON r.owner_kind='agent_run' AND r.owner_id=a.agent_run_id
@@ -1745,6 +1877,7 @@ impl ConfigStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -1752,11 +1885,12 @@ impl ConfigStore {
             .map_err(|error| error.to_string())?;
         let Some((
             authority_json,
-            current_generation,
+            run_generation,
+            slot_generation,
             reservation_epoch,
             disposition,
-            _slot_index,
-            _pool,
+            slot_index,
+            pool,
             owner_id,
             owner_kind,
         )) = row
@@ -1780,10 +1914,12 @@ impl ConfigStore {
             || authority.digest()? != evidence.authority_digest
             || authority.descriptor_digest != evidence.descriptor_digest
             || evidence.previous_controller_generation != expected_previous_generation
-            || current_generation != evidence.controller_generation
+            || run_generation != evidence.controller_generation
+            || slot_generation != expected_previous_generation
             || reservation_epoch != expected_reservation_epoch
             || owner_kind != "agent_run"
             || owner_id != evidence.agent_run_id.as_str()
+            || pool != "agent"
             || !matches!(disposition.as_str(), "unknown" | "live")
         {
             return Err("AgentRun or execution-slot identity changed before adoption".into());
@@ -1824,8 +1960,9 @@ impl ConfigStore {
         let slot_changed = tx.execute(
             "UPDATE execution_slots SET disposition='live',controller_generation=?4,process_identity_json=?5
              WHERE pool='agent' AND owner_kind='agent_run' AND owner_id=?1 AND slot_index=?2
-               AND reservation_epoch=?3 AND disposition IN ('unknown','live')",
-            params![evidence.agent_run_id.as_str(),_slot_index,expected_reservation_epoch,evidence.controller_generation,serde_json::to_string(&serde_json::json!({"provider_pid":evidence.provider_pid,"provider_start_identity":evidence.provider_start_identity,"process_tree_digest":evidence.process_tree_digest,"process_tree":provider_start.process_tree})).map_err(|error| error.to_string())?],
+               AND project_id=?6 AND reservation_epoch=?3 AND controller_generation=?7
+               AND disposition IN ('unknown','live')",
+            params![evidence.agent_run_id.as_str(),slot_index,expected_reservation_epoch,evidence.controller_generation,serde_json::to_string(&serde_json::json!({"provider_pid":evidence.provider_pid,"provider_start_identity":evidence.provider_start_identity,"process_tree_digest":evidence.process_tree_digest,"process_tree":provider_start.process_tree})).map_err(|error| error.to_string())?,authority.project_id.as_str(),expected_previous_generation],
         ).map_err(|error| error.to_string())?;
         if run_changed != 1 || slot_changed != 1 {
             return Err("AgentRun or slot changed while adoption was being recorded".into());
@@ -1887,6 +2024,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_target_anchor_evidence_is_optional_and_legacy_json_stays_compact() {
+        let mut target = StopOwnedRunTarget {
+            agent_run_id: AgentRunId::parse("agent-run-a").unwrap(),
+            attempt: 1,
+            run_epoch: 1,
+            reservation_epoch: 1,
+            authority_digest: Digest::parse("a".repeat(64)).unwrap(),
+            rex_server_identity: "rex-server".into(),
+            rex_session_id: "rex-session".into(),
+            rex_window_id: "rex-window".into(),
+            rex_block_id: "rex-block".into(),
+            wrapper: Some(StopProcessIdentity {
+                pid: 10,
+                start_identity: "wrapper-birth".into(),
+            }),
+            provider: Some(StopProcessIdentity {
+                pid: 11,
+                start_identity: "provider-birth".into(),
+            }),
+            rex_launch_anchor: None,
+            runtime_binary_digest: None,
+            lifecycle: StopTargetLifecycle::NeedsReconciliation,
+        };
+        let legacy = serde_json::to_value(&target).unwrap();
+        assert!(legacy.get("rex_launch_anchor").is_none());
+        assert!(legacy.get("runtime_binary_digest").is_none());
+
+        target.rex_launch_anchor = Some(crate::launch::LaunchAnchorIdentity {
+            pid: 9,
+            start_identity: "anchor-birth".into(),
+        });
+        target.runtime_binary_digest = Some(Digest::parse("d".repeat(64)).unwrap());
+        let anchored = serde_json::to_value(&target).unwrap();
+        let decoded: StopOwnedRunTarget = serde_json::from_value(anchored).unwrap();
+        assert_eq!(decoded, target);
+        let intent = StopOwnedRunsIntent {
+            schema_version: 1,
+            operation_id: OperationId::parse("stop-a").unwrap(),
+            request: StopOwnedRunsRequest {
+                schema_version: 1,
+                project_id: ProjectId::parse("project-a").unwrap(),
+                ticket_run_id: TicketRunId::parse("ticket-a").unwrap(),
+                expected_revision: 1,
+            },
+            targets: vec![decoded],
+            created_at_unix: 0,
+        };
+        intent.validate().unwrap();
+    }
+
+    #[test]
     fn store_adoption_accepts_large_exact_process_history_and_rejects_shared_budget_overflow() {
         use crate::store::OwnerMetadata;
         use sha2::{Digest as _, Sha256};
@@ -1922,8 +2110,8 @@ mod tests {
             .store
             .connection
             .execute(
-                "UPDATE execution_slots SET controller_generation=?2,disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
-                rusqlite::params![fixture.run.agent_run_id.as_str(), current_generation],
+                "UPDATE execution_slots SET disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.run.agent_run_id.as_str()],
             )
             .unwrap();
         fixture
@@ -2273,6 +2461,8 @@ mod tests {
                 rex_block_id: format!("rex-block-{index}"),
                 wrapper: None,
                 provider: None,
+                rex_launch_anchor: None,
+                runtime_binary_digest: None,
                 lifecycle: StopTargetLifecycle::IdentityUnknown,
             })
             .collect::<Vec<_>>();
@@ -2415,6 +2605,8 @@ mod tests {
                 pid: provider.pid,
                 start_identity: provider.start_identity.clone(),
             }),
+            rex_launch_anchor: None,
+            runtime_binary_digest: None,
             lifecycle: StopTargetLifecycle::NeedsReconciliation,
         };
         let request = StopOwnedRunsRequest {
@@ -2714,6 +2906,7 @@ mod tests {
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
             runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            rex_launch_anchor: None,
         };
         let authority_json = serde_json::to_string(&authority).unwrap();
         let authority_digest = authority.digest().unwrap();
@@ -2922,6 +3115,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(released, ("released".into(), generation));
+        let terminal_projection: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT r.state,l.state FROM agent_runs r
+                 JOIN agent_launch_state l USING(agent_run_id) WHERE r.agent_run_id=?1",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            terminal_projection,
+            ("cancelled".into(), "cancelled".into())
+        );
+        let terminal_receipt_exists: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1)",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!terminal_receipt_exists);
+        let lifecycle_facts: (u64, u64) = store
+            .connection
+            .query_row(
+                "SELECT SUM(fact_type='exit_confirmed'),SUM(fact_type='slot_released')
+                 FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=7",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_facts, (1, 1));
         let unrelated: (String, u64) = store
             .connection
             .query_row(

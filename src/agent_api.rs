@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{ArtifactId, Digest, OperationId, ProjectId};
+use crate::domain::ids::{ArtifactId, Digest, OperationId, ProjectId, TicketId, TicketRunId};
 use crate::engine::orchestration::{
     RoleArtifactKind, RoleArtifactReference, WorkerRecoveryAuthorization,
 };
@@ -47,6 +47,81 @@ pub struct AgentWakeItem {
     /// persisted source result. These locators are included in the wake digest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_artifacts: Vec<HostArtifactLocator>,
+    /// Immutable completion facts derived by the host for a Postmortem launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_completion_context: Option<HostCompletionContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCompletionContext {
+    pub schema_version: u32,
+    pub scope: HostCompletionScope,
+    pub operation_completion: HostOperationCompletion,
+    pub implementation_publication: HostImplementationPublication,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCompletionScope {
+    pub project_id: ProjectId,
+    pub ticket_run_id: TicketRunId,
+    pub ticket_id: TicketId,
+    pub ticket_revision: u64,
+    pub configuration_digest: Digest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostOperationCompletion {
+    pub plan_digest: Digest,
+    pub state: String,
+    pub not_required_reason: Option<String>,
+    pub receipts: Vec<HostPublicationReceipt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostImplementationPublication {
+    pub accepted_plan_digest: Digest,
+    pub configuration_digest: Digest,
+    pub merge_work_id: Digest,
+    pub assessed_revision: u64,
+    pub awaiting_merge_revision: u64,
+    pub prepared_receipt_digest: Digest,
+    pub publication_set_digest: Digest,
+    pub assessment_id: String,
+    pub assessment_evidence_id: String,
+    pub assessment_result_digest: Digest,
+    pub intent_evidence_id: String,
+    pub intent_result_digest: Digest,
+    pub assessment: serde_json::Value,
+    pub verification: Option<serde_json::Value>,
+    pub merge_verification: HostMergeVerification,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostMergeVerification {
+    pub work_id: Digest,
+    pub configuration_digest: Digest,
+    pub accepted_plan_digest: Digest,
+    pub assessment_id: String,
+    pub source_revision: u64,
+    pub merge_commit_sha: String,
+    pub included_head_sha: String,
+    pub receipt_digest: Digest,
+    pub receipt: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPublicationReceipt {
+    pub operation_id: String,
+    pub kind: String,
+    pub request_digest: Digest,
+    pub receipt_digest: Digest,
+    pub receipt: serde_json::Value,
 }
 
 /// A parent-workspace copy of a host-verified artifact. `path` is always relative
@@ -160,6 +235,52 @@ impl AgentWakeSnapshot {
                 );
             }
             previous = item.wake_input_id;
+            if let Some(context) = &item.host_completion_context {
+                let encoded = serde_json::to_vec(context).map_err(|error| error.to_string())?;
+                if encoded.is_empty() || encoded.len() > 256 * 1024 {
+                    return Err("Postmortem completion context exceeds the 256 KiB limit".into());
+                }
+            }
+            if let Some(context) = &item.host_completion_context
+                && (item.source_type != "ticket_run_transition"
+                    || item.payload_json["target"] != "postmortem"
+                    || item.payload_json["ticket_run_id"].as_str()
+                        != Some(context.scope.ticket_run_id.as_str())
+                    || item.payload_json["revision"].as_u64() != Some(item.source_revision)
+                    || context.schema_version != 1
+                    || context.scope.ticket_revision != item.source_revision
+                    || item.payload_json["message_id"].as_str() != Some(item.source_id.as_str())
+                    || context.scope.project_id != self.project_id
+                    || context.implementation_publication.configuration_digest
+                        != context.scope.configuration_digest
+                    || self.role_session_id
+                        != format!("ticket_run:{}:postmortem", context.scope.ticket_run_id)
+                    || !matches!(
+                        context.operation_completion.state.as_str(),
+                        "succeeded" | "not_required"
+                    )
+                    || (context.operation_completion.state == "not_required"
+                        && context.operation_completion.not_required_reason.is_none())
+                    || context
+                        .implementation_publication
+                        .merge_verification
+                        .work_id
+                        != context.implementation_publication.merge_work_id
+                    || context
+                        .implementation_publication
+                        .merge_verification
+                        .source_revision
+                        != context.implementation_publication.awaiting_merge_revision
+                    || context
+                        .implementation_publication
+                        .merge_verification
+                        .configuration_digest
+                        != context.scope.configuration_digest)
+            {
+                return Err(
+                    "Postmortem completion context is missing or outside its launch scope".into(),
+                );
+            }
             if item.host_artifacts.len() > 256 {
                 return Err("Agent inbox item exceeds the 256 artifact limit".into());
             }
@@ -227,6 +348,28 @@ impl AgentWakeSnapshot {
                 .is_some_and(|sources| sources != &actual_artifact_sources)
             {
                 return Err("Reviewer publication transition source evidence list differs from its host artifacts".into());
+            }
+        }
+        if let Some(ticket_run_id) = self
+            .role_session_id
+            .strip_prefix("ticket_run:")
+            .and_then(|session| session.strip_suffix(":postmortem"))
+        {
+            let contexts = self
+                .inputs
+                .iter()
+                .filter(|item| item.host_completion_context.is_some())
+                .count();
+            if contexts != 1
+                || self
+                    .inputs
+                    .iter()
+                    .filter_map(|item| item.host_completion_context.as_ref())
+                    .any(|context| context.scope.ticket_run_id.as_str() != ticket_run_id)
+            {
+                return Err(
+                    "Postmortem inbox must contain one matching host completion context".into(),
+                );
             }
         }
         if artifact_count > 256 || artifact_bytes > 64 * 1024 * 1024 {
@@ -712,6 +855,7 @@ mod tests {
                 payload_json: serde_json::json!({"kind":"validated_agent_result"}),
                 host_artifact_source_evidence_ids: Vec::new(),
                 host_artifacts: vec![locator],
+                host_completion_context: None,
             }],
         };
         snapshot.digest = snapshot.content_digest().unwrap();
@@ -741,6 +885,45 @@ mod tests {
         transition.digest = transition.content_digest().unwrap();
         transition.inputs[0].host_artifacts[0].path = "../../outside".into();
         assert!(transition.validate().is_err());
+    }
+
+    #[test]
+    fn postmortem_completion_context_is_revision_scoped_to_the_public_wake() {
+        let mut snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: crate::domain::ids::ProjectId::parse("project-a").unwrap(),
+            role_session_id: "ticket_run:ticket-run-a:postmortem".into(),
+            agent_run_id: "agent-postmortem-a".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: vec![AgentWakeItem {
+                wake_input_id: 1,
+                source_type: "ticket_run_transition".into(),
+                source_id: "transition-message".into(),
+                source_revision: 8,
+                priority: 10,
+                payload_json: serde_json::json!({
+                    "target":"postmortem", "ticket_run_id":"ticket-run-a",
+                    "revision":8, "message_id":"transition-message"
+                }),
+                host_artifact_source_evidence_ids: vec![],
+                host_artifacts: vec![],
+                host_completion_context: Some(serde_json::from_value(serde_json::json!({
+                    "schema_version":1,
+                    "scope":{"project_id":"project-a", "ticket_run_id":"ticket-run-a", "ticket_id":"ticket-a", "ticket_revision":8, "configuration_digest":"a".repeat(64)},
+                    "operation_completion":{"plan_digest":"c".repeat(64), "state":"not_required", "not_required_reason":"no required operations", "receipts":[]},
+                    "implementation_publication":{"accepted_plan_digest":"c".repeat(64), "configuration_digest":"a".repeat(64), "merge_work_id":"1".repeat(64), "assessed_revision":6, "awaiting_merge_revision":7, "prepared_receipt_digest":"2".repeat(64), "publication_set_digest":"3".repeat(64), "assessment_id":"assessment-a", "assessment_evidence_id":"e".repeat(64), "assessment_result_digest":"f".repeat(64), "intent_evidence_id":"5".repeat(64), "intent_result_digest":"6".repeat(64), "assessment":{}, "verification":null, "merge_verification":{"work_id":"1".repeat(64), "configuration_digest":"a".repeat(64), "accepted_plan_digest":"c".repeat(64), "assessment_id":"assessment-a", "source_revision":7, "merge_commit_sha":"2".repeat(40), "included_head_sha":"3".repeat(40), "receipt_digest":"4".repeat(64), "receipt":{}}}
+                })).unwrap()),
+            }],
+        };
+        snapshot.digest = snapshot.content_digest().unwrap();
+        snapshot.validate().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        publish_wake_snapshot(directory.path(), snapshot.clone()).unwrap();
+        let received = read_inbox(directory.path(), "agent-postmortem-a", 0).unwrap();
+        assert_eq!(received, snapshot.inputs);
+        snapshot.inputs[0].source_revision += 1;
+        snapshot.digest = snapshot.content_digest().unwrap();
+        assert!(snapshot.validate().is_err());
     }
 
     #[test]
@@ -777,6 +960,7 @@ mod tests {
                 payload_json: serde_json::json!({"authorization": authorization}),
                 host_artifact_source_evidence_ids: Vec::new(),
                 host_artifacts: Vec::new(),
+                host_completion_context: None,
             }],
         };
         snapshot.digest = snapshot.content_digest().unwrap();

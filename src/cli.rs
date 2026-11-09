@@ -312,6 +312,20 @@ enum AgentCommand {
         #[arg(long)]
         environment_handoff: PathBuf,
     },
+    /// Internal detached finite-turn supervisor bound to one Rex-owned foreground shim.
+    #[command(name = "run-step-supervisor", hide = true)]
+    RunStepSupervisor {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long)]
+        environment_handoff: PathBuf,
+        #[arg(long)]
+        anchor_pid: u32,
+        #[arg(long)]
+        anchor_start_identity: String,
+    },
     TrialStep {
         #[arg(long)]
         run: String,
@@ -2889,6 +2903,25 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 Ok(())
             }
         }
+        AgentCommand::RunStepSupervisor {
+            run,
+            package,
+            environment_handoff,
+            anchor_pid,
+            anchor_start_identity,
+        } => {
+            crate::run_step_cli::run_step_supervisor(
+                &run,
+                &package,
+                &environment_handoff,
+                crate::launch::LaunchAnchorIdentity {
+                    pid: anchor_pid,
+                    start_identity: anchor_start_identity,
+                },
+            )
+            .map_err(CliError::unavailable)?;
+            Ok(())
+        }
         AgentCommand::TrialStep {
             run,
             package,
@@ -3024,31 +3057,73 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
             run_id,
             after,
         } => {
-            if std::env::var("REX_PROJECTS_AGENT").as_deref() != Ok("1") {
-                return Err(CliError::conflict(
-                    "agent inbox can only run in a factory Agent context",
-                ));
-            }
-            let capability = MailboxCapability::open_registered_for_run(&run_id, &control_dir)
-                .map_err(CliError::unavailable)?;
-            let inputs = crate::agent_api::read_inbox(capability.directory(), &run_id, after)
-                .map_err(CliError::unavailable)?;
-            let next_after = inputs
-                .last()
-                .map_or(after, |item| after.max(item.wake_input_id));
+            let report = agent_inbox_report(
+                &control_dir,
+                &run_id,
+                after,
+                std::env::var("REX_PROJECTS_AGENT").as_deref() == Ok("1"),
+            )?;
             if json {
-                print_json(&serde_json::json!({
-                    "run_id": run_id,
-                    "after": after,
-                    "next_after": next_after,
-                    "inputs": inputs,
-                }))
+                print_json(&report)
             } else {
-                println!("Agent inbox has {} input(s) after {after}.", inputs.len());
+                println!(
+                    "Agent inbox has {} input(s) after {after}.",
+                    report["inputs"].as_array().map_or(0, Vec::len)
+                );
                 Ok(())
             }
         }
     }
+}
+
+fn agent_inbox_report(
+    control_dir: &Path,
+    run_id: &str,
+    after: u64,
+    factory_agent: bool,
+) -> Result<serde_json::Value, CliError> {
+    use crate::mailbox::MailboxCapability;
+
+    if !factory_agent {
+        return Err(CliError::conflict(
+            "agent inbox can only run in a factory Agent context",
+        ));
+    }
+    let capability = MailboxCapability::open_registered_for_run(run_id, control_dir)
+        .map_err(CliError::unavailable)?;
+    let inputs = crate::agent_api::read_inbox(capability.directory(), run_id, after)
+        .map_err(CliError::unavailable)?;
+    let next_after = inputs
+        .last()
+        .map_or(after, |item| after.max(item.wake_input_id));
+    Ok(serde_json::json!({
+        "run_id": run_id,
+        "after": after,
+        "next_after": next_after,
+        "inputs": inputs,
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_agent_inbox_for_test(args: &[&str]) -> Result<Vec<u8>, String> {
+    let cli = Cli::try_parse_from(args.iter().copied()).map_err(|error| error.to_string())?;
+    if !cli.json {
+        return Err("test inbox dispatch requires --json".into());
+    }
+    let Command::Agent {
+        command:
+            AgentCommand::Inbox {
+                control_dir,
+                run_id,
+                after,
+            },
+    } = cli.command
+    else {
+        return Err("test inbox dispatch requires `agent inbox`".into());
+    };
+    let report = agent_inbox_report(&control_dir, &run_id, after, true)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())
 }
 
 fn agent_repository_manifest(
@@ -3898,7 +3973,7 @@ fn version(json: bool) -> Result<(), CliError> {
                 .into(),
             cli_protocol: 1,
             database_schema: crate::store::SCHEMA_VERSION as u32,
-            source_revision: option_env!("REX_PROJECTS_SOURCE_REVISION").map(str::to_owned),
+            source_revision: crate::BUILD_SOURCE_REVISION.map(str::to_owned),
             dirty: option_env!("REX_PROJECTS_BUILD_DIRTY") == Some("true"),
         };
         print_json(&report)

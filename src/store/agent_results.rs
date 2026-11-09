@@ -22,7 +22,7 @@ use crate::engine::orchestration::{
 use crate::launch::{AgentLaunchAuthority, ProviderQualification};
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::roles::RoleResultMessage;
-use crate::run_step::{CleanupState, TurnOutcome};
+use crate::run_step::{CancellationCause, CleanupState, TurnOutcome};
 use crate::run_step_spool::{
     AgentTurnResult, BlockLossCleanupSnapshot, RunFamilyCoverage, RunFamilyRecord,
     StartRequestEnvelope,
@@ -382,6 +382,7 @@ pub(crate) fn verify_cancelled_agent_cleanup(
         descriptor_digest: authority.descriptor_digest.clone(),
         wrapper_pid: start.request.wrapper_pid,
         wrapper_start_identity: start.request.wrapper_start_identity.clone(),
+        rex_launch_anchor: start.request.rex_launch_anchor.clone(),
     };
     let wrapper: crate::launch::ObservedWrapperIdentity = crate::protocol::parse_unique(
         run.wrapper_identity_json
@@ -397,6 +398,11 @@ pub(crate) fn verify_cancelled_agent_cleanup(
         || family.wrapper_process.pid != wrapper.pid
         || family.wrapper_process.start_identity != wrapper.start_identity
         || family.wrapper_process.quality != ProcessIdentityQuality::KernelBirthToken
+        || start
+            .request
+            .rex_launch_anchor
+            .as_ref()
+            .is_some_and(|anchor| family.wrapper_process.parent_pid != anchor.pid)
         || family.provider_root.parent_pid != wrapper.pid
         || family.provider_root.quality != ProcessIdentityQuality::KernelBirthToken
     {
@@ -542,6 +548,18 @@ fn validate_cancelled_result_for_start(
     qualification: &ProviderQualification,
 ) -> Result<(), String> {
     let receipt = &result.receipt;
+    let signal_cancellation = receipt.cancellation_signal.is_some_and(|signal| signal > 0)
+        && receipt.cancellation_cause.is_none();
+    let anchor_cancellation = matches!(
+        (&receipt.cancellation_cause, start.request.rex_launch_anchor.as_ref()),
+        (
+            Some(CancellationCause::RexLaunchAnchorClosed {
+                pid,
+                start_identity,
+            }),
+            Some(anchor),
+        ) if *pid == anchor.pid && start_identity == &anchor.start_identity
+    ) && receipt.cancellation_signal.is_none();
     if receipt.run_id != authority.agent_run_id
         || receipt.attempt != authority.attempt
         || receipt.provider != qualification.adapter
@@ -550,7 +568,7 @@ fn validate_cancelled_result_for_start(
         || !matches!(receipt.outcome, TurnOutcome::Cancelled)
         || !matches!(receipt.cleanup, CleanupState::Confirmed)
         || receipt.timed_out
-        || receipt.cancellation_signal.is_none_or(|signal| signal <= 0)
+        || !(signal_cancellation || anchor_cancellation)
         || receipt.exit_code.is_some()
         || receipt.result_digest.is_some()
         || result.structured_result.is_some()
@@ -616,6 +634,7 @@ mod cancelled_cleanup_tests {
             qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
             wrapper_pid: std::process::id(),
             wrapper_start_identity: "wrapper-birth".into(),
+            rex_launch_anchor: None,
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
         };
@@ -627,6 +646,19 @@ mod cancelled_cleanup_tests {
             ),
             request,
         }
+    }
+
+    fn start_for_anchor_eof(authority: &AgentLaunchAuthority) -> StartRequestEnvelope {
+        let mut start = start_for(authority);
+        start.request.rex_launch_anchor = Some(crate::launch::LaunchAnchorIdentity {
+            pid: 7001,
+            start_identity: "shim-birth".into(),
+        });
+        start.request_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&start.request).unwrap())
+        );
+        start
     }
 
     fn cancelled_result(
@@ -655,6 +687,7 @@ mod cancelled_cleanup_tests {
                 exit_code: None,
                 timed_out: false,
                 cancellation_signal: Some(1),
+                cancellation_cause: None,
                 cleanup,
                 cleanup_detail: None,
                 processes: Vec::new(),
@@ -752,6 +785,39 @@ mod cancelled_cleanup_tests {
     }
 
     #[test]
+    fn anchor_eof_cancellation_requires_exact_durable_start_identity() {
+        let authority = tests::test_authority();
+        let start = start_for_anchor_eof(&authority);
+        let qualification = tests::reviewer_qualification(&authority);
+        let mut result = cancelled_result(&authority, &start, CleanupState::Confirmed);
+        result.receipt.cancellation_signal = None;
+        result.receipt.cancellation_cause = Some(CancellationCause::RexLaunchAnchorClosed {
+            pid: 7001,
+            start_identity: "shim-birth".into(),
+        });
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &result, &qualification)
+                .is_ok()
+        );
+
+        result.receipt.cancellation_cause = Some(CancellationCause::RexLaunchAnchorClosed {
+            pid: 7001,
+            start_identity: "reused-shim-pid".into(),
+        });
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &result, &qualification)
+                .is_err()
+        );
+
+        let legacy_start = start_for(&authority);
+        result.start_request_digest = legacy_start.request_digest.clone();
+        assert!(
+            validate_cancelled_result_for_start(&authority, &legacy_start, &result, &qualification)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn cancelled_cleanup_requires_persisted_accepted_start_ack() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::open_test(temp.path()).unwrap();
@@ -787,6 +853,7 @@ mod cancelled_cleanup_tests {
                 descriptor_digest: Digest::parse("b".repeat(64)).unwrap(),
                 wrapper_pid: wrapper.pid,
                 wrapper_start_identity: wrapper.start_identity.clone(),
+                rex_launch_anchor: None,
             },
             observed_at_unix: 1,
             coverage: RunFamilyCoverage::Complete,
@@ -941,8 +1008,9 @@ pub fn record_and_verify_agent_terminal(
         .map_err(|error| error.to_string())?;
     super::validate_active_generation(&tx, owner_generation)?;
     verify_persisted_authority(&tx, &authority, &authority_digest)?;
-    verify_agent_run_snapshot(&tx, &authority)?;
+    verify_agent_run_snapshot(&tx, &authority, owner_generation)?;
     verify_ticket_snapshot(&tx, &authority)?;
+    let launch_reservation = terminal_agent_launch_reservation(&tx, &authority)?;
     let prior: Option<(String, String)> = tx
         .query_row(
             "SELECT terminal_digest,receipt_json FROM agent_terminal_receipts WHERE agent_run_id=?1",
@@ -995,26 +1063,50 @@ pub fn record_and_verify_agent_terminal(
     }
     let run_changed = tx.execute(
         "UPDATE agent_runs SET state='completed',finished_at_unix=COALESCE(finished_at_unix,?2) WHERE agent_run_id=?1 AND state IN ('running','unknown') AND controller_generation=?3",
-        params![run_id.as_str(), now, authority.controller_generation],
+        params![run_id.as_str(), now, owner_generation],
     ).map_err(|error| error.to_string())?;
     if run_changed != 1 {
         return Err("AgentRun state changed before terminal evidence was recorded".into());
     }
-    let slot: Option<(String, u32, u64)> = tx
+    let latest_adoption_generation: Option<u64> = tx
         .query_row(
-            "SELECT pool,slot_index,reservation_epoch FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND project_id=?2 AND controller_generation=?3 AND disposition IN ('launch_pending','live','parked','unknown')",
-            params![run_id.as_str(), authority.project_id.as_str(), owner_generation],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT controller_generation FROM agent_run_adoptions WHERE agent_run_id=?1 ORDER BY controller_generation DESC LIMIT 1",
+            [run_id.as_str()],
+            |row| row.get(0),
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let Some((pool, slot_index, reservation_epoch)) = slot else {
+    let prior_slot_generation =
+        latest_adoption_generation.unwrap_or(authority.controller_generation);
+    let slot: Option<(String, u32, u64, u64)> = tx
+        .query_row(
+            "SELECT pool,slot_index,reservation_epoch,controller_generation FROM execution_slots
+             WHERE owner_kind='agent_run' AND owner_id=?1 AND project_id=?2
+               AND controller_generation IN (?3,?4,?5)
+               AND (?6 IS NULL OR (pool=?6 AND slot_index=?7 AND ticket_run_id IS ?8 AND reservation_epoch=?9))
+               AND disposition IN ('launch_pending','live','parked','unknown')",
+            params![
+                run_id.as_str(),
+                authority.project_id.as_str(),
+                authority.controller_generation,
+                prior_slot_generation,
+                owner_generation,
+                launch_reservation.as_ref().map(|reservation| reservation.pool.as_str()),
+                launch_reservation.as_ref().map(|reservation| reservation.slot_index),
+                launch_reservation.as_ref().and_then(|reservation| reservation.ticket_run_id.as_ref()).map(|ticket| ticket.as_str()),
+                launch_reservation.as_ref().map(|reservation| reservation.project_epoch),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((pool, slot_index, reservation_epoch, slot_generation)) = slot else {
         return Err("Agent terminal has no exact active execution slot to release".into());
     };
     let released = tx
         .execute(
-            "UPDATE execution_slots SET disposition='released',controller_generation=?5 WHERE pool=?1 AND slot_index=?2 AND owner_kind='agent_run' AND owner_id=?3 AND reservation_epoch=?4 AND project_id=?6 AND controller_generation=?5 AND disposition IN ('launch_pending','live','parked','unknown')",
-            params![pool, slot_index, run_id.as_str(), reservation_epoch, owner_generation, authority.project_id.as_str()],
+            "UPDATE execution_slots SET disposition='released',controller_generation=?5 WHERE pool=?1 AND slot_index=?2 AND owner_kind='agent_run' AND owner_id=?3 AND reservation_epoch=?4 AND project_id=?6 AND controller_generation=?7 AND disposition IN ('launch_pending','live','parked','unknown')",
+            params![pool, slot_index, run_id.as_str(), reservation_epoch, owner_generation, authority.project_id.as_str(), slot_generation],
         )
         .map_err(|error| error.to_string())?;
     if released != 1 {
@@ -1219,7 +1311,7 @@ pub fn ingest_agent_result(
     super::validate_active_generation(&tx, owner_generation)?;
     verify_persisted_authority(&tx, &authority, &terminal.authority_digest)?;
     verify_terminal_row(&tx, terminal)?;
-    verify_agent_run_snapshot(&tx, &authority)?;
+    verify_agent_run_snapshot(&tx, &authority, owner_generation)?;
     verify_registered_artifacts(
         &tx,
         &authority,
@@ -1475,7 +1567,9 @@ pub fn ingest_next_spooled_agent_result(
         let mut statement = store.connection.prepare(
             "SELECT a.agent_run_id,a.control_dir FROM agent_launch_authority a \
              JOIN agent_launch_state s USING(agent_run_id) \
-             WHERE a.controller_generation=?1 AND s.state IN ('running','unknown') \
+             JOIN agent_runs r USING(agent_run_id) \
+             WHERE r.controller_generation=?1 AND r.state IN ('running','unknown') \
+               AND s.state IN ('running','unknown') \
                AND NOT EXISTS(SELECT 1 FROM agent_terminal_receipts t WHERE t.agent_run_id=a.agent_run_id) \
              ORDER BY s.updated_at_unix,a.agent_run_id LIMIT ?2",
         ).map_err(|error| error.to_string())?;
@@ -1720,7 +1814,7 @@ pub fn acknowledge_agent_result(
     tx.commit().map_err(|error| error.to_string())
 }
 
-/// Acknowledge a host-validated Worker or Reviewer result when its Project configuration has
+/// Acknowledge a host-validated role result when its Project configuration has
 /// changed, provided the TicketRun is still at the exact revision and phase that launched it.
 /// Evidence is retained, and the ACK is scoped to the TicketRun revision so config reloads do not
 /// make the same stale result eligible for reduction again.
@@ -1731,10 +1825,11 @@ pub fn acknowledge_obsolete_configuration_result(
     evidence_id: &str,
     active_config_digest: &Digest,
 ) -> Result<bool, String> {
-    if !matches!(binding.role, Role::Worker | Role::Reviewer) {
-        return Err(
-            "obsolete configuration disposition only supports Worker and Reviewer results".into(),
-        );
+    if !matches!(
+        binding.role,
+        Role::Worker | Role::Reviewer | Role::MergeDecision
+    ) {
+        return Err("obsolete configuration disposition does not support this result role".into());
     }
     let ticket_run_id = binding
         .ticket_run_id
@@ -1776,6 +1871,7 @@ pub fn acknowledge_obsolete_configuration_result(
     let expected_role = match binding.role {
         Role::Worker => "worker",
         Role::Reviewer => "reviewer",
+        Role::MergeDecision => "merge_decision",
         _ => unreachable!(),
     };
     let authority: AgentLaunchAuthority = crate::protocol::parse_unique(authority_json.as_bytes())?;
@@ -1798,6 +1894,7 @@ pub fn acknowledge_obsolete_configuration_result(
     let expected_phase = match binding.role {
         Role::Worker => "implementing",
         Role::Reviewer => "reviewing",
+        Role::MergeDecision => "assessing",
         _ => unreachable!(),
     };
     if phase != expected_phase {
@@ -2300,6 +2397,7 @@ fn verify_persisted_authority(
 fn verify_agent_run_snapshot(
     tx: &Transaction<'_>,
     authority: &AgentLaunchAuthority,
+    owner_generation: u64,
 ) -> Result<(), String> {
     let run: Option<(String, String, u64, String, u64, String, String)> = tx.query_row("SELECT project_id,config_source,config_revision,config_digest,controller_generation,state,logical_owner FROM agent_runs WHERE agent_run_id=?1", [authority.agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional().map_err(|error| error.to_string())?;
     let Some((project, _source, config_revision, config_digest, run_generation, state, _owner)) =
@@ -2307,11 +2405,25 @@ fn verify_agent_run_snapshot(
     else {
         return Err("AgentRun disappeared".into());
     };
+    let generation_matches = if state == "completed" {
+        let terminal_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1)",
+                [authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        terminal_exists
+            && run_generation >= authority.controller_generation
+            && run_generation <= owner_generation
+    } else {
+        run_generation == owner_generation
+    };
     if project != authority.project_id.as_str()
         || config_revision != authority.config_revision.0
         || config_digest != authority.config_digest.as_str()
-        || run_generation != authority.controller_generation
-        || !matches!(state.as_str(), "running" | "completed")
+        || !generation_matches
+        || !matches!(state.as_str(), "running" | "unknown" | "completed")
     {
         return Err(
             "AgentRun project, config, generation, or lifecycle differs from launch authority"
@@ -2319,6 +2431,59 @@ fn verify_agent_run_snapshot(
         );
     }
     Ok(())
+}
+
+fn terminal_agent_launch_reservation(
+    tx: &Transaction<'_>,
+    authority: &AgentLaunchAuthority,
+) -> Result<Option<crate::launch::AgentLaunchReservation>, String> {
+    let row: Option<(String, String, String, String, u64, u64, String)> = tx
+        .query_row(
+            "SELECT reservation_json,lifecycle,project_id,operation_id,controller_generation,project_epoch,reservation_digest
+             FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [authority.agent_run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((json, lifecycle, project, operation, generation, epoch, reservation_digest)) = row
+    else {
+        // A persisted launch may predate immutable reservation records. Its terminal replay
+        // remains fenced by the persisted authority and exact active run/project-owned slot.
+        return Ok(None);
+    };
+    if lifecycle != "authorized" {
+        return Err("Agent terminal launch reservation is not authorized".into());
+    }
+    let reservation: crate::launch::AgentLaunchReservation =
+        crate::protocol::parse_unique(json.as_bytes())?;
+    if reservation.agent_run_id != authority.agent_run_id
+        || reservation.project_id.as_str() != project
+        || reservation.operation_id.as_str() != operation
+        || reservation.controller_generation != generation
+        || reservation.project_epoch != epoch
+        || reservation.digest()?.as_str() != reservation_digest
+        || reservation.project_id != authority.project_id
+        || reservation.operation_id != authority.operation_id
+        || reservation.role != authority.role
+        || reservation.role_session_id != authority.role_session_id
+        || reservation.ticket_run_id != authority.ticket_run_id
+        || reservation.ticket_revision != authority.ticket_revision
+        || reservation.controller_generation != authority.controller_generation
+    {
+        return Err("Agent terminal launch reservation differs from immutable authority".into());
+    }
+    Ok(Some(reservation))
 }
 
 fn verify_ticket_snapshot(
@@ -3300,6 +3465,7 @@ pub(crate) mod tests {
             continuation: None,
             shutdown_grace_seconds: 5,
             start_ack_timeout_seconds: 5,
+            supervision_mode: None,
         }
     }
 
@@ -3470,6 +3636,7 @@ pub(crate) mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancellation_signal: None,
+                cancellation_cause: None,
                 cleanup: CleanupState::Confirmed,
                 cleanup_detail: None,
                 processes: vec![],
@@ -3995,6 +4162,10 @@ pub(crate) mod tests {
                 authority.control_dir.display().to_string(),
             ],
         ).unwrap();
+        store.execute(
+            "INSERT INTO agent_runs(agent_run_id,controller_generation,state) VALUES (?1,?2,'running')",
+            rusqlite::params![authority.agent_run_id.as_str(), authority.controller_generation],
+        ).unwrap();
         store
             .execute(
                 "INSERT INTO provider_qualifications(receipt_digest,receipt_json) VALUES (?1,?2)",
@@ -4023,6 +4194,7 @@ pub(crate) mod tests {
                 qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
                 wrapper_pid,
                 wrapper_start_identity: wrapper_start_identity.clone(),
+                rex_launch_anchor: None,
                 rex_session_id: authority.rex_session_id.clone(),
                 rex_block_id: authority.rex_block_id.clone(),
             })
@@ -4049,6 +4221,7 @@ pub(crate) mod tests {
             descriptor_digest: authority.descriptor_digest.clone(),
             wrapper_pid,
             wrapper_start_identity: wrapper_start_identity.clone(),
+            rex_launch_anchor: None,
         };
         spool.publish_run_family_binding_once(&binding).unwrap();
         let family = |coverage| RunFamilyRecord {
@@ -4113,6 +4286,7 @@ pub(crate) mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancellation_signal: None,
+                cancellation_cause: None,
                 cleanup: if matches!(&outcome, TurnOutcome::Completed) {
                     CleanupState::Confirmed
                 } else {
@@ -4173,6 +4347,7 @@ pub(crate) mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT,controller_generation INTEGER,control_dir TEXT);
+                 CREATE TABLE agent_runs(agent_run_id TEXT,controller_generation INTEGER,state TEXT);
                  CREATE TABLE agent_launch_state(agent_run_id TEXT,state TEXT,start_request_digest TEXT,provider_process_tree_json TEXT,updated_at_unix INTEGER);
                  CREATE TABLE agent_terminal_receipts(agent_run_id TEXT,terminal_digest TEXT,observed_at_unix INTEGER);
                  CREATE TABLE provider_qualifications(receipt_digest TEXT,receipt_json TEXT);
@@ -4408,6 +4583,56 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(replay.receipt.evidence_id(), result.receipt.evidence_id());
+
+        let previous_generation = fixture.owner_generation;
+        let owner_generation = fixture
+            .store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "result-replay-after-owner-restart".into(),
+                state_root: fixture._temp.path().display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: "test-owner-restarted".into(),
+                executable_path: "/test/fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("http://fixture".into()),
+                rex_server_identity: Some("fixture-rex".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        assert!(owner_generation > previous_generation);
+        let restarted_replay = ingest_next_spooled_agent_result(
+            &mut fixture.store,
+            &fixture.artifacts,
+            owner_generation,
+            8,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            restarted_replay.receipt.evidence_id(),
+            result.receipt.evidence_id()
+        );
+        let evidence_count: u64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_evidence WHERE agent_run_id=?1",
+                [fixture.terminal.agent_run_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_count, 1);
+        let slot_disposition: String = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [fixture.terminal.agent_run_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slot_disposition, "released");
     }
 
     #[test]
@@ -4619,36 +4844,34 @@ pub(crate) mod tests {
             coordinator_authority_digest: coordinator_authority.digest().unwrap(),
         };
         let role_session = format!("ticket:{ticket}:worker:{node_id}");
-        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+        let wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: project.clone(),
             role_session_id: role_session.clone(),
             agent_run_id: worker_id.to_string(),
-            digest: Digest::parse("0".repeat(64)).unwrap(),
+            digest: prior_authority.wake_snapshot_digest.clone(),
             inputs: Vec::new(),
         };
-        wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
-        let limits = crate::mailbox::MailboxLimits {
-            max_request_bytes: 1_048_576,
-            max_pending_requests: 32,
-        };
-        let expires = 9_999_999_999;
-        crate::mailbox::MailboxCapability::create(
-            worker_id.to_string(),
-            &prior_authority.control_dir,
-            expires,
-            limits,
-        )
-        .unwrap();
+        let mailbox_directory = prior_authority.control_dir.join("mailbox");
+        let descriptor_bytes = std::fs::read(mailbox_directory.join("descriptor.json")).unwrap();
+        let descriptor: crate::mailbox::MailboxDescriptor =
+            crate::protocol::parse_unique(&descriptor_bytes).unwrap();
+        let expires = descriptor.expires_at_unix;
+        let mailbox_max_request_bytes = descriptor.max_request_bytes as u64;
+        let mailbox_max_pending_requests = descriptor.max_pending_requests as u32;
         let mailbox_digest = Digest::parse(
             crate::mailbox::MailboxDescriptor::capability_digest(
                 worker_id.as_str(),
                 expires,
-                limits,
+                crate::mailbox::MailboxLimits {
+                    max_request_bytes: descriptor.max_request_bytes,
+                    max_pending_requests: descriptor.max_pending_requests,
+                },
             )
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(mailbox_digest, prior_authority.mailbox_capability_digest);
         let reservation = crate::launch::AgentLaunchReservation {
             schema_version: 1,
             agent_run_id: worker_id.clone(),
@@ -4680,24 +4903,33 @@ pub(crate) mod tests {
             descriptor_path: prior_authority.descriptor_path.clone(),
             workspace_path: prior_authority.workspace_path.clone(),
             control_dir: prior_authority.control_dir.clone(),
-            mailbox_directory: prior_authority.control_dir.clone(),
+            mailbox_directory: mailbox_directory.clone(),
             mailbox_capability_digest: mailbox_digest.clone(),
             mailbox_expires_at_unix: expires,
-            mailbox_max_request_bytes: 1_048_576,
-            mailbox_max_pending_requests: 32,
+            mailbox_max_request_bytes,
+            mailbox_max_pending_requests,
             pool: "agent".into(),
             slot_index: 0,
             global_capacity: 4,
             project_capacity: 4,
         };
         let reservation_json = crate::store::canonical_json(&reservation).unwrap();
+        let wake_json = crate::store::canonical_json(&reservation.wake_snapshot).unwrap();
+        worker
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_wake_context(agent_run_id,snapshot_digest,snapshot_json,created_at_unix) VALUES (?1,?2,?3,1)",
+                rusqlite::params![worker_id.as_str(),prior_authority.wake_snapshot_digest.as_str(),wake_json],
+            )
+            .unwrap();
         worker.store.test_connection().execute(
             "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,1,?5,?6,'authorized',1,1)",
             rusqlite::params![worker_id.as_str(),project.as_str(),reservation.operation_id.as_str(),worker.owner_generation,reservation.digest().unwrap().as_str(),reservation_json],
         ).unwrap();
         worker.store.test_connection().execute(
-            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,?4,1048576,32)",
-            rusqlite::params![worker_id.as_str(),prior_authority.control_dir.display().to_string(),mailbox_digest.as_str(),expires],
+            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![worker_id.as_str(),mailbox_directory.display().to_string(),mailbox_digest.as_str(),expires,mailbox_max_request_bytes,mailbox_max_pending_requests],
         ).unwrap();
         let current = worker
             .store
@@ -4758,16 +4990,6 @@ pub(crate) mod tests {
                 )
                 .unwrap()
         );
-        let candidates = worker
-            .store
-            .worker_recovery_candidates(
-                worker.owner_generation,
-                &current,
-                &plan_record,
-                &project_config,
-                &configuration_digest,
-            )
-            .unwrap();
         let debug_rows: (String, bool, bool) = worker.store.test_connection().query_row(
             "SELECT state,EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1),EXISTS(SELECT 1 FROM agent_result_evidence WHERE agent_run_id=?1 AND role='worker' AND outcome='completed') FROM agent_runs WHERE agent_run_id=?1",
             [worker_id.as_str()],
@@ -4789,6 +5011,112 @@ pub(crate) mod tests {
             stored_reservation.ticket_revision.unwrap().0,
             current.revision
         );
+        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
+            worker_id.to_string(),
+            &stored_reservation.mailbox_directory,
+        )
+        .unwrap();
+        let artifact_count_before_terminal_rejection: u64 = worker
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM registered_artifacts WHERE agent_run_id=?1",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let artifact_request_id = "completed-worker-artifact-add";
+        let artifact_request = crate::engine::orchestration::ArtifactAddRequest {
+            schema_version: 1,
+            message_id: artifact_request_id.into(),
+            path: "change/late-artifact.json".into(),
+            kind: crate::engine::orchestration::RoleArtifactKind::Change,
+            artifact_schema_version: 1,
+        };
+        let artifact_envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(artifact_request_id).unwrap(),
+            operation_id: Some(stored_reservation.operation_id.clone()),
+            method: crate::protocol::MethodName::new("artifact.add").unwrap(),
+            project_id: Some(stored_reservation.project_id.clone()),
+            run_id: Some(worker_id.to_string()),
+            attempt: Some(stored_reservation.attempt),
+            run_epoch: Some(stored_reservation.run_epoch),
+            expected_subject_revision: Some(current.revision),
+            role: Some(Role::Worker),
+            request_type: None,
+            params: serde_json::to_value(artifact_request).unwrap(),
+        };
+        mailbox
+            .queue(
+                artifact_request_id,
+                &serde_json::to_vec(&artifact_envelope).unwrap(),
+                10,
+            )
+            .unwrap();
+        let pending_before_terminal_dispatch = mailbox.pending(11).unwrap();
+        let terminal_run_state: (String, u64) = worker
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT state,controller_generation FROM agent_runs WHERE agent_run_id=?1",
+                [worker_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!pending_before_terminal_dispatch.is_empty());
+        assert_eq!(terminal_run_state.0, "completed");
+        // Host-validation fixtures omit Rex block observations; seed the completed block needed
+        // to exercise the terminal mailbox replay path.
+        worker.store.test_connection().execute(
+            "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,?2,?3,'worker','factory','completed',1,1,1)",
+            rusqlite::params![prior_authority.rex_view_id.as_str(), prior_authority.rex_block_id, worker_id.as_str()],
+        ).unwrap();
+        assert!(
+            worker
+                .store
+                .process_one_agent_mailbox_request(
+                    worker.owner_generation,
+                    worker_id.as_str(),
+                    11,
+                    &worker.artifacts,
+                    &BTreeMap::new(),
+                )
+                .unwrap()
+        );
+        let terminal_rejection: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(
+                &mailbox
+                    .read_receipt(artifact_request_id, 11)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!terminal_rejection.error.as_ref().unwrap().retryable);
+        assert!(mailbox.pending(11).unwrap().is_empty());
+        assert_eq!(
+            worker
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM registered_artifacts WHERE agent_run_id=?1",
+                    [worker_id.as_str()],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            artifact_count_before_terminal_rejection
+        );
+        let candidates = worker
+            .store
+            .worker_recovery_candidates(
+                worker.owner_generation,
+                &current,
+                &plan_record,
+                &project_config,
+                &configuration_digest,
+            )
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
         let evidence_json: String = worker.store.test_connection().query_row(
             "SELECT result_json FROM agent_result_evidence WHERE agent_run_id=?1 AND role='worker' AND outcome='completed'",
             [worker_id.as_str()], |row| row.get(0),
@@ -4799,11 +5127,6 @@ pub(crate) mod tests {
             evidence_submission.assertion,
             AgentAssertion::Blocked { .. }
         ));
-        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
-            worker_id.to_string(),
-            &stored_reservation.mailbox_directory,
-        )
-        .unwrap();
         assert!(
             mailbox
                 .pending(u64::try_from(super::unix_now().unwrap()).unwrap())
@@ -4877,6 +5200,405 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let previous_owner_generation = worker.owner_generation;
+        let prior_authority = worker
+            .store
+            .agent_launch_authority(&worker_id)
+            .unwrap()
+            .unwrap();
+        let manifest = crate::host_commit::ChangeManifest {
+            schema_version: 1,
+            entries: vec![crate::host_commit::ManifestEntry::Delete {
+                path: "obsolete.md".into(),
+            }],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_path = "change/manifest.json";
+        let manifest_file = prior_authority.workspace_path.join(manifest_path);
+        std::fs::create_dir_all(manifest_file.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_file, &manifest_bytes).unwrap();
+        let manifest_artifact = worker
+            .artifacts
+            .register(
+                &prior_authority.workspace_path,
+                &prior_authority.project_id,
+                worker_id.as_str(),
+                Role::Worker,
+                manifest_path,
+                crate::engine::orchestration::RoleArtifactKind::Change,
+                1,
+            )
+            .unwrap();
+        crate::store::artifact_registry::persist_registration(
+            &mut worker.store.connection,
+            worker.owner_generation,
+            &prior_authority,
+            "fixture-change-manifest",
+            &digest(b"fixture Change ArtifactAdd request").unwrap(),
+            &manifest_artifact.reference,
+            &manifest_artifact.object_path,
+        )
+        .unwrap();
+        let restarted_generation = worker
+            .store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "completed-worker-mailbox-replay".into(),
+                state_root: worker._temp.path().display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: "fixture-owner-restarted".into(),
+                executable_path: "/test/fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("http://fixture".into()),
+                rex_server_identity: Some("fixture-rex".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        assert!(restarted_generation > previous_owner_generation);
+        let block_lifecycle: String = worker
+            .store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2",
+                rusqlite::params![
+                    prior_authority.rex_view_id.as_str(),
+                    prior_authority.rex_block_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(block_lifecycle.as_str(), "completed" | "closed"));
+        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
+            worker_id.to_string(),
+            &stored_reservation.mailbox_directory,
+        )
+        .unwrap();
+        let terminal_request_id = "terminal-restart-replay-scope-check";
+        let request = crate::agent_api::RepositoryCommitRequest {
+            schema_version: 1,
+            message_id: terminal_request_id.into(),
+            worktree_id: stored_assignment.node_id.to_string(),
+            expected_head: base.into(),
+            manifest: manifest_artifact.reference.clone(),
+            manifest_digest: manifest_artifact.reference.digest.clone(),
+            commit_message:
+                "docs: fixture retained commit\n\nCo-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let terminal_envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(terminal_request_id).unwrap(),
+            operation_id: Some(prior_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("repository.commit").unwrap(),
+            project_id: Some(project.clone()),
+            run_id: Some(worker_id.to_string()),
+            attempt: Some(prior_authority.attempt),
+            run_epoch: Some(prior_authority.run_epoch),
+            expected_subject_revision: Some(current.revision),
+            role: Some(Role::Worker),
+            request_type: None,
+            params: serde_json::to_value(&request).unwrap(),
+        };
+        mailbox
+            .queue(
+                terminal_request_id,
+                &serde_json::to_vec(&terminal_envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+
+        // Fixture-seed an already accepted and succeeded host effect through the public journal
+        // API. The mailbox replay below must match this exact intent and durable receipt.
+        let mailbox_request = mailbox
+            .pending(crate::mailbox::unix_time_now().unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let manifest_digest = request.manifest_digest.clone();
+        let payload = crate::delivery_runtime::CommitWorkerManifestEffectPayload {
+            schema_version: 1,
+            agent_run_id: worker_id.clone(),
+            project_id: project.clone(),
+            message_id: request.message_id.clone(),
+            configuration_digest: prior_authority.config_digest.clone(),
+            ticket_revision: current.revision,
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket.clone(),
+            work_node_id: stored_assignment.node_id.clone(),
+            repository_id: repository.clone(),
+            worktree_path: worktree.clone(),
+            branch: "agent/fixture/node-a".into(),
+            prepare_operation_id: prepare_operation.clone(),
+            expected_base_sha: base.into(),
+            expected_head: request.expected_head.clone(),
+            manifest_artifact: request.manifest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            manifest,
+            commit_message: request.commit_message.clone(),
+            required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let (request_json, request_digest) =
+            crate::delivery_runtime::canonical_delivery_payload(&payload).unwrap();
+        let effect_operation =
+            OperationId::parse(format!("repo-commit-{}", mailbox_request.digest)).unwrap();
+        let intent = crate::store::EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket.to_string(),
+            operation_id: effect_operation.to_string(),
+            logical_key: format!("repository.commit:{worker_id}:{}", mailbox_request.digest),
+            kind: "commit_worker_manifest".into(),
+            request_json,
+            request_digest,
+            expected_revision: Some(current.revision),
+        };
+        worker
+            .store
+            .enqueue_effect(restarted_generation, &intent)
+            .unwrap();
+        let claim = worker
+            .store
+            .claim_next_due_effect(
+                restarted_generation,
+                i64::MAX,
+                std::slice::from_ref(&intent.kind),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.intent, intent);
+        let effect_receipt = crate::delivery_runtime::CommitWorkerManifestEffectReceipt {
+            schema_version: 1,
+            agent_run_id: worker_id.clone(),
+            message_id: request.message_id.clone(),
+            ticket_run_id: ticket.clone(),
+            work_node_id: stored_assignment.node_id.clone(),
+            repository_id: repository.clone(),
+            base_sha: base.into(),
+            manifest_artifact: request.manifest.clone(),
+            commit: crate::host_commit::HostCommitReceipt {
+                operation_id: effect_operation,
+                repository_id: repository.clone(),
+                expected_head: request.expected_head.clone(),
+                observed_head: "d".repeat(40),
+                tree: "e".repeat(40),
+                manifest_digest,
+                signature_verified: true,
+                hooks_completed: true,
+                index_synchronized: true,
+                index_sync_conflict: false,
+            },
+        };
+        let effect_receipt_json = serde_json::to_string(&effect_receipt).unwrap();
+        worker
+            .store
+            .finish_effect(
+                intent.operation_id.as_str(),
+                restarted_generation,
+                crate::store::EffectOutcome::Succeeded,
+                Some(&effect_receipt_json),
+            )
+            .unwrap();
+        let mut committed_recovery = authorization.clone();
+        committed_recovery.prior_host_commit_operation_id =
+            Some(crate::domain::ids::OperationId::parse(intent.operation_id.clone()).unwrap());
+        committed_recovery.prior_host_commit_receipt_digest =
+            Some(digest(effect_receipt_json.as_bytes()).unwrap());
+        committed_recovery.expected_head = effect_receipt.commit.observed_head.clone();
+        committed_recovery
+            .prior_artifact_refs
+            .push(effect_receipt.manifest_artifact.clone());
+        let recovered_prepared = worker
+            .store
+            .prepared_worker_launch(
+                restarted_generation,
+                plan_record.accepted_revision,
+                &node_id,
+                &prepared_receipt,
+                &project_config,
+                &configuration_digest,
+            )
+            .unwrap()
+            .expect("recovery must retain the genuine accepted prepared token");
+        let validated_plan = plan_record
+            .validate_for(&project_config, &configuration_digest)
+            .unwrap();
+        let node = validated_plan
+            .nodes_in_execution_order
+            .iter()
+            .find(|node| node.id == node_id)
+            .unwrap();
+        let assignment = crate::runtime_services::prepared_worker_assignment_for_test(
+            &worker.store,
+            restarted_generation,
+            &plan_record,
+            &validated_plan,
+            &recovered_prepared,
+            node,
+            Some(&committed_recovery),
+        )
+        .unwrap();
+        let assignment_path = worker._temp.path().join("recovered-worker-assignment.json");
+        std::fs::write(&assignment_path, assignment).unwrap();
+        let assignment: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&assignment_path).unwrap()).unwrap();
+        assert_eq!(
+            assignment["prepared_worktree"]["expected_head"],
+            effect_receipt.commit.observed_head
+        );
+        assert_eq!(assignment["prepared_worktree"]["verification_only"], false);
+        assert_eq!(
+            assignment["retained_host_commit"]["commit"]["operation_id"],
+            intent.operation_id
+        );
+        assert_eq!(
+            assignment["retained_host_commit"]["manifest_artifact"]["path"],
+            effect_receipt.manifest_artifact.path
+        );
+        assert_eq!(
+            assignment["implementation_ready_identity"]["repository"],
+            repository.as_str()
+        );
+        assert_eq!(
+            assignment["implementation_ready_identity"]["change_reference_worktree_id"],
+            node_id.as_str()
+        );
+        let prepared_path =
+            std::path::PathBuf::from(assignment["prepared_worktree"]["path"].as_str().unwrap());
+        let physical_id = prepared_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let physical_claim: crate::engine::orchestration::ChangeReference =
+            serde_json::from_value(serde_json::json!({
+                "repository":repository,
+                "worktree_id":physical_id,
+                "commit_mode":"host",
+                "base_commit":base,
+                "previous_head":base,
+                "branch_head":effect_receipt.commit.observed_head,
+                "commit_shas":[effect_receipt.commit.observed_head],
+                "host_commit_operation_id":intent.operation_id
+            }))
+            .unwrap();
+        assert_eq!(
+            crate::engine::orchestration::change_reference_for_assignment(
+                std::slice::from_ref(&physical_claim),
+                &repository,
+                &node_id,
+                &prepared_path,
+            )
+            .unwrap(),
+            &physical_claim
+        );
+
+        let mut advanced_no_commit_recovery = authorization.clone();
+        advanced_no_commit_recovery.expected_head = "f".repeat(40);
+        let advanced_assignment = crate::runtime_services::prepared_worker_assignment_for_test(
+            &worker.store,
+            restarted_generation,
+            &plan_record,
+            &validated_plan,
+            &recovered_prepared,
+            node,
+            Some(&advanced_no_commit_recovery),
+        )
+        .unwrap();
+        let advanced_assignment: serde_json::Value =
+            serde_json::from_str(&advanced_assignment).unwrap();
+        assert_eq!(
+            advanced_assignment["prepared_worktree"]["expected_head"],
+            advanced_no_commit_recovery.expected_head
+        );
+        assert_eq!(
+            advanced_assignment["prepared_worktree"]["verification_only"],
+            false
+        );
+        assert!(advanced_assignment["retained_host_commit"].is_null());
+
+        let effect_count_before: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        let profiles = BTreeMap::from([(
+            prior_authority.profile_id.clone(),
+            serde_json::from_value(serde_json::json!({
+                "adapter":"codex", "command":["fixture"], "commit_mode":"host"
+            }))
+            .unwrap(),
+        )]);
+        let mut foreign_receipt = effect_receipt.clone();
+        foreign_receipt.agent_run_id = AgentRunId::parse("foreign-worker").unwrap();
+        let foreign_receipt_json = serde_json::to_string(&foreign_receipt).unwrap();
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![intent.operation_id, foreign_receipt_json],
+            )
+            .unwrap();
+        let rejected = worker.store.process_one_agent_mailbox_request(
+            restarted_generation,
+            worker_id.as_str(),
+            crate::store::now_unix().unwrap(),
+            &worker.artifacts,
+            &profiles,
+        );
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("durable receipt does not match its exact accepted intent")
+        );
+        assert!(
+            mailbox
+                .read_receipt(
+                    terminal_request_id,
+                    crate::mailbox::unix_time_now().unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![intent.operation_id, effect_receipt_json],
+            )
+            .unwrap();
+        let replay_result = worker.store.process_one_agent_mailbox_request(
+            restarted_generation,
+            worker_id.as_str(),
+            crate::store::now_unix().unwrap(),
+            &worker.artifacts,
+            &profiles,
+        );
+        assert!(replay_result.unwrap());
+        let receipt_bytes = mailbox
+            .read_receipt(
+                terminal_request_id,
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let response: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(&receipt_bytes).unwrap();
+        let response: crate::agent_api::RepositoryCommitReceipt =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(response.message_id, terminal_request_id);
+        assert_eq!(response.commit_operation_id.as_str(), intent.operation_id);
+        assert_eq!(response.manifest_artifact, request.manifest);
+        assert_eq!(response.commit, effect_receipt.commit);
+        let effect_count_after: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(effect_count_after, effect_count_before);
     }
 
     #[test]
@@ -5358,6 +6080,23 @@ impl ConfigStore {
         {
             return Err("published Worker result differs from the exact launch authority".into());
         }
+        let reservation = self
+            .agent_launch_reservation_for_run(&agent_run_id)?
+            .ok_or("published Worker result has no immutable launch reservation")?;
+        reservation.validate()?;
+        let assignment = reservation
+            .worker_assignment
+            .as_ref()
+            .filter(|assignment| {
+                reservation.project_id == *project_id
+                    && reservation.ticket_run_id.as_ref() == Some(ticket_run_id)
+                    && reservation.role == Role::Worker
+                    && assignment.ticket_revision == transition_source_revision
+                    && assignment.configuration_digest == authority.config_digest
+                    && assignment.node_id == *node_id
+                    && assignment.repository_id == *repository_id
+            })
+            .ok_or("published Worker result has no matching immutable prepared assignment")?;
         let terminal = verify_agent_terminal(self, owner_generation, &agent_run_id)?;
         let structured = terminal
             .result
@@ -5379,12 +6118,15 @@ impl ConfigStore {
         else {
             return Err("ImplementationReady result has an incompatible typed payload".into());
         };
-        let node_changes = payload
-            .change_references
-            .iter()
-            .filter(|change| change.worktree_id == *node_id && change.repository == *repository_id)
-            .collect::<Vec<_>>();
-        if node_changes.len() != 1 || node_changes[0].branch_head.as_str() != published_head {
+        let node_change = crate::engine::orchestration::change_reference_for_assignment(
+            &payload.change_references,
+            repository_id,
+            node_id,
+            &assignment.worktree_path,
+        )?;
+        if payload.change_references.len() != 1
+            || node_change.branch_head.as_str() != published_head
+        {
             return Err(
                 "Worker result does not uniquely match the published repository head".into(),
             );
@@ -5785,6 +6527,34 @@ pub(crate) mod host_validation_fixture {
         message: RoleResultMessage,
         agent_run_id: AgentRunId,
     ) -> Result<InPlaceValidatedResultFixture, String> {
+        host_validated_result_in_with_wake_inputs(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            ticket_run_id,
+            role,
+            message,
+            agent_run_id,
+            Vec::new(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixtures bind explicit launch and result identities"
+    )]
+    pub(crate) fn host_validated_result_in_with_wake_inputs(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        role: Role,
+        message: RoleResultMessage,
+        agent_run_id: AgentRunId,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
+    ) -> Result<InPlaceValidatedResultFixture, String> {
         let prepared = host_validated_result_inner(
             store,
             root,
@@ -5794,13 +6564,17 @@ pub(crate) mod host_validation_fixture {
             role,
             message,
             Some(agent_run_id),
-        )?;
-        let ingested = store.store_validated_agent_result(
-            &prepared.artifacts,
-            owner_generation,
-            &prepared.terminal,
-            prepared.message,
-        )?;
+            wake_inputs,
+        )
+        .map_err(|error| format!("host validated result fixture setup: {error}"))?;
+        let ingested = store
+            .store_validated_agent_result(
+                &prepared.artifacts,
+                owner_generation,
+                &prepared.terminal,
+                prepared.message,
+            )
+            .map_err(|error| format!("host validated result ingestion: {error}"))?;
         Ok(InPlaceValidatedResultFixture {
             artifacts: prepared.artifacts,
             ingested,
@@ -5830,6 +6604,7 @@ pub(crate) mod host_validation_fixture {
             role,
             message,
             agent_run_id_override,
+            Vec::new(),
         )
     }
 
@@ -5849,6 +6624,7 @@ pub(crate) mod host_validation_fixture {
             Role::Supervisor,
             message,
             None,
+            Vec::new(),
         )
     }
 
@@ -5865,6 +6641,7 @@ pub(crate) mod host_validation_fixture {
         role: Role,
         mut message: RoleResultMessage,
         agent_run_id_override: Option<AgentRunId>,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
     ) -> Result<InPlaceTerminalFixture, String> {
         let project = store
             .project(&project_id)?
@@ -5908,6 +6685,16 @@ pub(crate) mod host_validation_fixture {
             Role::Supervisor => format!("project:{}:supervisor", project_id.as_str()),
             _ => format!("fixture-{:?}", role).to_lowercase(),
         };
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: authority.role_session_id.clone(),
+            agent_run_id: agent_run_id.to_string(),
+            digest: Digest::parse("0".repeat(64))?,
+            inputs: wake_inputs,
+        };
+        wake_snapshot.digest = wake_snapshot.content_digest()?;
+        authority.wake_snapshot_digest = wake_snapshot.digest.clone();
         let parent_run_id = AgentRunId::parse(if has_run_id_override {
             format!("{agent_run_id}-parent")
         } else {
@@ -5950,6 +6737,24 @@ pub(crate) mod host_validation_fixture {
         authority.control_dir = root.join(format!("{}-control", agent_run_id));
         std::fs::create_dir(&authority.workspace_path).map_err(|error| error.to_string())?;
         std::fs::create_dir(&authority.control_dir).map_err(|error| error.to_string())?;
+        let mailbox_limits = crate::mailbox::MailboxLimits::default();
+        let mailbox_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_secs();
+        let mailbox_expires_at = mailbox_now.saturating_add(600);
+        authority.mailbox_capability_digest =
+            Digest::parse(crate::mailbox::MailboxDescriptor::capability_digest(
+                agent_run_id.as_str(),
+                mailbox_expires_at,
+                mailbox_limits,
+            )?)?;
+        let mailbox = crate::mailbox::MailboxCapability::create(
+            agent_run_id.as_str(),
+            &authority.control_dir.join("mailbox"),
+            mailbox_expires_at,
+            mailbox_limits,
+        )?;
         let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
             "adapter":"codex", "command":["/bin/codex"], "model":"fixture", "commit_mode":"native", "turn_timeout_seconds":60
         })).map_err(|error| error.to_string())?;
@@ -6021,11 +6826,11 @@ pub(crate) mod host_validation_fixture {
                 crate::launch::RexViewKind::Supervisor,
                 None,
                 None,
-                1,
+                mailbox_now,
             )?;
             store.connection.execute(
-                "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'supervisor',NULL,NULL,1,'fixture-rex','fixture-supervisor-session','fixture-supervisor-window',0,'active',?3,?3)",
-                rusqlite::params![supervisor_view_id.as_str(), project_id.as_str(), now],
+                "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'supervisor',NULL,NULL,?3,'fixture-rex','fixture-supervisor-session','fixture-supervisor-window',0,'active',?4,?4)",
+                rusqlite::params![supervisor_view_id.as_str(), project_id.as_str(), mailbox_now, now],
             ).map_err(|error| error.to_string())?;
         }
         authority.rex_view_id = view_id;
@@ -6052,7 +6857,7 @@ pub(crate) mod host_validation_fixture {
                     crate::launch::RexViewKind::Supervisor,
                     None,
                     None,
-                    1,
+                    mailbox_now,
                 )?;
             }
             parent_authority.operation_id = OperationId::parse(if has_run_id_override {
@@ -6064,6 +6869,12 @@ pub(crate) mod host_validation_fixture {
             parent_authority.descriptor_path = root.join("parent-package.json");
             parent_authority.workspace_path = root.join("parent-workspace");
             parent_authority.control_dir = root.join("parent-control");
+            parent_authority.mailbox_capability_digest =
+                Digest::parse(crate::mailbox::MailboxDescriptor::capability_digest(
+                    parent_run_id_str,
+                    mailbox_expires_at,
+                    mailbox_limits,
+                )?)?;
             parent_authority.validate()?;
             let parent_authority_json =
                 serde_json::to_string(&parent_authority).map_err(|error| error.to_string())?;
@@ -6164,6 +6975,7 @@ pub(crate) mod host_validation_fixture {
             qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
             wrapper_pid: std::process::id(),
             wrapper_start_identity: "fixture-wrapper".into(),
+            rex_launch_anchor: None,
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
         };
@@ -6204,24 +7016,110 @@ pub(crate) mod host_validation_fixture {
                 b"# Fixture source\n\nHost-registered Postmortem evidence.\n",
             )
             .map_err(|error| error.to_string())?;
+            let request: crate::engine::orchestration::ArtifactAddRequest =
+                serde_json::from_value(serde_json::json!({
+                    "schema_version": 1,
+                    "message_id": "fixture-postmortem-artifact",
+                    "path": source_path,
+                    "kind": "postmortem",
+                    "artifact_schema_version": 1
+                }))
+                .map_err(|error| format!("parse public ArtifactAdd request: {error}"))?;
+            request.validate()?;
+            let envelope = serde_json::json!({
+                "schema_version": crate::protocol::SCHEMA_VERSION,
+                "request_id": request.message_id,
+                "operation_id": authority.operation_id,
+                "method": "artifact.add",
+                "project_id": authority.project_id,
+                "run_id": authority.agent_run_id,
+                "attempt": authority.attempt,
+                "run_epoch": authority.run_epoch,
+                "role": authority.role,
+                "params": request,
+            });
+            mailbox.queue(
+                "fixture-postmortem-artifact",
+                &serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
+                mailbox_now,
+            )?;
+            let mailbox_request = mailbox
+                .pending(mailbox_now)?
+                .into_iter()
+                .find(|pending| pending.request_id == "fixture-postmortem-artifact")
+                .ok_or("public ArtifactAdd request was not available in the mailbox")?;
+            let artifact = store.process_artifact_add(
+                owner_generation,
+                &authority,
+                &artifacts,
+                &mailbox,
+                &mailbox_request,
+                &request,
+            )?;
+            let receipt_bytes = mailbox
+                .read_receipt("fixture-postmortem-artifact", mailbox_now)?
+                .ok_or("public ArtifactAdd receipt was not written")?;
+            let receipt: serde_json::Value = crate::protocol::parse_unique(&receipt_bytes)?;
+            if receipt["result"]["artifact"]
+                != serde_json::to_value(artifact.reference()).map_err(|error| error.to_string())?
+            {
+                return Err(
+                    "public ArtifactAdd receipt differs from its registered artifact".into(),
+                );
+            }
+            message.artifact_refs = vec![artifact.reference().clone()];
+            message.structured_result["source_references"] =
+                serde_json::json!([artifact.reference()]);
+            message.result_digest = Some(digest(
+                &serde_json::to_vec(&message.structured_result)
+                    .map_err(|error| error.to_string())?,
+            )?);
+        } else if role == Role::MergeDecision
+            && message.kind == crate::engine::orchestration::RoleOutputKind::MergeAssessment
+        {
+            let source_path = "evidence/merge-assessment.md";
+            let source_file = authority.workspace_path.join(source_path);
+            std::fs::create_dir_all(
+                source_file
+                    .parent()
+                    .ok_or("MergeAssessment evidence path has no parent")?,
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(
+                &source_file,
+                b"# Merge assessment evidence\n\nHost fixture evidence for the exact accepted publication subject.\n",
+            )
+            .map_err(|error| error.to_string())?;
             let artifact = artifacts.register(
                 &authority.workspace_path,
                 &authority.project_id,
                 authority.agent_run_id.as_str(),
                 role,
                 source_path,
-                crate::engine::orchestration::RoleArtifactKind::Postmortem,
+                crate::engine::orchestration::RoleArtifactKind::MergeAssessment,
                 1,
             )?;
+            let reference =
+                serde_json::to_value(&artifact.reference).map_err(|error| error.to_string())?;
+            let gates = message.structured_result["deterministic_gate_evidence"]
+                .as_array_mut()
+                .ok_or("MergeAssessment fixture has no deterministic gate list")?;
+            for gate in gates {
+                gate["evidence_references"] = serde_json::json!([reference]);
+            }
+            let ratings = message.structured_result["ratings"]
+                .as_object_mut()
+                .ok_or("MergeAssessment fixture has no risk ratings")?;
+            for rating in ratings.values_mut() {
+                rating["evidence_references"] = serde_json::json!([reference]);
+            }
             message.artifact_refs = vec![artifact.reference.clone()];
-            message.structured_result["source_references"] =
-                serde_json::json!([artifact.reference]);
-            let request_digest = digest(b"fixture ArtifactAdd request")?;
+            let request_digest = digest(b"fixture MergeAssessment ArtifactAdd request")?;
             crate::store::artifact_registry::persist_registration(
                 &mut store.connection,
                 owner_generation,
                 &authority,
-                "fixture-postmortem-artifact",
+                "fixture-merge-assessment-artifact",
                 &request_digest,
                 &artifact.reference,
                 &artifact.object_path,
@@ -6292,6 +7190,7 @@ pub(crate) mod host_validation_fixture {
             exit_code: Some(0),
             timed_out: false,
             cancellation_signal: None,
+            cancellation_cause: None,
             cleanup: CleanupState::Confirmed,
             cleanup_detail: None,
             processes: vec![process],
@@ -6532,11 +7431,31 @@ impl ConfigStore {
                     .map_err(|error| error.to_string())?
             };
             let mut commit: Option<(crate::domain::ids::OperationId, Digest, String)> = None;
+            let mut commit_manifest_artifact: Option<
+                crate::engine::orchestration::RoleArtifactReference,
+            > = None;
             let mut uncertain = false;
             for (operation_id, status, request_json, receipt_json) in effects {
                 match status.as_str() {
                     "pending" | "claimed" | "uncertain" => uncertain = true,
                     "succeeded" => {
+                        let Some(succeeded) = self.succeeded_effect_receipt(&operation_id)? else {
+                            uncertain = true;
+                            continue;
+                        };
+                        if succeeded.intent().kind
+                            != crate::engine::reducer::effect_name(
+                                &crate::engine::reducer::EffectKind::CommitWorkerManifest,
+                            )
+                            || succeeded.intent().request_json != request_json
+                            || succeeded.receipt_json()
+                                != receipt_json.as_deref().unwrap_or_default()
+                        {
+                            return Err(
+                                "succeeded Worker commit differs from its durable effect receipt"
+                                    .into(),
+                            );
+                        }
                         let payload: CommitWorkerManifestEffectPayload =
                             crate::protocol::parse_unique(request_json.as_bytes())?;
                         let Some(receipt_json) = receipt_json else {
@@ -6564,6 +7483,7 @@ impl ConfigStore {
                             || !receipt.commit.hooks_completed
                             || !receipt.commit.index_synchronized
                             || receipt.commit.index_sync_conflict
+                            || receipt.manifest_artifact != payload.manifest_artifact
                         {
                             return Err(
                                 "host Worker commit receipt does not match the prior accepted node"
@@ -6580,6 +7500,7 @@ impl ConfigStore {
                         {
                             return Err("prior Worker has multiple succeeded host commits".into());
                         }
+                        commit_manifest_artifact = Some(receipt.manifest_artifact);
                     }
                     "failed" | "cancelled" => {}
                     _ => uncertain = true,
@@ -6595,6 +7516,12 @@ impl ConfigStore {
                     }
                     None => (None, None, prepared_expected_head),
                 };
+            let mut prior_artifact_refs = submission.artifact_refs;
+            if let Some(manifest) = commit_manifest_artifact
+                && !prior_artifact_refs.contains(&manifest)
+            {
+                prior_artifact_refs.push(manifest);
+            }
             candidates.push(WorkerRecoveryCandidate {
                 work_node_id: assignment.node_id.clone(),
                 ticket_revision: run.revision,
@@ -6607,7 +7534,7 @@ impl ConfigStore {
                 prior_absence_digest: terminal.absence_digest().clone(),
                 prior_host_commit_receipt_digest,
                 prior_worker_result_evidence_id: evidence_id,
-                prior_artifact_refs: submission.artifact_refs,
+                prior_artifact_refs,
             });
         }
         Ok(candidates)
@@ -6888,6 +7815,174 @@ impl ConfigStore {
         }
         if prior_ack.is_none() {
             tx.execute("INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'applied',?3)",rusqlite::params![result.receipt.evidence_id(),source_revision,super::now_unix()?]).map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Reject a phase-ineligible child request and wake its canonical Coordinator atomically.
+    pub fn reject_coordinator_child_wake(
+        &mut self,
+        owner_generation: u64,
+        result: &IngestedAgentResult,
+        observed_phase: crate::engine::reducer::Phase,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        let binding = &result.validated.binding;
+        let crate::engine::orchestration::RoleResultPayload::SpawnRequest(request) =
+            &result.validated.typed_payload
+        else {
+            return Err("Coordinator spawn rejection requires a typed SpawnRequest".into());
+        };
+        let child_role = request.role;
+        if binding.role != Role::Coordinator
+            || result.validated.kind != crate::engine::orchestration::RoleOutputKind::SpawnRequest
+            || result.validated.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+            || child_role == Role::Worker
+            || child_role == Role::Coordinator
+            || child_role == Role::Supervisor
+        {
+            return Err(
+                "Coordinator spawn rejection requires a succeeded generic-role SpawnRequest".into(),
+            );
+        }
+        let ticket_run_id = binding
+            .ticket_run_id
+            .as_ref()
+            .ok_or("Coordinator spawn rejection requires TicketRun scope")?;
+        let expected_session = format!("ticket_run:{ticket_run_id}:coordinator");
+        let source_revision = binding
+            .ticket_revision
+            .map(|revision| revision.0)
+            .ok_or("Coordinator spawn rejection lacks TicketRun revision")?;
+        let role_session_id = expected_session.as_str();
+        if binding.role_session_id.as_str() != expected_session
+            || crate::runtime_services::role_allowed_in_phase(child_role, observed_phase)
+        {
+            return Err("Coordinator spawn rejection scope or phase is invalid".into());
+        }
+        let evidence_id = result.receipt.evidence_id();
+        let payload_json = crate::store::canonical_json(payload)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::validate_active_generation(&tx, owner_generation)?;
+        let evidence: Option<(String, String, String, String, Option<String>, u64)> = tx
+            .query_row(
+                "SELECT agent_run_id,project_id,role,outcome,ticket_run_id,run_epoch FROM agent_result_evidence WHERE evidence_id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((run_id, project_id, role, outcome, evidence_ticket, evidence_epoch)) = evidence
+        else {
+            return Err("Coordinator spawn rejection source evidence is missing".into());
+        };
+        if run_id != binding.agent_run_id.as_str()
+            || project_id != binding.project_id.as_str()
+            || role != "coordinator"
+            || outcome != "completed"
+            || evidence_ticket.as_deref() != Some(ticket_run_id.as_str())
+            || evidence_epoch != binding.run_epoch
+        {
+            return Err("Coordinator spawn rejection source evidence is not authoritative".into());
+        }
+        let (authority_json, authority_digest): (String, String) = tx
+            .query_row(
+                "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+                [binding.agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let authority: AgentLaunchAuthority =
+            crate::protocol::parse_unique(authority_json.as_bytes())?;
+        authority.validate()?;
+        if authority.agent_run_id != binding.agent_run_id
+            || authority.digest()?.as_str() != authority_digest
+            || binding_for(&authority)? != *binding
+            || authority.role_session_id != expected_session
+        {
+            return Err(
+                "Coordinator spawn rejection differs from immutable launch authority".into(),
+            );
+        }
+        let ticket: Option<(u64, String, u64, String, String)> = tx
+            .query_row(
+                "SELECT revision,internal_phase,config_revision,config_digest,project_id FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((revision, phase, config_revision, config_digest, ticket_project)) = ticket else {
+            return Err("Coordinator spawn rejection TicketRun is missing".into());
+        };
+        let project: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [binding.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let expected_phase = serde_json::to_value(observed_phase)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or("TicketRun phase is not serializable")?;
+        if revision != source_revision
+            || phase != expected_phase
+            || ticket_project != binding.project_id.as_str()
+            || config_revision != binding.config_revision.0
+            || config_digest != binding.config_digest.as_str()
+            || project
+                != Some((
+                    binding.config_revision.0,
+                    binding.config_digest.as_str().to_owned(),
+                ))
+        {
+            return Err("Coordinator spawn rejection TicketRun or Project is stale".into());
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='coordinator_spawn_rejected' AND source_id=?2 AND source_revision=?3",
+                rusqlite::params![role_session_id, evidence_id, source_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if existing
+            .as_ref()
+            .is_some_and(|stored| stored != &payload_json)
+        {
+            return Err("Coordinator spawn rejection already has a different wake".into());
+        }
+        if existing.is_none() {
+            tx.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'coordinator_spawn_rejected',?3,?4,100,?5,'pending',?6)",
+                rusqlite::params![binding.project_id.as_str(), role_session_id, evidence_id, source_revision, payload_json, super::now_unix()?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let prior_ack: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if prior_ack.as_ref().is_some_and(|(revision, disposition)| {
+            *revision != source_revision || disposition != "rejected_by_host"
+        }) {
+            return Err("Coordinator spawn rejection evidence was acknowledged differently".into());
+        }
+        if prior_ack.is_none() {
+            tx.execute(
+                "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'rejected_by_host',?3)",
+                rusqlite::params![evidence_id, source_revision, super::now_unix()?],
+            )
+            .map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())
     }

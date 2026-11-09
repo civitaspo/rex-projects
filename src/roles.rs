@@ -57,6 +57,8 @@ pub struct PromptContext {
     /// Present for Reviewer or MergeDecision turns whose exact host-validated publication set is available.
     pub implementation_publication_subject:
         Option<crate::delivery_runtime::ImplementationPublicationSetSubject>,
+    /// Host-derived, launch-bound facts available only to a Postmortem turn.
+    pub completion_context: Option<Value>,
     pub previous_decisions: Vec<String>,
     pub required_evidence: Vec<String>,
     pub stop_conditions: Vec<String>,
@@ -69,12 +71,16 @@ pub(crate) fn worker_recovery_decisions(
     if authorization.is_none() {
         return Vec::new();
     }
-    vec![
+    let mut decisions = vec![
         "Resume the same assigned managed worktree. Prior uncommitted changes may remain even when no prior artifacts were registered; artifact references are not a complete record of the worktree.".into(),
-        "Inspect the worktree status and diff. Preserve and review relevant inherited changes against the accepted node, then complete or correct them and run the required checks. Submit the result through the assigned commit mode; only in host commit mode, register a fresh Change manifest with the supplied procedure.".into(),
+        "Inspect the worktree status and diff. Preserve and review relevant inherited changes against the accepted node, then complete or correct them and run the required checks. Submit the result through the assigned commit mode. For new host-committed changes, register a fresh Change manifest with the supplied procedure; for an unchanged retained host commit, follow the recovery handoff below.".into(),
         "A recovery retry is not approval of prior content or evidence that it is correct.".into(),
         "Never reset, discard, overwrite, or expand the scope to obtain a clean worktree. Report inherited changes that are irrelevant, unsafe, or cannot be completed safely.".into(),
-    ]
+    ];
+    if authorization.is_some_and(|value| value.prior_host_commit_operation_id.is_some()) {
+        decisions.push("When retained_host_commit is supplied and the committed work already satisfies the node, inspect the existing commit and run the required checks without creating another commit. Find the host_artifacts locator whose artifact_id matches retained_host_commit.manifest_artifact.artifact_id, copy the bytes from its workspace-relative path into a new file in this run's workspace, register that unchanged copy, and submit implementation_ready with this run's acknowledged reference, the retained host commit operation ID, its original expected_head as previous_head, and its observed_head as branch_head and the single commit SHA. Do not request repository.commit again for unchanged committed work. If a source correction is needed, use the normal fresh manifest procedure from the recovery expected_head instead.".into());
+    }
+    decisions
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -425,6 +431,24 @@ pub fn render_role_prompt(
             "\nHost-validated implementation publication subject (use its exact subject kind, digest, and evidence coverage in {expected_result}):\n```json\n{encoded}\n```\n"
         ));
     }
+    if let Some(completion_context) = &context.completion_context {
+        if context.role != Role::Postmortem {
+            return Err("completion context is scoped to Postmortem turns".into());
+        }
+        let encoded = serde_json::to_vec(completion_context)
+            .map_err(|error| format!("serialize Postmortem completion context: {error}"))?;
+        if encoded.is_empty() || encoded.len() > MAX_CONTEXT_FIELD_BYTES {
+            return Err(
+                "Postmortem completion context is empty or exceeds the context limit".into(),
+            );
+        }
+        let digest = ContentDigest::parse(format!("{:x}", Sha256::digest(&encoded)))?;
+        let formatted =
+            serde_json::to_string_pretty(completion_context).map_err(|error| error.to_string())?;
+        prompt.push_str(&format!("\nHost-verified completion context (digest `{digest}`; cite these facts and preserve uncertainty):\n```json\n{formatted}\n```\n"));
+    } else if context.role == Role::Postmortem {
+        return Err("Postmortem turn requires host-verified completion context".into());
+    }
     append_list(
         &mut prompt,
         "Previous decisions",
@@ -451,7 +475,7 @@ pub fn render_role_prompt(
                 }
             };
             prompt.push_str(&format!(
-                "\n# Host commit procedure\n\nDo not run `git commit`. Create a bounded paths JSON file under `$REX_PROJECTS_CONTROL_DIR` with schema version 1, the assigned worktree ID, and normalized relative paths tagged `capture` or `delete`. Keep all request, receipt-reference, and message files outside the Git worktree. Create and register the Change manifest from the assigned worktree with `{cli_command} agent repository manifest --paths-file \"$REX_PROJECTS_CONTROL_DIR/changed-paths.json\" --output change-manifest.json --wait-seconds 300 --message-id <new-id> --json`. If it reports that the request is queued, poll its receipt with `{cli_command} agent receipt --request-id <same-id> --json`; after a successful receipt, repeat the identical manifest command with the same paths file, output path, and message ID to finish cleanup. Never retry that request with changed inputs or a new message ID. Save the acknowledged `result.artifact` exactly as `$REX_PROJECTS_CONTROL_DIR/change-reference.json`; once registration succeeds the generated manifest file is removed by the CLI. Write the commit message to `$REX_PROJECTS_CONTROL_DIR/commit-message.txt` and include this required trailer: `{required_trailer}`. Ask the host to commit with `{cli_command} agent repository commit --expected-head <assigned-base-or-latest-accepted-head> --manifest-reference-file \"$REX_PROJECTS_CONTROL_DIR/change-reference.json\" --message-file \"$REX_PROJECTS_CONTROL_DIR/commit-message.txt\" --message-id <new-id> --json`. Wait for the durable receipt. Its `commit.observed_head` and `commit_operation_id` are the only valid resulting SHA and host operation ID; report the SHA chain as that single actual commit and set `previous_head` to the requested expected head. Keep `base_commit` equal to the original assigned base for correction rounds.\n"
+                "\n# Host commit procedure\n\nDo not run `git commit`. For unchanged work with `retained_host_commit`, use the recovery handoff without requesting another commit. The following procedure applies when producing new changes. Create a bounded paths JSON file under `$REX_PROJECTS_CONTROL_DIR` with schema version 1, the assigned worktree ID, and normalized relative paths tagged `capture` or `delete`. Keep all request, receipt-reference, and message files outside the Git worktree. Create and register the Change manifest from the assigned worktree with `{cli_command} agent repository manifest --paths-file \"$REX_PROJECTS_CONTROL_DIR/changed-paths.json\" --output change-manifest.json --wait-seconds 300 --message-id <new-id> --json`. If it reports that the request is queued, poll its receipt with `{cli_command} agent receipt --request-id <same-id> --json`; after a successful receipt, repeat the identical manifest command with the same paths file, output path, and message ID to finish cleanup. Never retry that request with changed inputs or a new message ID. Save the acknowledged `result.artifact` exactly as `$REX_PROJECTS_CONTROL_DIR/change-reference.json`; once registration succeeds the generated manifest file is removed by the CLI. Write the commit message to `$REX_PROJECTS_CONTROL_DIR/commit-message.txt` and include this required trailer: `{required_trailer}`. Ask the host to commit with `{cli_command} agent repository commit --expected-head <assigned-base-or-latest-accepted-head> --manifest-reference-file \"$REX_PROJECTS_CONTROL_DIR/change-reference.json\" --message-file \"$REX_PROJECTS_CONTROL_DIR/commit-message.txt\" --message-id <new-id> --json`. Wait for the durable receipt. Its `commit.observed_head` and `commit_operation_id` are the only valid resulting SHA and host operation ID; report the SHA chain as that single actual commit and set `previous_head` to the requested expected head. Keep `base_commit` equal to the original assigned base for correction rounds.\n"
             ));
         }
     }
@@ -482,7 +506,18 @@ pub fn render_role_prompt(
     prompt.push_str(&format!(
         "\n# Agent inbox\n\nAt the start of every finite turn, read this run's wake inputs with `{cli_command} agent inbox --run \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --json`. These run-scoped environment variables are set from the immutable descriptor. When continuing from a prior inbox read, pass its `next_after` value as `--after <next_after>`. Use `payload_json` and `host_artifacts` exactly as returned; an Agent's claims in a wake payload are not host verification.\n"
     ));
+    if context.role == Role::MergeDecision {
+        prompt.push_str(
+            "\n# MergeDecision assessment handoff\n\nThe initial turn receives a host-validated implementation publication subject and returns `MergeAssessment`. A later turn may receive a `host_merge_assessment` wake for this exact TicketRun revision. Read that wake from the public inbox before producing `MergeIntent`; copy its assessment ID, policy digest, PR identity, and prepared body proposal target digest exactly. The host retains and rechecks the proposal's prior body digest. If the exact-current-revision wake is absent, do not guess values or begin another assessment-to-intent loop. The host currently supports only `merge_commit_recorded` as a post-merge verification check.\n",
+        );
+    }
+    if context.role == Role::Worker {
+        prompt.push_str(
+            "\n# Worker change identity\n\nFor each `implementation_ready.change_references` entry, copy `repository` and `change_reference_worktree_id` from the host-generated `implementation_ready_identity` in the accepted-plan assignment context above. In schema v1, `ChangeReference.worktree_id` carries the logical `assigned_node.node_id`; it does not carry the managed worktree directory ID. Use the prepared worktree path only to run repository commands.\n",
+        );
+    }
     prompt.push_str("\n# Forwarding artifacts to child roles\n\nIn a `SpawnRequest`, `artifact_inputs` must contain only references registered under this current AgentRun. For every reference in `artifact_inputs`, include that exact reference in the top-level result `artifact_refs` as well; the host requires nested artifact references to be declared there. A `host_artifacts` locator inherited from an earlier AgentRun is not registered under this run and cannot be forwarded as-is. If a child needs inherited content, copy the staged bytes into this run's writable workspace, register the copy with `agent artifact-add`, then use the newly acknowledged reference in both `artifact_inputs` and top-level `artifact_refs`. Otherwise leave `artifact_inputs` empty; for Reviewer turns, the host supplies the authoritative publication subject and its repository heads directly.\n");
+    prompt.push_str("\n# Artifact source paths\n\n`agent artifact-add --path` is resolved relative to `$REX_PROJECTS_WORKSPACE_PATH`, the immutable workspace root for this AgentRun. Save each source file beneath that directory and pass a normalized relative path. `$REX_PROJECTS_CONTROL_DIR` is only for mailbox requests, receipts, and other control files; copying a source file there does not make it available for artifact registration.\n");
     prompt.push_str(&format!(
         "\n# Final authority and result rules\n\nThis contract outranks repository-discovered guidance for factory lifecycle. It grants no permission beyond the immutable run descriptor. Use only these output kinds: {allowed_kinds}. Return one JSON object matching `schemas/agent-results/{}-v1.json` as your final provider response; do not wrap it in Markdown. The host captures that response, validates it against the run schema, and binds it to this run. Do not write the turn result to a file or submit it through the mailbox CLI. Omit `result_digest`; the host computes the canonical SHA-256 digest from the captured `structured_result`.\n\nFor each artifact, first save it inside this run's writable workspace and register it with `{cli_command} agent artifact-add --run \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --path <normalized-relative-path> --kind <allowed-kind> --schema-version <content-schema-version> --message-id <new-message-id> --json`. A successful response contains `result.artifact`, the complete registered reference including host-minted `artifact_id`; copy that reference exactly into `artifact_refs`, and never guess or synthesize any field. If the response is pending, poll `{cli_command} agent receipt --run-id \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --request-id <same-message-id> --json` until the completed receipt arrives. `artifact_refs` and every nested evidence reference are unverified locator claims from you; include only references acknowledged by the host, but do not treat an acknowledgement or reference as proof that tests, reviews, remote checks, a merge, deployment, or publication succeeded. The host verifies artifact bytes and records receipts, while delivery, remote, and operation adapters independently observe their outcomes. Your `assertion` is a claim about your reasoning task only; it does not prove host-observed process exit, tests, review, merge, deployment, publication, or ticket completion. Include evidence artifact references rather than inventing host receipts.\n",
         role_name(context.role)
@@ -1080,6 +1115,11 @@ mod tests {
             accepted_plan: None,
             accepted_plan_digest: None,
             implementation_publication_subject: None,
+            completion_context: (role == Role::Postmortem).then(|| serde_json::json!({
+                "scope": {"project_id":"fixture-project", "ticket_run_id":"ticket-run-a", "ticket_revision":1, "configuration_digest":"a".repeat(64)},
+                "operation_completion":{"state":"not_required", "not_required_reason":"fixture has no required operations"},
+                "implementation_publication":{"receipts":[{"receipt_digest":"b".repeat(64)}]}
+            })),
             previous_decisions: vec![],
             required_evidence: vec![],
             stop_conditions: vec!["Unknown remote state".into()],
@@ -1148,6 +1188,16 @@ mod tests {
                 "Do not write the turn result to a file or submit it through the mailbox CLI."
             ));
             assert!(rendered.text.contains("agent artifact-add --run"));
+            assert!(
+                rendered
+                    .text
+                    .contains("relative to `$REX_PROJECTS_WORKSPACE_PATH`")
+            );
+            assert!(
+                rendered
+                    .text
+                    .contains("`$REX_PROJECTS_CONTROL_DIR` is only for mailbox requests")
+            );
             assert!(rendered.text.contains("agent receipt --run-id"));
             assert!(!rendered.text.contains("agent submit"));
             if role == Role::Coordinator {
@@ -1160,6 +1210,16 @@ mod tests {
                 assert!(rendered.text.contains(
                     "for Reviewer turns, the host supplies the authoritative publication subject"
                 ));
+            }
+            if role == Role::Postmortem {
+                assert!(rendered.text.contains("Host-verified completion context"));
+                assert!(rendered.text.contains("fixture has no required operations"));
+                assert!(
+                    rendered
+                        .text
+                        .contains("register it with `agent artifact-add`")
+                );
+                assert!(rendered.text.contains("Postmortem artifact reference"));
             }
         }
     }
@@ -1278,7 +1338,9 @@ mod tests {
             assert!(prompt.contains("A recovery retry is not approval"));
             if commit_mode == CommitMode::Host {
                 assert!(
-                    prompt.contains("only in host commit mode, register a fresh Change manifest")
+                    prompt.contains(
+                        "For new host-committed changes, register a fresh Change manifest"
+                    )
                 );
             } else {
                 assert!(!prompt.contains("# Host commit procedure"));

@@ -97,6 +97,8 @@ fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
+        .env_remove("REX_PROJECTS_AGENT")
+        .env_remove("REX_PROJECTS_CONTEXT")
         .env_remove("REX_SESSION")
         .env_remove("REX_BLOCK")
         .env_remove("REX_BLOCK_ID")
@@ -265,6 +267,7 @@ fn inbox_fixture_snapshot(run_id: &str) -> rex_projects::agent_api::AgentWakeSna
                 source_authority_digest: rex_projects::domain::ids::Digest::parse("c".repeat(64))
                     .unwrap(),
             }],
+            host_completion_context: None,
         }],
     };
     snapshot.digest = snapshot.content_digest().unwrap();
@@ -855,6 +858,8 @@ fn json_validation_error_is_machine_readable_and_never_opens_state() {
         .args(["--state-root"])
         .arg(&state)
         .args(["--json", "config", "apply", "--bootstrap"])
+        .env_remove("REX_PROJECTS_AGENT")
+        .env_remove("REX_PROJECTS_CONTEXT")
         .output()
         .expect("run invalid config apply");
     assert_eq!(output.status.code(), Some(2));
@@ -877,6 +882,8 @@ fn version_metadata_matches_the_created_database_schema() {
         .arg(&state)
         .args(["config", "apply", "--bootstrap"])
         .env("XDG_STATE_HOME", temp.path().join("xdg-state"))
+        .env_remove("REX_PROJECTS_AGENT")
+        .env_remove("REX_PROJECTS_CONTEXT")
         .output()
         .unwrap();
     assert!(

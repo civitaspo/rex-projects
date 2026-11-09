@@ -193,7 +193,12 @@ pub fn run(
     let inbox = if invocation.scope.lane == FixtureLane::Workflow
         && matches!(
             role,
-            Role::Supervisor | Role::Coordinator | Role::Planner | Role::Worker | Role::Reviewer
+            Role::Supervisor
+                | Role::Coordinator
+                | Role::Planner
+                | Role::Worker
+                | Role::Reviewer
+                | Role::MergeDecision
         ) {
         Some(read_public_inbox(
             runtime_binary,
@@ -204,8 +209,10 @@ pub fn run(
     } else {
         None
     };
-    if matches!(role, Role::Coordinator | Role::Worker | Role::Reviewer)
-        && invocation.scope.lane == FixtureLane::Workflow
+    if matches!(
+        role,
+        Role::Coordinator | Role::Worker | Role::Reviewer | Role::MergeDecision
+    ) && invocation.scope.lane == FixtureLane::Workflow
         && context.hold_after_inbox
     {
         loop {
@@ -487,6 +494,10 @@ pub(crate) fn read_context(path: &Path) -> Result<AgentContext, String> {
     Ok(context)
 }
 
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn validate_recipe_references(value: &Value) -> Result<(), String> {
     match value {
         Value::Object(object) if object.contains_key("$fixture_ref") => {
@@ -507,6 +518,7 @@ fn validate_recipe_references(value: &Value) -> Result<(), String> {
                     | "inbox.planner_result"
                     | "project_id"
                     | "worker_node_id"
+                    | "worker_worktree_id"
                     | "worker.repository_id"
                     | "worker.base_sha"
                     | "worker.commit_mode"
@@ -731,6 +743,17 @@ fn execute_actions(
         facts
             .values
             .insert("worker.node_id".into(), json!(worker.node_id));
+        let worktree_id = cwd
+            .canonicalize()
+            .map_err(|error| format!("resolve fixture Worker worktree: {error}"))?
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or("fixture Worker worktree has no directory ID")?
+            .to_owned();
+        facts
+            .values
+            .insert("worker.worktree_id".into(), json!(worktree_id));
         facts
             .values
             .insert("worker.repository_id".into(), json!(worker.repository_id));
@@ -1364,6 +1387,13 @@ fn resolve_references(
             if name == "worker_node_id" {
                 return Ok(json!(worker_node_id(prompt)?));
             }
+            if name == "worker_worktree_id" {
+                return facts
+                    .values
+                    .get("worker.worktree_id")
+                    .cloned()
+                    .ok_or("Worker fixture has no observed managed worktree ID".into());
+            }
             facts.values.get(&name).cloned().ok_or_else(|| format!("fixture reference `{name}` was not produced by this turn's actual prompt or actions"))
         }
         Value::Object(object) => object
@@ -1690,6 +1720,24 @@ fn next_message(
         )? {
             facts.values.insert("inbox.planner_result".into(), plan);
         }
+        if role == Role::MergeDecision {
+            let ticket_run_id = invocation
+                .scope
+                .ticket_run_id
+                .as_deref()
+                .ok_or("MergeDecision fixture has no host-bound TicketRun ID")?;
+            let revision = invocation
+                .subject_revision
+                .ok_or("MergeDecision fixture has no host-bound TicketRun revision")?;
+            let merge_facts = inbox
+                .trusted_merge_assessment_facts(
+                    &invocation.scope.project_id,
+                    ticket_run_id,
+                    revision,
+                )?
+                .ok_or("MergeDecision fixture has no trusted assessment in its public inbox")?;
+            facts.values.extend(merge_facts);
+        }
     }
     let structured_result = resolve_references(
         template.recipe.structured_result.clone(),
@@ -1817,6 +1865,114 @@ impl FixtureInbox {
             [ticket_run_id] => Ok(Some(ticket_run_id.clone())),
             _ => Err("public Agent inbox contains multiple TicketRun dispatch wakes".into()),
         }
+    }
+
+    fn trusted_merge_assessment_facts(
+        &self,
+        project_id: &str,
+        ticket_run_id: &str,
+        revision: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, Value>>, String> {
+        let matches = self
+            .inputs
+            .iter()
+            .filter(|item| {
+                item.get("source_type").and_then(Value::as_str) == Some("host_merge_assessment")
+                    && item.get("source_revision").and_then(Value::as_u64) == Some(revision)
+            })
+            .collect::<Vec<_>>();
+        let [item] = matches.as_slice() else {
+            return if matches.is_empty() {
+                Ok(None)
+            } else {
+                Err("MergeDecision public inbox has multiple current trusted assessments".into())
+            };
+        };
+        let source_id = item
+            .get("source_id")
+            .and_then(Value::as_str)
+            .ok_or("trusted MergeAssessment wake omitted its source ID")?;
+        let assessment = item
+            .pointer("/payload_json/assessment")
+            .ok_or("trusted MergeAssessment wake omitted its assessment")?;
+        let proposal = assessment
+            .get("prepared_body_proposal")
+            .filter(|value| !value.is_null())
+            .ok_or("trusted MergeAssessment wake omitted its prepared body proposal")?;
+        let assessment_id = assessment
+            .get("assessment_id")
+            .and_then(Value::as_str)
+            .ok_or("trusted MergeAssessment omitted its assessment ID")?;
+        let policy_digest = assessment
+            .get("policy_digest")
+            .and_then(Value::as_str)
+            .ok_or("trusted MergeAssessment omitted its policy digest")?;
+        let target_body = proposal
+            .get("exact_target_body")
+            .and_then(Value::as_str)
+            .ok_or("prepared MergeAssessment body proposal omitted its exact bytes")?;
+        let target_body_digest = proposal
+            .get("target_body_digest")
+            .and_then(Value::as_str)
+            .ok_or("prepared MergeAssessment body proposal omitted its digest")?;
+        let proposal_assessment_id = proposal
+            .get("assessment_id")
+            .and_then(Value::as_str)
+            .ok_or("prepared MergeAssessment body proposal omitted its assessment binding")?;
+        let repo = assessment
+            .pointer("/evidence/subject/repository_id")
+            .and_then(Value::as_str)
+            .ok_or("trusted MergeAssessment omitted its repository ID")?;
+        let pull = assessment
+            .pointer("/evidence/subject/pull_request_id")
+            .and_then(Value::as_str)
+            .ok_or("trusted MergeAssessment omitted its PR ID")?;
+        let actual_body_digest = format!("{:x}", Sha256::digest(target_body.as_bytes()));
+        if item.pointer("/payload_json/kind").and_then(Value::as_str)
+            != Some("trusted_merge_assessment")
+            || assessment_id != source_id
+            || proposal_assessment_id != assessment_id
+            || assessment.pointer("/project_id").and_then(Value::as_str) != Some(project_id)
+            || assessment.pointer("/ticket_run_id").and_then(Value::as_str) != Some(ticket_run_id)
+            || assessment.pointer("/revision").and_then(Value::as_u64) != Some(revision)
+            || proposal
+                .pointer("/target_body_digest")
+                .and_then(Value::as_str)
+                != Some(actual_body_digest.as_str())
+            || !is_sha256_digest(policy_digest)
+            || !is_sha256_digest(target_body_digest)
+        {
+            return Err(
+                "trusted MergeAssessment inbox data failed its identity or digest binding".into(),
+            );
+        }
+        let prior_body_digest = proposal
+            .get("prior_body_digest")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut facts = std::collections::BTreeMap::new();
+        facts.insert(
+            "inbox.merge_assessment_id".into(),
+            Value::String(assessment_id.into()),
+        );
+        facts.insert(
+            "inbox.merge_policy_digest".into(),
+            Value::String(policy_digest.into()),
+        );
+        facts.insert(
+            "inbox.prepared_body_digest".into(),
+            Value::String(target_body_digest.into()),
+        );
+        facts.insert(
+            "inbox.prepared_body".into(),
+            Value::String(target_body.into()),
+        );
+        facts.insert("inbox.prior_body_digest".into(), prior_body_digest);
+        facts.insert(
+            "inbox.pr_identity".into(),
+            Value::String(format!("{repo}#{pull}")),
+        );
+        Ok(Some(facts))
     }
 
     fn is_periodic_review_only(&self) -> bool {
@@ -2670,6 +2826,135 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn merge_decision_recipe_uses_the_public_inbox_prepared_body_identity() {
+        use super::RoleOutputKind;
+        use rex_projects::agent_api::{AgentWakeItem, AgentWakeSnapshot};
+        use rex_projects::domain::ids::{Digest, ProjectId};
+        use sha2::{Digest as _, Sha256};
+
+        let root = tempfile::tempdir().unwrap();
+        let target_body = "Reviewed implementation.\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let target_digest = format!("{:x}", Sha256::digest(target_body.as_bytes()));
+        let assessment_id = "a".repeat(64);
+        let assessment = serde_json::json!({
+            "assessment_id": assessment_id,
+            "project_id": "project-a",
+            "ticket_run_id": "ticket-run-1",
+            "revision": 7,
+            "policy_digest": "b".repeat(64),
+            "evidence": {"subject": {"repository_id": "repo-a", "pull_request_id": "42"}},
+            "prepared_body_proposal": {
+                "assessment_id": assessment_id,
+                "publication_set_digest": "c".repeat(64),
+                "prior_body_present": true,
+                "prior_body_digest": "d".repeat(64),
+                "exact_target_body": target_body,
+                "target_body_digest": target_digest,
+                "expected_trailers": ["Co-authored-by: Codex <noreply@openai.com>"]
+            }
+        });
+        let mut snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role_session_id: "ticket_run:ticket-run-1:merge_decision".into(),
+            agent_run_id: "agent-merge-decision".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: vec![AgentWakeItem {
+                wake_input_id: 1,
+                source_type: "host_merge_assessment".into(),
+                source_id: assessment_id,
+                source_revision: 7,
+                priority: 50,
+                payload_json: serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "trusted_merge_assessment",
+                    "assessment": assessment
+                }),
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            }],
+        };
+        snapshot.digest = snapshot.content_digest().unwrap();
+        rex_projects::agent_api::publish_wake_snapshot(root.path(), snapshot).unwrap();
+        let public_inputs =
+            rex_projects::agent_api::read_inbox(root.path(), "agent-merge-decision", 0).unwrap();
+        let inbox = FixtureInbox::parse(
+            serde_json::json!({
+                "run_id": "agent-merge-decision",
+                "after": 0,
+                "next_after": 1,
+                "inputs": public_inputs
+            }),
+            "agent-merge-decision",
+        )
+        .unwrap();
+        let facts = inbox
+            .trusted_merge_assessment_facts("project-a", "ticket-run-1", 7)
+            .unwrap()
+            .unwrap();
+        let intent = serde_json::json!({
+            "assessment_id": facts["inbox.merge_assessment_id"],
+            "pr_identities": [facts["inbox.pr_identity"]],
+            "policy_digest": facts["inbox.merge_policy_digest"],
+            "prepared_body_digest": facts["inbox.prepared_body_digest"],
+            "steps": [
+                {"kind":"request_merge", "instruction_reference":"merge.instructions#request", "rationale":"request the configured merge"},
+                {"kind":"verify_merge_commit", "instruction_reference":"merge.instructions#verify", "rationale":"verify the resulting commit"}
+            ],
+            "post_merge_verification": [
+                {"kind":"merge_commit_recorded", "instruction_reference":"merge.instructions#verify", "rationale":"verify the remote merge commit"}
+            ]
+        });
+        super::validate_payload(RoleOutputKind::MergeIntent, &intent).unwrap();
+        let parsed = rex_projects::roles::RoleResultMessage {
+            schema_version: rex_projects::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "fixture-merge-intent".into(),
+            kind: RoleOutputKind::MergeIntent,
+            assertion: rex_projects::engine::orchestration::AgentAssertion::Succeeded,
+            structured_result: intent,
+            result_digest: None,
+            artifact_refs: Vec::new(),
+        }
+        .bind(rex_projects::engine::orchestration::RoleResultBinding {
+            agent_run_id: rex_projects::domain::ids::AgentRunId::parse("agent-merge-decision")
+                .unwrap(),
+            operation_id: rex_projects::domain::ids::OperationId::parse("start-merge-decision")
+                .unwrap(),
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role_session_id: rex_projects::engine::orchestration::RoleSessionId::parse(
+                "ticket_run:ticket-run-1:merge_decision",
+            )
+            .unwrap(),
+            role: Role::MergeDecision,
+            parent_run_id: Some(
+                rex_projects::domain::ids::AgentRunId::parse("agent-coordinator").unwrap(),
+            ),
+            parent_role: Some(Role::Coordinator),
+            ticket_run_id: Some(
+                rex_projects::domain::ids::TicketRunId::parse("ticket-run-1").unwrap(),
+            ),
+            ticket_revision: Some(rex_projects::domain::ids::Revision(7)),
+            config_revision: rex_projects::domain::ids::Revision(1),
+            config_digest: Digest::parse("e".repeat(64)).unwrap(),
+            profile_digest: Digest::parse("f".repeat(64)).unwrap(),
+            instruction_digest: Digest::parse("1".repeat(64)).unwrap(),
+            provider_capability_receipt_digest: Digest::parse("2".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("3".repeat(64)).unwrap(),
+            controller_generation: 1,
+            run_epoch: 1,
+            attempt: 1,
+        })
+        .unwrap();
+        assert!(matches!(
+            parsed.typed_payload,
+            rex_projects::engine::orchestration::RoleResultPayload::MergeIntent(_)
+        ));
+        assert_eq!(facts["inbox.prepared_body"], target_body);
+        assert_eq!(facts["inbox.prior_body_digest"], "d".repeat(64));
+    }
+
+    #[test]
     fn coordinator_waits_for_worker_verification_without_advancing_on_review_correction() {
         use super::RoleOutputKind;
         use rex_projects::domain::ids::{Digest, ProfileId, ProjectId, RepositoryId, TicketId};
@@ -2755,6 +3040,7 @@ mod tests {
                 accepted_plan: Some(accepted_plan_json),
                 accepted_plan_digest: Some(accepted_plan_digest),
                 implementation_publication_subject: None,
+                completion_context: None,
                 previous_decisions: Vec::new(),
                 required_evidence: Vec::new(),
                 stop_conditions: Vec::new(),
@@ -3475,6 +3761,7 @@ mod tests {
                     accepted_plan: Some(accepted_plan_json.clone()),
                     accepted_plan_digest: digest,
                     implementation_publication_subject: None,
+                    completion_context: None,
                     previous_decisions: Vec::new(),
                     required_evidence: Vec::new(),
                     stop_conditions: Vec::new(),
@@ -3737,6 +4024,7 @@ mod tests {
                 accepted_plan: Some("{}".into()),
                 accepted_plan_digest: Some(subject.accepted_plan_digest.clone()),
                 implementation_publication_subject: Some(subject),
+                completion_context: None,
                 previous_decisions: Vec::new(),
                 required_evidence: Vec::new(),
                 stop_conditions: Vec::new(),
@@ -3953,6 +4241,7 @@ mod tests {
                 accepted_plan: Some(assignment.to_string()),
                 accepted_plan_digest: Some(Digest::parse("a".repeat(64)).unwrap()),
                 implementation_publication_subject: None,
+                completion_context: None,
                 previous_decisions: Vec::new(),
                 required_evidence: Vec::new(),
                 stop_conditions: Vec::new(),

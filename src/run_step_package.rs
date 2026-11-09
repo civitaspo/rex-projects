@@ -36,6 +36,15 @@ pub struct RunStepPackage {
     pub continuation: Option<RunStepContinuation>,
     pub shutdown_grace_seconds: u64,
     pub start_ack_timeout_seconds: u64,
+    /// Absent only in packages persisted before detached finite-turn supervision existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_mode: Option<RunStepSupervisionMode>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStepSupervisionMode {
+    AnchoredSupervisor,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -146,6 +155,11 @@ impl RunStepPackage {
             || self.controller_generation == 0
         {
             return Err("unsupported or incomplete run-step package".into());
+        }
+        if let Some(mode) = self.supervision_mode
+            && mode != RunStepSupervisionMode::AnchoredSupervisor
+        {
+            return Err("unsupported run-step supervision mode".into());
         }
         if self.descriptor.run_id.as_str().is_empty()
             || self.descriptor.project_id != self.project_id
@@ -268,6 +282,7 @@ mod tests {
             continuation: None,
             shutdown_grace_seconds: 5,
             start_ack_timeout_seconds: 30,
+            supervision_mode: None,
         }
     }
 
@@ -296,6 +311,25 @@ mod tests {
         let mut zero_epoch = package();
         zero_epoch.execution_slot_epoch = 0;
         assert!(zero_epoch.validate().is_err());
+    }
+
+    #[test]
+    fn package_mode_is_bound_and_legacy_bytes_keep_foreground_compatibility() {
+        let legacy_json = serde_json::to_value(package()).unwrap();
+        assert!(legacy_json.get("supervision_mode").is_none());
+        let legacy: RunStepPackage = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.supervision_mode, None);
+
+        let mut anchored = package();
+        anchored.supervision_mode = Some(super::RunStepSupervisionMode::AnchoredSupervisor);
+        anchored.validate().unwrap();
+        let encoded = serde_json::to_value(&anchored).unwrap();
+        assert_eq!(
+            encoded["supervision_mode"],
+            serde_json::json!("anchored_supervisor")
+        );
+        let decoded: RunStepPackage = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.supervision_mode, anchored.supervision_mode);
     }
 
     #[test]

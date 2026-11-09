@@ -791,8 +791,10 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
         validate_argv("human.command", &human.command)?;
     }
     if let Some(knowledge) = &config.knowledge {
-        if knowledge.format != "okf" && knowledge.format != "llmwiki" {
-            return Err("knowledge.format must be `okf` or `llmwiki`".into());
+        if knowledge.format != "okf" {
+            return Err(
+                "knowledge.format must be `okf`; other formats are not supported yet".into(),
+            );
         }
         if knowledge.max_source_bytes == 0 {
             return Err("knowledge.max_source_bytes must be positive".into());
@@ -1642,6 +1644,24 @@ mod tests {
             super::validate_config(&config, &loaded.profiles)
                 .unwrap_err()
                 .contains("adapters.tickets.kind must be `command`")
+        );
+    }
+
+    #[test]
+    fn unsupported_knowledge_format_is_rejected_during_config_validation() {
+        let config_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let loaded = super::load(&config_path).unwrap();
+        let mut config = loaded.config;
+        config.knowledge = Some(super::KnowledgeConfig {
+            format: "llmwiki".into(),
+            root: "knowledge".into(),
+            max_source_bytes: 1024,
+        });
+        assert!(
+            super::validate_config(&config, &loaded.profiles)
+                .unwrap_err()
+                .contains("knowledge.format must be `okf`")
         );
     }
 

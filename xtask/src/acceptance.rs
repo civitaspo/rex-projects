@@ -5,13 +5,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rex_projects::adapters::rex::{
-    CreateDisposition, RexCliTransport, TicketWindow, owned_supervisor_window_label,
-    owned_ticket_window_label,
+    CreateDisposition, RexCliTransport, RexProcessObservation, TicketWindow,
+    owned_supervisor_window_label, owned_ticket_window_label,
 };
-use rex_projects::process::{ProcessOutput, ProcessRequest, run as run_process};
+use rex_projects::launch::{ObservedProviderStart, ObservedWrapperIdentity};
+use rex_projects::process::{
+    ProcessIdentity, ProcessIdentityQuality, ProcessOutput, ProcessRequest, inspect_process_table,
+    run as run_process,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -29,11 +36,30 @@ const HOST_COMMIT_REVIEWER_INBOX_STAGE: &str = "host_commit_reviewer_inbox";
 const HOST_COMMIT_WORKER_REWORK_STAGE: &str = "host_commit_worker_rework_inbox";
 const HOST_COMMIT_VERIFICATION_REVIEWER_STAGE: &str = "host_commit_verification_reviewer_inbox";
 const WORKER_RECOVERY_INBOX_STAGE: &str = "worker_recovery_inbox";
+const NATIVE_WORKER_BLOCK_LOSS_STAGE: &str = "native_worker_block_loss";
+const NATIVE_WORKER_CODEX_ENV: &str = "REX_PROJECTS_NATIVE_WORKER_CODEX";
+const ACCEPTANCE_FREEZE_MARKER_ENV: &str = "REX_PROJECTS_ACCEPTANCE_FREEZE_MARKER";
 const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
 const FIXTURE_PROJECT_ID: &str = "operations_project";
 const FIXTURE_TICKET_NAMESPACE: &str = "fixture/acceptance";
 const FIXTURE_TICKET_ID: &str = "ticket-1";
 const ACCEPTANCE_WORK_TASK: &str = "Create and commit a bounded acceptance fixture artifact in the assigned managed worktree, register the resulting Change manifest through the public Agent CLI, verify the exact signed host commit receipt, and preserve this complete task description in the pull request body.";
+const NATIVE_WORKER_LIFECYCLE_TASK: &str = "In the assigned managed worktree, run `/bin/sleep 300` in the foreground and wait for it to return. Do not edit files, run any other command, commit, or make remote changes. This is a bounded process-lifecycle exercise.";
+const NATIVE_WORKER_LAUNCH_EVIDENCE_QUERY: &str = "SELECT a.agent_run_id,a.launch_operation_id,a.runtime_binary_digest,a.rex_server_identity,a.rex_session_id,a.rex_window_id,
+                    a.rex_block_id,a.control_dir,a.workspace_path,r.state,l.state,
+                    l.wrapper_process_identity_json,l.provider_process_tree_json,
+                    s.disposition,s.reservation_epoch
+             FROM agent_launch_authority a
+             JOIN agent_runs r USING(agent_run_id)
+             JOIN agent_launch_state l USING(agent_run_id)
+             JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id
+             WHERE a.role='worker' AND r.state='running' AND l.state='running'
+               AND a.rex_server_identity=?1 AND a.rex_session_id=?2
+               AND a.qualification_receipt_digest=?3
+               AND l.wrapper_process_identity_json IS NOT NULL
+               AND l.provider_process_tree_json IS NOT NULL
+               AND s.disposition='live'
+             ORDER BY a.created_at_unix DESC LIMIT 1";
 const PROVIDER_ROLES: [&str; 8] = [
     "supervisor",
     "coordinator",
@@ -65,7 +91,8 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
                 || stage == WORKER_RECOVERY_INBOX_STAGE
                 || stage == HOST_COMMIT_REVIEWER_INBOX_STAGE
                 || stage == HOST_COMMIT_WORKER_REWORK_STAGE
-                || stage == HOST_COMMIT_VERIFICATION_REVIEWER_STAGE =>
+                || stage == HOST_COMMIT_VERIFICATION_REVIEWER_STAGE
+                || stage == NATIVE_WORKER_BLOCK_LOSS_STAGE =>
         {
             Ok(Some(stage))
         }
@@ -100,12 +127,22 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let host_commit_reviewer_inbox_stage =
         stage.as_deref() == Some(HOST_COMMIT_REVIEWER_INBOX_STAGE) || worker_review_rework_stage;
     let worker_recovery_inbox_stage = stage.as_deref() == Some(WORKER_RECOVERY_INBOX_STAGE);
+    let native_worker_block_loss_stage = stage.as_deref() == Some(NATIVE_WORKER_BLOCK_LOSS_STAGE);
+    let native_worker_codex = if native_worker_block_loss_stage {
+        Some(validate_native_worker_codex_path()?)
+    } else {
+        None
+    };
     let worker_connection_stage = coordinator_worker_inbox_stage
         || host_commit_reviewer_inbox_stage
-        || worker_recovery_inbox_stage;
+        || worker_recovery_inbox_stage
+        || native_worker_block_loss_stage;
     let provider_roles: &[&str] = if host_commit_reviewer_inbox_stage {
         &["supervisor", "coordinator", "planner", "worker", "reviewer"]
-    } else if coordinator_worker_inbox_stage || worker_recovery_inbox_stage {
+    } else if coordinator_worker_inbox_stage
+        || worker_recovery_inbox_stage
+        || native_worker_block_loss_stage
+    {
         &["supervisor", "coordinator", "planner", "worker"]
     } else if bounded_coordinator_stage {
         &["supervisor", "coordinator"]
@@ -136,10 +173,12 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             hold_reviewer_after_inbox: false,
             host_worker: host_commit_reviewer_inbox_stage
                 || coordinator_worker_inbox_stage
-                || worker_recovery_inbox_stage,
+                || worker_recovery_inbox_stage
+                || native_worker_block_loss_stage,
             worker_recovery_stage: worker_recovery_inbox_stage,
             worker_review_rework_stage,
             worker_verification_stage,
+            native_worker_codex: native_worker_codex.as_deref(),
         },
     )?;
     trace.push(json!({"step":"local_bare_repository_and_profiles","status":"passed","provider":"EMULATED"}));
@@ -149,6 +188,18 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         .map_err(|error| format!("write fixture config: {error}"))?;
     let seeded_ticket = seed_operations_ticket(&request, &executable)?;
     trace.push(json!({"step":"external_ticket_seeded_through_adapter_protocol","status":"observed","evidence":seeded_ticket}));
+    if native_worker_block_loss_stage {
+        write_native_worker_setup_freeze(
+            &request,
+            &cli_identity,
+            &executable,
+            &config_path,
+            &seeded_ticket,
+            native_worker_codex
+                .as_deref()
+                .expect("native Worker Codex path was validated"),
+        )?;
+    }
     let validate = product(&request, &state_root, &["config", "validate", "--json"])?;
     require_success("config validate", &validate)?;
     trace.push(
@@ -468,6 +519,22 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             trace.push(json!({"step":"project_lifecycle_observed","status":"running","evidence":last_status}));
             lifecycle_traced = true;
         }
+        if native_worker_block_loss_stage
+            && let Some(worker) = observe_running_native_worker(&request, &state_root)?
+        {
+            let ready = json!({
+                "status":"native_worker_running",
+                "product":cli_identity,
+                "rex_instance":request.expected_instance,
+                "worker":worker,
+            });
+            fs::write(
+                request.fixture_root.join("native-worker-ready.json"),
+                serde_json::to_vec_pretty(&ready).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("write native Worker ready observation: {error}"))?;
+            return Ok(());
+        }
         if bounded_coordinator_stage {
             let observations = read_public_inbox_observations(request.fixture_root)?;
             if coordinator_worker_inbox_stage {
@@ -672,7 +739,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let supervisor_observation = inbox_observations
         .iter()
         .find(|observation| observation["role"] == "supervisor");
-    let stage_valid = bounded_coordinator_stage
+    let coordinator_stage_valid = bounded_coordinator_stage
         && coordinator_qualification_wait_proof
             .as_ref()
             .is_some_and(|proof| proof["status"] == "passed")
@@ -696,6 +763,11 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 .and_then(Value::as_str)
                 == Some("fixture_coordinator")
         });
+    let stage_valid = bounded_stage_contract_valid(
+        stage.as_deref(),
+        coordinator_stage_valid,
+        native_worker_ready_marker_is_valid(&request.fixture_root.join("native-worker-ready.json")),
+    );
     if bounded_coordinator_stage {
         let hold_evidence = if coordinator_block_loss_stage {
             json!({
@@ -762,6 +834,65 @@ fn is_coordinator_dispatch_observation(observation: &Value) -> bool {
             .pointer("/input_files/snapshot_digest")
             .and_then(Value::as_str)
             .is_some_and(|digest| digest.len() == 64)
+}
+
+fn bounded_stage_contract_valid(
+    stage: Option<&str>,
+    coordinator_stage_valid: bool,
+    native_worker_ready: bool,
+) -> bool {
+    coordinator_stage_valid
+        && (stage != Some(NATIVE_WORKER_BLOCK_LOSS_STAGE) || native_worker_ready)
+}
+
+fn native_worker_ready_marker_is_valid(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let worker = &marker["worker"];
+    let anchor = &worker["wrapper_process_identity"]["rex_launch_anchor"];
+    let anchor_pid = anchor["pid"].as_u64();
+    let anchor_birth = anchor["start_identity"].as_str();
+    let child_pid = worker["rex_process_observation"]["child"]["pid"].as_u64();
+    let supervisor_birth = worker["wrapper_process_identity"]["start_identity"].as_str();
+    let live = worker["live_process_identities"].as_array();
+    let exact_live = anchor_pid.zip(anchor_birth).is_some_and(|(pid, birth)| {
+        live.is_some_and(|processes| {
+            processes.iter().any(|process| {
+                process["pid"].as_u64() == Some(pid)
+                    && process["start_identity"].as_str() == Some(birth)
+            }) && supervisor_birth.is_some_and(|supervisor_birth| {
+                processes.iter().any(|process| {
+                    process["pid"].as_u64() == worker["wrapper_process_identity"]["pid"].as_u64()
+                        && process["start_identity"].as_str() == Some(supervisor_birth)
+                        && process["parent_pid"].as_u64() == Some(pid)
+                })
+            })
+        })
+    });
+    marker["status"] == "native_worker_running"
+        && marker
+            .pointer("/worker/agent_state")
+            .and_then(Value::as_str)
+            == Some("running")
+        && marker
+            .pointer("/worker/launch_state")
+            .and_then(Value::as_str)
+            == Some("running")
+        && marker
+            .pointer("/worker/slot_disposition")
+            .and_then(Value::as_str)
+            == Some("live")
+        && marker
+            .pointer("/worker/live_process_identities")
+            .and_then(Value::as_array)
+            .is_some_and(|processes| processes.len() >= 2)
+        && worker["anchored_topology_verified"] == true
+        && child_pid == anchor_pid
+        && exact_live
 }
 
 fn is_prepared_worker_inbox_observation(
@@ -1509,6 +1640,26 @@ fn host_commit_reviewer_connection_evidence(
     let worker_result: Value = serde_json::from_str(&result_json)
         .map_err(|error| format!("parse accepted Worker result evidence: {error}"))?;
     let change = &worker_result["structured_result"]["change_references"][0];
+    let reservation_json: String = db
+        .query_row(
+            "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [durable_commit_receipt.agent_run_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("read immutable Worker assignment: {error}"))?;
+    let reservation: rex_projects::launch::AgentLaunchReservation =
+        serde_json::from_str(&reservation_json)
+            .map_err(|error| format!("parse immutable Worker assignment: {error}"))?;
+    reservation.validate()?;
+    let assignment = reservation
+        .worker_assignment
+        .as_ref()
+        .ok_or("published Worker reservation has no prepared assignment")?;
+    let expected_worktree_id = assignment
+        .worktree_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("prepared Worker worktree has no directory ID")?;
     let workspace = observation["workspace_path"]
         .as_str()
         .map(PathBuf::from)
@@ -1559,6 +1710,21 @@ fn host_commit_reviewer_connection_evidence(
             .as_array()
             .map(Vec::len)
             != Some(1)
+        || reservation.agent_run_id != durable_commit_receipt.agent_run_id
+        || reservation.project_id.as_str()
+            != observation["project_id"]
+                .as_str()
+                .unwrap_or("operations_project")
+        || reservation.role != rex_projects::domain::types::Role::Worker
+        || reservation
+            .ticket_run_id
+            .as_ref()
+            .is_none_or(|run| run.as_str() != ticket_run_id)
+        || reservation.config_digest != publish_request.configuration_digest
+        || assignment.configuration_digest != publish_request.configuration_digest
+        || assignment.node_id != publish_request.work_node_id
+        || assignment.repository_id != publish_request.repository_id
+        || change["worktree_id"].as_str() != Some(expected_worktree_id)
         || change["host_commit_operation_id"].as_str() != Some(operation_id.as_str())
         || change["base_commit"].as_str() != Some(durable_commit_receipt.base_sha.as_str())
         || change["previous_head"].as_str() != Some(expected_head.as_str())
@@ -1732,7 +1898,7 @@ fn prepare_local_repository(request: &Request<'_>, executable: &Path) -> Result<
 }
 
 #[derive(Clone, Copy, Default)]
-struct ProfilePreparation {
+struct ProfilePreparation<'a> {
     hold_coordinator_after_inbox: bool,
     hold_worker_after_inbox: bool,
     hold_reviewer_after_inbox: bool,
@@ -1740,13 +1906,14 @@ struct ProfilePreparation {
     worker_recovery_stage: bool,
     worker_review_rework_stage: bool,
     worker_verification_stage: bool,
+    native_worker_codex: Option<&'a Path>,
 }
 
 fn prepare_profiles(
     request: &Request<'_>,
     executable: &Path,
     runtime_binary: &Path,
-    preparation: ProfilePreparation,
+    preparation: ProfilePreparation<'_>,
 ) -> Result<(), String> {
     let profiles = request.fixture_root.join("profiles");
     let contexts = request.fixture_root.join("contexts");
@@ -1774,7 +1941,11 @@ fn prepare_profiles(
         } else if preparation.worker_review_rework_stage {
             profile_messages_with_review_rework(role)?
         } else {
-            profile_messages(role, preparation.host_worker)?
+            profile_messages_for_native_worker(
+                role,
+                preparation.host_worker,
+                preparation.native_worker_codex.is_some(),
+            )?
         };
         let hold = (preparation.hold_coordinator_after_inbox && role == "coordinator")
             || (preparation.hold_worker_after_inbox && role == "worker")
@@ -1787,26 +1958,38 @@ fn prepare_profiles(
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let command = format!(
-            "[{:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]",
-            executable.display().to_string(),
-            role,
-            scenario,
-            context.display().to_string(),
-            request
-                .fixture_root
-                .join("agent-state")
-                .display()
-                .to_string(),
-            runtime_binary.display().to_string()
-        );
+        let native_codex = (role == "worker")
+            .then_some(preparation.native_worker_codex)
+            .flatten();
+        let command = if let Some(codex) = native_codex {
+            format!("[{:?}]", codex.display().to_string())
+        } else {
+            format!(
+                "[{:?}, \"fixture\", \"agent\", \"--provider\", \"codex\", \"--role\", {:?}, \"--scenario\", {:?}, \"--context\", {:?}, \"--state-dir\", {:?}, \"--runtime-binary\", {:?}, \"--\"]",
+                executable.display().to_string(),
+                role,
+                scenario,
+                context.display().to_string(),
+                request
+                    .fixture_root
+                    .join("agent-state")
+                    .display()
+                    .to_string(),
+                runtime_binary.display().to_string()
+            )
+        };
         let commit_mode = if role == "worker" && preparation.host_worker {
             "host"
         } else {
             "native"
         };
+        let model = if native_codex.is_some() {
+            String::new()
+        } else {
+            "model = \"fixture-emulator\"\n".to_owned()
+        };
         let config = format!(
-            "adapter = \"codex\"\ncommand = {command}\nmodel = \"fixture-emulator\"\ncommit_mode = {commit_mode:?}\n\n[options]\nsandbox = \"workspace_write\"\napproval = \"never\"\n"
+            "adapter = \"codex\"\ncommand = {command}\n{model}commit_mode = {commit_mode:?}\n\n[options]\nsandbox = \"workspace_write\"\napproval = \"never\"\n"
         );
         fs::write(profile.join("config.toml"), config).map_err(|error| error.to_string())?;
     }
@@ -1956,6 +2139,14 @@ fn profile_messages_with_worker_recovery(
 }
 
 pub(crate) fn profile_messages(role: &str, host_worker: bool) -> Result<Vec<Value>, String> {
+    profile_messages_for_native_worker(role, host_worker, false)
+}
+
+fn profile_messages_for_native_worker(
+    role: &str,
+    host_worker: bool,
+    native_worker_lifecycle: bool,
+) -> Result<Vec<Value>, String> {
     let mut messages = vec![json!({
         "role": role,
         "lane": "qualification",
@@ -2002,7 +2193,7 @@ pub(crate) fn profile_messages(role: &str, host_worker: bool) -> Result<Vec<Valu
             }))
         ],
         "planner" => vec![message("planner", "plan_ready", json!({
-            "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":ACCEPTANCE_WORK_TASK,"depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
+            "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":if native_worker_lifecycle {NATIVE_WORKER_LIFECYCLE_TASK} else {ACCEPTANCE_WORK_TASK},"depends_on":[],"required_evidence":[if native_worker_lifecycle {"The bounded foreground process remains active until the host closes the Worker Rex block."} else {"The exact committed source change is visible in the prepared worktree."}],"investigation":false}],"requested_investigation_children":0},
             "unresolved_questions":[]
         }))],
         "worker" => {
@@ -2016,6 +2207,7 @@ pub(crate) fn profile_messages(role: &str, host_worker: bool) -> Result<Vec<Valu
                 "commit_shas":{"$fixture_ref":"worker.commit_shas"}
             });
             if host_worker {
+                change["worktree_id"] = json!({"$fixture_ref":"worker_worktree_id"});
                 change.as_object_mut().expect("change reference is an object").insert(
                     "host_commit_operation_id".into(),
                     json!({"$fixture_ref":"worker.host_commit_operation_id"}),
@@ -2301,6 +2493,560 @@ command = [{:?}, "fixture", "operations", "--state-dir", {:?}, "--observe-status
             .display()
             .to_string(),
     )
+}
+
+fn validate_native_worker_codex_path() -> Result<PathBuf, String> {
+    let path = std::env::var_os(NATIVE_WORKER_CODEX_ENV)
+        .map(PathBuf::from)
+        .ok_or("native Worker Codex path was not frozen")?;
+    if !path.is_absolute() || !path.is_file() {
+        return Err("native Worker Codex path must be an absolute executable file".into());
+    }
+    #[cfg(unix)]
+    if fs::metadata(&path)
+        .map_err(|error| format!("inspect native Worker Codex executable: {error}"))?
+        .permissions()
+        .mode()
+        & 0o111
+        == 0
+    {
+        return Err("native Worker Codex path is not executable".into());
+    }
+    let version = run_process(ProcessRequest {
+        executable: path.clone(),
+        args: vec![OsString::from("--version")],
+        stdin: Vec::new(),
+        cwd: None,
+        clear_environment: false,
+        environment: BTreeMap::new(),
+        timeout: STEP_TIMEOUT,
+        shutdown_grace: SHUTDOWN_GRACE,
+        stdout_limit: OUTPUT_LIMIT,
+        stderr_tail_limit: OUTPUT_LIMIT,
+    })
+    .map_err(|error| format!("run native Worker Codex version probe: {error}"))?;
+    let version_text = String::from_utf8_lossy(&version.stdout);
+    if version.timed_out
+        || !version.cleanup_confirmed
+        || !version.status.is_some_and(|status| status.success())
+        || version_text.lines().last().map(str::trim) != Some("codex-cli 0.166.0")
+    {
+        return Err("native Worker Codex must be the verified 0.166.0 executable".into());
+    }
+    Ok(path)
+}
+
+fn observe_running_native_worker(
+    request: &Request<'_>,
+    state_root: &Path,
+) -> Result<Option<Value>, String> {
+    let database = Connection::open_with_flags(
+        state_root.join("state.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("open state read-only for native Worker observation: {error}"))?;
+    let qualification: Option<(String, String, String, String, String)> = database
+        .query_row(
+            "SELECT executable_path,executable_digest,provider_version,profile_digest,receipt_digest
+             FROM provider_qualifications
+             WHERE project_id=?1 AND profile_id='fixture_worker' AND adapter='codex' AND status='verified'
+             AND receipt_digest=(SELECT qualification_receipt_digest FROM agent_launch_authority WHERE role='worker' AND rex_server_identity=?2 AND rex_session_id=?3 ORDER BY created_at_unix DESC LIMIT 1)
+             ORDER BY created_at_unix DESC LIMIT 1",
+            [FIXTURE_PROJECT_ID, request.expected_instance, request.rex_session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()
+        .map_err(|error| format!("read native Worker provider qualification: {error}"))?;
+    let Some((codex_path, codex_digest, codex_version, profile_digest, receipt_digest)) =
+        qualification
+    else {
+        return Ok(None);
+    };
+    let expected_codex_path = std::env::var_os(NATIVE_WORKER_CODEX_ENV)
+        .map(PathBuf::from)
+        .ok_or("native Worker Codex path was not frozen")?;
+    if codex_path != expected_codex_path.to_string_lossy().as_ref()
+        || !codex_version.contains("0.166.0")
+        || codex_digest
+            != format!(
+                "{:x}",
+                Sha256::digest(
+                    fs::read(&expected_codex_path)
+                        .map_err(|error| format!("read native Worker Codex binary: {error}"))?
+                )
+            )
+    {
+        return Ok(None);
+    }
+    type NativeWorkerLaunchRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        i64,
+    );
+    let row: Option<NativeWorkerLaunchRow> = database
+        .query_row(
+            NATIVE_WORKER_LAUNCH_EVIDENCE_QUERY,
+            params![
+                request.expected_instance,
+                request.rex_session,
+                receipt_digest
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("read native Worker launch evidence: {error}"))?;
+    let Some((
+        run_id,
+        operation_id,
+        runtime_binary_digest,
+        server_identity,
+        session_id,
+        window_id,
+        block_id,
+        control_dir,
+        workspace_path,
+        agent_state,
+        launch_state,
+        wrapper_identity_json,
+        provider_tree_json,
+        slot_disposition,
+        reservation_epoch,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let wrapper: ObservedWrapperIdentity = serde_json::from_str(
+        wrapper_identity_json
+            .as_deref()
+            .ok_or("native Worker wrapper identity was not saved")?,
+    )
+    .map_err(|error| format!("parse saved native Worker wrapper identity: {error}"))?;
+    let provider_start = parse_native_worker_provider_start(
+        &provider_tree_json,
+        &run_id,
+        &operation_id,
+        &codex_digest,
+        &runtime_binary_digest,
+        &wrapper,
+    )?;
+    let provider_tree = &provider_start.process_tree;
+    if wrapper.rex_session_id != session_id || wrapper.rex_block_id != block_id {
+        return Err(
+            "native Worker wrapper identity differs from its exact Rex block authority".into(),
+        );
+    }
+    let rex = match RexCliTransport::connect(
+        request.rex,
+        &[],
+        request.rex_server.to_owned(),
+        request.expected_instance.to_owned(),
+        session_id.clone(),
+        BTreeMap::new(),
+    ) {
+        Ok(rex) => rex,
+        Err(_) => return Ok(None),
+    };
+    let window = TicketWindow {
+        server_instance_id: server_identity.clone(),
+        session_id: session_id.clone(),
+        window_id: window_id.clone(),
+        label: String::new(),
+        initial_block_id: Some(block_id.clone()),
+        disposition: CreateDisposition::Existing,
+    };
+    if !rex
+        .agent_block_is_present(&window, &run_id, &block_id)
+        .map_err(|error| format!("verify exact native Worker Rex block: {error}"))?
+    {
+        return Ok(None);
+    }
+    let rex_process_observation = match rex.observe_process(&window, &run_id, &block_id) {
+        Ok(observation) => observation,
+        Err(_) => return Ok(None),
+    };
+    let current_processes = inspect_process_table()
+        .map_err(|error| format!("inspect live process identities for native Worker: {error}"))?;
+    if !native_worker_launch_is_live(
+        &wrapper,
+        &provider_start,
+        &rex_process_observation,
+        &runtime_binary_digest,
+        &current_processes,
+    ) {
+        return Ok(None);
+    }
+    let mut live_processes = Vec::with_capacity(provider_tree.len() + 2);
+    let mut expected_live = provider_tree
+        .iter()
+        .map(|identity| (identity.pid, identity.start_identity.as_str()))
+        .collect::<Vec<_>>();
+    if let Some(anchor) = &wrapper.rex_launch_anchor {
+        expected_live.push((anchor.pid, &anchor.start_identity));
+    }
+    for (pid, start_identity) in expected_live {
+        if let Some(process) = current_processes.iter().find(|process| {
+            process.pid == pid
+                && process.start_identity == start_identity
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+        }) {
+            live_processes.push(process);
+        }
+    }
+    Ok(Some(json!({
+        "run_id":run_id,
+        "server_instance_id":server_identity,
+        "session_id":session_id,
+        "window_id":window_id,
+        "block_id":block_id,
+        "control_dir":control_dir,
+        "managed_worktree":workspace_path,
+        "agent_state":agent_state,
+        "launch_state":launch_state,
+        "wrapper_process_identity":wrapper,
+        "provider_process_tree":provider_tree,
+        "provider_start_observation":provider_start,
+        "rex_process_observation":rex_process_observation_json(&rex_process_observation),
+        "anchored_topology_verified":wrapper.rex_launch_anchor.is_some(),
+        "live_process_identities":live_processes,
+        "slot_disposition":slot_disposition,
+        "reservation_epoch":reservation_epoch,
+        "worker_provider_qualification":{
+            "executable_path":codex_path,
+            "executable_sha256":codex_digest,
+            "provider_version":codex_version,
+            "profile_digest":profile_digest,
+            "receipt_digest":receipt_digest
+        }
+    })))
+}
+
+fn rex_process_observation_json(
+    observation: &rex_projects::adapters::rex::RexProcessObservation,
+) -> Value {
+    use rex_projects::adapters::rex::{RexLastExit, RexProcessInfo};
+
+    fn process_json(process: &RexProcessInfo) -> Value {
+        json!({
+            "pid": process.pid,
+            "user_id": process.user_id,
+            "name": process.name,
+            "argv0": process.argv0,
+            "path": process.path,
+            "invoked_path": process.invoked_path,
+            "script": process.script,
+            "cwd": process.cwd,
+            "user": process.user,
+        })
+    }
+
+    let last_exit = observation
+        .last_exit
+        .as_ref()
+        .map(|exit: &RexLastExit| json!({"exit_code": exit.exit_code, "error": exit.error}));
+    json!({
+        "last_exit": last_exit,
+        "child": observation.child.as_ref().map(process_json),
+        "foreground": observation.foreground.as_ref().map(process_json),
+        "ancestors": observation.ancestors.as_ref().map(|ancestors| {
+            ancestors.iter().map(process_json).collect::<Vec<_>>()
+        }),
+    })
+}
+
+fn parse_native_worker_provider_start(
+    serialized: &str,
+    expected_run_id: &str,
+    expected_operation_id: &str,
+    expected_executable_digest: &str,
+    expected_runtime_digest: &str,
+    wrapper: &ObservedWrapperIdentity,
+) -> Result<ObservedProviderStart, String> {
+    let observation: ObservedProviderStart = serde_json::from_str(serialized)
+        .map_err(|error| format!("parse saved native Worker provider observation: {error}"))?;
+    let tree_bytes = serde_json::to_vec(&observation.process_tree)
+        .map_err(|error| format!("encode saved native Worker process tree: {error}"))?;
+    let tree_digest = format!("{:x}", Sha256::digest(tree_bytes));
+    let wrapper_matches = observation
+        .process_tree
+        .iter()
+        .filter(|identity| {
+            identity.pid == wrapper.pid && identity.start_identity == wrapper.start_identity
+        })
+        .count()
+        == 1;
+    let provider_matches = observation.process_tree.iter().any(|identity| {
+        identity.pid == observation.provider_pid
+            && identity.start_identity == observation.provider_start_identity
+    });
+    let unique_kernel_identities = observation.process_tree.iter().all(|identity| {
+        identity.pid != 0
+            && !identity.start_identity.trim().is_empty()
+            && identity.identity_quality == ProcessIdentityQuality::KernelBirthToken
+            && identity.process_group_id != 0
+    }) && observation
+        .process_tree
+        .iter()
+        .map(|identity| identity.pid)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        == observation.process_tree.len();
+    if observation.agent_run_id.to_string() != expected_run_id
+        || observation.operation_id.to_string() != expected_operation_id
+        || observation.executable_digest.to_string() != expected_executable_digest
+        || wrapper.runtime_binary_digest.to_string() != expected_runtime_digest
+        || !observation.process_tree_confirmed
+        || observation.process_tree_digest.to_string() != tree_digest
+        || observation.provider_pid == wrapper.pid
+        || observation.provider_start_identity.trim().is_empty()
+        || observation
+            .provider_start_identity
+            .chars()
+            .any(char::is_control)
+        || !wrapper_matches
+        || !provider_matches
+        || !unique_kernel_identities
+    {
+        return Err("saved native Worker provider observation does not match launch authority or complete process evidence".into());
+    }
+    Ok(observation)
+}
+
+fn native_worker_processes_are_live(
+    wrapper: &ObservedWrapperIdentity,
+    provider: &ObservedProviderStart,
+    current: &[ProcessIdentity],
+) -> bool {
+    let is_live = |pid: u32, start_identity: &str| {
+        current.iter().any(|process| {
+            process.pid == pid
+                && process.start_identity == start_identity
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+        })
+    };
+    if provider.process_tree.is_empty()
+        || wrapper.pid == 0
+        || wrapper.start_identity.trim().is_empty()
+        || !is_live(wrapper.pid, &wrapper.start_identity)
+        || provider.provider_pid == wrapper.pid
+        || !is_live(provider.provider_pid, &provider.provider_start_identity)
+    {
+        return false;
+    }
+    let mut pids = std::collections::BTreeSet::new();
+    let wrapper_count = provider
+        .process_tree
+        .iter()
+        .filter(|identity| {
+            identity.pid == wrapper.pid && identity.start_identity == wrapper.start_identity
+        })
+        .count();
+    // Start snapshots retain completed hook children; supervisor/provider liveness is checked above.
+    wrapper_count == 1
+        && provider.process_tree.iter().all(|identity| {
+            identity.pid != 0
+                && !identity.start_identity.trim().is_empty()
+                && identity.identity_quality == ProcessIdentityQuality::KernelBirthToken
+                && pids.insert(identity.pid)
+        })
+        && provider.process_tree.iter().any(|identity| {
+            identity.pid == provider.provider_pid
+                && identity.start_identity == provider.provider_start_identity
+        })
+}
+
+fn native_worker_launch_is_live(
+    wrapper: &ObservedWrapperIdentity,
+    provider: &ObservedProviderStart,
+    rex: &RexProcessObservation,
+    runtime_binary_digest: &str,
+    current: &[ProcessIdentity],
+) -> bool {
+    if !native_worker_processes_are_live(wrapper, provider, current)
+        || !native_worker_anchor_topology_is_live(wrapper, provider.provider_pid, rex, current)
+    {
+        return false;
+    }
+    let runtime_digest_matches = |process: &ProcessIdentity| {
+        let Ok(Some(path)) = rex_projects::process::executable_path_for_identity(process) else {
+            return false;
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        format!("{:x}", Sha256::digest(bytes)) == runtime_binary_digest
+    };
+    let Some(supervisor) = current.iter().find(|process| {
+        process.pid == wrapper.pid && process.start_identity == wrapper.start_identity
+    }) else {
+        return false;
+    };
+    if !runtime_digest_matches(supervisor) {
+        return false;
+    }
+    if let Some(anchor) = &wrapper.rex_launch_anchor {
+        let Some(anchor_process) = current.iter().find(|process| {
+            process.pid == anchor.pid && process.start_identity == anchor.start_identity
+        }) else {
+            return false;
+        };
+        if !runtime_digest_matches(anchor_process)
+            || !rex
+                .child
+                .as_ref()
+                .and_then(|child| child.path.as_deref())
+                .and_then(|path| fs::read(path).ok())
+                .is_some_and(|bytes| {
+                    format!("{:x}", Sha256::digest(bytes)) == runtime_binary_digest
+                })
+        {
+            return false;
+        }
+    } else if !rex
+        .child
+        .as_ref()
+        .and_then(|child| child.path.as_deref())
+        .and_then(|path| fs::read(path).ok())
+        .is_some_and(|bytes| format!("{:x}", Sha256::digest(bytes)) == runtime_binary_digest)
+    {
+        return false;
+    }
+    true
+}
+
+fn native_worker_anchor_topology_is_live(
+    wrapper: &ObservedWrapperIdentity,
+    provider_pid: u32,
+    rex: &RexProcessObservation,
+    current: &[ProcessIdentity],
+) -> bool {
+    let expected_rex_pid = wrapper
+        .rex_launch_anchor
+        .as_ref()
+        .map_or(wrapper.pid, |anchor| anchor.pid);
+    if rex.last_exit.is_some()
+        || rex
+            .child
+            .as_ref()
+            .is_none_or(|child| child.pid != expected_rex_pid)
+        || rex.foreground.as_ref().is_none_or(|foreground| {
+            foreground.pid != wrapper.pid
+                && foreground.pid != provider_pid
+                && wrapper
+                    .rex_launch_anchor
+                    .as_ref()
+                    .is_none_or(|anchor| foreground.pid != anchor.pid)
+        })
+    {
+        return false;
+    }
+    let Some(supervisor) = current.iter().find(|process| {
+        process.pid == wrapper.pid
+            && process.start_identity == wrapper.start_identity
+            && process.quality == ProcessIdentityQuality::KernelBirthToken
+    }) else {
+        return false;
+    };
+    wrapper.rex_launch_anchor.as_ref().is_none_or(|anchor| {
+        current.iter().any(|process| {
+            process.pid == anchor.pid
+                && process.start_identity == anchor.start_identity
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+        }) && supervisor.parent_pid == anchor.pid
+    })
+}
+fn write_native_worker_setup_freeze(
+    request: &Request<'_>,
+    cli_identity: &Value,
+    driver_executable: &Path,
+    config_path: &Path,
+    seeded_ticket: &Value,
+    codex_path: &Path,
+) -> Result<(), String> {
+    let marker = std::env::var_os(ACCEPTANCE_FREEZE_MARKER_ENV)
+        .map(PathBuf::from)
+        .ok_or("native Worker setup freeze marker path is required")?;
+    if !marker.is_absolute() || !marker.starts_with(request.fixture_root) || marker.exists() {
+        return Err(
+            "native Worker setup freeze marker must be a new absolute path inside the fixture root"
+                .into(),
+        );
+    }
+    let continuation = marker.with_extension("continue");
+    if continuation.exists() {
+        return Err("native Worker setup freeze continuation marker already exists".into());
+    }
+    let worker_profile_path = request
+        .fixture_root
+        .join("profiles/fixture_worker/config.toml");
+    let frozen = json!({
+        "product":cli_identity,
+        "product_cli_path":request.cli,
+        "product_cli_sha256":format!("{:x}", Sha256::digest(fs::read(request.cli).map_err(|error| error.to_string())?)),
+        "driver_path":driver_executable,
+        "driver_sha256":format!("{:x}", Sha256::digest(fs::read(driver_executable).map_err(|error| error.to_string())?)),
+        "driver_version":env!("CARGO_PKG_VERSION"),
+        "driver_source_revision":rex_projects::BUILD_SOURCE_REVISION,
+        "driver_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("acceptance.rs"))),
+        "rex_instance_id":request.expected_instance,
+        "rex_endpoint":request.rex_server,
+        "rex_session_id":request.rex_session,
+        "fixture_root":request.fixture_root,
+        "stage":NATIVE_WORKER_BLOCK_LOSS_STAGE,
+        "config_path":config_path,
+        "config_sha256":format!("{:x}", Sha256::digest(fs::read(config_path).map_err(|error| error.to_string())?)),
+        "controller_xdg_state_home":request.fixture_root.join("xdg-state"),
+        "seeded_ticket":seeded_ticket,
+        "worker_profile_path":worker_profile_path,
+        "worker_profile_sha256":format!("{:x}", Sha256::digest(fs::read(&worker_profile_path).map_err(|error| error.to_string())?)),
+        "emulated_roles":["supervisor","coordinator","planner"],
+        "worker_provider":"native Codex 0.166.0",
+        "worker_codex_path":codex_path,
+        "worker_codex_sha256":format!("{:x}", Sha256::digest(fs::read(codex_path).map_err(|error| error.to_string())?)),
+        "native_worker_task":NATIVE_WORKER_LIFECYCLE_TASK
+    });
+    fs::write(
+        &marker,
+        serde_json::to_vec_pretty(&frozen).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("write setup freeze marker: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !continuation.exists() {
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for native Worker setup freeze continuation".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 fn verify_owned_session(request: &Request<'_>) -> Result<(), String> {
@@ -3170,6 +3916,583 @@ fn emit_report(fixture_root: &Path, report: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
+
+    #[test]
+    fn native_worker_block_loss_stage_is_supported_and_unknown_stages_are_rejected() {
+        assert_eq!(
+            parse_acceptance_stage(Some(NATIVE_WORKER_BLOCK_LOSS_STAGE.into())).unwrap(),
+            Some(NATIVE_WORKER_BLOCK_LOSS_STAGE.into())
+        );
+        assert!(parse_acceptance_stage(Some("unknown-stage".into())).is_err());
+    }
+
+    #[test]
+    fn native_worker_timeout_cannot_pass_on_the_coordinator_boundary_alone() {
+        assert!(!bounded_stage_contract_valid(
+            Some(NATIVE_WORKER_BLOCK_LOSS_STAGE),
+            true,
+            false
+        ));
+        assert!(bounded_stage_contract_valid(
+            Some(NATIVE_WORKER_BLOCK_LOSS_STAGE),
+            true,
+            true
+        ));
+        assert!(bounded_stage_contract_valid(
+            Some(COORDINATOR_INBOX_STAGE),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn native_worker_readiness_marker_rejects_missing_or_pending_slot_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let marker_path = temporary.path().join("native-worker-ready.json");
+        assert!(!native_worker_ready_marker_is_valid(&marker_path));
+
+        let pending_marker = json!({
+            "status":"native_worker_running",
+            "worker":{
+                "agent_state":"running",
+                "launch_state":"running",
+                "slot_disposition":"launch_pending",
+                "live_process_identities":[{"pid":1},{"pid":2}]
+            }
+        });
+        fs::write(&marker_path, serde_json::to_vec(&pending_marker).unwrap()).unwrap();
+        assert!(!native_worker_ready_marker_is_valid(&marker_path));
+
+        let anchored_marker = json!({
+            "status":"native_worker_running",
+            "worker":{
+                "agent_state":"running",
+                "launch_state":"running",
+                "slot_disposition":"live",
+                "anchored_topology_verified":true,
+                "wrapper_process_identity":{
+                    "pid":11,
+                    "start_identity":"supervisor-born",
+                    "rex_launch_anchor":{"pid":10,"start_identity":"shim-born"}
+                },
+                "rex_process_observation":{"child":{"pid":10}},
+                "live_process_identities":[
+                    {"pid":10,"parent_pid":1,"start_identity":"shim-born"},
+                    {"pid":11,"parent_pid":10,"start_identity":"supervisor-born"}
+                ]
+            }
+        });
+        fs::write(&marker_path, serde_json::to_vec(&anchored_marker).unwrap()).unwrap();
+        assert!(native_worker_ready_marker_is_valid(&marker_path));
+
+        let mut wrong_anchor = anchored_marker.clone();
+        wrong_anchor["worker"]["rex_process_observation"]["child"]["pid"] = json!(12);
+        fs::write(&marker_path, serde_json::to_vec(&wrong_anchor).unwrap()).unwrap();
+        assert!(!native_worker_ready_marker_is_valid(&marker_path));
+
+        let mut wrong_parent = anchored_marker;
+        wrong_parent["worker"]["live_process_identities"][1]["parent_pid"] = json!(99);
+        fs::write(&marker_path, serde_json::to_vec(&wrong_parent).unwrap()).unwrap();
+        assert!(!native_worker_ready_marker_is_valid(&marker_path));
+    }
+
+    #[test]
+    fn native_worker_anchor_topology_requires_exact_rex_anchor_and_supervisor_parent() {
+        use rex_projects::launch::LaunchAnchorIdentity;
+
+        let wrapper = ObservedWrapperIdentity {
+            pid: 11,
+            start_identity: "supervisor-born".into(),
+            rex_session_id: "session".into(),
+            rex_block_id: "block".into(),
+            runtime_binary_digest: rex_projects::domain::ids::Digest::parse("c".repeat(64))
+                .unwrap(),
+            rex_launch_anchor: Some(LaunchAnchorIdentity {
+                pid: 10,
+                start_identity: "shim-born".into(),
+            }),
+        };
+        let process = |pid, parent_pid, start_identity: &str| ProcessIdentity {
+            pid,
+            parent_pid,
+            process_group_id: pid,
+            start_identity: start_identity.into(),
+            command: "rex-projects".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let rex_process = |pid| rex_projects::adapters::rex::RexProcessInfo {
+            pid,
+            user_id: 1,
+            name: "rex-projects".into(),
+            argv0: None,
+            path: None,
+            invoked_path: None,
+            script: None,
+            cwd: None,
+            user: None,
+        };
+        let rex = RexProcessObservation {
+            last_exit: None,
+            child: Some(rex_process(10)),
+            foreground: Some(rex_process(22)),
+            ancestors: None,
+        };
+        let live = vec![
+            process(10, 1, "shim-born"),
+            process(11, 10, "supervisor-born"),
+            process(22, 11, "provider-born"),
+        ];
+        assert!(native_worker_anchor_topology_is_live(
+            &wrapper, 22, &rex, &live
+        ));
+
+        let mut wrong_rex_anchor = rex.clone();
+        wrong_rex_anchor.child = Some(rex_process(12));
+        assert!(!native_worker_anchor_topology_is_live(
+            &wrapper,
+            22,
+            &wrong_rex_anchor,
+            &live
+        ));
+        assert!(!native_worker_anchor_topology_is_live(
+            &wrapper,
+            22,
+            &rex,
+            &[
+                process(10, 1, "reused-shim"),
+                process(11, 10, "supervisor-born")
+            ]
+        ));
+        assert!(!native_worker_anchor_topology_is_live(
+            &wrapper,
+            22,
+            &rex,
+            &[
+                process(10, 1, "shim-born"),
+                process(11, 9, "supervisor-born")
+            ]
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires explicit frozen replay fixture, product CLI, and xtask paths"]
+    fn native_worker_qualification_replay_checks_generated_argv_schema_and_probe() {
+        use rex_projects::domain::types::{AgentAdapter, Role};
+        use rex_projects::providers::{InvocationPaths, build_invocation, project_result_schema};
+
+        let input_path = |name: &str| {
+            PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
+                .canonicalize()
+                .unwrap_or_else(|error| panic!("resolve {name}: {error}"))
+        };
+        let frozen_root = input_path("REX_PROJECTS_ACCEPTANCE_REPLAY_FIXTURE_ROOT");
+        let runtime = input_path("REX_PROJECTS_ACCEPTANCE_REPLAY_RUNTIME");
+        let driver = input_path("REX_PROJECTS_ACCEPTANCE_REPLAY_DRIVER");
+        assert!(runtime.is_file());
+        assert!(driver.is_file());
+
+        let frozen_package_bytes = fs::read(frozen_root.join("package.json")).unwrap();
+        let mut package: Value = serde_json::from_slice(&frozen_package_bytes).unwrap();
+        let frozen_runtime = PathBuf::from(package["runtime_binary_path"].as_str().unwrap());
+        let runtime_digest = format!("{:x}", Sha256::digest(fs::read(&runtime).unwrap()));
+        assert_eq!(package["runtime_binary_digest"], runtime_digest);
+
+        let runtime_schema =
+            serde_json::to_value(rex_projects::roles::result_schema(Role::Supervisor)).unwrap();
+        let fixture_schema: Value = serde_json::from_slice(
+            &fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../schemas/agent-results/supervisor-v1.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let package_schema = package["descriptor"]["result_schema"].clone();
+        assert_eq!(runtime_schema, fixture_schema);
+        assert_eq!(runtime_schema, package_schema);
+        let source_schema_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&runtime_schema).unwrap())
+        );
+
+        let argv_capture: Value =
+            serde_json::from_slice(&fs::read(frozen_root.join("invocation-argv.json")).unwrap())
+                .unwrap();
+        let captured_args = argv_capture["args"]
+            .as_array()
+            .expect("frozen fixture must contain generated argv")
+            .iter()
+            .map(|value| value.as_str().expect("argv entries are strings").to_owned())
+            .collect::<Vec<_>>();
+
+        let temporary = tempfile::tempdir().unwrap();
+        // Keep this replay workspace so a failed inner qualification probe leaves its
+        // bounded persisted diagnostic available for investigation.
+        let root = temporary.keep().canonicalize().unwrap();
+        eprintln!("qualification replay workspace: {}", root.display());
+        let workspace = root.join("workspace");
+        let control = root.join("control");
+        let contexts = root.join("contexts");
+        let state = root.join("agent-state");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&control).unwrap();
+        fs::create_dir_all(&contexts).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::copy(
+            frozen_root.join("contexts/supervisor.json"),
+            contexts.join("supervisor.json"),
+        )
+        .unwrap();
+
+        let frozen_root_text = frozen_root.to_string_lossy();
+        let root_text = root.to_string_lossy();
+        let runtime_text = runtime.to_string_lossy();
+        let frozen_runtime_text = frozen_runtime.to_string_lossy();
+        let relocate = |value: &str| {
+            value
+                .replace(frozen_root_text.as_ref(), root_text.as_ref())
+                .replace(frozen_runtime_text.as_ref(), runtime_text.as_ref())
+        };
+        let set_path = |value: &mut Value, pointer: &str, path: &Path| {
+            *value
+                .pointer_mut(pointer)
+                .expect("frozen package path exists") =
+                Value::String(path.to_string_lossy().into_owned());
+        };
+        let prompt = relocate(package["prompt"].as_str().unwrap());
+        package["prompt"] = Value::String(prompt.clone());
+        package["runtime_binary_path"] = Value::String(runtime.to_string_lossy().into_owned());
+        set_path(&mut package, "/workspace_root", &root);
+        set_path(
+            &mut package,
+            "/environment_handoff",
+            &control.join("environment-handoff.env"),
+        );
+        set_path(&mut package, "/result_path", &control.join("result.json"));
+        set_path(
+            &mut package,
+            "/marker_probe_path",
+            &workspace.join("marker-probe.json"),
+        );
+        set_path(&mut package, "/descriptor/workspace", &workspace);
+        set_path(&mut package, "/descriptor/control_dir", &control);
+        let package_path = root.join("package.json");
+        fs::write(&package_path, serde_json::to_vec_pretty(&package).unwrap()).unwrap();
+
+        let profile_path = frozen_root.join("profiles/fixture_supervisor/config.toml");
+        let mut profile: rex_projects::config::Profile =
+            toml::from_str(&fs::read_to_string(profile_path).unwrap()).unwrap();
+        for argument in &mut profile.command {
+            *argument = relocate(argument);
+        }
+        profile.command[0] = driver.to_string_lossy().into_owned();
+        let schema_path = root.join("provider-schema.json");
+        let projection = project_result_schema(&runtime_schema).unwrap();
+        fs::write(
+            &schema_path,
+            serde_json::to_vec(&projection.schema).unwrap(),
+        )
+        .unwrap();
+
+        let invocation = build_invocation(
+            &profile,
+            package["role_contract"].as_str().unwrap(),
+            &prompt,
+            &runtime_schema,
+            InvocationPaths {
+                schema_path: &schema_path,
+                control_dir: None,
+            },
+            None,
+        )
+        .unwrap();
+        let generated_args = invocation
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let mut expected_args = captured_args
+            .iter()
+            .map(|argument| relocate(argument))
+            .collect::<Vec<_>>();
+        let mut generated_comparison = generated_args.clone();
+        if let Some(last) = expected_args.last_mut() {
+            *last = last.trim_end_matches('\n').to_owned();
+        }
+        if let Some(last) = generated_comparison.last_mut() {
+            *last = last.trim_end_matches('\n').to_owned();
+        }
+        assert_eq!(generated_comparison, expected_args);
+
+        let mut environment = BTreeMap::new();
+        environment.insert(OsString::from("REX_PROJECTS_AGENT"), OsString::from("1"));
+        environment.insert(
+            OsString::from("REX_PROJECTS_CONTEXT"),
+            OsString::from("agent"),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_PROJECT_ID"),
+            OsString::from(package["project_id"].as_str().unwrap()),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_ROLE"),
+            OsString::from("supervisor"),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_RUN_ID"),
+            OsString::from(package["descriptor"]["run_id"].as_str().unwrap()),
+        );
+        let output = run_process(ProcessRequest {
+            executable: invocation.executable,
+            args: invocation.args,
+            stdin: Vec::new(),
+            cwd: Some(workspace.clone()),
+            clear_environment: false,
+            environment,
+            timeout: Duration::from_secs(30),
+            shutdown_grace: Duration::from_secs(2),
+            stdout_limit: OUTPUT_LIMIT,
+            stderr_tail_limit: 8 * 1024,
+        })
+        .unwrap();
+        assert!(!output.timed_out);
+        assert!(output.cleanup_confirmed);
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "qualification fixture CLI failed: status={:?}, stderr_tail={}, stdout={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr_tail),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        rex_projects::providers::parse_result(AgentAdapter::Codex, &output.stdout, &runtime_schema)
+            .unwrap();
+
+        let report_path = workspace.join("marker-probe.json");
+        let metadata = fs::symlink_metadata(&report_path).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert!(metadata.len() <= 16 * 1024);
+        let report: Value = serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["tool_binary_digest"], runtime_digest);
+        assert!(report["tool_pid"].as_u64().is_some_and(|pid| pid > 0));
+        assert!(report["descendant_pid"].as_u64().is_some_and(|pid| pid > 0));
+        eprintln!("qualification replay schema SHA256: {source_schema_digest}");
+    }
+
+    #[test]
+    fn native_worker_profile_requests_only_the_bounded_foreground_lifecycle_task() {
+        let messages = profile_messages_for_native_worker("planner", false, true).unwrap();
+        let plan = &messages[1]["structured_result"]["plan"]["nodes"][0];
+        assert_eq!(plan["task"], NATIVE_WORKER_LIFECYCLE_TASK);
+        assert_eq!(
+            plan["required_evidence"][0],
+            "The bounded foreground process remains active until the host closes the Worker Rex block."
+        );
+        assert!(!plan["task"].as_str().unwrap().contains("git "));
+    }
+
+    #[test]
+    fn native_worker_profile_builder_emits_absolute_codex_argv_and_lifecycle_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("acceptance");
+        fs::create_dir(&root).unwrap();
+        let codex = Path::new("/opt/codex/0.166.0/bin/codex");
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        prepare_profiles(
+            &request,
+            Path::new("/opt/xtask"),
+            request.cli,
+            ProfilePreparation {
+                host_worker: true,
+                native_worker_codex: Some(codex),
+                ..ProfilePreparation::default()
+            },
+        )
+        .unwrap();
+
+        let profile: toml::Value = toml::from_str(
+            &fs::read_to_string(root.join("profiles/fixture_worker/config.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(profile["adapter"].as_str(), Some("codex"));
+        assert_eq!(profile["commit_mode"].as_str(), Some("host"));
+        assert_eq!(
+            profile["command"][0].as_str(),
+            Some(codex.to_str().unwrap())
+        );
+        assert_eq!(profile["command"].as_array().unwrap().len(), 1);
+        assert!(profile.get("model").is_none());
+
+        let context: Value =
+            serde_json::from_slice(&fs::read(root.join("contexts/planner.json")).unwrap()).unwrap();
+        let plan = &context["messages"][1]["structured_result"]["plan"]["nodes"][0];
+        assert_eq!(plan["task"], NATIVE_WORKER_LIFECYCLE_TASK);
+    }
+
+    #[test]
+    fn native_worker_persisted_provider_envelope_reaches_readiness_and_rejects_bad_bindings() {
+        use rex_projects::domain::ids::{AgentRunId, Digest, OperationId};
+        use rex_projects::launch::ProviderProcessIdentity;
+
+        let wrapper = ObservedWrapperIdentity {
+            pid: 11,
+            start_identity: "wrapper-born".into(),
+            rex_launch_anchor: None,
+            rex_session_id: "session".into(),
+            rex_block_id: "block".into(),
+            runtime_binary_digest: Digest::parse("c".repeat(64)).unwrap(),
+        };
+        let tree = vec![
+            ProviderProcessIdentity {
+                pid: 11,
+                parent_pid: 1,
+                process_group_id: 11,
+                start_identity: "wrapper-born".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+            ProviderProcessIdentity {
+                pid: 22,
+                parent_pid: 11,
+                process_group_id: 11,
+                start_identity: "provider-born".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+            ProviderProcessIdentity {
+                pid: 33,
+                parent_pid: 22,
+                process_group_id: 33,
+                start_identity: "finished-hook-born".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+        ];
+        let tree_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&tree).unwrap())
+        ))
+        .unwrap();
+        let observation = ObservedProviderStart {
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            operation_id: OperationId::parse("op-1").unwrap(),
+            provider_pid: 22,
+            provider_start_identity: "provider-born".into(),
+            executable_digest: Digest::parse("a".repeat(64)).unwrap(),
+            process_tree_digest: tree_digest,
+            process_tree_confirmed: true,
+            process_tree: tree,
+        };
+        // Serialize the same typed envelope that ConfigStore persists in provider_process_tree_json.
+        let saved = serde_json::to_string(&observation).unwrap();
+        let parsed = parse_native_worker_provider_start(
+            &saved,
+            "run-1",
+            "op-1",
+            &"a".repeat(64),
+            &"c".repeat(64),
+            &wrapper,
+        )
+        .unwrap();
+        let live = [
+            ProcessIdentity {
+                pid: 11,
+                parent_pid: 1,
+                process_group_id: 11,
+                start_identity: "wrapper-born".into(),
+                command: "rex".into(),
+                quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+            ProcessIdentity {
+                pid: 22,
+                parent_pid: 11,
+                process_group_id: 11,
+                start_identity: "provider-born".into(),
+                command: "codex".into(),
+                quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+        ];
+        assert!(native_worker_processes_are_live(&wrapper, &parsed, &live));
+
+        let wrong_run = parse_native_worker_provider_start(
+            &saved,
+            "different-run",
+            "op-1",
+            &"a".repeat(64),
+            &"c".repeat(64),
+            &wrapper,
+        );
+        assert!(wrong_run.is_err());
+        let mut missing_provider = observation.clone();
+        missing_provider
+            .process_tree
+            .retain(|identity| identity.pid != 22);
+        assert!(!native_worker_processes_are_live(
+            &wrapper,
+            &missing_provider,
+            &live
+        ));
+        let mut duplicate_wrapper = observation.clone();
+        duplicate_wrapper
+            .process_tree
+            .push(duplicate_wrapper.process_tree[0].clone());
+        assert!(!native_worker_processes_are_live(
+            &wrapper,
+            &duplicate_wrapper,
+            &live
+        ));
+        let mut unverified_transient = observation.clone();
+        unverified_transient.process_tree[2].identity_quality =
+            ProcessIdentityQuality::SecondPrecision;
+        assert!(!native_worker_processes_are_live(
+            &wrapper,
+            &unverified_transient,
+            &live
+        ));
+        let mut stale_birth = live;
+        stale_birth[1].start_identity = "reused-pid".into();
+        assert!(!native_worker_processes_are_live(
+            &wrapper,
+            &parsed,
+            &stale_birth
+        ));
+    }
+
+    #[test]
+    fn native_worker_readiness_query_executes_against_production_database_schema() {
+        let temporary = tempfile::tempdir().unwrap();
+        if std::env::var_os("REX_PROJECTS_READINESS_QUERY_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "acceptance::tests::native_worker_readiness_query_executes_against_production_database_schema",
+                ])
+                .env("REX_PROJECTS_READINESS_QUERY_TEST_CHILD", "1")
+                .env("XDG_STATE_HOME", temporary.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let _store = rex_projects::store::ConfigStore::open(temporary.path()).unwrap();
+        let database = Connection::open_with_flags(
+            temporary.path().join("state.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let row: Option<String> = database
+            .query_row(
+                NATIVE_WORKER_LAUNCH_EVIDENCE_QUERY,
+                params!["fixture-instance", "fixture-session", "f".repeat(64)],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(row.is_none());
+    }
 
     #[test]
     fn saved_recovery_worker_observation_uses_the_typed_snapshot_digest() {

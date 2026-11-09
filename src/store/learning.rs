@@ -3735,6 +3735,7 @@ mod tests {
                     payload_json: wake.payload_json,
                     host_artifact_source_evidence_ids: Vec::new(),
                     host_artifacts: Vec::new(),
+                    host_completion_context: None,
                 })
                 .collect(),
         };
