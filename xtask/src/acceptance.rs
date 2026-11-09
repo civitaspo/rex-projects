@@ -1616,6 +1616,26 @@ fn host_commit_reviewer_connection_evidence(
     let worker_result: Value = serde_json::from_str(&result_json)
         .map_err(|error| format!("parse accepted Worker result evidence: {error}"))?;
     let change = &worker_result["structured_result"]["change_references"][0];
+    let reservation_json: String = db
+        .query_row(
+            "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [durable_commit_receipt.agent_run_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("read immutable Worker assignment: {error}"))?;
+    let reservation: rex_projects::launch::AgentLaunchReservation =
+        serde_json::from_str(&reservation_json)
+            .map_err(|error| format!("parse immutable Worker assignment: {error}"))?;
+    reservation.validate()?;
+    let assignment = reservation
+        .worker_assignment
+        .as_ref()
+        .ok_or("published Worker reservation has no prepared assignment")?;
+    let expected_worktree_id = assignment
+        .worktree_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("prepared Worker worktree has no directory ID")?;
     let workspace = observation["workspace_path"]
         .as_str()
         .map(PathBuf::from)
@@ -1666,6 +1686,21 @@ fn host_commit_reviewer_connection_evidence(
             .as_array()
             .map(Vec::len)
             != Some(1)
+        || reservation.agent_run_id != durable_commit_receipt.agent_run_id
+        || reservation.project_id.as_str()
+            != observation["project_id"]
+                .as_str()
+                .unwrap_or("operations_project")
+        || reservation.role != rex_projects::domain::types::Role::Worker
+        || reservation
+            .ticket_run_id
+            .as_ref()
+            .is_none_or(|run| run.as_str() != ticket_run_id)
+        || reservation.config_digest != publish_request.configuration_digest
+        || assignment.configuration_digest != publish_request.configuration_digest
+        || assignment.node_id != publish_request.work_node_id
+        || assignment.repository_id != publish_request.repository_id
+        || change["worktree_id"].as_str() != Some(expected_worktree_id)
         || change["host_commit_operation_id"].as_str() != Some(operation_id.as_str())
         || change["base_commit"].as_str() != Some(durable_commit_receipt.base_sha.as_str())
         || change["previous_head"].as_str() != Some(expected_head.as_str())
@@ -2148,6 +2183,7 @@ fn profile_messages_for_native_worker(
                 "commit_shas":{"$fixture_ref":"worker.commit_shas"}
             });
             if host_worker {
+                change["worktree_id"] = json!({"$fixture_ref":"worker_worktree_id"});
                 change.as_object_mut().expect("change reference is an object").insert(
                     "host_commit_operation_id".into(),
                     json!({"$fixture_ref":"worker.host_commit_operation_id"}),

@@ -2425,20 +2425,17 @@ impl FactoryRuntimeServices for RuntimeServices {
             .as_ref()
             .map(|authorization| authorization.expected_head.as_str())
             .unwrap_or_else(|| prepared.expected_head());
-        let change = claimed
-            .change_references
-            .iter()
-            .filter(|reference| reference.worktree_id == node_id)
-            .collect::<Vec<_>>();
-        if change.len() != 1 || change[0].repository != node.repository {
-            return Err("Worker result must identify exactly its assigned repository node".into());
-        }
         if claimed.change_references.len() != 1 {
             return Err(
                 "Worker result must contain exactly one change for its assigned node".into(),
             );
         }
-        let change = change[0];
+        let change = crate::engine::orchestration::change_reference_for_assignment(
+            &claimed.change_references,
+            &node.repository,
+            &node_id,
+            prepared.worktree_path(),
+        )?;
         let retained_commit = retained_host_commit(
             store,
             &binding.project_id,
@@ -5029,6 +5026,11 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
             "depends_on":node.depends_on,
             "required_evidence":node.required_evidence,
         },
+        "implementation_ready_identity":{
+            "repository":node.repository,
+            "change_reference_worktree_id":node.id,
+            "worktree_id_semantics":"Use assigned_node.node_id exactly. In schema v1 this is the logical work node ID, not the managed worktree directory ID."
+        },
         "prepared_worktree":{
             "path":worktree_path,
             "branch":branch,
@@ -5699,6 +5701,14 @@ mod worker_assignment_context_tests {
         assert_eq!(context["prepared_worktree"]["expected_head"], base_sha);
         assert_eq!(context["prepared_worktree"]["verification_only"], false);
         assert_eq!(context["prepared_worktree"]["repository_id"], "repo-a");
+        assert_eq!(
+            context["implementation_ready_identity"]["repository"],
+            "repo-a"
+        );
+        assert_eq!(
+            context["implementation_ready_identity"]["change_reference_worktree_id"],
+            "worker-b"
+        );
 
         let publication_head = "3".repeat(40);
         let verification = WorkerVerificationAssignment {
@@ -5801,6 +5811,10 @@ mod worker_assignment_context_tests {
         assert_eq!(
             recovery_context["retained_host_commit"]["commit"]["operation_id"],
             prior_operation.as_str()
+        );
+        assert_eq!(
+            recovery_context["implementation_ready_identity"]["change_reference_worktree_id"],
+            "worker-b"
         );
         assert_eq!(
             recovery_context["retained_host_commit"]["manifest_artifact"]["path"],

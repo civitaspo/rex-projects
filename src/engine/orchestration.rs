@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -726,6 +727,9 @@ role_payload!(PlanReadyPayload {
 #[serde(deny_unknown_fields)]
 pub struct ChangeReference {
     pub repository: RepositoryId,
+    /// New Worker results use the logical `assigned_node.node_id` in schema v1.
+    /// Host validation also accepts the exact managed worktree directory ID
+    /// derived from the same immutable assignment for existing schema-v1 results.
     pub worktree_id: WorkNodeId,
     pub commit_mode: CommitMode,
     pub base_commit: GitCommitId,
@@ -735,6 +739,35 @@ pub struct ChangeReference {
     /// Host-mode commits must name the durable `repository.commit` receipt whose SHA is reported above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_commit_operation_id: Option<String>,
+}
+
+/// Resolve a Worker claim to its exact host-prepared repository assignment.
+/// The managed directory ID is accepted only as a compatibility spelling for
+/// the same immutable assignment; arbitrary aliases and duplicate matches fail.
+pub(crate) fn change_reference_for_assignment<'a>(
+    references: &'a [ChangeReference],
+    repository_id: &RepositoryId,
+    work_node_id: &WorkNodeId,
+    worktree_path: &Path,
+) -> Result<&'a ChangeReference, String> {
+    let worktree_directory_id = worktree_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or("prepared Worker worktree has no canonical directory ID")?;
+    let matches = references
+        .iter()
+        .filter(|reference| {
+            reference.repository == *repository_id
+                && (reference.worktree_id == *work_node_id
+                    || reference.worktree_id.as_str() == worktree_directory_id)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [reference] => Ok(reference),
+        [] => Err("Worker result does not identify its exact prepared repository node".into()),
+        _ => Err("Worker result ambiguously identifies its prepared repository node".into()),
+    }
 }
 
 role_payload!(ImplementationReadyPayload {
@@ -2613,6 +2646,62 @@ mod tests {
     use crate::config::{GoalConfig, OperationMatch};
     use crate::domain::ids::{AdapterId, TicketId};
     use crate::domain::types::RecipeStage;
+
+    #[test]
+    fn change_reference_matches_only_its_exact_prepared_assignment() {
+        let repository = RepositoryId::parse("repo-a").unwrap();
+        let foreign_repository = RepositoryId::parse("repo-b").unwrap();
+        let node = WorkNodeId::parse("adapter-troubleshooting").unwrap();
+        let path = Path::new("/state/worktrees/repo-a/c22417d2fa7923308a4ae3f3c912ab58");
+        let reference = |repository: &RepositoryId, worktree_id: &str| {
+            serde_json::from_value::<ChangeReference>(json!({
+                "repository":repository,
+                "worktree_id":worktree_id,
+                "commit_mode":"host",
+                "base_commit":"d855022bcd52d3156e2c130f0952da50bfca606b",
+                "previous_head":"d855022bcd52d3156e2c130f0952da50bfca606b",
+                "branch_head":"06d67158f0f0d65449418bf505c9d723daccd244",
+                "commit_shas":["06d67158f0f0d65449418bf505c9d723daccd244"],
+                "host_commit_operation_id":"repo-commit-caba9518fbe184eefb25b2b5d3be5e6b6d096e3ca0463297f64b86ca55ce9698"
+            })).unwrap()
+        };
+
+        for identifier in [node.as_str(), "c22417d2fa7923308a4ae3f3c912ab58"] {
+            let claim = reference(&repository, identifier);
+            assert_eq!(
+                change_reference_for_assignment(
+                    std::slice::from_ref(&claim),
+                    &repository,
+                    &node,
+                    path
+                )
+                .unwrap(),
+                &claim
+            );
+        }
+
+        for claim in [
+            reference(&repository, "another-worktree-id"),
+            reference(&foreign_repository, "c22417d2fa7923308a4ae3f3c912ab58"),
+        ] {
+            assert!(
+                change_reference_for_assignment(
+                    std::slice::from_ref(&claim),
+                    &repository,
+                    &node,
+                    path
+                )
+                .is_err()
+            );
+        }
+
+        let logical = reference(&repository, node.as_str());
+        let physical = reference(&repository, "c22417d2fa7923308a4ae3f3c912ab58");
+        assert!(
+            change_reference_for_assignment(&[logical, physical], &repository, &node, path)
+                .is_err()
+        );
+    }
 
     fn test_digest(value: char) -> Digest {
         Digest::parse(value.to_string().repeat(64)).unwrap()

@@ -5304,6 +5304,42 @@ pub(crate) mod tests {
             assignment["retained_host_commit"]["manifest_artifact"]["path"],
             effect_receipt.manifest_artifact.path
         );
+        assert_eq!(
+            assignment["implementation_ready_identity"]["repository"],
+            repository.as_str()
+        );
+        assert_eq!(
+            assignment["implementation_ready_identity"]["change_reference_worktree_id"],
+            node_id.as_str()
+        );
+        let prepared_path =
+            std::path::PathBuf::from(assignment["prepared_worktree"]["path"].as_str().unwrap());
+        let physical_id = prepared_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let physical_claim: crate::engine::orchestration::ChangeReference =
+            serde_json::from_value(serde_json::json!({
+                "repository":repository,
+                "worktree_id":physical_id,
+                "commit_mode":"host",
+                "base_commit":base,
+                "previous_head":base,
+                "branch_head":effect_receipt.commit.observed_head,
+                "commit_shas":[effect_receipt.commit.observed_head],
+                "host_commit_operation_id":intent.operation_id
+            }))
+            .unwrap();
+        assert_eq!(
+            crate::engine::orchestration::change_reference_for_assignment(
+                std::slice::from_ref(&physical_claim),
+                &repository,
+                &node_id,
+                &prepared_path,
+            )
+            .unwrap(),
+            &physical_claim
+        );
 
         let mut advanced_no_commit_recovery = authorization.clone();
         advanced_no_commit_recovery.expected_head = "f".repeat(40);
@@ -5892,6 +5928,23 @@ impl ConfigStore {
         {
             return Err("published Worker result differs from the exact launch authority".into());
         }
+        let reservation = self
+            .agent_launch_reservation_for_run(&agent_run_id)?
+            .ok_or("published Worker result has no immutable launch reservation")?;
+        reservation.validate()?;
+        let assignment = reservation
+            .worker_assignment
+            .as_ref()
+            .filter(|assignment| {
+                reservation.project_id == *project_id
+                    && reservation.ticket_run_id.as_ref() == Some(ticket_run_id)
+                    && reservation.role == Role::Worker
+                    && assignment.ticket_revision == transition_source_revision
+                    && assignment.configuration_digest == authority.config_digest
+                    && assignment.node_id == *node_id
+                    && assignment.repository_id == *repository_id
+            })
+            .ok_or("published Worker result has no matching immutable prepared assignment")?;
         let terminal = verify_agent_terminal(self, owner_generation, &agent_run_id)?;
         let structured = terminal
             .result
@@ -5913,12 +5966,15 @@ impl ConfigStore {
         else {
             return Err("ImplementationReady result has an incompatible typed payload".into());
         };
-        let node_changes = payload
-            .change_references
-            .iter()
-            .filter(|change| change.worktree_id == *node_id && change.repository == *repository_id)
-            .collect::<Vec<_>>();
-        if node_changes.len() != 1 || node_changes[0].branch_head.as_str() != published_head {
+        let node_change = crate::engine::orchestration::change_reference_for_assignment(
+            &payload.change_references,
+            repository_id,
+            node_id,
+            &assignment.worktree_path,
+        )?;
+        if payload.change_references.len() != 1
+            || node_change.branch_head.as_str() != published_head
+        {
             return Err(
                 "Worker result does not uniquely match the published repository head".into(),
             );

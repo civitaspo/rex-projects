@@ -518,6 +518,7 @@ fn validate_recipe_references(value: &Value) -> Result<(), String> {
                     | "inbox.planner_result"
                     | "project_id"
                     | "worker_node_id"
+                    | "worker_worktree_id"
                     | "worker.repository_id"
                     | "worker.base_sha"
                     | "worker.commit_mode"
@@ -742,6 +743,17 @@ fn execute_actions(
         facts
             .values
             .insert("worker.node_id".into(), json!(worker.node_id));
+        let worktree_id = cwd
+            .canonicalize()
+            .map_err(|error| format!("resolve fixture Worker worktree: {error}"))?
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or("fixture Worker worktree has no directory ID")?
+            .to_owned();
+        facts
+            .values
+            .insert("worker.worktree_id".into(), json!(worktree_id));
         facts
             .values
             .insert("worker.repository_id".into(), json!(worker.repository_id));
@@ -1374,6 +1386,13 @@ fn resolve_references(
             }
             if name == "worker_node_id" {
                 return Ok(json!(worker_node_id(prompt)?));
+            }
+            if name == "worker_worktree_id" {
+                return facts
+                    .values
+                    .get("worker.worktree_id")
+                    .cloned()
+                    .ok_or("Worker fixture has no observed managed worktree ID".into());
             }
             facts.values.get(&name).cloned().ok_or_else(|| format!("fixture reference `{name}` was not produced by this turn's actual prompt or actions"))
         }
