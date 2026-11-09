@@ -2605,20 +2605,38 @@ pub(crate) mod tests {
     use std::path::PathBuf;
 
     fn coordinator_spawn_result(child_role: Role) -> IngestedAgentResult {
+        coordinator_spawn_result_at(
+            child_role,
+            "evidence-spawn",
+            "coordinator-run",
+            "coordinator-operation",
+            3,
+            3,
+            "ticket_run:ticket-run:coordinator",
+        )
+    }
+
+    fn coordinator_spawn_result_at(
+        child_role: Role,
+        evidence_id: &str,
+        agent_run_id: &str,
+        operation_id: &str,
+        ticket_revision: u64,
+        run_epoch: u64,
+        role_session_id: &str,
+    ) -> IngestedAgentResult {
         let digest = || Digest::parse("a".repeat(64)).unwrap();
         let binding = RoleResultBinding {
-            agent_run_id: AgentRunId::parse("coordinator-run").unwrap(),
-            operation_id: OperationId::parse("coordinator-operation").unwrap(),
+            agent_run_id: AgentRunId::parse(agent_run_id).unwrap(),
+            operation_id: OperationId::parse(operation_id).unwrap(),
             project_id: ProjectId::parse("project-a").unwrap(),
-            role_session_id: crate::engine::orchestration::RoleSessionId::parse(
-                "ticket_run:ticket-run:coordinator",
-            )
-            .unwrap(),
+            role_session_id: crate::engine::orchestration::RoleSessionId::parse(role_session_id)
+                .unwrap(),
             role: Role::Coordinator,
             parent_run_id: Some(AgentRunId::parse("supervisor-run").unwrap()),
             parent_role: Some(Role::Supervisor),
             ticket_run_id: Some(TicketRunId::parse("ticket-run").unwrap()),
-            ticket_revision: Some(Revision(3)),
+            ticket_revision: Some(Revision(ticket_revision)),
             config_revision: Revision(2),
             config_digest: digest(),
             profile_digest: digest(),
@@ -2626,7 +2644,7 @@ pub(crate) mod tests {
             provider_capability_receipt_digest: digest(),
             result_schema_digest: digest(),
             controller_generation: 7,
-            run_epoch: 3,
+            run_epoch,
             attempt: 1,
         };
         let request = crate::engine::orchestration::SpawnRequestPayload {
@@ -2654,7 +2672,7 @@ pub(crate) mod tests {
                 wake_recipients: Vec::new(),
             },
             receipt: StoredRoleResultReceipt {
-                evidence_id: "evidence-spawn".into(),
+                evidence_id: evidence_id.into(),
                 message_id: "message-1".into(),
                 content_digest: digest(),
                 terminal_digest: digest(),
@@ -2683,7 +2701,7 @@ pub(crate) mod tests {
                  INSERT INTO projects VALUES ('project-a',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
                  CREATE TABLE ticket_runs(ticket_run_id TEXT, project_id TEXT, revision INTEGER, internal_phase TEXT, config_revision INTEGER, config_digest TEXT);
                  INSERT INTO ticket_runs VALUES ('ticket-run','project-a',3,'planning',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-                 CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT);
+                 CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT, descriptor_digest TEXT, authority_digest TEXT);
                  CREATE TABLE agent_result_evidence(evidence_id TEXT, agent_run_id TEXT, project_id TEXT, role TEXT, outcome TEXT, ticket_run_id TEXT, run_epoch INTEGER);
                  INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed','ticket-run',3);
                  CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, source_revision INTEGER, priority INTEGER, payload_json TEXT, lifecycle TEXT, created_at_unix INTEGER, UNIQUE(role_session_id,source_type,source_id,source_revision));
@@ -2692,8 +2710,12 @@ pub(crate) mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO agent_launch_authority VALUES ('coordinator-run',?1)",
-                [&authority_json],
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run',?1,?2,?3)",
+                rusqlite::params![
+                    authority_json,
+                    authority.descriptor_digest.as_str(),
+                    authority.digest().unwrap().as_str(),
+                ],
             )
             .unwrap();
         ConfigStore {
@@ -2790,14 +2812,256 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn canonical_child_session_accepts_new_coordinator_turn_but_rejects_other_logical_parent() {
+        let mut store = spawn_test_store();
+        let first = coordinator_spawn_result(Role::Reviewer);
+        let child_session = "ticket_run:ticket-run:reviewer";
+        let first_payload = serde_json::json!({"request":"first review"});
+        store
+            .persist_coordinator_child_wake(
+                7,
+                &first,
+                Role::Reviewer,
+                child_session,
+                3,
+                &first_payload,
+            )
+            .unwrap();
+
+        let second = coordinator_spawn_result_at(
+            Role::Reviewer,
+            "evidence-spawn-2",
+            "coordinator-run-2",
+            "coordinator-operation-2",
+            7,
+            4,
+            "ticket_run:ticket-run:coordinator",
+        );
+        let mut second_authority = test_authority();
+        second_authority.agent_run_id = AgentRunId::parse("coordinator-run-2").unwrap();
+        second_authority.role = Role::Coordinator;
+        second_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        second_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        second_authority.parent_role = Some(Role::Supervisor);
+        second_authority.ticket_revision = Some(Revision(7));
+        second_authority.operation_id = OperationId::parse("coordinator-operation-2").unwrap();
+        second_authority.run_epoch = 4;
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_result_evidence VALUES ('evidence-spawn-2','coordinator-run-2','project-a','coordinator','completed','ticket-run',4)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run-2',?1,?2,?3)",
+                rusqlite::params![
+                    serde_json::to_string(&second_authority).unwrap(),
+                    second_authority.descriptor_digest.as_str(),
+                    second_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("UPDATE ticket_runs SET revision=7", [])
+            .unwrap();
+        store
+            .persist_coordinator_child_wake(
+                7,
+                &second,
+                Role::Reviewer,
+                child_session,
+                7,
+                &serde_json::json!({"request":"re-review after correction"}),
+            )
+            .unwrap();
+
+        let wake_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='coordinator_child'",
+                [child_session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wake_count, 2);
+        store
+            .connection
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE source_id='evidence-spawn'",
+                [],
+            )
+            .unwrap();
+        let parent = store
+            .coordinator_child_parent(&ProjectId::parse("project-a").unwrap(), child_session)
+            .unwrap()
+            .expect("fresh Reviewer wake resolves its Coordinator turn");
+        assert_eq!(parent.agent_run_id.as_str(), "coordinator-run-2");
+        assert_eq!(parent.role_session_id, "ticket_run:ticket-run:coordinator");
+
+        let wrong_parent = coordinator_spawn_result_at(
+            Role::Reviewer,
+            "evidence-spawn-wrong-parent",
+            "coordinator-run-wrong-parent",
+            "coordinator-operation-wrong-parent",
+            7,
+            5,
+            "ticket_run:ticket-run:coordinator",
+        );
+        let mut wrong_authority = second_authority.clone();
+        wrong_authority.agent_run_id = AgentRunId::parse("coordinator-run-wrong-parent").unwrap();
+        wrong_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        wrong_authority.operation_id =
+            OperationId::parse("coordinator-operation-wrong-parent").unwrap();
+        wrong_authority.run_epoch = 5;
+        let mut prior_wrong_authority = test_authority();
+        prior_wrong_authority.agent_run_id = AgentRunId::parse("coordinator-run").unwrap();
+        prior_wrong_authority.role = Role::Coordinator;
+        prior_wrong_authority.role_session_id =
+            "ticket_run:ticket-run:alternate-coordinator".into();
+        prior_wrong_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        prior_wrong_authority.parent_role = Some(Role::Supervisor);
+        prior_wrong_authority.operation_id = OperationId::parse("coordinator-operation").unwrap();
+        prior_wrong_authority.run_epoch = 3;
+        store
+            .connection
+            .execute(
+                "UPDATE agent_launch_authority SET authority_json=?1,authority_digest=?2 WHERE agent_run_id='coordinator-run'",
+                rusqlite::params![
+                    serde_json::to_string(&prior_wrong_authority).unwrap(),
+                    prior_wrong_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_result_evidence VALUES ('evidence-spawn-wrong-parent','coordinator-run-wrong-parent','project-a','coordinator','completed','ticket-run',5)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run-wrong-parent',?1,?2,?3)",
+                rusqlite::params![
+                    serde_json::to_string(&wrong_authority).unwrap(),
+                    wrong_authority.descriptor_digest.as_str(),
+                    wrong_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        let error = store
+            .persist_coordinator_child_wake(
+                7,
+                &wrong_parent,
+                Role::Reviewer,
+                child_session,
+                7,
+                &serde_json::json!({"request":"must reject"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("different logical Coordinator parent"));
+        let bad_ack_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_reducer_ack WHERE evidence_id='evidence-spawn-wrong-parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_ack_count, 0);
+
+        let mut original_authority = prior_wrong_authority;
+        original_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        store
+            .connection
+            .execute(
+                "UPDATE agent_launch_authority SET authority_json=?1,authority_digest=?2 WHERE agent_run_id='coordinator-run'",
+                rusqlite::params![
+                    serde_json::to_string(&original_authority).unwrap(),
+                    original_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+
+        store
+            .connection
+            .execute(
+                "UPDATE agent_launch_authority SET authority_digest='tampered' WHERE agent_run_id='coordinator-run-2'",
+                [],
+            )
+            .unwrap();
+        let third = coordinator_spawn_result_at(
+            Role::Reviewer,
+            "evidence-spawn-3",
+            "coordinator-run-3",
+            "coordinator-operation-3",
+            7,
+            6,
+            "ticket_run:ticket-run:coordinator",
+        );
+        let mut third_authority = test_authority();
+        third_authority.agent_run_id = AgentRunId::parse("coordinator-run-3").unwrap();
+        third_authority.role = Role::Coordinator;
+        third_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        third_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        third_authority.parent_role = Some(Role::Supervisor);
+        third_authority.ticket_revision = Some(Revision(7));
+        third_authority.operation_id = OperationId::parse("coordinator-operation-3").unwrap();
+        third_authority.run_epoch = 6;
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_result_evidence VALUES ('evidence-spawn-3','coordinator-run-3','project-a','coordinator','completed','ticket-run',6)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run-3',?1,?2,?3)",
+                rusqlite::params![
+                    serde_json::to_string(&third_authority).unwrap(),
+                    third_authority.descriptor_digest.as_str(),
+                    third_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        let authority_error = store
+            .persist_coordinator_child_wake(
+                7,
+                &third,
+                Role::Reviewer,
+                child_session,
+                7,
+                &serde_json::json!({"request":"must reject corrupt historical authority"}),
+            )
+            .unwrap_err();
+        assert!(authority_error.contains("authority digest fields do not match"));
+        let tampered_ack_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_reducer_ack WHERE evidence_id='evidence-spawn-3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tampered_ack_count, 0);
+    }
+
+    #[test]
     fn child_parent_resolves_from_source_evidence_and_host_authority() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
                 "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, lifecycle TEXT);
                  INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:planner','coordinator_child','evidence-spawn','pending');
-                 CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,project_id TEXT,role TEXT,outcome TEXT);
-                 INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed');
+                 CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,project_id TEXT,role TEXT,outcome TEXT,ticket_run_id TEXT);
+                 INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed','ticket-run');
                  CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT);",
             )
             .unwrap();
@@ -6699,6 +6963,11 @@ impl ConfigStore {
                 "Coordinator child source binding differs from registered launch authority".into(),
             );
         }
+        if source_authority.role_session_id != format!("ticket_run:{ticket_run_id}:coordinator") {
+            return Err(
+                "Coordinator child source has a noncanonical Coordinator role session".into(),
+            );
+        }
         let run: Option<(u64, String, u64, String)> = tx
             .query_row(
                 "SELECT revision,internal_phase,config_revision,config_digest FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
@@ -6748,21 +7017,80 @@ impl ConfigStore {
                 "Coordinator evidence already targets a different child role session".into(),
             );
         }
-        let session_source: Option<String> = tx
-            .query_row(
-                "SELECT source_id FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='coordinator_child' ORDER BY wake_input_id LIMIT 1",
-                [role_session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if session_source
-            .as_deref()
-            .is_some_and(|source| source != evidence_id)
+        let prior_parents = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT w.source_id,e.agent_run_id,e.project_id,e.role,e.outcome,e.ticket_run_id FROM role_wake_inputs w LEFT JOIN agent_result_evidence e ON e.evidence_id=w.source_id WHERE w.project_id=?1 AND w.role_session_id=?2 AND w.source_type='coordinator_child' ORDER BY w.wake_input_id",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![binding.project_id.as_str(), role_session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for (prior_evidence, prior_run, prior_project, prior_role, prior_outcome, prior_ticket) in
+            prior_parents
         {
-            return Err(
-                "canonical child role session already has a different Coordinator parent".into(),
-            );
+            if prior_evidence == evidence_id {
+                continue;
+            }
+            let Some(prior_run) = prior_run else {
+                return Err(
+                    "canonical child role session has missing Coordinator source evidence".into(),
+                );
+            };
+            if prior_project.as_deref() != Some(binding.project_id.as_str())
+                || prior_role.as_deref() != Some("coordinator")
+                || prior_outcome.as_deref() != Some("completed")
+                || prior_ticket.as_deref() != Some(ticket_run_id.as_str())
+            {
+                return Err(
+                    "canonical child role session has an invalid prior Coordinator source".into(),
+                );
+            }
+            let (prior_authority_json, prior_descriptor_digest, prior_authority_digest): (
+                String,
+                String,
+                String,
+            ) = tx
+                .query_row(
+                    "SELECT authority_json,descriptor_digest,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+                    [&prior_run],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            let prior_authority: AgentLaunchAuthority =
+                crate::protocol::parse_unique(prior_authority_json.as_bytes())?;
+            prior_authority.validate()?;
+            if prior_authority.agent_run_id.as_str() != prior_run
+                || prior_authority.descriptor_digest.as_str() != prior_descriptor_digest
+                || prior_authority.digest()?.as_str() != prior_authority_digest
+            {
+                return Err("stored Agent launch authority digest fields do not match".into());
+            }
+            if prior_authority.role != Role::Coordinator
+                || prior_authority.project_id != binding.project_id
+                || prior_authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+                || prior_authority.role_session_id != source_authority.role_session_id
+            {
+                return Err(
+                    "canonical child role session has a different logical Coordinator parent"
+                        .into(),
+                );
+            }
         }
         let existing: Option<String> = tx
             .query_row(
@@ -6826,12 +7154,12 @@ impl ConfigStore {
         let Some(evidence_id) = evidence_id else {
             return Ok(None);
         };
-        let parent_run: String = self
+        let (parent_run, ticket_run_id): (String, String) = self
             .connection
             .query_row(
-                "SELECT agent_run_id FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND role='coordinator' AND outcome='completed'",
+                "SELECT agent_run_id,ticket_run_id FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND role='coordinator' AND outcome='completed' AND ticket_run_id IS NOT NULL",
                 rusqlite::params![evidence_id, project_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| error.to_string())?;
         let authority = self
@@ -6839,8 +7167,17 @@ impl ConfigStore {
             .ok_or("Coordinator child source has no host launch authority")?;
         if authority.role != crate::domain::types::Role::Coordinator
             || authority.project_id != *project_id
+            || authority
+                .ticket_run_id
+                .as_ref()
+                .map(|ticket| ticket.as_str())
+                != Some(ticket_run_id.as_str())
+            || authority.role_session_id != format!("ticket_run:{ticket_run_id}:coordinator")
         {
-            return Err("Coordinator child source authority has the wrong role or Project".into());
+            return Err(
+                "Coordinator child source authority has the wrong role, Project, or TicketRun"
+                    .into(),
+            );
         }
         Ok(Some(authority))
     }
