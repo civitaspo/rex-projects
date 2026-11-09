@@ -1473,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_merge_review_approval_advances_only_on_a_matching_durable_step_receipt() {
+    fn merge_work_receipt_consumer_enforces_approval_and_builds_postmortem_inbox() {
         merge_review_approval_fixture(false);
     }
 
@@ -2474,5 +2474,77 @@ mod tests {
             .unwrap();
         assert_eq!(postmortem.phase, super::Phase::Postmortem);
         assert_eq!(postmortem.revision, 8);
+        let completion_context = crate::runtime_services::postmortem_completion_context_for_test(
+            &mut store,
+            generation,
+            &postmortem,
+            &loaded.digest,
+        )
+        .unwrap();
+        assert_eq!(
+            completion_context.operation_completion.state,
+            "not_required"
+        );
+        assert_eq!(
+            completion_context
+                .operation_completion
+                .not_required_reason
+                .as_deref(),
+            Some("This fixture has no deployed runtime target.")
+        );
+        assert_eq!(
+            completion_context
+                .implementation_publication
+                .merge_verification
+                .merge_commit_sha,
+            verified.merge_commit_sha
+        );
+        assert_eq!(
+            completion_context
+                .implementation_publication
+                .merge_verification
+                .included_head_sha,
+            verified.included_head_sha
+        );
+        let session = format!("ticket_run:{}:postmortem", ticket_run_id);
+        let inputs = store
+            .pending_role_wake_inputs(&project_id, &session, 256)
+            .unwrap();
+        let postmortem_wakes = inputs
+            .into_iter()
+            .filter(|input| {
+                input.source_type == "ticket_run_transition"
+                    && input.payload_json["target"] == "postmortem"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(postmortem_wakes.len(), 1);
+        let wake = &postmortem_wakes[0];
+        let mut inbox = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: session,
+            agent_run_id: "agent-postmortem-fixture".into(),
+            digest: digest('0'),
+            inputs: vec![crate::agent_api::AgentWakeItem {
+                wake_input_id: wake.wake_input_id,
+                source_type: wake.source_type.clone(),
+                source_id: wake.source_id.clone(),
+                source_revision: wake.source_revision,
+                priority: wake.priority,
+                payload_json: wake.payload_json.clone(),
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: Some(completion_context.clone()),
+            }],
+        };
+        inbox.digest = inbox.content_digest().unwrap();
+        let inbox_root = tempfile::tempdir().unwrap();
+        crate::agent_api::publish_wake_snapshot(inbox_root.path(), inbox.clone()).unwrap();
+        let consumed =
+            crate::agent_api::read_inbox(inbox_root.path(), "agent-postmortem-fixture", 0).unwrap();
+        assert_eq!(
+            consumed[0].host_completion_context,
+            Some(completion_context)
+        );
     }
 }

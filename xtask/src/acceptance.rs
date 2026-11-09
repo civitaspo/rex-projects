@@ -45,6 +45,21 @@ const FIXTURE_TICKET_NAMESPACE: &str = "fixture/acceptance";
 const FIXTURE_TICKET_ID: &str = "ticket-1";
 const ACCEPTANCE_WORK_TASK: &str = "Create and commit a bounded acceptance fixture artifact in the assigned managed worktree, register the resulting Change manifest through the public Agent CLI, verify the exact signed host commit receipt, and preserve this complete task description in the pull request body.";
 const NATIVE_WORKER_LIFECYCLE_TASK: &str = "In the assigned managed worktree, run `/bin/sleep 300` in the foreground and wait for it to return. Do not edit files, run any other command, commit, or make remote changes. This is a bounded process-lifecycle exercise.";
+const NATIVE_WORKER_LAUNCH_EVIDENCE_QUERY: &str = "SELECT a.agent_run_id,a.launch_operation_id,a.runtime_binary_digest,a.rex_server_identity,a.rex_session_id,a.rex_window_id,
+                    a.rex_block_id,a.control_dir,a.workspace_path,r.state,l.state,
+                    l.wrapper_process_identity_json,l.provider_process_tree_json,
+                    s.disposition,s.reservation_epoch
+             FROM agent_launch_authority a
+             JOIN agent_runs r USING(agent_run_id)
+             JOIN agent_launch_state l USING(agent_run_id)
+             JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id
+             WHERE a.role='worker' AND r.state='running' AND l.state='running'
+               AND a.rex_server_identity=?1 AND a.rex_session_id=?2
+               AND a.qualification_receipt_digest=?3
+               AND l.wrapper_process_identity_json IS NOT NULL
+               AND l.provider_process_tree_json IS NOT NULL
+               AND s.disposition='live'
+             ORDER BY a.created_at_unix DESC LIMIT 1";
 const PROVIDER_ROLES: [&str; 8] = [
     "supervisor",
     "coordinator",
@@ -2522,27 +2537,29 @@ fn observe_running_native_worker(
     );
     let row: Option<NativeWorkerLaunchRow> = database
         .query_row(
-            "SELECT a.agent_run_id,a.operation_id,a.runtime_binary_digest,a.rex_server_identity,a.rex_session_id,a.rex_window_id,
-                    a.rex_block_id,a.control_dir,a.workspace_path,r.state,l.state,
-                    l.wrapper_process_identity_json,l.provider_process_tree_json,
-                    s.disposition,s.reservation_epoch
-             FROM agent_launch_authority a
-             JOIN agent_runs r USING(agent_run_id)
-             JOIN agent_launch_state l USING(agent_run_id)
-             JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id
-             WHERE a.role='worker' AND r.state='running' AND l.state='running'
-               AND a.rex_server_identity=?1 AND a.rex_session_id=?2
-               AND a.qualification_receipt_digest=?3
-               AND l.wrapper_process_identity_json IS NOT NULL
-               AND l.provider_process_tree_json IS NOT NULL
-               AND s.disposition='live'
-             ORDER BY a.created_at_unix DESC LIMIT 1",
-            params![request.expected_instance, request.rex_session, receipt_digest],
+            NATIVE_WORKER_LAUNCH_EVIDENCE_QUERY,
+            params![
+                request.expected_instance,
+                request.rex_session,
+                receipt_digest
+            ],
             |row| {
                 Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                    row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )
@@ -4082,6 +4099,26 @@ mod tests {
             &parsed,
             &stale_birth
         ));
+    }
+
+    #[test]
+    fn native_worker_readiness_query_executes_against_production_database_schema() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _store = rex_projects::store::ConfigStore::open(temporary.path()).unwrap();
+        let database = Connection::open_with_flags(
+            temporary.path().join("state.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let row: Option<String> = database
+            .query_row(
+                NATIVE_WORKER_LAUNCH_EVIDENCE_QUERY,
+                params!["fixture-instance", "fixture-session", "f".repeat(64)],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(row.is_none());
     }
 
     #[test]

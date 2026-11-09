@@ -1052,12 +1052,17 @@ pub(crate) fn persist_registration(
         return Err("ArtifactAdd references an unknown AgentRun".into());
     };
     let stored: AgentLaunchAuthority = crate::protocol::parse_unique(authority_json.as_bytes())?;
-    if stored != *authority
-        || authority_digest != authority.digest()?.as_str()
-        || authority.controller_generation != owner_generation
-    {
+    if stored != *authority || authority_digest != authority.digest()?.as_str() {
         return Err("ArtifactAdd launch authority is stale or does not match the AgentRun".into());
     }
+    crate::store::agent_recovery::validate_agent_run_current_owner(
+        &tx,
+        &authority.agent_run_id,
+        authority.controller_generation,
+        owner_generation,
+        &authority.digest()?,
+        &authority.descriptor_digest,
+    )?;
     let expected_id = ArtifactId::from_registration_identity(
         &authority.project_id,
         &authority.agent_run_id,
@@ -1933,7 +1938,7 @@ mod tests {
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
              CREATE TABLE projects(project_id TEXT PRIMARY KEY);
              CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY);
-             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,controller_generation INTEGER NOT NULL);
              CREATE TABLE rex_views(view_id TEXT PRIMARY KEY);
              CREATE TABLE rex_view_blocks(view_id TEXT NOT NULL,block_id TEXT NOT NULL,PRIMARY KEY(view_id,block_id));
              CREATE TABLE agent_launch_authority(agent_run_id TEXT PRIMARY KEY,authority_json TEXT NOT NULL,authority_digest TEXT NOT NULL);
@@ -1957,6 +1962,15 @@ mod tests {
             .execute(
                 "INSERT INTO ticket_runs(ticket_run_id) VALUES (?1)",
                 [authority.ticket_run_id.as_ref().unwrap().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,controller_generation) VALUES (?1,?2)",
+                rusqlite::params![
+                    authority.agent_run_id.as_str(),
+                    authority.controller_generation
+                ],
             )
             .unwrap();
         let authority_json = serde_json::to_string(&authority).unwrap();

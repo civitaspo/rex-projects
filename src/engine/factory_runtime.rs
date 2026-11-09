@@ -681,7 +681,14 @@ fn apply_agent_result(
         && binding.role == Role::Postmortem
         && result.validated.kind == RoleOutputKind::PostmortemReady
     {
-        return apply_postmortem_result(store, owner_generation, now_unix, services, result);
+        return apply_postmortem_result(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            services,
+            result,
+        );
     }
     if result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
         && binding.role == Role::Operator
@@ -2298,6 +2305,7 @@ fn apply_postmortem_result(
     store: &mut ConfigStore,
     owner_generation: u64,
     now_unix: i64,
+    config: &Config,
     services: &impl FactoryRuntimeServices,
     result: &crate::store::agent_results::IngestedAgentResult,
 ) -> Result<bool, String> {
@@ -2324,6 +2332,13 @@ fn apply_postmortem_result(
         return Err("Postmortem result is stale or outside Postmortem".into());
     }
     validate_result_configuration(store, services.configuration_digest(), binding)?;
+    let max_source_bytes = config
+        .knowledge
+        .as_ref()
+        .ok_or("Postmortem publication requires configured knowledge limits")?
+        .max_source_bytes;
+    let max_source_bytes = usize::try_from(max_source_bytes)
+        .map_err(|_| "knowledge.max_source_bytes exceeds the supported size")?;
     let RoleResultPayload::PostmortemReady(payload) = &result.validated.typed_payload else {
         return Err("validated PostmortemReady kind has a different typed payload".into());
     };
@@ -2376,7 +2391,7 @@ fn apply_postmortem_result(
             source_bytes = source_bytes
                 .checked_add(artifact_size)
                 .ok_or("Postmortem source byte count overflow")?;
-            if source_bytes > crate::knowledge::DEFAULT_MAX_ARTICLE_BYTES {
+            if source_bytes > max_source_bytes {
                 return Err("Postmortem source material exceeds the configured byte limit".into());
             }
             let content = services.read_verified_artifact(verified)?;
@@ -2404,7 +2419,7 @@ fn apply_postmortem_result(
         findings: payload.findings.clone(),
         sources,
         generated_at: format_utc_timestamp(now_unix)?,
-        max_source_bytes: crate::knowledge::DEFAULT_MAX_ARTICLE_BYTES,
+        max_source_bytes,
     };
     let request_json = serde_json::to_string(&input).map_err(|error| error.to_string())?;
     use sha2::Digest as _;
@@ -5793,6 +5808,7 @@ pub(crate) mod tests {
                 payload_json: wake.payload_json.clone(),
                 host_artifact_source_evidence_ids: Vec::new(),
                 host_artifacts: Vec::new(),
+                host_completion_context: None,
             })
             .collect();
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {

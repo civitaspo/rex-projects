@@ -70,6 +70,103 @@ pub struct AgentAdoptionEvidence {
     pub observed_at_unix: i64,
 }
 
+/// Verify that the mutable run is owned by the active generation and that any transfer from the
+/// immutable launch generation is backed by the complete durable adoption chain.
+pub(crate) fn validate_agent_run_current_owner(
+    connection: &rusqlite::Connection,
+    agent_run_id: &AgentRunId,
+    launch_generation: u64,
+    owner_generation: u64,
+    authority_digest: &Digest,
+    descriptor_digest: &Digest,
+) -> Result<(), String> {
+    let current_generation: Option<u64> = connection
+        .query_row(
+            "SELECT controller_generation FROM agent_runs WHERE agent_run_id=?1",
+            [agent_run_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_generation != Some(owner_generation) {
+        return Err("AgentRun is not owned by the active controller generation".into());
+    }
+    if launch_generation == owner_generation {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT controller_generation,previous_controller_generation,authority_digest,descriptor_digest,evidence_digest,evidence_json FROM agent_run_adoptions WHERE agent_run_id=?1 ORDER BY controller_generation",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([agent_run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut expected_previous_generation = launch_generation;
+    for row in rows {
+        let (
+            generation,
+            previous_generation,
+            digest,
+            stored_descriptor_digest,
+            stored_digest,
+            json,
+        ) = row.map_err(|error| error.to_string())?;
+        if generation <= launch_generation {
+            return Err("AgentRun adoption predates immutable launch authority".into());
+        }
+        if generation > owner_generation {
+            break;
+        }
+        let evidence: AgentAdoptionEvidence = crate::protocol::parse_unique(json.as_bytes())?;
+        if generation != evidence.controller_generation
+            || previous_generation != evidence.previous_controller_generation
+            || previous_generation != expected_previous_generation
+            || evidence.agent_run_id != *agent_run_id
+            || digest != authority_digest.as_str()
+            || stored_descriptor_digest != descriptor_digest.as_str()
+            || evidence.authority_digest != *authority_digest
+            || evidence.descriptor_digest.as_str() != descriptor_digest.as_str()
+            || evidence.digest()?.as_str() != stored_digest
+        {
+            return Err(
+                "AgentRun adoption evidence does not continue immutable launch ownership".into(),
+            );
+        }
+        expected_previous_generation = generation;
+    }
+    if expected_previous_generation != owner_generation {
+        return Err("AgentRun has no valid adoption to the active controller generation".into());
+    }
+    Ok(())
+}
+
+impl ConfigStore {
+    pub(crate) fn validate_active_agent_run_owner(
+        &self,
+        authority: &AgentLaunchAuthority,
+        owner_generation: u64,
+    ) -> Result<(), String> {
+        validate_agent_run_current_owner(
+            &self.connection,
+            &authority.agent_run_id,
+            authority.controller_generation,
+            owner_generation,
+            &authority.digest()?,
+            &authority.descriptor_digest,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdoptedProcessIdentity {

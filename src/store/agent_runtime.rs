@@ -237,6 +237,7 @@ fn read_legacy_wake_context_rows(
                     payload_json,
                     host_artifact_source_evidence_ids: Vec::new(),
                     host_artifacts: Vec::new(),
+                    host_completion_context: None,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2421,6 +2422,7 @@ pub(crate) mod tests {
                 source_evidence_id,
                 source_authority_digest: digest('c'),
             }],
+            host_completion_context: None,
         };
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
@@ -3400,5 +3402,201 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(slot_owner, "run-2");
+    }
+
+    #[test]
+    fn adopted_live_agent_mailbox_request_uses_current_owner_without_rewriting_authority() {
+        use crate::store::OwnerMetadata;
+        use sha2::{Digest as _, Sha256};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut fixture = completed_block_loss_fixture(temp.path(), false);
+        let launch_generation = fixture.generation;
+        let reservation = fixture
+            .store
+            .agent_launch_reservation_for_run(&fixture.run.agent_run_id)
+            .unwrap()
+            .unwrap();
+        let original_authority = fixture.run.authority.clone();
+        let original_reservation_digest = reservation.digest().unwrap();
+        let owner_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "mailbox-adoption-owner-restart".into(),
+                state_root: temp.path().join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "mailbox-owner-restarted".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(owner_generation > launch_generation);
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET state='unknown',controller_generation=?2 WHERE agent_run_id=?1",
+                rusqlite::params![fixture.run.agent_run_id.as_str(), owner_generation],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.run.agent_run_id.as_str()],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_launch_state SET provider_process_tree_json=?2 WHERE agent_run_id=?1",
+                rusqlite::params![
+                    fixture.run.agent_run_id.as_str(),
+                    serde_json::to_string(&fixture.provider).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let mut process_tree = fixture
+            .provider
+            .process_tree
+            .iter()
+            .map(
+                |process| crate::store::agent_recovery::AdoptedProcessIdentity {
+                    pid: process.pid,
+                    parent_pid: process.parent_pid,
+                    process_group_id: process.process_group_id,
+                    start_identity: process.start_identity.clone(),
+                    identity_quality: serde_json::to_value(process.identity_quality)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                },
+            )
+            .collect::<Vec<_>>();
+        process_tree.retain(|process| process.pid != fixture.wrapper.pid);
+        process_tree.push(crate::store::agent_recovery::AdoptedProcessIdentity {
+            pid: fixture.wrapper.pid,
+            parent_pid: 1,
+            process_group_id: fixture.wrapper.pid,
+            start_identity: fixture.wrapper.start_identity.clone(),
+            identity_quality: "kernel_birth_token".into(),
+        });
+        process_tree.sort_by_key(|process| process.pid);
+        let tree_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+        ))
+        .unwrap();
+        let evidence = crate::store::agent_recovery::AgentAdoptionEvidence {
+            schema_version: 1,
+            agent_run_id: fixture.run.agent_run_id.clone(),
+            controller_generation: owner_generation,
+            previous_controller_generation: launch_generation,
+            authority_digest: original_authority.digest().unwrap(),
+            descriptor_digest: original_authority.descriptor_digest.clone(),
+            rex_process_observation_digest: Digest::parse("c".repeat(64)).unwrap(),
+            process_tree_digest: tree_digest,
+            provider_start_tree_digest: fixture.provider.process_tree_digest.clone(),
+            process_tree,
+            wrapper_pid: fixture.wrapper.pid,
+            wrapper_start_identity: fixture.wrapper.start_identity.clone(),
+            provider_pid: fixture.provider.provider_pid,
+            provider_start_identity: fixture.provider.provider_start_identity.clone(),
+            observed_at_unix: 1,
+        };
+        assert!(
+            fixture
+                .store
+                .record_agent_run_adoption(&evidence, fixture.run.reservation_epoch)
+                .unwrap()
+        );
+
+        crate::mailbox::MailboxCapability::create(
+            fixture.run.agent_run_id.to_string(),
+            &reservation.mailbox_directory,
+            reservation.mailbox_expires_at_unix,
+            crate::mailbox::MailboxLimits {
+                max_request_bytes: reservation.mailbox_max_request_bytes as usize,
+                max_pending_requests: reservation.mailbox_max_pending_requests as usize,
+            },
+        )
+        .unwrap();
+        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
+            fixture.run.agent_run_id.to_string(),
+            &reservation.mailbox_directory,
+        )
+        .unwrap();
+        let request_id = "adopted-mailbox-unsupported";
+        let envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            operation_id: Some(original_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("test.unsupported").unwrap(),
+            project_id: Some(original_authority.project_id.clone()),
+            run_id: Some(fixture.run.agent_run_id.to_string()),
+            attempt: Some(original_authority.attempt),
+            run_epoch: Some(original_authority.run_epoch),
+            expected_subject_revision: None,
+            role: Some(original_authority.role),
+            request_type: None,
+            params: serde_json::json!({}),
+        };
+        mailbox
+            .queue(
+                request_id,
+                &serde_json::to_vec(&envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+        assert!(
+            fixture
+                .store
+                .process_one_agent_mailbox_request(
+                    owner_generation,
+                    fixture.run.agent_run_id.as_str(),
+                    crate::store::now_unix().unwrap(),
+                    &artifacts,
+                    &Default::default(),
+                )
+                .unwrap()
+        );
+        let response = mailbox
+            .read_receipt(request_id, crate::mailbox::unix_time_now().unwrap())
+            .unwrap()
+            .unwrap();
+        let response: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(&response).unwrap();
+        assert_eq!(
+            serde_json::to_value(response.error.unwrap().code).unwrap(),
+            serde_json::json!("unsupported")
+        );
+        assert_eq!(
+            fixture
+                .store
+                .agent_launch_authority(&fixture.run.agent_run_id)
+                .unwrap()
+                .unwrap(),
+            original_authority
+        );
+        assert_eq!(
+            fixture
+                .store
+                .agent_launch_reservation_for_run(&fixture.run.agent_run_id)
+                .unwrap()
+                .unwrap()
+                .digest()
+                .unwrap(),
+            original_reservation_digest
+        );
     }
 }

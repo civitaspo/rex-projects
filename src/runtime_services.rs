@@ -138,6 +138,7 @@ struct WorkerAssignmentContext<'a> {
     expected_head: &'a str,
     verification: Option<&'a WorkerVerificationAssignment>,
     recovery_authorization: Option<&'a crate::engine::orchestration::WorkerRecoveryAuthorization>,
+    retained_host_commit: Option<&'a crate::delivery_runtime::CommitWorkerManifestEffectReceipt>,
     commit_mode: crate::domain::types::CommitMode,
     repository_id: &'a crate::domain::ids::RepositoryId,
 }
@@ -221,6 +222,189 @@ fn accepted_publication_subject(
         }
     });
     Ok(subject)
+}
+
+fn postmortem_completion_context(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    config_digest: &Digest,
+) -> Result<crate::agent_api::HostCompletionContext, String> {
+    use crate::store::operations::CompletionGate;
+    use sha2::Digest as _;
+
+    if run.phase != crate::engine::reducer::Phase::Postmortem
+        || store
+            .operations()?
+            .completion_gate(&run.project_id, &run.ticket_run_id)?
+            != CompletionGate::WaitingForPostmortem
+    {
+        return Err("Postmortem launch is missing a current completed operation gate".into());
+    }
+    let plan = store
+        .operations()?
+        .plan_state(&run.project_id, &run.ticket_run_id)?
+        .ok_or("Postmortem launch has no persisted operation plan")?;
+    if plan.config_digest != *config_digest
+        || !matches!(plan.state.as_str(), "succeeded" | "not_required")
+        || (plan.state == "not_required" && plan.not_required_reason.is_none())
+    {
+        return Err(
+            "Postmortem operation plan is stale or lacks its explicit completion reason".into(),
+        );
+    }
+    let merge_transition = store
+        .ticket_run_transition_evidence(
+            owner_generation,
+            &run.project_id,
+            &run.ticket_run_id,
+            run.revision.saturating_sub(256),
+            256,
+        )?
+        .into_iter()
+        .find_map(|(revision, evidence)| {
+            (evidence["kind"] == "merge_verified").then_some((revision, evidence))
+        })
+        .ok_or("Postmortem launch lacks persisted host-verified merge evidence")?;
+    let source_revision = merge_transition.1["source_revision"]
+        .as_u64()
+        .ok_or("merge verification transition lacks its source revision")?;
+    if source_revision.checked_add(1) != Some(merge_transition.0)
+        || merge_transition.0 > run.revision
+    {
+        return Err(
+            "merge verification evidence is outside the current TicketRun revision chain".into(),
+        );
+    }
+    let merge_work = store
+        .merge_work_item(
+            &run.project_id,
+            &run.ticket_run_id,
+            crate::domain::ids::Revision(source_revision),
+        )?
+        .ok_or("merge verification transition has no registered MergeWork receipt")?;
+    if merge_transition.1["work_id"].as_str() != Some(merge_work.work_id.as_str())
+        || merge_work.configuration_digest != *config_digest
+    {
+        return Err(
+            "Postmortem MergeWork receipt differs from the current Project or accepted plan".into(),
+        );
+    }
+    let succeeded_effects = store.list_succeeded_effect_receipts(
+        owner_generation,
+        &run.project_id,
+        "ticket_run",
+        run.ticket_run_id.as_str(),
+        256,
+    )?;
+    let operation_receipts = succeeded_effects
+        .iter()
+        .filter(|receipt| receipt.intent().kind == "operation")
+        .map(|receipt| {
+            let intent = receipt.intent();
+            Ok(crate::agent_api::HostPublicationReceipt {
+                operation_id: intent.operation_id.clone(),
+                kind: intent.kind.clone(),
+                request_digest: Digest::parse(intent.request_digest.clone())?,
+                receipt_digest: Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(receipt.receipt_json().as_bytes())
+                ))?,
+                receipt: serde_json::from_str(receipt.receipt_json())
+                    .map_err(|error| format!("invalid persisted operation receipt: {error}"))?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let merge_effect = succeeded_effects
+        .into_iter()
+        .find_map(|receipt| {
+            let intent = receipt.intent();
+            if intent.kind != "merge" || intent.expected_revision != Some(source_revision) {
+                return None;
+            }
+            let request: crate::merge_executor::MergeStepEffectRequest =
+                serde_json::from_str(&intent.request_json).ok()?;
+            let verification_step = merge_work.document.procedure.steps.last()?;
+            if request.work_id != merge_work.work_id
+                || request.awaiting_merge_revision.0 != source_revision
+                || request.step_key != verification_step.key
+                || request.prior_receipts.len() + 1 != merge_work.document.procedure.steps.len()
+            {
+                return None;
+            }
+            let verified: crate::merge_executor::MergeVerificationReceipt =
+                serde_json::from_str(receipt.receipt_json()).ok()?;
+            if merge_transition.1["merge_commit_sha"].as_str()
+                != Some(verified.merge_commit_sha.as_str())
+                || merge_transition.1["included_head_sha"].as_str()
+                    != Some(verified.included_head_sha.as_str())
+                || verified.included_head_sha != merge_work.document.evidence.subject.head_sha
+            {
+                return None;
+            }
+            Some((receipt, verified))
+        })
+        .ok_or("Postmortem launch lacks the exact succeeded MergeWork verification receipt")?;
+    let merge_receipt_json: serde_json::Value = serde_json::from_str(merge_effect.0.receipt_json())
+        .map_err(|error| format!("persisted merge verification receipt is invalid: {error}"))?;
+    let merge_receipt_digest = Digest::parse(format!(
+        "{:x}",
+        sha2::Sha256::digest(merge_effect.0.receipt_json().as_bytes())
+    ))?;
+    Ok(crate::agent_api::HostCompletionContext {
+        schema_version: 1,
+        scope: crate::agent_api::HostCompletionScope {
+            project_id: run.project_id.clone(),
+            ticket_run_id: run.ticket_run_id.clone(),
+            ticket_id: run.ticket_id.clone(),
+            ticket_revision: run.revision,
+            configuration_digest: config_digest.clone(),
+        },
+        operation_completion: crate::agent_api::HostOperationCompletion {
+            plan_digest: plan.plan_digest,
+            state: plan.state,
+            not_required_reason: plan.not_required_reason,
+            receipts: operation_receipts,
+        },
+        implementation_publication: crate::agent_api::HostImplementationPublication {
+            accepted_plan_digest: merge_work.accepted_plan_digest.clone(),
+            configuration_digest: merge_work.configuration_digest.clone(),
+            merge_work_id: merge_work.work_id.clone(),
+            assessed_revision: merge_work.assessed_revision.0,
+            awaiting_merge_revision: merge_work.awaiting_merge_revision.0,
+            prepared_receipt_digest: merge_work.prepared_receipt_digest.clone(),
+            publication_set_digest: merge_work.publication_set_digest.clone(),
+            assessment_id: merge_work.document.assessment_id.clone(),
+            assessment_evidence_id: merge_work.document.assessment_evidence_id.clone(),
+            assessment_result_digest: merge_work.document.assessment_result_digest.clone(),
+            intent_evidence_id: merge_work.document.intent_evidence_id.clone(),
+            intent_result_digest: merge_work.document.intent_result_digest.clone(),
+            assessment: serde_json::to_value(&merge_work.document.assessment)
+                .map_err(|error| error.to_string())?,
+            verification: None,
+            merge_verification: crate::agent_api::HostMergeVerification {
+                work_id: merge_work.work_id,
+                configuration_digest: merge_work.configuration_digest,
+                accepted_plan_digest: merge_work.accepted_plan_digest,
+                assessment_id: merge_work.document.assessment_id,
+                source_revision,
+                merge_commit_sha: merge_effect.1.merge_commit_sha,
+                included_head_sha: merge_effect.1.included_head_sha,
+                receipt_digest: merge_receipt_digest,
+                receipt: merge_receipt_json,
+            },
+        },
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn postmortem_completion_context_for_test(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    config_digest: &Digest,
+) -> Result<crate::agent_api::HostCompletionContext, String> {
+    postmortem_completion_context(store, owner_generation, run, config_digest)
 }
 
 impl RuntimeServices {
@@ -1701,6 +1885,13 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                                 .unwrap_or_else(|| context.token.expected_head()),
                             verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
+                            retained_host_commit: retained_host_commit(
+                                store,
+                                &reservation.project_id,
+                                &reservation.config_digest,
+                                worker_recovery_authorization.as_ref(),
+                            )?
+                            .as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
                         })?)
@@ -1715,6 +1906,21 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                     .filter(|_| worker_context.is_none())
                     .map(|plan| plan.plan_digest.clone()),
                 implementation_publication_subject,
+                completion_context: if reservation.role == Role::Postmortem {
+                    Some(
+                        serde_json::to_value(postmortem_completion_context(
+                            store,
+                            owner_generation,
+                            active_run
+                                .as_ref()
+                                .ok_or("Postmortem reservation has no TicketRun")?,
+                            &self.applied_config.digest,
+                        )?)
+                        .map_err(|error| error.to_string())?,
+                    )
+                } else {
+                    None
+                },
                 previous_decisions: crate::roles::worker_recovery_decisions(
                     worker_recovery_authorization.as_ref(),
                 ),
@@ -2215,7 +2421,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             return Err("Worker result reservation differs from its prepared assignment".into());
         }
         let recovery_authorization = reservation.wake_snapshot.worker_recovery_authorization()?;
-        let expected_head = recovery_authorization
+        let recovery_head = recovery_authorization
             .as_ref()
             .map(|authorization| authorization.expected_head.as_str())
             .unwrap_or_else(|| prepared.expected_head());
@@ -2233,6 +2439,25 @@ impl FactoryRuntimeServices for RuntimeServices {
             );
         }
         let change = change[0];
+        let retained_commit = retained_host_commit(
+            store,
+            &binding.project_id,
+            &binding.config_digest,
+            recovery_authorization.as_ref(),
+        )?;
+        let reuse_retained_commit = retained_commit.as_ref().is_some_and(|receipt| {
+            change.host_commit_operation_id.as_deref() == Some(receipt.commit.operation_id.as_str())
+        });
+        let expected_head = if reuse_retained_commit {
+            retained_commit
+                .as_ref()
+                .expect("matched retained commit")
+                .commit
+                .expected_head
+                .as_str()
+        } else {
+            recovery_head
+        };
         if change.previous_head.as_str() != expected_head {
             return Err("Worker change does not start at its host-authorized expected HEAD".into());
         }
@@ -2303,13 +2528,31 @@ impl FactoryRuntimeServices for RuntimeServices {
                 }
                 let receipt: crate::delivery_runtime::CommitWorkerManifestEffectReceipt =
                     crate::protocol::parse_unique(committed_effect.receipt_json().as_bytes())?;
-                if receipt.agent_run_id != binding.agent_run_id
+                let source = *source.first().expect("one Change artifact");
+                let (expected_worker, manifest_matches) = if reuse_retained_commit {
+                    let recovery = recovery_authorization
+                        .as_ref()
+                        .expect("retained commit requires recovery authority");
+                    if retained_commit.as_ref() != Some(&receipt) {
+                        return Err("retained commit changed after recovery validation".into());
+                    }
+                    (
+                        &recovery.prior_worker_agent_run_id,
+                        source.kind == receipt.manifest_artifact.kind
+                            && source.schema_version == receipt.manifest_artifact.schema_version
+                            && source.bytes == receipt.manifest_artifact.bytes
+                            && source.digest == receipt.manifest_artifact.digest,
+                    )
+                } else {
+                    (&binding.agent_run_id, source == &receipt.manifest_artifact)
+                };
+                if receipt.agent_run_id != *expected_worker
                     || receipt.message_id.trim().is_empty()
                     || receipt.ticket_run_id != *ticket_run_id
                     || receipt.work_node_id != node_id
                     || receipt.repository_id != node.repository
                     || receipt.base_sha != prepared.base_sha()
-                    || receipt.manifest_artifact != **source.first().expect("one Change artifact")
+                    || !manifest_matches
                     || receipt.commit.operation_id != operation_id
                     || receipt.commit.expected_head != expected_head
                     || receipt.commit.observed_head != change.branch_head.as_str()
@@ -2712,6 +2955,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             &runnable.record.config_digest,
             &workspace,
             wake_inputs,
+            None,
         )?;
         let wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
@@ -2736,6 +2980,7 @@ impl FactoryRuntimeServices for RuntimeServices {
                 accepted_plan: None,
                 accepted_plan_digest: None,
                 implementation_publication_subject: None,
+                completion_context: None,
                 previous_decisions: Vec::new(),
                 required_evidence: Vec::new(),
                 stop_conditions: Vec::new(),
@@ -2999,6 +3244,7 @@ impl RuntimeServices {
         config_digest: &Digest,
         workspace: &Path,
         wake_inputs: Vec<crate::store::agent_runtime::PendingRoleWakeInput>,
+        completion_context: Option<&crate::agent_api::HostCompletionContext>,
     ) -> Result<Vec<crate::agent_api::AgentWakeItem>, String> {
         let mut items = Vec::with_capacity(wake_inputs.len());
         for input in wake_inputs {
@@ -3220,6 +3466,8 @@ impl RuntimeServices {
                 } else {
                     Vec::new()
                 };
+            let is_postmortem_transition = input.source_type == "ticket_run_transition"
+                && input.payload_json["target"] == "postmortem";
             items.push(crate::agent_api::AgentWakeItem {
                 wake_input_id: input.wake_input_id,
                 source_type: input.source_type,
@@ -3229,6 +3477,11 @@ impl RuntimeServices {
                 payload_json: input.payload_json,
                 host_artifact_source_evidence_ids,
                 host_artifacts,
+                host_completion_context: if is_postmortem_transition {
+                    completion_context.cloned()
+                } else {
+                    None
+                },
             });
         }
         Ok(items)
@@ -3470,6 +3723,16 @@ impl RuntimeServices {
             } else {
                 None
             };
+        let completion_context = if candidate.role == Role::Postmortem {
+            Some(postmortem_completion_context(
+                store,
+                self.owner_generation,
+                &active_run,
+                &self.configuration_digest,
+            )?)
+        } else {
+            None
+        };
         let worker_node = worker_context
             .as_ref()
             .and_then(|context| {
@@ -3590,6 +3853,13 @@ impl RuntimeServices {
                             expected_head,
                             verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
+                            retained_host_commit: retained_host_commit(
+                                store,
+                                &candidate.project_id,
+                                &self.configuration_digest,
+                                worker_recovery_authorization.as_ref(),
+                            )?
+                            .as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
                         })?)
@@ -3604,6 +3874,11 @@ impl RuntimeServices {
                     .filter(|_| candidate.role != Role::Worker)
                     .map(|plan| plan.plan_digest.clone()),
                 implementation_publication_subject,
+                completion_context: completion_context
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
                 previous_decisions: crate::roles::worker_recovery_decisions(
                     if candidate.role == Role::Worker {
                         worker_recovery_authorization.as_ref()
@@ -3712,6 +3987,7 @@ impl RuntimeServices {
             &runnable.record.config_digest,
             &workspace,
             wake_inputs,
+            completion_context.as_ref(),
         )?;
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
@@ -4571,6 +4847,71 @@ fn worker_verification_assignment(
     }))
 }
 
+fn retained_host_commit(
+    store: &ConfigStore,
+    project_id: &crate::domain::ids::ProjectId,
+    config_digest: &Digest,
+    recovery: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Result<Option<crate::delivery_runtime::CommitWorkerManifestEffectReceipt>, String> {
+    use crate::delivery_runtime::{
+        CommitWorkerManifestEffectPayload, CommitWorkerManifestEffectReceipt,
+    };
+    let Some(recovery) = recovery else {
+        return Ok(None);
+    };
+    recovery.validate()?;
+    let Some(operation_id) = &recovery.prior_host_commit_operation_id else {
+        return Ok(None);
+    };
+    let succeeded = store
+        .succeeded_effect_receipt(operation_id.as_str())?
+        .ok_or("retained Worker commit is not durably succeeded")?;
+    let payload: CommitWorkerManifestEffectPayload =
+        crate::protocol::parse_unique(succeeded.intent().request_json.as_bytes())?;
+    let receipt: CommitWorkerManifestEffectReceipt =
+        crate::protocol::parse_unique(succeeded.receipt_json().as_bytes())?;
+    let receipt_digest = digest_bytes(succeeded.receipt_json().as_bytes())?;
+    if succeeded.intent().kind != "commit_worker_manifest"
+        || succeeded.intent().project_id != *project_id
+        || succeeded.intent().subject_type != "ticket_run"
+        || succeeded.intent().subject_id != recovery.ticket_run_id.as_str()
+        || succeeded.intent().expected_revision != Some(recovery.ticket_revision)
+        || payload.schema_version != 1
+        || payload.agent_run_id != recovery.prior_worker_agent_run_id
+        || payload.project_id != *project_id
+        || payload.configuration_digest != *config_digest
+        || payload.ticket_revision != recovery.ticket_revision
+        || payload.ticket_run_id != recovery.ticket_run_id
+        || payload.work_node_id != recovery.work_node_id
+        || receipt.schema_version != 1
+        || receipt.agent_run_id != recovery.prior_worker_agent_run_id
+        || receipt.message_id != payload.message_id
+        || receipt.message_id.trim().is_empty()
+        || receipt.ticket_run_id != recovery.ticket_run_id
+        || receipt.work_node_id != recovery.work_node_id
+        || receipt.repository_id != payload.repository_id
+        || receipt.base_sha != payload.expected_base_sha
+        || receipt.manifest_artifact != payload.manifest_artifact
+        || receipt.commit.operation_id != *operation_id
+        || receipt.commit.expected_head != payload.expected_head
+        || receipt.commit.repository_id != payload.repository_id
+        || receipt.commit.manifest_digest != payload.manifest_digest
+        || receipt.commit.observed_head != recovery.expected_head
+        || receipt.commit.observed_head == receipt.commit.expected_head
+        || !receipt.commit.signature_verified
+        || !receipt.commit.hooks_completed
+        || !receipt.commit.index_synchronized
+        || receipt.commit.index_sync_conflict
+        || recovery.prior_host_commit_receipt_digest.as_ref() != Some(&receipt_digest)
+        || !recovery
+            .prior_artifact_refs
+            .contains(&receipt.manifest_artifact)
+    {
+        return Err("retained Worker commit differs from its exact recovery authority".into());
+    }
+    Ok(Some(receipt))
+}
+
 fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<String, String> {
     let WorkerAssignmentContext {
         plan_record,
@@ -4582,6 +4923,7 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         expected_head,
         verification,
         recovery_authorization,
+        retained_host_commit,
         commit_mode,
         repository_id,
     } = context;
@@ -4647,6 +4989,7 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
             "repository_id":repository_id,
         },
         "worker_recovery_authorization":recovery_authorization,
+        "retained_host_commit":retained_host_commit,
         "delivery_authority":"The host owns push, pull request creation, merge, and delivery."
     });
     serde_json::to_string(&value).map_err(|error| error.to_string())
@@ -4834,6 +5177,7 @@ mod coordinator_worker_recovery_prompt_tests {
                 accepted_plan: None,
                 accepted_plan_digest: None,
                 implementation_publication_subject: None,
+                completion_context: None,
                 previous_decisions: Vec::new(),
                 required_evidence: Vec::new(),
                 stop_conditions: Vec::new(),
@@ -5045,6 +5389,183 @@ mod worker_assignment_context_tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn retained_commit_requires_the_exact_durable_recovery_receipt() {
+        use crate::delivery_runtime::{
+            CommitWorkerManifestEffectPayload, CommitWorkerManifestEffectReceipt,
+            canonical_delivery_payload,
+        };
+        use crate::store::{
+            EffectIntent, EffectOutcome, ExpectedRevision, OwnerMetadata, ProjectRecord,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = crate::config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
+        )
+        .unwrap();
+        let revision = store
+            .apply_snapshot("retained-commit", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let project_id = ProjectId::parse("retained-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "retained-commit".into(),
+                config_revision: revision.revision,
+                config_digest: applied.digest.clone(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: crate::domain::ids::Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "retained-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "retained-commit".into(),
+                process_start_identity: "fixture-owner".into(),
+                executable_path: "/fixture/rex-projects".into(),
+                executable_digest: "a".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let payload: CommitWorkerManifestEffectPayload = serde_json::from_value(serde_json::json!({
+            "schema_version":1, "agent_run_id":"prior-worker", "project_id":project_id,
+            "message_id":"commit-request", "configuration_digest":applied.digest,
+            "ticket_revision":3, "ticket_namespace":"fixture", "ticket_id":"50",
+            "ticket_run_id":"retained-run", "work_node_id":"docs", "repository_id":"repo-a",
+            "worktree_path":"/fixture/worktree", "branch":"rex-projects/docs",
+            "prepare_operation_id":"prepare-docs", "expected_base_sha":"a".repeat(40),
+            "expected_head":"a".repeat(40),
+                "manifest_artifact":{"artifact_id":"7".repeat(64), "kind":"change",
+                "schema_version":1,"path":"prior-worker/change.json","digest":"b".repeat(64),"bytes":50},
+            "manifest_digest":"c".repeat(64),
+            "manifest":{"schema_version":1,"entries":[{"kind":"delete","path":"old.md"}]},
+            "commit_message":"docs: clarify adapter setup", "required_trailer":"Co-authored-by: Codex <noreply@openai.com>"
+        })).unwrap();
+        let receipt = CommitWorkerManifestEffectReceipt {
+            schema_version: 1,
+            agent_run_id: payload.agent_run_id.clone(),
+            message_id: payload.message_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            work_node_id: payload.work_node_id.clone(),
+            repository_id: payload.repository_id.clone(),
+            base_sha: payload.expected_base_sha.clone(),
+            manifest_artifact: payload.manifest_artifact.clone(),
+            commit: crate::host_commit::HostCommitReceipt {
+                operation_id: crate::domain::ids::OperationId::parse("retained-operation").unwrap(),
+                repository_id: payload.repository_id.clone(),
+                expected_head: payload.expected_head.clone(),
+                observed_head: "d".repeat(40),
+                tree: "e".repeat(40),
+                manifest_digest: payload.manifest_digest.clone(),
+                signature_verified: true,
+                hooks_completed: true,
+                index_synchronized: true,
+                index_sync_conflict: false,
+            },
+        };
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        let mut recovery = crate::engine::orchestration::WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: payload.ticket_run_id.clone(),
+            ticket_revision: 3,
+            work_node_id: payload.work_node_id.clone(),
+            accepted_plan_digest: Digest::parse("f".repeat(64)).unwrap(),
+            prior_worker_agent_run_id: payload.agent_run_id.clone(),
+            prior_terminal_digest: Digest::parse("1".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("2".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: Some(receipt.commit.operation_id.clone()),
+            prior_host_commit_receipt_digest: Some(digest_bytes(receipt_json.as_bytes()).unwrap()),
+            expected_head: receipt.commit.observed_head.clone(),
+            source_coordinator_evidence_id: "coordinator-evidence".into(),
+            prior_worker_result_evidence_id: "worker-evidence".into(),
+            prior_artifact_refs: vec![receipt.manifest_artifact.clone()],
+        };
+        let (request_json, request_digest) = canonical_delivery_payload(&payload).unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &payload.ticket_namespace,
+                &payload.ticket_id,
+                &payload.ticket_run_id,
+                1,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET revision=3 WHERE ticket_run_id=?1",
+                [payload.ticket_run_id.as_str()],
+            )
+            .unwrap();
+        let intent = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: payload.ticket_run_id.to_string(),
+            operation_id: receipt.commit.operation_id.to_string(),
+            logical_key: "retained-commit-docs".into(),
+            kind: "commit_worker_manifest".into(),
+            request_json,
+            request_digest,
+            expected_revision: Some(3),
+        };
+        store.enqueue_effect(generation, &intent).unwrap();
+        assert!(
+            retained_host_commit(&store, &project_id, &applied.digest, Some(&recovery)).is_err()
+        );
+        let claim = store
+            .claim_next_due_effect(generation, i64::MAX, std::slice::from_ref(&intent.kind))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.intent.operation_id, intent.operation_id);
+        store
+            .finish_effect(
+                &intent.operation_id,
+                generation,
+                EffectOutcome::Succeeded,
+                Some(&receipt_json),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_host_commit(&store, &project_id, &applied.digest, Some(&recovery)).unwrap(),
+            Some(receipt.clone())
+        );
+        recovery.prior_artifact_refs.clear();
+        assert!(
+            retained_host_commit(&store, &project_id, &applied.digest, Some(&recovery)).is_err()
+        );
+        recovery
+            .prior_artifact_refs
+            .push(receipt.manifest_artifact.clone());
+        recovery.ticket_revision += 1;
+        assert!(
+            retained_host_commit(&store, &project_id, &applied.digest, Some(&recovery)).is_err()
+        );
+        recovery.ticket_revision -= 1;
+        assert!(
+            retained_host_commit(
+                &store,
+                &ProjectId::parse("foreign").unwrap(),
+                &applied.digest,
+                Some(&recovery)
+            )
+            .is_err()
+        );
+        recovery.prior_host_commit_receipt_digest = Some(Digest::parse("9".repeat(64)).unwrap());
+        assert!(
+            retained_host_commit(&store, &project_id, &applied.digest, Some(&recovery)).is_err()
+        );
+    }
+
+    #[test]
     fn predecessor_base_context_uses_the_host_prepared_sha() {
         let project_id = ProjectId::parse("project-a").unwrap();
         let ticket_run_id = TicketRunId::parse("run-a").unwrap();
@@ -5105,6 +5626,7 @@ mod worker_assignment_context_tests {
             expected_head: &base_sha,
             verification: None,
             recovery_authorization: None,
+            retained_host_commit: None,
             commit_mode: CommitMode::Host,
             repository_id: &repository,
         })
@@ -5139,6 +5661,7 @@ mod worker_assignment_context_tests {
             expected_head: &publication_head,
             verification: Some(&verification),
             recovery_authorization: None,
+            retained_host_commit: None,
             commit_mode: CommitMode::Host,
             repository_id: &repository,
         })
@@ -5179,6 +5702,18 @@ mod worker_assignment_context_tests {
             prior_worker_result_evidence_id: "worker-evidence".into(),
             prior_artifact_refs: Vec::new(),
         };
+        let retained: crate::delivery_runtime::CommitWorkerManifestEffectReceipt =
+            serde_json::from_value(serde_json::json!({
+                "schema_version":1,"agent_run_id":"worker-run-prior","message_id":"prior-commit",
+                "ticket_run_id":ticket_run_id,"work_node_id":"worker-b","repository_id":repository,
+                "base_sha":base_sha,
+                "manifest_artifact":{"artifact_id":"7".repeat(64),"kind":"change","schema_version":1,
+                    "path":"worker-run-prior/change.json","digest":"4".repeat(64),"bytes":100},
+                "commit":{"operation_id":prior_operation,"repository_id":repository,
+                    "expected_head":base_sha,"observed_head":recovery.expected_head,"tree":"5".repeat(40),
+                    "manifest_digest":"6".repeat(64),"signature_verified":true,"hooks_completed":true,
+                    "index_synchronized":true,"index_sync_conflict":false}
+            })).unwrap();
         let recovery_context = worker_assignment_context(&WorkerAssignmentContext {
             plan_record: &plan_record,
             validated_plan: &validated,
@@ -5187,13 +5722,18 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &recovery.expected_head,
-            verification: Some(&verification),
+            verification: None,
             recovery_authorization: Some(&recovery),
+            retained_host_commit: Some(&retained),
             commit_mode: CommitMode::Host,
             repository_id: &repository,
         })
         .unwrap();
-        let recovery_context: serde_json::Value = serde_json::from_str(&recovery_context).unwrap();
+        let context_directory = tempfile::tempdir().unwrap();
+        let assignment_path = context_directory.path().join("worker-assignment.json");
+        std::fs::write(&assignment_path, recovery_context).unwrap();
+        let recovery_context: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(assignment_path).unwrap()).unwrap();
         assert_eq!(recovery_context["prepared_worktree"]["base_sha"], base_sha);
         assert_eq!(
             recovery_context["prepared_worktree"]["expected_head"],
@@ -5201,11 +5741,15 @@ mod worker_assignment_context_tests {
         );
         assert_eq!(
             recovery_context["prepared_worktree"]["verification_only"],
-            true
+            false
         );
         assert_eq!(
-            recovery_context["prepared_worktree"]["accepted_publication"]["publication_operation_id"],
-            "publish-worker-1"
+            recovery_context["retained_host_commit"]["commit"]["operation_id"],
+            prior_operation.as_str()
+        );
+        assert_eq!(
+            recovery_context["retained_host_commit"]["manifest_artifact"]["path"],
+            retained.manifest_artifact.path
         );
         assert_eq!(
             recovery_context["worker_recovery_authorization"]["prior_worker_agent_run_id"],

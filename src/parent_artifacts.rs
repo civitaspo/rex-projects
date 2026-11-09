@@ -21,8 +21,8 @@ const MAX_PARENT_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Resolve host-registered references under the source AgentRun authority and stage their exact
-/// verified bytes in the destination role workspace. The caller must pass refs loaded from the
-/// durable source result, never refs copied out of wake JSON.
+/// verified bytes in the destination role workspace. The caller must pass refs from a durable
+/// result or host-validated recovery authorization, never Agent-selected references.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_verified_parent_artifacts(
     store: &mut ConfigStore,

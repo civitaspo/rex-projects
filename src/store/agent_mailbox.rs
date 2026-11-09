@@ -21,6 +21,12 @@ type MailboxRunAuthorityStateRow = (
     String,
 );
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MailboxDispatchMode {
+    Running,
+    TerminalReceiptReplay,
+}
+
 #[derive(Debug)]
 pub enum AgentMailboxProcessingError {
     Authority(String),
@@ -49,8 +55,9 @@ impl std::fmt::Display for AgentMailboxProcessingError {
 }
 
 impl crate::store::ConfigStore {
-    /// Process at most one request for `agent_run_id`. The launch must still be active and all
-    /// mailbox scope is resolved from durable host records, never from Agent-selected authority.
+    /// Process at most one request for `agent_run_id`. Running launches may submit supported
+    /// requests; a verified terminal run may only replay an already accepted commit receipt.
+    /// All mailbox scope is resolved from durable host records, never Agent-selected authority.
     pub fn process_one_agent_mailbox_request(
         &mut self,
         owner_generation: u64,
@@ -79,17 +86,33 @@ impl crate::store::ConfigStore {
             )
             .optional()
             .map_err(|error| AgentMailboxProcessingError::Authority(error.to_string()))?;
-        match active {
-            Some((state, generation)) if state == "running" && generation == owner_generation => {}
-            // Recovery must reconcile a previous owner's run before its mailbox is eligible.
+        let Some((state, generation)) = active else {
+            return Ok(false);
+        };
+        let active_state = state.clone();
+        let mode = match active_state.as_str() {
+            "running" if generation == owner_generation => MailboxDispatchMode::Running,
+            "running" => {
+                // Recovery must reconcile a previous owner's live run before its mailbox is eligible.
+                return Ok(false);
+            }
+            "completed" => {
+                crate::store::agent_results::verify_agent_terminal(
+                    self,
+                    owner_generation,
+                    &AgentRunId::parse(agent_run_id.to_owned())?,
+                )
+                .map_err(AgentMailboxProcessingError::Authority)?;
+                MailboxDispatchMode::TerminalReceiptReplay
+            }
             _ => return Ok(false),
-        }
+        };
         let run_id = AgentRunId::parse(agent_run_id.to_owned())?;
         let Some(authority) = self.agent_launch_authority(&run_id)? else {
             return Err("mailbox run has no persisted launch authority".into());
         };
-        if authority.controller_generation != owner_generation {
-            return Err("mailbox run is not owned by the active controller generation".into());
+        if mode == MailboxDispatchMode::Running {
+            self.validate_mailbox_owner_generation(owner_generation, &authority)?;
         }
 
         let reservation_row: Option<(String, String, String)> = self
@@ -161,7 +184,7 @@ impl crate::store::ConfigStore {
         let state_matches = match state {
             Some((
                 run_state,
-                generation,
+                persisted_generation,
                 project_id,
                 config_revision,
                 config_digest,
@@ -169,8 +192,11 @@ impl crate::store::ConfigStore {
                 operation_id,
                 digest,
             )) => {
-                run_state == "running"
-                    && generation == owner_generation
+                run_state == active_state
+                    // The second read must match the mutable owner snapshot observed above.
+                    // A completed run can retain its launch or adopted generation after restart;
+                    // its immutable terminal receipt, not a current slot lease, proves the end.
+                    && persisted_generation == generation
                     && project_id == authority.project_id.as_str()
                     && config_revision == authority.config_revision.0
                     && config_digest == authority.config_digest.as_str()
@@ -184,8 +210,8 @@ impl crate::store::ConfigStore {
             return Err("mailbox run is not in the exact active persisted launch state".into());
         }
         let active_block: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM rex_view_blocks blocks JOIN rex_views views USING(view_id) WHERE blocks.view_id=?1 AND blocks.block_id=?2 AND blocks.agent_run_id=?3 AND blocks.role=?4 AND blocks.ownership='factory' AND blocks.lifecycle='active' AND views.project_id=?5 AND views.lifecycle='active' AND views.rex_server_identity=?6 AND views.rex_session_id=?7 AND views.rex_window_id=?8)",
-            rusqlite::params![authority.rex_view_id.as_str(),authority.rex_block_id,agent_run_id,serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().ok_or("role serialization is not a string")?,authority.project_id.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id],
+            "SELECT EXISTS(SELECT 1 FROM rex_view_blocks blocks JOIN rex_views views USING(view_id) WHERE blocks.view_id=?1 AND blocks.block_id=?2 AND blocks.agent_run_id=?3 AND blocks.role=?4 AND blocks.ownership='factory' AND (?9=1 OR (blocks.lifecycle='active' AND views.lifecycle='active')) AND views.project_id=?5 AND views.rex_server_identity=?6 AND views.rex_session_id=?7 AND views.rex_window_id=?8)",
+            rusqlite::params![authority.rex_view_id.as_str(),authority.rex_block_id,agent_run_id,serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().ok_or("role serialization is not a string")?,authority.project_id.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,mode == MailboxDispatchMode::TerminalReceiptReplay],
             |row| row.get(0),
         ).map_err(|error| error.to_string())?;
         if !active_block {
@@ -266,7 +292,7 @@ impl crate::store::ConfigStore {
                     "Co-authored-by: Claude <noreply@anthropic.com>"
                 }
             };
-            self.process_repository_commit(
+            return self.process_repository_commit(
                 owner_generation,
                 &authority,
                 &reservation,
@@ -275,8 +301,11 @@ impl crate::store::ConfigStore {
                 &mailbox_request,
                 &request,
                 required_trailer,
-            )?;
-            return Ok(true);
+                mode,
+            );
+        }
+        if mode == MailboxDispatchMode::TerminalReceiptReplay {
+            return Ok(false);
         }
         if method.as_str() != Some("artifact.add") {
             let response = crate::protocol::ResponseEnvelope {
@@ -337,6 +366,22 @@ impl crate::store::ConfigStore {
         Ok(true)
     }
 
+    fn validate_mailbox_owner_generation(
+        &self,
+        owner_generation: u64,
+        authority: &crate::launch::AgentLaunchAuthority,
+    ) -> Result<(), AgentMailboxProcessingError> {
+        crate::store::agent_recovery::validate_agent_run_current_owner(
+            &self.connection,
+            &authority.agent_run_id,
+            authority.controller_generation,
+            owner_generation,
+            &authority.digest()?,
+            &authority.descriptor_digest,
+        )
+        .map_err(AgentMailboxProcessingError::Authority)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_repository_commit(
         &mut self,
@@ -348,7 +393,8 @@ impl crate::store::ConfigStore {
         mailbox_request: &crate::mailbox::MailboxRequest,
         request: &crate::agent_api::RepositoryCommitRequest,
         required_trailer: &str,
-    ) -> Result<(), AgentMailboxProcessingError> {
+        mode: MailboxDispatchMode,
+    ) -> Result<bool, AgentMailboxProcessingError> {
         use crate::delivery_runtime::{
             CommitWorkerManifestEffectPayload, PrepareWorktreesEffectPayload,
             canonical_delivery_payload,
@@ -466,7 +512,7 @@ impl crate::store::ConfigStore {
             expected_base_sha: assignment.base_sha.clone(),
             expected_head: request.expected_head.clone(),
             manifest_artifact: verified.reference().clone(),
-            manifest_digest: digest,
+            manifest_digest: digest.clone(),
             manifest,
             commit_message: request.commit_message.clone(),
             required_trailer: required_trailer.to_owned(),
@@ -492,8 +538,18 @@ impl crate::store::ConfigStore {
                     "repository.commit message ID was reused with different request content".into(),
                 );
             }
+        } else if mode == MailboxDispatchMode::TerminalReceiptReplay {
+            return Ok(false);
         } else {
             self.enqueue_effect(owner_generation, &intent)?;
+        }
+        if mode == MailboxDispatchMode::TerminalReceiptReplay {
+            let Some(receipt) = self.succeeded_effect_receipt(&intent.operation_id)? else {
+                return Ok(false);
+            };
+            if receipt.intent() != &intent {
+                return Err("terminal repository.commit receipt has a different intent".into());
+            }
         }
         let status: Option<(String, Option<String>)> = self
             .connection
@@ -507,6 +563,9 @@ impl crate::store::ConfigStore {
         if let Some((status, last_error)) = status
             && matches!(status.as_str(), "failed" | "cancelled")
         {
+            if mode == MailboxDispatchMode::TerminalReceiptReplay {
+                return Ok(false);
+            }
             let response = crate::protocol::ResponseEnvelope::<serde_json::Value> {
                 schema_version: crate::protocol::SCHEMA_VERSION,
                 request_id: mailbox_request.envelope.request_id.clone(),
@@ -531,18 +590,40 @@ impl crate::store::ConfigStore {
                     crate::mailbox::unix_time_now()?,
                 )
                 .map_err(AgentMailboxProcessingError::LocalMailbox)?;
-            return Ok(());
+            return Ok(true);
         }
         let Some(receipt) = self.succeeded_effect_receipt(&intent.operation_id)? else {
             // Keep the mailbox request pending. The normal dispatcher will execute/reconcile the
             // durable effect; this method will publish the receipt on a later controller pass.
-            return Ok(());
+            return Ok(false);
         };
         if receipt.intent() != &intent {
             return Err("repository.commit durable receipt has a different intent".into());
         }
         let committed: crate::delivery_runtime::CommitWorkerManifestEffectReceipt =
             crate::protocol::parse_unique(receipt.receipt_json().as_bytes())?;
+        if committed.schema_version != 1
+            || committed.agent_run_id != authority.agent_run_id
+            || committed.message_id != request.message_id
+            || committed.ticket_run_id != *ticket_run_id
+            || committed.work_node_id != assignment.node_id
+            || committed.repository_id != assignment.repository_id
+            || committed.base_sha != assignment.base_sha
+            || committed.manifest_artifact != *verified.reference()
+            || committed.commit.operation_id != operation_id
+            || committed.commit.repository_id != assignment.repository_id
+            || committed.commit.manifest_digest != digest
+            || committed.commit.expected_head != request.expected_head
+            || committed.commit.observed_head == committed.commit.expected_head
+            || !committed.commit.signature_verified
+            || !committed.commit.hooks_completed
+            || !committed.commit.index_synchronized
+            || committed.commit.index_sync_conflict
+        {
+            return Err(
+                "repository.commit durable receipt does not match its exact accepted intent".into(),
+            );
+        }
         let response = crate::protocol::ResponseEnvelope {
             schema_version: crate::protocol::SCHEMA_VERSION,
             request_id: mailbox_request.envelope.request_id.clone(),
@@ -567,13 +648,122 @@ impl crate::store::ConfigStore {
                 crate::mailbox::unix_time_now()?,
             )
             .map_err(AgentMailboxProcessingError::LocalMailbox)?;
-        Ok(())
+        Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use rusqlite::Connection;
+
+    fn adoption_evidence(
+        agent_run_id: &AgentRunId,
+        controller_generation: u64,
+        previous_controller_generation: u64,
+        authority_digest: &Digest,
+        descriptor_digest: &Digest,
+    ) -> crate::store::agent_recovery::AgentAdoptionEvidence {
+        use crate::store::agent_recovery::{AdoptedProcessIdentity, AgentAdoptionEvidence};
+
+        AgentAdoptionEvidence {
+            schema_version: 1,
+            agent_run_id: agent_run_id.clone(),
+            controller_generation,
+            previous_controller_generation,
+            authority_digest: authority_digest.clone(),
+            descriptor_digest: descriptor_digest.clone(),
+            rex_process_observation_digest: Digest::parse("a".repeat(64)).unwrap(),
+            process_tree_digest: Digest::parse("b".repeat(64)).unwrap(),
+            provider_start_tree_digest: Digest::parse("c".repeat(64)).unwrap(),
+            process_tree: vec![
+                AdoptedProcessIdentity {
+                    pid: 100,
+                    parent_pid: 1,
+                    process_group_id: 100,
+                    start_identity: "wrapper-start".into(),
+                    identity_quality: "kernel_birth_token".into(),
+                },
+                AdoptedProcessIdentity {
+                    pid: 101,
+                    parent_pid: 100,
+                    process_group_id: 100,
+                    start_identity: "provider-start".into(),
+                    identity_quality: "kernel_birth_token".into(),
+                },
+            ],
+            wrapper_pid: 100,
+            wrapper_start_identity: "wrapper-start".into(),
+            provider_pid: 101,
+            provider_start_identity: "provider-start".into(),
+            observed_at_unix: 1,
+        }
+    }
+
+    #[test]
+    fn adopted_run_owner_requires_the_durable_immutable_authority_chain() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY,controller_generation INTEGER);
+                 INSERT INTO agent_runs VALUES ('worker-run',8);
+                 CREATE TABLE agent_run_adoptions(agent_run_id TEXT,controller_generation INTEGER,previous_controller_generation INTEGER,authority_digest TEXT,descriptor_digest TEXT,evidence_digest TEXT,evidence_json TEXT);",
+            )
+            .unwrap();
+        let agent_run_id = AgentRunId::parse("worker-run").unwrap();
+        let authority_digest = Digest::parse("1".repeat(64)).unwrap();
+        let descriptor_digest = Digest::parse("2".repeat(64)).unwrap();
+        let evidence =
+            adoption_evidence(&agent_run_id, 8, 7, &authority_digest, &descriptor_digest);
+        connection
+            .execute(
+                "INSERT INTO agent_run_adoptions VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    agent_run_id.as_str(),
+                    evidence.controller_generation,
+                    evidence.previous_controller_generation,
+                    authority_digest.as_str(),
+                    descriptor_digest.as_str(),
+                    evidence.digest().unwrap().as_str(),
+                    serde_json::to_string(&evidence).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            crate::store::agent_recovery::validate_agent_run_current_owner(
+                &connection,
+                &agent_run_id,
+                7,
+                8,
+                &authority_digest,
+                &descriptor_digest,
+            )
+            .is_ok()
+        );
+        assert!(
+            crate::store::agent_recovery::validate_agent_run_current_owner(
+                &connection,
+                &agent_run_id,
+                7,
+                9,
+                &authority_digest,
+                &descriptor_digest,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::store::agent_recovery::validate_agent_run_current_owner(
+                &connection,
+                &agent_run_id,
+                7,
+                8,
+                &Digest::parse("3".repeat(64)).unwrap(),
+                &descriptor_digest,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn completed_or_foreign_generation_runs_are_not_processed() {
@@ -596,7 +786,7 @@ mod tests {
             crate::artifacts::ArtifactStore::open(&root.path().join("artifacts")).unwrap();
 
         assert!(
-            !store
+            store
                 .process_one_agent_mailbox_request(
                     7,
                     "run-a",
@@ -604,7 +794,7 @@ mod tests {
                     &artifact_store,
                     &Default::default()
                 )
-                .unwrap()
+                .is_err()
         );
         assert!(
             !store

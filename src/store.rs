@@ -2348,6 +2348,55 @@ impl ConfigStore {
             .collect()
     }
 
+    /// Read bounded immutable TicketRun transition evidence for host consumers that need to cite
+    /// an earlier verified phase transition. Returned evidence is scoped to this Project and run.
+    pub fn ticket_run_transition_evidence(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        after_revision: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, serde_json::Value)>, String> {
+        if limit == 0 || limit > 256 {
+            return Err("TicketRun transition evidence limit must be between 1 and 256".into());
+        }
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT new_revision,evidence_json FROM transitions WHERE project_id=?1 AND entity_type='ticket_run' AND entity_id=?2 AND new_revision>?3 ORDER BY new_revision DESC LIMIT ?4",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id.as_str(),
+                    ticket_run_id.as_str(),
+                    after_revision,
+                    limit as u64
+                ],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(|(revision, evidence)| {
+                let value: serde_json::Value = crate::protocol::parse_unique(evidence.as_bytes())?;
+                Ok((revision, value))
+            })
+            .collect()
+    }
+
     pub fn claim_ticket(
         &mut self,
         owner_generation: u64,
@@ -7102,6 +7151,7 @@ pub(crate) mod tests {
                     payload_json: wake.payload_json.clone(),
                     host_artifact_source_evidence_ids: Vec::new(),
                     host_artifacts: Vec::new(),
+                    host_completion_context: None,
                 }],
             };
             wake_snapshot.digest = wake_snapshot.content_digest().unwrap();

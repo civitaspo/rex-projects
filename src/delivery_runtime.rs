@@ -1833,13 +1833,13 @@ impl RepositoryDeliveryEffects {
         let reservation = store
             .agent_launch_reservation_for_run(&payload.agent_run_id)?
             .ok_or("repository.commit launch reservation is missing")?;
-        if authority.controller_generation != owner_generation
-            || authority.project_id != payload.project_id
+        store.validate_active_agent_run_owner(&authority, owner_generation)?;
+        if authority.project_id != payload.project_id
             || authority.role != crate::domain::types::Role::Worker
             || authority.ticket_run_id.as_ref() != Some(&payload.ticket_run_id)
             || authority.ticket_revision.map(|value| value.0) != Some(payload.ticket_revision)
             || authority.config_digest != payload.configuration_digest
-            || reservation.controller_generation != owner_generation
+            || reservation.controller_generation != authority.controller_generation
             || reservation.agent_run_id != payload.agent_run_id
             || reservation.project_id != authority.project_id
             || reservation.role != authority.role

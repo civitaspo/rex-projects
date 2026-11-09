@@ -4772,36 +4772,34 @@ pub(crate) mod tests {
             coordinator_authority_digest: coordinator_authority.digest().unwrap(),
         };
         let role_session = format!("ticket:{ticket}:worker:{node_id}");
-        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+        let wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: project.clone(),
             role_session_id: role_session.clone(),
             agent_run_id: worker_id.to_string(),
-            digest: Digest::parse("0".repeat(64)).unwrap(),
+            digest: prior_authority.wake_snapshot_digest.clone(),
             inputs: Vec::new(),
         };
-        wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
-        let limits = crate::mailbox::MailboxLimits {
-            max_request_bytes: 1_048_576,
-            max_pending_requests: 32,
-        };
-        let expires = 9_999_999_999;
-        crate::mailbox::MailboxCapability::create(
-            worker_id.to_string(),
-            &prior_authority.control_dir,
-            expires,
-            limits,
-        )
-        .unwrap();
+        let mailbox_directory = prior_authority.control_dir.join("mailbox");
+        let descriptor_bytes = std::fs::read(mailbox_directory.join("descriptor.json")).unwrap();
+        let descriptor: crate::mailbox::MailboxDescriptor =
+            crate::protocol::parse_unique(&descriptor_bytes).unwrap();
+        let expires = descriptor.expires_at_unix;
+        let mailbox_max_request_bytes = descriptor.max_request_bytes as u64;
+        let mailbox_max_pending_requests = descriptor.max_pending_requests as u32;
         let mailbox_digest = Digest::parse(
             crate::mailbox::MailboxDescriptor::capability_digest(
                 worker_id.as_str(),
                 expires,
-                limits,
+                crate::mailbox::MailboxLimits {
+                    max_request_bytes: descriptor.max_request_bytes,
+                    max_pending_requests: descriptor.max_pending_requests,
+                },
             )
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(mailbox_digest, prior_authority.mailbox_capability_digest);
         let reservation = crate::launch::AgentLaunchReservation {
             schema_version: 1,
             agent_run_id: worker_id.clone(),
@@ -4833,24 +4831,33 @@ pub(crate) mod tests {
             descriptor_path: prior_authority.descriptor_path.clone(),
             workspace_path: prior_authority.workspace_path.clone(),
             control_dir: prior_authority.control_dir.clone(),
-            mailbox_directory: prior_authority.control_dir.clone(),
+            mailbox_directory: mailbox_directory.clone(),
             mailbox_capability_digest: mailbox_digest.clone(),
             mailbox_expires_at_unix: expires,
-            mailbox_max_request_bytes: 1_048_576,
-            mailbox_max_pending_requests: 32,
+            mailbox_max_request_bytes,
+            mailbox_max_pending_requests,
             pool: "agent".into(),
             slot_index: 0,
             global_capacity: 4,
             project_capacity: 4,
         };
         let reservation_json = crate::store::canonical_json(&reservation).unwrap();
+        let wake_json = crate::store::canonical_json(&reservation.wake_snapshot).unwrap();
+        worker
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_wake_context(agent_run_id,snapshot_digest,snapshot_json,created_at_unix) VALUES (?1,?2,?3,1)",
+                rusqlite::params![worker_id.as_str(),prior_authority.wake_snapshot_digest.as_str(),wake_json],
+            )
+            .unwrap();
         worker.store.test_connection().execute(
             "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,1,?5,?6,'authorized',1,1)",
             rusqlite::params![worker_id.as_str(),project.as_str(),reservation.operation_id.as_str(),worker.owner_generation,reservation.digest().unwrap().as_str(),reservation_json],
         ).unwrap();
         worker.store.test_connection().execute(
-            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,?4,1048576,32)",
-            rusqlite::params![worker_id.as_str(),prior_authority.control_dir.display().to_string(),mailbox_digest.as_str(),expires],
+            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![worker_id.as_str(),mailbox_directory.display().to_string(),mailbox_digest.as_str(),expires,mailbox_max_request_bytes,mailbox_max_pending_requests],
         ).unwrap();
         let current = worker
             .store
@@ -5030,6 +5037,299 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let previous_owner_generation = worker.owner_generation;
+        let prior_authority = worker
+            .store
+            .agent_launch_authority(&worker_id)
+            .unwrap()
+            .unwrap();
+        let manifest = crate::host_commit::ChangeManifest {
+            schema_version: 1,
+            entries: vec![crate::host_commit::ManifestEntry::Delete {
+                path: "obsolete.md".into(),
+            }],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_path = "change/manifest.json";
+        let manifest_file = prior_authority.workspace_path.join(manifest_path);
+        std::fs::create_dir_all(manifest_file.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_file, &manifest_bytes).unwrap();
+        let manifest_artifact = worker
+            .artifacts
+            .register(
+                &prior_authority.workspace_path,
+                &prior_authority.project_id,
+                worker_id.as_str(),
+                Role::Worker,
+                manifest_path,
+                crate::engine::orchestration::RoleArtifactKind::Change,
+                1,
+            )
+            .unwrap();
+        crate::store::artifact_registry::persist_registration(
+            &mut worker.store.connection,
+            worker.owner_generation,
+            &prior_authority,
+            "fixture-change-manifest",
+            &digest(b"fixture Change ArtifactAdd request").unwrap(),
+            &manifest_artifact.reference,
+            &manifest_artifact.object_path,
+        )
+        .unwrap();
+        // The host-validation fixture omits Rex block observations; seed a completed block row
+        // here to cover mailbox replay after the external lifecycle ended.
+        worker
+            .store
+            .connection
+            .execute(
+                "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,?2,?3,'worker','factory','completed',1,1,1)",
+                rusqlite::params![prior_authority.rex_view_id.as_str(), prior_authority.rex_block_id, worker_id.as_str()],
+            )
+            .unwrap();
+
+        let restarted_generation = worker
+            .store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "completed-worker-mailbox-replay".into(),
+                state_root: worker._temp.path().display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: "fixture-owner-restarted".into(),
+                executable_path: "/test/fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("http://fixture".into()),
+                rex_server_identity: Some("fixture-rex".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        assert!(restarted_generation > previous_owner_generation);
+        let block_lifecycle: String = worker
+            .store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2",
+                rusqlite::params![
+                    prior_authority.rex_view_id.as_str(),
+                    prior_authority.rex_block_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(block_lifecycle.as_str(), "completed" | "closed"));
+        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
+            worker_id.to_string(),
+            &stored_reservation.mailbox_directory,
+        )
+        .unwrap();
+        let terminal_request_id = "terminal-restart-replay-scope-check";
+        let request = crate::agent_api::RepositoryCommitRequest {
+            schema_version: 1,
+            message_id: terminal_request_id.into(),
+            worktree_id: stored_assignment.node_id.to_string(),
+            expected_head: base.into(),
+            manifest: manifest_artifact.reference.clone(),
+            manifest_digest: manifest_artifact.reference.digest.clone(),
+            commit_message:
+                "docs: fixture retained commit\n\nCo-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let terminal_envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(terminal_request_id).unwrap(),
+            operation_id: Some(prior_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("repository.commit").unwrap(),
+            project_id: Some(project.clone()),
+            run_id: Some(worker_id.to_string()),
+            attempt: Some(prior_authority.attempt),
+            run_epoch: Some(prior_authority.run_epoch),
+            expected_subject_revision: Some(current.revision),
+            role: Some(Role::Worker),
+            request_type: None,
+            params: serde_json::to_value(&request).unwrap(),
+        };
+        mailbox
+            .queue(
+                terminal_request_id,
+                &serde_json::to_vec(&terminal_envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+
+        // Fixture-seed an already accepted and succeeded host effect through the public journal
+        // API. The mailbox replay below must match this exact intent and durable receipt.
+        let mailbox_request = mailbox
+            .pending(crate::mailbox::unix_time_now().unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let manifest_digest = request.manifest_digest.clone();
+        let payload = crate::delivery_runtime::CommitWorkerManifestEffectPayload {
+            schema_version: 1,
+            agent_run_id: worker_id.clone(),
+            project_id: project.clone(),
+            message_id: request.message_id.clone(),
+            configuration_digest: prior_authority.config_digest.clone(),
+            ticket_revision: current.revision,
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket.clone(),
+            work_node_id: stored_assignment.node_id.clone(),
+            repository_id: repository.clone(),
+            worktree_path: worktree.clone(),
+            branch: "agent/fixture/node-a".into(),
+            prepare_operation_id: prepare_operation.clone(),
+            expected_base_sha: base.into(),
+            expected_head: request.expected_head.clone(),
+            manifest_artifact: request.manifest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            manifest,
+            commit_message: request.commit_message.clone(),
+            required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let (request_json, request_digest) =
+            crate::delivery_runtime::canonical_delivery_payload(&payload).unwrap();
+        let effect_operation =
+            OperationId::parse(format!("repo-commit-{}", mailbox_request.digest)).unwrap();
+        let intent = crate::store::EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket.to_string(),
+            operation_id: effect_operation.to_string(),
+            logical_key: format!("repository.commit:{worker_id}:{}", mailbox_request.digest),
+            kind: "commit_worker_manifest".into(),
+            request_json,
+            request_digest,
+            expected_revision: Some(current.revision),
+        };
+        worker
+            .store
+            .enqueue_effect(restarted_generation, &intent)
+            .unwrap();
+        let claim = worker
+            .store
+            .claim_next_due_effect(
+                restarted_generation,
+                i64::MAX,
+                std::slice::from_ref(&intent.kind),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.intent, intent);
+        let effect_receipt = crate::delivery_runtime::CommitWorkerManifestEffectReceipt {
+            schema_version: 1,
+            agent_run_id: worker_id.clone(),
+            message_id: request.message_id.clone(),
+            ticket_run_id: ticket.clone(),
+            work_node_id: stored_assignment.node_id.clone(),
+            repository_id: repository.clone(),
+            base_sha: base.into(),
+            manifest_artifact: request.manifest.clone(),
+            commit: crate::host_commit::HostCommitReceipt {
+                operation_id: effect_operation,
+                repository_id: repository.clone(),
+                expected_head: request.expected_head.clone(),
+                observed_head: "d".repeat(40),
+                tree: "e".repeat(40),
+                manifest_digest,
+                signature_verified: true,
+                hooks_completed: true,
+                index_synchronized: true,
+                index_sync_conflict: false,
+            },
+        };
+        let effect_receipt_json = serde_json::to_string(&effect_receipt).unwrap();
+        worker
+            .store
+            .finish_effect(
+                intent.operation_id.as_str(),
+                restarted_generation,
+                crate::store::EffectOutcome::Succeeded,
+                Some(&effect_receipt_json),
+            )
+            .unwrap();
+        let effect_count_before: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        let profiles = BTreeMap::from([(
+            prior_authority.profile_id.clone(),
+            serde_json::from_value(serde_json::json!({
+                "adapter":"codex", "command":["fixture"], "commit_mode":"host"
+            }))
+            .unwrap(),
+        )]);
+        let mut foreign_receipt = effect_receipt.clone();
+        foreign_receipt.agent_run_id = AgentRunId::parse("foreign-worker").unwrap();
+        let foreign_receipt_json = serde_json::to_string(&foreign_receipt).unwrap();
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![intent.operation_id, foreign_receipt_json],
+            )
+            .unwrap();
+        let rejected = worker.store.process_one_agent_mailbox_request(
+            restarted_generation,
+            worker_id.as_str(),
+            crate::store::now_unix().unwrap(),
+            &worker.artifacts,
+            &profiles,
+        );
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("durable receipt does not match its exact accepted intent")
+        );
+        assert!(
+            mailbox
+                .read_receipt(
+                    terminal_request_id,
+                    crate::mailbox::unix_time_now().unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![intent.operation_id, effect_receipt_json],
+            )
+            .unwrap();
+        let replay_result = worker.store.process_one_agent_mailbox_request(
+            restarted_generation,
+            worker_id.as_str(),
+            crate::store::now_unix().unwrap(),
+            &worker.artifacts,
+            &profiles,
+        );
+        assert!(replay_result.unwrap());
+        let receipt_bytes = mailbox
+            .read_receipt(
+                terminal_request_id,
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let response: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(&receipt_bytes).unwrap();
+        let response: crate::agent_api::RepositoryCommitReceipt =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(response.message_id, terminal_request_id);
+        assert_eq!(response.commit_operation_id.as_str(), intent.operation_id);
+        assert_eq!(response.manifest_artifact, request.manifest);
+        assert_eq!(response.commit, effect_receipt.commit);
+        let effect_count_after: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(effect_count_after, effect_count_before);
     }
 
     #[test]
@@ -5947,13 +6247,16 @@ pub(crate) mod host_validation_fixture {
             role,
             message,
             Some(agent_run_id),
-        )?;
-        let ingested = store.store_validated_agent_result(
-            &prepared.artifacts,
-            owner_generation,
-            &prepared.terminal,
-            prepared.message,
-        )?;
+        )
+        .map_err(|error| format!("host validated result fixture setup: {error}"))?;
+        let ingested = store
+            .store_validated_agent_result(
+                &prepared.artifacts,
+                owner_generation,
+                &prepared.terminal,
+                prepared.message,
+            )
+            .map_err(|error| format!("host validated result ingestion: {error}"))?;
         Ok(InPlaceValidatedResultFixture {
             artifacts: prepared.artifacts,
             ingested,
@@ -6061,6 +6364,16 @@ pub(crate) mod host_validation_fixture {
             Role::Supervisor => format!("project:{}:supervisor", project_id.as_str()),
             _ => format!("fixture-{:?}", role).to_lowercase(),
         };
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: authority.role_session_id.clone(),
+            agent_run_id: agent_run_id.to_string(),
+            digest: Digest::parse("0".repeat(64))?,
+            inputs: Vec::new(),
+        };
+        wake_snapshot.digest = wake_snapshot.content_digest()?;
+        authority.wake_snapshot_digest = wake_snapshot.digest.clone();
         let parent_run_id = AgentRunId::parse(if has_run_id_override {
             format!("{agent_run_id}-parent")
         } else {
@@ -6103,6 +6416,24 @@ pub(crate) mod host_validation_fixture {
         authority.control_dir = root.join(format!("{}-control", agent_run_id));
         std::fs::create_dir(&authority.workspace_path).map_err(|error| error.to_string())?;
         std::fs::create_dir(&authority.control_dir).map_err(|error| error.to_string())?;
+        let mailbox_limits = crate::mailbox::MailboxLimits::default();
+        let mailbox_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_secs();
+        let mailbox_expires_at = mailbox_now.saturating_add(600);
+        authority.mailbox_capability_digest =
+            Digest::parse(crate::mailbox::MailboxDescriptor::capability_digest(
+                agent_run_id.as_str(),
+                mailbox_expires_at,
+                mailbox_limits,
+            )?)?;
+        let mailbox = crate::mailbox::MailboxCapability::create(
+            agent_run_id.as_str(),
+            &authority.control_dir.join("mailbox"),
+            mailbox_expires_at,
+            mailbox_limits,
+        )?;
         let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
             "adapter":"codex", "command":["/bin/codex"], "model":"fixture", "commit_mode":"native", "turn_timeout_seconds":60
         })).map_err(|error| error.to_string())?;
@@ -6174,11 +6505,11 @@ pub(crate) mod host_validation_fixture {
                 crate::launch::RexViewKind::Supervisor,
                 None,
                 None,
-                1,
+                mailbox_now,
             )?;
             store.connection.execute(
-                "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'supervisor',NULL,NULL,1,'fixture-rex','fixture-supervisor-session','fixture-supervisor-window',0,'active',?3,?3)",
-                rusqlite::params![supervisor_view_id.as_str(), project_id.as_str(), now],
+                "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'supervisor',NULL,NULL,?3,'fixture-rex','fixture-supervisor-session','fixture-supervisor-window',0,'active',?4,?4)",
+                rusqlite::params![supervisor_view_id.as_str(), project_id.as_str(), mailbox_now, now],
             ).map_err(|error| error.to_string())?;
         }
         authority.rex_view_id = view_id;
@@ -6205,7 +6536,7 @@ pub(crate) mod host_validation_fixture {
                     crate::launch::RexViewKind::Supervisor,
                     None,
                     None,
-                    1,
+                    mailbox_now,
                 )?;
             }
             parent_authority.operation_id = OperationId::parse(if has_run_id_override {
@@ -6217,6 +6548,12 @@ pub(crate) mod host_validation_fixture {
             parent_authority.descriptor_path = root.join("parent-package.json");
             parent_authority.workspace_path = root.join("parent-workspace");
             parent_authority.control_dir = root.join("parent-control");
+            parent_authority.mailbox_capability_digest =
+                Digest::parse(crate::mailbox::MailboxDescriptor::capability_digest(
+                    parent_run_id_str,
+                    mailbox_expires_at,
+                    mailbox_limits,
+                )?)?;
             parent_authority.validate()?;
             let parent_authority_json =
                 serde_json::to_string(&parent_authority).map_err(|error| error.to_string())?;
@@ -6357,28 +6694,60 @@ pub(crate) mod host_validation_fixture {
                 b"# Fixture source\n\nHost-registered Postmortem evidence.\n",
             )
             .map_err(|error| error.to_string())?;
-            let artifact = artifacts.register(
-                &authority.workspace_path,
-                &authority.project_id,
-                authority.agent_run_id.as_str(),
-                role,
-                source_path,
-                crate::engine::orchestration::RoleArtifactKind::Postmortem,
-                1,
+            let request: crate::engine::orchestration::ArtifactAddRequest =
+                serde_json::from_value(serde_json::json!({
+                    "schema_version": 1,
+                    "message_id": "fixture-postmortem-artifact",
+                    "path": source_path,
+                    "kind": "postmortem",
+                    "artifact_schema_version": 1
+                }))
+                .map_err(|error| format!("parse public ArtifactAdd request: {error}"))?;
+            request.validate()?;
+            let envelope = serde_json::json!({
+                "schema_version": crate::protocol::SCHEMA_VERSION,
+                "request_id": request.message_id,
+                "operation_id": authority.operation_id,
+                "method": "artifact.add",
+                "project_id": authority.project_id,
+                "run_id": authority.agent_run_id,
+                "attempt": authority.attempt,
+                "run_epoch": authority.run_epoch,
+                "role": authority.role,
+                "params": request,
+            });
+            mailbox.queue(
+                "fixture-postmortem-artifact",
+                &serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
+                mailbox_now,
             )?;
-            message.artifact_refs = vec![artifact.reference.clone()];
-            message.structured_result["source_references"] =
-                serde_json::json!([artifact.reference]);
-            let request_digest = digest(b"fixture ArtifactAdd request")?;
-            crate::store::artifact_registry::persist_registration(
-                &mut store.connection,
+            let mailbox_request = mailbox
+                .pending(mailbox_now)?
+                .into_iter()
+                .find(|pending| pending.request_id == "fixture-postmortem-artifact")
+                .ok_or("public ArtifactAdd request was not available in the mailbox")?;
+            let artifact = store.process_artifact_add(
                 owner_generation,
                 &authority,
-                "fixture-postmortem-artifact",
-                &request_digest,
-                &artifact.reference,
-                &artifact.object_path,
+                &artifacts,
+                &mailbox,
+                &mailbox_request,
+                &request,
             )?;
+            let receipt_bytes = mailbox
+                .read_receipt("fixture-postmortem-artifact", mailbox_now)?
+                .ok_or("public ArtifactAdd receipt was not written")?;
+            let receipt: serde_json::Value = crate::protocol::parse_unique(&receipt_bytes)?;
+            if receipt["result"]["artifact"]
+                != serde_json::to_value(artifact.reference()).map_err(|error| error.to_string())?
+            {
+                return Err(
+                    "public ArtifactAdd receipt differs from its registered artifact".into(),
+                );
+            }
+            message.artifact_refs = vec![artifact.reference().clone()];
+            message.structured_result["source_references"] =
+                serde_json::json!([artifact.reference()]);
             message.result_digest = Some(digest(
                 &serde_json::to_vec(&message.structured_result)
                     .map_err(|error| error.to_string())?,
@@ -6739,11 +7108,31 @@ impl ConfigStore {
                     .map_err(|error| error.to_string())?
             };
             let mut commit: Option<(crate::domain::ids::OperationId, Digest, String)> = None;
+            let mut commit_manifest_artifact: Option<
+                crate::engine::orchestration::RoleArtifactReference,
+            > = None;
             let mut uncertain = false;
             for (operation_id, status, request_json, receipt_json) in effects {
                 match status.as_str() {
                     "pending" | "claimed" | "uncertain" => uncertain = true,
                     "succeeded" => {
+                        let Some(succeeded) = self.succeeded_effect_receipt(&operation_id)? else {
+                            uncertain = true;
+                            continue;
+                        };
+                        if succeeded.intent().kind
+                            != crate::engine::reducer::effect_name(
+                                &crate::engine::reducer::EffectKind::CommitWorkerManifest,
+                            )
+                            || succeeded.intent().request_json != request_json
+                            || succeeded.receipt_json()
+                                != receipt_json.as_deref().unwrap_or_default()
+                        {
+                            return Err(
+                                "succeeded Worker commit differs from its durable effect receipt"
+                                    .into(),
+                            );
+                        }
                         let payload: CommitWorkerManifestEffectPayload =
                             crate::protocol::parse_unique(request_json.as_bytes())?;
                         let Some(receipt_json) = receipt_json else {
@@ -6771,6 +7160,7 @@ impl ConfigStore {
                             || !receipt.commit.hooks_completed
                             || !receipt.commit.index_synchronized
                             || receipt.commit.index_sync_conflict
+                            || receipt.manifest_artifact != payload.manifest_artifact
                         {
                             return Err(
                                 "host Worker commit receipt does not match the prior accepted node"
@@ -6787,6 +7177,7 @@ impl ConfigStore {
                         {
                             return Err("prior Worker has multiple succeeded host commits".into());
                         }
+                        commit_manifest_artifact = Some(receipt.manifest_artifact);
                     }
                     "failed" | "cancelled" => {}
                     _ => uncertain = true,
@@ -6802,6 +7193,12 @@ impl ConfigStore {
                     }
                     None => (None, None, prepared_expected_head),
                 };
+            let mut prior_artifact_refs = submission.artifact_refs;
+            if let Some(manifest) = commit_manifest_artifact
+                && !prior_artifact_refs.contains(&manifest)
+            {
+                prior_artifact_refs.push(manifest);
+            }
             candidates.push(WorkerRecoveryCandidate {
                 work_node_id: assignment.node_id.clone(),
                 ticket_revision: run.revision,
@@ -6814,7 +7211,7 @@ impl ConfigStore {
                 prior_absence_digest: terminal.absence_digest().clone(),
                 prior_host_commit_receipt_digest,
                 prior_worker_result_evidence_id: evidence_id,
-                prior_artifact_refs: submission.artifact_refs,
+                prior_artifact_refs,
             });
         }
         Ok(candidates)
