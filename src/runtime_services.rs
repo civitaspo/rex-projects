@@ -3235,7 +3235,7 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
 
 impl RuntimeServices {
     #[allow(clippy::too_many_arguments)]
-    fn wake_items_with_staged_artifacts(
+    pub(crate) fn wake_items_with_staged_artifacts(
         artifact_store: &ArtifactStore,
         store: &mut ConfigStore,
         owner_generation: u64,
@@ -4774,7 +4774,7 @@ fn coordinator_worker_recovery_summary(
     verified_worker_recovery_summary(candidates, |path| delivery.observe_local_head_at(path))
 }
 
-fn verified_worker_recovery_summary(
+pub(crate) fn verified_worker_recovery_summary(
     candidates: Vec<crate::engine::orchestration::WorkerRecoveryCandidate>,
     mut observe_head: impl FnMut(&Path) -> Result<String, String>,
 ) -> Result<Option<String>, String> {

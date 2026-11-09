@@ -394,6 +394,19 @@ impl FactoryRuntime {
             services.configuration_digest(),
         )?;
 
+        // A final mailbox receipt can make a terminal Worker's recovery candidate
+        // eligible after its previous Coordinator turn already took a prompt
+        // snapshot. Re-scan durable candidates every iteration: if the controller
+        // stops between the receipt and this transaction, the next process repeats
+        // the scan and persists the same idempotent Coordinator wake.
+        queue_ready_worker_recovery_wakes(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            services.configuration_digest(),
+        )?;
+
         let configured_projects = config.projects.keys().cloned().collect::<Vec<_>>();
         let learning_interval = config
             .learning
@@ -574,6 +587,68 @@ impl FactoryRuntime {
             external_errors,
         })
     }
+}
+
+pub(crate) fn queue_ready_worker_recovery_wakes(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    now_unix: i64,
+    config: &Config,
+    configuration_digest: &Digest,
+) -> Result<usize, String> {
+    use crate::engine::reducer::Phase;
+
+    let mut queued = 0;
+    for runnable in store.runnable_projects(owner_generation)? {
+        let Some(project) = config.projects.get(&runnable.record.id) else {
+            continue;
+        };
+        let mut offset = 0_u64;
+        loop {
+            let runs = store.active_ticket_runs_page_for_project(
+                owner_generation,
+                &runnable.record.id,
+                offset,
+                256,
+            )?;
+            let page_len = runs.len();
+            for run in runs.into_iter().filter(|run| {
+                run.phase == Phase::Implementing && run.project_epoch == runnable.project_epoch
+            }) {
+                let Some(plan) =
+                    store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
+                else {
+                    continue;
+                };
+                if plan.configuration_digest != *configuration_digest {
+                    continue;
+                }
+                for candidate in store.worker_recovery_candidates(
+                    owner_generation,
+                    &run,
+                    &plan,
+                    project,
+                    configuration_digest,
+                )? {
+                    if store.queue_worker_recovery_ready_wake(
+                        owner_generation,
+                        &run,
+                        &plan,
+                        configuration_digest,
+                        &candidate,
+                        now_unix,
+                    )? {
+                        queued += 1;
+                    }
+                }
+            }
+            if page_len < 256 {
+                break;
+            }
+            offset = offset.saturating_add(page_len as u64);
+        }
+    }
+    Ok(queued)
 }
 
 fn apply_agent_result(

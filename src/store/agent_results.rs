@@ -5438,6 +5438,36 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!pending_before_terminal_dispatch.is_empty());
         assert_eq!(terminal_run_state.0, "completed");
+        let readiness_config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind": "command", "command": ["test"]}},
+            "projects": {"fixture-project": project_config.clone()}
+        }))
+        .unwrap();
+        worker.store.test_connection().execute(
+            "UPDATE project_runtimes SET desired_lifecycle='running',observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+            rusqlite::params![project.as_str(), worker.owner_generation],
+        ).unwrap();
+        assert_eq!(
+            crate::engine::factory_runtime::queue_ready_worker_recovery_wakes(
+                &mut worker.store,
+                worker.owner_generation,
+                11,
+                &readiness_config,
+                &configuration_digest,
+            )
+            .unwrap(),
+            0,
+            "a pending mailbox request keeps the Worker out of the recovery prompt"
+        );
+        assert!(
+            worker
+                .store
+                .pending_role_wake_inputs(&project, &format!("ticket_run:{ticket}:coordinator"), 8,)
+                .unwrap()
+                .iter()
+                .all(|wake| wake.source_type != "worker_recovery_ready")
+        );
         // Host-validation fixtures omit Rex block observations; seed the completed block needed
         // to exercise the terminal mailbox replay path.
         worker.store.test_connection().execute(
@@ -5489,6 +5519,23 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(candidates.len(), 1);
+        let recovery_summary =
+            crate::runtime_services::verified_worker_recovery_summary(candidates.clone(), |path| {
+                let output = std::process::Command::new(&git_executable)
+                    .args(["-C", path.to_str().unwrap(), "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap();
+                if !output.status.success() {
+                    return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+                }
+                Ok(String::from_utf8(output.stdout)
+                    .map_err(|error| error.to_string())?
+                    .trim()
+                    .to_owned())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(recovery_summary.contains(worker_id.as_str()));
         let evidence_json: String = worker.store.test_connection().query_row(
             "SELECT result_json FROM agent_result_evidence WHERE agent_run_id=?1 AND role='worker' AND outcome='completed'",
             [worker_id.as_str()], |row| row.get(0),
@@ -5518,6 +5565,135 @@ pub(crate) mod tests {
         let candidate = &candidates[0];
         assert_eq!(candidate.prior_worker_agent_run_id, worker_id);
         assert_eq!(candidate.expected_head, base);
+        assert_eq!(
+            crate::engine::factory_runtime::queue_ready_worker_recovery_wakes(
+                &mut worker.store,
+                worker.owner_generation,
+                12,
+                &readiness_config,
+                &configuration_digest,
+            )
+            .unwrap(),
+            1,
+            "the post-receipt scan persists a Coordinator wake after a restart window"
+        );
+        let coordinator_wakes = worker
+            .store
+            .pending_role_wake_inputs(&project, &format!("ticket_run:{ticket}:coordinator"), 8)
+            .unwrap();
+        let readiness_wakes = coordinator_wakes
+            .into_iter()
+            .filter(|wake| wake.source_type == "worker_recovery_ready")
+            .collect::<Vec<_>>();
+        assert_eq!(readiness_wakes.len(), 1);
+        let wake_items =
+            crate::runtime_services::RuntimeServices::wake_items_with_staged_artifacts(
+                &worker.artifacts,
+                &mut worker.store,
+                worker.owner_generation,
+                &project,
+                stored_reservation.config_revision.0,
+                &configuration_digest,
+                &fixture_root,
+                readiness_wakes,
+                None,
+            )
+            .unwrap();
+        assert_eq!(wake_items.len(), 1);
+        assert_eq!(wake_items[0].source_type, "worker_recovery_ready");
+        assert_eq!(
+            wake_items[0].payload_json["prior_worker_result_evidence_id"],
+            candidate.prior_worker_result_evidence_id
+        );
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project.clone(),
+            role_session_id: format!("ticket_run:{ticket}:coordinator"),
+            agent_run_id: "fixture-coordinator-after-worker-mailbox-drain".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: wake_items,
+            worker_correction_context: None,
+        };
+        wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+        wake_snapshot.validate().unwrap();
+        let coordinator_control = worker._temp.path().join("coordinator-control");
+        std::fs::create_dir(&coordinator_control).unwrap();
+        crate::agent_api::publish_wake_snapshot(&coordinator_control, wake_snapshot.clone())
+            .unwrap();
+        let inbox_inputs =
+            crate::agent_api::read_inbox(&coordinator_control, &wake_snapshot.agent_run_id, 0)
+                .unwrap();
+        assert_eq!(inbox_inputs, wake_snapshot.inputs);
+        assert_eq!(inbox_inputs[0].source_type, "worker_recovery_ready");
+        let applied = crate::config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
+        )
+        .expect("load fixture config for the real Coordinator prompt renderer");
+        let rendered = crate::roles::render_role_prompt(
+            &applied,
+            &crate::roles::PromptContext {
+                project_id: ProjectId::parse("goal_project").unwrap(),
+                profile_id: None,
+                role: Role::Coordinator,
+                operation_recipe: None,
+                repositories: vec![RepositoryId::parse("example").unwrap()],
+                ticket: Some(crate::roles::TicketBrief {
+                    ticket_id: TicketId::parse("PAY-12").unwrap(),
+                    ticket_revision: current.revision,
+                    title: "Recover a blocked worker".into(),
+                    body: "Retry the same accepted node after its mailbox is drained.".into(),
+                    acceptance: Vec::new(),
+                }),
+                recovery_summary: Some(recovery_summary),
+                accepted_plan: None,
+                accepted_plan_digest: None,
+                implementation_publication_subject: None,
+                completion_context: None,
+                previous_decisions: Vec::new(),
+                required_evidence: Vec::new(),
+                stop_conditions: Vec::new(),
+                assigned_commit_mode: None,
+            },
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let input_file = worker._temp.path().join("coordinator-recovery-prompt.md");
+        std::fs::write(&input_file, rendered.text).unwrap();
+        let generated_input = std::fs::read_to_string(input_file).unwrap();
+        assert!(generated_input.contains(worker_id.as_str()));
+        assert!(generated_input.contains(base));
+        let coordinator_launch = worker
+            .store
+            .pending_role_wake_sessions(worker.owner_generation, 16)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| {
+                candidate.role_session_id == format!("ticket_run:{ticket}:coordinator")
+            })
+            .expect("durable readiness wake makes the Coordinator launchable");
+        assert_eq!(coordinator_launch.role, Role::Coordinator);
+        assert_eq!(
+            crate::engine::factory_runtime::queue_ready_worker_recovery_wakes(
+                &mut worker.store,
+                worker.owner_generation,
+                13,
+                &readiness_config,
+                &configuration_digest,
+            )
+            .unwrap(),
+            0,
+            "replaying readiness reconciliation does not enqueue a duplicate wake"
+        );
+        assert_eq!(
+            worker
+                .store
+                .pending_role_wake_inputs(&project, &format!("ticket_run:{ticket}:coordinator"), 8,)
+                .unwrap()
+                .into_iter()
+                .filter(|wake| wake.source_type == "worker_recovery_ready")
+                .count(),
+            1
+        );
         let authorization = crate::engine::orchestration::WorkerRecoveryAuthorization {
             schema_version: 1,
             ticket_run_id: ticket.clone(),
@@ -8401,6 +8577,118 @@ impl ConfigStore {
             });
         }
         Ok(candidates)
+    }
+
+    /// Persist a Coordinator-only nudge when a previously blocked Worker becomes
+    /// eligible for host-verified recovery. This contains no Worker authorization;
+    /// a later Coordinator result must still request and pass the normal recovery
+    /// candidate validation before a replacement can launch.
+    pub fn queue_worker_recovery_ready_wake(
+        &mut self,
+        owner_generation: u64,
+        run: &crate::store::scheduler::ActiveTicketRun,
+        plan: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+        configuration_digest: &Digest,
+        candidate: &crate::engine::orchestration::WorkerRecoveryCandidate,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        use crate::engine::reducer::Phase;
+
+        if run.phase != Phase::Implementing
+            || candidate.ticket_revision != run.revision
+            || candidate.accepted_plan_digest != plan.plan_digest
+            || plan.ticket_run_id != run.ticket_run_id
+            || plan.project_id != run.project_id
+            || plan.configuration_digest != *configuration_digest
+        {
+            return Err(
+                "Worker recovery readiness does not match the current TicketRun and plan".into(),
+            );
+        }
+        let role_session_id = format!("ticket_run:{}:coordinator", run.ticket_run_id);
+        let identity = serde_json::to_vec(&(
+            "rex-projects-worker-recovery-ready-v1",
+            run.project_id.as_str(),
+            run.ticket_run_id.as_str(),
+            run.revision,
+            configuration_digest.as_str(),
+            plan.plan_digest.as_str(),
+            candidate.prior_worker_result_evidence_id.as_str(),
+        ))
+        .map_err(|error| error.to_string())?;
+        let source_id = digest(&identity)?.to_string();
+        let payload = serde_json::json!({
+            "kind": "worker_recovery_ready",
+            "ticket_run_id": run.ticket_run_id.as_str(),
+            "ticket_revision": run.revision,
+            "prior_worker_result_evidence_id": candidate.prior_worker_result_evidence_id,
+            "instruction": "Re-evaluate host-verified Worker recovery candidates for this TicketRun. Do not start a Worker directly; any recovery requires a typed Coordinator SpawnRequest and fresh host authorization."
+        });
+        let payload_json = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::validate_active_generation(&tx, owner_generation)?;
+        let current: Option<(u64, String, u64)> = tx
+            .query_row(
+                "SELECT t.revision,t.internal_phase,c.project_epoch FROM ticket_runs t JOIN ticket_run_context c USING(project_id,ticket_run_id) JOIN projects p USING(project_id) JOIN project_runtimes r USING(project_id) WHERE t.project_id=?1 AND t.ticket_run_id=?2 AND p.desired_lifecycle='running' AND r.observed_lifecycle='running' AND r.controller_generation=?3",
+                rusqlite::params![run.project_id.as_str(), run.ticket_run_id.as_str(), owner_generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if current != Some((run.revision, "implementing".into(), run.project_epoch)) {
+            return Err(
+                "Worker recovery readiness became stale before its Coordinator wake was persisted"
+                    .into(),
+            );
+        }
+        let persisted_plan: Option<(String, String)> = tx
+            .query_row(
+                "SELECT plan_digest,configuration_digest FROM accepted_work_plans WHERE project_id=?1 AND ticket_run_id=?2 AND accepted_revision=?3",
+                rusqlite::params![run.project_id.as_str(), run.ticket_run_id.as_str(), plan.accepted_revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if persisted_plan
+            != Some((
+                plan.plan_digest.to_string(),
+                configuration_digest.to_string(),
+            ))
+        {
+            return Err("Worker recovery readiness plan is no longer the accepted plan".into());
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='worker_recovery_ready' AND source_id=?3 AND source_revision=?4",
+                rusqlite::params![run.project_id.as_str(), role_session_id, source_id, run.revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if existing
+            .as_ref()
+            .is_some_and(|stored| stored != &payload_json)
+        {
+            return Err(
+                "Worker recovery readiness key already has a different Coordinator wake".into(),
+            );
+        }
+        let inserted = if existing.is_none() {
+            tx.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'worker_recovery_ready',?3,?4,20,?5,'pending',?6)",
+                rusqlite::params![run.project_id.as_str(), role_session_id, source_id, run.revision, payload_json, now_unix],
+            )
+            .map_err(|error| error.to_string())?
+                == 1
+        } else {
+            false
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
     }
 
     /// Persist a Coordinator-requested Worker retry only after its candidate has been
