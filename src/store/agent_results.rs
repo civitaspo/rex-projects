@@ -5248,6 +5248,87 @@ pub(crate) mod tests {
                 Some(&effect_receipt_json),
             )
             .unwrap();
+        let mut committed_recovery = authorization.clone();
+        committed_recovery.prior_host_commit_operation_id =
+            Some(crate::domain::ids::OperationId::parse(intent.operation_id.clone()).unwrap());
+        committed_recovery.prior_host_commit_receipt_digest =
+            Some(digest(effect_receipt_json.as_bytes()).unwrap());
+        committed_recovery.expected_head = effect_receipt.commit.observed_head.clone();
+        committed_recovery
+            .prior_artifact_refs
+            .push(effect_receipt.manifest_artifact.clone());
+        let recovered_prepared = worker
+            .store
+            .prepared_worker_launch(
+                restarted_generation,
+                plan_record.accepted_revision,
+                &node_id,
+                &prepared_receipt,
+                &project_config,
+                &configuration_digest,
+            )
+            .unwrap()
+            .expect("recovery must retain the genuine accepted prepared token");
+        let validated_plan = plan_record
+            .validate_for(&project_config, &configuration_digest)
+            .unwrap();
+        let node = validated_plan
+            .nodes_in_execution_order
+            .iter()
+            .find(|node| node.id == node_id)
+            .unwrap();
+        let assignment = crate::runtime_services::prepared_worker_assignment_for_test(
+            &worker.store,
+            restarted_generation,
+            &plan_record,
+            &validated_plan,
+            &recovered_prepared,
+            node,
+            Some(&committed_recovery),
+        )
+        .unwrap();
+        let assignment_path = worker._temp.path().join("recovered-worker-assignment.json");
+        std::fs::write(&assignment_path, assignment).unwrap();
+        let assignment: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&assignment_path).unwrap()).unwrap();
+        assert_eq!(
+            assignment["prepared_worktree"]["expected_head"],
+            effect_receipt.commit.observed_head
+        );
+        assert_eq!(assignment["prepared_worktree"]["verification_only"], false);
+        assert_eq!(
+            assignment["retained_host_commit"]["commit"]["operation_id"],
+            intent.operation_id
+        );
+        assert_eq!(
+            assignment["retained_host_commit"]["manifest_artifact"]["path"],
+            effect_receipt.manifest_artifact.path
+        );
+
+        let mut advanced_no_commit_recovery = authorization.clone();
+        advanced_no_commit_recovery.expected_head = "f".repeat(40);
+        let advanced_assignment = crate::runtime_services::prepared_worker_assignment_for_test(
+            &worker.store,
+            restarted_generation,
+            &plan_record,
+            &validated_plan,
+            &recovered_prepared,
+            node,
+            Some(&advanced_no_commit_recovery),
+        )
+        .unwrap();
+        let advanced_assignment: serde_json::Value =
+            serde_json::from_str(&advanced_assignment).unwrap();
+        assert_eq!(
+            advanced_assignment["prepared_worktree"]["expected_head"],
+            advanced_no_commit_recovery.expected_head
+        );
+        assert_eq!(
+            advanced_assignment["prepared_worktree"]["verification_only"],
+            false
+        );
+        assert!(advanced_assignment["retained_host_commit"].is_null());
+
         let effect_count_before: u64 = worker
             .store
             .connection

@@ -4783,6 +4783,47 @@ fn ensure_worker_worktree_at_expected_head(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn prepared_worker_assignment_for_test(
+    store: &ConfigStore,
+    owner_generation: u64,
+    plan_record: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    validated_plan: &crate::engine::orchestration::ValidatedPlan,
+    token: &crate::store::accepted_plans::PreparedWorkerLaunch,
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    recovery_authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Result<String, String> {
+    let verification = worker_verification_assignment(
+        store,
+        owner_generation,
+        token,
+        node,
+        recovery_authorization,
+    )?;
+    let retained = retained_host_commit(
+        store,
+        token.project_id(),
+        token.configuration_digest(),
+        recovery_authorization,
+    )?;
+    worker_assignment_context(&WorkerAssignmentContext {
+        plan_record,
+        validated_plan,
+        node,
+        worktree_path: token.worktree_path(),
+        branch: token.branch(),
+        base_sha: token.base_sha(),
+        expected_head: recovery_authorization
+            .map(|authorization| authorization.expected_head.as_str())
+            .unwrap_or_else(|| token.expected_head()),
+        verification: verification.as_ref(),
+        recovery_authorization,
+        retained_host_commit: retained.as_ref(),
+        commit_mode: token.commit_mode(),
+        repository_id: token.repository_id(),
+    })
+}
+
 fn worker_verification_assignment(
     store: &ConfigStore,
     owner_generation: u64,
@@ -4793,9 +4834,27 @@ fn worker_verification_assignment(
     let expected_head = recovery_authorization
         .map(|authorization| authorization.expected_head.as_str())
         .unwrap_or_else(|| token.expected_head());
-    if expected_head == token.base_sha() {
+    if recovery_authorization.is_some_and(|authorization| {
+        authorization.ticket_run_id != *token.ticket_run_id()
+            || authorization.ticket_revision != token.ticket_revision()
+            || authorization.work_node_id != node.id
+            || authorization.accepted_plan_digest != *token.plan_digest()
+            || authorization.expected_head != expected_head
+    }) {
+        return Err("Worker recovery authorization differs from its prepared assignment".into());
+    }
+
+    // A prepared token at its base identifies first work for this accepted plan. A recovery
+    // authorization may advance that worktree through a retained host commit, but there is no
+    // accepted publication to verify yet.
+    if token.expected_head() == token.base_sha() {
         return Ok(None);
     }
+
+    // Correction work starts from a host accepted publication. Verify that publication from
+    // the prepared token, then only classify the worker as verification-only while recovery
+    // still points at that exact published head.
+    let published_head = token.expected_head();
     let snapshot = store.accepted_implementation_publication_snapshot(
         owner_generation,
         token.project_id(),
@@ -4827,23 +4886,19 @@ fn worker_verification_assignment(
         || receipt.work_node_id != node.id
         || receipt.repository_id != node.repository
         || receipt.configuration_digest != *token.configuration_digest()
-        || receipt.commit.head() != expected_head
-        || recovery_authorization.is_some_and(|authorization| {
-            authorization.ticket_run_id != *token.ticket_run_id()
-                || authorization.ticket_revision != token.ticket_revision()
-                || authorization.work_node_id != node.id
-                || authorization.accepted_plan_digest != *token.plan_digest()
-                || authorization.expected_head != expected_head
-        })
+        || receipt.commit.head() != published_head
     {
         return Err(
             "correction Worker publication differs from its host-prepared assignment".into(),
         );
     }
+    if expected_head != published_head {
+        return Ok(None);
+    }
     Ok(Some(WorkerVerificationAssignment {
         publication_revision: snapshot.publication_revision(),
         publication_operation_id: publication.intent().operation_id.as_str().to_owned(),
-        published_head: receipt.commit.head().to_owned(),
+        published_head: published_head.to_owned(),
     }))
 }
 

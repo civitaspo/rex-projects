@@ -4104,6 +4104,19 @@ mod tests {
     #[test]
     fn native_worker_readiness_query_executes_against_production_database_schema() {
         let temporary = tempfile::tempdir().unwrap();
+        if std::env::var_os("REX_PROJECTS_READINESS_QUERY_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "acceptance::tests::native_worker_readiness_query_executes_against_production_database_schema",
+                ])
+                .env("REX_PROJECTS_READINESS_QUERY_TEST_CHILD", "1")
+                .env("XDG_STATE_HOME", temporary.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         let _store = rex_projects::store::ConfigStore::open(temporary.path()).unwrap();
         let database = Connection::open_with_flags(
             temporary.path().join("state.sqlite3"),
