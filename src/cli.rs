@@ -3973,7 +3973,7 @@ fn version(json: bool) -> Result<(), CliError> {
                 .into(),
             cli_protocol: 1,
             database_schema: crate::store::SCHEMA_VERSION as u32,
-            source_revision: option_env!("REX_PROJECTS_SOURCE_REVISION").map(str::to_owned),
+            source_revision: crate::BUILD_SOURCE_REVISION.map(str::to_owned),
             dirty: option_env!("REX_PROJECTS_BUILD_DIRTY") == Some("true"),
         };
         print_json(&report)

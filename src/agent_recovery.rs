@@ -1766,11 +1766,15 @@ fn observe_provider_start(
             reason: RecoveryUnknown::ProviderIdentityMismatch,
         });
     };
+    let rex_child_pid = wrapper
+        .rex_launch_anchor
+        .as_ref()
+        .map_or(wrapper.pid, |anchor| anchor.pid);
     if rex_observation.last_exit.is_some() {
         if rex_observation
             .child
             .as_ref()
-            .is_some_and(|rex_wrapper| rex_wrapper.pid != wrapper.pid)
+            .is_some_and(|rex_child| rex_child.pid != rex_child_pid)
         {
             return Ok(AgentRecoveryDisposition::Unresolved {
                 reason: RecoveryUnknown::WrapperIdentityMismatch,
@@ -1790,7 +1794,7 @@ fn observe_provider_start(
             reason: RecoveryUnknown::WrapperIdentityMismatch,
         });
     };
-    if rex_wrapper.pid != wrapper.pid {
+    if rex_wrapper.pid != rex_child_pid {
         return Ok(AgentRecoveryDisposition::Unresolved {
             reason: RecoveryUnknown::ProviderIdentityMismatch,
         });
@@ -1802,6 +1806,29 @@ fn observe_provider_start(
             reason: RecoveryUnknown::WrapperIdentityMismatch,
         });
     };
+    if wrapper_process.quality != ProcessIdentityQuality::KernelBirthToken {
+        return Ok(AgentRecoveryDisposition::Unresolved {
+            reason: RecoveryUnknown::ProcessInspectionUnavailable,
+        });
+    }
+    if let Some(anchor) = &wrapper.rex_launch_anchor {
+        let Some(anchor_process) =
+            kernel_identity(process_table, anchor.pid, &anchor.start_identity)
+        else {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::WrapperIdentityMismatch,
+            });
+        };
+        if anchor_process.quality != ProcessIdentityQuality::KernelBirthToken
+            || wrapper_process.parent_pid != anchor.pid
+            || !process_executable_matches(wrapper_process, &wrapper.runtime_binary_digest)
+            || !process_executable_matches(anchor_process, &wrapper.runtime_binary_digest)
+        {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::WrapperIdentityMismatch,
+            });
+        }
+    }
     let tree = capture_process_tree(wrapper_process.pid, process_table);
     if tree
         .iter()
@@ -1812,12 +1839,23 @@ fn observe_provider_start(
             reason: RecoveryUnknown::ProcessInspectionUnavailable,
         });
     }
+    let rex_foreground_pid = rex_observation.foreground.as_ref().map(|process| {
+        if wrapper
+            .rex_launch_anchor
+            .as_ref()
+            .is_some_and(|anchor| process.pid == anchor.pid)
+        {
+            // The exact anchor was validated above. Some Rex versions report the
+            // foreground shim instead of a descendant; provider discovery still
+            // starts at the exact supervisor and retains its foreground gate.
+            wrapper.pid
+        } else {
+            process.pid
+        }
+    });
     let provider_process = match discover_provider_process(
         wrapper_process.pid,
-        rex_observation
-            .foreground
-            .as_ref()
-            .map(|process| process.pid),
+        rex_foreground_pid,
         Some(expected_executable.as_path()),
         &tree,
         |process| executable_path_for_identity(process).map_err(|_| ()),
@@ -2619,6 +2657,444 @@ esac
         )
         .unwrap();
         (store, generation, run, wrapper, rex)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_awaiting_provider_observation_uses_rex_anchor_and_exact_supervisor_tree() {
+        use crate::launch::{AgentStartRequest, LaunchAnchorIdentity};
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture =
+            crate::store::agent_runtime::tests::prepared_anchored_block_loss_fixture(root.path());
+        let anchor_pid_file = root.path().join("anchor.pid");
+        let supervisor_pid_file = root.path().join("supervisor.pid");
+        let provider_pid_file = root.path().join("provider.pid");
+        let test_exe = std::env::current_exe().unwrap();
+        let helper_test = "agent_recovery::tests::anchored_provider_start_process_helper";
+        let mut anchor_command = Command::new(&test_exe);
+        anchor_command.process_group(0);
+        let mut anchor = anchor_command
+            .args(["--exact", helper_test, "--nocapture"])
+            .env("REX_ANCHORED_PROCESS_MODE", "anchor")
+            .env("REX_ANCHORED_ANCHOR_PID_FILE", &anchor_pid_file)
+            .env("REX_ANCHORED_SUPERVISOR_PID_FILE", &supervisor_pid_file)
+            .env("REX_ANCHORED_PROVIDER_PID_FILE", &provider_pid_file)
+            .spawn()
+            .unwrap();
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let (anchor_pid, supervisor_pid, provider_pid) = loop {
+            if anchor_pid_file.exists()
+                && supervisor_pid_file.exists()
+                && provider_pid_file.exists()
+            {
+                let read_pid = |path: &std::path::Path| {
+                    fs::read_to_string(path)
+                        .unwrap()
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap()
+                };
+                break (
+                    read_pid(&anchor_pid_file),
+                    read_pid(&supervisor_pid_file),
+                    read_pid(&provider_pid_file),
+                );
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "anchored process tree did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let process_table = inspect_process_table().unwrap();
+        let identity = |pid| {
+            process_table
+                .iter()
+                .find(|process| process.pid == pid)
+                .cloned()
+                .unwrap_or_else(|| panic!("process {pid} is absent from the kernel process table"))
+        };
+        let anchor_identity = identity(anchor_pid);
+        let supervisor_identity = identity(supervisor_pid);
+        let provider_identity = identity(provider_pid);
+        assert_eq!(supervisor_identity.parent_pid, anchor_pid);
+        assert_eq!(provider_identity.parent_pid, supervisor_pid);
+
+        let wrapper = ObservedWrapperIdentity {
+            pid: supervisor_pid,
+            start_identity: supervisor_identity.start_identity.clone(),
+            rex_session_id: fixture.authority.rex_session_id.clone(),
+            rex_block_id: fixture.authority.rex_block_id.to_string(),
+            runtime_binary_digest: fixture.authority.runtime_binary_digest.clone(),
+            rex_launch_anchor: Some(LaunchAnchorIdentity {
+                pid: anchor_pid,
+                start_identity: anchor_identity.start_identity.clone(),
+            }),
+        };
+        let request = AgentStartRequest {
+            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+            operation_id: fixture.authority.operation_id.clone(),
+            agent_run_id: fixture.authority.agent_run_id.clone(),
+            project_id: fixture.authority.project_id.clone(),
+            controller_generation: fixture.generation,
+            descriptor_digest: fixture.authority.descriptor_digest.clone(),
+            runtime_binary_digest: fixture.authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: fixture.authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: fixture.authority.qualification_receipt_digest.clone(),
+            wrapper_pid: supervisor_pid,
+            wrapper_start_identity: supervisor_identity.start_identity.clone(),
+            rex_launch_anchor: wrapper.rex_launch_anchor.clone(),
+            rex_session_id: wrapper.rex_session_id.clone(),
+            rex_block_id: wrapper.rex_block_id.clone(),
+        };
+        let receipt = fixture
+            .store
+            .authorize_agent_start(fixture.generation, &request, &wrapper)
+            .unwrap();
+        let spool = RunStepSpool::open(&fixture.authority.control_dir).unwrap();
+        let start = spool.publish_start_once(request).unwrap();
+        spool.publish_start_receipt(&start, receipt).unwrap();
+        fixture
+            .store
+            .retain_agent_run_unknown(
+                fixture.generation,
+                &fixture.authority.agent_run_id,
+                fixture.reservation.project_epoch,
+            )
+            .unwrap();
+        let run = fixture
+            .store
+            .recoverable_agent_runs(fixture.generation, 8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let rex_script = root.path().join("rex-anchored-provider-fixture");
+        let session_view = serde_json::json!({
+            "session_id": fixture.authority.rex_session_id,
+            "windows": [{
+                "window_id": fixture.authority.rex_window_id,
+                "layers": [{"blocks": [{
+                    "block_id": fixture.authority.rex_block_id,
+                    "label": crate::adapters::rex::owned_agent_block_label(
+                        fixture.authority.agent_run_id.as_str(),
+                    ).unwrap(),
+                    "flavor": "com.superlogical.terminal.shell"
+                }]}]
+            }]
+        });
+        let process_observation = serde_json::json!({
+            "last_exit": null,
+            "child": {"pid": anchor_pid, "user_id": 501, "name": "rex-projects", "path": test_exe},
+            "foreground": {"pid": anchor_pid, "user_id": 501, "name": "rex-projects", "path": test_exe},
+            "ancestors": []
+        });
+        fs::write(
+            &rex_script,
+            r##"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/rex-test.sock","instance_id":"rex-instance","host_id":"fixture-host","rex_version":"1.2.3"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*) printf '%s\n' "$REX_TEST_SESSION_VIEW" ;;
+  *"api call com.superlogical.terminal.process"*) printf '%s\n' "$REX_TEST_PROCESS_OBSERVATION" ;;
+  *) exit 3 ;;
+esac
+"##,
+        )
+        .unwrap();
+        fs::set_permissions(&rex_script, fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = BTreeMap::from([
+            (
+                OsString::from("REX_TEST_SESSION_VIEW"),
+                OsString::from(session_view.to_string()),
+            ),
+            (
+                OsString::from("REX_TEST_PROCESS_OBSERVATION"),
+                OsString::from(process_observation.to_string()),
+            ),
+        ]);
+        let rex = RexCliTransport::connect(
+            &rex_script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "rex-instance".into(),
+            run.authority.rex_session_id.clone(),
+            environment,
+        )
+        .unwrap();
+        let observation_window = TicketWindow {
+            server_instance_id: "rex-instance".into(),
+            session_id: run.authority.rex_session_id.clone(),
+            window_id: run.authority.rex_window_id.clone(),
+            label: String::new(),
+            initial_block_id: Some(run.authority.rex_block_id.clone()),
+            disposition: CreateDisposition::Existing,
+        };
+        assert!(
+            rex.agent_block_is_present(
+                &observation_window,
+                run.authority.agent_run_id.as_str(),
+                &run.authority.rex_block_id,
+            )
+            .unwrap()
+        );
+        let mut policy = policy();
+        policy.rex_session_id = run.authority.rex_session_id.clone();
+        let mut wrong_runtime_digest = run.clone();
+        let mut wrong_digest_wrapper: ObservedWrapperIdentity = crate::protocol::parse_unique(
+            wrong_runtime_digest
+                .wrapper_identity_json
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let unauthorized_digest = Digest::parse("f".repeat(64)).unwrap();
+        wrong_runtime_digest.authority.runtime_binary_digest = unauthorized_digest.clone();
+        wrong_digest_wrapper.runtime_binary_digest = unauthorized_digest;
+        wrong_runtime_digest.wrapper_identity_json =
+            Some(serde_json::to_string(&wrong_digest_wrapper).unwrap());
+        let wrong_digest_disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &wrong_runtime_digest,
+                "rex-instance",
+                &process_table,
+            )
+            .unwrap();
+        assert!(matches!(
+            wrong_digest_disposition,
+            AgentRecoveryDisposition::Unresolved { .. }
+        ));
+        let mut wrong_anchor_birth = run.clone();
+        let mut wrong_anchor_wrapper: ObservedWrapperIdentity = crate::protocol::parse_unique(
+            wrong_anchor_birth
+                .wrapper_identity_json
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        wrong_anchor_wrapper
+            .rex_launch_anchor
+            .as_mut()
+            .unwrap()
+            .start_identity
+            .push_str("-reused");
+        wrong_anchor_birth.wrapper_identity_json =
+            Some(serde_json::to_string(&wrong_anchor_wrapper).unwrap());
+        let wrong_anchor_disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &wrong_anchor_birth,
+                "rex-instance",
+                &process_table,
+            )
+            .unwrap();
+        assert!(matches!(
+            wrong_anchor_disposition,
+            AgentRecoveryDisposition::Unresolved { .. }
+        ));
+        let mut wrong_supervisor_birth = run.clone();
+        let mut wrong_supervisor_wrapper: ObservedWrapperIdentity = crate::protocol::parse_unique(
+            wrong_supervisor_birth
+                .wrapper_identity_json
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        wrong_supervisor_wrapper.start_identity.push_str("-reused");
+        wrong_supervisor_birth.wrapper_identity_json =
+            Some(serde_json::to_string(&wrong_supervisor_wrapper).unwrap());
+        let wrong_supervisor_disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &wrong_supervisor_birth,
+                "rex-instance",
+                &process_table,
+            )
+            .unwrap();
+        assert!(matches!(
+            wrong_supervisor_disposition,
+            AgentRecoveryDisposition::Unresolved { .. }
+        ));
+        let mut wrong_parent_table = process_table.clone();
+        wrong_parent_table
+            .iter_mut()
+            .find(|process| process.pid == supervisor_pid)
+            .unwrap()
+            .parent_pid += 100_000;
+        let wrong_parent_disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &run,
+                "rex-instance",
+                &wrong_parent_table,
+            )
+            .unwrap();
+        assert!(matches!(
+            wrong_parent_disposition,
+            AgentRecoveryDisposition::Unresolved { .. }
+        ));
+        let mut unrelated_observation = process_observation.clone();
+        unrelated_observation["foreground"]["pid"] = serde_json::json!(u32::MAX);
+        let unrelated_environment = BTreeMap::from([
+            (
+                OsString::from("REX_TEST_SESSION_VIEW"),
+                OsString::from(session_view.to_string()),
+            ),
+            (
+                OsString::from("REX_TEST_PROCESS_OBSERVATION"),
+                OsString::from(unrelated_observation.to_string()),
+            ),
+        ]);
+        let unrelated_rex = RexCliTransport::connect(
+            &rex_script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "rex-instance".into(),
+            run.authority.rex_session_id.clone(),
+            unrelated_environment,
+        )
+        .unwrap();
+        let unrelated_foreground_disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &unrelated_rex,
+                &policy,
+                &run,
+                "rex-instance",
+                &process_table,
+            )
+            .unwrap();
+        assert!(matches!(
+            unrelated_foreground_disposition,
+            AgentRecoveryDisposition::Unresolved { .. }
+        ));
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_agent_launch_states(
+                &fixture.store,
+                run.agent_run_id.as_str(),
+            ),
+            (
+                "unknown".into(),
+                fixture.generation,
+                "awaiting_provider".into()
+            )
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                run.agent_run_id.as_str(),
+            ),
+            "unknown"
+        );
+        let disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &run,
+                "rex-instance",
+                &process_table,
+            )
+            .unwrap();
+        assert_eq!(disposition, AgentRecoveryDisposition::ProviderStarted);
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_agent_launch_states(
+                &fixture.store,
+                run.agent_run_id.as_str(),
+            ),
+            ("running".into(), fixture.generation, "running".into())
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                run.agent_run_id.as_str(),
+            ),
+            "live"
+        );
+        assert!(
+            crate::store::agent_runtime::tests::test_provider_tree_json(
+                &fixture.store,
+                run.agent_run_id.as_str(),
+            )
+            .is_some()
+        );
+        unsafe {
+            libc::kill(-(anchor_pid as i32), libc::SIGKILL);
+        }
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        while anchor.try_wait().unwrap().is_none() && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if anchor.try_wait().unwrap().is_none() {
+            let _ = anchor.kill();
+        }
+        let _ = anchor.wait();
+    }
+
+    #[test]
+    fn anchored_provider_start_process_helper() {
+        let Ok(mode) = std::env::var("REX_ANCHORED_PROCESS_MODE") else {
+            return;
+        };
+        let write_pid = |variable: &str| {
+            fs::write(
+                std::env::var(variable).unwrap(),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+        };
+        match mode.as_str() {
+            "anchor" => {
+                write_pid("REX_ANCHORED_ANCHOR_PID_FILE");
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "agent_recovery::tests::anchored_provider_start_process_helper",
+                        "--nocapture",
+                    ])
+                    .env("REX_ANCHORED_PROCESS_MODE", "supervisor")
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            "supervisor" => {
+                write_pid("REX_ANCHORED_SUPERVISOR_PID_FILE");
+                let status = Command::new("/usr/bin/perl")
+                    .args([
+                        "-e",
+                        "open my $f, '>', $ARGV[0] or die $!; print $f $$; close $f; sleep 120",
+                        &std::env::var("REX_ANCHORED_PROVIDER_PID_FILE").unwrap(),
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            other => panic!("unexpected fixture mode {other}"),
+        }
     }
 
     #[test]

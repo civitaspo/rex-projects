@@ -1,3 +1,5 @@
+pub const BUILD_SOURCE_REVISION: Option<&str> = option_env!("REX_PROJECTS_SOURCE_REVISION");
+
 pub mod adapters;
 pub mod agent_api;
 pub mod agent_recovery;

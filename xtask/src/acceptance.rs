@@ -3008,7 +3008,6 @@ fn write_native_worker_setup_freeze(
     let worker_profile_path = request
         .fixture_root
         .join("profiles/fixture_worker/config.toml");
-    let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/acceptance.rs");
     let frozen = json!({
         "product":cli_identity,
         "product_cli_path":request.cli,
@@ -3016,8 +3015,8 @@ fn write_native_worker_setup_freeze(
         "driver_path":driver_executable,
         "driver_sha256":format!("{:x}", Sha256::digest(fs::read(driver_executable).map_err(|error| error.to_string())?)),
         "driver_version":env!("CARGO_PKG_VERSION"),
-        "driver_source_revision":"52c6caa8f15297c3b396a578b952fae9f81655f6",
-        "driver_source_sha256":format!("{:x}", Sha256::digest(fs::read(source_path).map_err(|error| error.to_string())?)),
+        "driver_source_revision":rex_projects::BUILD_SOURCE_REVISION,
+        "driver_source_sha256":format!("{:x}", Sha256::digest(include_bytes!("acceptance.rs"))),
         "rex_instance_id":request.expected_instance,
         "rex_endpoint":request.rex_server,
         "rex_session_id":request.rex_session,
