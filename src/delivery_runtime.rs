@@ -17,7 +17,8 @@ use crate::delivery_forge::{
     PublicationError, PublishedPullRequest, PullRequestPublicationIntent, PullRequestPublisher,
 };
 use crate::domain::ids::{
-    Digest, OperationId, ProjectId, RepositoryId, TicketId, TicketNamespace, TicketRunId,
+    AgentRunId, Digest, OperationId, ProjectId, RepositoryId, TicketId, TicketNamespace,
+    TicketRunId,
 };
 use crate::domain::types::CommitMode;
 use crate::effects::{
@@ -822,6 +823,31 @@ impl RepositoryDelivery {
         Ok(head)
     }
 
+    /// Require an exact published HEAD and no tracked or untracked source changes in a
+    /// verification-only Worker worktree.
+    pub fn verify_clean_published_worktree_at(
+        &self,
+        path: &Path,
+        expected_head: &str,
+    ) -> Result<(), DeliveryError> {
+        validate_git_sha(expected_head)?;
+        if self.observe_local_head_at(path)? != expected_head {
+            return Err(DeliveryError::Conflict(
+                "verification worktree HEAD differs from the accepted publication".into(),
+            ));
+        }
+        let status = self.git_text(
+            path,
+            ["status", "--porcelain=v1", "--untracked-files=normal"],
+        )?;
+        if !status.is_empty() {
+            return Err(DeliveryError::Conflict(
+                "verification worktree contains source changes after publication".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Read the subject of one exact, currently checked-out Worker commit through the bounded
     /// Git executor. Publication callers must already have validated the commit authority.
     pub fn observe_commit_subject_at(
@@ -1519,6 +1545,16 @@ impl RepositoryDeliveryEffects {
             .map_err(|error| error.to_string())
     }
 
+    pub fn verify_clean_published_worktree_at(
+        &self,
+        path: &Path,
+        expected_head: &str,
+    ) -> Result<(), String> {
+        self.delivery
+            .verify_clean_published_worktree_at(path, expected_head)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn observe_commit_subject_at(
         &self,
         path: &Path,
@@ -1925,9 +1961,9 @@ impl RepositoryDeliveryEffects {
                     Some(prior_receipt.commit.observed_head)
                 }
                 None => {
-                    if recovery.expected_head != assignment.base_sha {
+                    if recovery.expected_head != assignment.expected_head() {
                         return Err(
-                            "pre-commit Worker recovery does not start at the prepared base".into(),
+                            "pre-commit Worker recovery does not start at its authorized expected HEAD".into(),
                         );
                     }
                     None
@@ -2677,8 +2713,9 @@ pub struct ImplementationPublicationReceipt {
 }
 
 /// Host-derived identity and coverage for the exact implementation publications under review.
-/// The revision and coverage are prompt metadata; `digest()` intentionally hashes only the
-/// historical three-field subject JSON consumed by ReviewReady validation.
+/// Revision and coverage are prompt metadata. With no verification, `digest()` hashes the
+/// historical three-field subject JSON; a check-only completion adds its separately bound
+/// verification provenance to that digest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementationPublicationSetSubject {
@@ -2687,6 +2724,25 @@ pub struct ImplementationPublicationSetSubject {
     pub publications: Vec<ImplementationPublicationSubjectFact>,
     pub coverage: Vec<WorkNodeId>,
     pub publication_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<WorkerVerificationSubject>,
+}
+
+/// Later Worker checks for an unchanged published tree. This provenance is part of the
+/// Reviewer subject digest without rewriting the original publication's revision or receipts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerVerificationSubject {
+    pub review_revision: u64,
+    pub source_evidence_id: String,
+    pub source_agent_run_id: AgentRunId,
+    pub source_result_digest: Digest,
+    pub publication_revision: u64,
+    pub publication_operation_id: OperationId,
+    pub published_head: String,
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub test_receipt_artifacts: Vec<crate::engine::orchestration::RoleArtifactReference>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2702,8 +2758,9 @@ pub struct ImplementationPublicationSubjectFact {
 }
 
 impl ImplementationPublicationSetSubject {
-    /// This is deliberately the exact JSON value and field set historically accepted by the
-    /// ReviewReady consumer. Do not add revision or coverage to this digest.
+    /// Preserve the historical subject digest when there is no check-only verification. When
+    /// verification exists, add its host-validated provenance without changing the original
+    /// publication layer.
     pub fn digest(&self) -> Result<Digest, String> {
         let mut publications = self
             .publications
@@ -2722,11 +2779,27 @@ impl ImplementationPublicationSetSubject {
             .collect::<Vec<_>>();
         publications
             .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
-        let subject = serde_json::json!({
+        let mut subject = serde_json::json!({
             "ticket_run_id": self.ticket_run_id,
             "accepted_plan_digest": self.accepted_plan_digest,
             "publications": publications,
         });
+        if let Some(verification) = &self.verification {
+            let mut artifacts = verification.test_receipt_artifacts.clone();
+            artifacts.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+            subject["verification"] = serde_json::json!({
+                "review_revision": verification.review_revision,
+                "source_evidence_id": verification.source_evidence_id,
+                "source_agent_run_id": verification.source_agent_run_id,
+                "source_result_digest": verification.source_result_digest,
+                "publication_revision": verification.publication_revision,
+                "publication_operation_id": verification.publication_operation_id,
+                "published_head": verification.published_head,
+                "work_node_id": verification.work_node_id,
+                "repository_id": verification.repository_id,
+                "test_receipt_artifacts": artifacts,
+            });
+        }
         let bytes = serde_json::to_vec(&subject).map_err(|error| error.to_string())?;
         Digest::parse(sha256_hex(&bytes))
     }
@@ -2923,6 +2996,7 @@ pub fn implementation_publication_set_subject(
         publications: facts,
         coverage,
         publication_revision,
+        verification: None,
     })
 }
 
@@ -3542,6 +3616,7 @@ mod tests {
             }],
             coverage: vec![WorkNodeId::parse("node-1").unwrap()],
             publication_revision: 5,
+            verification: None,
         };
         let legacy_value = serde_json::json!({
             "ticket_run_id": "run-1",
@@ -3566,6 +3641,32 @@ mod tests {
             .coverage
             .push(WorkNodeId::parse("extra-node").unwrap());
         assert_eq!(metadata_changed.digest().unwrap(), legacy_digest);
+
+        let mut verified = metadata_changed;
+        verified.verification = Some(WorkerVerificationSubject {
+            review_revision: 8,
+            source_evidence_id: "e".repeat(64),
+            source_agent_run_id: AgentRunId::parse("worker-run-8").unwrap(),
+            source_result_digest: Digest::parse("f".repeat(64)).unwrap(),
+            publication_revision: 6,
+            publication_operation_id: OperationId::parse("publish-node-1").unwrap(),
+            published_head: "c".repeat(40),
+            work_node_id: WorkNodeId::parse("node-1").unwrap(),
+            repository_id: RepositoryId::parse("repo-1").unwrap(),
+            test_receipt_artifacts: vec![crate::engine::orchestration::RoleArtifactReference {
+                artifact_id: crate::domain::ids::ArtifactId::parse("1".repeat(64)).unwrap(),
+                kind: crate::engine::orchestration::RoleArtifactKind::TestReceipt,
+                schema_version: 1,
+                path: "checks/test-receipt.md".into(),
+                digest: Digest::parse("2".repeat(64)).unwrap(),
+                bytes: 42,
+            }],
+        });
+        let verification_digest = verified.digest().unwrap();
+        assert_ne!(verification_digest, legacy_digest);
+        verified.verification.as_mut().unwrap().source_result_digest =
+            Digest::parse("3".repeat(64)).unwrap();
+        assert_ne!(verified.digest().unwrap(), verification_digest);
     }
     use crate::config::MergeConfig;
     use crate::process::ProcessRequest;

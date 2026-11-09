@@ -54,7 +54,7 @@ pub struct PromptContext {
     pub recovery_summary: Option<String>,
     pub accepted_plan: Option<String>,
     pub accepted_plan_digest: Option<ContentDigest>,
-    /// Present only for Reviewer turns whose exact host-validated publication set is available.
+    /// Present for Reviewer or MergeDecision turns whose exact host-validated publication set is available.
     pub implementation_publication_subject:
         Option<crate::delivery_runtime::ImplementationPublicationSetSubject>,
     pub previous_decisions: Vec<String>,
@@ -396,11 +396,14 @@ pub fn render_role_prompt(
         ));
     }
     if let Some(subject) = &context.implementation_publication_subject {
-        if context.role != Role::Reviewer {
-            return Err("implementation publication subject is scoped to Reviewer turns".into());
+        if !matches!(context.role, Role::Reviewer | Role::MergeDecision) {
+            return Err(
+                "implementation publication subject is scoped to Reviewer and MergeDecision turns"
+                    .into(),
+            );
         }
         let digest = subject.digest()?;
-        let binding = serde_json::json!({
+        let mut binding = serde_json::json!({
             "subject_kind": "implementation_publication_set",
             "subject_digest": digest,
             "evidence_coverage": subject.coverage,
@@ -408,9 +411,18 @@ pub fn render_role_prompt(
             "accepted_plan_digest": subject.accepted_plan_digest,
             "publications": subject.publications,
         });
+        if let Some(verification) = &subject.verification {
+            binding["verification"] = serde_json::to_value(verification)
+                .map_err(|error| format!("serialize Reviewer verification provenance: {error}"))?;
+        }
         let encoded = serde_json::to_string_pretty(&binding).map_err(|error| error.to_string())?;
+        let expected_result = if context.role == Role::Reviewer {
+            "ReviewReady"
+        } else {
+            "MergeAssessment"
+        };
         prompt.push_str(&format!(
-            "\nHost-validated implementation publication subject (use its exact subject kind, digest, and evidence coverage in ReviewReady):\n```json\n{encoded}\n```\n"
+            "\nHost-validated implementation publication subject (use its exact subject kind, digest, and evidence coverage in {expected_result}):\n```json\n{encoded}\n```\n"
         ));
     }
     append_list(
@@ -1150,6 +1162,69 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn reviewer_prompt_includes_host_validated_verification_provenance() {
+        let applied = fixture();
+        let cli_path = std::env::current_exe().unwrap();
+        let mut prompt_context = context(Role::Reviewer);
+        prompt_context.implementation_publication_subject = Some(
+            crate::delivery_runtime::ImplementationPublicationSetSubject {
+                ticket_run_id: crate::domain::ids::TicketRunId::parse("run-1").unwrap(),
+                accepted_plan_digest: ContentDigest::parse("a".repeat(64)).unwrap(),
+                publications: Vec::new(),
+                coverage: vec![crate::engine::orchestration::WorkNodeId::parse("node-1").unwrap()],
+                publication_revision: 5,
+                verification: Some(crate::delivery_runtime::WorkerVerificationSubject {
+                    review_revision: 7,
+                    source_evidence_id: "b".repeat(64),
+                    source_agent_run_id: crate::domain::ids::AgentRunId::parse("worker-run-6")
+                        .unwrap(),
+                    source_result_digest: ContentDigest::parse("c".repeat(64)).unwrap(),
+                    publication_revision: 5,
+                    publication_operation_id: crate::domain::ids::OperationId::parse(
+                        "publish-node-1",
+                    )
+                    .unwrap(),
+                    published_head: "d".repeat(40),
+                    work_node_id: crate::engine::orchestration::WorkNodeId::parse("node-1")
+                        .unwrap(),
+                    repository_id: RepositoryId::parse("example").unwrap(),
+                    test_receipt_artifacts: vec![
+                        crate::engine::orchestration::RoleArtifactReference {
+                            artifact_id: crate::domain::ids::ArtifactId::parse("e".repeat(64))
+                                .unwrap(),
+                            kind: crate::engine::orchestration::RoleArtifactKind::TestReceipt,
+                            schema_version: 1,
+                            path: "checks/test-receipt.md".into(),
+                            digest: ContentDigest::parse("f".repeat(64)).unwrap(),
+                            bytes: 42,
+                        },
+                    ],
+                }),
+            },
+        );
+
+        let rendered = render_role_prompt(&applied, &prompt_context, &cli_path).unwrap();
+        assert!(rendered.text.contains("\"verification\""));
+        assert!(rendered.text.contains("worker-run-6"));
+        assert!(rendered.text.contains("publish-node-1"));
+        assert!(rendered.text.contains("checks/test-receipt.md"));
+        let subject_digest = prompt_context
+            .implementation_publication_subject
+            .as_ref()
+            .unwrap()
+            .digest()
+            .unwrap();
+        assert!(rendered.text.contains(subject_digest.as_str()));
+
+        let mut merge_context = prompt_context;
+        merge_context.role = Role::MergeDecision;
+        let merge_rendered = render_role_prompt(&applied, &merge_context, &cli_path).unwrap();
+        assert!(merge_rendered.text.contains("in MergeAssessment"));
+        assert!(merge_rendered.text.contains("checks/test-receipt.md"));
+        assert!(merge_rendered.text.contains(subject_digest.as_str()));
     }
 
     #[test]

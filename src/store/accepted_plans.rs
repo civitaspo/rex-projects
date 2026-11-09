@@ -7,12 +7,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ProjectConfig;
 use crate::delivery_runtime::{PrepareWorktreesEffectPayload, PreparedWorktreesEffectReceipt};
-use crate::domain::ids::{AgentRunId, Digest, ProjectId, RepositoryId, TicketRunId};
+use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RepositoryId, TicketRunId};
 use crate::domain::types::CommitMode;
 use crate::engine::orchestration::{ValidatedPlan, WorkNodeId, WorkPlan};
 use crate::store::{ConfigStore, SucceededEffectReceipt};
 
 const MAX_PLAN_BYTES: usize = 1_048_576;
+
+fn accepted_transition_matches(
+    rows: &[(u64, u64, String)],
+    revision: u64,
+    kind: &str,
+    transition: &str,
+    source_revision: Option<u64>,
+    accepted_revision: Option<u64>,
+    publication_revision: Option<u64>,
+) -> bool {
+    rows.iter().any(|(_, next_revision, evidence)| {
+        *next_revision == revision
+            && serde_json::from_str::<serde_json::Value>(evidence).is_ok_and(|value| {
+                value["kind"] == kind
+                    && value["transition"] == transition
+                    && source_revision
+                        .is_none_or(|revision| value["source_revision"].as_u64() == Some(revision))
+                    && accepted_revision.is_none_or(|revision| {
+                        value["accepted_revision"].as_u64() == Some(revision)
+                    })
+                    && publication_revision.is_none_or(|revision| {
+                        value["publication_revision"].as_u64() == Some(revision)
+                    })
+            })
+    })
+}
+
 type AcceptedPlanRow = (
     String,
     String,
@@ -205,6 +232,25 @@ pub struct AcceptedImplementationPublicationSnapshot {
     publication_revision: u64,
     prepared_receipt: PreparedWorktreesEffectReceipt,
     publication_receipts: Vec<SucceededEffectReceipt>,
+    verification: Option<AcceptedWorkerVerification>,
+}
+
+/// A Worker check-only completion bound to an already accepted implementation publication.
+/// The publication provenance stays at its original revision; this record describes only the
+/// later review evidence that was verified against that exact published tree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceptedWorkerVerification {
+    pub review_revision: u64,
+    pub source_revision: u64,
+    pub source_evidence_id: String,
+    pub source_agent_run_id: AgentRunId,
+    pub source_result_digest: Digest,
+    pub publication_revision: u64,
+    pub publication_operation_id: OperationId,
+    pub published_head: crate::engine::orchestration::GitCommitId,
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub test_receipt_artifacts: Vec<crate::engine::orchestration::RoleArtifactReference>,
 }
 
 impl AcceptedImplementationPublicationSnapshot {
@@ -222,6 +268,10 @@ impl AcceptedImplementationPublicationSnapshot {
 
     pub fn publication_receipts(&self) -> &[SucceededEffectReceipt] {
         &self.publication_receipts
+    }
+
+    pub fn verification(&self) -> Option<&AcceptedWorkerVerification> {
+        self.verification.as_ref()
     }
 }
 
@@ -267,6 +317,7 @@ pub struct PreparedWorkerLaunch {
     worktree_path: std::path::PathBuf,
     branch: String,
     base_sha: String,
+    expected_head: Option<String>,
     prepare_operation_id: String,
     prepare_receipt_digest: Digest,
     source_evidence_id: String,
@@ -292,6 +343,7 @@ impl PreparedWorkerLaunch {
             worktree_path: self.worktree_path.clone(),
             branch: self.branch.clone(),
             base_sha: self.base_sha.clone(),
+            expected_head: self.expected_head.clone(),
             prepare_operation_id: self.prepare_operation_id.clone(),
             prepare_receipt_digest: self.prepare_receipt_digest.clone(),
             source_evidence_id: self.source_evidence_id.clone(),
@@ -339,6 +391,10 @@ impl PreparedWorkerLaunch {
     }
     pub fn base_sha(&self) -> &str {
         &self.base_sha
+    }
+
+    pub fn expected_head(&self) -> &str {
+        self.expected_head.as_deref().unwrap_or(&self.base_sha)
     }
     pub fn prepare_operation_id(&self) -> &str {
         &self.prepare_operation_id
@@ -690,7 +746,7 @@ impl ConfigStore {
             return Err("publication snapshot requires the active controller generation".into());
         }
         let mut stmt = self.connection.prepare(
-            "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC LIMIT 2",
+            "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC",
         ).map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map(
@@ -727,11 +783,42 @@ impl ConfigStore {
         {
             return Err("committed implementation publication transition is malformed".into());
         }
-        match (
-            phase.as_str(),
-            consumer_revision.checked_sub(publication_revision),
-        ) {
+        let publication_delta = consumer_revision.checked_sub(publication_revision);
+        let transition_chain_matches = |through_offset: u64| {
+            (1..=through_offset).all(|offset| {
+                let revision = publication_revision + offset;
+                if offset % 2 == 1 {
+                    accepted_transition_matches(
+                        &rows,
+                        revision,
+                        "review_assessment",
+                        "corrections_remain",
+                        Some(revision - 1),
+                        Some(revision),
+                        None,
+                    )
+                } else {
+                    accepted_transition_matches(
+                        &rows,
+                        revision,
+                        "worker_verification_completed",
+                        "worker_verification_completed",
+                        Some(revision - 1),
+                        Some(revision),
+                        Some(publication_revision),
+                    )
+                }
+            })
+        };
+        match (phase.as_str(), publication_delta) {
             ("reviewing", Some(0)) => {}
+            ("reviewing", Some(delta)) if delta >= 2 && delta % 2 == 0 => {
+                if !transition_chain_matches(delta) {
+                    return Err(
+                        "publication snapshot is no longer the current review subject".into(),
+                    );
+                }
+            }
             ("assessing", Some(1))
                 if rows.iter().any(|(_, next_revision, next_evidence)| {
                     *next_revision == consumer_revision
@@ -742,6 +829,42 @@ impl ConfigStore {
                             },
                         )
                 }) => {}
+            ("assessing", Some(delta))
+                if delta >= 3
+                    && delta % 2 == 1
+                    && transition_chain_matches(delta - 1)
+                    && rows.iter().any(|(_, next_revision, next_evidence)| {
+                        *next_revision == consumer_revision
+                            && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                                |value| {
+                                    value["kind"] == "review_assessment"
+                                        && value["transition"] == "review_converged"
+                                },
+                            )
+                    }) => {}
+            ("implementing", Some(1))
+                if rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "corrections_remain"
+                            },
+                        )
+                }) => {}
+            ("implementing", Some(delta))
+                if delta >= 3
+                    && delta % 2 == 1
+                    && transition_chain_matches(delta - 1)
+                    && accepted_transition_matches(
+                        &rows,
+                        consumer_revision,
+                        "review_assessment",
+                        "corrections_remain",
+                        Some(consumer_revision - 1),
+                        Some(consumer_revision),
+                        None,
+                    ) => {}
             _ => return Err("publication snapshot is no longer the current review subject".into()),
         }
         let accepted = self
@@ -894,11 +1017,101 @@ impl ConfigStore {
                 "publication snapshot digest does not match its committed receipt bindings".into(),
             );
         }
+        let verification_revision = match (phase.as_str(), publication_delta) {
+            ("reviewing", Some(delta)) if delta >= 2 && delta % 2 == 0 => Some(consumer_revision),
+            ("assessing", Some(delta)) if delta >= 3 && delta % 2 == 1 => {
+                consumer_revision.checked_sub(1)
+            }
+            _ => None,
+        };
+        let verification = if let Some(verification_revision) = verification_revision {
+            let (_, _, transition_json) = rows
+                .iter()
+                .find(|(_, next_revision, _)| *next_revision == verification_revision)
+                .ok_or("verification transition is missing from the current review subject")?;
+            let transition: serde_json::Value =
+                crate::protocol::parse_unique(transition_json.as_bytes())?;
+            let value = &transition["verification"];
+            let parsed: AcceptedWorkerVerification = serde_json::from_value(serde_json::json!({
+                "review_revision": value["review_revision"],
+                "source_revision": value["source_revision"],
+                "source_evidence_id": value["source_evidence_id"],
+                "source_agent_run_id": value["source_agent_run_id"],
+                "source_result_digest": value["source_result_digest"],
+                "publication_revision": value["publication_revision"],
+                "publication_operation_id": value["publication_operation_id"],
+                "published_head": value["published_head"],
+                "work_node_id": value["work_node_id"],
+                "repository_id": value["repository_id"],
+                "test_receipt_artifacts": value["test_receipt_artifacts"],
+            }))
+            .map_err(|error| {
+                format!("stored Worker verification transition is invalid: {error}")
+            })?;
+            if transition["source_revision"].as_u64() != Some(parsed.source_revision)
+                || transition["accepted_revision"].as_u64() != Some(parsed.review_revision)
+                || transition["evidence_id"].as_str() != Some(parsed.source_evidence_id.as_str())
+                || transition["result_digest"].as_str()
+                    != Some(parsed.source_result_digest.as_str())
+                || transition["kind"] != "worker_verification_completed"
+                || transition["transition"] != "worker_verification_completed"
+                || parsed.review_revision != verification_revision
+                || parsed.source_revision.checked_add(1) != Some(verification_revision)
+                || parsed.publication_revision != publication_revision
+                || parsed.test_receipt_artifacts.is_empty()
+                || parsed
+                    .test_receipt_artifacts
+                    .iter()
+                    .map(|artifact| artifact.artifact_id.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != parsed.test_receipt_artifacts.len()
+                || parsed.test_receipt_artifacts.iter().any(|artifact| {
+                    artifact.kind != crate::engine::orchestration::RoleArtifactKind::TestReceipt
+                })
+            {
+                return Err(
+                    "Worker verification transition is not bound to its accepted review revision"
+                        .into(),
+                );
+            }
+            let matching_publication = publication_receipts
+                .iter()
+                .filter_map(|receipt| {
+                    let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                        crate::protocol::parse_unique(receipt.intent().request_json.as_bytes())
+                            .ok()?;
+                    (request.work_node_id == parsed.work_node_id).then_some((receipt, request))
+                })
+                .collect::<Vec<_>>();
+            if matching_publication.len() != 1 {
+                return Err(
+                    "Worker verification does not identify exactly one accepted publication".into(),
+                );
+            }
+            let (receipt, request) = &matching_publication[0];
+            let published: crate::delivery_runtime::ImplementationPublicationReceipt =
+                crate::protocol::parse_unique(receipt.receipt_json().as_bytes())?;
+            if receipt.intent().operation_id != parsed.publication_operation_id.as_str()
+                || request.repository_id != parsed.repository_id
+                || published.commit.head() != parsed.published_head.as_str()
+                || published.repository_id != parsed.repository_id
+            {
+                return Err(
+                    "Worker verification differs from the exact accepted publication receipt"
+                        .into(),
+                );
+            }
+            Some(parsed)
+        } else {
+            None
+        };
         Ok(AcceptedImplementationPublicationSnapshot {
             accepted_plan: accepted,
             publication_revision,
             prepared_receipt,
             publication_receipts,
+            verification,
         })
     }
 
@@ -1028,6 +1241,65 @@ impl ConfigStore {
         {
             return Err("prepared worktree does not match accepted Worker node".into());
         }
+        let correction_transition: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision=?3",
+                params![ticket_run_id.as_str(), project_id.as_str(), current_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let expected_head = match correction_transition {
+            Some(evidence_json)
+                if serde_json::from_str::<serde_json::Value>(&evidence_json).is_ok_and(
+                    |value| {
+                        value["kind"] == "review_assessment"
+                            && value["transition"] == "corrections_remain"
+                    },
+                ) =>
+            {
+                let snapshot = self.accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    project_id,
+                    &ticket_run_id,
+                    current_revision,
+                )?;
+                let matching = snapshot
+                    .publication_receipts
+                    .iter()
+                    .filter_map(|publication| {
+                        let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                            crate::protocol::parse_unique(
+                                publication.intent().request_json.as_bytes(),
+                            )
+                            .ok()?;
+                        (request.work_node_id == *node_id).then_some((publication, request))
+                    })
+                    .collect::<Vec<_>>();
+                if matching.len() != 1 {
+                    return Err("review correction publication does not cover this Worker node exactly once".into());
+                }
+                let (publication, request) = &matching[0];
+                let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+                    crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+                if request.ticket_run_id != ticket_run_id
+                    || request.repository_id != node.repository
+                    || request.configuration_digest != plan.configuration_digest
+                    || receipt.ticket_run_id != ticket_run_id
+                    || receipt.work_node_id != *node_id
+                    || receipt.repository_id != node.repository
+                    || receipt.configuration_digest != plan.configuration_digest
+                {
+                    return Err(
+                        "review correction publication differs from the accepted Worker node"
+                            .into(),
+                    );
+                }
+                Some(receipt.commit.head().to_owned())
+            }
+            _ => None,
+        };
         Ok(Some(PreparedWorkerLaunch {
             project_id: project_id.clone(),
             ticket_run_id,
@@ -1041,6 +1313,7 @@ impl ConfigStore {
             worktree_path: prepared.worktree_path.clone(),
             branch: prepared.branch.clone(),
             base_sha: prepared.base_sha.clone(),
+            expected_head,
             prepare_operation_id: intent.operation_id.clone(),
             prepare_receipt_digest: digest_json(succeeded.receipt_json()),
             source_evidence_id: plan.source_evidence_id,

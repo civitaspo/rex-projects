@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{AgentRunId, Digest, ProjectId, TicketRunId};
+use crate::domain::ids::{AgentRunId, Digest, ProjectId, Revision, TicketRunId};
 use crate::domain::types::Role;
 use crate::engine::orchestration::{
     RoleResultBinding, RoleResultSubmission, ValidatedRoleResult, WakeSessionKey,
@@ -1862,6 +1862,11 @@ pub fn acknowledge_committed_role_result(
             "worker",
             &["worker_implementation_ready"],
         ),
+        "worker_verification_completed" => (
+            "worker-verification:",
+            "worker",
+            &["worker_verification_completed"],
+        ),
         "review_assessment" => (
             "review-ready:",
             "reviewer",
@@ -2600,20 +2605,38 @@ pub(crate) mod tests {
     use std::path::PathBuf;
 
     fn coordinator_spawn_result(child_role: Role) -> IngestedAgentResult {
+        coordinator_spawn_result_at(
+            child_role,
+            "evidence-spawn",
+            "coordinator-run",
+            "coordinator-operation",
+            3,
+            3,
+            "ticket_run:ticket-run:coordinator",
+        )
+    }
+
+    fn coordinator_spawn_result_at(
+        child_role: Role,
+        evidence_id: &str,
+        agent_run_id: &str,
+        operation_id: &str,
+        ticket_revision: u64,
+        run_epoch: u64,
+        role_session_id: &str,
+    ) -> IngestedAgentResult {
         let digest = || Digest::parse("a".repeat(64)).unwrap();
         let binding = RoleResultBinding {
-            agent_run_id: AgentRunId::parse("coordinator-run").unwrap(),
-            operation_id: OperationId::parse("coordinator-operation").unwrap(),
+            agent_run_id: AgentRunId::parse(agent_run_id).unwrap(),
+            operation_id: OperationId::parse(operation_id).unwrap(),
             project_id: ProjectId::parse("project-a").unwrap(),
-            role_session_id: crate::engine::orchestration::RoleSessionId::parse(
-                "ticket_run:ticket-run:coordinator",
-            )
-            .unwrap(),
+            role_session_id: crate::engine::orchestration::RoleSessionId::parse(role_session_id)
+                .unwrap(),
             role: Role::Coordinator,
             parent_run_id: Some(AgentRunId::parse("supervisor-run").unwrap()),
             parent_role: Some(Role::Supervisor),
             ticket_run_id: Some(TicketRunId::parse("ticket-run").unwrap()),
-            ticket_revision: Some(Revision(3)),
+            ticket_revision: Some(Revision(ticket_revision)),
             config_revision: Revision(2),
             config_digest: digest(),
             profile_digest: digest(),
@@ -2621,7 +2644,7 @@ pub(crate) mod tests {
             provider_capability_receipt_digest: digest(),
             result_schema_digest: digest(),
             controller_generation: 7,
-            run_epoch: 3,
+            run_epoch,
             attempt: 1,
         };
         let request = crate::engine::orchestration::SpawnRequestPayload {
@@ -2649,7 +2672,7 @@ pub(crate) mod tests {
                 wake_recipients: Vec::new(),
             },
             receipt: StoredRoleResultReceipt {
-                evidence_id: "evidence-spawn".into(),
+                evidence_id: evidence_id.into(),
                 message_id: "message-1".into(),
                 content_digest: digest(),
                 terminal_digest: digest(),
@@ -2678,7 +2701,7 @@ pub(crate) mod tests {
                  INSERT INTO projects VALUES ('project-a',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
                  CREATE TABLE ticket_runs(ticket_run_id TEXT, project_id TEXT, revision INTEGER, internal_phase TEXT, config_revision INTEGER, config_digest TEXT);
                  INSERT INTO ticket_runs VALUES ('ticket-run','project-a',3,'planning',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-                 CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT);
+                 CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT, descriptor_digest TEXT, authority_digest TEXT);
                  CREATE TABLE agent_result_evidence(evidence_id TEXT, agent_run_id TEXT, project_id TEXT, role TEXT, outcome TEXT, ticket_run_id TEXT, run_epoch INTEGER);
                  INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed','ticket-run',3);
                  CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, source_revision INTEGER, priority INTEGER, payload_json TEXT, lifecycle TEXT, created_at_unix INTEGER, UNIQUE(role_session_id,source_type,source_id,source_revision));
@@ -2687,8 +2710,12 @@ pub(crate) mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO agent_launch_authority VALUES ('coordinator-run',?1)",
-                [&authority_json],
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run',?1,?2,?3)",
+                rusqlite::params![
+                    authority_json,
+                    authority.descriptor_digest.as_str(),
+                    authority.digest().unwrap().as_str(),
+                ],
             )
             .unwrap();
         ConfigStore {
@@ -2785,14 +2812,256 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn canonical_child_session_accepts_new_coordinator_turn_but_rejects_other_logical_parent() {
+        let mut store = spawn_test_store();
+        let first = coordinator_spawn_result(Role::Reviewer);
+        let child_session = "ticket_run:ticket-run:reviewer";
+        let first_payload = serde_json::json!({"request":"first review"});
+        store
+            .persist_coordinator_child_wake(
+                7,
+                &first,
+                Role::Reviewer,
+                child_session,
+                3,
+                &first_payload,
+            )
+            .unwrap();
+
+        let second = coordinator_spawn_result_at(
+            Role::Reviewer,
+            "evidence-spawn-2",
+            "coordinator-run-2",
+            "coordinator-operation-2",
+            7,
+            4,
+            "ticket_run:ticket-run:coordinator",
+        );
+        let mut second_authority = test_authority();
+        second_authority.agent_run_id = AgentRunId::parse("coordinator-run-2").unwrap();
+        second_authority.role = Role::Coordinator;
+        second_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        second_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        second_authority.parent_role = Some(Role::Supervisor);
+        second_authority.ticket_revision = Some(Revision(7));
+        second_authority.operation_id = OperationId::parse("coordinator-operation-2").unwrap();
+        second_authority.run_epoch = 4;
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_result_evidence VALUES ('evidence-spawn-2','coordinator-run-2','project-a','coordinator','completed','ticket-run',4)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run-2',?1,?2,?3)",
+                rusqlite::params![
+                    serde_json::to_string(&second_authority).unwrap(),
+                    second_authority.descriptor_digest.as_str(),
+                    second_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("UPDATE ticket_runs SET revision=7", [])
+            .unwrap();
+        store
+            .persist_coordinator_child_wake(
+                7,
+                &second,
+                Role::Reviewer,
+                child_session,
+                7,
+                &serde_json::json!({"request":"re-review after correction"}),
+            )
+            .unwrap();
+
+        let wake_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='coordinator_child'",
+                [child_session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wake_count, 2);
+        store
+            .connection
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE source_id='evidence-spawn'",
+                [],
+            )
+            .unwrap();
+        let parent = store
+            .coordinator_child_parent(&ProjectId::parse("project-a").unwrap(), child_session)
+            .unwrap()
+            .expect("fresh Reviewer wake resolves its Coordinator turn");
+        assert_eq!(parent.agent_run_id.as_str(), "coordinator-run-2");
+        assert_eq!(parent.role_session_id, "ticket_run:ticket-run:coordinator");
+
+        let wrong_parent = coordinator_spawn_result_at(
+            Role::Reviewer,
+            "evidence-spawn-wrong-parent",
+            "coordinator-run-wrong-parent",
+            "coordinator-operation-wrong-parent",
+            7,
+            5,
+            "ticket_run:ticket-run:coordinator",
+        );
+        let mut wrong_authority = second_authority.clone();
+        wrong_authority.agent_run_id = AgentRunId::parse("coordinator-run-wrong-parent").unwrap();
+        wrong_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        wrong_authority.operation_id =
+            OperationId::parse("coordinator-operation-wrong-parent").unwrap();
+        wrong_authority.run_epoch = 5;
+        let mut prior_wrong_authority = test_authority();
+        prior_wrong_authority.agent_run_id = AgentRunId::parse("coordinator-run").unwrap();
+        prior_wrong_authority.role = Role::Coordinator;
+        prior_wrong_authority.role_session_id =
+            "ticket_run:ticket-run:alternate-coordinator".into();
+        prior_wrong_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        prior_wrong_authority.parent_role = Some(Role::Supervisor);
+        prior_wrong_authority.operation_id = OperationId::parse("coordinator-operation").unwrap();
+        prior_wrong_authority.run_epoch = 3;
+        store
+            .connection
+            .execute(
+                "UPDATE agent_launch_authority SET authority_json=?1,authority_digest=?2 WHERE agent_run_id='coordinator-run'",
+                rusqlite::params![
+                    serde_json::to_string(&prior_wrong_authority).unwrap(),
+                    prior_wrong_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_result_evidence VALUES ('evidence-spawn-wrong-parent','coordinator-run-wrong-parent','project-a','coordinator','completed','ticket-run',5)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run-wrong-parent',?1,?2,?3)",
+                rusqlite::params![
+                    serde_json::to_string(&wrong_authority).unwrap(),
+                    wrong_authority.descriptor_digest.as_str(),
+                    wrong_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        let error = store
+            .persist_coordinator_child_wake(
+                7,
+                &wrong_parent,
+                Role::Reviewer,
+                child_session,
+                7,
+                &serde_json::json!({"request":"must reject"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("different logical Coordinator parent"));
+        let bad_ack_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_reducer_ack WHERE evidence_id='evidence-spawn-wrong-parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_ack_count, 0);
+
+        let mut original_authority = prior_wrong_authority;
+        original_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        store
+            .connection
+            .execute(
+                "UPDATE agent_launch_authority SET authority_json=?1,authority_digest=?2 WHERE agent_run_id='coordinator-run'",
+                rusqlite::params![
+                    serde_json::to_string(&original_authority).unwrap(),
+                    original_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+
+        store
+            .connection
+            .execute(
+                "UPDATE agent_launch_authority SET authority_digest='tampered' WHERE agent_run_id='coordinator-run-2'",
+                [],
+            )
+            .unwrap();
+        let third = coordinator_spawn_result_at(
+            Role::Reviewer,
+            "evidence-spawn-3",
+            "coordinator-run-3",
+            "coordinator-operation-3",
+            7,
+            6,
+            "ticket_run:ticket-run:coordinator",
+        );
+        let mut third_authority = test_authority();
+        third_authority.agent_run_id = AgentRunId::parse("coordinator-run-3").unwrap();
+        third_authority.role = Role::Coordinator;
+        third_authority.role_session_id = "ticket_run:ticket-run:coordinator".into();
+        third_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
+        third_authority.parent_role = Some(Role::Supervisor);
+        third_authority.ticket_revision = Some(Revision(7));
+        third_authority.operation_id = OperationId::parse("coordinator-operation-3").unwrap();
+        third_authority.run_epoch = 6;
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_result_evidence VALUES ('evidence-spawn-3','coordinator-run-3','project-a','coordinator','completed','ticket-run',6)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_authority VALUES ('coordinator-run-3',?1,?2,?3)",
+                rusqlite::params![
+                    serde_json::to_string(&third_authority).unwrap(),
+                    third_authority.descriptor_digest.as_str(),
+                    third_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        let authority_error = store
+            .persist_coordinator_child_wake(
+                7,
+                &third,
+                Role::Reviewer,
+                child_session,
+                7,
+                &serde_json::json!({"request":"must reject corrupt historical authority"}),
+            )
+            .unwrap_err();
+        assert!(authority_error.contains("authority digest fields do not match"));
+        let tampered_ack_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_reducer_ack WHERE evidence_id='evidence-spawn-3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tampered_ack_count, 0);
+    }
+
+    #[test]
     fn child_parent_resolves_from_source_evidence_and_host_authority() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
                 "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, lifecycle TEXT);
                  INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:planner','coordinator_child','evidence-spawn','pending');
-                 CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,project_id TEXT,role TEXT,outcome TEXT);
-                 INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed');
+                 CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,project_id TEXT,role TEXT,outcome TEXT,ticket_run_id TEXT);
+                 INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed','ticket-run');
                  CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT);",
             )
             .unwrap();
@@ -4144,7 +4413,9 @@ pub(crate) mod tests {
     #[test]
     fn host_validated_blocked_worker_can_receive_one_coordinator_recovery_wake() {
         use crate::config::ProjectConfig;
-        use crate::domain::ids::{AgentRunId, OperationId, ProfileId, RepositoryId};
+        use crate::domain::ids::{
+            AgentRunId, OperationId, ProfileId, RepositoryId, TicketId, TicketNamespace,
+        };
         use crate::domain::types::CommitMode;
         use crate::domain::types::Role;
         use crate::engine::orchestration::{
@@ -4278,6 +4549,52 @@ pub(crate) mod tests {
         let worktree = root.path().join("worker-worktree");
         std::fs::create_dir_all(&worktree).unwrap();
         let prepare_operation = OperationId::parse("prepare-worker-recovery").unwrap();
+        let prepare_request = crate::delivery_runtime::PrepareWorktreesEffectPayload {
+            schema_version: 1,
+            source_revision: 3,
+            configuration_digest: configuration_digest.clone(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket.clone(),
+            work_nodes: vec![crate::delivery_runtime::PreparedWorktreeNodeRequest {
+                work_node_id: node_id.clone(),
+                repository_id: repository.clone(),
+                expected_base_sha: base.into(),
+                commit_mode: CommitMode::Host,
+            }],
+        };
+        let prepare_receipt = crate::delivery_runtime::PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: ticket.clone(),
+            work_nodes: vec![crate::delivery_runtime::PreparedWorktreeReceiptNode {
+                work_node_id: node_id.clone(),
+                repository_id: repository.clone(),
+                worktree_path: worktree.clone(),
+                branch: "agent/fixture/node-a".into(),
+                base_sha: base.into(),
+                commit_mode: CommitMode::Host,
+            }],
+        };
+        let request_json = crate::store::canonical_json(&prepare_request).unwrap();
+        let request_digest = digest(request_json.as_bytes()).unwrap();
+        let prepare_receipt_json = crate::store::canonical_json(&prepare_receipt).unwrap();
+        let prepare_receipt_digest = digest(prepare_receipt_json.as_bytes()).unwrap();
+        worker
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,status,attempt_count,next_attempt_at_unix,owner_generation,receipt_json,created_at_unix) VALUES (?1,?2,'ticket_run',?3,'prepare-worker-recovery','prepare_worktrees',?4,?5,3,'succeeded',1,0,?6,?7,1)",
+                rusqlite::params![
+                    prepare_operation.as_str(),
+                    project.as_str(),
+                    ticket.as_str(),
+                    request_json,
+                    request_digest.as_str(),
+                    worker.owner_generation,
+                    prepare_receipt_json
+                ],
+            )
+            .unwrap();
         let assignment = crate::launch::WorkerLaunchBinding {
             schema_version: 1,
             accepted_revision: 3,
@@ -4290,8 +4607,9 @@ pub(crate) mod tests {
             worktree_path: worktree.clone(),
             branch: "agent/fixture/node-a".into(),
             base_sha: base.into(),
+            expected_head: None,
             prepare_operation_id: prepare_operation.to_string(),
-            prepare_receipt_digest: Digest::parse("e".repeat(64)).unwrap(),
+            prepare_receipt_digest,
             source_evidence_id: plan_record.source_evidence_id.clone(),
             source_agent_run_id: plan_record.source_agent_run_id.clone(),
             source_message_id: plan_record.source_message_id.clone(),
@@ -4388,6 +4706,58 @@ pub(crate) mod tests {
             .into_iter()
             .find(|run| run.ticket_run_id == ticket)
             .unwrap();
+        let prepared_receipt = worker
+            .store
+            .succeeded_effect_receipt(prepare_operation.as_str())
+            .unwrap()
+            .unwrap();
+        let prepared = worker
+            .store
+            .prepared_worker_launch(
+                worker.owner_generation,
+                plan_record.accepted_revision,
+                &node_id,
+                &prepared_receipt,
+                &project_config,
+                &configuration_digest,
+            )
+            .unwrap();
+        assert!(
+            prepared.is_some(),
+            "prepared launch did not validate: {prepared:?}"
+        );
+        let mut expected_assignment = prepared.as_ref().unwrap().reservation_binding();
+        expected_assignment.expected_head = None;
+        let stored_assignment = worker
+            .store
+            .agent_launch_reservation_for_run(&worker_id)
+            .unwrap()
+            .unwrap()
+            .worker_assignment
+            .unwrap();
+        assert_eq!(expected_assignment, stored_assignment);
+        assert_eq!(
+            worker
+                .store
+                .agent_launch_authority(&worker_id)
+                .unwrap()
+                .unwrap()
+                .ticket_revision
+                .unwrap()
+                .0,
+            current.revision
+        );
+        assert!(
+            !worker
+                .store
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM role_wake_inputs WHERE project_id=?1 AND source_type='worker_recovery_authorization' AND source_id=(SELECT evidence_id FROM agent_result_evidence WHERE agent_run_id=?2 AND role='worker' AND outcome='completed' ORDER BY received_at_unix DESC LIMIT 1))",
+                    rusqlite::params![project.as_str(), worker_id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
         let candidates = worker
             .store
             .worker_recovery_candidates(
@@ -4508,7 +4878,164 @@ pub(crate) mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn verification_source_replays_real_terminal_and_registered_test_receipt() {
+        use crate::domain::ids::{OperationId, RepositoryId};
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+
+        let head = "2".repeat(40);
+        let payload = serde_json::json!({
+            "work_node_id":"node-a",
+            "repository":"repo-a",
+            "publication_operation_id":"publish-worker-1",
+            "published_head":head,
+            "test_receipt_artifact_ids":[]
+        });
+        let mut result = host_validation_fixture::host_validated_result(
+            Role::Worker,
+            RoleResultMessage {
+                schema_version: 1,
+                message_id: "verification-ready-result".into(),
+                kind: RoleOutputKind::VerificationReady,
+                assertion: AgentAssertion::Succeeded,
+                result_digest: Some(digest(&serde_json::to_vec(&payload).unwrap()).unwrap()),
+                structured_result: payload,
+                artifact_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        let binding = &result.ingested.validated.binding;
+        let ticket_run_id = binding.ticket_run_id.clone().unwrap();
+        let source_revision = binding.ticket_revision.unwrap().0;
+        let test_receipts = result
+            .ingested
+            .verified_artifacts
+            .iter()
+            .map(|artifact| artifact.reference().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(test_receipts.len(), 1);
+        let verification = crate::store::accepted_plans::AcceptedWorkerVerification {
+            review_revision: source_revision + 1,
+            source_revision,
+            source_evidence_id: result.ingested.receipt.evidence_id().to_owned(),
+            source_agent_run_id: binding.agent_run_id.clone(),
+            source_result_digest: result.ingested.validated.result_digest.clone(),
+            publication_revision: source_revision - 1,
+            publication_operation_id: OperationId::parse("publish-worker-1").unwrap(),
+            published_head: crate::engine::orchestration::GitCommitId::parse(head).unwrap(),
+            work_node_id: crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap(),
+            repository_id: RepositoryId::parse("repo-a").unwrap(),
+            test_receipt_artifacts: test_receipts.clone(),
+        };
+        let replayed = result
+            .store
+            .validated_worker_verification_source(
+                &result.artifacts,
+                result.owner_generation,
+                &binding.project_id,
+                &ticket_run_id,
+                &verification,
+            )
+            .unwrap();
+        assert_eq!(
+            replayed.receipt.evidence_id(),
+            verification.source_evidence_id
+        );
+        assert_eq!(
+            replayed.verified_artifacts[0].reference(),
+            &test_receipts[0]
+        );
+
+        let mut stale_receipt = verification;
+        stale_receipt.test_receipt_artifacts[0].digest = digest(b"changed receipt").unwrap();
+        assert!(
+            result
+                .store
+                .validated_worker_verification_source(
+                    &result.artifacts,
+                    result.owner_generation,
+                    &binding.project_id,
+                    &ticket_run_id,
+                    &stale_receipt,
+                )
+                .is_err()
+        );
+    }
 }
+fn accepted_correction_publication_head(
+    store: &ConfigStore,
+    owner_generation: u64,
+    binding: &RoleResultBinding,
+    authorization: &crate::engine::orchestration::WorkerRecoveryAuthorization,
+    assignment: &crate::launch::WorkerLaunchBinding,
+    current_revision: u64,
+) -> Result<Option<String>, String> {
+    let project_id = &binding.project_id;
+    let ticket_run_id = &authorization.ticket_run_id;
+    let node_id = &authorization.work_node_id;
+    let repository_id = &assignment.repository_id;
+    let configuration_digest = &binding.config_digest;
+    let plan_digest = &authorization.accepted_plan_digest;
+    let expected_base_sha = assignment.base_sha.as_str();
+    let transition: Option<String> = store
+        .connection
+        .query_row(
+            "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision=?3",
+            params![ticket_run_id.as_str(), project_id.as_str(), current_revision],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(transition) = transition else {
+        return Ok(None);
+    };
+    let evidence: serde_json::Value = crate::protocol::parse_unique(transition.as_bytes())?;
+    if evidence["kind"] != "review_assessment" || evidence["transition"] != "corrections_remain" {
+        return Ok(None);
+    }
+    let snapshot = store.accepted_implementation_publication_snapshot(
+        owner_generation,
+        project_id,
+        ticket_run_id,
+        current_revision,
+    )?;
+    if snapshot.accepted_plan().plan_digest != *plan_digest
+        || snapshot.accepted_plan().configuration_digest != *configuration_digest
+    {
+        return Err(
+            "correction publication belongs to a different accepted plan or configuration".into(),
+        );
+    }
+    let mut heads = Vec::new();
+    for publication in snapshot.publication_receipts() {
+        let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+            crate::protocol::parse_unique(publication.intent().request_json.as_bytes())?;
+        if request.work_node_id != *node_id {
+            continue;
+        }
+        let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+            crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+        if request.ticket_run_id != *ticket_run_id
+            || request.repository_id != *repository_id
+            || request.configuration_digest != *configuration_digest
+            || request.expected_base_sha != expected_base_sha
+            || receipt.ticket_run_id != *ticket_run_id
+            || receipt.work_node_id != *node_id
+            || receipt.repository_id != *repository_id
+            || receipt.configuration_digest != *configuration_digest
+            || receipt.source_revision != request.source_revision
+        {
+            return Err("correction publication does not match its accepted Worker node".into());
+        }
+        heads.push(receipt.commit.head().to_owned());
+    }
+    if heads.len() != 1 {
+        return Err("correction publication must cover the Worker node exactly once".into());
+    }
+    Ok(heads.pop())
+}
+
 #[allow(clippy::items_after_test_module)]
 impl ConfigStore {
     /// Atomically consumes a host-validated Supervisor intervention and wakes the exact
@@ -4742,6 +5269,241 @@ impl ConfigStore {
         agent_result_for_wake(self, artifact_store, owner_generation, wake_input_id)
     }
 
+    /// Revalidate the exact Worker result that produced a host-validated publication for one
+    /// accepted work node. The forge receipt supplies `published_head`; neither a Worker claim
+    /// nor a raw artifact row is sufficient to identify the source.
+    pub fn validated_worker_publication_source_for_node(
+        &mut self,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        publication: &crate::store::SucceededEffectReceipt,
+    ) -> Result<IngestedAgentResult, String> {
+        let intent = publication.intent();
+        let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+            crate::protocol::parse_unique(intent.request_json.as_bytes())?;
+        let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+            crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+        if intent.kind != "publish_implementation"
+            || intent.project_id != *project_id
+            || intent.subject_type != "ticket_run"
+            || intent.subject_id != ticket_run_id.as_str()
+            || request.ticket_run_id != *ticket_run_id
+            || receipt.ticket_run_id != *ticket_run_id
+            || request.work_node_id != receipt.work_node_id
+            || request.repository_id != receipt.repository_id
+            || request.configuration_digest != receipt.configuration_digest
+            || request.source_revision != receipt.source_revision
+        {
+            return Err("Worker source publication differs from its exact scoped receipt".into());
+        }
+        let node_id = &request.work_node_id;
+        let repository_id = &request.repository_id;
+        let publication_revision = request.source_revision;
+        let publication_operation_id = intent.operation_id.as_str();
+        let published_head = receipt.commit.head();
+        if !matches!(published_head.len(), 40 | 64)
+            || !published_head.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || publication_revision == 0
+        {
+            return Err(
+                "publication source requires a valid commit SHA and positive revision".into(),
+            );
+        }
+        let expected_session = format!("ticket:{ticket_run_id}:worker:{node_id}");
+        let transition_json: String = self.connection.query_row(
+            "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision=?3",
+            params![ticket_run_id.as_str(), project_id.as_str(), publication_revision],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        let transition: serde_json::Value =
+            crate::protocol::parse_unique(transition_json.as_bytes())?;
+        let transition_source_revision = transition["source_revision"]
+            .as_u64()
+            .ok_or("Worker publication transition lacks its source revision")?;
+        let evidence_id = transition["evidence_id"]
+            .as_str()
+            .ok_or("Worker publication transition lacks its source evidence ID")?;
+        let transition_result_digest: Digest =
+            serde_json::from_value(transition["result_digest"].clone()).map_err(|error| {
+                format!("Worker publication transition result digest is invalid: {error}")
+            })?;
+        if transition["kind"] != "worker_implementation_ready"
+            || transition["transition"] != "worker_implementation_ready"
+            || transition["publication_operation_id"].as_str() != Some(publication_operation_id)
+            || transition["accepted_revision"].as_u64() != Some(publication_revision)
+            || transition_source_revision.checked_add(1) != Some(publication_revision)
+        {
+            return Err(
+                "publication does not bind to the exact host-accepted Worker result transition"
+                    .into(),
+            );
+        }
+        let raw_run_id: String = self.connection.query_row(
+            "SELECT agent_run_id FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND ticket_run_id=?3 AND role='worker' AND outcome='completed'",
+            params![evidence_id, project_id.as_str(), ticket_run_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        let expected_evidence_id = evidence_id.to_owned();
+        let agent_run_id = AgentRunId::parse(raw_run_id)?;
+        let authority = self
+            .agent_launch_authority(&agent_run_id)?
+            .ok_or("Worker evidence has no immutable launch authority")?;
+        if authority.project_id != *project_id
+            || authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || authority.ticket_revision != Some(Revision(transition_source_revision))
+            || authority.role != Role::Worker
+            || authority.role_session_id != expected_session
+        {
+            return Err("published Worker result differs from the exact launch authority".into());
+        }
+        let terminal = verify_agent_terminal(self, owner_generation, &agent_run_id)?;
+        let structured = terminal
+            .result
+            .structured_result
+            .clone()
+            .ok_or("completed Worker terminal has no structured result")?;
+        let message: RoleResultMessage = serde_json::from_value(structured)
+            .map_err(|error| format!("Worker terminal role result is invalid: {error}"))?;
+        let validated = message.clone().bind(binding_for(&authority)?)?;
+        if validated.kind != crate::engine::orchestration::RoleOutputKind::ImplementationReady
+            || validated.result_digest != transition_result_digest
+        {
+            return Err(
+                "Worker terminal result differs from the accepted publication transition".into(),
+            );
+        }
+        let crate::engine::orchestration::RoleResultPayload::ImplementationReady(payload) =
+            validated.typed_payload
+        else {
+            return Err("ImplementationReady result has an incompatible typed payload".into());
+        };
+        let node_changes = payload
+            .change_references
+            .iter()
+            .filter(|change| change.worktree_id == *node_id && change.repository == *repository_id)
+            .collect::<Vec<_>>();
+        if node_changes.len() != 1 || node_changes[0].branch_head.as_str() != published_head {
+            return Err(
+                "Worker result does not uniquely match the published repository head".into(),
+            );
+        }
+        let ingested =
+            ingest_agent_result(self, artifact_store, owner_generation, &terminal, message)?;
+        if ingested.receipt.evidence_id() != expected_evidence_id {
+            return Err(
+                "revalidated Worker result resolved to different immutable evidence".into(),
+            );
+        }
+        Ok(ingested)
+    }
+
+    /// Revalidate the exact Worker result bound to a durable verification transition. This
+    /// reloads the terminal, launch authority, result bytes, and registered artifacts through
+    /// the ordinary ingestion path instead of treating transition JSON as artifact authority.
+    pub fn validated_worker_verification_source(
+        &mut self,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        verification: &crate::store::accepted_plans::AcceptedWorkerVerification,
+    ) -> Result<IngestedAgentResult, String> {
+        let (agent_run_raw, result_json, stored_digest): (String, String, String) = self
+            .connection
+            .query_row(
+                "SELECT agent_run_id,result_json,result_digest FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND ticket_run_id=?3 AND role='worker' AND outcome='completed'",
+                params![
+                    verification.source_evidence_id,
+                    project_id.as_str(),
+                    ticket_run_id.as_str()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| format!("Worker verification source evidence is missing: {error}"))?;
+        let agent_run_id = AgentRunId::parse(agent_run_raw)?;
+        let submission: RoleResultSubmission =
+            crate::protocol::parse_unique(result_json.as_bytes())?;
+        if submission.binding.project_id != *project_id
+            || submission.binding.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || submission.binding.ticket_revision != Some(Revision(verification.source_revision))
+            || submission.binding.role != Role::Worker
+            || submission.binding.agent_run_id != agent_run_id
+            || submission.result_digest != verification.source_result_digest
+            || stored_digest != verification.source_result_digest.as_str()
+        {
+            return Err(
+                "Worker verification source differs from its immutable evidence binding".into(),
+            );
+        }
+        let expected_session = format!(
+            "ticket:{ticket_run_id}:worker:{}",
+            verification.work_node_id
+        );
+        let authority = self
+            .agent_launch_authority(&agent_run_id)?
+            .ok_or("Worker verification source has no immutable launch authority")?;
+        if authority.project_id != *project_id
+            || authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || authority.ticket_revision != Some(Revision(verification.source_revision))
+            || authority.role != Role::Worker
+            || authority.role_session_id != expected_session
+            || binding_for(&authority)? != submission.binding
+        {
+            return Err("Worker verification source no longer matches its launch authority".into());
+        }
+        let terminal = verify_agent_terminal(self, owner_generation, &agent_run_id)?;
+        let message = RoleResultMessage {
+            schema_version: submission.schema_version,
+            message_id: submission.message_id,
+            kind: submission.kind,
+            assertion: submission.assertion,
+            structured_result: submission.structured_result,
+            result_digest: Some(submission.result_digest),
+            artifact_refs: submission.artifact_refs,
+        };
+        let replayed =
+            ingest_agent_result(self, artifact_store, owner_generation, &terminal, message)?;
+        if replayed.receipt.evidence_id() != verification.source_evidence_id {
+            return Err("Worker verification source replay resolved to different evidence".into());
+        }
+        let crate::engine::orchestration::RoleResultPayload::VerificationReady(claim) =
+            &replayed.validated.typed_payload
+        else {
+            return Err("Worker verification source has another result kind".into());
+        };
+        let actual_receipts = replayed
+            .verified_artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.reference().kind
+                    == crate::engine::orchestration::RoleArtifactKind::TestReceipt
+            })
+            .map(|artifact| artifact.reference().clone())
+            .collect::<Vec<_>>();
+        let actual_ids = actual_receipts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let claimed_ids = claim
+            .test_receipt_artifact_ids
+            .iter()
+            .map(|artifact_id| artifact_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if claim.work_node_id != verification.work_node_id
+            || claim.repository != verification.repository_id
+            || claim.publication_operation_id != verification.publication_operation_id
+            || claim.published_head != verification.published_head
+            || actual_receipts.len() != claim.test_receipt_artifact_ids.len()
+            || actual_ids != claimed_ids
+            || actual_receipts != verification.test_receipt_artifacts
+        {
+            return Err("Worker verification result differs from its accepted publication or TestReceipt set".into());
+        }
+        Ok(replayed)
+    }
+
     pub fn ingest_next_spooled_agent_result(
         &mut self,
         artifact_store: &crate::artifacts::ArtifactStore,
@@ -4935,6 +5697,7 @@ pub(crate) mod host_validation_fixture {
         let ticket_run_id = TicketRunId::parse("fixture-ticket-run")?;
         let (phase, external_status, ticket_revision) = match role {
             Role::Coordinator => ("planning", "in_progress", 3_u64),
+            Role::MergeDecision => ("assessing", "in_progress", 1_u64),
             Role::Postmortem => ("postmortem", "in_progress", 1_u64),
             Role::Worker => ("implementing", "in_progress", 4_u64),
             _ => ("reviewing", "in_review", 1_u64),
@@ -5141,6 +5904,7 @@ pub(crate) mod host_validation_fixture {
         authority.role_session_id = match role {
             Role::Worker => "ticket:fixture-ticket-run:worker:node-a".into(),
             Role::Coordinator => "ticket_run:fixture-ticket-run:coordinator".into(),
+            Role::MergeDecision => "ticket_run:fixture-ticket-run:merge_decision".into(),
             Role::Supervisor => format!("project:{}:supervisor", project_id.as_str()),
             _ => format!("fixture-{:?}", role).to_lowercase(),
         };
@@ -5196,10 +5960,11 @@ pub(crate) mod host_validation_fixture {
             Role::Supervisor => "supervisor-v1.json",
             Role::Worker => "worker-v1.json",
             Role::Reviewer => "reviewer-v1.json",
+            Role::MergeDecision => "merge_decision-v1.json",
             Role::Postmortem => "postmortem-v1.json",
             _ => {
                 return Err(
-                    "fixture currently supports Supervisor, Worker, Reviewer, and Postmortem roles"
+                    "fixture currently supports Supervisor, Worker, Reviewer, MergeDecision, and Postmortem roles"
                         .into(),
                 );
             }
@@ -5465,6 +6230,48 @@ pub(crate) mod host_validation_fixture {
                 &serde_json::to_vec(&message.structured_result)
                     .map_err(|error| error.to_string())?,
             )?);
+        } else if role == Role::Worker
+            && message.kind == crate::engine::orchestration::RoleOutputKind::VerificationReady
+        {
+            let source_path = "checks/test-receipt.md";
+            let source_file = authority.workspace_path.join(source_path);
+            std::fs::create_dir_all(
+                source_file
+                    .parent()
+                    .ok_or("Worker TestReceipt path has no parent")?,
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(
+                &source_file,
+                b"# Test receipt\n\nAll configured checks passed.\n",
+            )
+            .map_err(|error| error.to_string())?;
+            let artifact = artifacts.register(
+                &authority.workspace_path,
+                &authority.project_id,
+                authority.agent_run_id.as_str(),
+                role,
+                source_path,
+                crate::engine::orchestration::RoleArtifactKind::TestReceipt,
+                1,
+            )?;
+            message.artifact_refs = vec![artifact.reference.clone()];
+            message.structured_result["test_receipt_artifact_ids"] =
+                serde_json::json!([artifact.reference.artifact_id]);
+            let request_digest = digest(b"fixture Worker TestReceipt ArtifactAdd request")?;
+            crate::store::artifact_registry::persist_registration(
+                &mut store.connection,
+                owner_generation,
+                &authority,
+                "fixture-worker-test-receipt-artifact",
+                &request_digest,
+                &artifact.reference,
+                &artifact.object_path,
+            )?;
+            message.result_digest = Some(digest(
+                &serde_json::to_vec(&message.structured_result)
+                    .map_err(|error| error.to_string())?,
+            )?);
         }
         let structured = serde_json::to_value(&message).map_err(|error| error.to_string())?;
         let structured_digest =
@@ -5613,6 +6420,34 @@ impl ConfigStore {
             if node.repository != assignment.repository_id {
                 continue;
             }
+            let Some(preparation) =
+                self.succeeded_effect_receipt(&assignment.prepare_operation_id)?
+            else {
+                continue;
+            };
+            let Some(prepared) = self.prepared_worker_launch(
+                owner_generation,
+                plan.accepted_revision,
+                &assignment.node_id,
+                &preparation,
+                project_config,
+                configuration_digest,
+            )?
+            else {
+                continue;
+            };
+            let derived_assignment = prepared.reservation_binding();
+            if (assignment.expected_head.is_some()
+                && assignment.expected_head.as_deref() != Some(prepared.expected_head()))
+                || {
+                    let mut expected_prior = derived_assignment;
+                    expected_prior.expected_head = assignment.expected_head.clone();
+                    &expected_prior != assignment
+                }
+            {
+                continue;
+            }
+            let prepared_expected_head = prepared.expected_head().to_owned();
             let active: bool = self.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE role_session_id=?1 AND state IN ('launch_pending','running','unknown'))",
                 [&authority.role_session_id], |row| row.get(0),
@@ -5758,7 +6593,7 @@ impl ConfigStore {
                     Some((operation, receipt_digest, head)) => {
                         (Some(operation), Some(receipt_digest), head)
                     }
-                    None => (None, None, assignment.base_sha.clone()),
+                    None => (None, None, prepared_expected_head),
                 };
             candidates.push(WorkerRecoveryCandidate {
                 work_node_id: assignment.node_id.clone(),
@@ -5818,6 +6653,30 @@ impl ConfigStore {
             "ticket:{}:worker:{}",
             authorization.ticket_run_id, authorization.work_node_id
         );
+        let observed_prior_reservation_json: String = self
+            .connection
+            .query_row(
+                "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [authorization.prior_worker_agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let prior_reservation: crate::launch::AgentLaunchReservation =
+            crate::protocol::parse_unique(observed_prior_reservation_json.as_bytes())?;
+        let prior_assignment = prior_reservation
+            .worker_assignment
+            .as_ref()
+            .ok_or("prior Worker reservation has no prepared assignment")?;
+        let accepted_publication_head = accepted_correction_publication_head(
+            self,
+            owner_generation,
+            binding,
+            authorization,
+            prior_assignment,
+            source_revision,
+        )?;
+        let precommit_expected_head = accepted_publication_head
+            .unwrap_or_else(|| prior_assignment.expected_head().to_owned());
         let payload = serde_json::json!({
             "schema_version":1,
             "kind":"worker_recovery_authorization",
@@ -5883,6 +6742,11 @@ impl ConfigStore {
         let Some(prior_reservation_json) = prior_reservation_json else {
             return Err("prior Worker reservation is missing".into());
         };
+        if prior_reservation_json != observed_prior_reservation_json {
+            return Err(
+                "prior Worker reservation changed while recovery authority was derived".into(),
+            );
+        }
         let prior_reservation: crate::launch::AgentLaunchReservation =
             crate::protocol::parse_unique(prior_reservation_json.as_bytes())?;
         let prior_assignment = prior_reservation
@@ -5946,7 +6810,7 @@ impl ConfigStore {
                         "pending" | "claimed" | "uncertain" | "succeeded"
                     )
                 }) || authorization.prior_host_commit_receipt_digest.is_some()
-                    || authorization.expected_head != prior_assignment.base_sha
+                    || authorization.expected_head != precommit_expected_head
                 {
                     return Err("pre-commit Worker recovery has a pending, uncertain, or completed host commit".into());
                 }
@@ -6099,6 +6963,11 @@ impl ConfigStore {
                 "Coordinator child source binding differs from registered launch authority".into(),
             );
         }
+        if source_authority.role_session_id != format!("ticket_run:{ticket_run_id}:coordinator") {
+            return Err(
+                "Coordinator child source has a noncanonical Coordinator role session".into(),
+            );
+        }
         let run: Option<(u64, String, u64, String)> = tx
             .query_row(
                 "SELECT revision,internal_phase,config_revision,config_digest FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
@@ -6148,21 +7017,80 @@ impl ConfigStore {
                 "Coordinator evidence already targets a different child role session".into(),
             );
         }
-        let session_source: Option<String> = tx
-            .query_row(
-                "SELECT source_id FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='coordinator_child' ORDER BY wake_input_id LIMIT 1",
-                [role_session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if session_source
-            .as_deref()
-            .is_some_and(|source| source != evidence_id)
+        let prior_parents = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT w.source_id,e.agent_run_id,e.project_id,e.role,e.outcome,e.ticket_run_id FROM role_wake_inputs w LEFT JOIN agent_result_evidence e ON e.evidence_id=w.source_id WHERE w.project_id=?1 AND w.role_session_id=?2 AND w.source_type='coordinator_child' ORDER BY w.wake_input_id",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![binding.project_id.as_str(), role_session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for (prior_evidence, prior_run, prior_project, prior_role, prior_outcome, prior_ticket) in
+            prior_parents
         {
-            return Err(
-                "canonical child role session already has a different Coordinator parent".into(),
-            );
+            if prior_evidence == evidence_id {
+                continue;
+            }
+            let Some(prior_run) = prior_run else {
+                return Err(
+                    "canonical child role session has missing Coordinator source evidence".into(),
+                );
+            };
+            if prior_project.as_deref() != Some(binding.project_id.as_str())
+                || prior_role.as_deref() != Some("coordinator")
+                || prior_outcome.as_deref() != Some("completed")
+                || prior_ticket.as_deref() != Some(ticket_run_id.as_str())
+            {
+                return Err(
+                    "canonical child role session has an invalid prior Coordinator source".into(),
+                );
+            }
+            let (prior_authority_json, prior_descriptor_digest, prior_authority_digest): (
+                String,
+                String,
+                String,
+            ) = tx
+                .query_row(
+                    "SELECT authority_json,descriptor_digest,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+                    [&prior_run],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            let prior_authority: AgentLaunchAuthority =
+                crate::protocol::parse_unique(prior_authority_json.as_bytes())?;
+            prior_authority.validate()?;
+            if prior_authority.agent_run_id.as_str() != prior_run
+                || prior_authority.descriptor_digest.as_str() != prior_descriptor_digest
+                || prior_authority.digest()?.as_str() != prior_authority_digest
+            {
+                return Err("stored Agent launch authority digest fields do not match".into());
+            }
+            if prior_authority.role != Role::Coordinator
+                || prior_authority.project_id != binding.project_id
+                || prior_authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+                || prior_authority.role_session_id != source_authority.role_session_id
+            {
+                return Err(
+                    "canonical child role session has a different logical Coordinator parent"
+                        .into(),
+                );
+            }
         }
         let existing: Option<String> = tx
             .query_row(
@@ -6226,12 +7154,12 @@ impl ConfigStore {
         let Some(evidence_id) = evidence_id else {
             return Ok(None);
         };
-        let parent_run: String = self
+        let (parent_run, ticket_run_id): (String, String) = self
             .connection
             .query_row(
-                "SELECT agent_run_id FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND role='coordinator' AND outcome='completed'",
+                "SELECT agent_run_id,ticket_run_id FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2 AND role='coordinator' AND outcome='completed' AND ticket_run_id IS NOT NULL",
                 rusqlite::params![evidence_id, project_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| error.to_string())?;
         let authority = self
@@ -6239,8 +7167,17 @@ impl ConfigStore {
             .ok_or("Coordinator child source has no host launch authority")?;
         if authority.role != crate::domain::types::Role::Coordinator
             || authority.project_id != *project_id
+            || authority
+                .ticket_run_id
+                .as_ref()
+                .map(|ticket| ticket.as_str())
+                != Some(ticket_run_id.as_str())
+            || authority.role_session_id != format!("ticket_run:{ticket_run_id}:coordinator")
         {
-            return Err("Coordinator child source authority has the wrong role or Project".into());
+            return Err(
+                "Coordinator child source authority has the wrong role, Project, or TicketRun"
+                    .into(),
+            );
         }
         Ok(Some(authority))
     }

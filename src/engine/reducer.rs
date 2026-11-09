@@ -56,7 +56,9 @@ pub enum Input {
     WorkNodePublished(ValidatedWorkNodePublication),
     ImplementationPublished(ValidatedImplementationPublication),
     CorrectionsRemain,
+    WorkerVerificationCompleted,
     ReviewConverged,
+    ReviewEscalationRequired,
     RequireHumanReview,
     HumanReviewApproved,
     HumanReviewRevisionRequested,
@@ -137,6 +139,7 @@ pub fn reduce(
     let mut next = current.clone();
     let mut effects = Vec::new();
     let mut wakes = Vec::new();
+    let review_escalation = matches!(&input, Input::ReviewEscalationRequired);
     match input {
         Input::Dispatch if current.phase == Phase::Queued => {
             next.phase = Phase::Planning;
@@ -182,10 +185,25 @@ pub fn reduce(
             next.activity = Activity::Running;
             wakes.push(WakeTarget::TicketRole(Role::Worker));
         }
+        Input::WorkerVerificationCompleted
+            if current.phase == Phase::Implementing && current.activity == Activity::Running =>
+        {
+            next.phase = Phase::Reviewing;
+            next.activity = Activity::Running;
+            wakes.push(WakeTarget::TicketRole(Role::Reviewer));
+        }
         Input::ReviewConverged if current.phase == Phase::Reviewing => {
             next.phase = Phase::Assessing;
             next.activity = Activity::Running;
             wakes.push(WakeTarget::TicketRole(Role::MergeDecision));
+        }
+        Input::ReviewEscalationRequired if current.phase == Phase::Reviewing => {
+            // Keep the TicketRun in Reviewing and surface it as In Review. This is an
+            // escalation, not evidence that the review converged or merge was authorized.
+            next.activity = Activity::Blocked;
+            next.external_status = TicketStatus::InReview;
+            wakes.push(WakeTarget::Supervisor);
+            effects.push(EffectKind::PublishTicketStatus);
         }
         Input::RequireHumanReview if current.phase == Phase::Assessing => {
             next.phase = Phase::WaitingHuman;
@@ -276,6 +294,7 @@ pub fn reduce(
     if next.phase != Phase::WaitingHuman {
         next.external_status = match next.phase {
             Phase::Queued | Phase::Done => next.external_status,
+            Phase::Reviewing if review_escalation => TicketStatus::InReview,
             Phase::Canceled => TicketStatus::Canceled,
             _ => TicketStatus::InProgress,
         };
@@ -440,6 +459,53 @@ mod tests {
         .unwrap();
         assert_eq!(publication.ticket_run.phase, Phase::Publishing);
         assert!(publication.wakes.is_empty());
+    }
+
+    #[test]
+    fn reviewer_escalation_marks_in_review_without_claiming_convergence() {
+        let mut current = run();
+        current.phase = Phase::Reviewing;
+        current.activity = Activity::Running;
+        current.external_status = TicketStatus::InProgress;
+
+        let decision = reduce(&current, current.revision, Input::ReviewEscalationRequired).unwrap();
+
+        assert_eq!(decision.ticket_run.phase, Phase::Reviewing);
+        assert_eq!(decision.ticket_run.activity, Activity::Blocked);
+        assert_eq!(decision.ticket_run.external_status, TicketStatus::InReview);
+        assert_eq!(decision.ticket_run.required_review_revision, None);
+        assert_eq!(decision.wakes, [WakeTarget::Supervisor]);
+        assert_eq!(decision.effects, [EffectKind::PublishTicketStatus]);
+    }
+
+    #[test]
+    fn worker_verification_completion_routes_to_reviewer_without_publication_effects() {
+        let mut current = run();
+        current.phase = Phase::Implementing;
+        current.activity = Activity::Running;
+
+        let decision = reduce(
+            &current,
+            current.revision,
+            Input::WorkerVerificationCompleted,
+        )
+        .unwrap();
+
+        assert_eq!(decision.ticket_run.phase, Phase::Reviewing);
+        assert_eq!(decision.ticket_run.activity, Activity::Running);
+        assert_eq!(decision.wakes, [WakeTarget::TicketRole(Role::Reviewer)]);
+        assert!(decision.effects.is_empty());
+
+        let mut blocked = current;
+        blocked.activity = Activity::Blocked;
+        assert!(
+            reduce(
+                &blocked,
+                blocked.revision,
+                Input::WorkerVerificationCompleted
+            )
+            .is_err()
+        );
     }
 
     #[test]

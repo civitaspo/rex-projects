@@ -332,6 +332,7 @@ pub enum RoleOutputKind {
     PrepareWorktrees,
     PlanReady,
     ImplementationReady,
+    VerificationReady,
     ReviewReady,
     MergeAssessment,
     MergeIntent,
@@ -742,6 +743,13 @@ role_payload!(ImplementationReadyPayload {
     unresolved_items: Vec<String>,
     irregularity_references: Vec<RoleArtifactReference>,
 });
+role_payload!(VerificationReadyPayload {
+    work_node_id: WorkNodeId,
+    repository: RepositoryId,
+    publication_operation_id: OperationId,
+    published_head: GitCommitId,
+    test_receipt_artifact_ids: Vec<ArtifactId>,
+});
 role_payload!(ReviewReadyPayload {
     subject_kind: String,
     subject_digest: Digest,
@@ -913,6 +921,7 @@ pub enum RoleResultPayload {
     PrepareWorktrees(PrepareWorktreesPayload),
     PlanReady(PlanReadyPayload),
     ImplementationReady(ImplementationReadyPayload),
+    VerificationReady(VerificationReadyPayload),
     ReviewReady(ReviewReadyPayload),
     MergeAssessment(MergeAssessmentPayload),
     MergeIntent(MergeIntentPayload),
@@ -953,6 +962,9 @@ impl RoleResultPayload {
             RoleOutputKind::ImplementationReady => {
                 parse_variant!(ImplementationReadyPayload, ImplementationReady)
             }
+            RoleOutputKind::VerificationReady => {
+                parse_variant!(VerificationReadyPayload, VerificationReady)
+            }
             RoleOutputKind::ReviewReady => parse_variant!(ReviewReadyPayload, ReviewReady),
             RoleOutputKind::MergeAssessment => {
                 parse_variant!(MergeAssessmentPayload, MergeAssessment)
@@ -992,6 +1004,7 @@ impl RoleResultPayload {
             Self::PrepareWorktrees(_) => RoleOutputKind::PrepareWorktrees,
             Self::PlanReady(_) => RoleOutputKind::PlanReady,
             Self::ImplementationReady(_) => RoleOutputKind::ImplementationReady,
+            Self::VerificationReady(_) => RoleOutputKind::VerificationReady,
             Self::ReviewReady(_) => RoleOutputKind::ReviewReady,
             Self::MergeAssessment(_) => RoleOutputKind::MergeAssessment,
             Self::MergeIntent(_) => RoleOutputKind::MergeIntent,
@@ -1030,6 +1043,21 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
                         "implementation change must identify a unique work node and exact resulting commit chain".into(),
                     );
                 }
+            }
+        }
+        RoleResultPayload::VerificationReady(result) => {
+            if result.test_receipt_artifact_ids.is_empty() {
+                return Err(
+                    "verification-ready result requires at least one TestReceipt artifact".into(),
+                );
+            }
+            let mut artifact_ids = BTreeSet::new();
+            if result
+                .test_receipt_artifact_ids
+                .iter()
+                .any(|artifact_id| !artifact_ids.insert(artifact_id))
+            {
+                return Err("verification-ready result repeats a TestReceipt artifact ID".into());
             }
         }
         RoleResultPayload::MergeAssessment(result)
@@ -1131,6 +1159,28 @@ fn validate_payload_artifacts(
         RoleResultPayload::ImplementationReady(value) => {
             references.extend(&value.irregularity_references)
         }
+        RoleResultPayload::VerificationReady(value) => {
+            if declared_claims.len()
+                != declared_claims
+                    .iter()
+                    .filter(|reference| reference.kind == RoleArtifactKind::TestReceipt)
+                    .count()
+            {
+                return Err("verification-ready may claim only TestReceipt artifacts".into());
+            }
+            let declared_ids = declared_claims
+                .iter()
+                .filter(|reference| reference.kind == RoleArtifactKind::TestReceipt)
+                .map(|reference| &reference.artifact_id)
+                .collect::<BTreeSet<_>>();
+            let expected_ids = value
+                .test_receipt_artifact_ids
+                .iter()
+                .collect::<BTreeSet<_>>();
+            if declared_ids != expected_ids {
+                return Err("verification-ready TestReceipt IDs must exactly match its declared TestReceipt artifacts".into());
+            }
+        }
         RoleResultPayload::MergeAssessment(value) => {
             for gate in &value.deterministic_gate_evidence {
                 references.extend(&gate.evidence_references);
@@ -1195,6 +1245,7 @@ pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
         RoleOutputKind::PrepareWorktrees => schema_for_kind!(PrepareWorktreesPayload),
         RoleOutputKind::PlanReady => schema_for_kind!(PlanReadyPayload),
         RoleOutputKind::ImplementationReady => schema_for_kind!(ImplementationReadyPayload),
+        RoleOutputKind::VerificationReady => schema_for_kind!(VerificationReadyPayload),
         RoleOutputKind::ReviewReady => schema_for_kind!(ReviewReadyPayload),
         RoleOutputKind::MergeAssessment => schema_for_kind!(MergeAssessmentPayload),
         RoleOutputKind::MergeIntent => schema_for_kind!(MergeIntentPayload),
@@ -1675,7 +1726,7 @@ pub fn allowed_role_output_kinds(role: Role) -> Vec<RoleOutputKind> {
         ],
         Role::Coordinator => vec![K::SpawnRequest, K::PrepareWorktrees, K::PlanReady],
         Role::Planner => vec![K::PlanReady, K::InvestigationRequest],
-        Role::Worker => vec![K::ImplementationReady],
+        Role::Worker => vec![K::ImplementationReady, K::VerificationReady],
         Role::Reviewer => vec![K::ReviewReady, K::InvestigationRequest],
         Role::MergeDecision => vec![K::MergeAssessment, K::MergeIntent],
         Role::Operator => vec![K::OperationAction, K::OperationResult],
@@ -2621,6 +2672,37 @@ mod tests {
         })
     }
 
+    #[test]
+    fn verification_ready_requires_exact_registered_test_receipt_claims() {
+        let artifact_id = ArtifactId::parse("f".repeat(64)).unwrap();
+        let artifact = RoleArtifactReference {
+            artifact_id: artifact_id.clone(),
+            kind: RoleArtifactKind::TestReceipt,
+            schema_version: 1,
+            path: "checks/test-receipt.md".into(),
+            digest: test_digest('e'),
+            bytes: 17,
+        };
+        let payload = json!({
+            "work_node_id":"node-a",
+            "repository":"repo-a",
+            "publication_operation_id":"publish-worker-1",
+            "published_head":"2222222222222222222222222222222222222222",
+            "test_receipt_artifact_ids":[artifact_id]
+        });
+        let mut submission = worker_result_submission(RoleOutputKind::VerificationReady, payload);
+        submission.artifact_refs = vec![artifact.clone()];
+        validate_role_result(&worker_result_binding(), submission.clone()).unwrap();
+
+        submission.structured_result["test_receipt_artifact_ids"] = json!(["a".repeat(64)]);
+        submission.result_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&submission.structured_result).unwrap())
+        ))
+        .unwrap();
+        assert!(validate_role_result(&worker_result_binding(), submission).is_err());
+    }
+
     fn worker_irregularity_payload() -> Value {
         json!({
             "severity": "high",
@@ -2710,6 +2792,16 @@ mod tests {
             (
                 RoleOutputKind::ImplementationReady,
                 worker_implementation_ready_payload(),
+            ),
+            (
+                RoleOutputKind::VerificationReady,
+                json!({
+                    "work_node_id":"node-a",
+                    "repository":"repo-a",
+                    "publication_operation_id":"publish-worker-1",
+                    "published_head":"2222222222222222222222222222222222222222",
+                    "test_receipt_artifact_ids":["f".repeat(64)]
+                }),
             ),
             (
                 RoleOutputKind::ReviewReady,
@@ -3665,6 +3757,7 @@ mod tests {
             RoleOutputKind::PrepareWorktrees,
             RoleOutputKind::PlanReady,
             RoleOutputKind::ImplementationReady,
+            RoleOutputKind::VerificationReady,
             RoleOutputKind::ReviewReady,
             RoleOutputKind::MergeAssessment,
             RoleOutputKind::MergeIntent,

@@ -96,9 +96,16 @@ struct WorkerAssignmentContext<'a> {
     branch: &'a str,
     base_sha: &'a str,
     expected_head: &'a str,
+    verification: Option<&'a WorkerVerificationAssignment>,
     recovery_authorization: Option<&'a crate::engine::orchestration::WorkerRecoveryAuthorization>,
     commit_mode: crate::domain::types::CommitMode,
     repository_id: &'a crate::domain::ids::RepositoryId,
+}
+
+struct WorkerVerificationAssignment {
+    publication_revision: u64,
+    publication_operation_id: String,
+    published_head: String,
 }
 
 struct ReviewerPublicationConfig<'a> {
@@ -107,7 +114,7 @@ struct ReviewerPublicationConfig<'a> {
     repositories: &'a BTreeMap<crate::domain::ids::RepositoryId, crate::config::RepositoryConfig>,
 }
 
-fn reviewer_publication_subject(
+fn accepted_publication_subject(
     store: &ConfigStore,
     owner_generation: u64,
     project_id: &crate::domain::ids::ProjectId,
@@ -121,9 +128,16 @@ fn reviewer_publication_subject(
         ticket_run_id,
         revision,
     )?;
-    if snapshot.publication_revision() != revision {
+    let subject_matches_current_revision = snapshot.publication_revision() == revision
+        || snapshot.publication_revision().checked_add(1) == Some(revision)
+            && snapshot.verification().is_none()
+        || snapshot.verification().is_some_and(|verification| {
+            verification.review_revision == revision
+                || verification.review_revision.checked_add(1) == Some(revision)
+        });
+    if !subject_matches_current_revision {
         return Err(
-            "Reviewer prompt is not at the current implementation publication revision".into(),
+            "review or merge prompt is not at the current accepted publication or verification revision".into(),
         );
     }
     let accepted = snapshot.accepted_plan();
@@ -138,13 +152,28 @@ fn reviewer_publication_subject(
         config.repositories,
         snapshot.publication_receipts(),
     )?;
-    crate::delivery_runtime::implementation_publication_set_subject(
+    let mut subject = crate::delivery_runtime::implementation_publication_set_subject(
         &accepted.plan_digest,
         &accepted.proposal,
         &validated,
         snapshot.publication_receipts(),
         snapshot.publication_revision(),
-    )
+    )?;
+    subject.verification = snapshot.verification().map(|verification| {
+        crate::delivery_runtime::WorkerVerificationSubject {
+            review_revision: verification.review_revision,
+            source_evidence_id: verification.source_evidence_id.clone(),
+            source_agent_run_id: verification.source_agent_run_id.clone(),
+            source_result_digest: verification.source_result_digest.clone(),
+            publication_revision: verification.publication_revision,
+            publication_operation_id: verification.publication_operation_id.clone(),
+            published_head: verification.published_head.as_str().to_owned(),
+            work_node_id: verification.work_node_id.clone(),
+            repository_id: verification.repository_id.clone(),
+            test_receipt_artifacts: verification.test_receipt_artifacts.clone(),
+        }
+    });
+    Ok(subject)
 }
 
 impl RuntimeServices {
@@ -1503,25 +1532,26 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             None
         };
         let worker_node = worker_context.as_ref().map(|context| context.node.clone());
-        let implementation_publication_subject = if reservation.role == Role::Reviewer {
-            let run = active_run
-                .as_ref()
-                .ok_or("Reviewer reservation has no TicketRun")?;
-            Some(reviewer_publication_subject(
-                store,
-                self.owner_generation,
-                &run.project_id,
-                &run.ticket_run_id,
-                run.revision,
-                &ReviewerPublicationConfig {
-                    project,
-                    configuration_digest: &self.applied_config.digest,
-                    repositories: &self.applied_config.config.repositories,
-                },
-            )?)
-        } else {
-            None
-        };
+        let implementation_publication_subject =
+            if matches!(reservation.role, Role::Reviewer | Role::MergeDecision) {
+                let run = active_run
+                    .as_ref()
+                    .ok_or("review or MergeDecision reservation has no TicketRun")?;
+                Some(accepted_publication_subject(
+                    store,
+                    self.owner_generation,
+                    &run.project_id,
+                    &run.ticket_run_id,
+                    run.revision,
+                    &ReviewerPublicationConfig {
+                        project,
+                        configuration_digest: &self.applied_config.digest,
+                        repositories: &self.applied_config.config.repositories,
+                    },
+                )?)
+            } else {
+                None
+            };
         let accepted_plan = if let Some(run) = active_run.as_ref() {
             let accepted = store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?;
             if let Some(plan) = &accepted {
@@ -1537,7 +1567,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 authorization.as_ref(),
                 &context.plan_record,
                 &context.node,
-                context.token.base_sha(),
+                context.token.expected_head(),
                 context.token.ticket_run_id(),
                 reservation
                     .ticket_revision
@@ -1552,9 +1582,28 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             {
                 return Err("Worker recovery worktree changed after authorization".into());
             }
+            if authorization.is_none() && context.token.expected_head() != context.token.base_sha()
+            {
+                ensure_worker_worktree_at_expected_head(
+                    context.token.worktree_path(),
+                    context.token.expected_head(),
+                    |path| self.delivery_effects.observe_local_head_at(path),
+                    "Worker rework worktree changed after publication authorization",
+                )?;
+            }
             authorization
         } else {
             None
+        };
+        let worker_verification = match (&worker_context, &worker_node) {
+            (Some(context), Some(node)) => worker_verification_assignment(
+                store,
+                self.owner_generation,
+                &context.token,
+                node,
+                worker_recovery_authorization.as_ref(),
+            )?,
+            _ => None,
         };
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
@@ -1594,7 +1643,8 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                             expected_head: worker_recovery_authorization
                                 .as_ref()
                                 .map(|authorization| authorization.expected_head.as_str())
-                                .unwrap_or_else(|| context.token.base_sha()),
+                                .unwrap_or_else(|| context.token.expected_head()),
+                            verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
@@ -1894,6 +1944,16 @@ impl FactoryRuntimeServices for RuntimeServices {
             .map(Some)
     }
 
+    fn verify_worker_verification_worktree(
+        &self,
+        path: &Path,
+        expected_head: &str,
+    ) -> Result<(), String> {
+        self.delivery
+            .effects()
+            .verify_clean_published_worktree_at(path, expected_head)
+    }
+
     fn configuration_digest(&self) -> &Digest {
         &self.configuration_digest
     }
@@ -2031,6 +2091,17 @@ impl FactoryRuntimeServices for RuntimeServices {
         {
             return Err("Worker result does not match its prepared node authority".into());
         }
+        let reservation = store
+            .agent_launch_reservation_for_run(&binding.agent_run_id)?
+            .ok_or("Worker result has no immutable launch reservation")?;
+        if reservation.worker_assignment.as_ref() != Some(&prepared.reservation_binding()) {
+            return Err("Worker result reservation differs from its prepared assignment".into());
+        }
+        let recovery_authorization = reservation.wake_snapshot.worker_recovery_authorization()?;
+        let expected_head = recovery_authorization
+            .as_ref()
+            .map(|authorization| authorization.expected_head.as_str())
+            .unwrap_or_else(|| prepared.expected_head());
         let change = claimed
             .change_references
             .iter()
@@ -2045,6 +2116,9 @@ impl FactoryRuntimeServices for RuntimeServices {
             );
         }
         let change = change[0];
+        if change.previous_head.as_str() != expected_head {
+            return Err("Worker change does not start at its host-authorized expected HEAD".into());
+        }
         let commit_mode = prepared.commit_mode();
         if change.commit_mode != commit_mode || change.base_commit.as_str() != prepared.base_sha() {
             return Err("Worker commit claim differs from the host-prepared worktree".into());
@@ -2072,7 +2146,7 @@ impl FactoryRuntimeServices for RuntimeServices {
                     }
                 };
                 WorkerDeliveryCommit::Native {
-                    previous_accepted_head: change.previous_head.as_str().to_owned(),
+                    previous_accepted_head: expected_head.to_owned(),
                     worker_reported_head: change.branch_head.as_str().to_owned(),
                     required_trailer: trailer.to_owned(),
                 }
@@ -2120,7 +2194,7 @@ impl FactoryRuntimeServices for RuntimeServices {
                     || receipt.base_sha != prepared.base_sha()
                     || receipt.manifest_artifact != **source.first().expect("one Change artifact")
                     || receipt.commit.operation_id != operation_id
-                    || receipt.commit.expected_head != change.previous_head.as_str()
+                    || receipt.commit.expected_head != expected_head
                     || receipt.commit.observed_head != change.branch_head.as_str()
                     || receipt.commit.observed_head == receipt.commit.expected_head
                     || change.commit_shas.as_slice() != [change.branch_head.clone()]
@@ -2129,7 +2203,7 @@ impl FactoryRuntimeServices for RuntimeServices {
                 }
                 WorkerDeliveryCommit::HostReceipt {
                     operation_id,
-                    expected_head: change.previous_head.as_str().to_owned(),
+                    expected_head: expected_head.to_owned(),
                     worker_reported_head: change.branch_head.as_str().to_owned(),
                     receipt: Box::new(receipt),
                 }
@@ -2859,7 +2933,120 @@ impl RuntimeServices {
                         format!("cannot stage prior Worker recovery artifacts: {error}")
                     })?;
                 }
+            } else if input.source_type == "ticket_run_transition"
+                && input.payload_json["target"] == "reviewer"
+            {
+                let ticket_run_id = crate::domain::ids::TicketRunId::parse(
+                    input.payload_json["ticket_run_id"]
+                        .as_str()
+                        .ok_or("Reviewer transition wake has no TicketRun ID")?
+                        .to_owned(),
+                )?;
+                if input.payload_json["revision"].as_u64() != Some(input.source_revision)
+                    || input.payload_json["message_id"].as_str() != Some(input.source_id.as_str())
+                {
+                    return Err(
+                        "Reviewer transition wake differs from its durable source identity".into(),
+                    );
+                }
+                let snapshot = store.accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    project_id,
+                    &ticket_run_id,
+                    input.source_revision,
+                )?;
+                if snapshot.publication_revision() != input.source_revision
+                    && snapshot.verification().is_none_or(|verification| {
+                        verification.review_revision != input.source_revision
+                    })
+                {
+                    return Err(
+                        "Reviewer wake does not name the current publication or verification subject".into(),
+                    );
+                }
+                for publication in snapshot.publication_receipts() {
+                    let source = store.validated_worker_publication_source_for_node(
+                        artifact_store,
+                        owner_generation,
+                        project_id,
+                        &ticket_run_id,
+                        publication,
+                    )?;
+                    let references = source
+                        .validated
+                        .claimed_artifact_refs
+                        .iter()
+                        .filter(|reference| {
+                            matches!(
+                                reference.kind,
+                                crate::engine::orchestration::RoleArtifactKind::TestReceipt
+                                    | crate::engine::orchestration::RoleArtifactKind::General
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if references.is_empty() {
+                        continue;
+                    }
+                    let source_authority = store
+                        .agent_launch_authority(&source.validated.binding.agent_run_id)?
+                        .ok_or("published Worker check evidence lost its launch authority")?;
+                    let staged = crate::parent_artifacts::stage_verified_parent_artifacts(
+                        store,
+                        artifact_store,
+                        &source_authority,
+                        source.receipt.evidence_id(),
+                        project_id,
+                        config_revision,
+                        config_digest,
+                        workspace,
+                        &references,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "cannot stage published Worker check evidence for Reviewer: {error}"
+                        )
+                    })?;
+                    host_artifacts.extend(staged);
+                }
+                if let Some(verification) = snapshot.verification() {
+                    let source = store.validated_worker_verification_source(
+                        artifact_store,
+                        owner_generation,
+                        project_id,
+                        &ticket_run_id,
+                        verification,
+                    )?;
+                    let source_authority = store
+                        .agent_launch_authority(&source.validated.binding.agent_run_id)?
+                        .ok_or("verified Worker check evidence lost its launch authority")?;
+                    let staged = crate::parent_artifacts::stage_verified_parent_artifacts(
+                        store,
+                        artifact_store,
+                        &source_authority,
+                        source.receipt.evidence_id(),
+                        project_id,
+                        config_revision,
+                        config_digest,
+                        workspace,
+                        &verification.test_receipt_artifacts,
+                    )
+                    .map_err(|error| {
+                        format!("cannot stage verification-only Worker TestReceipt evidence for Reviewer: {error}")
+                    })?;
+                    host_artifacts.extend(staged);
+                }
             }
+            let host_artifact_source_evidence_ids =
+                if input.source_type == "ticket_run_transition" && !host_artifacts.is_empty() {
+                    let evidence_ids = host_artifacts
+                        .iter()
+                        .map(|artifact| artifact.source_evidence_id.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    evidence_ids.into_iter().collect()
+                } else {
+                    Vec::new()
+                };
             items.push(crate::agent_api::AgentWakeItem {
                 wake_input_id: input.wake_input_id,
                 source_type: input.source_type,
@@ -2867,6 +3054,7 @@ impl RuntimeServices {
                 source_revision: input.source_revision,
                 priority: input.priority,
                 payload_json: input.payload_json,
+                host_artifact_source_evidence_ids,
                 host_artifacts,
             });
         }
@@ -2916,7 +3104,7 @@ impl RuntimeServices {
             .find(|run| run.ticket_run_id == *ticket_run_id)
             .ok_or("ticket role refers to a missing or terminal TicketRun")?;
         if active_run.project_id != candidate.project_id
-            || !role_allowed_in_phase(candidate.role, active_run.phase)
+            || !role_allowed_for_run(candidate.role, active_run.phase, active_run.activity)
         {
             return Err("ticket role does not match the active TicketRun phase".into());
         }
@@ -3071,22 +3259,23 @@ impl RuntimeServices {
             worker_node_id.as_ref(),
             accepted_plan.as_ref(),
         )?;
-        let implementation_publication_subject = if candidate.role == Role::Reviewer {
-            Some(reviewer_publication_subject(
-                store,
-                self.owner_generation,
-                &active_run.project_id,
-                ticket_run_id,
-                active_run.revision,
-                &ReviewerPublicationConfig {
-                    project: &project,
-                    configuration_digest: &self.configuration_digest,
-                    repositories: &self.applied_config.config.repositories,
-                },
-            )?)
-        } else {
-            None
-        };
+        let implementation_publication_subject =
+            if matches!(candidate.role, Role::Reviewer | Role::MergeDecision) {
+                Some(accepted_publication_subject(
+                    store,
+                    self.owner_generation,
+                    &active_run.project_id,
+                    ticket_run_id,
+                    active_run.revision,
+                    &ReviewerPublicationConfig {
+                        project: &project,
+                        configuration_digest: &self.configuration_digest,
+                        repositories: &self.applied_config.config.repositories,
+                    },
+                )?)
+            } else {
+                None
+            };
         let worker_node = worker_context
             .as_ref()
             .and_then(|context| {
@@ -3100,6 +3289,18 @@ impl RuntimeServices {
         if candidate.role == Role::Worker && worker_node.is_none() {
             return Err("prepared Worker token does not resolve to an accepted plan node".into());
         }
+        let worker_verification = match (&worker_context, &worker_node) {
+            (Some(context), Some(node)) if candidate.role == Role::Worker => {
+                worker_verification_assignment(
+                    store,
+                    self.owner_generation,
+                    &context.token,
+                    node,
+                    worker_recovery_authorization.as_ref(),
+                )?
+            }
+            _ => None,
+        };
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
@@ -3156,7 +3357,7 @@ impl RuntimeServices {
                             worker_recovery_authorization.as_ref(),
                             plan,
                             node,
-                            context.token.base_sha(),
+                            context.token.expected_head(),
                             context.token.ticket_run_id(),
                             active_run.revision,
                         )?;
@@ -3171,10 +3372,20 @@ impl RuntimeServices {
                                 "Worker recovery worktree changed before launch reservation".into(),
                             );
                         }
+                        if worker_recovery_authorization.is_none()
+                            && context.token.expected_head() != context.token.base_sha()
+                        {
+                            ensure_worker_worktree_at_expected_head(
+                                context.token.worktree_path(),
+                                context.token.expected_head(),
+                                |path| self.delivery.effects().observe_local_head_at(path),
+                                "Worker rework worktree changed before launch reservation",
+                            )?;
+                        }
                         let expected_head = worker_recovery_authorization
                             .as_ref()
                             .map(|authorization| authorization.expected_head.as_str())
-                            .unwrap_or_else(|| context.token.base_sha());
+                            .unwrap_or_else(|| context.token.expected_head());
                         Some(worker_assignment_context(&WorkerAssignmentContext {
                             plan_record: plan,
                             validated_plan: validated,
@@ -3183,6 +3394,7 @@ impl RuntimeServices {
                             branch: context.token.branch(),
                             base_sha: context.token.base_sha(),
                             expected_head,
+                            verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
@@ -3876,6 +4088,15 @@ pub(crate) fn role_allowed_in_phase(role: Role, phase: crate::engine::reducer::P
     }
 }
 
+fn role_allowed_for_run(
+    role: Role,
+    phase: crate::engine::reducer::Phase,
+    activity: crate::engine::reducer::Activity,
+) -> bool {
+    role_allowed_in_phase(role, phase)
+        && (role != Role::Reviewer || activity == crate::engine::reducer::Activity::Running)
+}
+
 fn resolve_prepared_worker_context(
     store: &ConfigStore,
     owner_generation: u64,
@@ -4047,6 +4268,83 @@ fn verified_worker_recovery_summary(
     }
 }
 
+fn ensure_worker_worktree_at_expected_head(
+    worktree_path: &Path,
+    expected_head: &str,
+    mut observe_head: impl FnMut(&Path) -> Result<String, String>,
+    mismatch: &str,
+) -> Result<(), String> {
+    let observed = observe_head(worktree_path)?;
+    if observed != expected_head {
+        return Err(mismatch.into());
+    }
+    Ok(())
+}
+
+fn worker_verification_assignment(
+    store: &ConfigStore,
+    owner_generation: u64,
+    token: &crate::store::accepted_plans::PreparedWorkerLaunch,
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    recovery_authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Result<Option<WorkerVerificationAssignment>, String> {
+    let expected_head = recovery_authorization
+        .map(|authorization| authorization.expected_head.as_str())
+        .unwrap_or_else(|| token.expected_head());
+    if expected_head == token.base_sha() {
+        return Ok(None);
+    }
+    let snapshot = store.accepted_implementation_publication_snapshot(
+        owner_generation,
+        token.project_id(),
+        token.ticket_run_id(),
+        token.ticket_revision(),
+    )?;
+    let matching = snapshot
+        .publication_receipts()
+        .iter()
+        .filter_map(|publication| {
+            let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                crate::protocol::parse_unique(publication.intent().request_json.as_bytes()).ok()?;
+            (request.work_node_id == node.id).then_some((publication, request))
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(
+            "correction Worker publication must cover its accepted node exactly once".into(),
+        );
+    }
+    let (publication, request) = &matching[0];
+    let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+        crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+    if request.ticket_run_id != *token.ticket_run_id()
+        || request.repository_id != node.repository
+        || request.configuration_digest != *token.configuration_digest()
+        || request.source_revision.checked_add(1) != Some(snapshot.publication_revision())
+        || receipt.ticket_run_id != *token.ticket_run_id()
+        || receipt.work_node_id != node.id
+        || receipt.repository_id != node.repository
+        || receipt.configuration_digest != *token.configuration_digest()
+        || receipt.commit.head() != expected_head
+        || recovery_authorization.is_some_and(|authorization| {
+            authorization.ticket_run_id != *token.ticket_run_id()
+                || authorization.ticket_revision != token.ticket_revision()
+                || authorization.work_node_id != node.id
+                || authorization.accepted_plan_digest != *token.plan_digest()
+                || authorization.expected_head != expected_head
+        })
+    {
+        return Err(
+            "correction Worker publication differs from its host-prepared assignment".into(),
+        );
+    }
+    Ok(Some(WorkerVerificationAssignment {
+        publication_revision: snapshot.publication_revision(),
+        publication_operation_id: publication.intent().operation_id.as_str().to_owned(),
+        published_head: receipt.commit.head().to_owned(),
+    }))
+}
+
 fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<String, String> {
     let WorkerAssignmentContext {
         plan_record,
@@ -4056,6 +4354,7 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         branch,
         base_sha,
         expected_head,
+        verification,
         recovery_authorization,
         commit_mode,
         repository_id,
@@ -4112,6 +4411,12 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
             "branch":branch,
             "base_sha":base_sha,
             "expected_head":expected_head,
+            "verification_only":verification.is_some(),
+            "accepted_publication":verification.map(|value| serde_json::json!({
+                "publication_revision":value.publication_revision,
+                "publication_operation_id":value.publication_operation_id,
+                "published_head":value.published_head,
+            })),
             "commit_mode":commit_mode,
             "repository_id":repository_id,
         },
@@ -4340,11 +4645,124 @@ mod coordinator_worker_recovery_prompt_tests {
     }
 }
 
+#[cfg(test)]
+mod reviewer_activity_gate_tests {
+    use super::role_allowed_for_run;
+    use crate::domain::types::Role;
+    use crate::engine::reducer::{Activity, Phase};
+
+    #[test]
+    fn reviewer_wake_is_not_launchable_after_human_escalation_blocks_run() {
+        assert!(role_allowed_for_run(
+            Role::Reviewer,
+            Phase::Reviewing,
+            Activity::Running
+        ));
+        assert!(!role_allowed_for_run(
+            Role::Reviewer,
+            Phase::Reviewing,
+            Activity::Blocked
+        ));
+        assert!(!role_allowed_for_run(
+            Role::Reviewer,
+            Phase::Assessing,
+            Activity::Running
+        ));
+    }
+}
+
+#[cfg(test)]
+mod worker_rework_head_tests {
+    use super::ensure_worker_worktree_at_expected_head;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(directory: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .output()
+            .expect("git is installed for repository tests");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn correction_worker_rejects_a_managed_worktree_that_moved_after_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "rex-projects test"]);
+        git(
+            &repository,
+            &["config", "user.email", "rex-projects@example.invalid"],
+        );
+        std::fs::write(repository.join("tracked.txt"), "published\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(&repository, &["commit", "-m", "published implementation"]);
+        let published_head = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_str().unwrap(),
+                &published_head,
+            ],
+        );
+
+        let observe = |path: &Path| {
+            let output = Command::new("git")
+                .args(["-C", path.to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        ensure_worker_worktree_at_expected_head(
+            &worktree,
+            &published_head,
+            observe,
+            "stale worktree",
+        )
+        .expect("a worktree at the accepted publication is launchable");
+
+        git(&worktree, &["config", "user.name", "rex-projects test"]);
+        git(
+            &worktree,
+            &["config", "user.email", "rex-projects@example.invalid"],
+        );
+        std::fs::write(worktree.join("tracked.txt"), "unexpected later change\n").unwrap();
+        git(&worktree, &["add", "tracked.txt"]);
+        git(&worktree, &["commit", "-m", "unexpected worktree advance"]);
+        let result = ensure_worker_worktree_at_expected_head(
+            &worktree,
+            &published_head,
+            observe,
+            "Worker rework worktree changed after publication authorization",
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "Worker rework worktree changed after publication authorization"
+        );
+    }
+}
+
 fn validate_worker_recovery_assignment(
     authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
     plan: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
     node: &crate::engine::orchestration::ValidatedWorkNode,
-    base_sha: &str,
+    assigned_expected_head: &str,
     ticket_run_id: &crate::domain::ids::TicketRunId,
     ticket_revision: u64,
 ) -> Result<(), String> {
@@ -4356,7 +4774,7 @@ fn validate_worker_recovery_assignment(
             || authorization.accepted_plan_digest != plan.plan_digest
             || node.role != Role::Worker
             || (authorization.prior_host_commit_operation_id.is_none()
-                && authorization.expected_head != base_sha)
+                && authorization.expected_head != assigned_expected_head)
         {
             return Err(
                 "Worker recovery authority differs from its accepted plan assignment".into(),
@@ -4459,6 +4877,7 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &base_sha,
+            verification: None,
             recovery_authorization: None,
             commit_mode: CommitMode::Host,
             repository_id: &repository,
@@ -4475,7 +4894,47 @@ mod worker_assignment_context_tests {
         );
         assert_eq!(context["prepared_worktree"]["base_sha"], base_sha);
         assert_eq!(context["prepared_worktree"]["expected_head"], base_sha);
+        assert_eq!(context["prepared_worktree"]["verification_only"], false);
         assert_eq!(context["prepared_worktree"]["repository_id"], "repo-a");
+
+        let publication_head = "3".repeat(40);
+        let verification = WorkerVerificationAssignment {
+            publication_revision: 5,
+            publication_operation_id: "publish-worker-1".into(),
+            published_head: publication_head.clone(),
+        };
+        let verification_context = worker_assignment_context(&WorkerAssignmentContext {
+            plan_record: &plan_record,
+            validated_plan: &validated,
+            node: &node,
+            worktree_path: Path::new("/state/worktree"),
+            branch: "agent/run-a/worker-b",
+            base_sha: &base_sha,
+            expected_head: &publication_head,
+            verification: Some(&verification),
+            recovery_authorization: None,
+            commit_mode: CommitMode::Host,
+            repository_id: &repository,
+        })
+        .unwrap();
+        let verification_context: serde_json::Value =
+            serde_json::from_str(&verification_context).unwrap();
+        assert_eq!(
+            verification_context["prepared_worktree"]["verification_only"],
+            true
+        );
+        assert_eq!(
+            verification_context["prepared_worktree"]["accepted_publication"]["publication_operation_id"],
+            "publish-worker-1"
+        );
+        assert_eq!(
+            verification_context["prepared_worktree"]["accepted_publication"]["publication_revision"],
+            5
+        );
+        assert_eq!(
+            verification_context["prepared_worktree"]["accepted_publication"]["published_head"],
+            publication_head
+        );
 
         let prior_operation = crate::domain::ids::OperationId::parse("host-commit-prior").unwrap();
         let recovery = crate::engine::orchestration::WorkerRecoveryAuthorization {
@@ -4502,6 +4961,7 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &recovery.expected_head,
+            verification: Some(&verification),
             recovery_authorization: Some(&recovery),
             commit_mode: CommitMode::Host,
             repository_id: &repository,
@@ -4512,6 +4972,14 @@ mod worker_assignment_context_tests {
         assert_eq!(
             recovery_context["prepared_worktree"]["expected_head"],
             recovery.expected_head
+        );
+        assert_eq!(
+            recovery_context["prepared_worktree"]["verification_only"],
+            true
+        );
+        assert_eq!(
+            recovery_context["prepared_worktree"]["accepted_publication"]["publication_operation_id"],
+            "publish-worker-1"
         );
         assert_eq!(
             recovery_context["worker_recovery_authorization"]["prior_worker_agent_run_id"],
@@ -4525,7 +4993,7 @@ mod worker_assignment_context_tests {
             Some(&recovery),
             &plan_record,
             &node,
-            &base_sha,
+            &recovery.expected_head,
             &ticket_run_id,
             3,
         )
@@ -4535,9 +5003,33 @@ mod worker_assignment_context_tests {
                 Some(&recovery),
                 &plan_record,
                 &node,
-                &base_sha,
+                &recovery.expected_head,
                 &ticket_run_id,
                 4,
+            )
+            .is_err()
+        );
+        let mut correction_recovery = recovery.clone();
+        correction_recovery.prior_host_commit_operation_id = None;
+        correction_recovery.prior_host_commit_receipt_digest = None;
+        assert_ne!(correction_recovery.expected_head, base_sha);
+        validate_worker_recovery_assignment(
+            Some(&correction_recovery),
+            &plan_record,
+            &node,
+            &correction_recovery.expected_head,
+            &ticket_run_id,
+            3,
+        )
+        .expect("no-commit recovery remains bound to the published expected HEAD");
+        assert!(
+            validate_worker_recovery_assignment(
+                Some(&correction_recovery),
+                &plan_record,
+                &node,
+                &base_sha,
+                &ticket_run_id,
+                3,
             )
             .is_err()
         );

@@ -106,6 +106,11 @@ pub struct WorkerLaunchBinding {
     pub worktree_path: PathBuf,
     pub branch: String,
     pub base_sha: String,
+    /// Present only for an explicitly authorized continuation after a host-validated
+    /// publication and Reviewer `corrections_remain` transition. None preserves the
+    /// original launch encoding and means the prepared base is the expected head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_head: Option<String>,
     pub prepare_operation_id: String,
     pub prepare_receipt_digest: ContentDigest,
     pub source_evidence_id: String,
@@ -118,6 +123,10 @@ pub struct WorkerLaunchBinding {
 }
 
 impl WorkerLaunchBinding {
+    pub fn expected_head(&self) -> &str {
+        self.expected_head.as_deref().unwrap_or(&self.base_sha)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1
             || self.accepted_revision == 0
@@ -125,6 +134,9 @@ impl WorkerLaunchBinding {
             || !self.worktree_path.is_absolute()
             || self.branch.trim().is_empty()
             || self.base_sha.trim().is_empty()
+            || self.expected_head.as_ref().is_some_and(|head| {
+                !matches!(head.len(), 40 | 64) || !head.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
             || self.prepare_operation_id.trim().is_empty()
             || self.source_evidence_id.trim().is_empty()
             || self.source_message_id.trim().is_empty()
@@ -1255,8 +1267,8 @@ mod tests {
     use super::{
         AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, LaunchDecision,
         LaunchExpectation, ObservedProviderStart, ProviderProcessIdentity, ProviderQualification,
-        QualificationIdentity, QualificationProof, QualificationStatus, authorize_start,
-        migrate_v7,
+        QualificationIdentity, QualificationProof, QualificationStatus, WorkerLaunchBinding,
+        authorize_start, migrate_v7,
     };
     use crate::domain::ids::{
         AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketRunId,
@@ -1266,6 +1278,35 @@ mod tests {
 
     fn digest(byte: char) -> Digest {
         Digest::parse(byte.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn legacy_worker_binding_keeps_its_canonical_encoding_without_expected_head() {
+        let legacy = serde_json::json!({
+            "schema_version":1,
+            "accepted_revision":3,
+            "ticket_revision":4,
+            "configuration_digest":"a".repeat(64),
+            "plan_digest":"b".repeat(64),
+            "node_id":"node-a",
+            "repository_id":"repo-a",
+            "commit_mode":"host",
+            "worktree_path":"/tmp/repo-a/worktree",
+            "branch":"rex-projects/ticket/node-a",
+            "base_sha":"1".repeat(40),
+            "prepare_operation_id":"prepare-a",
+            "prepare_receipt_digest":"c".repeat(64),
+            "source_evidence_id":"evidence-a",
+            "source_agent_run_id":"agent-source",
+            "source_message_id":"message-a",
+            "source_result_digest":"d".repeat(64),
+            "coordinator_agent_run_id":"agent-coordinator",
+            "coordinator_role_session_id":"ticket:ticket-a:coordinator",
+            "coordinator_authority_digest":"e".repeat(64),
+        });
+        let binding: WorkerLaunchBinding = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(binding.expected_head(), binding.base_sha);
+        assert_eq!(serde_json::to_value(binding).unwrap(), legacy);
     }
 
     fn qualification(status: QualificationStatus) -> ProviderQualification {
