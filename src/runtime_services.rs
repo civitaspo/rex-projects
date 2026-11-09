@@ -95,6 +95,8 @@ struct WorkerAssignmentContext<'a> {
     worktree_path: &'a Path,
     branch: &'a str,
     base_sha: &'a str,
+    expected_head: &'a str,
+    recovery_authorization: Option<&'a crate::engine::orchestration::WorkerRecoveryAuthorization>,
     commit_mode: crate::domain::types::CommitMode,
     repository_id: &'a crate::domain::ids::RepositoryId,
 }
@@ -334,6 +336,7 @@ impl RuntimeServices {
             rex_identity: rex_identity.clone(),
             rex: rex.clone(),
             tickets: tickets.clone(),
+            delivery_effects: delivery.shared_effects(),
         });
         handlers.push(Box::new(crate::stop_owned_runs::StopOwnedRunsHandler::new(
             rex.clone(),
@@ -1230,6 +1233,7 @@ struct RuntimeAgentMaterializer {
     rex_identity: RexIdentity,
     rex: Arc<RexCliTransport>,
     tickets: Arc<dyn TicketAdapter>,
+    delivery_effects: Arc<crate::delivery_runtime::RepositoryDeliveryEffects>,
 }
 
 impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
@@ -1542,6 +1546,29 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 recovery_summary: None,
                 accepted_plan: match (&worker_context, &accepted_plan) {
                     (Some(context), _) => {
+                        let recovery_authorization =
+                            reservation.wake_snapshot.worker_recovery_authorization()?;
+                        validate_worker_recovery_assignment(
+                            recovery_authorization.as_ref(),
+                            &context.plan_record,
+                            &context.node,
+                            context.token.base_sha(),
+                            context.token.ticket_run_id(),
+                            reservation
+                                .ticket_revision
+                                .map(|revision| revision.0)
+                                .unwrap_or(0),
+                        )?;
+                        if let Some(authorization) = &recovery_authorization
+                            && self
+                                .delivery_effects
+                                .observe_local_head_at(context.token.worktree_path())?
+                                != authorization.expected_head
+                        {
+                            return Err(
+                                "Worker recovery worktree changed after authorization".into()
+                            );
+                        }
                         Some(worker_assignment_context(&WorkerAssignmentContext {
                             plan_record: &context.plan_record,
                             validated_plan: &context.validated_plan,
@@ -1549,6 +1576,11 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                             worktree_path: context.token.worktree_path(),
                             branch: context.token.branch(),
                             base_sha: context.token.base_sha(),
+                            expected_head: recovery_authorization
+                                .as_ref()
+                                .map(|authorization| authorization.expected_head.as_str())
+                                .unwrap_or_else(|| context.token.base_sha()),
+                            recovery_authorization: recovery_authorization.as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
                         })?)
@@ -1833,6 +1865,16 @@ impl FactoryRuntimeServices for RuntimeServices {
         &mut self,
     ) -> Result<BTreeMap<crate::domain::ids::RepositoryId, String>, String> {
         self.delivery.observe_base_heads()
+    }
+
+    fn observe_worker_recovery_head(
+        &self,
+        candidate: &crate::engine::orchestration::WorkerRecoveryCandidate,
+    ) -> Result<Option<String>, String> {
+        self.delivery
+            .effects()
+            .observe_local_head_at(&candidate.worktree_path)
+            .map(Some)
     }
 
     fn configuration_digest(&self) -> &Digest {
@@ -2757,6 +2799,51 @@ impl RuntimeServices {
                         )
                     })?;
                 }
+            } else if input.source_type == "worker_recovery_authorization" {
+                let authorization: crate::engine::orchestration::WorkerRecoveryAuthorization =
+                    serde_json::from_value(
+                        input
+                            .payload_json
+                            .get("authorization")
+                            .cloned()
+                            .ok_or("Worker recovery wake has no host authorization")?,
+                    )
+                    .map_err(|error| format!("invalid Worker recovery authorization: {error}"))?;
+                authorization.validate()?;
+                if input.source_id != authorization.prior_worker_result_evidence_id
+                    || input.source_revision != authorization.ticket_revision
+                {
+                    return Err(
+                        "Worker recovery wake source differs from its host authorization".into(),
+                    );
+                }
+                if !authorization.prior_artifact_refs.is_empty() {
+                    let authority = store
+                        .agent_launch_authority(&authorization.prior_worker_agent_run_id)?
+                        .ok_or("Worker recovery prior run lost its launch authority")?;
+                    if authority.project_id != *project_id
+                        || authority.ticket_run_id.as_ref() != Some(&authorization.ticket_run_id)
+                        || authority.role != Role::Worker
+                    {
+                        return Err(
+                            "Worker recovery artifacts belong to a different prior Worker".into(),
+                        );
+                    }
+                    host_artifacts = crate::parent_artifacts::stage_verified_parent_artifacts(
+                        store,
+                        artifact_store,
+                        &authority,
+                        &authorization.prior_worker_result_evidence_id,
+                        project_id,
+                        config_revision,
+                        config_digest,
+                        workspace,
+                        &authorization.prior_artifact_refs,
+                    )
+                    .map_err(|error| {
+                        format!("cannot stage prior Worker recovery artifacts: {error}")
+                    })?;
+                }
             }
             items.push(crate::agent_api::AgentWakeItem {
                 wake_input_id: input.wake_input_id,
@@ -2945,6 +3032,22 @@ impl RuntimeServices {
             .as_ref()
             .map(|plan| plan.validate_for(&project, &self.configuration_digest))
             .transpose()?;
+        let wake_inputs = store.pending_role_wake_inputs(
+            &candidate.project_id,
+            &candidate.role_session_id,
+            256,
+        )?;
+        if wake_inputs.is_empty() {
+            return Ok(false);
+        }
+        let worker_recovery_authorization = worker_recovery_authorization_from_inputs(
+            &wake_inputs,
+            candidate.role,
+            ticket_run_id,
+            active_run.revision,
+            worker_node_id.as_ref(),
+            accepted_plan.as_ref(),
+        )?;
         let implementation_publication_subject = if candidate.role == Role::Reviewer {
             Some(reviewer_publication_subject(
                 store,
@@ -2996,7 +3099,41 @@ impl RuntimeServices {
                     body: ticket.ticket.body,
                     acceptance: Vec::new(),
                 }),
-                recovery_summary: None,
+                recovery_summary: if candidate.role == Role::Coordinator
+                    && active_run.phase == crate::engine::reducer::Phase::Implementing
+                {
+                    let candidates = if let Some(plan) = &accepted_plan {
+                        store.worker_recovery_candidates(
+                            self.owner_generation,
+                            &active_run,
+                            plan,
+                            &project,
+                            &self.configuration_digest,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+                    let mut verified_candidates = Vec::new();
+                    for candidate in candidates {
+                        let head = self
+                            .delivery
+                            .effects()
+                            .observe_local_head_at(&candidate.worktree_path)?;
+                        if head == candidate.expected_head {
+                            verified_candidates.push(candidate);
+                        }
+                    }
+                    if verified_candidates.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            serde_json::to_string(&verified_candidates)
+                                .map_err(|error| error.to_string())?,
+                        )
+                    }
+                } else {
+                    None
+                },
                 accepted_plan: match (
                     &accepted_plan,
                     &validated_plan,
@@ -3006,6 +3143,29 @@ impl RuntimeServices {
                     (Some(plan), Some(validated), Some(context), Some(node))
                         if candidate.role == Role::Worker =>
                     {
+                        validate_worker_recovery_assignment(
+                            worker_recovery_authorization.as_ref(),
+                            plan,
+                            node,
+                            context.token.base_sha(),
+                            context.token.ticket_run_id(),
+                            active_run.revision,
+                        )?;
+                        if let Some(authorization) = &worker_recovery_authorization
+                            && self
+                                .delivery
+                                .effects()
+                                .observe_local_head_at(context.token.worktree_path())?
+                                != authorization.expected_head
+                        {
+                            return Err(
+                                "Worker recovery worktree changed before launch reservation".into(),
+                            );
+                        }
+                        let expected_head = worker_recovery_authorization
+                            .as_ref()
+                            .map(|authorization| authorization.expected_head.as_str())
+                            .unwrap_or_else(|| context.token.base_sha());
                         Some(worker_assignment_context(&WorkerAssignmentContext {
                             plan_record: plan,
                             validated_plan: validated,
@@ -3013,6 +3173,8 @@ impl RuntimeServices {
                             worktree_path: context.token.worktree_path(),
                             branch: context.token.branch(),
                             base_sha: context.token.base_sha(),
+                            expected_head,
+                            recovery_authorization: worker_recovery_authorization.as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
                         })?)
@@ -3046,14 +3208,6 @@ impl RuntimeServices {
             },
             &self.runtime_binary,
         )?;
-        let wake_inputs = store.pending_role_wake_inputs(
-            &candidate.project_id,
-            &candidate.role_session_id,
-            256,
-        )?;
-        if wake_inputs.is_empty() {
-            return Ok(false);
-        }
         let expected_parent_role = match candidate.role {
             Role::Coordinator => Some(Role::Supervisor),
             Role::Worker => None,
@@ -3845,6 +3999,8 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         worktree_path,
         branch,
         base_sha,
+        expected_head,
+        recovery_authorization,
         commit_mode,
         repository_id,
     } = context;
@@ -3899,12 +4055,83 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
             "path":worktree_path,
             "branch":branch,
             "base_sha":base_sha,
+            "expected_head":expected_head,
             "commit_mode":commit_mode,
             "repository_id":repository_id,
         },
+        "worker_recovery_authorization":recovery_authorization,
         "delivery_authority":"The host owns push, pull request creation, merge, and delivery."
     });
     serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn worker_recovery_authorization_from_inputs(
+    inputs: &[crate::store::agent_runtime::PendingRoleWakeInput],
+    role: Role,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    ticket_revision: u64,
+    node_id: Option<&crate::engine::orchestration::WorkNodeId>,
+    accepted_plan: Option<&crate::store::accepted_plans::AcceptedWorkPlanRecord>,
+) -> Result<Option<crate::engine::orchestration::WorkerRecoveryAuthorization>, String> {
+    let mut parsed = None;
+    for input in inputs
+        .iter()
+        .filter(|input| input.source_type == "worker_recovery_authorization")
+    {
+        let authorization: crate::engine::orchestration::WorkerRecoveryAuthorization =
+            serde_json::from_value(
+                input
+                    .payload_json
+                    .get("authorization")
+                    .cloned()
+                    .ok_or("Worker recovery wake has no host authorization")?,
+            )
+            .map_err(|error| format!("invalid Worker recovery authorization: {error}"))?;
+        authorization.validate()?;
+        if input.source_id != authorization.prior_worker_result_evidence_id
+            || authorization.ticket_run_id != *ticket_run_id
+            || authorization.ticket_revision != ticket_revision
+            || input.source_revision != ticket_revision
+            || node_id != Some(&authorization.work_node_id)
+            || accepted_plan
+                .is_none_or(|plan| plan.plan_digest != authorization.accepted_plan_digest)
+        {
+            return Err("Worker recovery wake is stale or outside the accepted node".into());
+        }
+        if parsed.replace(authorization).is_some() {
+            return Err("Worker role session has multiple recovery authorities".into());
+        }
+    }
+    if role != Role::Worker && parsed.is_some() {
+        return Err("non-Worker role cannot consume a Worker recovery authority".into());
+    }
+    Ok(parsed)
+}
+
+fn validate_worker_recovery_assignment(
+    authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+    plan: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    base_sha: &str,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    ticket_revision: u64,
+) -> Result<(), String> {
+    if let Some(authorization) = authorization {
+        authorization.validate()?;
+        if authorization.ticket_run_id != *ticket_run_id
+            || authorization.ticket_revision != ticket_revision
+            || authorization.work_node_id != node.id
+            || authorization.accepted_plan_digest != plan.plan_digest
+            || node.role != Role::Worker
+            || (authorization.prior_host_commit_operation_id.is_none()
+                && authorization.expected_head != base_sha)
+        {
+            return Err(
+                "Worker recovery authority differs from its accepted plan assignment".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn mailbox_expiration(now_unix: i64, turn_timeout_seconds: u64) -> Result<u64, String> {
@@ -3999,6 +4226,8 @@ mod worker_assignment_context_tests {
             worktree_path: Path::new("/state/worktree"),
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
+            expected_head: &base_sha,
+            recovery_authorization: None,
             commit_mode: CommitMode::Host,
             repository_id: &repository,
         })
@@ -4013,6 +4242,106 @@ mod worker_assignment_context_tests {
             "Use the exact predecessor head selected by the host; do not substitute the trunk base."
         );
         assert_eq!(context["prepared_worktree"]["base_sha"], base_sha);
+        assert_eq!(context["prepared_worktree"]["expected_head"], base_sha);
         assert_eq!(context["prepared_worktree"]["repository_id"], "repo-a");
+
+        let prior_operation = crate::domain::ids::OperationId::parse("host-commit-prior").unwrap();
+        let recovery = crate::engine::orchestration::WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            ticket_revision: 3,
+            work_node_id: crate::engine::orchestration::WorkNodeId::parse("worker-b").unwrap(),
+            accepted_plan_digest: plan_record.plan_digest.clone(),
+            prior_worker_agent_run_id: AgentRunId::parse("worker-run-prior").unwrap(),
+            prior_terminal_digest: Digest::parse("f".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("1".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: Some(prior_operation.clone()),
+            prior_host_commit_receipt_digest: Some(Digest::parse("2".repeat(64)).unwrap()),
+            expected_head: "3".repeat(40),
+            source_coordinator_evidence_id: "coordinator-evidence".into(),
+            prior_worker_result_evidence_id: "worker-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        };
+        let recovery_context = worker_assignment_context(&WorkerAssignmentContext {
+            plan_record: &plan_record,
+            validated_plan: &validated,
+            node: &node,
+            worktree_path: Path::new("/state/worktree"),
+            branch: "agent/run-a/worker-b",
+            base_sha: &base_sha,
+            expected_head: &recovery.expected_head,
+            recovery_authorization: Some(&recovery),
+            commit_mode: CommitMode::Host,
+            repository_id: &repository,
+        })
+        .unwrap();
+        let recovery_context: serde_json::Value = serde_json::from_str(&recovery_context).unwrap();
+        assert_eq!(recovery_context["prepared_worktree"]["base_sha"], base_sha);
+        assert_eq!(
+            recovery_context["prepared_worktree"]["expected_head"],
+            recovery.expected_head
+        );
+        assert_eq!(
+            recovery_context["worker_recovery_authorization"]["prior_worker_agent_run_id"],
+            "worker-run-prior"
+        );
+        assert_eq!(
+            recovery_context["worker_recovery_authorization"]["prior_host_commit_operation_id"],
+            prior_operation.as_str()
+        );
+        validate_worker_recovery_assignment(
+            Some(&recovery),
+            &plan_record,
+            &node,
+            &base_sha,
+            &ticket_run_id,
+            3,
+        )
+        .unwrap();
+        assert!(
+            validate_worker_recovery_assignment(
+                Some(&recovery),
+                &plan_record,
+                &node,
+                &base_sha,
+                &ticket_run_id,
+                4,
+            )
+            .is_err()
+        );
+
+        let wake = crate::store::agent_runtime::PendingRoleWakeInput {
+            wake_input_id: 1,
+            source_type: "worker_recovery_authorization".into(),
+            source_id: recovery.prior_worker_result_evidence_id.clone(),
+            source_revision: 3,
+            priority: 10,
+            payload_json: serde_json::json!({"authorization": recovery}),
+        };
+        assert!(
+            worker_recovery_authorization_from_inputs(
+                std::slice::from_ref(&wake),
+                Role::Worker,
+                &ticket_run_id,
+                3,
+                Some(&node.id),
+                Some(&plan_record),
+            )
+            .unwrap()
+            .is_some()
+        );
+        let mut stale_wake = wake;
+        stale_wake.source_revision = 2;
+        assert!(
+            worker_recovery_authorization_from_inputs(
+                &[stale_wake],
+                Role::Worker,
+                &ticket_run_id,
+                3,
+                Some(&node.id),
+                Some(&plan_record),
+            )
+            .is_err()
+        );
     }
 }

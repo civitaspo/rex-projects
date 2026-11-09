@@ -367,6 +367,25 @@ impl crate::store::ConfigStore {
         let ticket_revision = authority
             .ticket_revision
             .ok_or("repository.commit Worker has no TicketRun revision")?;
+        let expected_head = match reservation.wake_snapshot.worker_recovery_authorization()? {
+            Some(recovery) => {
+                if recovery.ticket_run_id != *ticket_run_id
+                    || recovery.ticket_revision != ticket_revision.0
+                    || recovery.work_node_id != assignment.node_id
+                    || recovery.accepted_plan_digest != assignment.plan_digest
+                    || recovery.prior_worker_agent_run_id == authority.agent_run_id
+                    || (recovery.prior_host_commit_operation_id.is_none()
+                        && recovery.expected_head != assignment.base_sha)
+                {
+                    return Err(AgentMailboxProcessingError::Authority(
+                        "Worker recovery authority differs from the immutable accepted assignment"
+                            .into(),
+                    ));
+                }
+                recovery.expected_head
+            }
+            None => assignment.base_sha.clone(),
+        };
         let envelope = &mailbox_request.envelope;
         if authority.role != crate::domain::types::Role::Worker
             || assignment.commit_mode != crate::domain::types::CommitMode::Host
@@ -380,6 +399,7 @@ impl crate::store::ConfigStore {
             || envelope.attempt != Some(authority.attempt)
             || envelope.run_epoch != Some(authority.run_epoch)
             || envelope.expected_subject_revision != Some(ticket_revision.0)
+            || request.expected_head != expected_head
         {
             return Err(AgentMailboxProcessingError::LocalMailbox(
                 "repository.commit request differs from immutable Worker authority".into(),

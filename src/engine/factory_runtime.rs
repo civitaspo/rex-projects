@@ -138,6 +138,16 @@ pub trait FactoryRuntimeServices {
         &mut self,
     ) -> Result<std::collections::BTreeMap<crate::domain::ids::RepositoryId, String>, String>;
 
+    /// Observe a host-persisted Worker worktree using the configured bounded Git adapter.
+    /// The default deliberately fails closed so test/runtime implementations cannot assert
+    /// that a recovery worktree is at the expected revision without observing it.
+    fn observe_worker_recovery_head(
+        &self,
+        _candidate: &crate::engine::orchestration::WorkerRecoveryCandidate,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     fn configuration_digest(&self) -> &Digest;
 
     fn human_evidence_documents(
@@ -2656,10 +2666,10 @@ fn apply_coordinator_spawn_request(
     else {
         return Err("validated SpawnRequest kind has a different typed payload".into());
     };
-    if matches!(
-        request.role,
-        Role::Worker | Role::Supervisor | Role::Coordinator
-    ) {
+    if matches!(request.role, Role::Supervisor | Role::Coordinator)
+        || (request.role == Role::Worker && request.worker_recovery.is_none())
+        || (request.role != Role::Worker && request.worker_recovery.is_some())
+    {
         return Err("Coordinator SpawnRequest targets a role without a generic launch path".into());
     }
     let project_record = store
@@ -2727,6 +2737,91 @@ fn apply_coordinator_spawn_request(
                 .any(|node| node.id == request.work_node)
         {
             return Err("Coordinator SpawnRequest does not match an accepted plan node".into());
+        }
+        if request.role == Role::Worker {
+            let project = config
+                .projects
+                .get(&binding.project_id)
+                .ok_or("Worker recovery Project is no longer configured")?;
+            let expected_profile =
+                crate::config::effective_project_roles(&binding.project_id, &config.projects)?
+                    .get(&Role::Worker)
+                    .cloned()
+                    .ok_or("Project has no Worker profile")?;
+            let expected_profile = current
+                .recipe_id
+                .as_ref()
+                .and_then(|recipe_id| config.operation_recipes.get(recipe_id))
+                .and_then(|recipe| recipe.roles.get(&Role::Worker))
+                .cloned()
+                .unwrap_or(expected_profile);
+            if request.profile_id != expected_profile {
+                return Err("Worker recovery profile differs from current Project policy".into());
+            }
+            let validated = accepted.validate_for(project, configuration_digest)?;
+            let node = validated
+                .nodes_in_execution_order
+                .iter()
+                .find(|node| node.id == request.work_node && node.role == Role::Worker)
+                .ok_or("Worker recovery request does not name an accepted Worker node")?;
+            if request.allowed_repositories.as_slice() != [node.repository.clone()] {
+                return Err(
+                    "Worker recovery repository scope differs from the accepted node".into(),
+                );
+            }
+            let recovery = request
+                .worker_recovery
+                .as_ref()
+                .ok_or("Worker recovery request lacks its prior Worker identity")?;
+            let candidate = store.worker_recovery_candidates(
+                owner_generation,
+                &current,
+                &accepted,
+                project,
+                configuration_digest,
+            )?.into_iter().find(|candidate| {
+                candidate.prior_worker_agent_run_id == recovery.prior_worker_agent_run_id
+                    && candidate.ticket_revision == current.revision
+                    && candidate.work_node_id == request.work_node
+                    && candidate.accepted_plan_digest == accepted.plan_digest
+                    && candidate.prior_host_commit_operation_id == recovery.prior_host_commit_operation_id
+            }).ok_or("Worker recovery request does not match a current host-verified retry candidate")?;
+            if services
+                .observe_worker_recovery_head(&candidate)?
+                .as_deref()
+                != Some(candidate.expected_head.as_str())
+            {
+                return Err(
+                    "Worker recovery worktree HEAD is not the host-accepted continuation point"
+                        .into(),
+                );
+            }
+            let authorization = crate::engine::orchestration::WorkerRecoveryAuthorization {
+                schema_version: 1,
+                ticket_run_id: current.ticket_run_id.clone(),
+                ticket_revision: candidate.ticket_revision,
+                work_node_id: candidate.work_node_id,
+                accepted_plan_digest: candidate.accepted_plan_digest,
+                prior_worker_agent_run_id: candidate.prior_worker_agent_run_id,
+                prior_terminal_digest: candidate.prior_terminal_digest,
+                prior_absence_digest: candidate.prior_absence_digest,
+                prior_host_commit_operation_id: candidate.prior_host_commit_operation_id,
+                prior_host_commit_receipt_digest: candidate.prior_host_commit_receipt_digest,
+                expected_head: candidate.expected_head,
+                source_coordinator_evidence_id: result.receipt.evidence_id().to_owned(),
+                prior_worker_result_evidence_id: candidate.prior_worker_result_evidence_id,
+                prior_artifact_refs: candidate.prior_artifact_refs,
+            };
+            store.persist_worker_recovery_wake(
+                owner_generation,
+                result,
+                &authorization,
+                source_revision.0,
+            )?;
+            return Ok(true);
+        }
+        if request.worker_recovery.is_some() {
+            return Err("non-Worker SpawnRequest cannot carry Worker recovery context".into());
         }
     }
     let mut expected_profile =

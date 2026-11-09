@@ -811,7 +811,12 @@ impl RepositoryDelivery {
         &self,
         work: &PreparedRepositoryWork,
     ) -> Result<String, DeliveryError> {
-        let head = self.git_text(&work.worktree.path, ["rev-parse", "--verify", "HEAD"])?;
+        self.observe_local_head_at(&work.worktree.path)
+    }
+
+    /// Observe one host-persisted worktree path using the configured bounded Git executor.
+    pub fn observe_local_head_at(&self, path: &Path) -> Result<String, DeliveryError> {
+        let head = self.git_text(path, ["rev-parse", "--verify", "HEAD"])?;
         let head = head.trim().to_owned();
         validate_git_sha(&head)?;
         Ok(head)
@@ -1484,6 +1489,12 @@ impl RepositoryDeliveryEffects {
         Arc::clone(&self.host_jobs)
     }
 
+    pub fn observe_local_head_at(&self, path: &Path) -> Result<String, String> {
+        self.delivery
+            .observe_local_head_at(path)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn prepare_worktrees_handler(self: &Arc<Self>) -> PrepareWorktreesEffectHandler {
         PrepareWorktreesEffectHandler {
             effects: Arc::clone(self),
@@ -1811,8 +1822,89 @@ impl RepositoryDeliveryEffects {
                 latest_published_head = Some(published.commit.head().to_owned());
             }
         }
-        let trusted_previous_head = latest_published_head
+        let recovery_authorization = reservation.wake_snapshot.worker_recovery_authorization()?;
+        let recovery_head = if let Some(recovery) = &recovery_authorization {
+            if recovery.ticket_run_id != payload.ticket_run_id
+                || recovery.ticket_revision != payload.ticket_revision
+                || recovery.work_node_id != payload.work_node_id
+                || recovery.accepted_plan_digest != assignment.plan_digest
+                || recovery.prior_worker_agent_run_id == payload.agent_run_id
+                || recovery.expected_head != payload.expected_head
+            {
+                return Err("repository.commit Worker recovery authorization differs from this accepted node".into());
+            }
+            match recovery.prior_host_commit_operation_id.as_ref() {
+                Some(prior_operation_id) => {
+                    let prior = store
+                        .succeeded_effect_receipt(prior_operation_id.as_str())?
+                        .ok_or("Worker recovery prior host commit is no longer succeeded")?;
+                    if prior.intent().kind
+                        != crate::engine::reducer::effect_name(&EffectKind::CommitWorkerManifest)
+                    {
+                        return Err(
+                            "Worker recovery prior operation is not a host Worker commit".into(),
+                        );
+                    }
+                    let prior_payload: CommitWorkerManifestEffectPayload =
+                        serde_json::from_str(&prior.intent().request_json).map_err(|error| {
+                            format!("stored prior Worker commit request is invalid: {error}")
+                        })?;
+                    let prior_receipt: CommitWorkerManifestEffectReceipt =
+                        serde_json::from_str(prior.receipt_json()).map_err(|error| {
+                            format!("stored prior Worker commit receipt is invalid: {error}")
+                        })?;
+                    let receipt_digest =
+                        Digest::parse(sha256_hex(prior.receipt_json().as_bytes()))?;
+                    if recovery.prior_host_commit_receipt_digest.as_ref() != Some(&receipt_digest)
+                        || prior.intent().project_id != authority.project_id
+                        || prior.intent().subject_type != "ticket_run"
+                        || prior.intent().subject_id != payload.ticket_run_id.as_str()
+                        || prior.intent().expected_revision != Some(payload.ticket_revision)
+                        || prior_payload.agent_run_id != recovery.prior_worker_agent_run_id
+                        || prior_payload.project_id != authority.project_id
+                        || prior_payload.configuration_digest != authority.config_digest
+                        || prior_payload.ticket_revision != payload.ticket_revision
+                        || prior_payload.ticket_run_id != payload.ticket_run_id
+                        || prior_payload.work_node_id != payload.work_node_id
+                        || prior_payload.repository_id != payload.repository_id
+                        || prior_payload.expected_base_sha != assignment.base_sha
+                        || prior_payload.prepare_operation_id.as_str()
+                            != assignment.prepare_operation_id
+                        || prior_receipt.agent_run_id != recovery.prior_worker_agent_run_id
+                        || prior_receipt.message_id != prior_payload.message_id
+                        || prior_receipt.ticket_run_id != payload.ticket_run_id
+                        || prior_receipt.work_node_id != payload.work_node_id
+                        || prior_receipt.repository_id != payload.repository_id
+                        || prior_receipt.base_sha != assignment.base_sha
+                        || prior_receipt.manifest_artifact != prior_payload.manifest_artifact
+                        || prior_receipt.commit.operation_id != *prior_operation_id
+                        || prior_receipt.commit.expected_head != prior_payload.expected_head
+                        || prior_receipt.commit.observed_head != recovery.expected_head
+                        || prior_receipt.commit.observed_head == prior_receipt.commit.expected_head
+                        || !prior_receipt.commit.signature_verified
+                        || !prior_receipt.commit.hooks_completed
+                        || !prior_receipt.commit.index_synchronized
+                        || prior_receipt.commit.index_sync_conflict
+                    {
+                        return Err("Worker recovery prior host commit receipt does not prove the authorized HEAD".into());
+                    }
+                    Some(prior_receipt.commit.observed_head)
+                }
+                None => {
+                    if recovery.expected_head != assignment.base_sha {
+                        return Err(
+                            "pre-commit Worker recovery does not start at the prepared base".into(),
+                        );
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let trusted_previous_head = recovery_head
             .as_deref()
+            .or(latest_published_head.as_deref())
             .unwrap_or(payload.expected_base_sha.as_str());
         if payload.expected_head != trusted_previous_head {
             return Err(
@@ -3472,6 +3564,75 @@ mod tests {
             output.status.is_some_and(|status| status.success()),
             "fixture git command failed: {args:?}"
         );
+    }
+
+    #[test]
+    fn bounded_local_head_observation_ignores_inherited_git_repository_selectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let target = temp.path().join("target");
+        let unrelated = temp.path().join("unrelated");
+        for (path, file, content) in [
+            (&target, "target.txt", "target"),
+            (&unrelated, "unrelated.txt", "unrelated"),
+        ] {
+            std::fs::create_dir(path).unwrap();
+            git(&executable, path, &["init", "--initial-branch=main"]);
+            git(&executable, path, &["config", "user.name", "Fixture"]);
+            git(
+                &executable,
+                path,
+                &["config", "user.email", "fixture@example.test"],
+            );
+            std::fs::write(path.join(file), content).unwrap();
+            git(&executable, path, &["add", file]);
+            git(
+                &executable,
+                path,
+                &["-c", "commit.gpgsign=false", "commit", "-m", "fixture"],
+            );
+        }
+        let head = |path: &Path| {
+            let output = process::run(ProcessRequest {
+                executable: executable.clone(),
+                args: ["rev-parse", "--verify", "HEAD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(path.to_owned()),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(3),
+                shutdown_grace: Duration::from_secs(2),
+                stdout_limit: 4096,
+                stderr_tail_limit: 4096,
+            })
+            .unwrap();
+            assert!(output.status.is_some_and(|status| status.success()));
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let expected = head(&target);
+        assert_ne!(expected, head(&unrelated));
+
+        let delivery = RepositoryDelivery::new(
+            &temp.path().join("state"),
+            GitOptions {
+                executable,
+                environment: BTreeMap::from([(
+                    OsString::from("GIT_DIR"),
+                    unrelated.join(".git").into_os_string(),
+                )]),
+                timeout: Duration::from_secs(3),
+            },
+            BTreeMap::new(),
+            HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(delivery.observe_local_head_at(&target).unwrap(), expected);
     }
 
     fn seed_local_remote(root: &Path, executable: &Path) -> (PathBuf, String) {

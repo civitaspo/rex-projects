@@ -590,10 +590,122 @@ role_payload!(SpawnRequestPayload {
     profile_id: ProfileId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_digest: Option<Digest>,
+    /// Requests host-authorized recovery of a terminal Worker on this accepted node.
+    /// This value is a request only; the controller derives the durable wake authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_recovery: Option<WorkerRecoveryRequest>,
     allowed_repositories: Vec<RepositoryId>,
     artifact_inputs: Vec<RoleArtifactReference>,
     parent_run_id: Option<AgentRunId>,
 });
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRecoveryRequest {
+    pub prior_worker_agent_run_id: AgentRunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_host_commit_operation_id: Option<crate::domain::ids::OperationId>,
+}
+
+/// Durable authorization minted by the host after validating a Worker recovery request.
+/// This host-issued value binds the retry to the current TicketRun revision; `expected_head`
+/// is derived only from the prepared base or the exact verified host commit receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRecoveryAuthorization {
+    pub schema_version: u32,
+    pub ticket_run_id: TicketRunId,
+    pub ticket_revision: u64,
+    pub work_node_id: WorkNodeId,
+    pub accepted_plan_digest: Digest,
+    pub prior_worker_agent_run_id: AgentRunId,
+    pub prior_terminal_digest: Digest,
+    pub prior_absence_digest: Digest,
+    pub prior_host_commit_operation_id: Option<crate::domain::ids::OperationId>,
+    pub prior_host_commit_receipt_digest: Option<Digest>,
+    pub expected_head: String,
+    pub source_coordinator_evidence_id: String,
+    pub prior_worker_result_evidence_id: String,
+    pub prior_artifact_refs: Vec<RoleArtifactReference>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRecoveryCandidate {
+    pub work_node_id: WorkNodeId,
+    pub ticket_revision: u64,
+    #[serde(skip)]
+    pub worktree_path: std::path::PathBuf,
+    pub accepted_plan_digest: Digest,
+    pub prior_worker_agent_run_id: AgentRunId,
+    pub prior_host_commit_operation_id: Option<crate::domain::ids::OperationId>,
+    pub expected_head: String,
+    pub prior_terminal_digest: Digest,
+    pub prior_absence_digest: Digest,
+    pub prior_host_commit_receipt_digest: Option<Digest>,
+    pub prior_worker_result_evidence_id: String,
+    pub prior_artifact_refs: Vec<RoleArtifactReference>,
+}
+
+impl WorkerRecoveryAuthorization {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.ticket_revision == 0
+            || self.expected_head.len() != 40 && self.expected_head.len() != 64
+            || !self
+                .expected_head
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.source_coordinator_evidence_id.trim().is_empty()
+            || self.prior_worker_result_evidence_id.trim().is_empty()
+            || self.prior_worker_agent_run_id.as_str().trim().is_empty()
+            || self.work_node_id.as_str().trim().is_empty()
+            || self.prior_host_commit_operation_id.is_some()
+                != self.prior_host_commit_receipt_digest.is_some()
+        {
+            return Err("Worker recovery authorization is malformed".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod worker_recovery_authorization_tests {
+    use super::*;
+
+    fn authorization() -> WorkerRecoveryAuthorization {
+        WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: TicketRunId::parse("ticket-run-1").unwrap(),
+            ticket_revision: 3,
+            work_node_id: WorkNodeId::parse("worker-1").unwrap(),
+            accepted_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            prior_worker_agent_run_id: AgentRunId::parse("worker-run-1").unwrap(),
+            prior_terminal_digest: Digest::parse("b".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("c".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: None,
+            prior_host_commit_receipt_digest: None,
+            expected_head: "d".repeat(40),
+            source_coordinator_evidence_id: "coordinator-evidence".into(),
+            prior_worker_result_evidence_id: "worker-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_recovery_authorization_requires_a_lowercase_git_object_id_and_paired_receipt() {
+        authorization().validate().unwrap();
+
+        let mut uppercase_head = authorization();
+        uppercase_head.expected_head = "D".repeat(40);
+        assert!(uppercase_head.validate().is_err());
+
+        let mut unpaired_receipt = authorization();
+        unpaired_receipt.prior_host_commit_operation_id =
+            Some(crate::domain::ids::OperationId::parse("operation-1").unwrap());
+        assert!(unpaired_receipt.validate().is_err());
+    }
+}
 role_payload!(InvestigationRequestPayload {
     question: String,
     allowed_repositories: Vec<RepositoryId>,
