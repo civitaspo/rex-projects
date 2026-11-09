@@ -38,3 +38,41 @@ The wrapper reports revision support and whether writes are conditional. Revisio
 `operation.find` must validate the lookup scope, requested method, and subject before returning `found`. Each receipt must bind to the requested operation ID or stable external key and the affected ticket ID. Return `absent` only when the tracker can prove absence within the declared scope. If visibility is delayed or evidence is incomplete, return `unknown` with a reason. rex-projects validates every receipt against the requested operation and subject.
 
 An existing vendor CLI does not automatically implement this contract. Put a wrapper at the configured command boundary to translate this protocol into its flags, request body, or SDK, then normalize its structured output. Do not make the core parse tracker-specific tables or vendor output formats.
+
+## Troubleshooting
+
+Use an explicit configuration that points to your own normalized wrapper. From a
+checkout, inspect the public envelope schema and the ticket-specific contract,
+then exercise the adapter through supported read commands (replace the config,
+project, and ticket ID with your own):
+
+```sh
+rex-projects schema response | jq .
+jq . schemas/ticket-adapter/v1.json
+rex-projects ticket list --config /path/to/rex.yml --project example --limit 10 --json
+rex-projects ticket show --config /path/to/rex.yml --project example --id TICKET-1 --json
+```
+
+- **Process failure:** The wrapper's stderr is for diagnostics, not protocol
+  output. A nonzero exit, timeout, or failed process cleanup is a transport
+  failure, even if stdout contains JSON. Check the wrapper's executable,
+  allowlisted environment, and its own tracker authentication and logs. Keep
+  tracker commands, credentials, and authentication inside the wrapper.
+- **Invalid response:** On a successful exit, stdout must contain one JSON
+  response envelope with `schema_version: 1`, the exact incoming `request_id`,
+  and exactly one non-null `result` or `error`. Send logs to stderr instead of
+  stdout. Copy the ID from each request rather than generating a new one, and
+  check the result against the ticket schema. A namespace mismatch is also a
+  protocol failure: return the same stable `ticket_namespace` from
+  `adapter.describe`, operation results, and nested tickets. The first
+  successful description pins it for that adapter instance.
+- **Normalized error:** For a tracker error that the wrapper can classify,
+  exit successfully and return an `error` envelope with the request ID and a
+  supported code, message, and `retryable` flag. This is distinct from a
+  process failure or malformed response. Investigate the reported code and
+  wrapper diagnostics; for example, `unauthorized` points to the wrapper's
+  tracker authentication.
+- **Unknown native status:** Add an explicit mapping in the wrapper to the
+  correct normalized status after checking the tracker's semantics, and keep
+  its `adapter.describe` status labels consistent. If no mapping is known,
+  return a normalized error instead of inventing a default status.
