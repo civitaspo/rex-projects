@@ -57,6 +57,7 @@ pub enum Input {
     ImplementationPublished(ValidatedImplementationPublication),
     CorrectionsRemain,
     ReviewConverged,
+    ReviewEscalationRequired,
     RequireHumanReview,
     HumanReviewApproved,
     HumanReviewRevisionRequested,
@@ -134,6 +135,7 @@ pub fn reduce(
         return Err("terminal ticket run cannot transition".into());
     }
 
+    let review_escalation = matches!(&input, Input::ReviewEscalationRequired);
     let mut next = current.clone();
     let mut effects = Vec::new();
     let mut wakes = Vec::new();
@@ -186,6 +188,14 @@ pub fn reduce(
             next.phase = Phase::Assessing;
             next.activity = Activity::Running;
             wakes.push(WakeTarget::TicketRole(Role::MergeDecision));
+        }
+        Input::ReviewEscalationRequired if current.phase == Phase::Reviewing => {
+            // Keep the TicketRun in Reviewing and surface it as In Review. This is an
+            // escalation, not evidence that the review converged or merge was authorized.
+            next.activity = Activity::Blocked;
+            next.external_status = TicketStatus::InReview;
+            wakes.push(WakeTarget::Supervisor);
+            effects.push(EffectKind::PublishTicketStatus);
         }
         Input::RequireHumanReview if current.phase == Phase::Assessing => {
             next.phase = Phase::WaitingHuman;
@@ -277,6 +287,7 @@ pub fn reduce(
         next.external_status = match next.phase {
             Phase::Queued | Phase::Done => next.external_status,
             Phase::Canceled => TicketStatus::Canceled,
+            Phase::Reviewing if review_escalation => TicketStatus::InReview,
             _ => TicketStatus::InProgress,
         };
     }
@@ -440,6 +451,23 @@ mod tests {
         .unwrap();
         assert_eq!(publication.ticket_run.phase, Phase::Publishing);
         assert!(publication.wakes.is_empty());
+    }
+
+    #[test]
+    fn reviewer_escalation_marks_in_review_without_claiming_convergence() {
+        let mut current = run();
+        current.phase = Phase::Reviewing;
+        current.activity = Activity::Running;
+        current.external_status = TicketStatus::InProgress;
+
+        let decision = reduce(&current, current.revision, Input::ReviewEscalationRequired).unwrap();
+
+        assert_eq!(decision.ticket_run.phase, Phase::Reviewing);
+        assert_eq!(decision.ticket_run.activity, Activity::Blocked);
+        assert_eq!(decision.ticket_run.external_status, TicketStatus::InReview);
+        assert_eq!(decision.ticket_run.required_review_revision, None);
+        assert_eq!(decision.wakes, [WakeTarget::Supervisor]);
+        assert_eq!(decision.effects, [EffectKind::PublishTicketStatus]);
     }
 
     #[test]

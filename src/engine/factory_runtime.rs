@@ -1482,7 +1482,7 @@ fn apply_reviewer_result(
     services: &mut impl FactoryRuntimeServices,
     result: &crate::store::agent_results::IngestedAgentResult,
 ) -> Result<bool, String> {
-    use crate::engine::orchestration::{ReviewProgress, RoleResultPayload, review_disposition};
+    use crate::engine::orchestration::RoleResultPayload;
 
     let binding = &result.validated.binding;
     let ticket_run_id = binding
@@ -1509,9 +1509,11 @@ fn apply_reviewer_result(
         .ok_or("Reviewer result references no active TicketRun")?;
     if run.project_id != binding.project_id
         || run.revision != source_revision.0
-        || run.phase != Phase::Reviewing
+        || !reviewer_result_allowed(run.phase, run.activity)
     {
-        return Err("Reviewer ReviewReady result is stale or outside Reviewing".into());
+        return Err(
+            "Reviewer ReviewReady result is stale, blocked, or outside active Reviewing".into(),
+        );
     }
     if crate::store::agent_results::acknowledge_obsolete_configuration_result(
         store,
@@ -1598,17 +1600,14 @@ fn apply_reviewer_result(
     let unresolved = !assessment.findings.is_empty() || !assessment.unknowns.is_empty();
     let completed_rounds =
         store.applied_reviewer_correction_round_count(&run.project_id, ticket_run_id)?;
-    let disposition = review_disposition(
-        ReviewProgress {
+    let (transition, transition_name) = review_assessment_transition(
+        &assessment.disposition,
+        unresolved,
+        crate::engine::orchestration::ReviewProgress {
             completed_rounds,
             maximum_rounds: project.max_review_rounds,
         },
-        unresolved,
     )?;
-    if assessment.disposition.trim().is_empty() {
-        return Err("Reviewer assessment has an empty disposition".into());
-    }
-    let (transition, transition_name) = review_transition(disposition);
     let accepted_revision = run
         .revision
         .checked_add(1)
@@ -1661,8 +1660,39 @@ fn review_transition(
     match disposition {
         D::StartCorrectionWorker => (Input::CorrectionsRemain, "corrections_remain"),
         D::StartMergeDecision => (Input::ReviewConverged, "review_converged"),
-        D::HumanRequiredAtRoundLimit => (Input::ReviewConverged, "review_round_limit_reached"),
+        D::HumanRequiredAtRoundLimit => (
+            Input::ReviewEscalationRequired,
+            "review_round_limit_reached",
+        ),
     }
+}
+
+fn review_assessment_transition(
+    raw_disposition: &str,
+    has_unresolved_items: bool,
+    progress: crate::engine::orchestration::ReviewProgress,
+) -> Result<(Input, &'static str), String> {
+    use crate::engine::orchestration::review_disposition;
+
+    let disposition = raw_disposition.trim().to_ascii_lowercase();
+    if disposition.is_empty() {
+        return Err("Reviewer assessment has an empty disposition".into());
+    }
+    match disposition.as_str() {
+        "approved" if !has_unresolved_items => Ok((Input::ReviewConverged, "review_converged")),
+        "approved" | "changes_requested" if has_unresolved_items => {
+            Ok(review_transition(review_disposition(progress, true)?))
+        }
+        "changes_requested" => Ok((Input::ReviewEscalationRequired, "review_requires_human")),
+        _ => Ok((
+            Input::ReviewEscalationRequired,
+            "review_disposition_unrecognized",
+        )),
+    }
+}
+
+fn reviewer_result_allowed(phase: Phase, activity: crate::engine::reducer::Activity) -> bool {
+    phase == Phase::Reviewing && activity == crate::engine::reducer::Activity::Running
 }
 
 fn apply_operator_result(
@@ -5280,8 +5310,52 @@ pub(crate) mod tests {
         assert_eq!(at_limit, ReviewDisposition::HumanRequiredAtRoundLimit);
         assert_eq!(
             review_transition(at_limit),
-            (Input::ReviewConverged, "review_round_limit_reached")
+            (
+                Input::ReviewEscalationRequired,
+                "review_round_limit_reached"
+            )
         );
+    }
+
+    #[test]
+    fn reviewer_disposition_cannot_override_unknowns_or_claim_convergence() {
+        use super::{review_assessment_transition, reviewer_result_allowed};
+        use crate::engine::orchestration::ReviewProgress;
+        use crate::engine::reducer::Activity;
+        use crate::engine::reducer::Input;
+
+        let progress = ReviewProgress {
+            completed_rounds: 0,
+            maximum_rounds: 3,
+        };
+        assert_eq!(
+            review_assessment_transition("approved", false, progress).unwrap(),
+            (Input::ReviewConverged, "review_converged")
+        );
+        assert_eq!(
+            review_assessment_transition("approved", true, progress).unwrap(),
+            (Input::CorrectionsRemain, "corrections_remain")
+        );
+        assert_eq!(
+            review_assessment_transition("changes_requested", false, progress).unwrap(),
+            (Input::ReviewEscalationRequired, "review_requires_human")
+        );
+        assert_eq!(
+            review_assessment_transition("rejected", false, progress).unwrap(),
+            (
+                Input::ReviewEscalationRequired,
+                "review_disposition_unrecognized"
+            )
+        );
+        assert!(reviewer_result_allowed(Phase::Reviewing, Activity::Running));
+        assert!(!reviewer_result_allowed(
+            Phase::Reviewing,
+            Activity::Blocked
+        ));
+        assert!(!reviewer_result_allowed(
+            Phase::Assessing,
+            Activity::Running
+        ));
     }
 
     #[test]

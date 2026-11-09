@@ -956,12 +956,613 @@ fn role_name(role: Role) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_wrapper_process, observed_process_start_identity, wait_for_start_request};
-    use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId};
+    use super::{
+        DurableFamilyObserver, observe_wrapper_process, observed_process_start_identity,
+        wait_for_start_request,
+    };
+    use crate::config::{ClaudeCodeOptions, Profile, ProfileOptions};
+    use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RexBlockId};
+    use crate::domain::types::{AgentAdapter, CommitMode, Role};
     use crate::launch::AgentStartRequest;
-    use crate::run_step_spool::RunStepSpool;
+    use crate::run_step::{
+        ProviderCapabilityEvidence, ProviderQualificationStatus, RunDescriptor, TurnRequest,
+    };
+    use crate::run_step_spool::{
+        BlockLossCleanupSnapshot, RunFamilyBinding, RunFamilyCoverage, RunStepSpool,
+    };
+    use serde_json::json;
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    const BLOCK_LOSS_CHILD_ENV: &str = "REX_TEST_BLOCK_LOSS_RUN_STEP_CHILD";
+    const BLOCK_LOSS_ROOT_ENV: &str = "REX_TEST_BLOCK_LOSS_RUN_STEP_ROOT";
+    const BLOCK_LOSS_GRACE_ENV: &str = "REX_TEST_BLOCK_LOSS_RUN_STEP_GRACE";
+    const BLOCK_LOSS_UNPUBLISHED_CHILD_ENV: &str = "REX_TEST_BLOCK_LOSS_UNPUBLISHED_CHILD";
+    const BLOCK_LOSS_UNPUBLISHED_MARKER_ENV: &str = "REX_TEST_BLOCK_LOSS_UNPUBLISHED_MARKER";
+
+    fn fixture_digest(value: char) -> Digest {
+        Digest::parse(value.to_string().repeat(64)).unwrap()
+    }
+
+    fn block_loss_turn_request(
+        root: &Path,
+        provider_exit_marker: &Path,
+        shutdown_grace: Duration,
+    ) -> TurnRequest {
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        fs::create_dir_all(root.join("control")).unwrap();
+        let executable = fs::canonicalize("/usr/bin/perl").unwrap();
+        let script = "$SIG{TERM} = 'IGNORE'; $SIG{INT} = 'IGNORE'; while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }";
+        let profile = Profile {
+            adapter: AgentAdapter::ClaudeCode,
+            command: vec![
+                executable.display().to_string(),
+                "-e".into(),
+                script.into(),
+                provider_exit_marker.display().to_string(),
+            ],
+            description: None,
+            model: Some("fixture-model".into()),
+            effort: None,
+            turn_timeout_seconds: 60,
+            instruction_files: Vec::new(),
+            skill_paths: Vec::new(),
+            commit_mode: CommitMode::Host,
+            learned_guidance: None,
+            options: Some(ProfileOptions::ClaudeCode(ClaudeCodeOptions::default())),
+        };
+        let profile_digest = fixture_digest('a');
+        let result_schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
+        let projection = crate::providers::project_result_schema(&result_schema).unwrap();
+        let provider_capability = ProviderCapabilityEvidence {
+            schema_version: 1,
+            adapter: AgentAdapter::ClaudeCode,
+            profile_digest: profile_digest.clone(),
+            version: "block-loss-run-step-test".into(),
+            executable_path: executable.clone(),
+            executable_digest: super::digest_file(&executable).unwrap(),
+            permission_mode: "auto; permission prompts denied unattended".into(),
+            invocation_options_digest: crate::run_step::invocation_options_digest(&profile)
+                .unwrap(),
+            commit_mode: profile.commit_mode,
+            schema_projection: projection.identity,
+            receipt_digest: fixture_digest('b'),
+            status: ProviderQualificationStatus::Verified,
+        };
+        TurnRequest {
+            descriptor: RunDescriptor {
+                schema_version: 1,
+                project_id: ProjectId::parse("project-block-loss-run-step").unwrap(),
+                run_id: AgentRunId::parse("run-block-loss-run-step").unwrap(),
+                operation_id: OperationId::parse("operation-block-loss-run-step").unwrap(),
+                role: Role::Worker,
+                ticket_run_id: None,
+                expected_subject_revision: 0,
+                attempt: 1,
+                run_epoch: 1,
+                controller_generation: 1,
+                workspace: root.join("workspace"),
+                control_dir: root.join("control"),
+                worker_assignment: None,
+                rex_session_id: "session-block-loss-run-step".into(),
+                rex_block_id: RexBlockId::parse("block-block-loss-run-step").unwrap(),
+                profile_digest,
+                instruction_digest: fixture_digest('c'),
+                plan_digest: None,
+                environment_snapshot_id: fixture_digest('d'),
+                wake_snapshot_digest: fixture_digest('e'),
+                provider_capability,
+                result_schema,
+            },
+            profile,
+            role_contract: "fixture Worker".into(),
+            prompt: "wait for the test harness".into(),
+            environment: BTreeMap::from([(
+                OsString::from("PATH"),
+                OsString::from("/bin:/usr/bin"),
+            )]),
+            continuation: None,
+            shutdown_grace,
+        }
+    }
+
+    fn run_block_loss_child(root: PathBuf) {
+        let request = block_loss_turn_request(
+            &root,
+            &root.join("provider-exit"),
+            Duration::from_secs(
+                std::env::var(BLOCK_LOSS_GRACE_ENV)
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1),
+            ),
+        );
+        let wrapper_pid = std::process::id();
+        let wrapper_start_identity = observed_process_start_identity(wrapper_pid).unwrap();
+        let spool = RunStepSpool::open(&request.descriptor.control_dir).unwrap();
+        let start = spool
+            .publish_start_once(AgentStartRequest {
+                schema_version: 1,
+                operation_id: request.descriptor.operation_id.clone(),
+                agent_run_id: request.descriptor.run_id.clone(),
+                project_id: request.descriptor.project_id.clone(),
+                controller_generation: request.descriptor.controller_generation,
+                descriptor_digest: fixture_digest('f'),
+                runtime_binary_digest: fixture_digest('1'),
+                environment_snapshot_id: request.descriptor.environment_snapshot_id.clone(),
+                qualification_receipt_digest: fixture_digest('b'),
+                wrapper_pid,
+                wrapper_start_identity: wrapper_start_identity.clone(),
+                rex_session_id: request.descriptor.rex_session_id.clone(),
+                rex_block_id: request.descriptor.rex_block_id.as_str().to_owned(),
+            })
+            .unwrap();
+        spool
+            .publish_run_family_binding_once(&RunFamilyBinding {
+                schema_version: 1,
+                agent_run_id: request.descriptor.run_id.clone(),
+                reservation_epoch: 1,
+                authority_digest: fixture_digest('2'),
+                descriptor_digest: fixture_digest('f'),
+                wrapper_pid,
+                wrapper_start_identity,
+            })
+            .unwrap();
+        let mut observer =
+            DurableFamilyObserver::new(&spool, spool.read_run_family_binding().unwrap());
+        let result = crate::run_step::run_turn(&request, &mut observer).unwrap();
+        spool.publish_turn_result_once(&start, result).unwrap();
+    }
+
+    fn wait_for_observing_family(spool: &RunStepSpool) -> crate::run_step_spool::RunFamilyRecord {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(family) = spool.read_run_family_record().unwrap()
+                && family.coverage == RunFamilyCoverage::Observing
+            {
+                return family;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "family did not become Observing"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn block_loss_snapshot(
+        family: &crate::run_step_spool::RunFamilyRecord,
+    ) -> BlockLossCleanupSnapshot {
+        let mut process_tree = family.process_tree.clone();
+        process_tree.push(family.wrapper_process.clone());
+        process_tree.sort_by(|left, right| {
+            (left.pid, &left.start_identity).cmp(&(right.pid, &right.start_identity))
+        });
+        let bytes = serde_json::to_vec(&process_tree).unwrap();
+        BlockLossCleanupSnapshot {
+            schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
+            agent_run_id: family.binding.agent_run_id.clone(),
+            reservation_epoch: family.binding.reservation_epoch,
+            authority_digest: family.binding.authority_digest.clone(),
+            launch_tree_digest: family.process_tree_digest.clone(),
+            observed_at_unix: super::unix_now_seconds().unwrap(),
+            cleanup_covered: false,
+            process_tree,
+            process_tree_digest: Digest::parse(format!("{:x}", Sha256::digest(&bytes))).unwrap(),
+        }
+    }
+
+    fn signal_groups(
+        process_tree: &[crate::process::ProcessIdentity],
+        signal: crate::process::ProcessSignal,
+    ) -> bool {
+        let current = crate::process::inspect_process_table().unwrap();
+        let mut signalled = false;
+        for group in process_tree
+            .iter()
+            .map(|process| process.process_group_id)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            signalled |= crate::process::signal_process_group_if_observed(
+                group,
+                process_tree,
+                &current,
+                signal,
+            )
+            .unwrap_or(false);
+        }
+        signalled
+    }
+
+    fn process_is_live(identity: &crate::process::ProcessIdentity) -> bool {
+        crate::process::inspect_process_table()
+            .unwrap()
+            .iter()
+            .any(|current| {
+                current.pid == identity.pid && current.start_identity == identity.start_identity
+            })
+    }
+
+    fn wait_for_family_absence(family: &crate::run_step_spool::RunFamilyRecord) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !process_is_live(&family.wrapper_process)
+                && family
+                    .process_tree
+                    .iter()
+                    .all(|identity| !process_is_live(identity))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observed family did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    struct BlockLossChildGuard {
+        child: std::process::Child,
+        child_identity: Option<crate::process::ProcessIdentity>,
+        spool: RunStepSpool,
+        family: Option<crate::run_step_spool::RunFamilyRecord>,
+        snapshot: Option<BlockLossCleanupSnapshot>,
+        finished: bool,
+    }
+
+    impl BlockLossChildGuard {
+        fn new(child: std::process::Child, spool: RunStepSpool) -> Self {
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            let child_identity = loop {
+                let identity = crate::process::inspect_process_table()
+                    .ok()
+                    .and_then(|table| {
+                        table.into_iter().find(|process| {
+                            process.pid == child.id()
+                                && process.quality
+                                    == crate::process::ProcessIdentityQuality::KernelBirthToken
+                        })
+                    });
+                if identity.is_some() || std::time::Instant::now() >= deadline {
+                    break identity;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            Self {
+                child,
+                child_identity,
+                spool,
+                family: None,
+                snapshot: None,
+                finished: false,
+            }
+        }
+
+        fn observe(&mut self, family: crate::run_step_spool::RunFamilyRecord) {
+            self.snapshot = Some(block_loss_snapshot(&family));
+            self.family = Some(family);
+        }
+
+        fn wait_bounded(&mut self, timeout: Duration) -> std::io::Result<std::process::ExitStatus> {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "run-step child exceeded bounded receipt-writer wait",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn cleanup(&mut self) {
+            if self.family.is_none() {
+                self.family = self.spool.read_run_family_record().ok().flatten();
+            }
+            if self.snapshot.is_none()
+                && let Some(family) = &self.family
+            {
+                self.snapshot = Some(block_loss_snapshot(family));
+            }
+            if self.snapshot.is_none()
+                && let (Some(root), Ok(current)) = (
+                    self.child_identity.as_ref(),
+                    crate::process::inspect_process_table(),
+                )
+            {
+                let root_is_same_birth = current.iter().any(|process| {
+                    process.pid == root.pid
+                        && process.start_identity == root.start_identity
+                        && process.quality
+                            == crate::process::ProcessIdentityQuality::KernelBirthToken
+                });
+                let observed = if root_is_same_birth {
+                    crate::process::capture_process_tree(root.pid, &current)
+                } else {
+                    Vec::new()
+                };
+                let observed_root_is_same_birth = observed.iter().any(|process| {
+                    process.pid == root.pid && process.start_identity == root.start_identity
+                });
+                if observed_root_is_same_birth {
+                    for group in observed
+                        .iter()
+                        .map(|process| process.process_group_id)
+                        .collect::<std::collections::BTreeSet<_>>()
+                    {
+                        let _ = crate::process::signal_process_group_if_observed(
+                            group,
+                            &observed,
+                            &current,
+                            crate::process::ProcessSignal::Kill,
+                        );
+                    }
+                }
+            }
+            if let Some(snapshot) = &self.snapshot
+                && let Ok(current) = crate::process::inspect_process_table()
+            {
+                for group in snapshot
+                    .process_tree
+                    .iter()
+                    .map(|p| p.process_group_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    let _ = crate::process::signal_process_group_if_observed(
+                        group,
+                        &snapshot.process_tree,
+                        &current,
+                        crate::process::ProcessSignal::Kill,
+                    );
+                }
+            }
+            let _ = self.child.kill();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if std::time::Instant::now() >= deadline => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+    }
+
+    impl Drop for BlockLossChildGuard {
+        fn drop(&mut self) {
+            if !self.finished {
+                self.cleanup();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_loss_run_step_child() {
+        if std::env::var_os(BLOCK_LOSS_CHILD_ENV).is_none() {
+            return;
+        }
+        run_block_loss_child(PathBuf::from(
+            std::env::var_os(BLOCK_LOSS_ROOT_ENV).unwrap(),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_loss_unpublished_tree_child() {
+        if std::env::var_os(BLOCK_LOSS_UNPUBLISHED_CHILD_ENV).is_none() {
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+
+        let marker = PathBuf::from(std::env::var_os(BLOCK_LOSS_UNPUBLISHED_MARKER_ENV).unwrap());
+        let mut provider = Command::new("/bin/sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        fs::write(marker, provider.id().to_string()).unwrap();
+        loop {
+            if let Some(status) = provider.try_wait().unwrap() {
+                panic!("provider exited before the parent cleanup: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guard_kills_birth_checked_descendants_before_root_without_family_record() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempdir().unwrap();
+        let marker = root.path().join("provider.pid");
+        fs::create_dir_all(root.path().join("control")).unwrap();
+        let spool = RunStepSpool::open(&root.path().join("control")).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run_step_cli::tests::block_loss_unpublished_tree_child",
+                "--nocapture",
+            ])
+            .env(BLOCK_LOSS_UNPUBLISHED_CHILD_ENV, "1")
+            .env(BLOCK_LOSS_UNPUBLISHED_MARKER_ENV, &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let guard = BlockLossChildGuard::new(child, spool);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider marker was not published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let provider_pid: u32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
+        let current = crate::process::inspect_process_table().unwrap();
+        let tree = crate::process::capture_process_tree(guard.child.id(), &current);
+        let wrapper = tree
+            .iter()
+            .find(|process| process.pid == guard.child.id())
+            .unwrap();
+        let provider = tree
+            .iter()
+            .find(|process| process.pid == provider_pid)
+            .unwrap();
+        assert_eq!(
+            wrapper.quality,
+            crate::process::ProcessIdentityQuality::KernelBirthToken
+        );
+        assert_eq!(
+            provider.quality,
+            crate::process::ProcessIdentityQuality::KernelBirthToken
+        );
+        assert_ne!(wrapper.process_group_id, provider.process_group_id);
+
+        drop(guard);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while tree.iter().any(process_is_live) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unpublished child family survived guard cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_kills_provider_at_three_seconds_but_preserves_run_step_receipt_writer() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempdir().unwrap();
+        let control_dir = root.path().join("control");
+        fs::create_dir_all(&control_dir).unwrap();
+        let spool = RunStepSpool::open(&control_dir).unwrap();
+        let writer = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run_step_cli::tests::block_loss_run_step_child",
+                "--nocapture",
+            ])
+            .env(BLOCK_LOSS_CHILD_ENV, "1")
+            .env(BLOCK_LOSS_ROOT_ENV, root.path())
+            .env(BLOCK_LOSS_GRACE_ENV, "30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut writer = BlockLossChildGuard::new(writer, spool.clone());
+
+        let family = wait_for_observing_family(&spool);
+        writer.observe(family.clone());
+        let start = spool.read_start_request().unwrap();
+        let snapshot = block_loss_snapshot(&family);
+        assert_eq!(
+            snapshot
+                .process_tree
+                .iter()
+                .map(|process| process.process_group_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2,
+            "fixture must keep the wrapper writer and provider in separate groups"
+        );
+        let first_term_sent = signal_groups(
+            &snapshot.process_tree,
+            crate::process::ProcessSignal::Terminate,
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        let wrapper_alive_at_three = process_is_live(&family.wrapper_process);
+        let provider_alive_at_three = process_is_live(&family.provider_root);
+        let wrapper = crate::launch::ObservedWrapperIdentity {
+            pid: family.wrapper_process.pid,
+            start_identity: family.wrapper_process.start_identity.clone(),
+            rex_session_id: start.request.rex_session_id.clone(),
+            rex_block_id: start.request.rex_block_id.clone(),
+            runtime_binary_digest: start.request.runtime_binary_digest.clone(),
+        };
+        let second_signal_sent = crate::agent_recovery::signal_missing_block_process_groups(
+            &snapshot,
+            &wrapper,
+            &crate::process::inspect_process_table().unwrap(),
+            3,
+            Some(42),
+        );
+        let provider_absent_after_kill = wait_until_provider_absent(&snapshot, &family);
+        if !provider_absent_after_kill {
+            let current = crate::process::inspect_process_table().unwrap();
+            for group in family
+                .process_tree
+                .iter()
+                .map(|process| process.process_group_id)
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                let _ = crate::process::signal_process_group_if_observed(
+                    group,
+                    &snapshot.process_tree,
+                    &current,
+                    crate::process::ProcessSignal::Kill,
+                );
+            }
+        }
+        let writer_status = writer.wait_bounded(Duration::from_secs(10)).unwrap();
+        wait_for_family_absence(&family);
+        writer.finished = true;
+
+        let family_after = spool.read_run_family_record().unwrap().unwrap();
+        let result_after = spool.read_turn_result(&start).unwrap();
+        assert!(first_term_sent && second_signal_sent);
+        assert!(
+            wrapper_alive_at_three && provider_alive_at_three,
+            "wrapper_alive_at_three={wrapper_alive_at_three}, provider_alive_at_three={provider_alive_at_three}"
+        );
+        assert!(provider_absent_after_kill);
+        assert!(writer_status.success());
+        assert_eq!(family_after.coverage, RunFamilyCoverage::Complete);
+        assert!(matches!(
+            result_after.receipt.outcome,
+            crate::run_step::TurnOutcome::Cancelled
+        ));
+        assert!(matches!(
+            result_after.receipt.cleanup,
+            crate::run_step::CleanupState::Confirmed
+        ));
+    }
+
+    fn wait_until_provider_absent(
+        snapshot: &BlockLossCleanupSnapshot,
+        family: &crate::run_step_spool::RunFamilyRecord,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let provider_absent = snapshot.process_tree.iter().all(|identity| {
+                identity.pid == family.wrapper_process.pid || !process_is_live(identity)
+            });
+            if provider_absent {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     fn start_request() -> AgentStartRequest {
         AgentStartRequest {

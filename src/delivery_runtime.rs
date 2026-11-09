@@ -1925,9 +1925,9 @@ impl RepositoryDeliveryEffects {
                     Some(prior_receipt.commit.observed_head)
                 }
                 None => {
-                    if recovery.expected_head != assignment.base_sha {
+                    if recovery.expected_head != assignment.expected_head() {
                         return Err(
-                            "pre-commit Worker recovery does not start at the prepared base".into(),
+                            "pre-commit Worker recovery does not start at its authorized expected HEAD".into(),
                         );
                     }
                     None

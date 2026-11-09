@@ -2599,6 +2599,7 @@ mod tests {
                 "worktree_path": turn.descriptor.workspace,
                 "branch": "rex-projects/documentation-node",
                 "base_sha": "1".repeat(40),
+                "expected_head": "2".repeat(40),
                 "prepare_operation_id": "prepare-a",
                 "prepare_receipt_digest": "c".repeat(64),
                 "source_evidence_id": "evidence-a",
@@ -2611,6 +2612,9 @@ mod tests {
             }))
             .unwrap(),
         );
+        let worker_assignment = turn.descriptor.worker_assignment.as_ref().unwrap();
+        assert_eq!(worker_assignment.base_sha, "1".repeat(40));
+        assert_eq!(worker_assignment.expected_head(), "2".repeat(40));
         for key in [
             "REX_PROJECTS_COMMIT_MODE",
             "REX_PROJECTS_WORKTREE_ID",
@@ -2705,7 +2709,68 @@ mod tests {
         );
         assert_eq!(pending[0].envelope.params["path"], "manifest.json");
 
-        for index in 0..31 {
+        // Exercise the actual public CLI parser and request handoff for a Worker
+        // whose authorized expected HEAD is later than its immutable prepared base.
+        let manifest_reference = turn.descriptor.workspace.join("manifest-reference.json");
+        let manifest_bytes = fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap();
+        let manifest_digest = crate::domain::ids::Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(&manifest_bytes)
+        ))
+        .unwrap();
+        let artifact_reference = crate::engine::orchestration::RoleArtifactReference {
+            artifact_id: crate::domain::ids::ArtifactId::parse("f".repeat(64)).unwrap(),
+            kind: crate::engine::orchestration::RoleArtifactKind::Change,
+            schema_version: 1,
+            path: "artifacts/manifest.json".into(),
+            digest: manifest_digest,
+            bytes: manifest_bytes.len() as u64,
+        };
+        fs::write(
+            &manifest_reference,
+            serde_json::to_vec(&artifact_reference).unwrap(),
+        )
+        .unwrap();
+        let commit_message = turn.descriptor.workspace.join("commit-message.txt");
+        fs::write(&commit_message, "docs: update verified documentation\n").unwrap();
+        let expected_rework_head = worker_assignment.expected_head().to_owned();
+        let commit = std::process::Command::new(&binary)
+            .args(["agent", "repository", "commit", "--expected-head"])
+            .arg(&expected_rework_head)
+            .args(["--manifest-reference-file"])
+            .arg(&manifest_reference)
+            .args(["--message-file"])
+            .arg(&commit_message)
+            .args([
+                "--message-id",
+                "worker-rework-commit",
+                "--wait-seconds",
+                "0",
+                "--json",
+            ])
+            .env_clear()
+            .envs(&prepared.environment)
+            .current_dir(&prepared.working_directory)
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "actual repository commit CLI failed: {} {}",
+            String::from_utf8_lossy(&commit.stderr),
+            String::from_utf8_lossy(&commit.stdout)
+        );
+        let commit_request = mailbox
+            .pending(unix_time_now().unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|request| request.request_id == "worker-rework-commit")
+            .expect("repository commit CLI queues a durable request");
+        assert_eq!(
+            commit_request.envelope.params["expected_head"],
+            expected_rework_head
+        );
+
+        for index in 0..30 {
             let message_id = format!("queue-fill-{index}");
             let mut request = serde_json::to_value(&pending[0].envelope).unwrap();
             request["request_id"] = json!(message_id);

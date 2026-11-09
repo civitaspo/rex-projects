@@ -27,6 +27,12 @@ use crate::store::agent_recovery::{
 };
 
 const MAX_HEARTBEAT_BYTES: u64 = 1024;
+const MISSING_BLOCK_PROVIDER_KILL_AFTER_SECONDS: u64 = 3;
+const RUN_STEP_TERM_GRACE_SECONDS: u64 = 3;
+const RUN_STEP_KILL_GRACE_SECONDS: u64 = 3;
+const RUN_STEP_PIPE_JOIN_BUDGET_SECONDS: u64 = 1;
+// This bounded allowance does not prove that the producer committed its terminal receipt.
+const RUN_STEP_WRITER_FINALIZATION_POLICY_ALLOWANCE_SECONDS: u64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct RecoveryPolicy {
@@ -1019,6 +1025,7 @@ fn reconcile_missing_block(
         return stop_known_processes_without_watch(
             store,
             run,
+            wrapper,
             owner_generation,
             policy,
             &spool,
@@ -1034,6 +1041,7 @@ fn reconcile_missing_block(
         return stop_known_processes_without_watch(
             store,
             run,
+            wrapper,
             owner_generation,
             policy,
             &spool,
@@ -1067,6 +1075,7 @@ fn reconcile_missing_block(
             return stop_known_processes_without_watch(
                 store,
                 run,
+                wrapper,
                 owner_generation,
                 policy,
                 &spool,
@@ -1097,6 +1106,7 @@ fn reconcile_missing_block(
         return stop_known_processes_without_watch(
             store,
             run,
+            wrapper,
             owner_generation,
             policy,
             &spool,
@@ -1152,23 +1162,15 @@ fn reconcile_missing_block(
             &snapshot,
             &survivors,
         )?;
-        let groups = snapshot
-            .process_tree
-            .iter()
-            .map(|process| process.process_group_id)
-            .collect::<BTreeSet<_>>();
-        let signal = if store.missing_block_survival_age_seconds(run, policy.now_unix)? >= 3 {
-            ProcessSignal::Kill
-        } else {
-            ProcessSignal::Terminate
-        };
-        for group_id in groups {
-            if signal_process_group_if_observed(group_id, &snapshot.process_tree, &fresh, signal)
-                .is_err()
-            {
-                watch_healthy = false;
-            }
-        }
+        let survival_age = store.missing_block_survival_age_seconds(run, policy.now_unix)?;
+        let writer_kill_after = run_step_writer_kill_after_seconds(run);
+        watch_healthy &= signal_missing_block_process_groups(
+            &snapshot,
+            wrapper,
+            &fresh,
+            survival_age,
+            writer_kill_after,
+        );
     }
     if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
         watch_healthy &= watch.drain_events();
@@ -1299,6 +1301,7 @@ fn reconcile_missing_block(
 fn stop_known_processes_without_watch(
     store: &mut ConfigStore,
     run: &RecoverableAgentRun,
+    wrapper: &ObservedWrapperIdentity,
     owner_generation: u64,
     policy: &RecoveryPolicy,
     spool: &RunStepSpool,
@@ -1310,20 +1313,15 @@ fn stop_known_processes_without_watch(
     let _ = spool.write_block_loss_cleanup_snapshot(&snapshot);
     let survivors = crate::process::matching_processes(&snapshot.process_tree, current);
     if !survivors.is_empty() {
-        let signal = if store.missing_block_survival_age_seconds(run, policy.now_unix)? >= 3 {
-            ProcessSignal::Kill
-        } else {
-            ProcessSignal::Terminate
-        };
-        for group_id in snapshot
-            .process_tree
-            .iter()
-            .map(|process| process.process_group_id)
-            .collect::<BTreeSet<_>>()
-        {
-            let _ =
-                signal_process_group_if_observed(group_id, &snapshot.process_tree, current, signal);
-        }
+        let survival_age = store.missing_block_survival_age_seconds(run, policy.now_unix)?;
+        let writer_kill_after = run_step_writer_kill_after_seconds(run);
+        let _ = signal_missing_block_process_groups(
+            &snapshot,
+            wrapper,
+            current,
+            survival_age,
+            writer_kill_after,
+        );
         return store_survival_or_unresolved(
             store,
             owner_generation,
@@ -1334,6 +1332,153 @@ fn stop_known_processes_without_watch(
         );
     }
     Ok(AgentRecoveryDisposition::Unresolved { reason })
+}
+
+fn run_step_writer_kill_after_seconds(run: &RecoverableAgentRun) -> Option<u64> {
+    const MAX_PACKAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+    let path = &run.authority.descriptor_path;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PACKAGE_BYTES
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new().read(true).open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.len() > MAX_PACKAGE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_PACKAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+        return None;
+    }
+    let digest = Digest::parse(format!("{:x}", Sha256::digest(&bytes))).ok()?;
+    if digest != run.authority.descriptor_digest {
+        return None;
+    }
+    let package: crate::run_step_package::RunStepPackage =
+        crate::protocol::parse_unique(&bytes).ok()?;
+    package.validate().ok()?;
+    let result_schema_digest = digest_json(&package.descriptor.result_schema).ok()?;
+    if package.execution_slot_epoch != run.reservation_epoch
+        || package.descriptor.run_id != run.agent_run_id
+        || package.project_id != run.authority.project_id
+        || package.operation_id != run.authority.operation_id
+        || package.controller_generation != run.authority.controller_generation
+        || package.descriptor.role != run.authority.role
+        || package.descriptor.attempt != run.authority.attempt
+        || package.descriptor.run_epoch != run.authority.run_epoch
+        || result_schema_digest != run.authority.result_schema_digest
+        || package.descriptor.ticket_run_id != run.authority.ticket_run_id
+        || package.descriptor.expected_subject_revision
+            != run
+                .authority
+                .ticket_revision
+                .map(|revision| revision.0)
+                .unwrap_or(0)
+        || package.descriptor.workspace != run.authority.workspace_path
+        || package.descriptor.control_dir != run.authority.control_dir
+        || package.descriptor.profile_digest != run.authority.profile_digest
+        || package.descriptor.instruction_digest != run.authority.instruction_digest
+        || package.descriptor.environment_snapshot_id != run.authority.environment_snapshot_id
+        || package.descriptor.wake_snapshot_digest != run.authority.wake_snapshot_digest
+        || package.descriptor.provider_capability.receipt_digest
+            != run.authority.qualification_receipt_digest
+        || package.runtime_binary_digest != run.authority.runtime_binary_digest
+        || package.qualification_receipt_digest != run.authority.qualification_receipt_digest
+        || package.descriptor.rex_session_id != run.authority.rex_session_id
+        || package.descriptor.rex_block_id.as_str() != run.authority.rex_block_id
+        || package.rex_server_identity != run.authority.rex_server_identity
+        || package.rex_window_id != run.authority.rex_window_id
+    {
+        return None;
+    }
+
+    package
+        .shutdown_grace_seconds
+        .checked_add(RUN_STEP_TERM_GRACE_SECONDS)?
+        .checked_add(RUN_STEP_KILL_GRACE_SECONDS)?
+        .checked_add(RUN_STEP_PIPE_JOIN_BUDGET_SECONDS)?
+        .checked_add(RUN_STEP_WRITER_FINALIZATION_POLICY_ALLOWANCE_SECONDS)
+}
+
+pub(crate) fn signal_missing_block_process_groups(
+    snapshot: &BlockLossCleanupSnapshot,
+    wrapper: &ObservedWrapperIdentity,
+    current: &[ProcessIdentity],
+    survival_age_seconds: u64,
+    writer_kill_after_seconds: Option<u64>,
+) -> bool {
+    let writer_processes = snapshot
+        .process_tree
+        .iter()
+        .filter(|process| {
+            process.pid == wrapper.pid
+                && process.start_identity == wrapper.start_identity
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+                && process.process_group_id != 0
+        })
+        .collect::<Vec<_>>();
+    let writer_group = (writer_processes.len() == 1).then(|| writer_processes[0].process_group_id);
+    let mut healthy = writer_group.is_some();
+    let groups = snapshot
+        .process_tree
+        .iter()
+        .map(|process| process.process_group_id)
+        .filter(|group| *group != 0)
+        .collect::<BTreeSet<_>>();
+    let provider_signal = missing_block_survival_signal(survival_age_seconds);
+    let writer_signal =
+        missing_block_writer_signal(survival_age_seconds, writer_kill_after_seconds);
+    for group_id in groups {
+        // Without an exact writer identity, only TERM is safe: a provider KILL could
+        // otherwise destroy the terminal receipt writer as well.
+        let signal = match writer_group {
+            Some(writer_group) if group_id == writer_group => writer_signal,
+            Some(_) => provider_signal,
+            None => ProcessSignal::Terminate,
+        };
+        if signal_process_group_if_observed(group_id, &snapshot.process_tree, current, signal)
+            .is_err()
+        {
+            healthy = false;
+        }
+    }
+    healthy
+}
+
+fn missing_block_survival_signal(survival_age_seconds: u64) -> ProcessSignal {
+    if survival_age_seconds >= MISSING_BLOCK_PROVIDER_KILL_AFTER_SECONDS {
+        ProcessSignal::Kill
+    } else {
+        ProcessSignal::Terminate
+    }
+}
+
+fn missing_block_writer_signal(
+    survival_age_seconds: u64,
+    kill_after_seconds: Option<u64>,
+) -> ProcessSignal {
+    if kill_after_seconds.is_some_and(|threshold| survival_age_seconds >= threshold) {
+        ProcessSignal::Kill
+    } else {
+        ProcessSignal::Terminate
+    }
 }
 
 fn store_survival_or_unresolved(
@@ -2023,6 +2168,267 @@ mod tests {
         assert!(!provider_tree_contains_wrapper(&provider, &reused_pid));
         let omitted_wrapper = ObservedWrapperIdentity { pid: 12, ..wrapper };
         assert!(!provider_tree_contains_wrapper(&provider, &omitted_wrapper));
+    }
+
+    #[test]
+    fn block_loss_escalation_keeps_the_writer_until_its_verified_policy_cutoff() {
+        let cutoff = Some(42);
+        assert_eq!(missing_block_survival_signal(2), ProcessSignal::Terminate);
+        assert_eq!(missing_block_survival_signal(3), ProcessSignal::Kill);
+        assert_eq!(
+            missing_block_writer_signal(3, cutoff),
+            ProcessSignal::Terminate
+        );
+        assert_eq!(
+            missing_block_writer_signal(41, cutoff),
+            ProcessSignal::Terminate
+        );
+        assert_eq!(missing_block_writer_signal(42, cutoff), ProcessSignal::Kill);
+        assert_eq!(
+            missing_block_writer_signal(300, None),
+            ProcessSignal::Terminate
+        );
+    }
+
+    #[test]
+    fn writer_cutoff_comes_from_the_authority_bound_run_step_package() {
+        let root = tempfile::tempdir().unwrap();
+        let run = writer_cutoff_test_run(root.path());
+        assert_eq!(run_step_writer_kill_after_seconds(&run), Some(42));
+
+        let mut missing = run.clone();
+        missing.authority.descriptor_path = root.path().join("missing-package.json");
+        assert_eq!(run_step_writer_kill_after_seconds(&missing), None);
+
+        fs::write(&run.authority.descriptor_path, b"tampered").unwrap();
+        assert_eq!(run_step_writer_kill_after_seconds(&run), None);
+    }
+
+    fn writer_cutoff_test_run(root: &std::path::Path) -> RecoverableAgentRun {
+        use crate::domain::ids::{OperationId, ProfileId, ProjectId, Revision, RexBlockId};
+        use crate::domain::types::{AgentAdapter, CommitMode, Role};
+        use crate::run_step::{
+            ProviderCapabilityEvidence, ProviderQualificationStatus, RunDescriptor,
+        };
+
+        let root = fs::canonicalize(root).unwrap();
+        let workspace = root.join("workspace");
+        let control_dir = root.join("control");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&control_dir).unwrap();
+        let descriptor_path = root.join("run-step.package.json");
+        let digest = |ch: char| Digest::parse(ch.to_string().repeat(64)).unwrap();
+        let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
+            "adapter":"codex", "command":["/bin/codex"], "model":"fixture",
+            "commit_mode":"native", "turn_timeout_seconds":60
+        }))
+        .unwrap();
+        let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
+        let result_schema = serde_json::json!({"type":"object"});
+        let project_id = ProjectId::parse("project-writer-cutoff").unwrap();
+        let run_id = AgentRunId::parse("run-writer-cutoff").unwrap();
+        let operation_id = OperationId::parse("operation-writer-cutoff").unwrap();
+        let qualification_digest = digest('f');
+        let package = crate::run_step_package::RunStepPackage {
+            schema_version: 2,
+            execution_slot_epoch: 1,
+            descriptor: RunDescriptor {
+                schema_version: 1,
+                project_id: project_id.clone(),
+                run_id: run_id.clone(),
+                operation_id: operation_id.clone(),
+                role: Role::Supervisor,
+                ticket_run_id: None,
+                expected_subject_revision: 0,
+                attempt: 1,
+                run_epoch: 1,
+                controller_generation: 1,
+                workspace: workspace.clone(),
+                control_dir: control_dir.clone(),
+                worker_assignment: None,
+                rex_session_id: "session-writer-cutoff".into(),
+                rex_block_id: RexBlockId::parse("block-writer-cutoff").unwrap(),
+                profile_digest: profile_digest.clone(),
+                instruction_digest: digest('a'),
+                plan_digest: None,
+                environment_snapshot_id: digest('b'),
+                wake_snapshot_digest: digest('c'),
+                provider_capability: ProviderCapabilityEvidence {
+                    schema_version: 1,
+                    adapter: AgentAdapter::Codex,
+                    profile_digest: profile_digest.clone(),
+                    version: "fixture-1".into(),
+                    executable_path: "/bin/codex".into(),
+                    schema_projection: crate::providers::project_result_schema(&result_schema)
+                        .unwrap()
+                        .identity,
+                    executable_digest: digest('d'),
+                    permission_mode: "workspace_write".into(),
+                    invocation_options_digest: digest('e'),
+                    commit_mode: CommitMode::Native,
+                    receipt_digest: qualification_digest.clone(),
+                    status: ProviderQualificationStatus::Verified,
+                },
+                result_schema: result_schema.clone(),
+            },
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            controller_generation: 1,
+            runtime_binary_digest: digest('1'),
+            qualification_receipt_digest: qualification_digest.clone(),
+            rex_cli_path: "/bin/rex".into(),
+            rex_search_path: vec!["/bin".into()],
+            rex_endpoint: "unix:///tmp/rex.sock".into(),
+            rex_server_identity: "rex-instance".into(),
+            rex_window_id: "window-writer-cutoff".into(),
+            profile,
+            role_contract: "fixture".into(),
+            prompt: "fixture".into(),
+            continuation: None,
+            shutdown_grace_seconds: 30,
+            start_ack_timeout_seconds: 30,
+        };
+        let descriptor_digest = package.publish_once(&descriptor_path).unwrap();
+        let authority = crate::launch::AgentLaunchAuthority {
+            agent_run_id: run_id.clone(),
+            project_id,
+            role: Role::Supervisor,
+            role_session_id: "role-session-writer-cutoff".into(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: Revision(1),
+            config_digest: digest('2'),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: 1,
+            operation_id,
+            operation_recipe_id: None,
+            rex_view_id: digest('3'),
+            descriptor_digest,
+            runtime_binary_digest: digest('1'),
+            descriptor_path,
+            environment_snapshot_id: digest('b'),
+            profile_id: ProfileId::parse("profile-writer-cutoff").unwrap(),
+            profile_digest,
+            instruction_digest: digest('a'),
+            result_schema_digest: digest_json(&result_schema).unwrap(),
+            wake_snapshot_digest: digest('c'),
+            qualification_receipt_digest: qualification_digest,
+            rex_server_identity: "rex-instance".into(),
+            rex_session_id: "session-writer-cutoff".into(),
+            rex_window_id: "window-writer-cutoff".into(),
+            rex_block_id: "block-writer-cutoff".into(),
+            workspace_path: workspace,
+            control_dir,
+            mailbox_capability_digest: digest('4'),
+        };
+        RecoverableAgentRun {
+            agent_run_id: run_id,
+            current_generation: 1,
+            previous_generation: 0,
+            authority,
+            authority_digest: digest('5'),
+            agent_state: "unknown".into(),
+            started_at_unix: Some(1),
+            launch_state: "running".into(),
+            process_identity_json: None,
+            wrapper_identity_json: None,
+            provider_tree_json: None,
+            pool: "agent".into(),
+            slot_index: 0,
+            reservation_epoch: 1,
+            slot_disposition: "live".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_loss_provider_kill_does_not_kill_exact_writer_group_at_three_seconds() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("writer-ready");
+        let mut writer = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent_recovery::tests::block_loss_writer_ignores_term_child",
+                "--nocapture",
+            ])
+            .env("REX_TEST_BLOCK_LOSS_IGNORE_TERM_CHILD", "1")
+            .env("REX_TEST_BLOCK_LOSS_WRITER_READY", &ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert!(wait_until(|| ready.exists().then_some(())).is_some());
+        let mut provider = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let writer_identity = wait_for_identity(writer.id());
+        let provider_identity = wait_for_identity(provider.id());
+        assert_ne!(
+            writer_identity.process_group_id,
+            provider_identity.process_group_id
+        );
+        let wrapper = ObservedWrapperIdentity {
+            pid: writer_identity.pid,
+            start_identity: writer_identity.start_identity.clone(),
+            rex_session_id: "session".into(),
+            rex_block_id: "block".into(),
+            runtime_binary_digest: Digest::parse("c".repeat(64)).unwrap(),
+        };
+        let snapshot = make_test_snapshot(
+            vec![writer_identity.clone(), provider_identity.clone()],
+            false,
+        );
+
+        let signals_ok = signal_missing_block_process_groups(
+            &snapshot,
+            &wrapper,
+            &inspect_process_table().unwrap(),
+            3,
+            Some(42),
+        );
+        provider.wait().unwrap();
+        let provider_absent = wait_until_processes_absent(std::slice::from_ref(&provider_identity));
+        let current = inspect_process_table().unwrap();
+        let writer_alive =
+            !crate::process::matching_processes(std::slice::from_ref(&writer_identity), &current)
+                .is_empty();
+
+        writer.kill().unwrap();
+        writer.wait().unwrap();
+        assert!(signals_ok);
+        assert!(provider_absent);
+        assert!(writer_alive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_loss_writer_ignores_term_child() {
+        if std::env::var_os("REX_TEST_BLOCK_LOSS_IGNORE_TERM_CHILD").is_none() {
+            return;
+        }
+        // The parent test owns this process and terminates it with a birth-checked SIGKILL.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+        }
+        fs::write(
+            std::env::var_os("REX_TEST_BLOCK_LOSS_WRITER_READY")
+                .map(std::path::PathBuf::from)
+                .unwrap(),
+            b"ready",
+        )
+        .unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 
     #[test]

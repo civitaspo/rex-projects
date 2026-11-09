@@ -375,7 +375,7 @@ impl crate::store::ConfigStore {
                     || recovery.accepted_plan_digest != assignment.plan_digest
                     || recovery.prior_worker_agent_run_id == authority.agent_run_id
                     || (recovery.prior_host_commit_operation_id.is_none()
-                        && recovery.expected_head != assignment.base_sha)
+                        && recovery.expected_head != assignment.expected_head())
                 {
                     return Err(AgentMailboxProcessingError::Authority(
                         "Worker recovery authority differs from the immutable accepted assignment"
@@ -384,7 +384,7 @@ impl crate::store::ConfigStore {
                 }
                 recovery.expected_head
             }
-            None => assignment.base_sha.clone(),
+            None => assignment.expected_head().to_owned(),
         };
         let envelope = &mailbox_request.envelope;
         if authority.role != crate::domain::types::Role::Worker

@@ -160,27 +160,76 @@ impl AgentWakeSnapshot {
                 return Err("Agent inbox item exceeds the 256 artifact limit".into());
             }
             artifact_count += item.host_artifacts.len();
-            if !item.host_artifacts.is_empty()
-                && !matches!(
-                    item.source_type.as_str(),
-                    "agent_result" | "worker_recovery_authorization"
-                )
+            let transition_artifact_sources = if item.source_type == "ticket_run_transition"
+                && !item.host_artifacts.is_empty()
             {
-                return Err("host artifact locators must accompany a verified result or Worker recovery wake".into());
-            }
+                if item.payload_json["target"] != "reviewer"
+                    || item.payload_json["revision"].as_u64() != Some(item.source_revision)
+                    || item.payload_json["message_id"].as_str() != Some(item.source_id.as_str())
+                {
+                    return Err("host artifacts may accompany only a current Reviewer publication transition".into());
+                }
+                let sources = item.payload_json["host_artifact_source_evidence_ids"]
+                    .as_array()
+                    .ok_or(
+                        "Reviewer publication transition has no host artifact source evidence list",
+                    )?
+                    .iter()
+                    .map(|value| {
+                        let source = value
+                            .as_str()
+                            .ok_or("Reviewer artifact source evidence ID must be a string")?;
+                        Digest::parse(source.to_owned())?;
+                        Ok(source.to_owned())
+                    })
+                    .collect::<Result<std::collections::BTreeSet<_>, String>>()?;
+                if sources.is_empty()
+                    || sources.len()
+                        != item.payload_json["host_artifact_source_evidence_ids"]
+                            .as_array()
+                            .map(Vec::len)
+                            .unwrap_or_default()
+                {
+                    return Err(
+                        "Reviewer artifact source evidence IDs must be nonempty and unique".into(),
+                    );
+                }
+                Some(sources)
+            } else {
+                if !item.host_artifacts.is_empty()
+                    && !matches!(
+                        item.source_type.as_str(),
+                        "agent_result" | "worker_recovery_authorization"
+                    )
+                {
+                    return Err("host artifact locators must accompany a verified result, Worker recovery wake, or Reviewer publication transition".into());
+                }
+                None
+            };
             let mut seen_artifacts = std::collections::BTreeSet::new();
+            let mut actual_artifact_sources = std::collections::BTreeSet::new();
             for artifact in &item.host_artifacts {
                 artifact.validate()?;
-                if artifact.source_evidence_id != item.source_id
-                    || !seen_artifacts.insert(artifact.artifact_id.as_str())
-                {
+                let source_matches = if let Some(sources) = &transition_artifact_sources {
+                    sources.contains(&artifact.source_evidence_id)
+                } else {
+                    artifact.source_evidence_id == item.source_id
+                };
+                if !source_matches || !seen_artifacts.insert(artifact.artifact_id.as_str()) {
                     return Err(
                         "host artifact locator source or identity differs from its wake".into(),
                     );
                 }
+                actual_artifact_sources.insert(artifact.source_evidence_id.clone());
                 artifact_bytes = artifact_bytes
                     .checked_add(artifact.bytes)
                     .ok_or("Agent inbox artifact byte count overflow")?;
+            }
+            if transition_artifact_sources
+                .as_ref()
+                .is_some_and(|sources| sources != &actual_artifact_sources)
+            {
+                return Err("Reviewer publication transition source evidence list differs from its host artifacts".into());
             }
         }
         if artifact_count > 256 || artifact_bytes > 64 * 1024 * 1024 {
@@ -641,7 +690,7 @@ mod tests {
     fn host_artifact_locator_is_typed_workspace_relative_and_digest_bound() {
         let locator = HostArtifactLocator {
             artifact_id: ArtifactId::parse("a".repeat(64)).unwrap(),
-            kind: RoleArtifactKind::Change,
+            kind: RoleArtifactKind::TestReceipt,
             schema_version: 1,
             digest: Digest::parse("b".repeat(64)).unwrap(),
             bytes: 12,
@@ -669,8 +718,33 @@ mod tests {
         };
         snapshot.digest = snapshot.content_digest().unwrap();
         snapshot.validate().unwrap();
-        snapshot.inputs[0].host_artifacts[0].path = "../../outside".into();
-        assert!(snapshot.validate().is_err());
+
+        let mut transition = snapshot.clone();
+        transition.inputs[0].source_type = "ticket_run_transition".into();
+        transition.inputs[0].source_id = "review-transition-message".into();
+        transition.inputs[0].payload_json = serde_json::json!({
+            "target":"reviewer",
+            "revision":1,
+            "message_id":"review-transition-message",
+            "host_artifact_source_evidence_ids":["e".repeat(64)]
+        });
+        transition.digest = transition.content_digest().unwrap();
+        transition.validate().unwrap();
+
+        transition.inputs[0].payload_json["host_artifact_source_evidence_ids"] =
+            serde_json::json!(["f".repeat(64)]);
+        transition.digest = transition.content_digest().unwrap();
+        assert!(transition.validate().is_err());
+        transition.inputs[0].payload_json["host_artifact_source_evidence_ids"] =
+            serde_json::json!(["e".repeat(64)]);
+        transition.digest = transition.content_digest().unwrap();
+        transition.inputs[0].payload_json["target"] = serde_json::json!("operator");
+        transition.digest = transition.content_digest().unwrap();
+        assert!(transition.validate().is_err());
+        transition.inputs[0].payload_json["target"] = serde_json::json!("reviewer");
+        transition.digest = transition.content_digest().unwrap();
+        transition.inputs[0].host_artifacts[0].path = "../../outside".into();
+        assert!(transition.validate().is_err());
     }
 
     #[test]

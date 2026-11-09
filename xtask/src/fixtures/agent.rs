@@ -2045,6 +2045,7 @@ fn read_public_inbox(
         "project_id": std::env::var("REX_PROJECTS_PROJECT_ID").ok(),
         "role": std::env::var("REX_PROJECTS_ROLE").ok(),
         "provider_evidence": "EMULATED",
+        "workspace_path": std::env::current_dir().map_err(|error| error.to_string())?,
         "after": inbox.after,
         "next_after": inbox.next_after,
         "wake_input_ids": inbox.inputs.iter().filter_map(|item| item.get("wake_input_id").cloned()).collect::<Vec<_>>(),

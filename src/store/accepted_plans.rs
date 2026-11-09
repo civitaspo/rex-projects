@@ -267,6 +267,7 @@ pub struct PreparedWorkerLaunch {
     worktree_path: std::path::PathBuf,
     branch: String,
     base_sha: String,
+    expected_head: Option<String>,
     prepare_operation_id: String,
     prepare_receipt_digest: Digest,
     source_evidence_id: String,
@@ -292,6 +293,7 @@ impl PreparedWorkerLaunch {
             worktree_path: self.worktree_path.clone(),
             branch: self.branch.clone(),
             base_sha: self.base_sha.clone(),
+            expected_head: self.expected_head.clone(),
             prepare_operation_id: self.prepare_operation_id.clone(),
             prepare_receipt_digest: self.prepare_receipt_digest.clone(),
             source_evidence_id: self.source_evidence_id.clone(),
@@ -339,6 +341,10 @@ impl PreparedWorkerLaunch {
     }
     pub fn base_sha(&self) -> &str {
         &self.base_sha
+    }
+
+    pub fn expected_head(&self) -> &str {
+        self.expected_head.as_deref().unwrap_or(&self.base_sha)
     }
     pub fn prepare_operation_id(&self) -> &str {
         &self.prepare_operation_id
@@ -742,6 +748,16 @@ impl ConfigStore {
                             },
                         )
                 }) => {}
+            ("implementing", Some(1))
+                if rows.iter().any(|(_, next_revision, next_evidence)| {
+                    *next_revision == consumer_revision
+                        && serde_json::from_str::<serde_json::Value>(next_evidence).is_ok_and(
+                            |value| {
+                                value["kind"] == "review_assessment"
+                                    && value["transition"] == "corrections_remain"
+                            },
+                        )
+                }) => {}
             _ => return Err("publication snapshot is no longer the current review subject".into()),
         }
         let accepted = self
@@ -1028,6 +1044,65 @@ impl ConfigStore {
         {
             return Err("prepared worktree does not match accepted Worker node".into());
         }
+        let correction_transition: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision=?3",
+                params![ticket_run_id.as_str(), project_id.as_str(), current_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let expected_head = match correction_transition {
+            Some(evidence_json)
+                if serde_json::from_str::<serde_json::Value>(&evidence_json).is_ok_and(
+                    |value| {
+                        value["kind"] == "review_assessment"
+                            && value["transition"] == "corrections_remain"
+                    },
+                ) =>
+            {
+                let snapshot = self.accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    project_id,
+                    &ticket_run_id,
+                    current_revision,
+                )?;
+                let matching = snapshot
+                    .publication_receipts
+                    .iter()
+                    .filter_map(|publication| {
+                        let request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                            crate::protocol::parse_unique(
+                                publication.intent().request_json.as_bytes(),
+                            )
+                            .ok()?;
+                        (request.work_node_id == *node_id).then_some((publication, request))
+                    })
+                    .collect::<Vec<_>>();
+                if matching.len() != 1 {
+                    return Err("review correction publication does not cover this Worker node exactly once".into());
+                }
+                let (publication, request) = &matching[0];
+                let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+                    crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+                if request.ticket_run_id != ticket_run_id
+                    || request.repository_id != node.repository
+                    || request.configuration_digest != plan.configuration_digest
+                    || receipt.ticket_run_id != ticket_run_id
+                    || receipt.work_node_id != *node_id
+                    || receipt.repository_id != node.repository
+                    || receipt.configuration_digest != plan.configuration_digest
+                {
+                    return Err(
+                        "review correction publication differs from the accepted Worker node"
+                            .into(),
+                    );
+                }
+                Some(receipt.commit.head().to_owned())
+            }
+            _ => None,
+        };
         Ok(Some(PreparedWorkerLaunch {
             project_id: project_id.clone(),
             ticket_run_id,
@@ -1041,6 +1116,7 @@ impl ConfigStore {
             worktree_path: prepared.worktree_path.clone(),
             branch: prepared.branch.clone(),
             base_sha: prepared.base_sha.clone(),
+            expected_head,
             prepare_operation_id: intent.operation_id.clone(),
             prepare_receipt_digest: digest_json(succeeded.receipt_json()),
             source_evidence_id: plan.source_evidence_id,

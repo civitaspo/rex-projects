@@ -26,6 +26,7 @@ const COORDINATOR_INBOX_STAGE: &str = "supervisor_coordinator_inbox";
 const COORDINATOR_BLOCK_LOSS_STAGE: &str = "supervisor_coordinator_block_loss";
 const COORDINATOR_WORKER_INBOX_STAGE: &str = "supervisor_coordinator_worker_inbox";
 const HOST_COMMIT_REVIEWER_INBOX_STAGE: &str = "host_commit_reviewer_inbox";
+const HOST_COMMIT_WORKER_REWORK_STAGE: &str = "host_commit_worker_rework_inbox";
 const WORKER_RECOVERY_INBOX_STAGE: &str = "worker_recovery_inbox";
 const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
 const FIXTURE_PROJECT_ID: &str = "operations_project";
@@ -61,7 +62,8 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
                 || stage == COORDINATOR_BLOCK_LOSS_STAGE
                 || stage == COORDINATOR_WORKER_INBOX_STAGE
                 || stage == WORKER_RECOVERY_INBOX_STAGE
-                || stage == HOST_COMMIT_REVIEWER_INBOX_STAGE =>
+                || stage == HOST_COMMIT_REVIEWER_INBOX_STAGE
+                || stage == HOST_COMMIT_WORKER_REWORK_STAGE =>
         {
             Ok(Some(stage))
         }
@@ -89,8 +91,9 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let bounded_coordinator_stage = stage.is_some();
     let coordinator_block_loss_stage = stage.as_deref() == Some(COORDINATOR_BLOCK_LOSS_STAGE);
     let coordinator_worker_inbox_stage = stage.as_deref() == Some(COORDINATOR_WORKER_INBOX_STAGE);
+    let worker_review_rework_stage = stage.as_deref() == Some(HOST_COMMIT_WORKER_REWORK_STAGE);
     let host_commit_reviewer_inbox_stage =
-        stage.as_deref() == Some(HOST_COMMIT_REVIEWER_INBOX_STAGE);
+        stage.as_deref() == Some(HOST_COMMIT_REVIEWER_INBOX_STAGE) || worker_review_rework_stage;
     let worker_recovery_inbox_stage = stage.as_deref() == Some(WORKER_RECOVERY_INBOX_STAGE);
     let worker_connection_stage = coordinator_worker_inbox_stage
         || host_commit_reviewer_inbox_stage
@@ -130,6 +133,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 || coordinator_worker_inbox_stage
                 || worker_recovery_inbox_stage,
             worker_recovery_stage: worker_recovery_inbox_stage,
+            worker_review_rework_stage,
         },
     )?;
     trace.push(json!({"step":"local_bare_repository_and_profiles","status":"passed","provider":"EMULATED"}));
@@ -498,9 +502,35 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             }
             if host_commit_reviewer_inbox_stage {
                 for observation in &observations {
-                    if let Some(evidence) =
-                        host_commit_reviewer_connection_evidence(observation, &state_root)?
-                    {
+                    if let Some(evidence) = host_commit_reviewer_connection_evidence(
+                        observation,
+                        &state_root,
+                        if worker_review_rework_stage {
+                            "implementing"
+                        } else {
+                            "assessing"
+                        },
+                    )? {
+                        let rework = if worker_review_rework_stage {
+                            let mut proof = None;
+                            for worker in &observations {
+                                if let Some(found) =
+                                    review_rework_worker_connection_evidence(worker, &state_root)?
+                                {
+                                    proof = Some(found);
+                                    break;
+                                }
+                            }
+                            let Some(proof) = proof else {
+                                continue;
+                            };
+                            Some(proof)
+                        } else {
+                            None
+                        };
+                        if let Some(proof) = rework {
+                            trace.push(json!({"step":"review_correction_worker_package_materialized","status":"passed","evidence":proof}));
+                        }
                         trace.push(json!({
                             "step":"host_worker_commit_to_reviewer_gate",
                             "status":"passed",
@@ -974,10 +1004,138 @@ fn parse_recovery_wake_snapshot(
     Ok(snapshot)
 }
 
+/// Inspect the actual package and public inbox of a second Worker after a committed review correction.
+fn review_rework_worker_connection_evidence(
+    observation: &Value,
+    state_root: &Path,
+) -> Result<Option<Value>, String> {
+    if observation["role"] != "worker" {
+        return Ok(None);
+    }
+    let assignment = &observation["worker_assignment"];
+    let (Some(run_id), Some(ticket_run_id), Some(expected_head), Some(base_sha)) = (
+        observation["run_id"].as_str(),
+        observation["ticket_run_id"].as_str(),
+        assignment["expected_head"].as_str(),
+        assignment["base_sha"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    if expected_head == base_sha {
+        return Ok(None);
+    }
+    let db = Connection::open_with_flags(
+        state_root.join("state.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("open rework proof state: {error}"))?;
+    let row: Option<(String, String, String)> = db.query_row(
+        "SELECT a.authority_json,r.reservation_json,t.evidence_json FROM agent_launch_authority a JOIN agent_launch_reservations r USING(agent_run_id) JOIN transitions t ON t.entity_type='ticket_run' AND t.entity_id=a.ticket_run_id AND t.project_id=a.project_id AND t.new_revision=a.ticket_revision WHERE a.agent_run_id=?1 AND a.role='worker'",
+        [run_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).optional().map_err(|error| format!("read correction Worker authority: {error}"))?;
+    let Some((authority_json, reservation_json, transition_json)) = row else {
+        return Ok(None);
+    };
+    let authority: rex_projects::launch::AgentLaunchAuthority =
+        serde_json::from_str(&authority_json).map_err(|error| error.to_string())?;
+    let reservation: rex_projects::launch::AgentLaunchReservation =
+        serde_json::from_str(&reservation_json).map_err(|error| error.to_string())?;
+    let transition: Value =
+        serde_json::from_str(&transition_json).map_err(|error| error.to_string())?;
+    if transition["kind"] != "review_assessment" || transition["transition"] != "corrections_remain"
+    {
+        return Err("rework Worker is not bound to a committed review correction".into());
+    }
+    let binding = reservation
+        .worker_assignment
+        .as_ref()
+        .ok_or("rework Worker has no assignment binding")?;
+    let package_path = observation
+        .pointer("/input_files/package_path")
+        .and_then(Value::as_str)
+        .ok_or("rework Worker has no generated package path")?;
+    let package_bytes = fs::read(package_path)
+        .map_err(|error| format!("read generated correction Worker package: {error}"))?;
+    let package: rex_projects::run_step_package::RunStepPackage =
+        serde_json::from_slice(&package_bytes).map_err(|error| error.to_string())?;
+    package.validate()?;
+    let mut publications = db.prepare("SELECT receipt_json FROM effects WHERE subject_type='ticket_run' AND subject_id=?1 AND project_id=?2 AND kind='publish_implementation' AND status='succeeded'").map_err(|error| error.to_string())?;
+    let publication_rows = publications
+        .query_map(
+            params![ticket_run_id, authority.project_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut matching = 0;
+    for row in publication_rows {
+        let publication: rex_projects::delivery_runtime::ImplementationPublicationReceipt =
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        if publication.work_node_id == binding.node_id
+            && publication.repository_id == binding.repository_id
+            && publication.commit.head() == expected_head
+        {
+            matching += 1;
+        }
+    }
+    let snapshot_path = observation
+        .pointer("/input_files/snapshot_path")
+        .and_then(Value::as_str)
+        .ok_or("rework Worker has no generated inbox path")?;
+    let snapshot_bytes = fs::read(snapshot_path)
+        .map_err(|error| format!("read generated correction Worker inbox: {error}"))?;
+    let snapshot: rex_projects::agent_api::AgentWakeSnapshot =
+        serde_json::from_slice(&snapshot_bytes).map_err(|error| error.to_string())?;
+    snapshot.validate()?;
+    let actual_head = git_output(&binding.worktree_path, &["rev-parse", "HEAD"])?;
+    if authority.project_id.as_str() != observation["project_id"].as_str().unwrap_or_default()
+        || authority.ticket_run_id.as_ref().map(|id| id.as_str()) != Some(ticket_run_id)
+        || authority.ticket_revision.map(|revision| revision.0) != Some(binding.ticket_revision)
+        || package.project_id != authority.project_id
+        || package.descriptor.project_id != authority.project_id
+        || package
+            .descriptor
+            .ticket_run_id
+            .as_ref()
+            .map(|id| id.as_str())
+            != Some(ticket_run_id)
+        || matching != 1
+        || binding.expected_head() != expected_head
+        || binding.base_sha != base_sha
+        || authority.descriptor_path != Path::new(package_path)
+        || authority.descriptor_digest.as_str() != format!("{:x}", Sha256::digest(&package_bytes))
+        || observation
+            .pointer("/input_files/package_sha256")
+            .and_then(Value::as_str)
+            != Some(authority.descriptor_digest.as_str())
+        || package.descriptor.worker_assignment.as_ref() != Some(binding)
+        || package.descriptor.run_id.as_str() != run_id
+        || package.descriptor.expected_subject_revision != binding.ticket_revision
+        || snapshot.agent_run_id.as_str() != run_id
+        || snapshot.digest != authority.wake_snapshot_digest
+        || package.descriptor.wake_snapshot_digest != snapshot.digest
+        || snapshot.project_id != authority.project_id
+        || snapshot.role_session_id != authority.role_session_id
+        || observation
+            .pointer("/input_files/snapshot_digest")
+            .and_then(Value::as_str)
+            != Some(snapshot.digest.as_str())
+        || serde_json::to_value(&snapshot.inputs).map_err(|error| error.to_string())?
+            != observation["inbox_inputs"]
+        || actual_head.trim() != expected_head
+    {
+        return Err("correction Worker package, public inbox, original base, and published head do not match".into());
+    }
+    Ok(Some(
+        json!({"run_id":run_id,"ticket_run_id":ticket_run_id,"ticket_revision":binding.ticket_revision,"work_node_id":binding.node_id,"accepted_plan_digest":binding.plan_digest,"base_sha":base_sha,"expected_head":expected_head,"actual_head":actual_head.trim(),"package_path":package_path,"package_digest":authority.descriptor_digest,"snapshot_path":snapshot_path,"source":"public_agent_inbox_and_host_generated_package"}),
+    ))
+}
+
 fn accepted_reviewer_result(
     db: &Connection,
     ticket_run_id: &str,
     reviewer_run_id: &str,
+    expected_phase: &str,
 ) -> Result<Option<Value>, String> {
     let row: Option<(String, u64)> = db
         .query_row(
@@ -985,8 +1143,8 @@ fn accepted_reviewer_result(
              JOIN agent_runs a ON a.agent_run_id=?2 AND a.project_id=t.project_id AND a.role='reviewer' AND a.state='completed'
              JOIN agent_result_evidence e ON e.agent_run_id=a.agent_run_id AND e.project_id=t.project_id AND e.ticket_run_id=t.ticket_run_id AND e.role='reviewer' AND e.outcome='completed'
              JOIN agent_result_reducer_ack k ON k.evidence_id=e.evidence_id AND k.disposition='applied' AND k.reducer_revision=t.revision
-             WHERE t.ticket_run_id=?1 AND t.internal_phase='assessing' AND json_extract(e.result_json,'$.kind')='review_ready'",
-            params![ticket_run_id, reviewer_run_id],
+             WHERE t.ticket_run_id=?1 AND t.internal_phase=?3 AND json_extract(e.result_json,'$.kind')='review_ready'",
+            params![ticket_run_id, reviewer_run_id, expected_phase],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
@@ -1003,6 +1161,7 @@ fn accepted_reviewer_result(
 fn host_commit_reviewer_connection_evidence(
     observation: &Value,
     state_root: &Path,
+    expected_phase: &str,
 ) -> Result<Option<Value>, String> {
     if observation["role"] != "reviewer"
         || observation["ticket_run_id"]
@@ -1022,7 +1181,8 @@ fn host_commit_reviewer_connection_evidence(
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(|error| format!("open acceptance database read-only for Reviewer handoff: {error}"))?;
-    let Some(reviewer_result) = accepted_reviewer_result(&db, ticket_run_id, reviewer_run_id)?
+    let Some(reviewer_result) =
+        accepted_reviewer_result(&db, ticket_run_id, reviewer_run_id, expected_phase)?
     else {
         return Ok(None);
     };
@@ -1090,20 +1250,59 @@ fn host_commit_reviewer_connection_evidence(
     let Some(durable_commit_receipt) = commit_receipts.get(operation_id.as_str()) else {
         return Err("implementation publication has no succeeded repository.commit receipt".into());
     };
-    let result_row: Option<String> = db
+    let result_row: Option<(String, String)> = db
         .query_row(
-            "SELECT result_json FROM agent_result_evidence WHERE agent_run_id=?1 AND role='worker' AND outcome='completed' ORDER BY received_at_unix DESC LIMIT 1",
+            "SELECT evidence_id,result_json FROM agent_result_evidence WHERE agent_run_id=?1 AND role='worker' AND outcome='completed' ORDER BY received_at_unix DESC LIMIT 1",
             [durable_commit_receipt.agent_run_id.as_str()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|error| format!("read accepted Worker result evidence: {error}"))?;
-    let Some(result_json) = result_row else {
+    let Some((worker_evidence_id, result_json)) = result_row else {
         return Ok(None);
     };
     let worker_result: Value = serde_json::from_str(&result_json)
         .map_err(|error| format!("parse accepted Worker result evidence: {error}"))?;
     let change = &worker_result["structured_result"]["change_references"][0];
+    let workspace = observation["workspace_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or("Reviewer inbox observation has no workspace path")?;
+    let staged_checks = observation["inbox_inputs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|item| item["host_artifacts"].as_array().into_iter().flatten())
+        .find(|artifact| {
+            artifact["kind"] == "test_receipt"
+                && artifact["source_run_id"].as_str()
+                    == Some(durable_commit_receipt.agent_run_id.as_str())
+                && artifact["source_evidence_id"].as_str() == Some(worker_evidence_id.as_str())
+        })
+        .ok_or("Reviewer public inbox is missing the published Worker's check artifact")?;
+    let staged: rex_projects::agent_api::HostArtifactLocator =
+        serde_json::from_value(staged_checks.clone())
+            .map_err(|error| format!("parse Reviewer check artifact locator: {error}"))?;
+    staged.validate()?;
+    let registered = worker_result["artifact_refs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|reference| reference["artifact_id"].as_str() == Some(staged.artifact_id.as_str()))
+        .ok_or("Reviewer check artifact is absent from the exact accepted Worker result")?;
+    let staged_bytes = fs::read(workspace.join(&staged.path))
+        .map_err(|error| format!("read Reviewer staged Worker check artifact: {error}"))?;
+    if registered["kind"] != "test_receipt"
+        || registered["digest"].as_str() != Some(staged.digest.as_str())
+        || registered["bytes"].as_u64() != Some(staged.bytes)
+        || registered["schema_version"].as_u64() != Some(u64::from(staged.schema_version))
+        || staged_bytes.len() as u64 != staged.bytes
+        || format!("{:x}", Sha256::digest(&staged_bytes)) != staged.digest.as_str()
+        || String::from_utf8_lossy(&staged_bytes)
+            != "Emulated Worker check evidence for the exact published source revision.\n"
+    {
+        return Err("Reviewer staged check bytes or Worker evidence provenance differ from the accepted source".into());
+    }
     if publish_request.pull_request.title != "test: record acceptance fixture change"
         || publication.pull_request.title != publish_request.pull_request.title
         || !publish_request
@@ -1132,7 +1331,7 @@ fn host_commit_reviewer_connection_evidence(
     Ok(Some(json!({
         "status":"passed",
         "ticket_run_id":ticket_run_id,
-        "phase":"assessing",
+        "phase":expected_phase,
         "reviewer_run_id":reviewer_run_id,
         "reviewer_state":"completed",
         "reviewer_result":reviewer_result,
@@ -1143,7 +1342,8 @@ fn host_commit_reviewer_connection_evidence(
         "repository_commit_receipt":durable_commit_receipt,
         "publication_effect_operation_id":publication.effect_operation_id,
         "publication_receipt":publication,
-        "reviewer_input_count":observation["inbox_inputs"].as_array().map(Vec::len)
+        "reviewer_input_count":observation["inbox_inputs"].as_array().map(Vec::len),
+        "reviewer_staged_worker_check":staged_checks
     })))
 }
 
@@ -1293,6 +1493,7 @@ struct ProfilePreparation {
     hold_reviewer_after_inbox: bool,
     host_worker: bool,
     worker_recovery_stage: bool,
+    worker_review_rework_stage: bool,
 }
 
 fn prepare_profiles(
@@ -1322,6 +1523,8 @@ fn prepare_profiles(
         let context = contexts.join(format!("{role}.json"));
         let messages = if preparation.worker_recovery_stage {
             profile_messages_with_worker_recovery(role, preparation.host_worker)?
+        } else if preparation.worker_review_rework_stage {
+            profile_messages_with_review_rework(role)?
         } else {
             profile_messages(role, preparation.host_worker)?
         };
@@ -1360,6 +1563,35 @@ fn prepare_profiles(
         fs::write(profile.join("config.toml"), config).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn profile_messages_with_review_rework(role: &str) -> Result<Vec<Value>, String> {
+    let mut messages = profile_messages(role, true)?;
+    match role {
+        "reviewer" => {
+            for message in messages.iter_mut().filter(|item| item["lane"] == "workflow") {
+                message["structured_result"]["disposition"] = json!("changes_requested");
+                message["structured_result"]["unknowns"] = json!(["Repeat the bounded check against the unchanged published head."]);
+            }
+        }
+        "worker" => messages.push(message("worker", "progress", json!({
+            "summary":"The correction Worker read its host-generated assignment through the public inbox CLI.",
+            "completed_node_keys":[],"pending_node_keys":["acceptance-node"],
+            "evidence":[],"next_observation_at":null
+        }))),
+        "coordinator" => {
+            let third = messages.iter().enumerate().filter(|(_, item)| item["lane"] == "workflow").nth(2).map(|(index, _)| index)
+                .ok_or("Coordinator fixture has no post-implementation message")?;
+            messages[third] = message("coordinator", "progress", json!({
+                "summary":"The host retains the same accepted node while review corrections are checked.",
+                "completed_node_keys":[],"pending_node_keys":["acceptance-node"],
+                "evidence":[],"next_observation_at":null
+            }));
+            messages.truncate(third + 1);
+        }
+        _ => {}
+    }
+    Ok(messages)
 }
 
 fn profile_messages_with_worker_recovery(
@@ -1479,14 +1711,21 @@ pub(crate) fn profile_messages(role: &str, host_worker: bool) -> Result<Vec<Valu
                     "host_commit_operation_id".into(),
                     json!({"$fixture_ref":"worker.host_commit_operation_id"}),
                 );
-                vec![message("worker", "implementation_ready", json!({
+                let mut worker_result = message("worker", "implementation_ready", json!({
                     "change_references":[change],
                     "completed_acceptance_items":["The production CLI registered a Change manifest and returned the exact host commit receipt."],
                     "unresolved_items":[],"irregularity_references":[]
                 })).with_actions(vec![
                     json!({"action":"write_file","path":"fixture-change.md","contents":"# Acceptance fixture change\n\nCreated by the bounded emulated Worker action.\n"}),
-                    json!({"action":"repository_commit","action_id":"worker-change","message":"test: record acceptance fixture change"})
-                ]).with_artifact_ref(json!({"$fixture_ref":"artifact.change"}))]
+                    json!({"action":"repository_commit","action_id":"worker-change","message":"test: record acceptance fixture change"}),
+                    json!({"action":"write_file","path":"worker-checks.txt","contents":"Emulated Worker check evidence for the exact published source revision.\n"}),
+                    json!({"action":"register_artifact","action_id":"test_receipt","path":"worker-checks.txt","kind":"test_receipt","schema_version":1,"message_id":"worker-checks"})
+                ]).with_artifact_ref(json!({"$fixture_ref":"artifact.change"}));
+                worker_result["artifact_refs"] = json!([
+                    {"$fixture_ref":"artifact.change"},
+                    {"$fixture_ref":"artifact.test_receipt"}
+                ]);
+                vec![worker_result]
             } else {
                 vec![message("worker", "implementation_ready", json!({
                     "change_references":[change],
@@ -2719,9 +2958,10 @@ mod tests {
         ).unwrap();
         let readonly =
             Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let accepted = accepted_reviewer_result(&readonly, "ticket-run", "reviewer-run")
-            .unwrap()
-            .expect("applied ReviewReady advances Reviewing to Assessing");
+        let accepted =
+            accepted_reviewer_result(&readonly, "ticket-run", "reviewer-run", "assessing")
+                .unwrap()
+                .expect("applied ReviewReady advances Reviewing to Assessing");
         assert_eq!(accepted["reducer_revision"], 6);
         assert_eq!(accepted["result"]["kind"], "review_ready");
         for update in [
@@ -2735,7 +2975,7 @@ mod tests {
         ] {
             writable.execute_batch(update).unwrap();
             assert!(
-                accepted_reviewer_result(&readonly, "ticket-run", "reviewer-run")
+                accepted_reviewer_result(&readonly, "ticket-run", "reviewer-run", "assessing")
                     .unwrap()
                     .is_none(),
                 "{update}"
@@ -3097,7 +3337,11 @@ mod tests {
     #[test]
     fn emulated_workflow_messages_match_current_role_schemas() {
         for role in PROVIDER_ROLES {
-            for message in profile_messages(role, false).unwrap() {
+            for message in profile_messages(role, false)
+                .unwrap()
+                .into_iter()
+                .chain(profile_messages_with_review_rework(role).unwrap())
+            {
                 if message["lane"] != "workflow" {
                     continue;
                 }
