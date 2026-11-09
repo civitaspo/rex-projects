@@ -5,9 +5,6 @@ use std::process::{Child, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-#[path = "support/linux_process_snapshot.rs"]
-mod linux_process_snapshot;
-
 const MAX_CAPTURED_STDERR_BYTES: usize = 8 * 1024;
 
 struct ForegroundOwner {
@@ -110,130 +107,6 @@ fn command(config: &std::path::Path, state: &std::path::Path, home: &std::path::
         .env("REX_CALL_LOG", home.join("rex-calls.log"))
         .env("REX_FORBIDDEN_MARKER", home.join("rex-mutation-attempted"));
     command
-}
-
-#[test]
-fn linux_owner_snapshot_is_bounded_and_omits_syscall_arguments() {
-    fn write_stat(path: &std::path::Path, pid: u32, parent_pid: u32, start_ticks: u64) {
-        let mut fields = vec!["S".to_owned(), parent_pid.to_string()];
-        while fields.len() < 19 {
-            fields.push("0".into());
-        }
-        fields.push(start_ticks.to_string());
-        std::fs::write(
-            path,
-            format!("{pid} (fixture process) {}", fields.join(" ")),
-        )
-        .unwrap();
-    }
-
-    let temp = tempfile::tempdir().unwrap();
-    let owner_pid = 123;
-    let task_dir = temp.path().join(owner_pid.to_string()).join("task");
-    std::fs::create_dir_all(&task_dir).unwrap();
-    write_stat(
-        &temp.path().join(owner_pid.to_string()).join("stat"),
-        owner_pid,
-        7,
-        456,
-    );
-    for tid in owner_pid + 1..owner_pid + 8 + 3 {
-        let thread_dir = task_dir.join(tid.to_string());
-        std::fs::create_dir_all(&thread_dir).unwrap();
-        write_stat(
-            &thread_dir.join("stat"),
-            tid,
-            7,
-            456 + u64::from(tid - owner_pid),
-        );
-        std::fs::write(thread_dir.join("wchan"), "futex_wait_queue\n").unwrap();
-        std::fs::write(thread_dir.join("syscall"), "202 987654321 123456789\n").unwrap();
-    }
-    let leader_dir = task_dir.join(owner_pid.to_string());
-    std::fs::create_dir_all(&leader_dir).unwrap();
-    write_stat(&leader_dir.join("stat"), owner_pid, 7, 456);
-    std::fs::write(leader_dir.join("wchan"), "futex_wait_queue\n").unwrap();
-    std::fs::write(leader_dir.join("syscall"), "202 987654321 123456789\n").unwrap();
-    std::fs::write(leader_dir.join("children"), "456\n").unwrap();
-    let child_dir = temp.path().join("456");
-    let child_task_dir = child_dir.join("task/456");
-    std::fs::create_dir_all(&child_task_dir).unwrap();
-    write_stat(&child_dir.join("stat"), 456, owner_pid, 789);
-    write_stat(&child_task_dir.join("stat"), 456, owner_pid, 789);
-    std::fs::write(child_task_dir.join("wchan"), "do_poll.constprop.0\n").unwrap();
-    std::fs::write(child_task_dir.join("syscall"), "7 555444 333222\n").unwrap();
-
-    let host_job_dir = task_dir.join("124");
-    std::fs::write(host_job_dir.join("comm"), "rex-host-job-invoke\n").unwrap();
-    let snapshot = linux_process_snapshot::snapshot_at_with_thread_limit(
-        temp.path(),
-        owner_pid,
-        None,
-        None,
-        true,
-        4,
-    );
-    assert!(
-        snapshot.contains("pid=123,ppid=7,state=S,start_ticks=456"),
-        "{snapshot}"
-    );
-    assert!(snapshot.contains("tid=124,role=host_job,state=S,wchan=futex_wait_queue,syscall=202"));
-    assert!(
-        snapshot.find("tid=124,role=host_job").unwrap()
-            < snapshot.find("tid=123,role=leader").unwrap()
-    );
-    assert!(snapshot.contains(
-        "pid=456,start_ticks=789,tid=456,role=leader,state=S,wchan=do_poll.constprop.0,syscall=7"
-    ), "{snapshot}");
-    assert!(snapshot.contains("wchan=futex_wait_queue,syscall=202"));
-    assert!(snapshot.contains("threads_truncated=true"));
-    assert_eq!(snapshot.matches("tid=").count(), 4);
-    assert!(!snapshot.contains("987654321"));
-    assert!(!snapshot.contains("fixture process"));
-
-    let child = linux_process_snapshot::snapshot_at_with_thread_limit(
-        temp.path(),
-        456,
-        Some("linux-start-ticks:789"),
-        Some(owner_pid),
-        false,
-        8,
-    );
-    assert!(child.contains("pid=456,ppid=123,state=S,start_ticks=789"));
-    assert!(
-        linux_process_snapshot::snapshot_at_with_thread_limit(
-            temp.path(),
-            456,
-            Some("linux-start-ticks:wrong"),
-            Some(owner_pid),
-            false,
-            8,
-        )
-        .contains("identity_changed=true")
-    );
-    assert!(
-        linux_process_snapshot::snapshot_at_with_thread_limit(
-            temp.path(),
-            456,
-            Some("linux-start-ticks:789"),
-            Some(7),
-            false,
-            8,
-        )
-        .contains("identity_changed=true")
-    );
-}
-
-fn owner_process_snapshot(owner_pid: u32) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        linux_process_snapshot::snapshot(owner_pid, None, None, true)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = owner_pid;
-        "unsupported_platform".into()
-    }
 }
 
 fn fixture(
@@ -1187,7 +1060,6 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
     let mut owner = ForegroundOwner::spawn(owner_command)
         .expect("spawn foreground controller with captured stderr");
     let startup_deadline = Instant::now() + Duration::from_secs(10);
-    let mut status_polls = 0;
     loop {
         if let Some(status) = owner
             .try_wait()
@@ -1200,32 +1072,16 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
             .args(["--json", "status"])
             .output()
             .unwrap();
-        status_polls += 1;
-        let report = serde_json::from_slice::<serde_json::Value>(&status.stdout);
-        let active = report
-            .as_ref()
-            .map(|report| report["owner"]["active"].clone())
-            .map_err(ToString::to_string);
-        let status_stdout = String::from_utf8_lossy(&status.stdout);
-        let status_stderr = String::from_utf8_lossy(&status.stderr);
-        let status_diagnostic = format!(
-            "exit={:?}, success={}, owner_active={active:?}, stdout={:?}, stderr={:?}",
-            status.status.code(),
-            status.status.success(),
-            status_stdout.chars().take(2048).collect::<String>(),
-            status_stderr.chars().take(2048).collect::<String>(),
-        );
-        if status.status.success() && report.is_ok_and(|report| report["owner"]["active"] == true) {
+        if status.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&status.stdout)
+                .is_ok_and(|report| report["owner"]["active"] == true)
+        {
             break;
         }
         if Instant::now() >= startup_deadline {
-            let owner_pid = owner.child.id();
-            let process_snapshot = owner_process_snapshot(owner_pid);
             owner.terminate();
             let stderr = owner.stderr_tail();
-            panic!(
-                "foreground controller startup timed out after 10s; polls={status_polls}; last status={status_diagnostic}; owner_process_snapshot={process_snapshot:?}; controller stderr: {stderr}"
-            );
+            panic!("foreground controller startup timed out after 10s; stderr: {stderr}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1278,10 +1134,7 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         assert_eq!(report["state"], "queued");
     }
     let mut applied = false;
-    let mut apply_polls = 0;
-    let mut last_applied_state = String::from("no reload observation received");
     for _ in 0..100 {
-        apply_polls += 1;
         let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
         let revision: u64 = connection
             .query_row("SELECT revision FROM config_current", [], |row| row.get(0))
@@ -1297,9 +1150,6 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
             &std::fs::read(state.join("runtime-owner.json")).unwrap_or_default(),
         )
         .unwrap_or_default();
-        last_applied_state = format!(
-            "config_revision={revision}, project_revision={project_revision}, owner_projection={owner_projection}"
-        );
         if revision == 2 && project_revision == 2 && owner_projection["config_revision"] == 2 {
             applied = true;
             break;
@@ -1307,11 +1157,10 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     if !applied {
-        let controller_status = owner.try_wait().unwrap();
         owner.terminate();
         let stderr = owner.stderr_tail();
         panic!(
-            "active controller did not apply and load the durable config snapshot after {apply_polls} polls; last state: {last_applied_state}; controller status: {controller_status:?}; stderr: {stderr}"
+            "active controller did not apply and load the durable config snapshot; stderr: {stderr}"
         );
     }
 
