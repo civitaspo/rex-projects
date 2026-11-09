@@ -32,6 +32,15 @@ impl VerifiedStagedHostArtifact {
         &self.locator.path
     }
 
+    pub(crate) fn locator(&self) -> &HostArtifactLocator {
+        &self.locator
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_locator_for_test(locator: HostArtifactLocator) -> Self {
+        Self { locator }
+    }
+
     pub(crate) fn verify_copy_in(&self, workspace: &Path) -> Result<(), String> {
         self.locator.validate()?;
         let workspace = canonical_real_directory(workspace, "Worker verification worktree")?;

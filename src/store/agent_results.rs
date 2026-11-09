@@ -4861,6 +4861,7 @@ pub(crate) mod tests {
         ]);
         let base_commit = run_git(&["-C", seed_repository.to_str().unwrap(), "rev-parse", "HEAD"]);
         let base = base_commit.as_str();
+        let bootstrap_worker_id = AgentRunId::parse("fixture-bootstrap-worker").unwrap();
         let worker_id = AgentRunId::parse("fixture-prior-worker").unwrap();
         let blocked = serde_json::json!({
             "summary":"blocked on a missing dependency",
@@ -4877,10 +4878,10 @@ pub(crate) mod tests {
                     reason: "missing dependency".into(),
                 },
                 result_digest: Some(digest(&serde_json::to_vec(&blocked).unwrap()).unwrap()),
-                structured_result: blocked,
+                structured_result: blocked.clone(),
                 artifact_refs: Vec::new(),
             },
-            Some(worker_id.clone()),
+            Some(bootstrap_worker_id),
         )
         .unwrap();
         let project = ProjectId::parse("fixture-project").unwrap();
@@ -4975,11 +4976,6 @@ pub(crate) mod tests {
             "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,3,?3,?4,?5,?6,?7,?8,?9,?7,?10,?11,1)",
             rusqlite::params![project.as_str(),ticket.as_str(),configuration_digest.as_str(),plan_digest.as_str(),plan_json,plan_record.source_evidence_id,plan_record.source_agent_run_id.as_str(),plan_record.source_message_id,plan_record.source_result_digest.as_str(),plan_record.coordinator_role_session_id,plan_record.coordinator_authority_digest.as_str()],
         ).unwrap();
-        let prior_authority = worker
-            .store
-            .agent_launch_authority(&worker_id)
-            .unwrap()
-            .unwrap();
         let git_options = crate::worktrees::GitOptions {
             executable: git_executable.clone(),
             environment: BTreeMap::new(),
@@ -5024,6 +5020,138 @@ pub(crate) mod tests {
             .unwrap();
         let worktree = prepared_work.worktree.path.clone();
         let branch = prepared_work.worktree.branch.clone();
+        let source_payload = serde_json::json!({
+            "work_node_id":"node-artifact-source",
+            "repository":"repo-a",
+            "publication_operation_id":"publish-artifact-source",
+            "published_head":base,
+            "test_receipt_artifact_ids":[]
+        });
+        let source = host_validation_fixture::host_validated_result_inner(
+            &mut worker.store,
+            &fixture_root,
+            worker.owner_generation,
+            project.clone(),
+            Some(ticket.clone()),
+            Role::Worker,
+            RoleResultMessage {
+                schema_version: 1,
+                message_id: "registered-host-artifact-source".into(),
+                kind: RoleOutputKind::VerificationReady,
+                assertion: AgentAssertion::Succeeded,
+                result_digest: Some(digest(&serde_json::to_vec(&source_payload).unwrap()).unwrap()),
+                structured_result: source_payload,
+                artifact_refs: Vec::new(),
+            },
+            Some(AgentRunId::parse("fixture-artifact-source-worker").unwrap()),
+            Vec::new(),
+            Some("node-artifact-source"),
+        )
+        .unwrap();
+        let source_references = source.message.artifact_refs.clone();
+        let source_result = worker
+            .store
+            .store_validated_agent_result(
+                &source.artifacts,
+                worker.owner_generation,
+                &source.terminal,
+                source.message,
+            )
+            .unwrap();
+        let source_authority = worker
+            .store
+            .agent_launch_authority(&AgentRunId::parse("fixture-artifact-source-worker").unwrap())
+            .unwrap()
+            .unwrap();
+        let staged_locators = crate::parent_artifacts::stage_verified_parent_artifacts(
+            &mut worker.store,
+            &worker.artifacts,
+            &source_authority,
+            source_result.receipt.evidence_id(),
+            &project,
+            source_authority.config_revision.0,
+            &source_authority.config_digest,
+            &worktree,
+            &source_references,
+        )
+        .unwrap();
+        assert_eq!(staged_locators.len(), 1);
+        let source_evidence_id = source_result.receipt.evidence_id().to_owned();
+        let wake_authorization = crate::engine::orchestration::WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: ticket.clone(),
+            ticket_revision: 4,
+            work_node_id: node_id.clone(),
+            accepted_plan_digest: plan_digest.clone(),
+            prior_worker_agent_run_id: source_authority.agent_run_id.clone(),
+            prior_terminal_digest: Digest::parse("b".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("c".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: None,
+            prior_host_commit_receipt_digest: None,
+            expected_head: base.into(),
+            source_coordinator_evidence_id: source_evidence_id.clone(),
+            prior_worker_result_evidence_id: source_evidence_id.clone(),
+            prior_artifact_refs: source_references.clone(),
+        };
+        let wake_input = crate::agent_api::AgentWakeItem {
+            wake_input_id: 1,
+            source_type: "worker_recovery_authorization".into(),
+            source_id: source_evidence_id,
+            source_revision: 4,
+            priority: 1,
+            payload_json: serde_json::json!({"authorization":wake_authorization}),
+            host_artifact_source_evidence_ids: Vec::new(),
+            host_artifacts: staged_locators,
+            host_completion_context: None,
+        };
+        let role_session = format!("ticket:{ticket}:{role}", role = "worker:node-a");
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project.clone(),
+            role_session_id: role_session.clone(),
+            agent_run_id: worker_id.to_string(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: vec![wake_input],
+            worker_correction_context: None,
+        };
+        wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+        let recipient = host_validation_fixture::host_validated_result_inner(
+            &mut worker.store,
+            &fixture_root,
+            worker.owner_generation,
+            project.clone(),
+            Some(ticket.clone()),
+            Role::Worker,
+            RoleResultMessage {
+                schema_version: 1,
+                message_id: "blocked-worker-result-with-artifact".into(),
+                kind: RoleOutputKind::Progress,
+                assertion: AgentAssertion::Blocked {
+                    reason: "missing dependency".into(),
+                },
+                result_digest: Some(digest(&serde_json::to_vec(&blocked).unwrap()).unwrap()),
+                structured_result: blocked.clone(),
+                artifact_refs: Vec::new(),
+            },
+            Some(worker_id.clone()),
+            wake_snapshot.inputs.clone(),
+            Some("node-a"),
+        )
+        .unwrap();
+        let _recipient_result = worker
+            .store
+            .store_validated_agent_result(
+                &recipient.artifacts,
+                worker.owner_generation,
+                &recipient.terminal,
+                recipient.message,
+            )
+            .unwrap();
+        let prior_authority = worker
+            .store
+            .agent_launch_authority(&worker_id)
+            .unwrap()
+            .unwrap();
         let prepare_operation = OperationId::parse("prepare-worker-recovery").unwrap();
         let prepare_request = crate::delivery_runtime::PrepareWorktreesEffectPayload {
             schema_version: 1,
@@ -5094,16 +5222,8 @@ pub(crate) mod tests {
             coordinator_role_session_id: coordinator_authority.role_session_id.clone(),
             coordinator_authority_digest: coordinator_authority.digest().unwrap(),
         };
-        let role_session = format!("ticket:{ticket}:worker:{node_id}");
-        let wake_snapshot = crate::agent_api::AgentWakeSnapshot {
-            schema_version: 1,
-            project_id: project.clone(),
-            role_session_id: role_session.clone(),
-            agent_run_id: worker_id.to_string(),
-            digest: prior_authority.wake_snapshot_digest.clone(),
-            inputs: Vec::new(),
-            worker_correction_context: None,
-        };
+        assert_eq!(wake_snapshot.role_session_id, role_session);
+        assert_eq!(wake_snapshot.digest, prior_authority.wake_snapshot_digest);
         let mailbox_directory = prior_authority.control_dir.join("mailbox");
         let descriptor_bytes = std::fs::read(mailbox_directory.join("descriptor.json")).unwrap();
         let descriptor: crate::mailbox::MailboxDescriptor =
@@ -5459,10 +5579,15 @@ pub(crate) mod tests {
             .agent_launch_authority(&worker_id)
             .unwrap()
             .unwrap();
+        let manifested_bytes = b"updated tracked fixture\n";
+        std::fs::write(worktree.join("README.md"), manifested_bytes).unwrap();
         let manifest = crate::host_commit::ChangeManifest {
             schema_version: 1,
-            entries: vec![crate::host_commit::ManifestEntry::Delete {
-                path: "obsolete.md".into(),
+            entries: vec![crate::host_commit::ManifestEntry::Write {
+                path: "README.md".into(),
+                mode: crate::host_commit::FileMode::Regular0644,
+                sha256: digest(manifested_bytes).unwrap(),
+                byte_count: manifested_bytes.len() as u64,
             }],
         };
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
@@ -5526,9 +5651,11 @@ pub(crate) mod tests {
             &stored_reservation.mailbox_directory,
         )
         .unwrap();
-        let invalid_request_id = "terminal-restart-invalid-commit-trailer";
+        let unknown_receipt = worktree.join("correction-test-receipt.txt");
+        std::fs::write(&unknown_receipt, "not in the immutable change manifest\n").unwrap();
+        let invalid_request_id = "terminal-restart-manifest-path-mismatch";
         let invalid_commit_message =
-            "docs: fixture retained commit\\n\\nCo-authored-by: Codex <noreply@openai.com>";
+            "docs: fixture retained commit\n\nCo-authored-by: Codex <noreply@openai.com>";
         let invalid_request = crate::agent_api::RepositoryCommitRequest {
             schema_version: 1,
             message_id: invalid_request_id.into(),
@@ -5761,14 +5888,41 @@ pub(crate) mod tests {
             invalid_receipt["reason"]
                 .as_str()
                 .unwrap()
-                .contains("trailer")
+                .contains("manifest paths")
         );
         let observed_head = delivery.observe_local_head_at(&worktree).unwrap();
         assert_eq!(observed_head, base);
-        let index_status = run_git(&["-C", worktree.to_str().unwrap(), "status", "--porcelain"]);
-        assert!(
-            index_status.is_empty(),
-            "invalid request mutated worktree: {index_status}"
+        assert_eq!(
+            run_git(&[
+                "-C",
+                worktree.to_str().unwrap(),
+                "diff",
+                "--cached",
+                "--quiet",
+                "HEAD"
+            ]),
+            ""
+        );
+        let unchanged_rejection_status =
+            run_git(&["-C", worktree.to_str().unwrap(), "status", "--porcelain"]);
+        assert!(unchanged_rejection_status.contains("README.md"));
+        assert!(unchanged_rejection_status.contains("correction-test-receipt.txt"));
+        std::fs::remove_file(&unknown_receipt).unwrap();
+        std::fs::write(worktree.join("README.md"), "base\n").unwrap();
+        let remaining_status = run_git(&[
+            "-C",
+            worktree.to_str().unwrap(),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ]);
+        assert_eq!(
+            remaining_status,
+            format!(
+                "?? .rex-artifacts/sha256/{}/{}",
+                &source_references[0].artifact_id.as_str()[..2],
+                source_references[0].artifact_id
+            )
         );
         let effect_count_before_invalid_replay: u64 = worker
             .store
@@ -5804,7 +5958,7 @@ pub(crate) mod tests {
             .unwrap();
         let invalid_error = invalid_mailbox_receipt.error.unwrap();
         assert!(!invalid_error.retryable);
-        assert!(invalid_error.message.contains("trailer"));
+        assert!(invalid_error.message.contains("manifest paths"));
         let effect_count_after_invalid_replay: u64 = worker
             .store
             .connection
@@ -5814,6 +5968,170 @@ pub(crate) mod tests {
             effect_count_after_invalid_replay,
             effect_count_before_invalid_replay
         );
+
+        std::fs::write(worktree.join("README.md"), manifested_bytes).unwrap();
+        let prepared_request_id = "terminal-restart-registered-artifact-prepare";
+        let prepared_request = crate::agent_api::RepositoryCommitRequest {
+            schema_version: 1,
+            message_id: prepared_request_id.into(),
+            worktree_id: stored_assignment.node_id.to_string(),
+            expected_head: base.into(),
+            manifest: manifest_artifact.reference.clone(),
+            manifest_digest: manifest_artifact.reference.digest.clone(),
+            commit_message:
+                "docs: prepare with registered host artifact\n\nCo-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let prepared_envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(prepared_request_id).unwrap(),
+            operation_id: Some(prior_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("repository.commit").unwrap(),
+            project_id: Some(project.clone()),
+            run_id: Some(worker_id.to_string()),
+            attempt: Some(prior_authority.attempt),
+            run_epoch: Some(prior_authority.run_epoch),
+            expected_subject_revision: Some(current.revision),
+            role: Some(Role::Worker),
+            request_type: None,
+            params: serde_json::to_value(&prepared_request).unwrap(),
+        };
+        mailbox
+            .queue(
+                prepared_request_id,
+                &serde_json::to_vec(&prepared_envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let prepared_mailbox_request = mailbox
+            .pending(crate::mailbox::unix_time_now().unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|request| request.request_id == prepared_request_id)
+            .unwrap();
+        let prepared_payload = crate::delivery_runtime::CommitWorkerManifestEffectPayload {
+            schema_version: 1,
+            agent_run_id: worker_id.clone(),
+            project_id: project.clone(),
+            message_id: prepared_request.message_id.clone(),
+            configuration_digest: prior_authority.config_digest.clone(),
+            ticket_revision: current.revision,
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket.clone(),
+            work_node_id: stored_assignment.node_id.clone(),
+            repository_id: repository.clone(),
+            worktree_path: worktree.clone(),
+            branch: branch.clone(),
+            prepare_operation_id: prepare_operation.clone(),
+            expected_base_sha: base.into(),
+            expected_head: prepared_request.expected_head.clone(),
+            manifest_artifact: prepared_request.manifest.clone(),
+            manifest_digest: prepared_request.manifest_digest.clone(),
+            manifest: manifest.clone(),
+            commit_message: prepared_request.commit_message.clone(),
+            required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let (prepared_request_json, prepared_request_digest) =
+            crate::delivery_runtime::canonical_delivery_payload(&prepared_payload).unwrap();
+        let prepared_operation =
+            OperationId::parse(format!("repo-commit-{}", prepared_mailbox_request.digest)).unwrap();
+        let prepared_intent = crate::store::EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket.to_string(),
+            operation_id: prepared_operation.to_string(),
+            logical_key: format!(
+                "repository.commit:{worker_id}:{}",
+                prepared_mailbox_request.digest
+            ),
+            kind: "commit_worker_manifest".into(),
+            request_json: prepared_request_json,
+            request_digest: prepared_request_digest,
+            expected_revision: Some(current.revision),
+        };
+        worker
+            .store
+            .enqueue_effect(restarted_generation, &prepared_intent)
+            .unwrap();
+        // Stop at the signing boundary: no unsigned fallback. The HostCommitter fixture tests
+        // the successful signed/post-hook path; this dispatcher test proves verified evidence
+        // reaches its durable prepared intent through the real registry and effect handler.
+        run_git(&[
+            "-C",
+            worktree.to_str().unwrap(),
+            "config",
+            "gpg.program",
+            "/usr/bin/false",
+        ]);
+        let prepared_tick = crate::effects::EffectDispatcher::tick(
+            &mut worker.store,
+            restarted_generation,
+            crate::store::now_unix().unwrap() + 40,
+            &[&commit_handler],
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepared_tick,
+            crate::effects::DispatchTick::WaitingForReconciliation { .. }
+        ));
+        let prepared_effect_status: String = worker
+            .store
+            .connection
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id=?1",
+                [prepared_intent.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prepared_effect_status, "uncertain");
+        let prepared_host_intent_path = delivery_state
+            .join("host-commits")
+            .join(prepared_operation.as_str())
+            .join("intent.json");
+        let prepared_host_intent: crate::host_commit::HostCommitIntent =
+            crate::protocol::parse_unique(&std::fs::read(&prepared_host_intent_path).unwrap())
+                .unwrap();
+        assert_eq!(prepared_host_intent.host_artifact_allowlist.len(), 1);
+        assert_eq!(
+            prepared_host_intent.host_artifact_allowlist[0].artifact_id,
+            source_references[0].artifact_id
+        );
+        assert_eq!(delivery.observe_local_head_at(&worktree).unwrap(), base);
+        let prepared_mailbox_receipt = crate::protocol::ResponseEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(prepared_request_id).unwrap(),
+            result: None::<serde_json::Value>,
+            error: Some(crate::protocol::ProtocolError {
+                code: crate::protocol::ErrorCode::Unavailable,
+                message: "fixture stopped after verifying durable host-commit preparation".into(),
+                retryable: true,
+                retry_after_ms: None,
+                details: BTreeMap::new(),
+            }),
+            extensions: BTreeMap::new(),
+        };
+        mailbox
+            .publish_receipt(
+                prepared_request_id,
+                &serde_json::to_vec(&prepared_mailbox_receipt).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        worker
+            .store
+            .test_connection()
+            .execute(
+                "DELETE FROM effects WHERE operation_id=?1",
+                [prepared_intent.operation_id.as_str()],
+            )
+            .unwrap();
+        std::fs::remove_dir_all(
+            delivery_state
+                .join("host-commits")
+                .join(prepared_operation.as_str()),
+        )
+        .unwrap();
 
         let terminal_request_id = "terminal-restart-replay-scope-check";
         let request = crate::agent_api::RepositoryCommitRequest {
@@ -6870,10 +7188,10 @@ pub(crate) mod host_validation_fixture {
         pub ingested: IngestedAgentResult,
     }
 
-    struct InPlaceTerminalFixture {
-        artifacts: crate::artifacts::ArtifactStore,
-        terminal: VerifiedAgentTerminal,
-        message: RoleResultMessage,
+    pub(super) struct InPlaceTerminalFixture {
+        pub(super) artifacts: crate::artifacts::ArtifactStore,
+        pub(super) terminal: VerifiedAgentTerminal,
+        pub(super) message: RoleResultMessage,
     }
 
     /// Builds real host terminal and result evidence around test-seeded running launch records.
@@ -7099,6 +7417,7 @@ pub(crate) mod host_validation_fixture {
             message,
             Some(agent_run_id),
             wake_inputs,
+            None,
         )
         .map_err(|error| format!("host validated result fixture setup: {error}"))?;
         let ingested = store
@@ -7139,6 +7458,7 @@ pub(crate) mod host_validation_fixture {
             message,
             agent_run_id_override,
             Vec::new(),
+            None,
         )
     }
 
@@ -7159,6 +7479,7 @@ pub(crate) mod host_validation_fixture {
             message,
             None,
             Vec::new(),
+            None,
         )
     }
 
@@ -7166,7 +7487,7 @@ pub(crate) mod host_validation_fixture {
         clippy::too_many_arguments,
         reason = "Test fixtures bind explicit launch and result identities"
     )]
-    fn host_validated_result_inner(
+    pub(super) fn host_validated_result_inner(
         store: &mut ConfigStore,
         root: &std::path::Path,
         owner_generation: u64,
@@ -7176,6 +7497,7 @@ pub(crate) mod host_validation_fixture {
         mut message: RoleResultMessage,
         agent_run_id_override: Option<AgentRunId>,
         wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
+        worker_node_id: Option<&str>,
     ) -> Result<InPlaceTerminalFixture, String> {
         let project = store
             .project(&project_id)?
@@ -7213,7 +7535,13 @@ pub(crate) mod host_validation_fixture {
         authority.project_id = project_id.clone();
         authority.role = role;
         authority.role_session_id = match role {
-            Role::Worker => "ticket:fixture-ticket-run:worker:node-a".into(),
+            Role::Worker => format!(
+                "ticket:{}:worker:{}",
+                ticket_run_id
+                    .as_ref()
+                    .map_or("fixture-ticket-run", TicketRunId::as_str),
+                worker_node_id.unwrap_or("node-a")
+            ),
             Role::Coordinator => "ticket_run:fixture-ticket-run:coordinator".into(),
             Role::MergeDecision => "ticket_run:fixture-ticket-run:merge_decision".into(),
             Role::Supervisor => format!("project:{}:supervisor", project_id.as_str()),
