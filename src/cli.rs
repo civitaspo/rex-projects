@@ -312,6 +312,20 @@ enum AgentCommand {
         #[arg(long)]
         environment_handoff: PathBuf,
     },
+    /// Internal detached finite-turn supervisor bound to one Rex-owned foreground shim.
+    #[command(name = "run-step-supervisor", hide = true)]
+    RunStepSupervisor {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long)]
+        environment_handoff: PathBuf,
+        #[arg(long)]
+        anchor_pid: u32,
+        #[arg(long)]
+        anchor_start_identity: String,
+    },
     TrialStep {
         #[arg(long)]
         run: String,
@@ -2888,6 +2902,25 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                 println!("Completed finite Agent turn {}.", result.run_id);
                 Ok(())
             }
+        }
+        AgentCommand::RunStepSupervisor {
+            run,
+            package,
+            environment_handoff,
+            anchor_pid,
+            anchor_start_identity,
+        } => {
+            crate::run_step_cli::run_step_supervisor(
+                &run,
+                &package,
+                &environment_handoff,
+                crate::launch::LaunchAnchorIdentity {
+                    pid: anchor_pid,
+                    start_identity: anchor_start_identity,
+                },
+            )
+            .map_err(CliError::unavailable)?;
+            Ok(())
         }
         AgentCommand::TrialStep {
             run,

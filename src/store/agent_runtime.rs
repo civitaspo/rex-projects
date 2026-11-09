@@ -1667,24 +1667,55 @@ pub(crate) mod tests {
         pub slot_owner_id: String,
     }
 
+    pub(crate) struct PreparedBlockLossFixture {
+        pub store: ConfigStore,
+        pub generation: u64,
+        pub authority: crate::launch::AgentLaunchAuthority,
+        pub authority_digest: Digest,
+        pub qualification: ProviderQualification,
+        pub reservation: AgentLaunchReservation,
+        pub slot_owner_id: String,
+    }
+
+    enum BlockLossFixtureOutcome {
+        Prepared(Box<PreparedBlockLossFixture>),
+        Completed(Box<CompletedBlockLossFixture>),
+    }
+
     pub(crate) fn completed_block_loss_fixture(
         root: &std::path::Path,
         complete_family: bool,
     ) -> CompletedBlockLossFixture {
-        completed_block_loss_fixture_inner(root, complete_family, true)
+        match completed_block_loss_fixture_inner(root, complete_family, true, false) {
+            BlockLossFixtureOutcome::Completed(fixture) => *fixture,
+            BlockLossFixtureOutcome::Prepared(_) => unreachable!(),
+        }
     }
 
     pub(crate) fn completed_family_without_terminal_fixture(
         root: &std::path::Path,
     ) -> CompletedBlockLossFixture {
-        completed_block_loss_fixture_inner(root, true, false)
+        match completed_block_loss_fixture_inner(root, true, false, false) {
+            BlockLossFixtureOutcome::Completed(fixture) => *fixture,
+            BlockLossFixtureOutcome::Prepared(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn prepared_anchored_block_loss_fixture(
+        root: &std::path::Path,
+    ) -> PreparedBlockLossFixture {
+        match completed_block_loss_fixture_inner(root, false, false, true) {
+            BlockLossFixtureOutcome::Prepared(fixture) => *fixture,
+            BlockLossFixtureOutcome::Completed(_) => unreachable!(),
+        }
     }
 
     fn completed_block_loss_fixture_inner(
         root: &std::path::Path,
         complete_family: bool,
         publish_cancelled_terminal: bool,
-    ) -> CompletedBlockLossFixture {
+        prepare_anchored_only: bool,
+    ) -> BlockLossFixtureOutcome {
         use crate::domain::ids::{AgentRunId, OperationId, ProfileId, ProjectId, Revision};
         use crate::domain::types::{AgentAdapter, Role};
         use crate::launch::{
@@ -1713,7 +1744,26 @@ pub(crate) mod tests {
         let mut config = applied();
         let profile_id = ProfileId::parse("supervisor").unwrap();
         let profile = config.profiles.get_mut(&profile_id).unwrap();
-        profile.command = vec!["/bin/sleep".into()];
+        let executable = if prepare_anchored_only {
+            let marker = root.join("provider-exit");
+            profile.adapter = AgentAdapter::ClaudeCode;
+            profile.options = Some(crate::config::ProfileOptions::ClaudeCode(
+                crate::config::ClaudeCodeOptions::default(),
+            ));
+            profile.command = vec![
+                "/usr/bin/perl".into(),
+                "-e".into(),
+                "$SIG{TERM}='IGNORE'; $SIG{INT}='IGNORE'; while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }".into(),
+                marker.display().to_string(),
+            ];
+            std::fs::canonicalize("/usr/bin/perl").unwrap()
+        } else {
+            profile.command = vec!["/bin/sleep".into()];
+            std::fs::canonicalize("/bin/sleep").unwrap()
+        };
+        let profile_commit_mode = profile.commit_mode;
+        let profile_invocation_options_digest =
+            crate::run_step::invocation_options_digest(profile).unwrap();
         let profile_digest = crate::store::agent_profile_digest(profile).unwrap();
         let applied_snapshot = store
             .apply_snapshot("factory", &config, ExpectedRevision::Bootstrap)
@@ -1761,9 +1811,15 @@ pub(crate) mod tests {
             .unwrap();
 
         let mut qualification = qualification();
-        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
         qualification.project_id = project_id.clone();
         qualification.profile_digest = profile_digest.clone();
+        if prepare_anchored_only {
+            qualification.adapter = AgentAdapter::ClaudeCode;
+            qualification.commit_mode = profile_commit_mode;
+            qualification.permission_mode = "auto; permission prompts denied unattended".into();
+            qualification.invocation_options_digest = profile_invocation_options_digest;
+            qualification.proof.observed_permission_mode = qualification.permission_mode.clone();
+        }
         qualification.executable_path = executable.display().to_string();
         qualification.executable_digest = Digest::parse(format!(
             "{:x}",
@@ -1800,7 +1856,16 @@ pub(crate) mod tests {
             start_identity: "wrapper-born-test".into(),
             rex_session_id: "session".into(),
             rex_block_id: "block-test".into(),
-            runtime_binary_digest: digest('4'),
+            runtime_binary_digest: if prepare_anchored_only {
+                Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(std::fs::read(std::env::current_exe().unwrap()).unwrap())
+                ))
+                .unwrap()
+            } else {
+                digest('4')
+            },
+            rex_launch_anchor: None,
         };
         let provider_pid = u32::MAX - 19;
         let provider_start_identity = "provider-born-test".to_owned();
@@ -1967,8 +2032,10 @@ pub(crate) mod tests {
             role_contract: "fixture".into(),
             prompt: "fixture".into(),
             continuation: None,
-            shutdown_grace_seconds: 30,
-            start_ack_timeout_seconds: 30,
+            shutdown_grace_seconds: if prepare_anchored_only { 1 } else { 30 },
+            start_ack_timeout_seconds: if prepare_anchored_only { 10 } else { 30 },
+            supervision_mode: prepare_anchored_only
+                .then_some(crate::run_step_package::RunStepSupervisionMode::AnchoredSupervisor),
         };
         let mut authority = authority_base;
         authority.descriptor_digest = package.publish_once(&authority.descriptor_path).unwrap();
@@ -2000,6 +2067,18 @@ pub(crate) mod tests {
             [project_id.as_str()],
         ).unwrap();
 
+        if prepare_anchored_only {
+            return BlockLossFixtureOutcome::Prepared(Box::new(PreparedBlockLossFixture {
+                store,
+                generation,
+                authority,
+                authority_digest,
+                qualification,
+                reservation,
+                slot_owner_id: run_id.to_string(),
+            }));
+        }
+
         let start_request = AgentStartRequest {
             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
             operation_id: operation_id.clone(),
@@ -2012,6 +2091,7 @@ pub(crate) mod tests {
             qualification_receipt_digest: qualification_digest.clone(),
             wrapper_pid: wrapper.pid,
             wrapper_start_identity: wrapper.start_identity.clone(),
+            rex_launch_anchor: None,
             rex_session_id: wrapper.rex_session_id.clone(),
             rex_block_id: wrapper.rex_block_id.clone(),
         };
@@ -2049,6 +2129,7 @@ pub(crate) mod tests {
             descriptor_digest: authority.descriptor_digest.clone(),
             wrapper_pid: wrapper.pid,
             wrapper_start_identity: wrapper.start_identity.clone(),
+            rex_launch_anchor: None,
         };
         spool.publish_run_family_binding_once(&binding).unwrap();
         let make_family = |coverage| RunFamilyRecord {
@@ -2123,6 +2204,7 @@ pub(crate) mod tests {
                     exit_code: None,
                     timed_out: false,
                     cancellation_signal: Some(1),
+                    cancellation_cause: None,
                     cleanup: CleanupState::Confirmed,
                     cleanup_detail: None,
                     processes: vec![observed_process],
@@ -2138,7 +2220,7 @@ pub(crate) mod tests {
         }
         let slot_owner_id = run_id.to_string();
 
-        CompletedBlockLossFixture {
+        BlockLossFixtureOutcome::Completed(Box::new(CompletedBlockLossFixture {
             store,
             generation,
             run: crate::store::agent_recovery::RecoverableAgentRun {
@@ -2162,7 +2244,7 @@ pub(crate) mod tests {
             provider,
             start,
             slot_owner_id,
-        }
+        }))
     }
 
     pub(crate) fn test_execution_slot_disposition(store: &ConfigStore, owner_id: &str) -> String {
@@ -2693,6 +2775,7 @@ pub(crate) mod tests {
             qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
             wrapper_pid: 42,
             wrapper_start_identity: "wrapper-start-1".into(),
+            rex_launch_anchor: None,
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
         };
@@ -2707,6 +2790,7 @@ pub(crate) mod tests {
                     rex_session_id: start_request.rex_session_id.clone(),
                     rex_block_id: start_request.rex_block_id.clone(),
                     runtime_binary_digest: start_request.runtime_binary_digest.clone(),
+                    rex_launch_anchor: None,
                 },
             )
             .unwrap();
@@ -2780,6 +2864,19 @@ pub(crate) mod tests {
             &start_request.wrapper_start_identity,
         )
         .unwrap();
+        let mut wrongly_anchored_package = wrapper_package.clone();
+        wrongly_anchored_package.supervision_mode =
+            Some(crate::run_step_package::RunStepSupervisionMode::AnchoredSupervisor);
+        assert!(
+            crate::run_step_cli::validate_run_family_binding(
+                &wrongly_anchored_package,
+                &family_binding,
+                &start_request,
+                start_request.wrapper_pid,
+                &start_request.wrapper_start_identity,
+            )
+            .is_err()
+        );
         let mut wrong_slot_binding = family_binding;
         wrong_slot_binding.reservation_epoch = reservation.run_epoch;
         assert!(

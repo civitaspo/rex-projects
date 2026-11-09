@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{AgentRunId, Digest};
-use crate::launch::{AgentLaunchReceipt, AgentStartRequest};
+use crate::launch::{AgentLaunchReceipt, AgentStartRequest, LaunchAnchorIdentity};
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::run_step::{RunReceipt, TurnResult};
 
@@ -81,6 +81,8 @@ pub struct RunFamilyBinding {
     pub descriptor_digest: Digest,
     pub wrapper_pid: u32,
     pub wrapper_start_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<LaunchAnchorIdentity>,
 }
 
 impl RunFamilyBinding {
@@ -89,6 +91,12 @@ impl RunFamilyBinding {
             || self.reservation_epoch == 0
             || self.wrapper_pid == 0
             || self.wrapper_start_identity.trim().is_empty()
+            || self.rex_launch_anchor.as_ref().is_some_and(|anchor| {
+                anchor.pid == 0
+                    || anchor.pid == self.wrapper_pid
+                    || anchor.start_identity.trim().is_empty()
+                    || anchor.start_identity.chars().any(char::is_control)
+            })
         {
             return Err("run-family binding is outside its bounds".into());
         }
@@ -453,6 +461,7 @@ impl RunStepSpool {
             || family.binding.descriptor_digest != request.request.descriptor_digest
             || family.binding.wrapper_pid != request.request.wrapper_pid
             || family.binding.wrapper_start_identity != request.request.wrapper_start_identity
+            || family.binding.rex_launch_anchor != request.request.rex_launch_anchor
             || family.coverage != RunFamilyCoverage::Complete
         {
             return Err(
@@ -556,6 +565,7 @@ impl RunStepSpool {
             || family.binding.descriptor_digest != request.request.descriptor_digest
             || family.binding.wrapper_pid != request.request.wrapper_pid
             || family.binding.wrapper_start_identity != request.request.wrapper_start_identity
+            || family.binding.rex_launch_anchor != request.request.rex_launch_anchor
             || family.coverage != RunFamilyCoverage::Complete
         {
             return Err(
@@ -840,6 +850,7 @@ mod tests {
             qualification_receipt_digest: digest('d'),
             wrapper_pid: 100,
             wrapper_start_identity: "birth-100".into(),
+            rex_launch_anchor: None,
             rex_session_id: "session-1".into(),
             rex_block_id: "block-1".into(),
         }
@@ -885,6 +896,7 @@ mod tests {
             descriptor_digest: request.descriptor_digest.clone(),
             wrapper_pid: request.wrapper_pid,
             wrapper_start_identity: request.wrapper_start_identity.clone(),
+            rex_launch_anchor: request.rex_launch_anchor.clone(),
         }
     }
 
@@ -953,6 +965,7 @@ mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancellation_signal: None,
+                cancellation_cause: None,
                 cleanup: CleanupState::Confirmed,
                 cleanup_detail: None,
                 processes: vec![],

@@ -22,7 +22,7 @@ use crate::engine::orchestration::{
 use crate::launch::{AgentLaunchAuthority, ProviderQualification};
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::roles::RoleResultMessage;
-use crate::run_step::{CleanupState, TurnOutcome};
+use crate::run_step::{CancellationCause, CleanupState, TurnOutcome};
 use crate::run_step_spool::{
     AgentTurnResult, BlockLossCleanupSnapshot, RunFamilyCoverage, RunFamilyRecord,
     StartRequestEnvelope,
@@ -382,6 +382,7 @@ pub(crate) fn verify_cancelled_agent_cleanup(
         descriptor_digest: authority.descriptor_digest.clone(),
         wrapper_pid: start.request.wrapper_pid,
         wrapper_start_identity: start.request.wrapper_start_identity.clone(),
+        rex_launch_anchor: start.request.rex_launch_anchor.clone(),
     };
     let wrapper: crate::launch::ObservedWrapperIdentity = crate::protocol::parse_unique(
         run.wrapper_identity_json
@@ -397,6 +398,11 @@ pub(crate) fn verify_cancelled_agent_cleanup(
         || family.wrapper_process.pid != wrapper.pid
         || family.wrapper_process.start_identity != wrapper.start_identity
         || family.wrapper_process.quality != ProcessIdentityQuality::KernelBirthToken
+        || start
+            .request
+            .rex_launch_anchor
+            .as_ref()
+            .is_some_and(|anchor| family.wrapper_process.parent_pid != anchor.pid)
         || family.provider_root.parent_pid != wrapper.pid
         || family.provider_root.quality != ProcessIdentityQuality::KernelBirthToken
     {
@@ -542,6 +548,18 @@ fn validate_cancelled_result_for_start(
     qualification: &ProviderQualification,
 ) -> Result<(), String> {
     let receipt = &result.receipt;
+    let signal_cancellation = receipt.cancellation_signal.is_some_and(|signal| signal > 0)
+        && receipt.cancellation_cause.is_none();
+    let anchor_cancellation = matches!(
+        (&receipt.cancellation_cause, start.request.rex_launch_anchor.as_ref()),
+        (
+            Some(CancellationCause::RexLaunchAnchorClosed {
+                pid,
+                start_identity,
+            }),
+            Some(anchor),
+        ) if *pid == anchor.pid && start_identity == &anchor.start_identity
+    ) && receipt.cancellation_signal.is_none();
     if receipt.run_id != authority.agent_run_id
         || receipt.attempt != authority.attempt
         || receipt.provider != qualification.adapter
@@ -550,7 +568,7 @@ fn validate_cancelled_result_for_start(
         || !matches!(receipt.outcome, TurnOutcome::Cancelled)
         || !matches!(receipt.cleanup, CleanupState::Confirmed)
         || receipt.timed_out
-        || receipt.cancellation_signal.is_none_or(|signal| signal <= 0)
+        || !(signal_cancellation || anchor_cancellation)
         || receipt.exit_code.is_some()
         || receipt.result_digest.is_some()
         || result.structured_result.is_some()
@@ -616,6 +634,7 @@ mod cancelled_cleanup_tests {
             qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
             wrapper_pid: std::process::id(),
             wrapper_start_identity: "wrapper-birth".into(),
+            rex_launch_anchor: None,
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
         };
@@ -627,6 +646,19 @@ mod cancelled_cleanup_tests {
             ),
             request,
         }
+    }
+
+    fn start_for_anchor_eof(authority: &AgentLaunchAuthority) -> StartRequestEnvelope {
+        let mut start = start_for(authority);
+        start.request.rex_launch_anchor = Some(crate::launch::LaunchAnchorIdentity {
+            pid: 7001,
+            start_identity: "shim-birth".into(),
+        });
+        start.request_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&start.request).unwrap())
+        );
+        start
     }
 
     fn cancelled_result(
@@ -655,6 +687,7 @@ mod cancelled_cleanup_tests {
                 exit_code: None,
                 timed_out: false,
                 cancellation_signal: Some(1),
+                cancellation_cause: None,
                 cleanup,
                 cleanup_detail: None,
                 processes: Vec::new(),
@@ -752,6 +785,39 @@ mod cancelled_cleanup_tests {
     }
 
     #[test]
+    fn anchor_eof_cancellation_requires_exact_durable_start_identity() {
+        let authority = tests::test_authority();
+        let start = start_for_anchor_eof(&authority);
+        let qualification = tests::reviewer_qualification(&authority);
+        let mut result = cancelled_result(&authority, &start, CleanupState::Confirmed);
+        result.receipt.cancellation_signal = None;
+        result.receipt.cancellation_cause = Some(CancellationCause::RexLaunchAnchorClosed {
+            pid: 7001,
+            start_identity: "shim-birth".into(),
+        });
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &result, &qualification)
+                .is_ok()
+        );
+
+        result.receipt.cancellation_cause = Some(CancellationCause::RexLaunchAnchorClosed {
+            pid: 7001,
+            start_identity: "reused-shim-pid".into(),
+        });
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &result, &qualification)
+                .is_err()
+        );
+
+        let legacy_start = start_for(&authority);
+        result.start_request_digest = legacy_start.request_digest.clone();
+        assert!(
+            validate_cancelled_result_for_start(&authority, &legacy_start, &result, &qualification)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn cancelled_cleanup_requires_persisted_accepted_start_ack() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::open_test(temp.path()).unwrap();
@@ -787,6 +853,7 @@ mod cancelled_cleanup_tests {
                 descriptor_digest: Digest::parse("b".repeat(64)).unwrap(),
                 wrapper_pid: wrapper.pid,
                 wrapper_start_identity: wrapper.start_identity.clone(),
+                rex_launch_anchor: None,
             },
             observed_at_unix: 1,
             coverage: RunFamilyCoverage::Complete,
@@ -3398,6 +3465,7 @@ pub(crate) mod tests {
             continuation: None,
             shutdown_grace_seconds: 5,
             start_ack_timeout_seconds: 5,
+            supervision_mode: None,
         }
     }
 
@@ -3568,6 +3636,7 @@ pub(crate) mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancellation_signal: None,
+                cancellation_cause: None,
                 cleanup: CleanupState::Confirmed,
                 cleanup_detail: None,
                 processes: vec![],
@@ -4125,6 +4194,7 @@ pub(crate) mod tests {
                 qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
                 wrapper_pid,
                 wrapper_start_identity: wrapper_start_identity.clone(),
+                rex_launch_anchor: None,
                 rex_session_id: authority.rex_session_id.clone(),
                 rex_block_id: authority.rex_block_id.clone(),
             })
@@ -4151,6 +4221,7 @@ pub(crate) mod tests {
             descriptor_digest: authority.descriptor_digest.clone(),
             wrapper_pid,
             wrapper_start_identity: wrapper_start_identity.clone(),
+            rex_launch_anchor: None,
         };
         spool.publish_run_family_binding_once(&binding).unwrap();
         let family = |coverage| RunFamilyRecord {
@@ -4215,6 +4286,7 @@ pub(crate) mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancellation_signal: None,
+                cancellation_cause: None,
                 cleanup: if matches!(&outcome, TurnOutcome::Completed) {
                     CleanupState::Confirmed
                 } else {
@@ -6791,6 +6863,7 @@ pub(crate) mod host_validation_fixture {
             qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
             wrapper_pid: std::process::id(),
             wrapper_start_identity: "fixture-wrapper".into(),
+            rex_launch_anchor: None,
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
         };
@@ -7005,6 +7078,7 @@ pub(crate) mod host_validation_fixture {
             exit_code: Some(0),
             timed_out: false,
             cancellation_signal: None,
+            cancellation_cause: None,
             cleanup: CleanupState::Confirmed,
             cleanup_detail: None,
             processes: vec![process],

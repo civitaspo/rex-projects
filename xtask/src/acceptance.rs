@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rex_projects::adapters::rex::{
-    CreateDisposition, RexCliTransport, TicketWindow, owned_supervisor_window_label,
-    owned_ticket_window_label,
+    CreateDisposition, RexCliTransport, RexProcessObservation, TicketWindow,
+    owned_supervisor_window_label, owned_ticket_window_label,
 };
 use rex_projects::launch::{ObservedProviderStart, ObservedWrapperIdentity};
 use rex_projects::process::{
@@ -852,6 +852,27 @@ fn native_worker_ready_marker_is_valid(path: &Path) -> bool {
     let Ok(marker) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
+    let worker = &marker["worker"];
+    let anchor = &worker["wrapper_process_identity"]["rex_launch_anchor"];
+    let anchor_pid = anchor["pid"].as_u64();
+    let anchor_birth = anchor["start_identity"].as_str();
+    let child_pid = worker["rex_process_observation"]["child"]["pid"].as_u64();
+    let supervisor_birth = worker["wrapper_process_identity"]["start_identity"].as_str();
+    let live = worker["live_process_identities"].as_array();
+    let exact_live = anchor_pid.zip(anchor_birth).is_some_and(|(pid, birth)| {
+        live.is_some_and(|processes| {
+            processes.iter().any(|process| {
+                process["pid"].as_u64() == Some(pid)
+                    && process["start_identity"].as_str() == Some(birth)
+            }) && supervisor_birth.is_some_and(|supervisor_birth| {
+                processes.iter().any(|process| {
+                    process["pid"].as_u64() == worker["wrapper_process_identity"]["pid"].as_u64()
+                        && process["start_identity"].as_str() == Some(supervisor_birth)
+                        && process["parent_pid"].as_u64() == Some(pid)
+                })
+            })
+        })
+    });
     marker["status"] == "native_worker_running"
         && marker
             .pointer("/worker/agent_state")
@@ -869,6 +890,9 @@ fn native_worker_ready_marker_is_valid(path: &Path) -> bool {
             .pointer("/worker/live_process_identities")
             .and_then(Value::as_array)
             .is_some_and(|processes| processes.len() >= 2)
+        && worker["anchored_topology_verified"] == true
+        && child_pid == anchor_pid
+        && exact_live
 }
 
 fn is_prepared_worker_inbox_observation(
@@ -2641,16 +2665,55 @@ fn observe_running_native_worker(
             "native Worker wrapper identity differs from its exact Rex block authority".into(),
         );
     }
-    let current_processes = inspect_process_table()
-        .map_err(|error| format!("inspect live process identities for native Worker: {error}"))?;
-    if !native_worker_processes_are_live(&wrapper, &provider_start, &current_processes) {
+    let rex = match RexCliTransport::connect(
+        request.rex,
+        &[],
+        request.rex_server.to_owned(),
+        request.expected_instance.to_owned(),
+        session_id.clone(),
+        BTreeMap::new(),
+    ) {
+        Ok(rex) => rex,
+        Err(_) => return Ok(None),
+    };
+    let window = TicketWindow {
+        server_instance_id: server_identity.clone(),
+        session_id: session_id.clone(),
+        window_id: window_id.clone(),
+        label: String::new(),
+        initial_block_id: Some(block_id.clone()),
+        disposition: CreateDisposition::Existing,
+    };
+    if !rex
+        .agent_block_is_present(&window, &run_id, &block_id)
+        .map_err(|error| format!("verify exact native Worker Rex block: {error}"))?
+    {
         return Ok(None);
     }
-    let mut live_processes = Vec::with_capacity(provider_tree.len());
-    for (pid, start_identity) in provider_tree
+    let rex_process_observation = match rex.observe_process(&window, &run_id, &block_id) {
+        Ok(observation) => observation,
+        Err(_) => return Ok(None),
+    };
+    let current_processes = inspect_process_table()
+        .map_err(|error| format!("inspect live process identities for native Worker: {error}"))?;
+    if !native_worker_launch_is_live(
+        &wrapper,
+        &provider_start,
+        &rex_process_observation,
+        &runtime_binary_digest,
+        &current_processes,
+    ) {
+        return Ok(None);
+    }
+    let mut live_processes = Vec::with_capacity(provider_tree.len() + 2);
+    let mut expected_live = provider_tree
         .iter()
         .map(|identity| (identity.pid, identity.start_identity.as_str()))
-    {
+        .collect::<Vec<_>>();
+    if let Some(anchor) = &wrapper.rex_launch_anchor {
+        expected_live.push((anchor.pid, &anchor.start_identity));
+    }
+    for (pid, start_identity) in expected_live {
         if let Some(process) = current_processes.iter().find(|process| {
             process.pid == pid
                 && process.start_identity == start_identity
@@ -2672,6 +2735,8 @@ fn observe_running_native_worker(
         "wrapper_process_identity":wrapper,
         "provider_process_tree":provider_tree,
         "provider_start_observation":provider_start,
+        "rex_process_observation":rex_process_observation_json(&rex_process_observation),
+        "anchored_topology_verified":wrapper.rex_launch_anchor.is_some(),
         "live_process_identities":live_processes,
         "slot_disposition":slot_disposition,
         "reservation_epoch":reservation_epoch,
@@ -2683,6 +2748,39 @@ fn observe_running_native_worker(
             "receipt_digest":receipt_digest
         }
     })))
+}
+
+fn rex_process_observation_json(
+    observation: &rex_projects::adapters::rex::RexProcessObservation,
+) -> Value {
+    use rex_projects::adapters::rex::{RexLastExit, RexProcessInfo};
+
+    fn process_json(process: &RexProcessInfo) -> Value {
+        json!({
+            "pid": process.pid,
+            "user_id": process.user_id,
+            "name": process.name,
+            "argv0": process.argv0,
+            "path": process.path,
+            "invoked_path": process.invoked_path,
+            "script": process.script,
+            "cwd": process.cwd,
+            "user": process.user,
+        })
+    }
+
+    let last_exit = observation
+        .last_exit
+        .as_ref()
+        .map(|exit: &RexLastExit| json!({"exit_code": exit.exit_code, "error": exit.error}));
+    json!({
+        "last_exit": last_exit,
+        "child": observation.child.as_ref().map(process_json),
+        "foreground": observation.foreground.as_ref().map(process_json),
+        "ancestors": observation.ancestors.as_ref().map(|ancestors| {
+            ancestors.iter().map(process_json).collect::<Vec<_>>()
+        }),
+    })
 }
 
 fn parse_native_worker_provider_start(
@@ -2784,6 +2882,107 @@ fn native_worker_processes_are_live(
             identity.pid == provider.provider_pid
                 && identity.start_identity == provider.provider_start_identity
         })
+}
+
+fn native_worker_launch_is_live(
+    wrapper: &ObservedWrapperIdentity,
+    provider: &ObservedProviderStart,
+    rex: &RexProcessObservation,
+    runtime_binary_digest: &str,
+    current: &[ProcessIdentity],
+) -> bool {
+    if !native_worker_processes_are_live(wrapper, provider, current)
+        || !native_worker_anchor_topology_is_live(wrapper, provider.provider_pid, rex, current)
+    {
+        return false;
+    }
+    let runtime_digest_matches = |process: &ProcessIdentity| {
+        let Ok(Some(path)) = rex_projects::process::executable_path_for_identity(process) else {
+            return false;
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        format!("{:x}", Sha256::digest(bytes)) == runtime_binary_digest
+    };
+    let Some(supervisor) = current.iter().find(|process| {
+        process.pid == wrapper.pid && process.start_identity == wrapper.start_identity
+    }) else {
+        return false;
+    };
+    if !runtime_digest_matches(supervisor) {
+        return false;
+    }
+    if let Some(anchor) = &wrapper.rex_launch_anchor {
+        let Some(anchor_process) = current.iter().find(|process| {
+            process.pid == anchor.pid && process.start_identity == anchor.start_identity
+        }) else {
+            return false;
+        };
+        if !runtime_digest_matches(anchor_process)
+            || !rex
+                .child
+                .as_ref()
+                .and_then(|child| child.path.as_deref())
+                .and_then(|path| fs::read(path).ok())
+                .is_some_and(|bytes| {
+                    format!("{:x}", Sha256::digest(bytes)) == runtime_binary_digest
+                })
+        {
+            return false;
+        }
+    } else if !rex
+        .child
+        .as_ref()
+        .and_then(|child| child.path.as_deref())
+        .and_then(|path| fs::read(path).ok())
+        .is_some_and(|bytes| format!("{:x}", Sha256::digest(bytes)) == runtime_binary_digest)
+    {
+        return false;
+    }
+    true
+}
+
+fn native_worker_anchor_topology_is_live(
+    wrapper: &ObservedWrapperIdentity,
+    provider_pid: u32,
+    rex: &RexProcessObservation,
+    current: &[ProcessIdentity],
+) -> bool {
+    let expected_rex_pid = wrapper
+        .rex_launch_anchor
+        .as_ref()
+        .map_or(wrapper.pid, |anchor| anchor.pid);
+    if rex.last_exit.is_some()
+        || rex
+            .child
+            .as_ref()
+            .is_none_or(|child| child.pid != expected_rex_pid)
+        || rex.foreground.as_ref().is_none_or(|foreground| {
+            foreground.pid != wrapper.pid
+                && foreground.pid != provider_pid
+                && wrapper
+                    .rex_launch_anchor
+                    .as_ref()
+                    .is_none_or(|anchor| foreground.pid != anchor.pid)
+        })
+    {
+        return false;
+    }
+    let Some(supervisor) = current.iter().find(|process| {
+        process.pid == wrapper.pid
+            && process.start_identity == wrapper.start_identity
+            && process.quality == ProcessIdentityQuality::KernelBirthToken
+    }) else {
+        return false;
+    };
+    wrapper.rex_launch_anchor.as_ref().is_none_or(|anchor| {
+        current.iter().any(|process| {
+            process.pid == anchor.pid
+                && process.start_identity == anchor.start_identity
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+        }) && supervisor.parent_pid == anchor.pid
+    })
 }
 fn write_native_worker_setup_freeze(
     request: &Request<'_>,
@@ -3764,6 +3963,116 @@ mod tests {
         });
         fs::write(&marker_path, serde_json::to_vec(&pending_marker).unwrap()).unwrap();
         assert!(!native_worker_ready_marker_is_valid(&marker_path));
+
+        let anchored_marker = json!({
+            "status":"native_worker_running",
+            "worker":{
+                "agent_state":"running",
+                "launch_state":"running",
+                "slot_disposition":"live",
+                "anchored_topology_verified":true,
+                "wrapper_process_identity":{
+                    "pid":11,
+                    "start_identity":"supervisor-born",
+                    "rex_launch_anchor":{"pid":10,"start_identity":"shim-born"}
+                },
+                "rex_process_observation":{"child":{"pid":10}},
+                "live_process_identities":[
+                    {"pid":10,"parent_pid":1,"start_identity":"shim-born"},
+                    {"pid":11,"parent_pid":10,"start_identity":"supervisor-born"}
+                ]
+            }
+        });
+        fs::write(&marker_path, serde_json::to_vec(&anchored_marker).unwrap()).unwrap();
+        assert!(native_worker_ready_marker_is_valid(&marker_path));
+
+        let mut wrong_anchor = anchored_marker.clone();
+        wrong_anchor["worker"]["rex_process_observation"]["child"]["pid"] = json!(12);
+        fs::write(&marker_path, serde_json::to_vec(&wrong_anchor).unwrap()).unwrap();
+        assert!(!native_worker_ready_marker_is_valid(&marker_path));
+
+        let mut wrong_parent = anchored_marker;
+        wrong_parent["worker"]["live_process_identities"][1]["parent_pid"] = json!(99);
+        fs::write(&marker_path, serde_json::to_vec(&wrong_parent).unwrap()).unwrap();
+        assert!(!native_worker_ready_marker_is_valid(&marker_path));
+    }
+
+    #[test]
+    fn native_worker_anchor_topology_requires_exact_rex_anchor_and_supervisor_parent() {
+        use rex_projects::launch::LaunchAnchorIdentity;
+
+        let wrapper = ObservedWrapperIdentity {
+            pid: 11,
+            start_identity: "supervisor-born".into(),
+            rex_session_id: "session".into(),
+            rex_block_id: "block".into(),
+            runtime_binary_digest: rex_projects::domain::ids::Digest::parse("c".repeat(64))
+                .unwrap(),
+            rex_launch_anchor: Some(LaunchAnchorIdentity {
+                pid: 10,
+                start_identity: "shim-born".into(),
+            }),
+        };
+        let process = |pid, parent_pid, start_identity: &str| ProcessIdentity {
+            pid,
+            parent_pid,
+            process_group_id: pid,
+            start_identity: start_identity.into(),
+            command: "rex-projects".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let rex_process = |pid| rex_projects::adapters::rex::RexProcessInfo {
+            pid,
+            user_id: 1,
+            name: "rex-projects".into(),
+            argv0: None,
+            path: None,
+            invoked_path: None,
+            script: None,
+            cwd: None,
+            user: None,
+        };
+        let rex = RexProcessObservation {
+            last_exit: None,
+            child: Some(rex_process(10)),
+            foreground: Some(rex_process(22)),
+            ancestors: None,
+        };
+        let live = vec![
+            process(10, 1, "shim-born"),
+            process(11, 10, "supervisor-born"),
+            process(22, 11, "provider-born"),
+        ];
+        assert!(native_worker_anchor_topology_is_live(
+            &wrapper, 22, &rex, &live
+        ));
+
+        let mut wrong_rex_anchor = rex.clone();
+        wrong_rex_anchor.child = Some(rex_process(12));
+        assert!(!native_worker_anchor_topology_is_live(
+            &wrapper,
+            22,
+            &wrong_rex_anchor,
+            &live
+        ));
+        assert!(!native_worker_anchor_topology_is_live(
+            &wrapper,
+            22,
+            &rex,
+            &[
+                process(10, 1, "reused-shim"),
+                process(11, 10, "supervisor-born")
+            ]
+        ));
+        assert!(!native_worker_anchor_topology_is_live(
+            &wrapper,
+            22,
+            &rex,
+            &[
+                process(10, 1, "shim-born"),
+                process(11, 9, "supervisor-born")
+            ]
+        ));
     }
 
     #[test]
@@ -4035,6 +4344,7 @@ mod tests {
         let wrapper = ObservedWrapperIdentity {
             pid: 11,
             start_identity: "wrapper-born".into(),
+            rex_launch_anchor: None,
             rex_session_id: "session".into(),
             rex_block_id: "block".into(),
             runtime_binary_digest: Digest::parse("c".repeat(64)).unwrap(),

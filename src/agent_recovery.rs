@@ -721,6 +721,23 @@ impl AgentRecoveryRuntime {
                 reason: RecoveryUnknown::WrapperIdentityMismatch,
             });
         };
+        if let Some(anchor) = &wrapper.rex_launch_anchor {
+            let Some(anchor_process) =
+                kernel_identity(process_table, anchor.pid, &anchor.start_identity)
+            else {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::WrapperIdentityMismatch,
+                });
+            };
+            if wrapper_process.parent_pid != anchor.pid
+                || !process_executable_matches(wrapper_process, &wrapper.runtime_binary_digest)
+                || !process_executable_matches(anchor_process, &wrapper.runtime_binary_digest)
+            {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::WrapperIdentityMismatch,
+                });
+            }
+        }
         let Some(provider_process) = kernel_identity(
             process_table,
             provider.provider_pid,
@@ -918,6 +935,7 @@ fn reconcile_missing_block(
                 && family.binding.descriptor_digest == run.authority.descriptor_digest
                 && family.binding.wrapper_pid == wrapper.pid
                 && family.binding.wrapper_start_identity == wrapper.start_identity
+                && family.binding.rex_launch_anchor == wrapper.rex_launch_anchor
                 && family.provider_root.pid == provider.provider_pid
                 && family.provider_root.start_identity == provider.provider_start_identity
                 && family.provider_root.quality == ProcessIdentityQuality::KernelBirthToken
@@ -1910,6 +1928,7 @@ fn observe_completed_provider_start_from_family(
         descriptor_digest: run.authority.descriptor_digest.clone(),
         wrapper_pid: wrapper.pid,
         wrapper_start_identity: wrapper.start_identity.clone(),
+        rex_launch_anchor: wrapper.rex_launch_anchor.clone(),
     };
     if family.binding != expected_binding
         || family.coverage != RunFamilyCoverage::Complete
@@ -2085,14 +2104,44 @@ fn rex_processes_match(
     wrapper: &ObservedWrapperIdentity,
     provider: &ObservedProviderStart,
 ) -> bool {
+    let rex_pid = wrapper
+        .rex_launch_anchor
+        .as_ref()
+        .map_or(wrapper.pid, |anchor| anchor.pid);
     observation.last_exit.is_none()
         && observation
             .child
             .as_ref()
-            .is_some_and(|process| process.pid == wrapper.pid)
+            .is_some_and(|process| process.pid == rex_pid)
         && observation.foreground.as_ref().is_some_and(|process| {
-            process.pid == provider.provider_pid || process.pid == wrapper.pid
+            process.pid == provider.provider_pid
+                || process.pid == wrapper.pid
+                || process.pid == rex_pid
         })
+}
+
+fn process_executable_matches(process: &ProcessIdentity, expected: &Digest) -> bool {
+    let Ok(Some(path)) = crate::process::executable_path_for_identity(process) else {
+        return false;
+    };
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let Ok(read) = file.read(&mut buffer) else {
+            return false;
+        };
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Digest::parse(format!("{:x}", hasher.finalize()))
+        .ok()
+        .as_ref()
+        == Some(expected)
 }
 
 fn verified_qualification_executable(
@@ -2196,6 +2245,7 @@ mod tests {
             rex_session_id: "session".into(),
             rex_block_id: "block".into(),
             runtime_binary_digest: Digest::parse("c".repeat(64)).unwrap(),
+            rex_launch_anchor: None,
         };
         assert!(provider_tree_contains_wrapper(&provider, &wrapper));
         let reused_pid = ObservedWrapperIdentity {
@@ -2205,6 +2255,69 @@ mod tests {
         assert!(!provider_tree_contains_wrapper(&provider, &reused_pid));
         let omitted_wrapper = ObservedWrapperIdentity { pid: 12, ..wrapper };
         assert!(!provider_tree_contains_wrapper(&provider, &omitted_wrapper));
+    }
+
+    #[test]
+    fn live_adoption_matches_rex_anchor_and_retains_supervisor_identity_separately() {
+        let wrapper = ObservedWrapperIdentity {
+            pid: 11,
+            start_identity: "supervisor-born".into(),
+            rex_session_id: "session".into(),
+            rex_block_id: "block".into(),
+            runtime_binary_digest: Digest::parse("c".repeat(64)).unwrap(),
+            rex_launch_anchor: Some(crate::launch::LaunchAnchorIdentity {
+                pid: 10,
+                start_identity: "shim-born".into(),
+            }),
+        };
+        let provider = ObservedProviderStart {
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            operation_id: crate::domain::ids::OperationId::parse("op-1").unwrap(),
+            provider_pid: 22,
+            provider_start_identity: "provider-born".into(),
+            executable_digest: Digest::parse("a".repeat(64)).unwrap(),
+            process_tree_digest: Digest::parse("b".repeat(64)).unwrap(),
+            process_tree_confirmed: true,
+            process_tree: vec![],
+        };
+        let rex_process = |pid| crate::adapters::rex::RexProcessInfo {
+            pid,
+            user_id: 1,
+            name: "rex-projects".into(),
+            argv0: None,
+            path: None,
+            invoked_path: None,
+            script: None,
+            cwd: None,
+            user: None,
+        };
+        let observation = RexProcessObservation {
+            last_exit: None,
+            child: Some(rex_process(10)),
+            foreground: Some(rex_process(22)),
+            ancestors: None,
+        };
+        assert!(rex_processes_match(&observation, &wrapper, &provider));
+
+        let mut wrong_anchor = observation.clone();
+        wrong_anchor.child = Some(rex_process(12));
+        assert!(!rex_processes_match(&wrong_anchor, &wrapper, &provider));
+
+        let legacy_wrapper = ObservedWrapperIdentity {
+            rex_launch_anchor: None,
+            ..wrapper
+        };
+        let legacy_observation = RexProcessObservation {
+            last_exit: None,
+            child: Some(rex_process(11)),
+            foreground: Some(rex_process(22)),
+            ancestors: None,
+        };
+        assert!(rex_processes_match(
+            &legacy_observation,
+            &legacy_wrapper,
+            &provider
+        ));
     }
 
     #[test]
@@ -2324,6 +2437,7 @@ mod tests {
             continuation: None,
             shutdown_grace_seconds: 30,
             start_ack_timeout_seconds: 30,
+            supervision_mode: None,
         };
         let descriptor_digest = package.publish_once(&descriptor_path).unwrap();
         let authority = crate::launch::AgentLaunchAuthority {
@@ -2466,6 +2580,7 @@ mod tests {
             rex_session_id: "session".into(),
             rex_block_id: "block".into(),
             runtime_binary_digest: run.authority.runtime_binary_digest.clone(),
+            rex_launch_anchor: None,
         };
         run.wrapper_identity_json = Some(serde_json::to_string(&wrapper).unwrap());
 
@@ -3066,6 +3181,7 @@ esac
             exit_code: Some(0),
             timed_out: false,
             cancellation_signal: None,
+            cancellation_cause: None,
             cleanup: crate::run_step::CleanupState::Confirmed,
             cleanup_detail: None,
             processes: vec![crate::run_step::ObservedProcess {
@@ -3318,6 +3434,7 @@ esac
             rex_session_id: "session".into(),
             rex_block_id: "block".into(),
             runtime_binary_digest: Digest::parse("c".repeat(64)).unwrap(),
+            rex_launch_anchor: None,
         };
         let snapshot = make_test_snapshot(
             vec![writer_identity.clone(), provider_identity.clone()],

@@ -2816,6 +2816,7 @@ mod tests {
             rex_session_id: authority.rex_session_id.clone(),
             rex_block_id: authority.rex_block_id.clone(),
             runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            rex_launch_anchor: None,
         };
         let authority_json = serde_json::to_string(&authority).unwrap();
         let authority_digest = authority.digest().unwrap();

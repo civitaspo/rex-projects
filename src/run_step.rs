@@ -34,6 +34,12 @@ pub trait ProcessObserver {
     fn try_wait(&mut self, child: &mut std::process::Child) -> std::io::Result<Option<ExitStatus>> {
         child.try_wait()
     }
+    fn cancellation_requested(&mut self) -> bool {
+        false
+    }
+    fn cancellation_cause(&self) -> Option<CancellationCause> {
+        None
+    }
     fn pid(identity: &Self::Identity) -> u32;
     fn group(identity: &Self::Identity) -> u32;
     fn capture_tree(&self, root_pid: u32, table: &[Self::Identity]) -> Vec<Self::Identity>;
@@ -288,6 +294,13 @@ pub enum TurnOutcome {
     MissingResult,
 }
 
+/// A non-signal cancellation tied to one immutable Rex launch anchor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CancellationCause {
+    RexLaunchAnchorClosed { pid: u32, start_identity: String },
+}
+
 /// Bounded non-sensitive reason a provider's structured result was rejected.
 /// Raw provider stdout/stderr is never persisted in the run receipt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -328,6 +341,8 @@ pub struct RunReceipt {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cancellation_signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_cause: Option<CancellationCause>,
     pub cleanup: CleanupState,
     pub cleanup_detail: Option<String>,
     pub processes: Vec<ObservedProcess>,
@@ -782,6 +797,11 @@ fn run_prepared<O: ProcessObserver>(
         }
         turn_timeout = turn_timeout.min(remaining - cleanup_budget);
     }
+    if observer.cancellation_requested() {
+        return Err(RunError::Process(
+            "run-step launch anchor closed before provider start".into(),
+        ));
+    }
     let mut child = command.spawn().map_err(RunError::Io)?;
     let pid = child.id();
     let stdout = child.stdout.take().expect("provider stdout is piped");
@@ -929,6 +949,7 @@ fn run_prepared<O: ProcessObserver>(
     let mut outcome = TurnOutcome::ProviderFailed;
     let mut timed_out = false;
     let mut cancellation_signal = None;
+    let mut cancellation_cause = None;
     let mut cleanup_known = true;
     let mut inspection_error = None;
 
@@ -1002,8 +1023,11 @@ fn run_prepared<O: ProcessObserver>(
         let received = PENDING_SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(unix))]
         let received = 0;
-        if received != 0 {
-            cancellation_signal = Some(received);
+        if received != 0 || observer.cancellation_requested() {
+            cancellation_signal = (received != 0).then_some(received);
+            cancellation_cause = (received == 0)
+                .then(|| observer.cancellation_cause())
+                .flatten();
             outcome = TurnOutcome::Cancelled;
             cleanup_known = match stop_observed_groups(
                 observer,
@@ -1229,6 +1253,7 @@ fn run_prepared<O: ProcessObserver>(
             exit_code,
             timed_out,
             cancellation_signal,
+            cancellation_cause,
             cleanup: if cleanup_known {
                 CleanupState::Confirmed
             } else {
@@ -1333,6 +1358,7 @@ fn unresolved_receipt(
             exit_code: None,
             timed_out,
             cancellation_signal,
+            cancellation_cause: None,
             cleanup,
             cleanup_detail: error,
             processes,
@@ -2114,12 +2140,12 @@ mod tests {
     use crate::process::{self, ProcessIdentity};
 
     use super::{
-        CleanupState, ConversationContinuation, DisposableQualificationContext, ObservedProcess,
-        ProcessObserver, ProcessSignal, ProviderCapabilityEvidence, ProviderProcessFailure,
-        ProviderQualificationStatus, RunDescriptor, RunReceipt, SystemProcessObserver, TurnOutcome,
-        TurnRequest, classify_provider_process_failure, factory_environment,
-        issue_qualification_permit, prepare, prepare_with_qualification, run_fixture_turn,
-        run_qualification_turn, run_turn,
+        CancellationCause, CleanupState, ConversationContinuation, DisposableQualificationContext,
+        ObservedProcess, ProcessObserver, ProcessSignal, ProviderCapabilityEvidence,
+        ProviderProcessFailure, ProviderQualificationStatus, RunDescriptor, RunReceipt,
+        SystemProcessObserver, TurnOutcome, TurnRequest, classify_provider_process_failure,
+        factory_environment, issue_qualification_permit, prepare, prepare_with_qualification,
+        run_fixture_turn, run_qualification_turn, run_turn,
     };
 
     #[test]
@@ -2163,6 +2189,7 @@ mod tests {
             exit_code: Some(0),
             timed_out: false,
             cancellation_signal: None,
+            cancellation_cause: None,
             cleanup: CleanupState::Confirmed,
             cleanup_detail: None,
             processes: vec![ObservedProcess {
@@ -2378,6 +2405,7 @@ mod tests {
     struct DelayedSystemObserver {
         after_spawn_delay: Duration,
         root_pid: Option<u32>,
+        anchor_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[cfg(unix)]
@@ -2392,6 +2420,18 @@ mod tests {
 
         fn inspect(&mut self) -> Result<Vec<Self::Identity>, String> {
             process::inspect_process_table().map_err(|error| error.to_string())
+        }
+
+        fn cancellation_requested(&mut self) -> bool {
+            self.anchor_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn cancellation_cause(&self) -> Option<CancellationCause> {
+            Some(CancellationCause::RexLaunchAnchorClosed {
+                pid: 10,
+                start_identity: "shim-born".into(),
+            })
         }
 
         fn pid(identity: &Self::Identity) -> u32 {
@@ -3173,11 +3213,12 @@ mod tests {
             descriptor_digest: Digest::parse("a".repeat(64)).unwrap(),
             wrapper_pid: wrapper.pid,
             wrapper_start_identity: wrapper.start_identity,
+            rex_launch_anchor: None,
         };
         spool.publish_run_family_binding_once(&binding).unwrap();
         std::thread::scope(|scope| {
             let producer = scope.spawn(|| {
-                let mut observer = DurableFamilyObserver::new(&spool, binding);
+                let mut observer = DurableFamilyObserver::new(&spool, binding, None, None);
                 run_fixture_turn(&turn, &mut observer).unwrap()
             });
             let deadline = std::time::Instant::now() + Duration::from_secs(4);
@@ -3296,12 +3337,13 @@ mod tests {
             descriptor_digest: Digest::parse("a".repeat(64)).unwrap(),
             wrapper_pid: wrapper.pid,
             wrapper_start_identity: wrapper.start_identity,
+            rex_launch_anchor: None,
         };
         spool.publish_run_family_binding_once(&binding).unwrap();
 
         std::thread::scope(|scope| {
             let producer = scope.spawn(|| {
-                let mut observer = DurableFamilyObserver::new(&spool, binding);
+                let mut observer = DurableFamilyObserver::new(&spool, binding, None, None);
                 run_fixture_turn(&turn, &mut observer).unwrap()
             });
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -3599,6 +3641,7 @@ mod tests {
         let mut observer = DelayedSystemObserver {
             after_spawn_delay: Duration::from_millis(8_200),
             root_pid: None,
+            anchor_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let result = run_qualification_turn(&turn, permit, &mut observer).unwrap();
         assert!(!matches!(result.receipt.outcome, TurnOutcome::Completed));
@@ -3776,6 +3819,54 @@ mod tests {
                 .unwrap()
                 .contains(&ProcessSignal::Kill)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_rex_launch_anchor_cancels_and_confirms_provider_cleanup() {
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let executable = root.path().join("long-running fake claude");
+        fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        turn.shutdown_grace = Duration::from_millis(50);
+        let anchor_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close_anchor = anchor_closed.clone();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            close_anchor.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut observer = DelayedSystemObserver {
+            after_spawn_delay: Duration::ZERO,
+            root_pid: None,
+            anchor_closed,
+        };
+
+        let result = run_fixture_turn(&turn, &mut observer).unwrap();
+        closer.join().unwrap();
+
+        assert!(matches!(result.receipt.outcome, TurnOutcome::Cancelled));
+        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+        assert_eq!(result.receipt.cancellation_signal, None);
+        assert_eq!(
+            result.receipt.cancellation_cause,
+            Some(CancellationCause::RexLaunchAnchorClosed {
+                pid: 10,
+                start_identity: "shim-born".into(),
+            })
+        );
+        let remaining = process::inspect_process_table().unwrap();
+        assert!(result.receipt.processes.iter().all(|observed| {
+            remaining.iter().all(|current| {
+                current.pid != observed.pid || current.start_identity != observed.start_identity
+            })
+        }));
     }
 
     #[cfg(unix)]

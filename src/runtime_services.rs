@@ -2035,6 +2035,9 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             continuation: None,
             shutdown_grace_seconds: self.applied_config.config.runtime.shutdown_grace_seconds,
             start_ack_timeout_seconds: 30,
+            supervision_mode: Some(
+                crate::run_step_package::RunStepSupervisionMode::AnchoredSupervisor,
+            ),
         };
         package.validate()?;
         let _ = now_unix;

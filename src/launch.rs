@@ -995,6 +995,10 @@ pub struct AgentStartRequest {
     pub qualification_receipt_digest: ContentDigest,
     pub wrapper_pid: u32,
     pub wrapper_start_identity: String,
+    /// Rex-owned foreground shim which launched the finite-turn supervisor. Legacy runs have
+    /// no detached supervisor and therefore omit this exact identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<LaunchAnchorIdentity>,
     pub rex_session_id: String,
     pub rex_block_id: String,
 }
@@ -1007,6 +1011,15 @@ pub struct ObservedWrapperIdentity {
     pub rex_session_id: String,
     pub rex_block_id: String,
     pub runtime_binary_digest: ContentDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<LaunchAnchorIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchAnchorIdentity {
+    pub pid: u32,
+    pub start_identity: String,
 }
 
 /// Host process observation taken after provider spawn. Unknown tree state must remain
@@ -1113,6 +1126,7 @@ impl ObservedWrapperIdentity {
             || self.rex_session_id != request.rex_session_id
             || self.rex_block_id != request.rex_block_id
             || self.runtime_binary_digest != request.runtime_binary_digest
+            || self.rex_launch_anchor != request.rex_launch_anchor
             || self.start_identity.trim().is_empty()
         {
             return Err("observed Rex wrapper does not match the Agent start request".into());
@@ -1128,6 +1142,14 @@ impl AgentStartRequest {
         }
         if self.wrapper_pid == 0 || self.controller_generation == 0 {
             return Err("Agent start request lacks process or controller identity".into());
+        }
+        if let Some(anchor) = &self.rex_launch_anchor
+            && (anchor.pid == 0
+                || anchor.pid == self.wrapper_pid
+                || anchor.start_identity.trim().is_empty()
+                || anchor.start_identity.chars().any(char::is_control))
+        {
+            return Err("Agent start request has an invalid Rex launch anchor".into());
         }
         for (field, value) in [
             (
@@ -1355,9 +1377,47 @@ mod tests {
             qualification_receipt_digest: digest('5'),
             wrapper_pid: 321,
             wrapper_start_identity: "pid-start-identity".into(),
+            rex_launch_anchor: None,
             rex_session_id: "session-1".into(),
             rex_block_id: "block-1".into(),
         }
+    }
+
+    #[test]
+    fn anchored_start_requires_a_distinct_exact_anchor_identity() {
+        let mut request = start_request();
+        request.rex_launch_anchor = Some(super::LaunchAnchorIdentity {
+            pid: 320,
+            start_identity: "anchor-birth".into(),
+        });
+        assert!(request.validate().is_ok());
+
+        request.rex_launch_anchor.as_mut().unwrap().pid = request.wrapper_pid;
+        assert!(request.validate().is_err());
+        request.rex_launch_anchor.as_mut().unwrap().pid = 320;
+        request.rex_launch_anchor.as_mut().unwrap().start_identity = "\n".into();
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn observed_identity_must_preserve_the_exact_anchor_binding() {
+        let mut request = start_request();
+        request.rex_launch_anchor = Some(super::LaunchAnchorIdentity {
+            pid: 320,
+            start_identity: "anchor-birth".into(),
+        });
+        let observed = super::ObservedWrapperIdentity {
+            pid: request.wrapper_pid,
+            start_identity: request.wrapper_start_identity.clone(),
+            rex_session_id: request.rex_session_id.clone(),
+            rex_block_id: request.rex_block_id.clone(),
+            runtime_binary_digest: request.runtime_binary_digest.clone(),
+            rex_launch_anchor: Some(super::LaunchAnchorIdentity {
+                pid: 320,
+                start_identity: "reused-pid".into(),
+            }),
+        };
+        assert!(observed.matches_start_request(&request).is_err());
     }
 
     fn authority() -> AgentLaunchAuthority {

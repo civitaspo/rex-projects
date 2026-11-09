@@ -863,6 +863,7 @@ mod tests {
             exit_code: Some(0),
             timed_out: false,
             cancellation_signal: None,
+            cancellation_cause: None,
             cleanup: CleanupState::Confirmed,
             cleanup_detail: None,
             processes: vec![],
