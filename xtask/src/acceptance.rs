@@ -905,27 +905,24 @@ fn worker_recovery_inbox_evidence(observation: &Value) -> Result<Option<Value>, 
             .map_err(|error| format!("read recovery Worker package: {error}"))?,
     )
     .map_err(|error| format!("parse recovery Worker package: {error}"))?;
-    let snapshot: Value = serde_json::from_slice(
-        &fs::read(snapshot_path)
-            .map_err(|error| format!("read recovery wake snapshot: {error}"))?,
-    )
-    .map_err(|error| format!("parse recovery wake snapshot: {error}"))?;
+    let snapshot_bytes =
+        fs::read(snapshot_path).map_err(|error| format!("read recovery wake snapshot: {error}"))?;
+    let snapshot = parse_recovery_wake_snapshot(&snapshot_bytes)?;
     let package_bytes = fs::read(package_path)
         .map_err(|error| format!("read recovery Worker package for digest check: {error}"))?;
-    let snapshot_bytes = fs::read(snapshot_path)
-        .map_err(|error| format!("read recovery wake snapshot for digest check: {error}"))?;
     let package_digest = format!("{:x}", Sha256::digest(&package_bytes));
-    let snapshot_digest = format!("{:x}", Sha256::digest(&snapshot_bytes));
+    let snapshot_digest = snapshot.digest.as_str().to_owned();
     let authorization = &input["payload_json"]["authorization"];
     let Some(prior_run_id) = authorization["prior_worker_agent_run_id"].as_str() else {
         return Ok(None);
     };
-    let snapshot_has_authorization = snapshot["inputs"].as_array().is_some_and(|items| {
-        items.iter().any(|item| {
-            item["source_type"] == "worker_recovery_authorization"
-                && item["payload_json"]["authorization"] == *authorization
-        })
-    });
+    let snapshot_authorization = snapshot
+        .worker_recovery_authorization()
+        .map_err(|error| format!("read typed recovery authorization from snapshot: {error}"))?;
+    let snapshot_has_authorization = snapshot_authorization
+        .map(|authorization| serde_json::to_value(authorization).map_err(|e| e.to_string()))
+        .transpose()?
+        .is_some_and(|snapshot_authorization| snapshot_authorization == *authorization);
     let prompt = package["prompt"].as_str().unwrap_or_default();
     let assignment = &observation["worker_assignment"];
     let matching_input = snapshot_has_authorization
@@ -937,7 +934,7 @@ fn worker_recovery_inbox_evidence(observation: &Value) -> Result<Option<Value>, 
             .pointer("/input_files/snapshot_digest")
             .and_then(Value::as_str)
             == Some(snapshot_digest.as_str())
-        && snapshot["agent_run_id"] == observation["run_id"]
+        && snapshot.agent_run_id == observation["run_id"]
         && package["descriptor"]["role"] == "worker"
         && package["descriptor"]["ticket_run_id"] == observation["ticket_run_id"]
         && prompt.contains(prior_run_id)
@@ -962,6 +959,17 @@ fn worker_recovery_inbox_evidence(observation: &Value) -> Result<Option<Value>, 
         "snapshot_path":snapshot_path,
         "snapshot_contains_exact_authorization":snapshot_has_authorization
     })))
+}
+
+fn parse_recovery_wake_snapshot(
+    bytes: &[u8],
+) -> Result<rex_projects::agent_api::AgentWakeSnapshot, String> {
+    let snapshot: rex_projects::agent_api::AgentWakeSnapshot = serde_json::from_slice(bytes)
+        .map_err(|error| format!("parse recovery wake snapshot: {error}"))?;
+    snapshot
+        .validate()
+        .map_err(|error| format!("validate recovery wake snapshot: {error}"))?;
+    Ok(snapshot)
 }
 
 fn accepted_reviewer_result(
@@ -2606,6 +2614,66 @@ fn emit_report(fixture_root: &Path, report: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
+
+    #[test]
+    fn saved_recovery_worker_observation_uses_the_typed_snapshot_digest() {
+        let saved_snapshot = r#"{"schema_version":1,"project_id":"operations_project","role_session_id":"ticket:run-190b18e04a0397a4d95da694ce92b900fa8f151721c469c2:worker:acceptance-node","agent_run_id":"agent-624e2526960c60d5008d6459a85dfbb9","digest":"ff25c466db5c1c3e94ff57531ab53c77756bac6862b273e8bdc1e49280fc54fb","inputs":[{"wake_input_id":12,"source_type":"worker_recovery_authorization","source_id":"589ff35b2a7ff2c47e1cb3f97926441148610e84ea0717fc5b654c2081e60555","source_revision":3,"priority":10,"payload_json":{"authorization":{"accepted_plan_digest":"1234609ed0689d9694a9c5d0ea3d6a601dc3ea6d554e3429745b00b92a927102","expected_head":"5e56202ae6671c051089454edcc2f4614f1c713f","prior_absence_digest":"5818daba39bbd06006f59597e3f62237f588f02af10b07fa9662b88209983dc7","prior_artifact_refs":[],"prior_host_commit_operation_id":null,"prior_host_commit_receipt_digest":null,"prior_terminal_digest":"75dda941d697241a74181e327c45bcc179a4bbfe832c5ac4270cde73d13d093f","prior_worker_agent_run_id":"agent-b50ec39c8c2d89b27525c53497f93abb","prior_worker_result_evidence_id":"589ff35b2a7ff2c47e1cb3f97926441148610e84ea0717fc5b654c2081e60555","schema_version":1,"source_coordinator_evidence_id":"d83133795ad61f7ee4fc84ea2fee45e5b2918e07d3cb07901c575cd9310781c3","ticket_revision":3,"ticket_run_id":"run-190b18e04a0397a4d95da694ce92b900fa8f151721c469c2","work_node_id":"acceptance-node"},"kind":"worker_recovery_authorization","schema_version":1}}]}"#;
+        let snapshot: Value = serde_json::from_str(saved_snapshot).unwrap();
+        let snapshot_bytes = serde_json::to_vec_pretty(&snapshot).unwrap();
+        let typed_snapshot = parse_recovery_wake_snapshot(&snapshot_bytes).unwrap();
+        assert_eq!(typed_snapshot.digest.as_str(), snapshot["digest"]);
+        let raw_file_digest = format!("{:x}", Sha256::digest(&snapshot_bytes));
+        assert_ne!(raw_file_digest, snapshot["digest"].as_str().unwrap());
+
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("snapshot.json");
+        fs::write(&snapshot_path, &snapshot_bytes).unwrap();
+        let authorization = snapshot["inputs"][0]["payload_json"]["authorization"].clone();
+        let prior_run_id = authorization["prior_worker_agent_run_id"].as_str().unwrap();
+        let expected_head = authorization["expected_head"].as_str().unwrap();
+        let package_path = directory.path().join("run-step.package.json");
+        let package_bytes = serde_json::to_vec(&json!({
+            "descriptor":{
+                "role":"worker",
+                "ticket_run_id":authorization["ticket_run_id"]
+            },
+            "prompt":format!("Retry {prior_run_id} from head {expected_head}")
+        }))
+        .unwrap();
+        fs::write(&package_path, &package_bytes).unwrap();
+        let input = &snapshot["inputs"][0];
+        let mut observation = json!({
+            "role":"worker",
+            "run_id":snapshot["agent_run_id"],
+            "ticket_run_id":authorization["ticket_run_id"],
+            "inbox_inputs":[{
+                "source_type":"worker_recovery_authorization",
+                "source_revision":input["source_revision"],
+                "payload_json":{"authorization":authorization}
+            }],
+            "input_files":{
+                "package_path":package_path,
+                "package_sha256":format!("{:x}", Sha256::digest(&package_bytes)),
+                "snapshot_path":snapshot_path,
+                "snapshot_digest":snapshot["digest"]
+            },
+            "worker_assignment":{
+                "node_id":authorization["work_node_id"],
+                "accepted_plan_digest":authorization["accepted_plan_digest"]
+            }
+        });
+        assert!(
+            worker_recovery_inbox_evidence(&observation)
+                .unwrap()
+                .is_some()
+        );
+        observation["input_files"]["snapshot_digest"] = json!(raw_file_digest);
+        assert!(
+            worker_recovery_inbox_evidence(&observation)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn reviewer_boundary_requires_applied_review_ready_at_the_current_assessing_revision() {
