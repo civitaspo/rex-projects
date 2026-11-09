@@ -937,6 +937,7 @@ fn worker_recovery_inbox_evidence(observation: &Value) -> Result<Option<Value>, 
         && snapshot.agent_run_id == observation["run_id"]
         && package["descriptor"]["role"] == "worker"
         && package["descriptor"]["ticket_run_id"] == observation["ticket_run_id"]
+        && prompt.contains("Prior uncommitted changes may remain")
         && prompt.contains(prior_run_id)
         && authorization["ticket_run_id"] == observation["ticket_run_id"]
         && authorization["ticket_revision"] == input["source_revision"]
@@ -2637,7 +2638,9 @@ mod tests {
                 "role":"worker",
                 "ticket_run_id":authorization["ticket_run_id"]
             },
-            "prompt":format!("Retry {prior_run_id} from head {expected_head}")
+            "prompt":format!(
+                "Retry {prior_run_id} from head {expected_head}. Prior uncommitted changes may remain."
+            )
         }))
         .unwrap();
         fs::write(&package_path, &package_bytes).unwrap();
@@ -2668,6 +2671,23 @@ mod tests {
                 .is_some()
         );
         observation["input_files"]["snapshot_digest"] = json!(raw_file_digest);
+        assert!(
+            worker_recovery_inbox_evidence(&observation)
+                .unwrap()
+                .is_none()
+        );
+        observation["input_files"]["snapshot_digest"] = snapshot["digest"].clone();
+        let package_without_guidance = serde_json::to_vec(&json!({
+            "descriptor":{
+                "role":"worker",
+                "ticket_run_id":authorization["ticket_run_id"]
+            },
+            "prompt":format!("Retry {prior_run_id} from head {expected_head}")
+        }))
+        .unwrap();
+        fs::write(&package_path, &package_without_guidance).unwrap();
+        observation["input_files"]["package_sha256"] =
+            json!(format!("{:x}", Sha256::digest(&package_without_guidance)));
         assert!(
             worker_recovery_inbox_evidence(&observation)
                 .unwrap()

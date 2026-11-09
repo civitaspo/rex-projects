@@ -1531,6 +1531,31 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
         } else {
             None
         };
+        let worker_recovery_authorization = if let Some(context) = &worker_context {
+            let authorization = reservation.wake_snapshot.worker_recovery_authorization()?;
+            validate_worker_recovery_assignment(
+                authorization.as_ref(),
+                &context.plan_record,
+                &context.node,
+                context.token.base_sha(),
+                context.token.ticket_run_id(),
+                reservation
+                    .ticket_revision
+                    .map(|revision| revision.0)
+                    .unwrap_or(0),
+            )?;
+            if let Some(authorization) = &authorization
+                && self
+                    .delivery_effects
+                    .observe_local_head_at(context.token.worktree_path())?
+                    != authorization.expected_head
+            {
+                return Err("Worker recovery worktree changed after authorization".into());
+            }
+            authorization
+        } else {
+            None
+        };
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
@@ -1559,29 +1584,6 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 },
                 accepted_plan: match (&worker_context, &accepted_plan) {
                     (Some(context), _) => {
-                        let recovery_authorization =
-                            reservation.wake_snapshot.worker_recovery_authorization()?;
-                        validate_worker_recovery_assignment(
-                            recovery_authorization.as_ref(),
-                            &context.plan_record,
-                            &context.node,
-                            context.token.base_sha(),
-                            context.token.ticket_run_id(),
-                            reservation
-                                .ticket_revision
-                                .map(|revision| revision.0)
-                                .unwrap_or(0),
-                        )?;
-                        if let Some(authorization) = &recovery_authorization
-                            && self
-                                .delivery_effects
-                                .observe_local_head_at(context.token.worktree_path())?
-                                != authorization.expected_head
-                        {
-                            return Err(
-                                "Worker recovery worktree changed after authorization".into()
-                            );
-                        }
                         Some(worker_assignment_context(&WorkerAssignmentContext {
                             plan_record: &context.plan_record,
                             validated_plan: &context.validated_plan,
@@ -1589,11 +1591,11 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                             worktree_path: context.token.worktree_path(),
                             branch: context.token.branch(),
                             base_sha: context.token.base_sha(),
-                            expected_head: recovery_authorization
+                            expected_head: worker_recovery_authorization
                                 .as_ref()
                                 .map(|authorization| authorization.expected_head.as_str())
                                 .unwrap_or_else(|| context.token.base_sha()),
-                            recovery_authorization: recovery_authorization.as_ref(),
+                            recovery_authorization: worker_recovery_authorization.as_ref(),
                             commit_mode: context.token.commit_mode(),
                             repository_id: context.token.repository_id(),
                         })?)
@@ -1608,7 +1610,9 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                     .filter(|_| worker_context.is_none())
                     .map(|plan| plan.plan_digest.clone()),
                 implementation_publication_subject,
-                previous_decisions: Vec::new(),
+                previous_decisions: crate::roles::worker_recovery_decisions(
+                    worker_recovery_authorization.as_ref(),
+                ),
                 required_evidence: worker_node
                     .as_ref()
                     .map(|node| node.required_evidence.clone())
@@ -3188,7 +3192,13 @@ impl RuntimeServices {
                     .filter(|_| candidate.role != Role::Worker)
                     .map(|plan| plan.plan_digest.clone()),
                 implementation_publication_subject,
-                previous_decisions: Vec::new(),
+                previous_decisions: crate::roles::worker_recovery_decisions(
+                    if candidate.role == Role::Worker {
+                        worker_recovery_authorization.as_ref()
+                    } else {
+                        None
+                    },
+                ),
                 required_evidence: worker_node
                     .as_ref()
                     .map(|node| node.required_evidence.clone())

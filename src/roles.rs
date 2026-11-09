@@ -63,6 +63,20 @@ pub struct PromptContext {
     pub assigned_commit_mode: Option<CommitMode>,
 }
 
+pub(crate) fn worker_recovery_decisions(
+    authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Vec<String> {
+    if authorization.is_none() {
+        return Vec::new();
+    }
+    vec![
+        "Resume the same assigned managed worktree. Prior uncommitted changes may remain even when no prior artifacts were registered; artifact references are not a complete record of the worktree.".into(),
+        "Inspect the worktree status and diff. Preserve and review relevant inherited changes against the accepted node, then complete or correct them and run the required checks. Submit the result through the assigned commit mode; only in host commit mode, register a fresh Change manifest with the supplied procedure.".into(),
+        "A recovery retry is not approval of prior content or evidence that it is correct.".into(),
+        "Never reset, discard, overwrite, or expand the scope to obtain a clean worktree. Report inherited changes that are irrelevant, unsafe, or cannot be completed safely.".into(),
+    ]
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InstructionSource {
     pub layer: String,
@@ -1124,6 +1138,83 @@ mod tests {
             assert!(rendered.text.contains("agent receipt --run-id"));
             assert!(!rendered.text.contains("agent submit"));
         }
+    }
+
+    #[test]
+    fn worker_recovery_guidance_is_present_only_for_typed_recovery_authority() {
+        let applied = fixture();
+        let cli_path = std::env::current_exe().unwrap();
+        let authorization: crate::engine::orchestration::WorkerRecoveryAuthorization =
+            serde_json::from_value(serde_json::json!({
+                "schema_version":1,
+                "ticket_run_id":"ticket-run-a",
+                "ticket_revision":4,
+                "work_node_id":"node-alpha",
+                "accepted_plan_digest":"a".repeat(64),
+                "prior_worker_agent_run_id":"agent-prior-worker",
+                "prior_terminal_digest":"b".repeat(64),
+                "prior_absence_digest":"c".repeat(64),
+                "prior_host_commit_operation_id":null,
+                "prior_host_commit_receipt_digest":null,
+                "expected_head":"d".repeat(40),
+                "source_coordinator_evidence_id":"e".repeat(64),
+                "prior_worker_result_evidence_id":"f".repeat(64),
+                "prior_artifact_refs":[]
+            }))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for commit_mode in [CommitMode::Native, CommitMode::Host] {
+            let mut applied_for_mode = applied.clone();
+            for profile in applied_for_mode.profiles.values_mut() {
+                profile.commit_mode = commit_mode;
+            }
+            let recovery_context = PromptContext {
+                accepted_plan: Some(
+                    serde_json::json!({
+                        "expected_head":authorization.expected_head
+                    })
+                    .to_string(),
+                ),
+                previous_decisions: worker_recovery_decisions(Some(&authorization)),
+                assigned_commit_mode: Some(commit_mode),
+                ..context(Role::Worker)
+            };
+            let rendered =
+                render_role_prompt(&applied_for_mode, &recovery_context, &cli_path).unwrap();
+            let prompt_path = directory
+                .path()
+                .join(format!("worker-recovery-{commit_mode:?}-prompt.md"));
+            std::fs::write(&prompt_path, rendered.text).unwrap();
+            let prompt = std::fs::read_to_string(prompt_path).unwrap();
+            assert!(prompt.contains("Prior uncommitted changes may remain"));
+            assert!(prompt.contains(&authorization.expected_head));
+            assert!(prompt.contains("A recovery retry is not approval"));
+            if commit_mode == CommitMode::Host {
+                assert!(
+                    prompt.contains("only in host commit mode, register a fresh Change manifest")
+                );
+            } else {
+                assert!(!prompt.contains("# Host commit procedure"));
+                assert!(!prompt.contains("agent repository manifest --paths-file"));
+            }
+        }
+
+        let normal_context = PromptContext {
+            previous_decisions: worker_recovery_decisions(None),
+            ..context(Role::Worker)
+        };
+        let normal = render_role_prompt(&applied, &normal_context, &cli_path).unwrap();
+        assert!(!normal.text.contains("Prior uncommitted changes may remain"));
+        let coordinator_context = PromptContext {
+            previous_decisions: worker_recovery_decisions(None),
+            ..context(Role::Coordinator)
+        };
+        let coordinator = render_role_prompt(&applied, &coordinator_context, &cli_path).unwrap();
+        assert!(
+            !coordinator
+                .text
+                .contains("Prior uncommitted changes may remain")
+        );
     }
 
     #[test]
