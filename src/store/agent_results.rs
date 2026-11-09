@@ -1447,6 +1447,30 @@ pub fn ingest_next_spooled_agent_result(
         return Ok(Some(existing));
     }
 
+    // A terminal may commit before role validation or before the next controller tick.
+    // Revisit that durable gap without rereading an Agent-writable spool.
+    let terminal_ids = {
+        let mut statement = store.connection.prepare(
+            "SELECT t.agent_run_id FROM agent_terminal_receipts t
+             WHERE NOT EXISTS(SELECT 1 FROM agent_result_evidence e WHERE e.agent_run_id=t.agent_run_id)
+               AND NOT EXISTS(SELECT 1 FROM role_wake_inputs w WHERE w.source_type='role_result_rejected' AND w.source_id=t.agent_run_id AND json_extract(w.payload_json,'$.terminal_digest')=t.terminal_digest)
+             ORDER BY t.observed_at_unix,t.agent_run_id LIMIT ?1",
+        ).map_err(|error| error.to_string())?;
+        statement
+            .query_map([candidate_limit as u64], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for run_id in terminal_ids {
+        let terminal = verify_agent_terminal(store, owner_generation, &AgentRunId::parse(run_id)?)?;
+        if let Some(result) =
+            ingest_verified_terminal_result(store, artifact_store, owner_generation, &terminal)?
+        {
+            return Ok(Some(result));
+        }
+    }
+
     let candidates = {
         let mut statement = store.connection.prepare(
             "SELECT a.agent_run_id,a.control_dir FROM agent_launch_authority a \
@@ -1534,17 +1558,131 @@ pub fn ingest_next_spooled_agent_result(
         }
         let terminal =
             record_and_verify_agent_terminal(store, owner_generation, &start, &terminal_result)?;
-        let message: RoleResultMessage = serde_json::from_value(
-            terminal_result
-                .structured_result
-                .clone()
-                .ok_or("completed Agent result has no structured role result")?,
-        )
-        .map_err(|error| format!("Agent {} role result is invalid: {error}", run_id))?;
-        return ingest_agent_result(store, artifact_store, owner_generation, &terminal, message)
-            .map(Some);
+        if let Some(result) =
+            ingest_verified_terminal_result(store, artifact_store, owner_generation, &terminal)?
+        {
+            return Ok(Some(result));
+        }
     }
     Ok(None)
+}
+
+fn ingest_verified_terminal_result(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    terminal: &VerifiedAgentTerminal,
+) -> Result<Option<IngestedAgentResult>, String> {
+    let authority = store
+        .agent_launch_authority(&terminal.agent_run_id)?
+        .ok_or("role result lost its immutable launch authority")?;
+    let binding = binding_for(&authority)?;
+    let value = terminal
+        .result
+        .structured_result
+        .clone()
+        .ok_or("completed Agent terminal has no structured result")?;
+    let message = serde_json::from_value::<RoleResultMessage>(value);
+    let mut valid = match &message {
+        Ok(message) => message.clone().bind(binding).is_ok(),
+        Err(_) => false,
+    };
+    if valid {
+        for reference in &message
+            .as_ref()
+            .map_err(|error| error.to_string())?
+            .artifact_refs
+        {
+            // Untrusted references must name this run's exact registration. Byte and storage
+            // verification still happens in normal ingestion and its failures remain errors.
+            let registered: bool = store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_artifacts WHERE artifact_id=?1 AND agent_run_id=?2 AND authority_digest=?3 AND kind=?4 AND schema_version=?5 AND relative_path=?6 AND content_digest=?7 AND byte_count=?8)",
+                params![reference.artifact_id.as_str(),authority.agent_run_id.as_str(),terminal.authority_digest.as_str(),reference.kind.as_str(),reference.schema_version,reference.path,reference.digest.as_str(),reference.bytes],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if !registered {
+                valid = false;
+                break;
+            }
+        }
+    }
+    if !valid {
+        record_rejected_role_result(store, owner_generation, terminal, &authority)?;
+        eprintln!(
+            "rex-projects: rejected role output from Agent {}; terminal evidence is retained; inspect the role input and use `ticket instruct` to request a corrected turn",
+            authority.agent_run_id
+        );
+        return Ok(None);
+    }
+    ingest_agent_result(
+        store,
+        artifact_store,
+        owner_generation,
+        terminal,
+        message.map_err(|error| error.to_string())?,
+    )
+    .map(Some)
+}
+
+fn record_rejected_role_result(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    terminal: &VerifiedAgentTerminal,
+    authority: &AgentLaunchAuthority,
+) -> Result<(), String> {
+    let (recipient, lifecycle) = if let Some(parent_id) = &authority.parent_run_id {
+        let parent = store
+            .agent_launch_authority(parent_id)?
+            .ok_or("rejected role result parent authority is missing")?;
+        if parent.project_id != authority.project_id
+            || Some(parent.role) != authority.parent_role
+            || !matches!(parent.role, Role::Coordinator | Role::Supervisor)
+        {
+            return Err("rejected role result parent is outside its role hierarchy".into());
+        }
+        (parent.role_session_id, "pending")
+    } else {
+        // Parentless roles need explicit human direction, not an unbounded self-retry.
+        (authority.role_session_id.clone(), "superseded")
+    };
+    let payload = serde_json::json!({
+        "kind":"role_result_rejected", "agent_run_id":authority.agent_run_id,
+        "run_epoch":authority.run_epoch, "terminal_digest":terminal.terminal_digest,
+        "category":"invalid_role_result",
+        "instruction":"The process exited, but its role output failed semantic validation. No child or workflow transition was authorized. Inspect the immutable result and request a corrected turn; inherited artifact locators cannot be forwarded as current-run registrations."
+    }).to_string();
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    super::validate_active_generation(&tx, owner_generation)?;
+    verify_persisted_authority(&tx, authority, &terminal.authority_digest)?;
+    verify_terminal_row(&tx, terminal)?;
+    let has_evidence: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_result_evidence WHERE agent_run_id=?1)",
+            [authority.agent_run_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_evidence {
+        return Err("cannot reject a role result that already has valid evidence".into());
+    }
+    let existing: Option<String> = tx.query_row(
+        "SELECT payload_json FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='role_result_rejected' AND source_id=?2 AND source_revision=?3",
+        params![recipient,authority.agent_run_id.as_str(),authority.run_epoch], |row| row.get(0),
+    ).optional().map_err(|error| error.to_string())?;
+    if let Some(existing) = existing {
+        if existing != payload {
+            return Err("role rejection marker differs from the verified terminal".into());
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'role_result_rejected',?3,?4,100,?5,?6,?7)",
+            params![authority.project_id.as_str(),recipient,authority.agent_run_id.as_str(),authority.run_epoch,payload,lifecycle,unix_now()?],
+        ).map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 
 /// Mark a typed result consumed after the FactoryRuntime has committed its reducer transition.
@@ -3767,11 +3905,12 @@ pub(crate) mod tests {
             .execute_batch(
                 "CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT,controller_generation INTEGER,control_dir TEXT);
                  CREATE TABLE agent_launch_state(agent_run_id TEXT,state TEXT,start_request_digest TEXT,provider_process_tree_json TEXT,updated_at_unix INTEGER);
-                 CREATE TABLE agent_terminal_receipts(agent_run_id TEXT);
+                 CREATE TABLE agent_terminal_receipts(agent_run_id TEXT,terminal_digest TEXT,observed_at_unix INTEGER);
                  CREATE TABLE provider_qualifications(receipt_digest TEXT,receipt_json TEXT);
                  CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,message_id TEXT,result_json TEXT,received_at_unix INTEGER);
                  CREATE TABLE agent_result_reducer_ack(evidence_id TEXT);
-                 CREATE TABLE execution_slots(owner_kind TEXT,owner_id TEXT,disposition TEXT,reservation_epoch INTEGER);",
+                 CREATE TABLE execution_slots(owner_kind TEXT,owner_id TEXT,disposition TEXT,reservation_epoch INTEGER);
+                 CREATE TABLE role_wake_inputs(source_type TEXT,source_id TEXT,payload_json TEXT);",
             )
             .unwrap();
         ConfigStore {
@@ -3889,6 +4028,117 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(disposition, "live");
+    }
+
+    #[test]
+    fn completed_invalid_spawn_result_is_rejected_durably_without_stopping_ingestion() {
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        for declare_unregistered_reference in [false, true] {
+            let mut message = RoleResultMessage {
+                schema_version: 1,
+                message_id: "coordinator-review-request".into(),
+                kind: RoleOutputKind::SpawnRequest,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: serde_json::json!({
+                    "work_node":"node-a", "role":"reviewer", "profile_id":"fixture-profile",
+                    "plan_digest":"a".repeat(64), "allowed_repositories":["repo-a"],
+                    "artifact_inputs":[{"artifact_id":"b".repeat(64),"kind":"general",
+                        "schema_version":1,"path":"sha256/bb/evidence","digest":"c".repeat(64),"bytes":14}]
+                }),
+                result_digest: None,
+                artifact_refs: Vec::new(),
+            };
+            if declare_unregistered_reference {
+                message.artifact_refs =
+                    serde_json::from_value(message.structured_result["artifact_inputs"].clone())
+                        .unwrap();
+            }
+            let mut fixture =
+                host_validation_fixture::host_validated_terminal_result(Role::Coordinator, message)
+                    .unwrap();
+            for _ in 0..2 {
+                let result = ingest_next_spooled_agent_result(
+                    &mut fixture.store,
+                    &fixture.artifacts,
+                    fixture.owner_generation,
+                    8,
+                )
+                .unwrap();
+                assert!(result.is_none());
+            }
+            let count: u64 = fixture.store.connection.query_row(
+            "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id=?1",
+            [fixture.terminal.agent_run_id.as_str()], |row| row.get(0),
+        ).unwrap();
+            assert_eq!(count, 1);
+            let evidence: u64 = fixture
+                .store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_result_evidence WHERE agent_run_id=?1",
+                    [fixture.terminal.agent_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                evidence, 0,
+                "an invalid claim must never become verified role evidence"
+            );
+            verify_agent_terminal(
+                &fixture.store,
+                fixture.owner_generation,
+                fixture.terminal.agent_run_id(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn completed_valid_result_is_replayed_after_the_terminal_commit_gap() {
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        let mut fixture = host_validation_fixture::host_validated_terminal_result(
+            Role::Coordinator,
+            RoleResultMessage {
+                schema_version: 1,
+                message_id: "coordinator-progress-after-terminal".into(),
+                kind: RoleOutputKind::Progress,
+                assertion: AgentAssertion::Blocked {
+                    reason: "waiting for review".into(),
+                },
+                structured_result: serde_json::json!({
+                    "summary":"waiting for review", "completed_node_keys":[],
+                    "pending_node_keys":["node-a"], "evidence":[], "next_observation_at":null
+                }),
+                result_digest: None,
+                artifact_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        let result = ingest_next_spooled_agent_result(
+            &mut fixture.store,
+            &fixture.artifacts,
+            fixture.owner_generation,
+            8,
+        )
+        .unwrap()
+        .expect("a valid terminal must still produce its role result after restart");
+        assert_eq!(
+            result.validated.message_id,
+            "coordinator-progress-after-terminal"
+        );
+        assert_eq!(
+            result.validated.binding.agent_run_id,
+            *fixture.terminal.agent_run_id()
+        );
+        let replay = ingest_next_spooled_agent_result(
+            &mut fixture.store,
+            &fixture.artifacts,
+            fixture.owner_generation,
+            8,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replay.receipt.evidence_id(), result.receipt.evidence_id());
     }
 
     #[test]
