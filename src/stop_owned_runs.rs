@@ -270,12 +270,16 @@ impl StopOwnedRunsHandler {
         else {
             return self.mark_unknown(target, &authority, context);
         };
-        if observation.last_exit.is_some()
-            || child.pid != wrapper_target.pid
-            || foreground.pid != provider_target.pid
-            || !rex_command_matches(child, &self.runtime_binary)
-            || !rex_command_matches(foreground, Path::new(&qualification.executable_path))
-        {
+        let anchored = target.rex_launch_anchor.as_ref();
+        let rex_binding_matches = rex_observation_matches_target(
+            target,
+            child,
+            foreground,
+            &self.runtime_binary,
+            Path::new(&qualification.executable_path),
+            &self.runtime_binary_digest,
+        );
+        if observation.last_exit.is_some() || !rex_binding_matches {
             return self.mark_unknown(target, &authority, context);
         }
         let tree = capture_process_tree(wrapper_target.pid, &current);
@@ -300,13 +304,35 @@ impl StopOwnedRunsHandler {
         let (Some(wrapper), Some(provider)) = (wrapper, provider) else {
             return self.mark_unknown(target, &authority, context);
         };
-        if wrapper.pid != wrapper.process_group_id
-            || tree
-                .iter()
-                .any(|process| process.process_group_id != wrapper.process_group_id)
-            || provider.process_group_id != wrapper.process_group_id
-        {
+        let process_scope_matches = if let Some(anchor) = anchored {
+            if target.runtime_binary_digest.is_none() {
+                return self.mark_unknown(target, &authority, context);
+            }
+            anchored_process_scope_matches(anchor, wrapper, provider, &tree, &current)
+        } else {
+            wrapper.pid == wrapper.process_group_id
+                && tree
+                    .iter()
+                    .all(|process| process.process_group_id == wrapper.process_group_id)
+                && provider.process_group_id == wrapper.process_group_id
+        };
+        if !process_scope_matches {
             return self.mark_unknown(target, &authority, context);
+        }
+        if let Some(anchor) = anchored {
+            let Some(runtime_digest) = target.runtime_binary_digest.as_ref() else {
+                return self.mark_unknown(target, &authority, context);
+            };
+            if !anchored_process_binaries_match(
+                anchor,
+                wrapper_target,
+                provider_target,
+                &current,
+                runtime_digest,
+                &qualification.executable_digest,
+            ) {
+                return self.mark_unknown(target, &authority, context);
+            }
         }
         let snapshot_digest = match context.store.record_stop_process_snapshot(
             context.owner_generation,
@@ -330,13 +356,156 @@ impl StopOwnedRunsHandler {
             let _ = snapshot_digest;
             return self.mark_unknown(target, &authority, context);
         }
-        let signal = signal_for_attempt(attempt_count, self.shutdown_grace);
-        match signal_process_group_if_observed(wrapper.process_group_id, &tree, &current, signal) {
-            Ok(_) if signal == ProcessSignal::Kill => {
-                self.mark_unknown(target, &authority, context)
+        let signal_current = match inspect_process_table() {
+            Ok(current) => current,
+            Err(_) => return self.mark_unknown(target, &authority, context),
+        };
+        let signal_tree = capture_process_tree(wrapper_target.pid, &signal_current);
+        if signal_tree != tree
+            || hash_file(&self.runtime_binary).ok().as_ref() != Some(&self.runtime_binary_digest)
+            || target
+                .runtime_binary_digest
+                .as_ref()
+                .is_some_and(|digest| digest != &self.runtime_binary_digest)
+            || hash_file(Path::new(&qualification.executable_path))
+                .ok()
+                .as_ref()
+                != Some(&qualification.executable_digest)
+        {
+            return self.mark_unknown(target, &authority, context);
+        }
+        let fresh_wrapper = signal_tree.iter().find(|process| {
+            process.pid == wrapper_target.pid
+                && process.start_identity == wrapper_target.start_identity
+        });
+        let fresh_provider = signal_tree.iter().find(|process| {
+            process.pid == provider_target.pid
+                && process.start_identity == provider_target.start_identity
+        });
+        let (Some(fresh_wrapper), Some(fresh_provider)) = (fresh_wrapper, fresh_provider) else {
+            return self.mark_unknown(target, &authority, context);
+        };
+        let fresh_scope_matches = if let Some(anchor) = anchored {
+            anchored_process_scope_matches(
+                anchor,
+                fresh_wrapper,
+                fresh_provider,
+                &signal_tree,
+                &signal_current,
+            )
+        } else {
+            fresh_wrapper.pid == fresh_wrapper.process_group_id
+                && signal_tree
+                    .iter()
+                    .all(|process| process.process_group_id == fresh_wrapper.process_group_id)
+                && fresh_provider.process_group_id == fresh_wrapper.process_group_id
+        };
+        if !fresh_scope_matches {
+            return self.mark_unknown(target, &authority, context);
+        }
+        if let Some(anchor) = anchored {
+            let Some(runtime_digest) = target.runtime_binary_digest.as_ref() else {
+                return self.mark_unknown(target, &authority, context);
+            };
+            if !anchored_process_binaries_match(
+                anchor,
+                wrapper_target,
+                provider_target,
+                &signal_current,
+                runtime_digest,
+                &qualification.executable_digest,
+            ) {
+                return self.mark_unknown(target, &authority, context);
             }
-            Ok(_) => TargetReconcile::Signalled,
-            Err(_) => self.mark_unknown(target, &authority, context),
+        }
+        let fresh_observation = match self.rex.observe_process(
+            &window,
+            target.agent_run_id.as_str(),
+            &target.rex_block_id,
+        ) {
+            Ok(observation) => observation,
+            Err(_) => return self.mark_unknown(target, &authority, context),
+        };
+        let (Some(fresh_child), Some(fresh_foreground)) = (
+            fresh_observation.child.as_ref(),
+            fresh_observation.foreground.as_ref(),
+        ) else {
+            return self.mark_unknown(target, &authority, context);
+        };
+        if fresh_observation.last_exit.is_some()
+            || !rex_observation_matches_target(
+                target,
+                fresh_child,
+                fresh_foreground,
+                &self.runtime_binary,
+                Path::new(&qualification.executable_path),
+                &self.runtime_binary_digest,
+            )
+        {
+            return self.mark_unknown(target, &authority, context);
+        }
+        let action_current = match inspect_process_table() {
+            Ok(current) => current,
+            Err(_) => return self.mark_unknown(target, &authority, context),
+        };
+        let action_tree = capture_process_tree(wrapper_target.pid, &action_current);
+        if action_tree != signal_tree {
+            return self.mark_unknown(target, &authority, context);
+        }
+        if let Some(anchor) = anchored {
+            let (Some(action_wrapper), Some(action_provider)) = (
+                action_tree.iter().find(|process| {
+                    process.pid == wrapper_target.pid
+                        && process.start_identity == wrapper_target.start_identity
+                }),
+                action_tree.iter().find(|process| {
+                    process.pid == provider_target.pid
+                        && process.start_identity == provider_target.start_identity
+                }),
+            ) else {
+                return self.mark_unknown(target, &authority, context);
+            };
+            let Some(runtime_digest) = target.runtime_binary_digest.as_ref() else {
+                return self.mark_unknown(target, &authority, context);
+            };
+            if !anchored_process_scope_matches(
+                anchor,
+                action_wrapper,
+                action_provider,
+                &action_tree,
+                &action_current,
+            ) || !anchored_process_binaries_match(
+                anchor,
+                wrapper_target,
+                provider_target,
+                &action_current,
+                runtime_digest,
+                &qualification.executable_digest,
+            ) {
+                return self.mark_unknown(target, &authority, context);
+            }
+        }
+        let signal = signal_for_attempt(attempt_count, self.shutdown_grace);
+        let groups = signal_tree
+            .iter()
+            .map(|process| process.process_group_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for group in groups {
+            let group_current = match inspect_process_table() {
+                Ok(current) => current,
+                Err(_) => return self.mark_unknown(target, &authority, context),
+            };
+            if !observed_group_members_match(&signal_tree, &group_current, group)
+                || signal_process_group_if_observed(group, &signal_tree, &group_current, signal)
+                    .is_err()
+            {
+                return self.mark_unknown(target, &authority, context);
+            }
+        }
+        if signal == ProcessSignal::Kill {
+            self.mark_unknown(target, &authority, context)
+        } else {
+            TargetReconcile::Signalled
         }
     }
 
@@ -361,6 +530,152 @@ impl StopOwnedRunsHandler {
     }
 }
 
+fn anchored_process_scope_matches(
+    anchor: &crate::launch::LaunchAnchorIdentity,
+    wrapper: &crate::process::ProcessIdentity,
+    provider: &crate::process::ProcessIdentity,
+    tree: &[crate::process::ProcessIdentity],
+    current: &[crate::process::ProcessIdentity],
+) -> bool {
+    let anchor_process = current.iter().find(|process| {
+        process.pid == anchor.pid
+            && process.start_identity == anchor.start_identity
+            && process.quality == ProcessIdentityQuality::KernelBirthToken
+    });
+    let wrapper_process = current.iter().find(|process| {
+        process.pid == wrapper.pid
+            && process.start_identity == wrapper.start_identity
+            && process.parent_pid == anchor.pid
+            && process.process_group_id == wrapper.process_group_id
+            && process.quality == ProcessIdentityQuality::KernelBirthToken
+    });
+    let provider_process = current.iter().find(|process| {
+        process.pid == provider.pid
+            && process.start_identity == provider.start_identity
+            && process.parent_pid == wrapper.pid
+            && process.quality == ProcessIdentityQuality::KernelBirthToken
+    });
+    let groups = tree
+        .iter()
+        .map(|process| process.process_group_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    anchor_process.is_some()
+        && wrapper_process.is_some()
+        && provider_process.is_some()
+        && wrapper.parent_pid == anchor.pid
+        && wrapper.pid == wrapper.process_group_id
+        && provider.parent_pid == wrapper.pid
+        && tree.iter().all(|process| process.process_group_id > 0)
+        && anchor_process.is_some_and(|anchor| !groups.contains(&anchor.process_group_id))
+        && current
+            .iter()
+            .filter(|process| groups.contains(&process.process_group_id))
+            .all(|actual| {
+                tree.iter().any(|known| {
+                    known.pid == actual.pid
+                        && known.start_identity == actual.start_identity
+                        && known.process_group_id == actual.process_group_id
+                        && actual.quality == ProcessIdentityQuality::KernelBirthToken
+                })
+            })
+}
+
+fn anchored_process_binaries_match(
+    anchor: &crate::launch::LaunchAnchorIdentity,
+    wrapper: &crate::store::agent_recovery::StopProcessIdentity,
+    provider: &crate::store::agent_recovery::StopProcessIdentity,
+    current: &[crate::process::ProcessIdentity],
+    runtime_digest: &ContentDigest,
+    provider_digest: &ContentDigest,
+) -> bool {
+    let exact_process = |pid, start_identity: &str| {
+        current.iter().find(|process| {
+            process.pid == pid
+                && process.start_identity == start_identity
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+        })
+    };
+    exact_process(anchor.pid, &anchor.start_identity)
+        .is_some_and(|process| process_executable_matches_digest(process, runtime_digest))
+        && exact_process(wrapper.pid, &wrapper.start_identity)
+            .is_some_and(|process| process_executable_matches_digest(process, runtime_digest))
+        && exact_process(provider.pid, &provider.start_identity)
+            .is_some_and(|process| process_executable_matches_digest(process, provider_digest))
+}
+
+fn rex_observation_matches_target(
+    target: &StopOwnedRunTarget,
+    child: &crate::adapters::rex::RexProcessInfo,
+    foreground: &crate::adapters::rex::RexProcessInfo,
+    runtime_binary: &Path,
+    provider_binary: &Path,
+    runtime_binary_digest: &ContentDigest,
+) -> bool {
+    let child_pid_matches = if let Some(anchor) = &target.rex_launch_anchor {
+        target.runtime_binary_digest.as_ref() == Some(runtime_binary_digest)
+            && child.pid == anchor.pid
+    } else {
+        target
+            .wrapper
+            .as_ref()
+            .is_some_and(|wrapper| child.pid == wrapper.pid)
+    };
+    let foreground_matches = if let Some(anchor) = &target.rex_launch_anchor {
+        let is_anchor = foreground.pid == anchor.pid;
+        let is_wrapper = target
+            .wrapper
+            .as_ref()
+            .is_some_and(|wrapper| foreground.pid == wrapper.pid);
+        let is_provider = target
+            .provider
+            .as_ref()
+            .is_some_and(|provider| foreground.pid == provider.pid);
+        (is_anchor || is_wrapper) && rex_command_matches(foreground, runtime_binary)
+            || is_provider && rex_command_matches(foreground, provider_binary)
+    } else {
+        target
+            .provider
+            .as_ref()
+            .is_some_and(|provider| foreground.pid == provider.pid)
+            && rex_command_matches(foreground, provider_binary)
+    };
+    child_pid_matches && foreground_matches && rex_command_matches(child, runtime_binary)
+}
+
+fn process_executable_matches_digest(
+    process: &crate::process::ProcessIdentity,
+    expected: &ContentDigest,
+) -> bool {
+    crate::process::executable_path_for_identity(process)
+        .ok()
+        .flatten()
+        .and_then(|path| hash_file(&path).ok())
+        .as_ref()
+        == Some(expected)
+}
+
+fn observed_group_members_match(
+    snapshot: &[crate::process::ProcessIdentity],
+    current: &[crate::process::ProcessIdentity],
+    group: u32,
+) -> bool {
+    group > 0
+        && snapshot
+            .iter()
+            .filter(|process| process.process_group_id == group)
+            .all(|expected| expected.quality == ProcessIdentityQuality::KernelBirthToken)
+        && current
+            .iter()
+            .filter(|process| process.process_group_id == group)
+            .all(|actual| {
+                snapshot.iter().any(|expected| {
+                    expected.pid == actual.pid
+                        && expected.start_identity == actual.start_identity
+                        && actual.quality == ProcessIdentityQuality::KernelBirthToken
+                })
+            })
+}
+
 fn rex_observation_digest(
     observation: &crate::adapters::rex::RexProcessObservation,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -376,14 +691,17 @@ pub(crate) fn owned_process_tree_is_absent(
     snapshot: &[crate::process::ProcessIdentity],
     current: &[crate::process::ProcessIdentity],
 ) -> bool {
-    let Some(group_id) = snapshot.first().map(|identity| identity.process_group_id) else {
+    let Some(_) = snapshot.first() else {
         return false;
     };
-    group_id > 0
+    let groups = snapshot
+        .iter()
+        .map(|identity| identity.process_group_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    !groups.contains(&0)
         && snapshot.iter().all(|identity| {
             identity.quality == ProcessIdentityQuality::KernelBirthToken
                 && identity.start_identity.trim() != ""
-                && identity.process_group_id == group_id
         })
         && snapshot.iter().all(|expected| {
             !current.iter().any(|actual| {
@@ -392,7 +710,7 @@ pub(crate) fn owned_process_tree_is_absent(
         })
         && current
             .iter()
-            .all(|actual| actual.process_group_id != group_id)
+            .all(|actual| !groups.contains(&actual.process_group_id))
 }
 
 impl EffectHandler for StopOwnedRunsHandler {
@@ -635,5 +953,253 @@ mod tests {
             quality: ProcessIdentityQuality::SecondPrecision,
         }];
         assert!(!owned_process_tree_is_absent(&unknown, &[]));
+    }
+
+    #[test]
+    fn anchored_scope_requires_exact_fresh_parent_births_and_family_group_ids() {
+        let identity = |pid, parent_pid, group, start: &str| crate::process::ProcessIdentity {
+            pid,
+            parent_pid,
+            process_group_id: group,
+            start_identity: start.into(),
+            command: "runtime".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let anchor = crate::launch::LaunchAnchorIdentity {
+            pid: 10,
+            start_identity: "anchor-birth".into(),
+        };
+        let wrapper = identity(20, 10, 20, "wrapper-birth");
+        let provider = identity(30, 20, 30, "provider-birth");
+        let tree = vec![wrapper.clone(), provider.clone()];
+        let current = vec![
+            identity(10, 1, 10, "anchor-birth"),
+            wrapper.clone(),
+            provider.clone(),
+        ];
+        assert!(anchored_process_scope_matches(
+            &anchor, &wrapper, &provider, &tree, &current
+        ));
+
+        let wrong_anchor_birth = vec![
+            identity(10, 1, 10, "reused-anchor"),
+            wrapper.clone(),
+            provider.clone(),
+        ];
+        assert!(!anchored_process_scope_matches(
+            &anchor,
+            &wrapper,
+            &provider,
+            &tree,
+            &wrong_anchor_birth
+        ));
+        let wrong_wrapper_birth = identity(20, 10, 20, "reused-wrapper");
+        assert!(!anchored_process_scope_matches(
+            &anchor,
+            &wrong_wrapper_birth,
+            &provider,
+            &tree,
+            &current
+        ));
+        let wrong_parent = identity(20, 99, 20, "wrapper-birth");
+        assert!(!anchored_process_scope_matches(
+            &anchor,
+            &wrong_parent,
+            &provider,
+            &tree,
+            &current
+        ));
+        let unknown_group = vec![wrapper.clone(), identity(30, 20, 0, "provider-birth")];
+        assert!(!anchored_process_scope_matches(
+            &anchor,
+            &wrapper,
+            &provider,
+            &unknown_group,
+            &current
+        ));
+        let with_unrelated_same_provider_group = vec![
+            current[0].clone(),
+            wrapper.clone(),
+            provider.clone(),
+            identity(40, 1, provider.process_group_id, "foreign-birth"),
+        ];
+        assert!(!anchored_process_scope_matches(
+            &anchor,
+            &wrapper,
+            &provider,
+            &tree,
+            &with_unrelated_same_provider_group
+        ));
+    }
+
+    #[test]
+    fn rex_observation_requires_exact_anchored_child_foreground_and_both_executables() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        let provider_binary = temp.path().join("provider");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        std::fs::write(&provider_binary, b"provider").unwrap();
+        let runtime_digest = ContentDigest::parse("d".repeat(64)).unwrap();
+        let mut target = StopOwnedRunTarget {
+            agent_run_id: crate::domain::ids::AgentRunId::parse("agent-run-a").unwrap(),
+            attempt: 1,
+            run_epoch: 1,
+            reservation_epoch: 1,
+            authority_digest: ContentDigest::parse("a".repeat(64)).unwrap(),
+            rex_server_identity: "server".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+            rex_block_id: "block".into(),
+            wrapper: Some(crate::store::agent_recovery::StopProcessIdentity {
+                pid: 20,
+                start_identity: "wrapper".into(),
+            }),
+            provider: Some(crate::store::agent_recovery::StopProcessIdentity {
+                pid: 30,
+                start_identity: "provider".into(),
+            }),
+            rex_launch_anchor: Some(crate::launch::LaunchAnchorIdentity {
+                pid: 10,
+                start_identity: "anchor".into(),
+            }),
+            runtime_binary_digest: Some(runtime_digest.clone()),
+            lifecycle: StopTargetLifecycle::NeedsReconciliation,
+        };
+        let process = |pid, path: &Path| crate::adapters::rex::RexProcessInfo {
+            pid,
+            user_id: 1,
+            name: "runtime".into(),
+            argv0: None,
+            path: Some(path.display().to_string()),
+            invoked_path: None,
+            script: None,
+            cwd: None,
+            user: None,
+        };
+        let child = process(10, &runtime);
+        let foreground = process(30, &provider_binary);
+        assert!(rex_observation_matches_target(
+            &target,
+            &child,
+            &foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+        let anchor_foreground = process(10, &runtime);
+        assert!(rex_observation_matches_target(
+            &target,
+            &child,
+            &anchor_foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+        let wrapper_foreground = process(20, &runtime);
+        assert!(rex_observation_matches_target(
+            &target,
+            &child,
+            &wrapper_foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+
+        let foreign_child = process(11, &runtime);
+        assert!(!rex_observation_matches_target(
+            &target,
+            &foreign_child,
+            &foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+        let foreign_foreground = process(31, &provider_binary);
+        assert!(!rex_observation_matches_target(
+            &target,
+            &child,
+            &foreign_foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+        let wrong_runtime = temp.path().join("wrong-runtime");
+        std::fs::write(&wrong_runtime, b"wrong").unwrap();
+        let wrong_child = process(10, &wrong_runtime);
+        assert!(!rex_observation_matches_target(
+            &target,
+            &wrong_child,
+            &foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+        let wrong_anchor_foreground = process(10, &provider_binary);
+        assert!(!rex_observation_matches_target(
+            &target,
+            &child,
+            &wrong_anchor_foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+        target.runtime_binary_digest = Some(ContentDigest::parse("e".repeat(64)).unwrap());
+        assert!(!rex_observation_matches_target(
+            &target,
+            &child,
+            &foreground,
+            &runtime,
+            &provider_binary,
+            &runtime_digest,
+        ));
+    }
+
+    #[test]
+    fn current_process_executable_must_match_its_pinned_digest() {
+        let process = crate::process::process_identity_for_pid(std::process::id())
+            .unwrap()
+            .unwrap();
+        let executable = crate::process::executable_path_for_identity(&process)
+            .unwrap()
+            .unwrap();
+        let digest = hash_file(&executable).unwrap();
+        assert!(process_executable_matches_digest(&process, &digest));
+        assert!(!process_executable_matches_digest(
+            &process,
+            &ContentDigest::parse("0".repeat(64)).unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_disappeared_process_group_does_not_block_signaling_the_next_pinned_group() {
+        let identity = |pid, group, start: &str| crate::process::ProcessIdentity {
+            pid,
+            parent_pid: 1,
+            process_group_id: group,
+            start_identity: start.into(),
+            command: "fixture".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let snapshot = vec![
+            identity(20, 20, "wrapper-birth"),
+            identity(30, 30, "provider-birth"),
+        ];
+        let after_wrapper_group_exits = vec![identity(30, 30, "provider-birth")];
+        assert!(observed_group_members_match(
+            &snapshot,
+            &after_wrapper_group_exits,
+            20
+        ));
+        assert!(observed_group_members_match(
+            &snapshot,
+            &after_wrapper_group_exits,
+            30
+        ));
+        let foreign_provider_group = vec![identity(40, 30, "foreign-birth")];
+        assert!(!observed_group_members_match(
+            &snapshot,
+            &foreign_provider_group,
+            30
+        ));
     }
 }

@@ -7769,6 +7769,74 @@ pub(crate) mod tests {
         let worker_assignment = prepared_worker.reservation_binding();
         assert_eq!(worker_assignment.expected_head(), corrected_head);
 
+        let verification_plan = store
+            .latest_accepted_work_plan(&project_id, &ticket_run_id)
+            .unwrap()
+            .unwrap();
+        let validated_verification_plan = verification_plan
+            .validate_for(project_config, &config_digest)
+            .unwrap();
+        let verification_node = validated_verification_plan
+            .nodes_in_execution_order
+            .iter()
+            .find(|node| node.id == stacked_id)
+            .unwrap();
+        let recovery_authorization = crate::engine::orchestration::WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            ticket_revision: verification_run.revision,
+            work_node_id: stacked_id.clone(),
+            accepted_plan_digest: verification_plan.plan_digest.clone(),
+            prior_worker_agent_run_id: crate::domain::ids::AgentRunId::parse(
+                "prior-verification-worker-run",
+            )
+            .unwrap(),
+            prior_terminal_digest: Digest::parse("1".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("2".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: None,
+            prior_host_commit_receipt_digest: None,
+            expected_head: corrected_head.clone(),
+            source_coordinator_evidence_id: coordinator_result
+                .ingested
+                .receipt
+                .evidence_id()
+                .to_owned(),
+            prior_worker_result_evidence_id: "prior-worker-result-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        };
+        let recovery_assignment = crate::runtime_services::prepared_worker_assignment_for_test(
+            &store,
+            owner_generation,
+            &verification_plan,
+            &validated_verification_plan,
+            &prepared_worker,
+            verification_node,
+            Some(&recovery_authorization),
+        )
+        .unwrap();
+        let recovery_assignment: serde_json::Value =
+            serde_json::from_str(&recovery_assignment).unwrap();
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["verification_only"],
+            true
+        );
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["accepted_publication"]["publication_operation_id"],
+            corrected_intent.operation_id
+        );
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["accepted_publication"]["publication_revision"],
+            corrected_review.revision
+        );
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["accepted_publication"]["published_head"],
+            corrected_head
+        );
+        assert_eq!(
+            recovery_assignment["worker_recovery_authorization"]["expected_head"],
+            corrected_head
+        );
+
         let worker_agent_run_id =
             crate::domain::ids::AgentRunId::parse("verification-worker-run").unwrap();
         let worker_payload = serde_json::json!({

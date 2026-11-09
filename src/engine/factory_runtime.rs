@@ -3288,10 +3288,7 @@ fn apply_coordinator_spawn_request(
         .into_iter()
         .find(|run| run.ticket_run_id == *ticket_run_id)
         .ok_or("Coordinator SpawnRequest references no active TicketRun")?;
-    if current.project_id != binding.project_id
-        || current.revision != source_revision.0
-        || !crate::runtime_services::role_allowed_in_phase(request.role, current.phase)
-    {
+    if current.project_id != binding.project_id || current.revision != source_revision.0 {
         return Err("Coordinator SpawnRequest is stale or outside its TicketRun".into());
     }
     if !config
@@ -3437,6 +3434,39 @@ fn apply_coordinator_spawn_request(
     }
     if expected_profile != request.profile_id {
         return Err("Coordinator SpawnRequest profile differs from current Project policy".into());
+    }
+    if !crate::runtime_services::role_allowed_in_phase(request.role, current.phase) {
+        let phase = serde_json::to_value(current.phase)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or("TicketRun phase is not serializable")?;
+        let allowed_roles = [
+            Role::Planner,
+            Role::Worker,
+            Role::Reviewer,
+            Role::MergeDecision,
+            Role::Operator,
+            Role::Postmortem,
+        ]
+        .into_iter()
+        .filter(|role| crate::runtime_services::role_allowed_in_phase(*role, current.phase))
+        .map(|role| serde_json::to_value(role).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+        let next_step = if current.phase == crate::engine::reducer::Phase::Implementing {
+            "Continue with a Worker only when a host-verified verification or recovery authorization is available; otherwise wait for the required host phase transition."
+        } else {
+            "Do not request a child role that is illegal in the current phase. Continue only with a host-authorized role from allowed_roles, or wait for the required host phase transition."
+        };
+        let payload = serde_json::json!({
+            "kind": "coordinator_spawn_rejected",
+            "source_evidence_id": result.receipt.evidence_id(),
+            "requested_role": request.role,
+            "current_phase": phase,
+            "allowed_roles": allowed_roles,
+            "next_step": next_step
+        });
+        store.reject_coordinator_child_wake(owner_generation, result, current.phase, &payload)?;
+        return Ok(true);
     }
     let session = format!("ticket_run:{ticket_run_id}:{}", role_name(request.role));
     let payload = serde_json::json!({
@@ -5383,6 +5413,462 @@ pub(crate) mod tests {
             )
             .unwrap(),
             Some((3, "applied".into()))
+        );
+    }
+
+    #[test]
+    fn phase_ineligible_coordinator_spawn_is_acknowledged_and_wakes_same_coordinator() {
+        use crate::domain::ids::Digest;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use serde_json::json;
+
+        let structured_result = json!({
+            "work_node": "initial-plan",
+            "role": "planner",
+            "profile_id": "fixture-profile",
+            "allowed_repositories": [],
+            "artifact_inputs": [],
+            "parent_run_id": null
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Coordinator,
+                RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "coordinator-phase-rejected-1".into(),
+                    kind: RoleOutputKind::SpawnRequest,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result,
+                    result_digest: Some(result_digest),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET internal_phase='implementing' WHERE ticket_run_id='fixture-ticket-run'",
+                [],
+            )
+            .unwrap();
+        let config: Config = serde_json::from_value(json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind": "command", "command": ["ticket-cli"]}},
+            "projects": {"fixture-project": {
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "goal": {"revision": 1, "statement": "fixture goal", "acceptance": ["produce a valid plan"]},
+                "roles": {"coordinator": "fixture-profile", "planner": "fixture-profile"}
+            }}
+        }))
+        .unwrap();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
+        };
+        let coordinator_session = "ticket_run:fixture-ticket-run:coordinator";
+
+        for _ in 0..2 {
+            assert!(
+                super::apply_agent_result(
+                    &mut fixture.store,
+                    fixture.owner_generation,
+                    10,
+                    &config,
+                    &mut services,
+                    &fixture.ingested,
+                )
+                .unwrap()
+            );
+        }
+
+        let project_id = ProjectId::parse("fixture-project").unwrap();
+        let wakes = fixture
+            .store
+            .pending_role_wake_inputs(&project_id, coordinator_session, 8)
+            .unwrap();
+        assert_eq!(wakes.len(), 1);
+        let rejected = wakes
+            .iter()
+            .find(|wake| wake.source_type == "coordinator_spawn_rejected")
+            .unwrap();
+        assert_eq!(rejected.source_id, fixture.ingested.receipt.evidence_id());
+        assert_eq!(rejected.payload_json["current_phase"], "implementing");
+        assert_eq!(rejected.payload_json["requested_role"], "planner");
+        assert!(
+            rejected.payload_json["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("host-verified")
+        );
+        assert!(
+            fixture
+                .store
+                .pending_role_wake_inputs(&project_id, "ticket_run:fixture-ticket-run:planner", 8)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                fixture.ingested.receipt.evidence_id(),
+            )
+            .unwrap(),
+            Some((3, "rejected_by_host".into()))
+        );
+
+        let negative_structured_result = json!({
+            "work_node": "initial-plan",
+            "role": "planner",
+            "profile_id": "fixture-profile",
+            "allowed_repositories": [],
+            "artifact_inputs": [],
+            "parent_run_id": null
+        });
+        let negative_result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&negative_structured_result).unwrap())
+        ))
+        .unwrap();
+        let mut negative_fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Coordinator,
+                RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "coordinator-phase-rejected-bad-authority".into(),
+                    kind: RoleOutputKind::SpawnRequest,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result: negative_structured_result,
+                    result_digest: Some(negative_result_digest),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        negative_fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET internal_phase='implementing' WHERE ticket_run_id='fixture-ticket-run'",
+                [],
+            )
+            .unwrap();
+        negative_fixture
+            .store
+            .test_connection()
+            .execute("DROP TRIGGER agent_launch_authority_immutable_update", [])
+            .unwrap();
+        negative_fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE agent_launch_authority SET authority_digest=?2 WHERE agent_run_id=?1",
+                rusqlite::params!["fixture-agent-run", "f".repeat(64)],
+            )
+            .unwrap();
+        assert!(
+            super::apply_agent_result(
+                &mut negative_fixture.store,
+                negative_fixture.owner_generation,
+                10,
+                &config,
+                &mut services,
+                &negative_fixture.ingested,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &negative_fixture.store,
+                negative_fixture.ingested.receipt.evidence_id(),
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            negative_fixture
+                .store
+                .pending_role_wake_inputs(&project_id, coordinator_session, 8)
+                .unwrap()
+                .iter()
+                .all(|wake| wake.source_id != negative_fixture.ingested.receipt.evidence_id())
+        );
+    }
+
+    #[test]
+    fn phase_ineligible_reviewer_spawn_with_accepted_plan_and_general_artifact_is_rejected() {
+        use crate::domain::ids::{AgentRunId, ArtifactId, Digest, RepositoryId};
+        use crate::engine::orchestration::{
+            AgentAssertion, PlannedWorkNode, RoleArtifactKind, RoleArtifactReference,
+            RoleOutputKind, SpawnRequestPayload, WorkPlan,
+        };
+        use crate::roles::RoleResultMessage;
+        use crate::store::accepted_plans::PersistedWorkPlan;
+        use std::collections::BTreeMap;
+
+        let project_id = ProjectId::parse("fixture-project").unwrap();
+        let ticket_run_id = crate::domain::ids::TicketRunId::parse("fixture-ticket-run").unwrap();
+        let repository = RepositoryId::parse("repo-a").unwrap();
+        let work_node = crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap();
+        let run_id = AgentRunId::parse("fixture-agent-run").unwrap();
+        let general_bytes = b"Coordinator registered general evidence";
+        let general_digest =
+            Digest::parse(format!("{:x}", sha2::Sha256::digest(general_bytes))).unwrap();
+        let general_artifact_id = ArtifactId::from_registration_identity(
+            &project_id,
+            &run_id,
+            "general",
+            1,
+            &general_digest,
+        )
+        .unwrap();
+        let general_reference = RoleArtifactReference {
+            artifact_id: general_artifact_id.clone(),
+            kind: RoleArtifactKind::General,
+            schema_version: 1,
+            path: format!(
+                "sha256/{}/{}",
+                &general_artifact_id.as_str()[..2],
+                general_artifact_id.as_str()
+            ),
+            digest: general_digest,
+            bytes: general_bytes.len() as u64,
+        };
+        let proposal = WorkPlan {
+            nodes: vec![PlannedWorkNode {
+                id: work_node.clone(),
+                repository: repository.clone(),
+                task: "implement the requested change".into(),
+                depends_on: Vec::new(),
+                required_evidence: vec!["tests pass".into()],
+                investigation: false,
+            }],
+            requested_investigation_children: 0,
+        };
+        let persisted_plan = PersistedWorkPlan {
+            schema_version: 1,
+            proposal: proposal.clone(),
+            observed_base_shas: BTreeMap::new(),
+        };
+        let plan_json = crate::store::canonical_json(&persisted_plan).unwrap();
+        let plan_digest =
+            Digest::parse(format!("{:x}", sha2::Sha256::digest(plan_json.as_bytes()))).unwrap();
+        let request = SpawnRequestPayload {
+            work_node: work_node.clone(),
+            role: Role::Reviewer,
+            profile_id: crate::domain::ids::ProfileId::parse("fixture-profile").unwrap(),
+            plan_digest: Some(plan_digest.clone()),
+            worker_recovery: None,
+            allowed_repositories: vec![repository.clone()],
+            artifact_inputs: vec![general_reference.clone()],
+            parent_run_id: None,
+        };
+        let structured_result = serde_json::to_value(&request).unwrap();
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_terminal_result(
+                Role::Coordinator,
+                RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "coordinator-review-request-with-general-artifact".into(),
+                    kind: RoleOutputKind::SpawnRequest,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result,
+                    result_digest: Some(result_digest),
+                    artifact_refs: vec![general_reference.clone()],
+                },
+            )
+            .unwrap();
+        let authority = fixture
+            .store
+            .agent_launch_authority(&run_id)
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir_all(authority.workspace_path.join("evidence")).unwrap();
+        std::fs::write(
+            authority.workspace_path.join("evidence/context.txt"),
+            general_bytes,
+        )
+        .unwrap();
+        let artifact_request_id = "coordinator-general-artifact";
+        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
+            run_id.to_string(),
+            &authority.control_dir.join("mailbox"),
+        )
+        .unwrap();
+        let artifact_request = crate::engine::orchestration::ArtifactAddRequest {
+            schema_version: 1,
+            message_id: artifact_request_id.into(),
+            path: "evidence/context.txt".into(),
+            kind: RoleArtifactKind::General,
+            artifact_schema_version: 1,
+        };
+        let artifact_envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(artifact_request_id).unwrap(),
+            operation_id: Some(authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("artifact.add").unwrap(),
+            project_id: Some(project_id.clone()),
+            run_id: Some(run_id.to_string()),
+            attempt: Some(authority.attempt),
+            run_epoch: Some(authority.run_epoch),
+            expected_subject_revision: Some(authority.ticket_revision.unwrap().0),
+            role: Some(Role::Coordinator),
+            request_type: None,
+            params: serde_json::to_value(&artifact_request).unwrap(),
+        };
+        let mailbox_now = crate::mailbox::unix_time_now().unwrap();
+        mailbox
+            .queue(
+                artifact_request_id,
+                &serde_json::to_vec(&artifact_envelope).unwrap(),
+                mailbox_now,
+            )
+            .unwrap();
+        let mailbox_request = mailbox.pending(mailbox_now).unwrap().remove(0);
+        let registered = fixture
+            .store
+            .process_artifact_add(
+                fixture.owner_generation,
+                &authority,
+                &fixture.artifacts,
+                &mailbox,
+                &mailbox_request,
+                &artifact_request,
+            )
+            .unwrap();
+        assert_eq!(registered.reference(), &general_reference);
+
+        let ingested = crate::store::agent_results::ingest_next_spooled_agent_result(
+            &mut fixture.store,
+            &fixture.artifacts,
+            fixture.owner_generation,
+            8,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ingested.validated.binding.role, Role::Coordinator);
+        assert_eq!(ingested.validated.kind, RoleOutputKind::SpawnRequest);
+        assert_eq!(ingested.verified_artifacts.len(), 1);
+        assert_eq!(
+            ingested.verified_artifacts[0].reference(),
+            &general_reference
+        );
+        assert_eq!(
+            ingested.validated.typed_payload,
+            crate::engine::orchestration::RoleResultPayload::SpawnRequest(request.clone())
+        );
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET internal_phase='implementing' WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            )
+            .unwrap();
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,3,?3,?4,?5,?6,?7,?8,?9,?7,?10,?11,1)",
+                rusqlite::params![
+                    project_id.as_str(),
+                    ticket_run_id.as_str(),
+                    authority.config_digest.as_str(),
+                    plan_digest.as_str(),
+                    plan_json,
+                    ingested.receipt.evidence_id(),
+                    authority.agent_run_id.as_str(),
+                    ingested.receipt.message_id(),
+                    ingested.receipt.content_digest().as_str(),
+                    authority.role_session_id,
+                    authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind": "command", "command": ["ticket-cli"]}},
+            "projects": {"fixture-project": {
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "repositories": ["repo-a"],
+                "goal": {"revision": 1, "statement": "fixture goal", "acceptance": ["produce a valid review request"]},
+                "roles": {"coordinator": "fixture-profile", "reviewer": "fixture-profile"}
+            }}
+        }))
+        .unwrap();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest: authority.config_digest.clone(),
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
+        };
+        for _ in 0..2 {
+            assert!(
+                super::apply_agent_result(
+                    &mut fixture.store,
+                    fixture.owner_generation,
+                    10,
+                    &config,
+                    &mut services,
+                    &ingested,
+                )
+                .unwrap()
+            );
+        }
+        let coordinator_session = format!("ticket_run:{ticket_run_id}:coordinator");
+        let wakes = fixture
+            .store
+            .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+            .unwrap();
+        assert_eq!(
+            wakes
+                .iter()
+                .filter(|wake| wake.source_type == "coordinator_spawn_rejected")
+                .count(),
+            1
+        );
+        assert!(wakes.iter().any(|wake| {
+            wake.source_type == "coordinator_spawn_rejected"
+                && wake.source_id == ingested.receipt.evidence_id()
+                && wake.payload_json["requested_role"] == "reviewer"
+                && wake.payload_json["current_phase"] == "implementing"
+        }));
+        assert!(
+            fixture
+                .store
+                .pending_role_wake_inputs(
+                    &project_id,
+                    &format!("ticket_run:{ticket_run_id}:reviewer"),
+                    16
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                ingested.receipt.evidence_id(),
+            )
+            .unwrap(),
+            Some((3, "rejected_by_host".into()))
         );
     }
 

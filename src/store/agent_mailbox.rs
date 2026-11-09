@@ -305,7 +305,24 @@ impl crate::store::ConfigStore {
             );
         }
         if mode == MailboxDispatchMode::TerminalReceiptReplay {
-            return Ok(false);
+            let response = crate::protocol::ResponseEnvelope {
+                schema_version: crate::protocol::SCHEMA_VERSION,
+                request_id: mailbox_request.envelope.request_id.clone(),
+                result: None::<serde_json::Value>,
+                error: Some(crate::protocol::ProtocolError {
+                    code: crate::protocol::ErrorCode::Unsupported,
+                    message: "terminal Agent runs cannot process new mailbox requests".into(),
+                    retryable: false,
+                    retry_after_ms: None,
+                    details: Default::default(),
+                }),
+                extensions: Default::default(),
+            };
+            let bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+            mailbox
+                .publish_receipt(&mailbox_request.request_id, &bytes, now_unix.max(0) as u64)
+                .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+            return Ok(true);
         }
         if method.as_str() != Some("artifact.add") {
             let response = crate::protocol::ResponseEnvelope {

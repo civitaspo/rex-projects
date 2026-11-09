@@ -216,6 +216,10 @@ pub struct StopOwnedRunTarget {
     pub rex_block_id: String,
     pub wrapper: Option<StopProcessIdentity>,
     pub provider: Option<StopProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<crate::launch::LaunchAnchorIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binary_digest: Option<Digest>,
     pub lifecycle: StopTargetLifecycle,
 }
 
@@ -330,6 +334,16 @@ impl StopOwnedRunsIntent {
                         || process.start_identity.trim().is_empty()
                         || process.start_identity.chars().any(char::is_control)
                 })
+                || target.rex_launch_anchor.as_ref().is_some_and(|anchor| {
+                    anchor.pid == 0
+                        || anchor.start_identity.trim().is_empty()
+                        || anchor.start_identity.chars().any(char::is_control)
+                        || target
+                            .wrapper
+                            .as_ref()
+                            .is_some_and(|wrapper| wrapper.pid == anchor.pid)
+                })
+                || target.rex_launch_anchor.is_some() != target.runtime_binary_digest.is_some()
                 || (target.lifecycle == StopTargetLifecycle::NeedsReconciliation
                     && (target.wrapper.is_none() || target.provider.is_none()))
                 || (target.lifecycle == StopTargetLifecycle::IdentityUnknown
@@ -533,14 +547,13 @@ fn validate_stop_process_snapshot(
         return Err("StopOwnedRuns process snapshot is empty or exceeds its bound".into());
     }
     let mut last_pid = 0;
-    let group = processes[0].process_group_id;
     for process in processes {
         if process.pid <= last_pid
             || process.quality != ProcessIdentityQuality::KernelBirthToken
             || process.start_identity.trim().is_empty()
             || process.command.trim().is_empty()
             || process.command.chars().any(char::is_control)
-            || process.process_group_id != group
+            || process.process_group_id == 0
         {
             return Err(
                 "StopOwnedRuns process snapshot lacks a complete ordered process group".into(),
@@ -1419,7 +1432,7 @@ impl ConfigStore {
                     "StopOwnedRuns scope does not match stored Agent launch authority".into(),
                 );
             }
-            let wrapper = wrapper_json
+            let observed_wrapper = wrapper_json
                 .as_deref()
                 .and_then(|json| {
                     crate::protocol::parse_unique::<ObservedWrapperIdentity>(json.as_bytes()).ok()
@@ -1428,11 +1441,21 @@ impl ConfigStore {
                     identity.rex_session_id == authority.rex_session_id
                         && identity.rex_block_id == authority.rex_block_id
                         && identity.runtime_binary_digest == authority.runtime_binary_digest
-                })
+                });
+            let wrapper = observed_wrapper
+                .as_ref()
                 .map(|identity| StopProcessIdentity {
                     pid: identity.pid,
-                    start_identity: identity.start_identity,
+                    start_identity: identity.start_identity.clone(),
                 });
+            let rex_launch_anchor = observed_wrapper
+                .as_ref()
+                .and_then(|identity| identity.rex_launch_anchor.clone());
+            let runtime_binary_digest = rex_launch_anchor.as_ref().and_then(|_| {
+                observed_wrapper
+                    .as_ref()
+                    .map(|identity| identity.runtime_binary_digest.clone())
+            });
             let provider = provider_json
                 .as_deref()
                 .and_then(|json| {
@@ -1462,6 +1485,8 @@ impl ConfigStore {
                 rex_block_id: authority.rex_block_id,
                 wrapper,
                 provider,
+                rex_launch_anchor,
+                runtime_binary_digest,
                 lifecycle,
             });
         }
@@ -1989,6 +2014,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_target_anchor_evidence_is_optional_and_legacy_json_stays_compact() {
+        let mut target = StopOwnedRunTarget {
+            agent_run_id: AgentRunId::parse("agent-run-a").unwrap(),
+            attempt: 1,
+            run_epoch: 1,
+            reservation_epoch: 1,
+            authority_digest: Digest::parse("a".repeat(64)).unwrap(),
+            rex_server_identity: "rex-server".into(),
+            rex_session_id: "rex-session".into(),
+            rex_window_id: "rex-window".into(),
+            rex_block_id: "rex-block".into(),
+            wrapper: Some(StopProcessIdentity {
+                pid: 10,
+                start_identity: "wrapper-birth".into(),
+            }),
+            provider: Some(StopProcessIdentity {
+                pid: 11,
+                start_identity: "provider-birth".into(),
+            }),
+            rex_launch_anchor: None,
+            runtime_binary_digest: None,
+            lifecycle: StopTargetLifecycle::NeedsReconciliation,
+        };
+        let legacy = serde_json::to_value(&target).unwrap();
+        assert!(legacy.get("rex_launch_anchor").is_none());
+        assert!(legacy.get("runtime_binary_digest").is_none());
+
+        target.rex_launch_anchor = Some(crate::launch::LaunchAnchorIdentity {
+            pid: 9,
+            start_identity: "anchor-birth".into(),
+        });
+        target.runtime_binary_digest = Some(Digest::parse("d".repeat(64)).unwrap());
+        let anchored = serde_json::to_value(&target).unwrap();
+        let decoded: StopOwnedRunTarget = serde_json::from_value(anchored).unwrap();
+        assert_eq!(decoded, target);
+        let intent = StopOwnedRunsIntent {
+            schema_version: 1,
+            operation_id: OperationId::parse("stop-a").unwrap(),
+            request: StopOwnedRunsRequest {
+                schema_version: 1,
+                project_id: ProjectId::parse("project-a").unwrap(),
+                ticket_run_id: TicketRunId::parse("ticket-a").unwrap(),
+                expected_revision: 1,
+            },
+            targets: vec![decoded],
+            created_at_unix: 0,
+        };
+        intent.validate().unwrap();
+    }
+
+    #[test]
     fn store_adoption_accepts_large_exact_process_history_and_rejects_shared_budget_overflow() {
         use crate::store::OwnerMetadata;
         use sha2::{Digest as _, Sha256};
@@ -2375,6 +2451,8 @@ mod tests {
                 rex_block_id: format!("rex-block-{index}"),
                 wrapper: None,
                 provider: None,
+                rex_launch_anchor: None,
+                runtime_binary_digest: None,
                 lifecycle: StopTargetLifecycle::IdentityUnknown,
             })
             .collect::<Vec<_>>();
@@ -2517,6 +2595,8 @@ mod tests {
                 pid: provider.pid,
                 start_identity: provider.start_identity.clone(),
             }),
+            rex_launch_anchor: None,
+            runtime_binary_digest: None,
             lifecycle: StopTargetLifecycle::NeedsReconciliation,
         };
         let request = StopOwnedRunsRequest {

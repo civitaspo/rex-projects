@@ -2870,13 +2870,13 @@ fn native_worker_processes_are_live(
             identity.pid == wrapper.pid && identity.start_identity == wrapper.start_identity
         })
         .count();
+    // Start snapshots retain completed hook children; supervisor/provider liveness is checked above.
     wrapper_count == 1
         && provider.process_tree.iter().all(|identity| {
             identity.pid != 0
                 && !identity.start_identity.trim().is_empty()
                 && identity.identity_quality == ProcessIdentityQuality::KernelBirthToken
                 && pids.insert(identity.pid)
-                && is_live(identity.pid, &identity.start_identity)
         })
         && provider.process_tree.iter().any(|identity| {
             identity.pid == provider.provider_pid
@@ -4363,6 +4363,13 @@ mod tests {
                 start_identity: "provider-born".into(),
                 identity_quality: ProcessIdentityQuality::KernelBirthToken,
             },
+            ProviderProcessIdentity {
+                pid: 33,
+                parent_pid: 22,
+                process_group_id: 33,
+                start_identity: "finished-hook-born".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
         ];
         let tree_digest = Digest::parse(format!(
             "{:x}",
@@ -4435,6 +4442,14 @@ mod tests {
         assert!(!native_worker_processes_are_live(
             &wrapper,
             &duplicate_wrapper,
+            &live
+        ));
+        let mut unverified_transient = observation.clone();
+        unverified_transient.process_tree[2].identity_quality =
+            ProcessIdentityQuality::SecondPrecision;
+        assert!(!native_worker_processes_are_live(
+            &wrapper,
+            &unverified_transient,
             &live
         ));
         let mut stale_birth = live;
