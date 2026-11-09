@@ -49,8 +49,8 @@ project, and ticket ID with your own):
 ```sh
 rex-projects schema response | jq .
 jq . schemas/ticket-adapter/v1.json
-rex-projects ticket list --config /path/to/rex.yml --project example --limit 10 --json
-rex-projects ticket show --config /path/to/rex.yml --project example --id TICKET-1 --json
+rex-projects ticket list --config /path/to/config.toml --project example --limit 10 --json
+rex-projects ticket show --config /path/to/config.toml --project example --id TICKET-1 --json
 ```
 
 - **Process failure:** The wrapper's stderr is for diagnostics, not protocol
