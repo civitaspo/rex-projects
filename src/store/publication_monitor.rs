@@ -44,6 +44,23 @@ pub struct PublicationBaseline {
 }
 
 impl ConfigStore {
+    /// A ticket Coordinator must wait for implementation publication to settle before it
+    /// reserves a new turn. Publication advances the TicketRun revision, and a reservation
+    /// made against the preceding revision cannot be launched safely afterward.
+    pub fn ticket_run_has_unsettled_implementation_publication(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM effects WHERE project_id=?1 AND subject_type='ticket_run' AND subject_id=?2 AND kind='publish_implementation' AND status IN ('pending','claimed','uncertain'))",
+                params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     /// A branch is not compared while a matching publication intent is still being reconciled.
     pub fn publication_effect_in_flight(
         &self,

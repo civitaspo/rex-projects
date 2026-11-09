@@ -31,6 +31,7 @@ const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
 const FIXTURE_PROJECT_ID: &str = "operations_project";
 const FIXTURE_TICKET_NAMESPACE: &str = "fixture/acceptance";
 const FIXTURE_TICKET_ID: &str = "ticket-1";
+const ACCEPTANCE_WORK_TASK: &str = "Create and commit a bounded acceptance fixture artifact in the assigned managed worktree, register the resulting Change manifest through the public Agent CLI, verify the exact signed host commit receipt, and preserve this complete task description in the pull request body.";
 const PROVIDER_ROLES: [&str; 8] = [
     "supervisor",
     "coordinator",
@@ -1103,7 +1104,13 @@ fn host_commit_reviewer_connection_evidence(
     let worker_result: Value = serde_json::from_str(&result_json)
         .map_err(|error| format!("parse accepted Worker result evidence: {error}"))?;
     let change = &worker_result["structured_result"]["change_references"][0];
-    if worker_result["kind"] != "implementation_ready"
+    if publish_request.pull_request.title != "test: record acceptance fixture change"
+        || publication.pull_request.title != publish_request.pull_request.title
+        || !publish_request
+            .pull_request
+            .body
+            .contains(ACCEPTANCE_WORK_TASK)
+        || worker_result["kind"] != "implementation_ready"
         || worker_result["structured_result"]["change_references"]
             .as_array()
             .map(Vec::len)
@@ -1454,7 +1461,7 @@ pub(crate) fn profile_messages(role: &str, host_worker: bool) -> Result<Vec<Valu
             }))
         ],
         "planner" => vec![message("planner", "plan_ready", json!({
-            "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":"Create and commit a bounded acceptance fixture artifact.","depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
+            "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":ACCEPTANCE_WORK_TASK,"depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
             "unresolved_questions":[]
         }))],
         "worker" => {
@@ -3405,7 +3412,7 @@ mod tests {
                     "inbox.external_revision" => json!("rev-1"),
                     "inbox.coordinator_profile" => json!("fixture_coordinator"),
                     "inbox.planner_result" => json!({
-                        "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":"Create and commit a bounded acceptance fixture artifact.","depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
+                        "plan":{"nodes":[{"id":"acceptance-node","repository":"fixture","task":ACCEPTANCE_WORK_TASK,"depends_on":[],"required_evidence":["The exact committed source change is visible in the prepared worktree."],"investigation":false}],"requested_investigation_children":0},
                         "unresolved_questions":[]
                     }),
                     _ => json!("acceptance-node"),

@@ -2150,14 +2150,12 @@ impl FactoryRuntimeServices for RuntimeServices {
             Ok(head) => head,
             Err(_) => return Ok(None),
         };
-        let title = node
-            .task
-            .lines()
-            .next()
-            .unwrap_or("Implement planned work")
-            .trim();
+        let title = self
+            .delivery
+            .effects()
+            .observe_commit_subject_at(prepared.worktree_path(), change.branch_head.as_str())?;
         if title.is_empty() || title.len() > 200 {
-            return Err("accepted work node has an invalid pull request title".into());
+            return Err("observed Worker commit has an invalid pull request title".into());
         }
         let body = format!(
             "Ticket: {}\n\nWork node: {}\n\nTask:\n{}\n\nCompleted acceptance items:\n{}\n\nUnresolved items:\n{}\n\nRex-Projects-Run: {}\nRex-Projects-Node: {}",
@@ -2194,7 +2192,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             commit,
             expected_remote_head,
             pull_request: PullRequestContent {
-                title: title.to_owned(),
+                title,
                 body,
                 update_target: None,
             },
@@ -2953,6 +2951,14 @@ impl RuntimeServices {
                 != Some(runnable.record.config_revision)
         {
             return Err("ticket Project configuration or epoch changed".into());
+        }
+        if candidate.role == Role::Coordinator
+            && store.ticket_run_has_unsettled_implementation_publication(
+                &candidate.project_id,
+                ticket_run_id,
+            )?
+        {
+            return Ok(false);
         }
         let mut profile_id = crate::config::effective_project_roles(
             &candidate.project_id,
@@ -4113,6 +4119,81 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         "delivery_authority":"The host owns push, pull request creation, merge, and delivery."
     });
     serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod coordinator_publication_gate_tests {
+    use crate::domain::ids::{ProjectId, TicketRunId};
+    use crate::store::ConfigStore;
+
+    #[test]
+    fn coordinator_waits_only_for_an_unsettled_publication_on_its_ticket_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::open_test(temp.path()).unwrap();
+        let digest = "a".repeat(64);
+        store
+            .test_connection()
+            .execute_batch(&format!(
+                "INSERT INTO config_snapshots(source_identity,revision,digest,digest_algorithm,representation,effective_config_json,source_manifest_json,applied_at_unix) VALUES ('fixture',1,'{digest}','sha256','canonical_json_utf8_sorted_keys','{{}}','{{}}',1);
+                 INSERT INTO config_current(source_identity,revision) VALUES ('fixture',1);
+                 INSERT INTO projects(project_id,config_source,config_revision,config_digest,mode,goal_revision,desired_lifecycle,state_revision,created_at_unix) VALUES ('project-a','fixture',1,'{digest}','operations',0,'running',0,1);
+                 INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,status,attempt_count,next_attempt_at_unix,created_at_unix) VALUES ('publish-1','project-a','ticket_run','ticket-run-a','publish-1','publish_implementation','{{}}','{digest}','pending',0,1,1);
+                 INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,status,attempt_count,next_attempt_at_unix,created_at_unix) VALUES ('publish-other','project-a','ticket_run','ticket-run-b','publish-other','publish_implementation','{{}}','{digest}','pending',0,1,1);"
+            ))
+            .unwrap();
+
+        let project = ProjectId::parse("project-a").unwrap();
+        let ticket_run = TicketRunId::parse("ticket-run-a").unwrap();
+        assert!(
+            store
+                .ticket_run_has_unsettled_implementation_publication(&project, &ticket_run)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ticket_run_has_unsettled_implementation_publication(
+                    &project,
+                    &TicketRunId::parse("ticket-run-c").unwrap(),
+                )
+                .unwrap()
+        );
+
+        for status in ["claimed", "uncertain"] {
+            store
+                .test_connection()
+                .execute(
+                    "UPDATE effects SET status=?1 WHERE operation_id='publish-1'",
+                    [status],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .ticket_run_has_unsettled_implementation_publication(&project, &ticket_run)
+                    .unwrap()
+            );
+        }
+
+        store
+            .test_connection()
+            .execute(
+                "UPDATE effects SET status='succeeded' WHERE operation_id='publish-1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .ticket_run_has_unsettled_implementation_publication(&project, &ticket_run)
+                .unwrap()
+        );
+        assert!(
+            store
+                .ticket_run_has_unsettled_implementation_publication(
+                    &project,
+                    &TicketRunId::parse("ticket-run-b").unwrap(),
+                )
+                .unwrap()
+        );
+    }
 }
 
 fn worker_recovery_authorization_from_inputs(

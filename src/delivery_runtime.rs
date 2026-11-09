@@ -822,6 +822,30 @@ impl RepositoryDelivery {
         Ok(head)
     }
 
+    /// Read the subject of one exact, currently checked-out Worker commit through the bounded
+    /// Git executor. Publication callers must already have validated the commit authority.
+    pub fn observe_commit_subject_at(
+        &self,
+        path: &Path,
+        expected_head: &str,
+    ) -> Result<String, DeliveryError> {
+        validate_git_sha(expected_head)?;
+        let actual_head = self.observe_local_head_at(path)?;
+        if actual_head != expected_head {
+            return Err(DeliveryError::Conflict(
+                "pull request title source differs from the observed worktree HEAD".into(),
+            ));
+        }
+        let subject = self.git_text(path, ["show", "-s", "--format=%s", expected_head])?;
+        let subject = subject.trim().to_owned();
+        if subject.is_empty() || subject.contains(['\n', '\r']) {
+            return Err(DeliveryError::Invalid(
+                "observed Worker commit has an invalid pull request title".into(),
+            ));
+        }
+        Ok(subject)
+    }
+
     /// Observe the exact owned branch and matching PR timeline through the configured Git and
     /// `gh` CLI identities. A failed branch read is an error; forge capability gaps stay typed.
     pub fn observe_publication(
@@ -1492,6 +1516,16 @@ impl RepositoryDeliveryEffects {
     pub fn observe_local_head_at(&self, path: &Path) -> Result<String, String> {
         self.delivery
             .observe_local_head_at(path)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn observe_commit_subject_at(
+        &self,
+        path: &Path,
+        expected_head: &str,
+    ) -> Result<String, String> {
+        self.delivery
+            .observe_commit_subject_at(path, expected_head)
             .map_err(|error| error.to_string())
     }
 
@@ -3633,6 +3667,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(delivery.observe_local_head_at(&target).unwrap(), expected);
+    }
+
+    #[test]
+    fn bounded_commit_subject_observation_uses_the_exact_current_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let repository = temp.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&executable, &repository, &["init", "--initial-branch=main"]);
+        git(
+            &executable,
+            &repository,
+            &["config", "user.name", "Fixture"],
+        );
+        git(
+            &executable,
+            &repository,
+            &["config", "user.email", "fixture@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&executable, &repository, &["add", "README.md"]);
+        let subject = "docs: handle long accepted work descriptions";
+        git(
+            &executable,
+            &repository,
+            &["-c", "commit.gpgsign=false", "commit", "-m", subject],
+        );
+        let head = process::run(ProcessRequest {
+            executable: executable.clone(),
+            args: ["rev-parse", "--verify", "HEAD"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            stdin: Vec::new(),
+            cwd: Some(repository.clone()),
+            clear_environment: true,
+            environment: BTreeMap::new(),
+            timeout: Duration::from_secs(3),
+            shutdown_grace: Duration::from_secs(2),
+            stdout_limit: 4096,
+            stderr_tail_limit: 4096,
+        })
+        .unwrap();
+        assert!(head.status.is_some_and(|status| status.success()));
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+
+        let delivery = RepositoryDelivery::new(
+            &temp.path().join("state"),
+            GitOptions {
+                executable,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(3),
+            },
+            BTreeMap::new(),
+            HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            delivery
+                .observe_commit_subject_at(&repository, &head)
+                .unwrap(),
+            subject
+        );
+        assert!(
+            delivery
+                .observe_commit_subject_at(&repository, &"0".repeat(40))
+                .is_err()
+        );
     }
 
     fn seed_local_remote(root: &Path, executable: &Path) -> (PathBuf, String) {
