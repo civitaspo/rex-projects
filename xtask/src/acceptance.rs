@@ -3765,7 +3765,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().canonicalize().unwrap();
+        // Keep this replay workspace so a failed inner qualification probe leaves its
+        // bounded persisted diagnostic available for investigation.
+        let root = temporary.keep().canonicalize().unwrap();
+        eprintln!("qualification replay workspace: {}", root.display());
         let workspace = root.join("workspace");
         let control = root.join("control");
         let contexts = root.join("contexts");
@@ -3893,7 +3896,13 @@ mod tests {
         .unwrap();
         assert!(!output.timed_out);
         assert!(output.cleanup_confirmed);
-        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "qualification fixture CLI failed: status={:?}, stderr_tail={}, stdout={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr_tail),
+            String::from_utf8_lossy(&output.stdout)
+        );
         rex_projects::providers::parse_result(AgentAdapter::Codex, &output.stdout, &runtime_schema)
             .unwrap();
 

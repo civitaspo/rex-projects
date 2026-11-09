@@ -199,9 +199,13 @@ fn run_marker_probe_with_environment(
     let executable_size = fs::metadata(&executable)
         .map_err(|error| error.to_string())?
         .len();
-    if executable_size > 256 * 1024 * 1024
-        || digest(&fs::read(&executable).map_err(|error| error.to_string())?)?
-            != package.runtime_binary_digest
+    if executable_size > 256 * 1024 * 1024 {
+        return Err(format!(
+            "qualification probe executable exceeds the 256 MiB limit ({executable_size} bytes)"
+        ));
+    }
+    if digest(&fs::read(&executable).map_err(|error| error.to_string())?)?
+        != package.runtime_binary_digest
     {
         return Err("qualification probe executable does not match the pinned runtime".into());
     }
