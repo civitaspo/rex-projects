@@ -1578,16 +1578,16 @@ fn profile_messages_with_review_rework(role: &str) -> Result<Vec<Value>, String>
             "summary":"The correction Worker read its host-generated assignment through the public inbox CLI.",
             "completed_node_keys":[],"pending_node_keys":["acceptance-node"],
             "evidence":[],"next_observation_at":null
-        }))),
+        })).with_lane("workflow")),
         "coordinator" => {
-            let third = messages.iter().enumerate().filter(|(_, item)| item["lane"] == "workflow").nth(2).map(|(index, _)| index)
-                .ok_or("Coordinator fixture has no post-implementation message")?;
-            messages[third] = message("coordinator", "progress", json!({
+            let fourth = messages.iter().enumerate().filter(|(_, item)| item["lane"] == "workflow").nth(3).map(|(index, _)| index)
+                .ok_or("Coordinator fixture has no post-review message")?;
+            messages[fourth] = message("coordinator", "progress", json!({
                 "summary":"The host retains the same accepted node while review corrections are checked.",
                 "completed_node_keys":[],"pending_node_keys":["acceptance-node"],
                 "evidence":[],"next_observation_at":null
-            }));
-            messages.truncate(third + 1);
+            })).with_lane("workflow");
+            messages.truncate(fourth + 1);
         }
         _ => {}
     }
@@ -3332,6 +3332,43 @@ mod tests {
             dispatch.recipe.structured_result["coordinator_profile"]["$fixture_ref"],
             "inbox.coordinator_profile"
         );
+    }
+
+    #[test]
+    fn generated_review_rework_context_preserves_the_reviewer_parent_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("review-rework");
+        fs::create_dir(&root).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &root,
+        };
+        prepare_profiles(
+            &request,
+            &std::env::current_exe().unwrap(),
+            request.cli,
+            ProfilePreparation {
+                host_worker: true,
+                worker_review_rework_stage: true,
+                ..ProfilePreparation::default()
+            },
+        )
+        .unwrap();
+        let context =
+            crate::fixtures::agent::read_context(&root.join("contexts/coordinator.json")).unwrap();
+        let workflow = context
+            .messages
+            .iter()
+            .filter(|item| item.lane == Some(crate::fixtures::agent::FixtureLane::Workflow))
+            .collect::<Vec<_>>();
+        assert_eq!(workflow.len(), 4);
+        assert_eq!(workflow[2].kind, RoleOutputKind::SpawnRequest);
+        assert_eq!(workflow[2].recipe.structured_result["role"], "reviewer");
+        assert_eq!(workflow[3].kind, RoleOutputKind::Progress);
     }
 
     #[test]
