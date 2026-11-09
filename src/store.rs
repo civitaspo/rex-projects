@@ -4761,11 +4761,38 @@ impl ConfigStore {
         } else {
             0
         };
-        if authority.controller_generation != current_generation
-            || authority.operation_id != observation.operation_id
-        {
+        if authority.operation_id != observation.operation_id {
             return Err(
                 "provider start observation does not match the active launch authority".into(),
+            );
+        }
+        let receipt_json: Option<String> = tx
+            .query_row(
+                "SELECT launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1 AND state='awaiting_provider' AND start_request_id=?2",
+                params![authority.agent_run_id.as_str(), authority.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        let Some(receipt_json) = receipt_json else {
+            return Err("provider start observation has no durable launch receipt".into());
+        };
+        let receipt: crate::launch::AgentLaunchReceipt =
+            crate::protocol::parse_unique(receipt_json.as_bytes())
+                .map_err(|error| format!("stored Agent launch receipt is invalid: {error}"))?;
+        if receipt.schema_version != crate::launch::LAUNCH_SCHEMA_VERSION
+            || receipt.decision != crate::launch::LaunchDecision::Accepted
+            || receipt.reason.is_some()
+            || receipt.agent_run_id != authority.agent_run_id
+            || receipt.operation_id != authority.operation_id
+            || receipt.controller_generation != authority.controller_generation
+            || receipt.descriptor_digest != authority.descriptor_digest
+            || receipt.runtime_binary_digest != authority.runtime_binary_digest
+            || receipt.qualification_receipt_digest != authority.qualification_receipt_digest
+        {
+            return Err(
+                "stored accepted launch receipt does not match immutable launch authority".into(),
             );
         }
         let qualification_json: String = tx
@@ -4799,7 +4826,7 @@ impl ConfigStore {
             "process_tree": &observation.process_tree,
         });
         let run_changed = tx.execute(
-            "UPDATE agent_runs SET state='running',process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state='launch_pending' AND controller_generation=?4",
+            "UPDATE agent_runs SET state='running',process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state IN ('launch_pending','unknown') AND controller_generation=?4",
             params![observation.agent_run_id.as_str(),serde_json::to_string(&process_identity).map_err(|error| error.to_string())?,now,current_generation],
         ).map_err(|error| error.to_string())?;
         if run_changed != 1 {

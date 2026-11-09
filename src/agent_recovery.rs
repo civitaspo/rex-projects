@@ -1875,7 +1875,7 @@ fn observe_completed_provider_start_from_family(
     let request = &start.request;
     if request.agent_run_id != run.agent_run_id
         || request.operation_id != run.authority.operation_id
-        || request.controller_generation != owner_generation
+        || request.controller_generation != run.authority.controller_generation
         || request.descriptor_digest != run.authority.descriptor_digest
         || request.runtime_binary_digest != run.authority.runtime_binary_digest
         || request.qualification_receipt_digest != run.authority.qualification_receipt_digest
@@ -2631,13 +2631,48 @@ esac
     }
 
     #[test]
-    fn completed_family_promotes_provider_then_releases_only_exact_cancelled_slot() {
+    fn completed_family_promotes_after_owner_restart_then_releases_only_exact_cancelled_slot() {
+        use crate::store::OwnerMetadata;
         use std::collections::BTreeMap;
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
         let mut fixture =
             crate::store::agent_runtime::tests::completed_block_loss_fixture(root.path(), true);
+        let launch_generation = fixture.generation;
+        crate::store::agent_runtime::tests::test_set_execution_slot_generation(
+            &mut fixture.store,
+            &fixture.slot_owner_id,
+            launch_generation,
+        );
+        let current_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "completed-block-loss-restart-test".into(),
+                state_root: root.path().join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-restarted".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(current_generation > launch_generation);
+        let recovered = fixture
+            .store
+            .recoverable_agent_runs(current_generation, 8)
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        fixture.generation = current_generation;
+        fixture.run = recovered.into_iter().next().unwrap();
+        assert_eq!(fixture.run.current_generation, current_generation);
+        assert_eq!(
+            fixture.run.authority.controller_generation,
+            launch_generation
+        );
         let wrapper_json = serde_json::to_string(&fixture.wrapper).unwrap();
         assert_eq!(
             fixture.run.wrapper_identity_json.as_deref(),
@@ -2682,19 +2717,24 @@ esac
             )
             .unwrap();
         assert_eq!(start, AgentRecoveryDisposition::ProviderStarted);
-        fixture.run.agent_state = "running".into();
-        fixture.run.started_at_unix = Some(10);
-        fixture.run.launch_state = "running".into();
-        fixture.run.provider_tree_json = Some(serde_json::to_string(&fixture.provider).unwrap());
-        fixture.run.process_identity_json = Some(
-            serde_json::json!({
-                "provider_pid": fixture.provider.provider_pid,
-                "provider_start_identity": fixture.provider.provider_start_identity,
-                "executable_digest": fixture.provider.executable_digest,
-                "process_tree_digest": fixture.provider.process_tree_digest,
-                "process_tree": fixture.provider.process_tree,
-            })
-            .to_string(),
+        fixture.run = fixture
+            .store
+            .recoverable_agent_runs(fixture.generation, 8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            crate::protocol::parse_unique::<ObservedProviderStart>(
+                fixture
+                    .run
+                    .provider_tree_json
+                    .as_deref()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap(),
+            fixture.provider
         );
 
         let terminal = runtime
@@ -2720,6 +2760,98 @@ esac
             crate::store::agent_runtime::tests::test_execution_slot_disposition(
                 &fixture.store,
                 "unrelated-run",
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn completed_family_rejects_start_request_from_a_different_launch_generation() {
+        use crate::run_step_spool::RunStepSpool;
+        use crate::store::OwnerMetadata;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture =
+            crate::store::agent_runtime::tests::completed_block_loss_fixture(root.path(), true);
+        crate::store::agent_runtime::tests::test_set_execution_slot_generation(
+            &mut fixture.store,
+            &fixture.slot_owner_id,
+            fixture.generation,
+        );
+        let current_generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "completed-block-loss-mismatched-start-test".into(),
+                state_root: root.path().join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-restarted".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        let run = fixture
+            .store
+            .recoverable_agent_runs(current_generation, 8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_ne!(run.authority.controller_generation, current_generation);
+        let spool = RunStepSpool::open(&run.authority.control_dir).unwrap();
+        let mut request = spool.read_start_request().unwrap();
+        request.request.controller_generation = current_generation;
+        request.request_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&request.request).unwrap())
+        );
+        fs::write(
+            spool.directory().join("start.request.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            spool
+                .read_start_request()
+                .unwrap()
+                .request
+                .controller_generation,
+            current_generation
+        );
+        assert_ne!(
+            request.request.controller_generation,
+            run.authority.controller_generation
+        );
+        let qualification = fixture
+            .store
+            .provider_qualification(&run.authority.qualification_receipt_digest)
+            .unwrap()
+            .unwrap();
+        let expected_executable = verified_qualification_executable(&qualification).unwrap();
+
+        let disposition = observe_completed_provider_start_from_family(
+            &mut fixture.store,
+            current_generation,
+            &run,
+            &fixture.wrapper,
+            &qualification,
+            &expected_executable,
+        )
+        .unwrap();
+
+        assert_eq!(
+            disposition,
+            AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProviderIdentityMismatch,
+            }
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                &fixture.slot_owner_id,
             ),
             "unknown"
         );

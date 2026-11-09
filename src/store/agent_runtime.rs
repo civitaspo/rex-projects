@@ -2094,6 +2094,20 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    pub(crate) fn test_set_execution_slot_generation(
+        store: &mut ConfigStore,
+        owner_id: &str,
+        generation: u64,
+    ) {
+        store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET disposition='launch_pending',controller_generation=?2 WHERE owner_id=?1",
+                rusqlite::params![owner_id, generation],
+            )
+            .unwrap();
+    }
+
     pub(crate) fn test_insert_unknown_execution_slot(
         store: &mut ConfigStore,
         project_id: &str,
