@@ -4927,6 +4927,7 @@ pub(crate) mod tests {
                 source_revision: wake.source_revision,
                 priority: wake.priority,
                 payload_json: wake.payload_json.clone(),
+                host_artifact_source_evidence_ids: Vec::new(),
                 host_artifacts: Vec::new(),
             })
             .collect();

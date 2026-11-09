@@ -251,6 +251,7 @@ fn inbox_fixture_snapshot(run_id: &str) -> rex_projects::agent_api::AgentWakeSna
             source_revision: 1,
             priority: 7,
             payload_json: serde_json::json!({"structured_result":{"summary":"Planner output"}}),
+            host_artifact_source_evidence_ids: Vec::new(),
             host_artifacts: vec![rex_projects::agent_api::HostArtifactLocator {
                 artifact_id: rex_projects::domain::ids::ArtifactId::parse(artifact_id.clone())
                     .unwrap(),

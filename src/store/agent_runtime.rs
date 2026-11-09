@@ -235,6 +235,7 @@ fn read_legacy_wake_context_rows(
                     source_revision: input.source_revision,
                     priority,
                     payload_json,
+                    host_artifact_source_evidence_ids: Vec::new(),
                     host_artifacts: Vec::new(),
                 })
             })
@@ -1733,19 +1734,37 @@ mod tests {
                 )
                 .is_err()
         );
+        let reviewer_message_id = "review-transition-message";
+        let reviewer_payload = serde_json::json!({
+            "target": "reviewer",
+            "revision": 1,
+            "message_id": reviewer_message_id,
+        });
         store.connection.execute(
-            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'project:project-a:supervisor','test','event-1',1,10,'{\"kind\":\"start\"}','pending',1)",
-            [project.as_str()],
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'project:project-a:supervisor','ticket_run_transition',?2,1,10,?3,'pending',1)",
+            rusqlite::params![project.as_str(), reviewer_message_id, reviewer_payload.to_string()],
         ).unwrap();
         let run_id = AgentRunId::parse("run-1").unwrap();
+        let source_evidence_id = "e".repeat(64);
         let wake = crate::agent_api::AgentWakeItem {
             wake_input_id: 1,
-            source_type: "test".into(),
-            source_id: "event-1".into(),
+            source_type: "ticket_run_transition".into(),
+            source_id: reviewer_message_id.into(),
             source_revision: 1,
             priority: 10,
-            payload_json: serde_json::json!({"kind":"start"}),
-            host_artifacts: vec![],
+            payload_json: reviewer_payload.clone(),
+            host_artifact_source_evidence_ids: vec![source_evidence_id.clone()],
+            host_artifacts: vec![crate::agent_api::HostArtifactLocator {
+                artifact_id: crate::domain::ids::ArtifactId::parse("a".repeat(64)).unwrap(),
+                kind: crate::engine::orchestration::RoleArtifactKind::TestReceipt,
+                schema_version: 1,
+                digest: digest('b'),
+                bytes: 12,
+                path: format!(".rex-artifacts/sha256/{}/{}", "aa", "a".repeat(64)),
+                source_run_id: run_id.as_str().into(),
+                source_evidence_id,
+                source_authority_digest: digest('c'),
+            }],
         };
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
@@ -2589,6 +2608,7 @@ mod tests {
         loaded_wake.validate().unwrap();
         assert_eq!(snapshot_digest, reservation.wake_snapshot.digest.as_str());
         assert_eq!(loaded_wake, reservation.wake_snapshot);
+        assert_eq!(loaded_wake.inputs[0].payload_json, reviewer_payload);
         assert_eq!(
             reopened.persisted_start_receipt(&start_request).unwrap(),
             Some(receipt)
@@ -2621,7 +2641,13 @@ mod tests {
         next.operation_id = OperationId::parse("op-run-2").unwrap();
         next.wake_snapshot.agent_run_id = next.agent_run_id.as_str().into();
         next.wake_snapshot.inputs[0].wake_input_id = 2;
+        next.wake_snapshot.inputs[0].source_type = "test".into();
         next.wake_snapshot.inputs[0].source_id = "event-2".into();
+        next.wake_snapshot.inputs[0].payload_json = serde_json::json!({"kind":"start"});
+        next.wake_snapshot.inputs[0]
+            .host_artifact_source_evidence_ids
+            .clear();
+        next.wake_snapshot.inputs[0].host_artifacts.clear();
         next.wake_snapshot.digest = next.wake_snapshot.content_digest().unwrap();
         let next_preparation = reopened.prepare_role_launch(&next).unwrap();
         assert!(

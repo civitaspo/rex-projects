@@ -39,6 +39,10 @@ pub struct AgentWakeItem {
     pub source_revision: u64,
     pub priority: i32,
     pub payload_json: serde_json::Value,
+    /// Host evidence IDs whose artifacts accompany a Reviewer transition. Kept separate from
+    /// the durable payload so reservation can compare that payload byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_artifact_source_evidence_ids: Vec<String>,
     /// Host-generated, workspace-relative copies of artifacts named by this wake's
     /// persisted source result. These locators are included in the wake digest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -169,26 +173,16 @@ impl AgentWakeSnapshot {
                 {
                     return Err("host artifacts may accompany only a current Reviewer publication transition".into());
                 }
-                let sources = item.payload_json["host_artifact_source_evidence_ids"]
-                    .as_array()
-                    .ok_or(
-                        "Reviewer publication transition has no host artifact source evidence list",
-                    )?
+                let sources = item
+                    .host_artifact_source_evidence_ids
                     .iter()
-                    .map(|value| {
-                        let source = value
-                            .as_str()
-                            .ok_or("Reviewer artifact source evidence ID must be a string")?;
+                    .map(|source| {
                         Digest::parse(source.to_owned())?;
                         Ok(source.to_owned())
                     })
                     .collect::<Result<std::collections::BTreeSet<_>, String>>()?;
                 if sources.is_empty()
-                    || sources.len()
-                        != item.payload_json["host_artifact_source_evidence_ids"]
-                            .as_array()
-                            .map(Vec::len)
-                            .unwrap_or_default()
+                    || sources.len() != item.host_artifact_source_evidence_ids.len()
                 {
                     return Err(
                         "Reviewer artifact source evidence IDs must be nonempty and unique".into(),
@@ -196,6 +190,9 @@ impl AgentWakeSnapshot {
                 }
                 Some(sources)
             } else {
+                if !item.host_artifact_source_evidence_ids.is_empty() {
+                    return Err("host artifact source evidence IDs may accompany only a Reviewer publication transition".into());
+                }
                 if !item.host_artifacts.is_empty()
                     && !matches!(
                         item.source_type.as_str(),
@@ -713,6 +710,7 @@ mod tests {
                 source_revision: 1,
                 priority: 0,
                 payload_json: serde_json::json!({"kind":"validated_agent_result"}),
+                host_artifact_source_evidence_ids: Vec::new(),
                 host_artifacts: vec![locator],
             }],
         };
@@ -725,18 +723,16 @@ mod tests {
         transition.inputs[0].payload_json = serde_json::json!({
             "target":"reviewer",
             "revision":1,
-            "message_id":"review-transition-message",
-            "host_artifact_source_evidence_ids":["e".repeat(64)]
+            "message_id":"review-transition-message"
         });
+        transition.inputs[0].host_artifact_source_evidence_ids = vec!["e".repeat(64)];
         transition.digest = transition.content_digest().unwrap();
         transition.validate().unwrap();
 
-        transition.inputs[0].payload_json["host_artifact_source_evidence_ids"] =
-            serde_json::json!(["f".repeat(64)]);
+        transition.inputs[0].host_artifact_source_evidence_ids = vec!["f".repeat(64)];
         transition.digest = transition.content_digest().unwrap();
         assert!(transition.validate().is_err());
-        transition.inputs[0].payload_json["host_artifact_source_evidence_ids"] =
-            serde_json::json!(["e".repeat(64)]);
+        transition.inputs[0].host_artifact_source_evidence_ids = vec!["e".repeat(64)];
         transition.digest = transition.content_digest().unwrap();
         transition.inputs[0].payload_json["target"] = serde_json::json!("operator");
         transition.digest = transition.content_digest().unwrap();
@@ -779,6 +775,7 @@ mod tests {
                 source_revision: 3,
                 priority: 10,
                 payload_json: serde_json::json!({"authorization": authorization}),
+                host_artifact_source_evidence_ids: Vec::new(),
                 host_artifacts: Vec::new(),
             }],
         };

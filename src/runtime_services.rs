@@ -2955,26 +2955,24 @@ impl RuntimeServices {
                     host_artifacts.extend(staged);
                 }
             }
-            let mut payload_json = input.payload_json;
-            if input.source_type == "ticket_run_transition" && !host_artifacts.is_empty() {
-                let evidence_ids = host_artifacts
-                    .iter()
-                    .map(|artifact| artifact.source_evidence_id.clone())
-                    .collect::<std::collections::BTreeSet<_>>();
-                payload_json["host_artifact_source_evidence_ids"] = serde_json::Value::Array(
-                    evidence_ids
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                );
-            }
+            let host_artifact_source_evidence_ids =
+                if input.source_type == "ticket_run_transition" && !host_artifacts.is_empty() {
+                    let evidence_ids = host_artifacts
+                        .iter()
+                        .map(|artifact| artifact.source_evidence_id.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    evidence_ids.into_iter().collect()
+                } else {
+                    Vec::new()
+                };
             items.push(crate::agent_api::AgentWakeItem {
                 wake_input_id: input.wake_input_id,
                 source_type: input.source_type,
                 source_id: input.source_id,
                 source_revision: input.source_revision,
                 priority: input.priority,
-                payload_json,
+                payload_json: input.payload_json,
+                host_artifact_source_evidence_ids,
                 host_artifacts,
             });
         }
