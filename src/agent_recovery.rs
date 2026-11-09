@@ -120,7 +120,6 @@ pub(crate) fn observe_after_recovery_marker(
 }
 
 const MAX_FORK_WATCH_RUNS: usize = 64;
-const MAX_FORK_WATCH_IDENTITIES: usize = 1024;
 
 #[derive(Default)]
 pub struct AgentRecoveryRuntime {
@@ -208,7 +207,7 @@ impl RunForkWatch {
     }
 
     fn arm(&mut self, processes: &[ProcessIdentity], current: &[ProcessIdentity]) -> bool {
-        if self.invalidated || processes.len() > MAX_FORK_WATCH_IDENTITIES {
+        if self.invalidated || crate::process::validate_process_evidence_tree(processes).is_err() {
             return false;
         }
         #[cfg(not(target_os = "macos"))]
@@ -277,6 +276,10 @@ impl RunForkWatch {
                     }
                     Err(_) => self.invalidated = true,
                 }
+            }
+            let watched = self.watched.values().cloned().collect::<Vec<_>>();
+            if crate::process::validate_process_evidence_tree(&watched).is_err() {
+                self.invalidated = true;
             }
             self.drain_events() && !self.invalidated
         }
@@ -435,7 +438,7 @@ impl AgentRecoveryRuntime {
                 watch.invalidated = true;
                 return false;
             };
-            if extended.len() > MAX_FORK_WATCH_IDENTITIES
+            if crate::process::validate_process_evidence_tree(&extended).is_err()
                 || !watch.arm(&extended, &fresh)
                 || !watch.drain_events()
             {
@@ -454,7 +457,7 @@ impl AgentRecoveryRuntime {
                 watch.invalidated = true;
                 return false;
             };
-            if after_tree.len() > MAX_FORK_WATCH_IDENTITIES {
+            if crate::process::validate_process_evidence_tree(&after_tree).is_err() {
                 watch.invalidated = true;
                 return false;
             }
@@ -947,7 +950,7 @@ fn reconcile_missing_block(
             if let Some(family) = &family {
                 merge_process_tree(&mut snapshot.process_tree, &family.process_tree);
             }
-            if snapshot.process_tree.len() > MAX_FORK_WATCH_IDENTITIES {
+            if crate::process::validate_process_evidence_tree(&snapshot.process_tree).is_err() {
                 return Ok(AgentRecoveryDisposition::Unresolved {
                     reason: RecoveryUnknown::ProcessInspectionUnavailable,
                 });
@@ -1115,7 +1118,7 @@ fn reconcile_missing_block(
             RecoveryUnknown::ProcessInspectionUnavailable,
         );
     };
-    if extended.len() > MAX_FORK_WATCH_IDENTITIES {
+    if crate::process::validate_process_evidence_tree(&extended).is_err() {
         if let Some(watch) = runtime.fork_watches.get_mut(&run.agent_run_id) {
             watch.invalidated = true;
         }
@@ -1205,7 +1208,7 @@ fn reconcile_missing_block(
             &survivors,
         );
     };
-    if final_tree.len() > MAX_FORK_WATCH_IDENTITIES {
+    if crate::process::validate_process_evidence_tree(&final_tree).is_err() {
         return store_survival_or_unresolved(
             store,
             owner_generation,
@@ -1551,7 +1554,9 @@ fn initial_cleanup_tree(
     }
     let mut identities = launch_tree.to_vec();
     merge_process_tree(&mut identities, &captured);
-    (identities.len() <= 1024).then_some(identities)
+    crate::process::validate_process_evidence_tree(&identities)
+        .is_ok()
+        .then_some(identities)
 }
 
 fn cleanup_absence_confirmed(
@@ -1646,7 +1651,7 @@ fn extend_process_tree(
                 return Ok(None);
             }
         }
-        if extended.len() > 1024 {
+        if crate::process::validate_process_evidence_tree(&extended).is_err() {
             return Ok(None);
         }
         if extended.len() == before {

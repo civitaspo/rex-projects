@@ -7,6 +7,71 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub(crate) const MAX_PROCESS_EVIDENCE_IDENTITIES: usize = 65_536;
+pub(crate) const MAX_PROCESS_EVIDENCE_TREE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES: usize = 34 * 1024 * 1024;
+
+pub(crate) fn serialized_json_size_at_most<T: serde::Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+) -> Result<usize, String> {
+    struct BoundedCounter {
+        bytes: usize,
+        exceeded: bool,
+        limit: usize,
+    }
+
+    impl std::io::Write for BoundedCounter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let Some(bytes) = self.bytes.checked_add(buffer.len()) else {
+                self.exceeded = true;
+                return Err(std::io::Error::other(
+                    "process evidence byte limit exceeded",
+                ));
+            };
+            if bytes > self.limit {
+                self.exceeded = true;
+                return Err(std::io::Error::other(
+                    "process evidence byte limit exceeded",
+                ));
+            }
+            self.bytes = bytes;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = BoundedCounter {
+        bytes: 0,
+        exceeded: false,
+        limit,
+    };
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        if counter.exceeded {
+            return Err("serialized JSON exceeds its byte limit".into());
+        }
+        return Err(error.to_string());
+    }
+    if counter.bytes > limit {
+        return Err("serialized JSON exceeds its byte limit".into());
+    }
+    Ok(counter.bytes)
+}
+
+pub(crate) fn validate_process_evidence_tree<T: serde::Serialize>(
+    tree: &[T],
+) -> Result<(), String> {
+    if tree.len() > MAX_PROCESS_EVIDENCE_IDENTITIES {
+        return Err("process evidence exceeds the 65,536 identity limit".into());
+    }
+    serialized_json_size_at_most(tree, MAX_PROCESS_EVIDENCE_TREE_BYTES)
+        .map(|_| ())
+        .map_err(|_| "process evidence exceeds the 32 MiB serialized tree limit".into())
+}
+
 fn is_process_gone(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
 }
@@ -1077,6 +1142,31 @@ mod tests {
 
     use super::{ProcessRequest, resolve_executable, run, run_in_new_session};
     use std::path::Path;
+
+    #[test]
+    fn process_evidence_budget_rejects_identity_and_serialized_byte_overflow() {
+        let identities = (1..=super::MAX_PROCESS_EVIDENCE_IDENTITIES + 1)
+            .map(|pid| super::ProcessIdentity {
+                pid: pid as u32,
+                parent_pid: 1,
+                process_group_id: 1,
+                start_identity: format!("birth-{pid}"),
+                command: "worker".into(),
+                quality: super::ProcessIdentityQuality::KernelBirthToken,
+            })
+            .collect::<Vec<_>>();
+        assert!(super::validate_process_evidence_tree(&identities).is_err());
+
+        let oversized = vec![super::ProcessIdentity {
+            pid: 1,
+            parent_pid: 1,
+            process_group_id: 1,
+            start_identity: "birth-1".into(),
+            command: "x".repeat(super::MAX_PROCESS_EVIDENCE_TREE_BYTES),
+            quality: super::ProcessIdentityQuality::KernelBirthToken,
+        }];
+        assert!(super::validate_process_evidence_tree(&oversized).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

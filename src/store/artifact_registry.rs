@@ -313,7 +313,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 12 | 13) {
+    if !matches!(version, 12..=14) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -329,6 +329,13 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
         return Err("schema 12 migration record is missing".into());
     }
     let canonical = canonical_v12_schema()?;
+    if version == 14 {
+        let tx = canonical
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        crate::store::ConfigStore::migrate_v14_process_evidence(&tx)?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
     for table in V12_TABLES {
         let actual = read_table_layout(connection, table)?;
         let expected = read_table_layout(&canonical, table)?;
@@ -412,7 +419,7 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version != 13 {
+    if !matches!(version, 13 | 14) {
         return Err(format!(
             "Agent block lifecycle schema version mismatch: {version}"
         ));
@@ -447,6 +454,103 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     if !exists || !migration_recorded || !immutable_update || !immutable_delete {
         return Err("schema 13 Agent block lifecycle migration is incomplete".into());
+    }
+    Ok(())
+}
+
+pub fn migrate_v14(connection: &Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version == 14 {
+        return validate_v14_schema(connection);
+    }
+    if version != 13 {
+        return Err(format!(
+            "process evidence storage migration 14 requires schema 13, found {version}"
+        ));
+    }
+    validate_v13_schema(connection)?;
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    crate::store::ConfigStore::migrate_v14_process_evidence(&tx)?;
+    let violations = foreign_key_violations(&tx)?;
+    if !violations.is_empty() {
+        return Err(format!(
+            "schema v14 migration produced foreign-key violations: {violations:?}"
+        ));
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations(version,applied_at_unix) VALUES (14,?1)",
+        [crate::store::now_unix()?],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.pragma_update(None, "user_version", 14)
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    validate_v14_schema(connection)
+}
+
+pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version != 14 {
+        return Err(format!(
+            "process evidence schema version mismatch: {version}"
+        ));
+    }
+    validate_v13_schema(connection)?;
+    let migration_recorded: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let maximum_json_bytes = crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES;
+    for (table, column) in [
+        ("agent_run_adoptions", "evidence_json"),
+        ("agent_terminal_receipts", "receipt_json"),
+    ] {
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let expected_constraint = format!("length(CAST({column}ASBLOB))<={maximum_json_bytes}");
+        let compact_sql = sql
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if !compact_sql.contains(&expected_constraint) {
+            return Err(format!(
+                "schema 14 {table}.{column} has an incompatible byte bound"
+            ));
+        }
+    }
+    for trigger in [
+        "agent_run_adoptions_immutable_update",
+        "agent_run_adoptions_immutable_delete",
+        "agent_terminal_receipts_immutable_update",
+        "agent_terminal_receipts_immutable_delete",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                [trigger],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !exists {
+            return Err(format!("schema 14 trigger {trigger} is missing"));
+        }
+    }
+    if !migration_recorded {
+        return Err("schema 14 process evidence migration record is missing".into());
     }
     Ok(())
 }
@@ -1361,14 +1465,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v13_migration_composes_helpers_and_reopens_without_schema_changes() {
+    fn fresh_v14_migration_composes_helpers_and_reopens_without_schema_changes() {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         for table in [
             "registered_artifacts",
             "agent_terminal_receipts",
@@ -1391,7 +1495,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert!(found, "schema v13 is missing {table}");
+            assert!(found, "schema v14 is missing {table}");
         }
         drop(store);
 
@@ -1400,9 +1504,186 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         super::validate_v12_schema(&reopened.connection).unwrap();
         super::validate_v13_schema(&reopened.connection).unwrap();
+        super::validate_v14_schema(&reopened.connection).unwrap();
+    }
+
+    #[test]
+    fn v14_process_evidence_migration_preserves_existing_v13_rows_and_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::store::agent_runtime::tests::completed_block_loss_fixture(temp.path(), false);
+        let run_id = fixture.run.agent_run_id.clone();
+        let project_id = fixture.run.authority.project_id.clone();
+        let generation = fixture.generation;
+        let authority_digest = fixture.run.authority_digest.clone();
+        fixture
+            .store
+            .connection
+            .execute(
+                "INSERT INTO agent_run_adoptions(agent_run_id,controller_generation,previous_controller_generation,authority_digest,descriptor_digest,evidence_digest,evidence_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,10)",
+                rusqlite::params![
+                    run_id.as_str(),
+                    generation,
+                    generation,
+                    authority_digest.as_str(),
+                    fixture.run.authority.descriptor_digest.as_str(),
+                    "a".repeat(64),
+                    r#"{"legacy":"adoption"}"#,
+                ],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "INSERT INTO agent_terminal_receipts(agent_run_id,project_id,attempt,controller_generation,authority_digest,start_request_digest,start_request_json,terminal_digest,result_digest,absence_digest,receipt_json,observed_at_unix) VALUES (?1,?2,1,?3,?4,?5,'{}',?6,?7,?8,?9,10)",
+                rusqlite::params![
+                    run_id.as_str(),
+                    project_id.as_str(),
+                    generation,
+                    authority_digest.as_str(),
+                    "b".repeat(64),
+                    "c".repeat(64),
+                    "d".repeat(64),
+                    "e".repeat(64),
+                    r#"{"legacy":"terminal"}"#,
+                ],
+            )
+            .unwrap();
+        let state_root = temp.path().join("state");
+        drop(fixture.store);
+
+        let database = state_root.join("state.sqlite3");
+        let canonical = super::canonical_v12_schema().unwrap();
+        let adoption_sql: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_run_adoptions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let terminal_sql: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_terminal_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let adoption_triggers = [
+            "agent_run_adoptions_immutable_update",
+            "agent_run_adoptions_immutable_delete",
+        ]
+        .map(|name| {
+            canonical
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        });
+        let terminal_triggers = [
+            "agent_terminal_receipts_immutable_update",
+            "agent_terminal_receipts_immutable_delete",
+        ]
+        .map(|name| {
+            canonical
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        });
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 BEGIN IMMEDIATE;
+                 DROP TRIGGER agent_run_adoptions_immutable_update;
+                 DROP TRIGGER agent_run_adoptions_immutable_delete;
+                 CREATE TEMP TABLE saved_agent_run_adoptions AS SELECT * FROM agent_run_adoptions;
+                 DROP TABLE agent_run_adoptions;
+                 DROP TRIGGER agent_terminal_receipts_immutable_update;
+                 DROP TRIGGER agent_terminal_receipts_immutable_delete;
+                 CREATE TEMP TABLE saved_agent_terminal_receipts AS SELECT * FROM agent_terminal_receipts;
+                 DROP TABLE agent_terminal_receipts;
+                 DELETE FROM schema_migrations WHERE version=14;
+                 PRAGMA user_version=13;
+                 ",
+            )
+            .unwrap();
+        connection.execute_batch(&adoption_sql).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agent_run_adoptions SELECT * FROM saved_agent_run_adoptions;
+                 DROP TABLE saved_agent_run_adoptions;",
+            )
+            .unwrap();
+        for trigger in &adoption_triggers {
+            connection.execute_batch(trigger).unwrap();
+        }
+        connection.execute_batch(&terminal_sql).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agent_terminal_receipts SELECT * FROM saved_agent_terminal_receipts;
+                 DROP TABLE saved_agent_terminal_receipts;",
+            )
+            .unwrap();
+        for trigger in &terminal_triggers {
+            connection.execute_batch(trigger).unwrap();
+        }
+        connection
+            .execute_batch("COMMIT; PRAGMA foreign_keys=ON;")
+            .unwrap();
+        drop(connection);
+
+        let migrated = crate::store::ConfigStore::open_test(&state_root).unwrap();
+        let version: i64 = migrated
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 14);
+        let adoption_json: String = migrated
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM agent_run_adoptions WHERE agent_run_id=?1 AND controller_generation=?2",
+                rusqlite::params![run_id.as_str(), generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(adoption_json, r#"{"legacy":"adoption"}"#);
+        let terminal_json: String = migrated
+            .connection
+            .query_row(
+                "SELECT receipt_json FROM agent_terminal_receipts WHERE agent_run_id=?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_json, r#"{"legacy":"terminal"}"#);
+        assert!(
+            migrated
+                .connection
+                .execute(
+                    "UPDATE agent_run_adoptions SET evidence_json='{}' WHERE agent_run_id=?1",
+                    [run_id.as_str()],
+                )
+                .is_err()
+        );
+        assert!(
+            migrated
+                .connection
+                .execute(
+                    "DELETE FROM agent_terminal_receipts WHERE agent_run_id=?1",
+                    [run_id.as_str()],
+                )
+                .is_err()
+        );
+        super::validate_v14_schema(&migrated.connection).unwrap();
     }
 
     #[test]
@@ -1457,11 +1738,11 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     #[test]
-    fn valid_v10_database_migrates_to_v13_and_reopens() {
+    fn valid_v10_database_migrates_to_v14_and_reopens() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite3");
         let mut connection = Connection::open(&path).unwrap();
@@ -1487,9 +1768,10 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         super::validate_v12_schema(&store.connection).unwrap();
         super::validate_v13_schema(&store.connection).unwrap();
+        super::validate_v14_schema(&store.connection).unwrap();
     }
 
     fn test_authority() -> AgentLaunchAuthority {
