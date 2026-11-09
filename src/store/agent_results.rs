@@ -6447,6 +6447,34 @@ pub(crate) mod host_validation_fixture {
         message: RoleResultMessage,
         agent_run_id: AgentRunId,
     ) -> Result<InPlaceValidatedResultFixture, String> {
+        host_validated_result_in_with_wake_inputs(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            ticket_run_id,
+            role,
+            message,
+            agent_run_id,
+            Vec::new(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixtures bind explicit launch and result identities"
+    )]
+    pub(crate) fn host_validated_result_in_with_wake_inputs(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        role: Role,
+        message: RoleResultMessage,
+        agent_run_id: AgentRunId,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
+    ) -> Result<InPlaceValidatedResultFixture, String> {
         let prepared = host_validated_result_inner(
             store,
             root,
@@ -6456,6 +6484,7 @@ pub(crate) mod host_validation_fixture {
             role,
             message,
             Some(agent_run_id),
+            wake_inputs,
         )
         .map_err(|error| format!("host validated result fixture setup: {error}"))?;
         let ingested = store
@@ -6495,6 +6524,7 @@ pub(crate) mod host_validation_fixture {
             role,
             message,
             agent_run_id_override,
+            Vec::new(),
         )
     }
 
@@ -6514,6 +6544,7 @@ pub(crate) mod host_validation_fixture {
             Role::Supervisor,
             message,
             None,
+            Vec::new(),
         )
     }
 
@@ -6530,6 +6561,7 @@ pub(crate) mod host_validation_fixture {
         role: Role,
         mut message: RoleResultMessage,
         agent_run_id_override: Option<AgentRunId>,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
     ) -> Result<InPlaceTerminalFixture, String> {
         let project = store
             .project(&project_id)?
@@ -6579,7 +6611,7 @@ pub(crate) mod host_validation_fixture {
             role_session_id: authority.role_session_id.clone(),
             agent_run_id: agent_run_id.to_string(),
             digest: Digest::parse("0".repeat(64))?,
-            inputs: Vec::new(),
+            inputs: wake_inputs,
         };
         wake_snapshot.digest = wake_snapshot.content_digest()?;
         authority.wake_snapshot_digest = wake_snapshot.digest.clone();

@@ -1993,6 +1993,10 @@ fn factory_environment(
         OsString::from("REX_PROJECTS_CONTROL_DIR"),
         descriptor.control_dir.as_os_str().to_owned(),
     );
+    environment.insert(
+        OsString::from("REX_PROJECTS_WORKSPACE_PATH"),
+        descriptor.workspace.as_os_str().to_owned(),
+    );
     if let Some(ticket_run_id) = &descriptor.ticket_run_id {
         environment.insert(
             OsString::from("REX_PROJECTS_TICKET_RUN_ID"),
@@ -2588,11 +2592,9 @@ mod tests {
     #[test]
     fn overlays_fresh_scoped_markers_and_keeps_the_captured_user_environment() {
         let root = tempdir().unwrap();
-        let env = factory_environment(
-            &request(root.path(), AgentAdapter::Codex, "/bin/sh").environment,
-            &descriptor(root.path(), &profile(AgentAdapter::Codex, "/bin/sh")),
-        )
-        .unwrap();
+        let request = request(root.path(), AgentAdapter::Codex, "/bin/sh");
+        let descriptor = descriptor(root.path(), &profile(AgentAdapter::Codex, "/bin/sh"));
+        let env = factory_environment(&request.environment, &descriptor).unwrap();
         assert_eq!(
             env.get(OsStr::new("REX_PROJECTS_AGENT"))
                 .and_then(|v| v.to_str()),
@@ -2602,6 +2604,11 @@ mod tests {
             env.get(OsStr::new("REX_PROJECTS_ROLE"))
                 .and_then(|v| v.to_str()),
             Some("worker")
+        );
+        assert_eq!(
+            env.get(OsStr::new("REX_PROJECTS_WORKSPACE_PATH"))
+                .and_then(|value| value.to_str()),
+            Some(descriptor.workspace.to_str().unwrap())
         );
         assert_eq!(
             env.get(OsStr::new("REX_SESSION")).and_then(|v| v.to_str()),

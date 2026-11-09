@@ -19,6 +19,32 @@ use crate::engine::orchestration::{RoleArtifactKind, RoleArtifactReference};
 
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) enum ArtifactRegistrationError {
+    AgentSource(String),
+    Host(String),
+}
+
+impl std::fmt::Display for ArtifactRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentSource(message) | Self::Host(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for ArtifactRegistrationError {
+    fn from(message: String) -> Self {
+        Self::Host(message)
+    }
+}
+
+impl From<&str> for ArtifactRegistrationError {
+    fn from(message: &str) -> Self {
+        Self::Host(message.to_owned())
+    }
+}
+
 fn read_regular_nofollow(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -98,17 +124,68 @@ impl ArtifactStore {
         kind: RoleArtifactKind,
         schema_version: u32,
     ) -> Result<VerifiedArtifact, String> {
-        crate::agent_api::validate_relative_path(path)?;
+        self.register_classified(
+            workspace,
+            project_id,
+            agent_run_id,
+            role,
+            path,
+            kind,
+            schema_version,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_for_agent(
+        &self,
+        workspace: &Path,
+        project_id: &ProjectId,
+        agent_run_id: &str,
+        role: Role,
+        path: &str,
+        kind: RoleArtifactKind,
+        schema_version: u32,
+    ) -> Result<VerifiedArtifact, ArtifactRegistrationError> {
+        self.register_classified(
+            workspace,
+            project_id,
+            agent_run_id,
+            role,
+            path,
+            kind,
+            schema_version,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_classified(
+        &self,
+        workspace: &Path,
+        project_id: &ProjectId,
+        agent_run_id: &str,
+        role: Role,
+        path: &str,
+        kind: RoleArtifactKind,
+        schema_version: u32,
+    ) -> Result<VerifiedArtifact, ArtifactRegistrationError> {
+        crate::agent_api::validate_relative_path(path)
+            .map_err(ArtifactRegistrationError::AgentSource)?;
         if schema_version == 0 || agent_run_id.trim().is_empty() {
-            return Err("Artifact request is missing run or schema identity".into());
+            return Err(ArtifactRegistrationError::AgentSource(
+                "Artifact request is missing run or schema identity".into(),
+            ));
         }
         if !crate::engine::orchestration::role_may_submit_artifact(role, kind) {
-            return Err("Agent role is not authorized to register this artifact kind".into());
+            return Err(ArtifactRegistrationError::AgentSource(
+                "Agent role is not authorized to register this artifact kind".into(),
+            ));
         }
-        let workspace =
-            fs::canonicalize(workspace).map_err(|error| format!("workspace: {error}"))?;
+        let workspace = fs::canonicalize(workspace)
+            .map_err(|error| ArtifactRegistrationError::Host(format!("workspace: {error}")))?;
         let bytes = read_workspace_file(&workspace, path)?;
-        validate_contents(kind, schema_version, path, &bytes)?;
+        validate_contents(kind, schema_version, path, &bytes)
+            .map_err(ArtifactRegistrationError::AgentSource)?;
         let content_digest = Digest::parse(format!("{:x}", Sha256::digest(&bytes)))?;
         let agent_run_id = crate::domain::ids::AgentRunId::parse(agent_run_id.to_owned())?;
         let artifact_id = crate::domain::ids::ArtifactId::from_registration_identity(
@@ -185,13 +262,18 @@ fn ensure_real_directory_chain(root: &Path, target: &Path) -> Result<(), String>
     Ok(())
 }
 
-fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, String> {
+fn read_workspace_file(
+    workspace: &Path,
+    relative: &str,
+) -> Result<Vec<u8>, ArtifactRegistrationError> {
     let path = Path::new(relative);
     if path
         .components()
         .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err("Artifact path contains a non-normal component".into());
+        return Err(ArtifactRegistrationError::AgentSource(
+            "Artifact path contains a non-normal component".into(),
+        ));
     }
     #[cfg(unix)]
     {
@@ -200,16 +282,21 @@ fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, Stri
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(workspace)
-            .map_err(|error| format!("open workspace root: {error}"))?;
+            .map_err(|error| {
+                ArtifactRegistrationError::Host(format!("open workspace root: {error}"))
+            })?;
         let mut parent_fd = root.as_raw_fd();
         let mut parents = Vec::<File>::new();
         let components = path.components().collect::<Vec<_>>();
         for component in &components[..components.len() - 1] {
             let Component::Normal(name) = component else {
-                return Err("Artifact path is not normalized".into());
+                return Err(ArtifactRegistrationError::AgentSource(
+                    "Artifact path is not normalized".into(),
+                ));
             };
-            let name = std::ffi::CString::new(name.as_encoded_bytes())
-                .map_err(|_| "Artifact path contains NUL")?;
+            let name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(|_| {
+                ArtifactRegistrationError::AgentSource("Artifact path contains NUL".into())
+            })?;
             let fd = unsafe {
                 libc::openat(
                     parent_fd,
@@ -218,9 +305,9 @@ fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, Stri
                 )
             };
             if fd < 0 {
-                return Err(format!(
-                    "open Artifact parent: {}",
-                    std::io::Error::last_os_error()
+                return Err(classify_source_open_error(
+                    "open Artifact parent",
+                    std::io::Error::last_os_error(),
                 ));
             }
             let opened = unsafe { File::from_raw_fd(fd) };
@@ -228,11 +315,17 @@ fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, Stri
             // Retain descriptors until the final open to prevent parent replacement mid-walk.
             parents.push(opened);
         }
-        let Component::Normal(name) = components.last().ok_or("Artifact path is empty")? else {
-            return Err("Artifact path is not normalized".into());
+        let Component::Normal(name) = components.last().ok_or_else(|| {
+            ArtifactRegistrationError::AgentSource("Artifact path is empty".into())
+        })?
+        else {
+            return Err(ArtifactRegistrationError::AgentSource(
+                "Artifact path is not normalized".into(),
+            ));
         };
-        let name = std::ffi::CString::new(name.as_encoded_bytes())
-            .map_err(|_| "Artifact path contains NUL")?;
+        let name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(|_| {
+            ArtifactRegistrationError::AgentSource("Artifact path contains NUL".into())
+        })?;
         // O_NONBLOCK prevents a malicious FIFO from hanging the host before fstat can reject it.
         let fd = unsafe {
             libc::openat(
@@ -242,36 +335,74 @@ fn read_workspace_file(workspace: &Path, relative: &str) -> Result<Vec<u8>, Stri
             )
         };
         if fd < 0 {
-            return Err(format!(
-                "open Artifact: {}",
-                std::io::Error::last_os_error()
+            return Err(classify_source_open_error(
+                "open Artifact",
+                std::io::Error::last_os_error(),
             ));
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| ArtifactRegistrationError::Host(error.to_string()))?;
         if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES {
-            return Err("Artifact must be a bounded regular file".into());
+            return Err(ArtifactRegistrationError::AgentSource(
+                "Artifact must be a bounded regular file".into(),
+            ));
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         file.take(MAX_ARTIFACT_BYTES + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ArtifactRegistrationError::Host(error.to_string()))?;
         if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
-            return Err("Artifact exceeds 64 MiB".into());
+            return Err(ArtifactRegistrationError::AgentSource(
+                "Artifact exceeds 64 MiB".into(),
+            ));
         }
         Ok(bytes)
     }
     #[cfg(not(unix))]
     {
         let full = workspace.join(path);
-        let metadata = fs::symlink_metadata(&full).map_err(|error| error.to_string())?;
+        let metadata = fs::symlink_metadata(&full)
+            .map_err(|error| classify_source_open_error("inspect Artifact source", error))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.len() > MAX_ARTIFACT_BYTES
         {
-            return Err("Artifact must be a bounded regular file".into());
+            return Err(ArtifactRegistrationError::AgentSource(
+                "Artifact must be a bounded regular file".into(),
+            ));
         }
-        fs::read(full).map_err(|error| error.to_string())
+        fs::read(full).map_err(|error| classify_source_open_error("read Artifact", error))
+    }
+}
+
+fn classify_source_open_error(context: &str, error: std::io::Error) -> ArtifactRegistrationError {
+    #[cfg(unix)]
+    let is_agent_source_error = matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ENOENT
+                | libc::ENOTDIR
+                | libc::ELOOP
+                | libc::EACCES
+                | libc::EPERM
+                | libc::ENAMETOOLONG
+        )
+    );
+    #[cfg(not(unix))]
+    let is_agent_source_error = matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidInput
+    );
+    let message = format!("{context}: {error}");
+    if is_agent_source_error {
+        ArtifactRegistrationError::AgentSource(message)
+    } else {
+        ArtifactRegistrationError::Host(message)
     }
 }
 
@@ -382,10 +513,61 @@ fn validate_contents(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ARTIFACT_BYTES, publish_immutable_object, read_workspace_file};
+    use super::{
+        ArtifactRegistrationError, MAX_ARTIFACT_BYTES, classify_source_open_error,
+        publish_immutable_object, read_workspace_file,
+    };
     use std::fs;
     use std::io::Read;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn source_open_classifier_keeps_host_resource_failures_fatal() {
+        #[cfg(unix)]
+        {
+            for errno in [
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ENOMEM,
+                libc::EIO,
+                libc::EINTR,
+            ] {
+                assert!(matches!(
+                    classify_source_open_error(
+                        "open Artifact",
+                        std::io::Error::from_raw_os_error(errno)
+                    ),
+                    ArtifactRegistrationError::Host(_)
+                ));
+            }
+            for errno in [libc::ENOENT, libc::ENOTDIR, libc::ELOOP, libc::EACCES] {
+                assert!(matches!(
+                    classify_source_open_error(
+                        "open Artifact",
+                        std::io::Error::from_raw_os_error(errno)
+                    ),
+                    ArtifactRegistrationError::AgentSource(_)
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(matches!(
+                classify_source_open_error(
+                    "open Artifact",
+                    std::io::Error::from(std::io::ErrorKind::NotFound)
+                ),
+                ArtifactRegistrationError::AgentSource(_)
+            ));
+            assert!(matches!(
+                classify_source_open_error(
+                    "open Artifact",
+                    std::io::Error::other("host I/O failure")
+                ),
+                ArtifactRegistrationError::Host(_)
+            ));
+        }
+    }
 
     #[test]
     fn retry_after_abandoned_partial_stage_publishes_complete_object() {

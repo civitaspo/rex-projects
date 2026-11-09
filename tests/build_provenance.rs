@@ -131,6 +131,8 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
         .args(arguments)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .output()
         .unwrap();
     assert_success(&output, &format!("git {}", arguments.join(" ")));

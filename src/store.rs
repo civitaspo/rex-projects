@@ -6538,6 +6538,107 @@ pub(crate) mod tests {
         published_publication_fixture(true);
     }
 
+    fn assert_registered_staging_survives_verification(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        source: &crate::store::agent_results::host_validation_fixture::InPlaceValidatedResultFixture,
+        target: &crate::launch::AgentLaunchReservation,
+    ) {
+        let state = root.join("staged-artifact-verification-state");
+        std::fs::create_dir(&state).unwrap();
+        let assignment = target.worker_assignment.as_ref().unwrap();
+        let workspace = &assignment.worktree_path;
+        let locators = &target.wake_snapshot.inputs[0].host_artifacts;
+        assert!(!locators.is_empty());
+        let delivery = crate::delivery_runtime::RepositoryDelivery::new(
+            &state,
+            crate::worktrees::GitOptions {
+                executable: "/usr/bin/git".into(),
+                environment: BTreeMap::new(),
+                timeout: std::time::Duration::from_secs(5),
+            },
+            BTreeMap::new(),
+            crate::host_jobs::HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        let verify = |store: &mut ConfigStore, binding: &crate::launch::WorkerLaunchBinding| {
+            crate::parent_artifacts::verify_worker_worktree_with_host_artifacts(
+                store,
+                &source.artifacts,
+                &target.project_id,
+                target.ticket_run_id.as_ref().unwrap(),
+                binding,
+                |path, head, allowed| {
+                    delivery
+                        .verify_clean_published_worktree_at(path, head, allowed)
+                        .map_err(|error| error.to_string())
+                },
+            )
+        };
+        verify(store, assignment).unwrap();
+        let extra = workspace.join(".rex-artifacts/unregistered.txt");
+        std::fs::write(&extra, "not host-registered").unwrap();
+        assert!(verify(store, assignment).is_err());
+        std::fs::remove_file(extra).unwrap();
+        let tracked = workspace.join("tracked.txt");
+        std::fs::write(&tracked, "staged source change").unwrap();
+        for args in [
+            ["add", "--", "tracked.txt"],
+            ["rm", "--cached", "tracked.txt"],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(verify(store, assignment).is_err());
+        }
+        std::fs::remove_file(tracked).unwrap();
+        let mut foreign = assignment.clone();
+        foreign.plan_digest = Digest::parse("0".repeat(64)).unwrap();
+        assert!(verify(store, &foreign).is_err());
+        let mut bad_source = locators.clone();
+        bad_source[0].source_evidence_id = "0".repeat(64);
+        assert!(
+            crate::parent_artifacts::verify_staged_host_artifacts(
+                store,
+                &source.artifacts,
+                &target.project_id,
+                target.ticket_run_id.as_ref().unwrap(),
+                &target.config_digest,
+                workspace,
+                &bad_source,
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let copy = workspace.join(&locators[0].path);
+            let original = std::fs::read(&copy).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&copy, vec![b'x'; original.len()]).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert!(verify(store, assignment).is_err());
+            std::fs::remove_file(&copy).unwrap();
+            let outside = state.join("outside-copy");
+            std::fs::write(&outside, &original).unwrap();
+            symlink(&outside, &copy).unwrap();
+            assert!(verify(store, assignment).is_err());
+            std::fs::remove_file(&copy).unwrap();
+            std::fs::write(&copy, original).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        verify(store, assignment).unwrap();
+        for locator in locators {
+            std::fs::remove_file(workspace.join(&locator.path)).unwrap();
+        }
+    }
+
     fn published_publication_fixture(single_publication: bool) {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
@@ -7157,20 +7258,59 @@ pub(crate) mod tests {
             wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
             let control_dir = temp.path().join("merge-agent-control");
             std::fs::create_dir(&control_dir).unwrap();
-            crate::agent_api::publish_wake_snapshot(&control_dir, wake_snapshot).unwrap();
-            let public_inputs = crate::agent_api::read_inbox(
+            let merge_agent_run_id = merge_result
+                .ingested
+                .validated
+                .binding
+                .agent_run_id
+                .to_string();
+            crate::mailbox::MailboxCapability::create(
+                merge_agent_run_id.clone(),
                 &control_dir,
-                &merge_result
-                    .ingested
-                    .validated
-                    .binding
-                    .agent_run_id
-                    .to_string(),
-                0,
+                u64::MAX,
+                crate::mailbox::MailboxLimits::default(),
             )
             .unwrap();
+            crate::agent_api::publish_wake_snapshot(&control_dir, wake_snapshot).unwrap();
+            let public_inputs =
+                crate::agent_api::read_inbox(&control_dir, &merge_agent_run_id, 0).unwrap();
             assert_eq!(public_inputs.len(), 1);
-            let public_assessment = &public_inputs[0].payload_json["assessment"];
+            let control_dir_string = control_dir.to_string_lossy().into_owned();
+            let cli_json = crate::cli::dispatch_agent_inbox_for_test(&[
+                "rex-projects",
+                "agent",
+                "inbox",
+                "--run",
+                &merge_agent_run_id,
+                "--control-dir",
+                &control_dir_string,
+                "--json",
+            ])
+            .unwrap();
+            let cli_report: serde_json::Value = serde_json::from_slice(&cli_json).unwrap();
+            assert_eq!(cli_report["run_id"], merge_agent_run_id);
+            assert_eq!(cli_report["inputs"].as_array().unwrap().len(), 1);
+            let cli_input = &cli_report["inputs"][0];
+            assert_eq!(cli_input["source_type"], "host_merge_assessment");
+            assert_eq!(cli_input, &serde_json::to_value(&public_inputs[0]).unwrap());
+            let public_assessment = &cli_input["payload_json"]["assessment"];
+            assert_eq!(
+                public_assessment["assessment_id"],
+                trusted.assessment_id.as_str()
+            );
+            assert_eq!(
+                public_assessment["policy_digest"],
+                trusted.policy_digest.as_str()
+            );
+            assert_eq!(
+                public_assessment["prepared_body_proposal"]["target_body_digest"],
+                trusted
+                    .prepared_body_proposal
+                    .as_ref()
+                    .unwrap()
+                    .target_body_digest
+                    .as_str()
+            );
             let typed_intent = serde_json::json!({
                 "assessment_id": public_assessment["assessment_id"],
                 "pr_identities": [format!("{}#{}", public_assessment["evidence"]["subject"]["repository_id"].as_str().unwrap(), public_assessment["evidence"]["subject"]["pull_request_id"].as_str().unwrap())],
@@ -7887,7 +8027,34 @@ pub(crate) mod tests {
             "published_head": corrected_head,
             "test_receipt_artifact_ids": [],
         });
-        let second_worker_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+        let source_authority = second_correction_store
+            .agent_launch_authority(&worker_result.ingested.validated.binding.agent_run_id)
+            .unwrap()
+            .unwrap();
+        let staged_artifacts = crate::parent_artifacts::stage_verified_parent_artifacts(
+            &mut second_correction_store,
+            &worker_result.artifacts,
+            &source_authority,
+            worker_result.ingested.receipt.evidence_id(),
+            &project_id,
+            source_authority.config_revision.0,
+            &config_digest,
+            &worker_worktree,
+            &worker_result.ingested.validated.claimed_artifact_refs,
+        )
+        .unwrap();
+        let second_worker_inputs = vec![crate::agent_api::AgentWakeItem {
+            wake_input_id: 1,
+            source_type: "agent_result".into(),
+            source_id: worker_result.ingested.receipt.evidence_id().to_owned(),
+            source_revision: source_authority.ticket_revision.unwrap().0,
+            priority: 1,
+            payload_json: serde_json::json!({}),
+            host_artifact_source_evidence_ids: Vec::new(),
+            host_artifacts: staged_artifacts,
+            host_completion_context: None,
+        }];
+        let second_worker_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs(
             &mut second_correction_store,
             &std::fs::canonicalize(temp.path()).unwrap(),
             owner_generation,
@@ -7904,6 +8071,7 @@ pub(crate) mod tests {
                 artifact_refs: Vec::new(),
             },
             second_worker_agent_run_id.clone(),
+            second_worker_inputs.clone(),
         )
         .unwrap();
         let second_worker_authority = second_correction_store
@@ -7916,7 +8084,7 @@ pub(crate) mod tests {
             role_session_id: second_worker_authority.role_session_id.clone(),
             agent_run_id: second_worker_agent_run_id.to_string(),
             digest: Digest::parse("0".repeat(64)).unwrap(),
-            inputs: Vec::new(),
+            inputs: second_worker_inputs,
         };
         second_worker_wake_snapshot.digest = second_worker_wake_snapshot.content_digest().unwrap();
         let second_worker_reservation = crate::launch::AgentLaunchReservation {
@@ -7987,6 +8155,12 @@ pub(crate) mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        assert_registered_staging_survives_verification(
+            &mut second_correction_store,
+            temp.path(),
+            &worker_result,
+            &second_worker_reservation,
+        );
         assert!(
             crate::engine::factory_runtime::tests::apply_agent_result_for_test(
                 &mut second_correction_store,

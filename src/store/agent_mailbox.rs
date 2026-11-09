@@ -355,15 +355,47 @@ impl crate::store::ConfigStore {
                 "mailbox request digest is empty".into(),
             ));
         }
-        self.process_artifact_add(
+        match self.process_artifact_add_for_agent(
             owner_generation,
             &authority,
             artifact_store,
             &mailbox,
             &mailbox_request,
             &request,
-        )?;
-        Ok(true)
+        ) {
+            Ok(_) => Ok(true),
+            Err(crate::artifacts::ArtifactRegistrationError::AgentSource(message)) => {
+                let response = crate::protocol::ResponseEnvelope {
+                    schema_version: crate::protocol::SCHEMA_VERSION,
+                    request_id: mailbox_request.envelope.request_id.clone(),
+                    result: None::<serde_json::Value>,
+                    error: Some(crate::protocol::ProtocolError {
+                        code: crate::protocol::ErrorCode::InvalidRequest,
+                        message,
+                        retryable: false,
+                        retry_after_ms: None,
+                        details: Default::default(),
+                    }),
+                    extensions: Default::default(),
+                };
+                let bytes = serde_json::to_vec(&response).map_err(|error| {
+                    AgentMailboxProcessingError::Authority(format!(
+                        "serialize ArtifactAdd rejection receipt: {error}"
+                    ))
+                })?;
+                mailbox
+                    .publish_receipt(&mailbox_request.request_id, &bytes, now_unix.max(0) as u64)
+                    .map_err(|error| {
+                        AgentMailboxProcessingError::Authority(format!(
+                            "persist ArtifactAdd rejection receipt: {error}"
+                        ))
+                    })?;
+                Ok(true)
+            }
+            Err(crate::artifacts::ArtifactRegistrationError::Host(error)) => {
+                Err(AgentMailboxProcessingError::Authority(error))
+            }
+        }
     }
 
     fn validate_mailbox_owner_generation(
@@ -656,6 +688,379 @@ impl crate::store::ConfigStore {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    fn adopt_fixture_run(
+        fixture: &mut crate::store::agent_runtime::tests::CompletedBlockLossFixture,
+        root: &std::path::Path,
+    ) -> u64 {
+        use crate::store::OwnerMetadata;
+        use sha2::{Digest as _, Sha256};
+
+        let launch_generation = fixture.generation;
+        let reservation = fixture
+            .store
+            .agent_launch_reservation_for_run(&fixture.run.agent_run_id)
+            .unwrap()
+            .unwrap();
+        let authority = fixture.run.authority.clone();
+        let generation = fixture
+            .store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "artifact-mailbox-test-owner-restart".into(),
+                state_root: root.join("state").display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "artifact-mailbox-test-owner".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET state='unknown',controller_generation=?2 WHERE agent_run_id=?1",
+                rusqlite::params![fixture.run.agent_run_id.as_str(), generation],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE execution_slots SET disposition='unknown' WHERE owner_kind='agent_run' AND owner_id=?1",
+                [fixture.run.agent_run_id.as_str()],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE agent_launch_state SET provider_process_tree_json=?2 WHERE agent_run_id=?1",
+                rusqlite::params![
+                    fixture.run.agent_run_id.as_str(),
+                    serde_json::to_string(&fixture.provider).unwrap(),
+                ],
+            )
+            .unwrap();
+        let mut process_tree = fixture
+            .provider
+            .process_tree
+            .iter()
+            .map(
+                |process| crate::store::agent_recovery::AdoptedProcessIdentity {
+                    pid: process.pid,
+                    parent_pid: process.parent_pid,
+                    process_group_id: process.process_group_id,
+                    start_identity: process.start_identity.clone(),
+                    identity_quality: serde_json::to_value(process.identity_quality)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                },
+            )
+            .filter(|process| process.pid != fixture.wrapper.pid)
+            .collect::<Vec<_>>();
+        process_tree.push(crate::store::agent_recovery::AdoptedProcessIdentity {
+            pid: fixture.wrapper.pid,
+            parent_pid: 1,
+            process_group_id: fixture.wrapper.pid,
+            start_identity: fixture.wrapper.start_identity.clone(),
+            identity_quality: "kernel_birth_token".into(),
+        });
+        process_tree.sort_by_key(|process| process.pid);
+        let evidence = crate::store::agent_recovery::AgentAdoptionEvidence {
+            schema_version: 1,
+            agent_run_id: fixture.run.agent_run_id.clone(),
+            controller_generation: generation,
+            previous_controller_generation: launch_generation,
+            authority_digest: authority.digest().unwrap(),
+            descriptor_digest: authority.descriptor_digest.clone(),
+            rex_process_observation_digest: crate::domain::ids::Digest::parse("c".repeat(64))
+                .unwrap(),
+            process_tree_digest: crate::domain::ids::Digest::parse(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+            ))
+            .unwrap(),
+            provider_start_tree_digest: fixture.provider.process_tree_digest.clone(),
+            process_tree,
+            wrapper_pid: fixture.wrapper.pid,
+            wrapper_start_identity: fixture.wrapper.start_identity.clone(),
+            provider_pid: fixture.provider.provider_pid,
+            provider_start_identity: fixture.provider.provider_start_identity.clone(),
+            observed_at_unix: 1,
+        };
+        assert!(
+            fixture
+                .store
+                .record_agent_run_adoption(&evidence, fixture.run.reservation_epoch)
+                .unwrap()
+        );
+        crate::mailbox::MailboxCapability::create(
+            fixture.run.agent_run_id.to_string(),
+            &reservation.mailbox_directory,
+            reservation.mailbox_expires_at_unix,
+            crate::mailbox::MailboxLimits {
+                max_request_bytes: reservation.mailbox_max_request_bytes as usize,
+                max_pending_requests: reservation.mailbox_max_pending_requests as usize,
+            },
+        )
+        .unwrap();
+        generation
+    }
+
+    fn queue_artifact_request(
+        mailbox: &MailboxCapability,
+        authority: &crate::launch::AgentLaunchAuthority,
+        id: &str,
+        path: &str,
+    ) {
+        queue_artifact_request_kind(
+            mailbox,
+            authority,
+            id,
+            path,
+            crate::engine::orchestration::RoleArtifactKind::General,
+        );
+    }
+
+    fn queue_artifact_request_kind(
+        mailbox: &MailboxCapability,
+        authority: &crate::launch::AgentLaunchAuthority,
+        id: &str,
+        path: &str,
+        kind: crate::engine::orchestration::RoleArtifactKind,
+    ) {
+        let request = crate::engine::orchestration::ArtifactAddRequest {
+            schema_version: 1,
+            message_id: id.into(),
+            path: path.into(),
+            kind,
+            artifact_schema_version: 1,
+        };
+        let envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(id).unwrap(),
+            operation_id: Some(authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("artifact.add").unwrap(),
+            project_id: Some(authority.project_id.clone()),
+            run_id: Some(authority.agent_run_id.to_string()),
+            attempt: Some(authority.attempt),
+            run_epoch: Some(authority.run_epoch),
+            expected_subject_revision: Some(
+                authority.ticket_revision.map_or(0, |revision| revision.0),
+            ),
+            role: Some(authority.role),
+            request_type: None,
+            params: serde_json::to_value(request).unwrap(),
+        };
+        mailbox
+            .queue(
+                id,
+                &serde_json::to_vec(&envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn artifact_source_rejection_is_durable_and_next_request_can_register() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut fixture =
+            crate::store::agent_runtime::tests::completed_block_loss_fixture(temp.path(), false);
+        let generation = adopt_fixture_run(&mut fixture, temp.path());
+        let authority = fixture.run.authority.clone();
+        let reservation = fixture
+            .store
+            .agent_launch_reservation_for_run(&fixture.run.agent_run_id)
+            .unwrap()
+            .unwrap();
+        let mailbox = crate::mailbox::MailboxCapability::open_registered_for_run(
+            fixture.run.agent_run_id.to_string(),
+            &reservation.mailbox_directory,
+        )
+        .unwrap();
+        let artifact_store = ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+        let control_only_path = "evidence.json";
+        std::fs::write(
+            authority.control_dir.join(control_only_path),
+            br#"{"schema_version":1}"#,
+        )
+        .unwrap();
+        queue_artifact_request(
+            &mailbox,
+            &authority,
+            "missing-workspace-source",
+            control_only_path,
+        );
+        assert!(
+            fixture
+                .store
+                .process_one_agent_mailbox_request(
+                    generation,
+                    authority.agent_run_id.as_str(),
+                    10,
+                    &artifact_store,
+                    &Default::default(),
+                )
+                .unwrap()
+        );
+        let rejected: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(
+                &mailbox
+                    .read_receipt("missing-workspace-source", 10)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let error = rejected.error.unwrap();
+        assert_eq!(
+            serde_json::to_value(error.code).unwrap(),
+            serde_json::json!("invalid_request")
+        );
+        assert!(!error.retryable);
+        assert_eq!(rejected.request_id.as_str(), "missing-workspace-source");
+
+        std::fs::write(
+            authority.workspace_path.join(control_only_path),
+            br#"{"schema_version":1}"#,
+        )
+        .unwrap();
+        queue_artifact_request(&mailbox, &authority, "workspace-source", control_only_path);
+        assert!(
+            fixture
+                .store
+                .process_one_agent_mailbox_request(
+                    generation,
+                    authority.agent_run_id.as_str(),
+                    11,
+                    &artifact_store,
+                    &Default::default(),
+                )
+                .unwrap()
+        );
+        let registered: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(
+                &mailbox
+                    .read_receipt("workspace-source", 11)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(registered.error.is_none());
+        assert!(registered.result.unwrap()["artifact"]["artifact_id"].is_string());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            symlink(
+                authority.control_dir.join(control_only_path),
+                authority.workspace_path.join("linked.json"),
+            )
+            .unwrap();
+            queue_artifact_request(&mailbox, &authority, "symlink-source", "linked.json");
+            assert!(
+                fixture
+                    .store
+                    .process_one_agent_mailbox_request(
+                        generation,
+                        authority.agent_run_id.as_str(),
+                        12,
+                        &artifact_store,
+                        &Default::default(),
+                    )
+                    .unwrap()
+            );
+            let symlink_response: crate::protocol::ResponseEnvelope<serde_json::Value> =
+                crate::protocol::parse_unique(
+                    &mailbox.read_receipt("symlink-source", 12).unwrap().unwrap(),
+                )
+                .unwrap();
+            assert!(symlink_response.error.is_some());
+        }
+
+        std::fs::write(authority.workspace_path.join("invalid.json"), b"{invalid").unwrap();
+        queue_artifact_request(&mailbox, &authority, "invalid-content", "invalid.json");
+        assert!(
+            fixture
+                .store
+                .process_one_agent_mailbox_request(
+                    generation,
+                    authority.agent_run_id.as_str(),
+                    13,
+                    &artifact_store,
+                    &Default::default(),
+                )
+                .unwrap()
+        );
+        let invalid_response: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(
+                &mailbox
+                    .read_receipt("invalid-content", 13)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(invalid_response.error.is_some());
+
+        queue_artifact_request_kind(
+            &mailbox,
+            &authority,
+            "unauthorized-artifact-kind",
+            "valid.json",
+            crate::engine::orchestration::RoleArtifactKind::Change,
+        );
+        assert!(
+            fixture
+                .store
+                .process_one_agent_mailbox_request(
+                    generation,
+                    authority.agent_run_id.as_str(),
+                    14,
+                    &artifact_store,
+                    &Default::default(),
+                )
+                .unwrap()
+        );
+        let unauthorized_response: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(
+                &mailbox
+                    .read_receipt("unauthorized-artifact-kind", 14)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let unauthorized_error = unauthorized_response.error.unwrap();
+        assert_eq!(
+            serde_json::to_value(unauthorized_error.code).unwrap(),
+            serde_json::json!("invalid_request")
+        );
+        assert!(!unauthorized_error.retryable);
+
+        std::fs::remove_dir_all(&authority.workspace_path).unwrap();
+        queue_artifact_request(&mailbox, &authority, "host-workspace-failure", "valid.json");
+        assert!(matches!(
+            fixture.store.process_one_agent_mailbox_request(
+                generation,
+                authority.agent_run_id.as_str(),
+                15,
+                &artifact_store,
+                &Default::default(),
+            ),
+            Err(AgentMailboxProcessingError::Authority(_))
+        ));
+        assert!(
+            mailbox
+                .read_receipt("host-workspace-failure", 15)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     fn adoption_evidence(
         agent_run_id: &AgentRunId,

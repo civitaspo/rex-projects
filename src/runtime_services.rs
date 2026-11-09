@@ -18,7 +18,7 @@ use crate::adapters::tickets::{
 };
 use crate::artifacts::ArtifactStore;
 use crate::config::{AppliedConfig, Config};
-use crate::domain::ids::{AdapterId, Digest, RexBlockId, TicketId, TicketNamespace};
+use crate::domain::ids::{AdapterId, Digest, RexBlockId, TicketId, TicketNamespace, TicketRunId};
 use crate::domain::types::{Role, TicketStatus};
 use crate::effects::EffectHandler;
 use crate::engine::factory_runtime::{ExternalTicketPage, FactoryRuntimeServices};
@@ -2272,12 +2272,25 @@ impl FactoryRuntimeServices for RuntimeServices {
 
     fn verify_worker_verification_worktree(
         &self,
-        path: &Path,
-        expected_head: &str,
+        store: &mut ConfigStore,
+        project_id: &crate::domain::ids::ProjectId,
+        ticket_run_id: &TicketRunId,
+        assignment: &crate::launch::WorkerLaunchBinding,
     ) -> Result<(), String> {
-        self.delivery
-            .effects()
-            .verify_clean_published_worktree_at(path, expected_head)
+        crate::parent_artifacts::verify_worker_worktree_with_host_artifacts(
+            store,
+            &self.artifacts,
+            project_id,
+            ticket_run_id,
+            assignment,
+            |path, expected_head, host_artifacts| {
+                self.delivery.effects().verify_clean_published_worktree_at(
+                    path,
+                    expected_head,
+                    host_artifacts,
+                )
+            },
+        )
     }
 
     fn configuration_digest(&self) -> &Digest {

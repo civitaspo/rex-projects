@@ -195,8 +195,10 @@ pub(crate) fn apply_worker_verification_result(
         );
     }
     services.verify_worker_verification_worktree(
-        prepared.worktree_path(),
-        publication_receipt_body.commit.head(),
+        store,
+        &binding.project_id,
+        ticket_run_id,
+        assignment,
     )?;
 
     let requested_receipts = claim

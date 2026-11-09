@@ -829,6 +829,7 @@ impl RepositoryDelivery {
         &self,
         path: &Path,
         expected_head: &str,
+        host_artifacts: &[crate::parent_artifacts::VerifiedStagedHostArtifact],
     ) -> Result<(), DeliveryError> {
         validate_git_sha(expected_head)?;
         if self.observe_local_head_at(path)? != expected_head {
@@ -836,14 +837,35 @@ impl RepositoryDelivery {
                 "verification worktree HEAD differs from the accepted publication".into(),
             ));
         }
-        let status = self.git_text(
+        let mut allowed_paths = BTreeSet::new();
+        for artifact in host_artifacts {
+            artifact
+                .verify_copy_in(path)
+                .map_err(DeliveryError::Invalid)?;
+            if !allowed_paths.insert(artifact.path().as_bytes().to_vec()) {
+                return Err(DeliveryError::Invalid(
+                    "verification host artifact allowlist repeats a path".into(),
+                ));
+            }
+        }
+        let status = self.git_bytes(
             path,
-            ["status", "--porcelain=v1", "--untracked-files=normal"],
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         )?;
-        if !status.is_empty() {
-            return Err(DeliveryError::Conflict(
-                "verification worktree contains source changes after publication".into(),
-            ));
+        for record in status
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            if record.len() < 4 || &record[..3] != b"?? " {
+                return Err(DeliveryError::Conflict(
+                    "verification worktree contains source changes after publication".into(),
+                ));
+            }
+            if !allowed_paths.contains(&record[3..]) {
+                return Err(DeliveryError::Conflict(
+                    "verification worktree contains an unregistered untracked path".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1549,9 +1571,10 @@ impl RepositoryDeliveryEffects {
         &self,
         path: &Path,
         expected_head: &str,
+        host_artifacts: &[crate::parent_artifacts::VerifiedStagedHostArtifact],
     ) -> Result<(), String> {
         self.delivery
-            .verify_clean_published_worktree_at(path, expected_head)
+            .verify_clean_published_worktree_at(path, expected_head, host_artifacts)
             .map_err(|error| error.to_string())
     }
 

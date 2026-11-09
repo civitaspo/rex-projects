@@ -279,8 +279,10 @@ pub trait FactoryRuntimeServices {
     /// Implementations must compare the exact expected HEAD and reject tracked or untracked edits.
     fn verify_worker_verification_worktree(
         &self,
-        _path: &std::path::Path,
-        _expected_head: &str,
+        _store: &mut ConfigStore,
+        _project_id: &crate::domain::ids::ProjectId,
+        _ticket_run_id: &crate::domain::ids::TicketRunId,
+        _assignment: &crate::launch::WorkerLaunchBinding,
     ) -> Result<(), String> {
         Err("Worker verification worktree observation is unavailable".into())
     }
@@ -3779,8 +3781,10 @@ pub(crate) mod tests {
 
         fn verify_worker_verification_worktree(
             &self,
-            path: &std::path::Path,
-            expected_head: &str,
+            store: &mut crate::store::ConfigStore,
+            project_id: &crate::domain::ids::ProjectId,
+            ticket_run_id: &crate::domain::ids::TicketRunId,
+            assignment: &crate::launch::WorkerLaunchBinding,
         ) -> Result<(), String> {
             use std::ffi::OsString;
             use std::time::Duration;
@@ -3790,6 +3794,11 @@ pub(crate) mod tests {
                 .unwrap_or_default();
             let git = crate::process::resolve_executable(std::path::Path::new("git"), &search_path)
                 .ok_or("test fixture could not resolve git")?;
+            let expected_head = assignment
+                .expected_head
+                .as_deref()
+                .ok_or("test fixture verification assignment has no expected head")?;
+            let path = assignment.worktree_path.as_path();
             let run = |args: &[&str]| -> Result<String, String> {
                 let mut environment = BTreeMap::new();
                 if let Some(path) = std::env::var_os("PATH") {
@@ -3824,11 +3833,16 @@ pub(crate) mod tests {
             if observed_head.trim() != expected_head {
                 return Err("test fixture Worker worktree HEAD changed".into());
             }
-            if !run(&["status", "--porcelain=v1", "--untracked-files=normal"])?
-                .trim()
-                .is_empty()
-            {
-                return Err("test fixture Worker verification worktree is dirty".into());
+            let locators =
+                store.persisted_worker_host_artifacts(project_id, ticket_run_id, assignment)?;
+            let allowed_paths = locators
+                .iter()
+                .map(|locator| locator.path.as_str())
+                .collect::<BTreeSet<_>>();
+            for line in run(&["status", "--porcelain=v1", "--untracked-files=all"])?.lines() {
+                if !line.starts_with("?? ") || !allowed_paths.contains(&line[3..]) {
+                    return Err("test fixture Worker verification worktree is dirty".into());
+                }
             }
             Ok(())
         }

@@ -6,7 +6,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{Digest, ProjectId};
 use crate::domain::types::Role;
-use crate::launch::{AgentLaunchReservation, StartAgentEffectPayload};
+use crate::launch::{AgentLaunchReservation, StartAgentEffectPayload, WorkerLaunchBinding};
 use crate::store::{EffectIntent, insert_effect, now_unix, validate_active_generation};
 
 const MAX_WAKE_SNAPSHOT_ITEMS: usize = 256;
@@ -551,6 +551,140 @@ impl ConfigStore {
             return Ok(None);
         };
         self.agent_launch_reservation(agent_run_id, &Digest::parse(digest)?)
+    }
+
+    /// Recover only the host artifact locators previously staged into this exact prepared
+    /// Worker worktree/node. Reservation and wake digests make the locator set host-owned;
+    /// callers still revalidate each source registration and staged copy before use.
+    pub fn persisted_worker_host_artifacts(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &crate::domain::ids::TicketRunId,
+        assignment: &WorkerLaunchBinding,
+    ) -> Result<Vec<crate::agent_api::HostArtifactLocator>, String> {
+        assignment.validate()?;
+        let mut statement = self.connection.prepare(
+            "SELECT r.reservation_digest,r.reservation_json FROM agent_launch_reservations r JOIN agent_launch_authority a USING(agent_run_id) WHERE r.project_id=?1 AND a.ticket_run_id=?2 AND a.role='worker' AND r.lifecycle='authorized' ORDER BY r.created_at_unix DESC LIMIT ?3",
+        ).map_err(|error| error.to_string())?;
+        const MAX_CANDIDATE_RESERVATIONS: u64 = 4096;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    project_id.as_str(),
+                    ticket_run_id.as_str(),
+                    MAX_CANDIDATE_RESERVATIONS + 1
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if rows.len() as u64 > MAX_CANDIDATE_RESERVATIONS {
+            return Err(
+                "Worker host artifact provenance exceeds its reservation scan limit".into(),
+            );
+        }
+
+        let mut locators = std::collections::BTreeMap::new();
+        let mut total_bytes = 0u64;
+        for (stored_digest, json) in rows {
+            let reservation: AgentLaunchReservation =
+                crate::protocol::parse_unique(json.as_bytes())
+                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            reservation.validate()?;
+            if reservation.digest()?.as_str() != stored_digest {
+                return Err("stored launch reservation digest is inconsistent".into());
+            }
+            let authority = self
+                .agent_launch_authority(&reservation.agent_run_id)?
+                .ok_or("persisted Worker host artifact reservation lost its launch authority")?;
+            if authority.agent_run_id != reservation.agent_run_id
+                || authority.project_id != reservation.project_id
+                || authority.role != reservation.role
+                || authority.role_session_id != reservation.role_session_id
+                || authority.parent_run_id != reservation.parent_run_id
+                || authority.parent_role != reservation.parent_role
+                || authority.ticket_run_id != reservation.ticket_run_id
+                || authority.ticket_revision != reservation.ticket_revision
+                || authority.config_revision != reservation.config_revision
+                || authority.config_digest != reservation.config_digest
+                || authority.attempt != reservation.attempt
+                || authority.run_epoch != reservation.run_epoch
+                || authority.controller_generation != reservation.controller_generation
+                || authority.operation_id != reservation.operation_id
+                || authority.operation_recipe_id != reservation.operation_recipe_id
+                || authority.rex_view_id != reservation.rex_view_id
+                || authority.runtime_binary_digest != reservation.runtime_binary_digest
+                || authority.environment_snapshot_id != reservation.environment_snapshot_id
+                || authority.profile_id != reservation.profile_id
+                || authority.profile_digest != reservation.profile_digest
+                || authority.instruction_digest != reservation.instruction_digest
+                || authority.result_schema_digest != reservation.result_schema_digest
+                || authority.qualification_receipt_digest
+                    != reservation.qualification_receipt_digest
+                || authority.descriptor_path != reservation.descriptor_path
+                || authority.workspace_path != reservation.workspace_path
+                || authority.control_dir != reservation.control_dir
+                || authority.mailbox_capability_digest != reservation.mailbox_capability_digest
+                || authority.role != Role::Worker
+                || authority.project_id != *project_id
+                || authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+                || authority.wake_snapshot_digest != reservation.wake_snapshot.digest
+            {
+                return Err(
+                    "persisted Worker reservation differs from its immutable launch authority"
+                        .into(),
+                );
+            }
+            if reservation.project_id != *project_id
+                || reservation.ticket_run_id.as_ref() != Some(ticket_run_id)
+                || reservation.role != Role::Worker
+            {
+                continue;
+            }
+            let Some(prior_assignment) = reservation.worker_assignment.as_ref() else {
+                continue;
+            };
+            if prior_assignment.configuration_digest != assignment.configuration_digest
+                || prior_assignment.plan_digest != assignment.plan_digest
+                || prior_assignment.node_id != assignment.node_id
+                || prior_assignment.repository_id != assignment.repository_id
+                || prior_assignment.worktree_path != assignment.worktree_path
+                || prior_assignment.branch != assignment.branch
+                || prior_assignment.base_sha != assignment.base_sha
+                || prior_assignment.commit_mode != assignment.commit_mode
+                || prior_assignment.prepare_operation_id != assignment.prepare_operation_id
+            {
+                continue;
+            }
+            if reservation.wake_snapshot.digest != reservation.wake_snapshot.content_digest()? {
+                return Err("stored Worker wake snapshot digest is inconsistent".into());
+            }
+            for locator in reservation
+                .wake_snapshot
+                .inputs
+                .iter()
+                .flat_map(|input| &input.host_artifacts)
+            {
+                locator.validate()?;
+                if let Some(previous) = locators.get(locator.artifact_id.as_str()) {
+                    if previous != locator {
+                        return Err(
+                            "Worker host artifact identity has conflicting staged locators".into(),
+                        );
+                    }
+                    continue;
+                }
+                total_bytes = total_bytes
+                    .checked_add(locator.bytes)
+                    .ok_or("Worker host artifact byte count overflow")?;
+                if total_bytes > 64 * 1024 * 1024 || locators.len() >= 256 {
+                    return Err("Worker host artifact provenance exceeds its staging limits".into());
+                }
+                locators.insert(locator.artifact_id.as_str().to_owned(), locator.clone());
+            }
+        }
+        Ok(locators.into_values().collect())
     }
 
     /// Close phase two after host authority and the real Rex block have both been

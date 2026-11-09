@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::agent_api::HostArtifactLocator;
 use crate::artifacts::ArtifactStore;
-use crate::domain::ids::{Digest, ProjectId};
+use crate::domain::ids::{AgentRunId, Digest, ProjectId, TicketRunId};
 use crate::engine::orchestration::RoleArtifactReference;
 use crate::launch::AgentLaunchAuthority;
 use crate::store::ConfigStore;
@@ -19,6 +19,224 @@ use crate::store::ConfigStore;
 const MAX_PARENT_ARTIFACTS: usize = 256;
 const MAX_PARENT_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// A persisted host artifact copy revalidated against its source registration and on-disk bytes.
+/// Its private fields make it impossible for an Agent claim to authorize an untracked path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedStagedHostArtifact {
+    locator: HostArtifactLocator,
+}
+
+impl VerifiedStagedHostArtifact {
+    pub fn path(&self) -> &str {
+        &self.locator.path
+    }
+
+    pub(crate) fn verify_copy_in(&self, workspace: &Path) -> Result<(), String> {
+        self.locator.validate()?;
+        let workspace = canonical_real_directory(workspace, "Worker verification worktree")?;
+        let mut current = workspace.to_path_buf();
+        for component in [
+            ".rex-artifacts",
+            "sha256",
+            &self.locator.artifact_id.as_str()[..2],
+        ] {
+            current.push(component);
+            let metadata = fs::symlink_metadata(&current)
+                .map_err(|error| format!("inspect staged host artifact directory: {error}"))?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err("staged host artifact directory is not a real directory".into());
+            }
+            if !fs::canonicalize(&current)
+                .map_err(|error| format!("canonicalize staged host artifact directory: {error}"))?
+                .starts_with(&workspace)
+            {
+                return Err("staged host artifact directory escaped the worktree".into());
+            }
+        }
+        let path = workspace.join(&self.locator.path);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect staged host artifact: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != self.locator.bytes
+        {
+            return Err("staged host artifact is linked or has an invalid size".into());
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o222 != 0 {
+            return Err("staged host artifact is not readonly".into());
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        let file = options.open(&path).map_err(|error| {
+            format!("open staged host artifact without following links: {error}")
+        })?;
+        let opened = file.metadata().map_err(|error| error.to_string())?;
+        if !opened.is_file() || opened.len() != self.locator.bytes {
+            return Err("staged host artifact changed while opening".into());
+        }
+        let mut hash = Sha256::new();
+        let mut limited = file.take(self.locator.bytes.saturating_add(1));
+        let mut actual_bytes = Vec::with_capacity(
+            usize::try_from(self.locator.bytes)
+                .unwrap_or(0)
+                .min(64 * 1024),
+        );
+        limited
+            .read_to_end(&mut actual_bytes)
+            .map_err(|error| error.to_string())?;
+        hash.update(&actual_bytes);
+        if actual_bytes.len() as u64 != self.locator.bytes
+            || format!("{:x}", hash.finalize()) != self.locator.digest.as_str()
+        {
+            return Err("staged host artifact bytes differ from their verified locator".into());
+        }
+        Ok(())
+    }
+}
+
+/// Revalidate persisted host locators against their immutable source authority, registry object,
+/// and existing copy in this exact workspace. This never creates or repairs staged files.
+pub fn verify_staged_host_artifacts(
+    store: &mut ConfigStore,
+    artifact_store: &ArtifactStore,
+    project_id: &ProjectId,
+    ticket_run_id: &TicketRunId,
+    configuration_digest: &Digest,
+    workspace: &Path,
+    locators: &[HostArtifactLocator],
+) -> Result<Vec<VerifiedStagedHostArtifact>, String> {
+    if locators.len() > MAX_PARENT_ARTIFACTS {
+        return Err("staged host artifact allowlist exceeds its 256 item limit".into());
+    }
+    let workspace = canonical_real_directory(workspace, "Worker verification worktree")?;
+    let mut total_bytes = 0u64;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut verified_locators = Vec::with_capacity(locators.len());
+    for locator in locators {
+        locator.validate()?;
+        if !seen.insert(locator.artifact_id.as_str()) {
+            return Err("staged host artifact allowlist repeats an artifact ID".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(locator.bytes)
+            .ok_or("staged host artifact byte count overflow")?;
+        if total_bytes > MAX_PARENT_ARTIFACT_BYTES {
+            return Err("staged host artifact allowlist exceeds its 64 MiB limit".into());
+        }
+        let source_run_id = AgentRunId::parse(locator.source_run_id.clone())?;
+        let source_authority = store
+            .agent_launch_authority(&source_run_id)?
+            .ok_or("staged host artifact source Agent authority is missing")?;
+        let source_authority_digest = source_authority.digest()?;
+        if source_authority.agent_run_id != source_run_id
+            || source_authority.project_id != *project_id
+            || source_authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || source_authority.config_digest != *configuration_digest
+            || source_authority_digest != locator.source_authority_digest
+        {
+            return Err("staged host artifact source authority differs from its assignment".into());
+        }
+        let stored_path = locator
+            .path
+            .strip_prefix(".rex-artifacts/")
+            .ok_or("staged host artifact path is outside its workspace namespace")?;
+        let reference = RoleArtifactReference {
+            artifact_id: locator.artifact_id.clone(),
+            kind: locator.kind,
+            schema_version: locator.schema_version,
+            path: stored_path.to_owned(),
+            digest: locator.digest.clone(),
+            bytes: locator.bytes,
+        };
+        store.validate_host_artifact_source_evidence(
+            &locator.source_evidence_id,
+            &source_authority,
+            &reference,
+        )?;
+        let verified = store
+            .lookup_verified_artifact(artifact_store, &source_authority, &reference)?
+            .ok_or("staged host artifact has no immutable registry entry")?;
+        if verified.reference() != &reference
+            || verified.registration().authority_digest != source_authority_digest
+            || verified.registration().project_id != *project_id
+            || verified.registration().ticket_run_id.as_ref() != Some(ticket_run_id)
+            || verified.registration().config_digest != *configuration_digest
+        {
+            return Err("staged host artifact registration differs from its source locator".into());
+        }
+        let bytes = verified.read_bytes(artifact_store)?;
+        verify_staged_path_components(&workspace, &reference, &locator.path)?;
+        let destination = workspace.join(&locator.path);
+        let metadata = fs::symlink_metadata(&destination)
+            .map_err(|error| format!("inspect staged host artifact: {error}"))?;
+        verify_existing(&destination, metadata, &bytes, &reference)?;
+        verified_locators.push(VerifiedStagedHostArtifact {
+            locator: locator.clone(),
+        });
+    }
+    Ok(verified_locators)
+}
+
+/// Run the strict verification-worktree observation after resolving this exact prepared node's
+/// durable host artifact allowance. The observer still sees only registry-verified copies.
+pub(crate) fn verify_worker_worktree_with_host_artifacts(
+    store: &mut ConfigStore,
+    artifact_store: &ArtifactStore,
+    project_id: &ProjectId,
+    ticket_run_id: &TicketRunId,
+    assignment: &crate::launch::WorkerLaunchBinding,
+    observe: impl FnOnce(&Path, &str, &[VerifiedStagedHostArtifact]) -> Result<(), String>,
+) -> Result<(), String> {
+    let expected_head = assignment
+        .expected_head
+        .as_deref()
+        .ok_or("Worker verification assignment has no expected head")?;
+    let locators = store.persisted_worker_host_artifacts(project_id, ticket_run_id, assignment)?;
+    let verified = verify_staged_host_artifacts(
+        store,
+        artifact_store,
+        project_id,
+        ticket_run_id,
+        &assignment.configuration_digest,
+        &assignment.worktree_path,
+        &locators,
+    )?;
+    observe(&assignment.worktree_path, expected_head, &verified)
+}
+
+fn verify_staged_path_components(
+    workspace: &Path,
+    reference: &RoleArtifactReference,
+    locator_path: &str,
+) -> Result<(), String> {
+    let mut current = workspace.to_path_buf();
+    for component in [
+        ".rex-artifacts",
+        "sha256",
+        &reference.artifact_id.as_str()[..2],
+    ] {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| format!("inspect staged host artifact directory: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("staged host artifact directory is not a real directory".into());
+        }
+        if !fs::canonicalize(&current)
+            .map_err(|error| format!("canonicalize staged host artifact directory: {error}"))?
+            .starts_with(workspace)
+        {
+            return Err("staged host artifact directory escaped the worktree".into());
+        }
+    }
+    if locator_path != format!(".rex-artifacts/{}", reference.path) {
+        return Err("staged host artifact path differs from its registry reference".into());
+    }
+    Ok(())
+}
 
 /// Resolve host-registered references under the source AgentRun authority and stage their exact
 /// verified bytes in the destination role workspace. The caller must pass refs from a durable
