@@ -25,6 +25,118 @@ pub struct ProcessRequest {
     pub stderr_tail_limit: usize,
 }
 
+#[cfg(debug_assertions)]
+const PROCESS_START_DIAGNOSTIC_DIR_ENV: &str = "REX_PROCESS_START_DIAGNOSTIC_DIR";
+#[cfg(debug_assertions)]
+const MAX_PROCESS_START_MARKER_BYTES: usize = 128;
+
+#[derive(Clone, Copy)]
+enum ProcessStartPhase {
+    InitialInspectBefore,
+    InitialInspectAfter,
+    InitialCaptureBefore,
+    InitialCaptureAfter,
+    OnStartedBefore,
+    OnStartedAfter,
+    InputWriterStart,
+}
+
+impl ProcessStartPhase {
+    #[cfg(test)]
+    const ALL: [Self; 7] = [
+        Self::InitialInspectBefore,
+        Self::InitialInspectAfter,
+        Self::InitialCaptureBefore,
+        Self::InitialCaptureAfter,
+        Self::OnStartedBefore,
+        Self::OnStartedAfter,
+        Self::InputWriterStart,
+    ];
+
+    #[cfg(debug_assertions)]
+    fn name(self) -> &'static str {
+        match self {
+            Self::InitialInspectBefore => "initial_inspect_before",
+            Self::InitialInspectAfter => "initial_inspect_after",
+            Self::InitialCaptureBefore => "initial_capture_before",
+            Self::InitialCaptureAfter => "initial_capture_after",
+            Self::OnStartedBefore => "on_started_before",
+            Self::OnStartedAfter => "on_started_after",
+            Self::InputWriterStart => "input_writer_start",
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone)]
+struct ProcessStartDiagnostic {
+    directory: Option<PathBuf>,
+    caller_pid: u32,
+    child_root_pid: u32,
+    started_at: Instant,
+}
+
+#[cfg(debug_assertions)]
+impl ProcessStartDiagnostic {
+    fn from_env(child_root_pid: u32) -> Option<Self> {
+        let directory = std::env::var_os(PROCESS_START_DIAGNOSTIC_DIR_ENV)?;
+        Some(Self::new(
+            Some(PathBuf::from(directory)),
+            std::process::id(),
+            child_root_pid,
+        ))
+    }
+
+    fn new(directory: Option<PathBuf>, caller_pid: u32, child_root_pid: u32) -> Self {
+        Self {
+            directory,
+            caller_pid,
+            child_root_pid,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn mark(&self, phase: ProcessStartPhase) {
+        use std::fs::OpenOptions;
+
+        let Some(directory) = &self.directory else {
+            return;
+        };
+        let marker = directory.join(format!(
+            "{}-{}-{}.marker",
+            self.caller_pid,
+            self.child_root_pid,
+            phase.name()
+        ));
+        let Ok(mut marker) = OpenOptions::new().write(true).create_new(true).open(marker) else {
+            return;
+        };
+        let elapsed_us = self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let contents = format!(
+            "caller_pid={},child_root_pid={},stage={},elapsed_us={elapsed_us}\n",
+            self.caller_pid,
+            self.child_root_pid,
+            phase.name()
+        );
+        if contents.len() <= MAX_PROCESS_START_MARKER_BYTES {
+            let _ = marker.write_all(contents.as_bytes());
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Clone)]
+struct ProcessStartDiagnostic;
+
+#[cfg(not(debug_assertions))]
+impl ProcessStartDiagnostic {
+    fn from_env(_child_root_pid: u32) -> Option<Self> {
+        None
+    }
+
+    fn mark(&self, _phase: ProcessStartPhase) {}
+}
+
 pub(crate) fn clear_git_repository_environment(environment: &mut BTreeMap<OsString, OsString>) {
     for key in [
         "GIT_DIR",
@@ -171,8 +283,15 @@ fn run_inner(
     let mut child = command.spawn().map_err(ProcessError::Start)?;
     let root_pid = child.id();
     let mut observed_processes = Vec::new();
+    let start_diagnostic = require_started_identity
+        .then(|| ProcessStartDiagnostic::from_env(root_pid))
+        .flatten();
     if require_started_identity {
-        let identity_scan = collect_tree(root_pid, &mut observed_processes);
+        let identity_scan = collect_tree_with_diagnostic(
+            root_pid,
+            &mut observed_processes,
+            start_diagnostic.as_ref(),
+        );
         if identity_scan.is_err() {
             let cleaned = cleanup_child_tree(
                 &mut child,
@@ -203,7 +322,13 @@ fn run_inner(
                 ProcessError::CleanupUnconfirmed
             });
         };
+        if let Some(diagnostic) = &start_diagnostic {
+            diagnostic.mark(ProcessStartPhase::OnStartedBefore);
+        }
         on_started(root_identity);
+        if let Some(diagnostic) = &start_diagnostic {
+            diagnostic.mark(ProcessStartPhase::OnStartedAfter);
+        }
     }
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -220,7 +345,11 @@ fn run_inner(
     });
     let input = std::mem::take(&mut request.stdin);
     let (input_tx, input_rx) = mpsc::sync_channel(1);
+    let input_diagnostic = start_diagnostic.clone();
     thread::spawn(move || {
+        if let Some(diagnostic) = &input_diagnostic {
+            diagnostic.mark(ProcessStartPhase::InputWriterStart);
+        }
         let _ = stdin.write_all(&input);
         let _ = stdin.flush();
         let _ = input_tx.send(());
@@ -878,7 +1007,22 @@ fn collect_tree(
     root_pid: u32,
     observed: &mut Vec<ProcessIdentity>,
 ) -> Result<Vec<ProcessIdentity>, ProcessError> {
-    let current = inspect_process_table()?;
+    collect_tree_with_diagnostic(root_pid, observed, None)
+}
+
+fn collect_tree_with_diagnostic(
+    root_pid: u32,
+    observed: &mut Vec<ProcessIdentity>,
+    diagnostic: Option<&ProcessStartDiagnostic>,
+) -> Result<Vec<ProcessIdentity>, ProcessError> {
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.mark(ProcessStartPhase::InitialInspectBefore);
+    }
+    let table = inspect_process_table();
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.mark(ProcessStartPhase::InitialInspectAfter);
+    }
+    let current = table?;
     if let Some(root) = current.iter().find(|item| item.pid == root_pid) {
         if root.process_group_id != root_pid
             || root.quality != ProcessIdentityQuality::KernelBirthToken
@@ -891,7 +1035,14 @@ fn collect_tree(
                 "root process identity changed during observation".into(),
             ));
         }
-        for item in capture_process_tree(root_pid, &current) {
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.mark(ProcessStartPhase::InitialCaptureBefore);
+        }
+        let process_tree = capture_process_tree(root_pid, &current);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.mark(ProcessStartPhase::InitialCaptureAfter);
+        }
+        for item in process_tree {
             if !observed.iter().any(|known| known == &item) {
                 observed.push(item);
             }
@@ -1079,6 +1230,71 @@ mod tests {
 
     use super::{ProcessRequest, resolve_executable, run, run_in_new_session};
     use std::path::Path;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn process_start_phase_markers_are_bounded_scoped_and_first_write_wins() {
+        use super::{ProcessStartDiagnostic, ProcessStartPhase};
+
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostic = |caller_pid, child_root_pid| {
+            ProcessStartDiagnostic::new(
+                Some(directory.path().to_path_buf()),
+                caller_pid,
+                child_root_pid,
+            )
+        };
+        assert!(ProcessStartPhase::ALL.len() <= 8);
+
+        let first = diagnostic(101, 201);
+        first.mark(ProcessStartPhase::InitialInspectBefore);
+        let marker = directory
+            .path()
+            .join("101-201-initial_inspect_before.marker");
+        let original = std::fs::read(&marker).unwrap();
+        first.mark(ProcessStartPhase::InitialInspectBefore);
+        assert_eq!(std::fs::read(&marker).unwrap(), original);
+
+        diagnostic(101, 202).mark(ProcessStartPhase::InitialInspectBefore);
+        diagnostic(102, 201).mark(ProcessStartPhase::InitialInspectBefore);
+        let mut markers = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        markers.sort();
+        assert_eq!(
+            markers,
+            [
+                "101-201-initial_inspect_before.marker",
+                "101-202-initial_inspect_before.marker",
+                "102-201-initial_inspect_before.marker",
+            ]
+        );
+        for (caller_pid, child_root_pid, name) in [
+            (101, 201, &markers[0]),
+            (101, 202, &markers[1]),
+            (102, 201, &markers[2]),
+        ] {
+            let contents = std::fs::read_to_string(directory.path().join(name)).unwrap();
+            assert!(contents.len() <= super::MAX_PROCESS_START_MARKER_BYTES);
+            assert!(contents.contains(&format!("caller_pid={caller_pid},")));
+            assert!(contents.contains(&format!("child_root_pid={child_root_pid},")));
+            assert!(contents.contains("stage=initial_inspect_before,"));
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn disabled_process_start_phase_diagnostic_performs_no_file_io() {
+        use super::{ProcessStartDiagnostic, ProcessStartPhase};
+
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostic = ProcessStartDiagnostic::new(None, 101, 201);
+        for phase in ProcessStartPhase::ALL {
+            diagnostic.mark(phase);
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     #[cfg(unix)]
     #[test]

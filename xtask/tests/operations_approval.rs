@@ -33,6 +33,7 @@ use rex_projects::store::operations::DurableOperationState;
 use rex_projects::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
 const SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+const PROCESS_START_DIAGNOSTIC_DIR_ENV: &str = "REX_PROCESS_START_DIAGNOSTIC_DIR";
 
 fn is_xtask_comm(comm: &[u8]) -> bool {
     comm.strip_suffix(b"\n").unwrap_or(comm) == b"xtask"
@@ -65,11 +66,87 @@ impl Drop for XdgStateHomeGuard {
     }
 }
 
+struct ProcessStartDiagnosticDirGuard(Option<std::ffi::OsString>);
+
+impl ProcessStartDiagnosticDirGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let prior = std::env::var_os(PROCESS_START_DIAGNOSTIC_DIR_ENV);
+        unsafe { std::env::set_var(PROCESS_START_DIAGNOSTIC_DIR_ENV, path) };
+        Self(prior)
+    }
+}
+
+impl Drop for ProcessStartDiagnosticDirGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => unsafe {
+                std::env::set_var(PROCESS_START_DIAGNOSTIC_DIR_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(PROCESS_START_DIAGNOSTIC_DIR_ENV) },
+        }
+    }
+}
+
+fn process_start_phase_markers(
+    directory: &std::path::Path,
+    caller_pid: u32,
+    child_root_pid: u32,
+) -> Vec<(String, String)> {
+    use std::io::Read;
+
+    let prefix = format!("{caller_pid}-{child_root_pid}-");
+    let mut markers = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stage = name.strip_prefix(&prefix)?.strip_suffix(".marker")?;
+            let mut contents = Vec::new();
+            std::fs::File::open(entry.path())
+                .ok()?
+                .take(128)
+                .read_to_end(&mut contents)
+                .ok()?;
+            Some((
+                stage.to_owned(),
+                String::from_utf8_lossy(&contents).trim().to_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| left.0.cmp(&right.0));
+    markers
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_phase_summary(
+    directory: &std::path::Path,
+    caller_pid: u32,
+    identities: &[(u32, String)],
+) -> String {
+    identities
+        .iter()
+        .map(|(child_root_pid, _)| {
+            let markers = process_start_phase_markers(directory, caller_pid, *child_root_pid)
+                .into_iter()
+                .map(|(_, contents)| contents)
+                .collect::<Vec<_>>()
+                .join(";");
+            format!("child_root_pid={child_root_pid},markers=[{markers}]")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 #[test]
 fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
     let temp = tempfile::tempdir().expect("temporary operation state");
     let isolated_xdg = temp.path().join("xdg-state");
     let _xdg_state_home = XdgStateHomeGuard::set(&isolated_xdg);
+    let process_start_diagnostic_dir = temp.path().join("process-start-diagnostics");
+    std::fs::create_dir_all(&process_start_diagnostic_dir).unwrap();
+    let _process_start_diagnostic_dir =
+        ProcessStartDiagnosticDirGuard::set(&process_start_diagnostic_dir);
     let fixture_state = temp.path().join("fixture-state");
     let mut config: Config = toml::from_str(include_str!("../../examples/fixture/config.toml"))
         .expect("public fixture configuration parses");
@@ -413,6 +490,14 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
             };
             let fixture_process_diagnostic = fixture_processes.diagnostic;
             #[cfg(target_os = "linux")]
+            let fixture_start_phase_diagnostic = process_start_phase_summary(
+                &process_start_diagnostic_dir,
+                std::process::id(),
+                &fixture_processes.identities,
+            );
+            #[cfg(not(target_os = "linux"))]
+            let fixture_start_phase_diagnostic = "not_applicable".to_owned();
+            #[cfg(target_os = "linux")]
             let owner_thread_diagnostic = linux_process_snapshot::snapshot_with_thread_limit(
                 std::process::id(),
                 None,
@@ -441,7 +526,7 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
             #[cfg(not(target_os = "linux"))]
             let fixture_thread_diagnostic = "not_applicable".to_owned();
             panic!(
-                "pooled invoke did not settle: fixture_receipt_exists={}, operation_state={:?}, operation_external_reference_present={}, operation_terminal_receipt_present={}, invoke_host_job={invoke_job_diagnostic}, fixture_process={fixture_process_diagnostic}, owner_threads={owner_thread_diagnostic}, fixture_threads={fixture_thread_diagnostic}",
+                "pooled invoke did not settle: fixture_receipt_exists={}, operation_state={:?}, operation_external_reference_present={}, operation_terminal_receipt_present={}, invoke_host_job={invoke_job_diagnostic}, fixture_process={fixture_process_diagnostic}, fixture_start_phases={fixture_start_phase_diagnostic}, owner_threads={owner_thread_diagnostic}, fixture_threads={fixture_thread_diagnostic}",
                 fixture_receipt.exists(),
                 operation.state,
                 operation.external_reference.is_some(),
@@ -531,6 +616,7 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
             OperationMethod::Observe,
         ),
     ];
+    let mut child_root_pids = Vec::new();
     for (job_id, method) in operation_jobs {
         let job = store
             .host_job(&job_id)
@@ -541,7 +627,46 @@ fn queued_human_approval_gates_operation_fixture_invoke_and_reconcile() {
             job.state,
             HostJobState::Succeeded | HostJobState::Failed
         ));
+        let child_root_pid = job
+            .process_identity
+            .as_ref()
+            .expect("completed host job records the child identity")
+            .pid;
+        child_root_pids.push(child_root_pid);
+        let markers = process_start_phase_markers(
+            &process_start_diagnostic_dir,
+            std::process::id(),
+            child_root_pid,
+        );
+        assert_eq!(
+            markers
+                .iter()
+                .map(|(stage, _)| stage.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "initial_capture_after",
+                "initial_capture_before",
+                "initial_inspect_after",
+                "initial_inspect_before",
+                "input_writer_start",
+                "on_started_after",
+                "on_started_before",
+            ],
+            "host job {job_id} should leave one marker for each startup phase"
+        );
+        for (stage, contents) in markers {
+            assert!(contents.contains(&format!("caller_pid={},", std::process::id())));
+            assert!(contents.contains(&format!("child_root_pid={child_root_pid},")));
+            assert!(contents.contains(&format!("stage={stage},")));
+        }
     }
+    child_root_pids.sort_unstable();
+    child_root_pids.dedup();
+    assert_eq!(
+        child_root_pids.len(),
+        3,
+        "each operation job uses a distinct process"
+    );
 }
 
 struct FixtureProcesses {

@@ -88,25 +88,6 @@ fn thread_snapshot(proc_root: &Path, pid: u32, tid: u32, role: &str) -> String {
     format!("tid={tid},role={role},state={state},wchan={wchan},syscall={syscall}")
 }
 
-/// Snapshot one process after checking its PID birth token and optional parent PID.
-/// Thread selection prefers `rex-host-job-*` threads, then the leader, then other TIDs.
-pub fn snapshot_at(
-    proc_root: &Path,
-    pid: u32,
-    expected_start_identity: Option<&str>,
-    expected_parent_pid: Option<u32>,
-    include_children: bool,
-) -> String {
-    snapshot_at_with_thread_limit(
-        proc_root,
-        pid,
-        expected_start_identity,
-        expected_parent_pid,
-        include_children,
-        MAX_THREADS,
-    )
-}
-
 pub fn snapshot_at_with_thread_limit(
     proc_root: &Path,
     pid: u32,

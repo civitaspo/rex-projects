@@ -191,31 +191,34 @@ fn linux_owner_snapshot_is_bounded_and_omits_syscall_arguments() {
     assert!(!snapshot.contains("987654321"));
     assert!(!snapshot.contains("fixture process"));
 
-    let child = linux_process_snapshot::snapshot_at(
+    let child = linux_process_snapshot::snapshot_at_with_thread_limit(
         temp.path(),
         456,
         Some("linux-start-ticks:789"),
         Some(owner_pid),
         false,
+        8,
     );
     assert!(child.contains("pid=456,ppid=123,state=S,start_ticks=789"));
     assert!(
-        linux_process_snapshot::snapshot_at(
+        linux_process_snapshot::snapshot_at_with_thread_limit(
             temp.path(),
             456,
             Some("linux-start-ticks:wrong"),
             Some(owner_pid),
             false,
+            8,
         )
         .contains("identity_changed=true")
     );
     assert!(
-        linux_process_snapshot::snapshot_at(
+        linux_process_snapshot::snapshot_at_with_thread_limit(
             temp.path(),
             456,
             Some("linux-start-ticks:789"),
             Some(7),
             false,
+            8,
         )
         .contains("identity_changed=true")
     );
