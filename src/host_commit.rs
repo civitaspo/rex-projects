@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -390,6 +390,145 @@ impl HostCommitter {
         })
     }
 
+    pub fn validate_required_trailer(
+        &self,
+        worktree: &ManagedWorktree,
+        message: &str,
+        required_trailer: &str,
+    ) -> Result<(), HostCommitError> {
+        if required_trailer.trim().is_empty()
+            || required_trailer.contains(['\n', '\r'])
+            || message.trim().is_empty()
+            || message.contains('\0')
+        {
+            return Err(HostCommitError::Invalid(
+                "host commit message or required authorship trailer is malformed".into(),
+            ));
+        }
+        let parsed = self.git_text(
+            &worktree.path,
+            "parse required commit trailer",
+            ["interpret-trailers", "--parse"],
+            Some(message.as_bytes()),
+            None,
+        )?;
+        if !parsed.lines().any(|line| line == required_trailer) {
+            return Err(HostCommitError::Invalid(format!(
+                "host commit message is missing the required authorship trailer: {required_trailer}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Recover an immutable prepared host commit for an effect being reconciled.
+    /// Unlike `prepare`, this never requires current HEAD to equal expected HEAD: the
+    /// commit may already have been created before the process crashed.
+    pub fn load_prepared(
+        &self,
+        worktree: &ManagedWorktree,
+        operation_id: &OperationId,
+        manifest: &ChangeManifest,
+        manifest_root: &Path,
+        message: &str,
+    ) -> Result<Option<PreparedHostCommit>, HostCommitError> {
+        validate_manifest(manifest)?;
+        if message.trim().is_empty() || message.contains('\0') {
+            return Err(HostCommitError::Invalid(
+                "commit message must be nonempty and contain no NUL".into(),
+            ));
+        }
+        let repo = worktree.path.canonicalize().map_err(io_error)?;
+        let managed_root = self
+            .state_root
+            .join("worktrees")
+            .canonicalize()
+            .map_err(io_error)?;
+        if !repo.starts_with(managed_root) || !repo.is_dir() {
+            return Err(HostCommitError::Invalid(
+                "host commits are limited to managed worktrees".into(),
+            ));
+        }
+        self.validate_worktree_path(worktree, &repo)?;
+        if manifest_root.canonicalize().map_err(io_error)? != repo {
+            return Err(HostCommitError::Invalid(
+                "manifest source must be the verified managed worktree".into(),
+            ));
+        }
+        let _lock = self.repository_lock(&worktree.repository_id)?;
+        let directory = self
+            .state_root
+            .join("host-commits")
+            .join(operation_id.as_str());
+        if !directory.exists() {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(&directory).map_err(io_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(HostCommitError::Conflict(
+                "prepared host-commit staging path is not a private directory".into(),
+            ));
+        }
+        let intent_path = directory.join("intent.json");
+        let metadata = fs::symlink_metadata(&intent_path).map_err(io_error)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > 32 * 1024 * 1024
+        {
+            return Err(HostCommitError::Conflict(
+                "interrupted host-commit intent is missing or invalid".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        open_read_nofollow(&intent_path)?
+            .take(32 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_error)?;
+        let intent: HostCommitIntent = serde_json::from_slice(&bytes).map_err(|_| {
+            HostCommitError::Conflict("interrupted host-commit intent is invalid".into())
+        })?;
+        let expected_manifest_digest = manifest_digest(manifest)?;
+        if intent.operation_id != *operation_id
+            || intent.repository_id != worktree.repository_id
+            || intent.worktree_branch != worktree.branch
+            || intent.expected_head != worktree.base_sha
+            || intent.manifest_digest != expected_manifest_digest
+            || intent.manifest != *manifest
+            || intent.message != message
+            || intent.staging_directory != directory
+            || intent.normal_index_backup != directory.join("normal-index.backup")
+        {
+            return Err(HostCommitError::Conflict(
+                "stored prepared host commit differs from the durable effect request".into(),
+            ));
+        }
+        let index = directory.join("index");
+        let index_metadata = fs::symlink_metadata(&index).map_err(io_error)?;
+        if index_metadata.file_type().is_symlink() || !index_metadata.is_file() {
+            return Err(HostCommitError::Conflict(
+                "prepared host-commit index is missing or unsafe".into(),
+            ));
+        }
+        let expected_tree = self
+            .git_text(
+                &repo,
+                "recover prepared host-commit tree",
+                ["write-tree"],
+                None,
+                Some(&mut IndexEnvironment::new(index.clone())),
+            )?
+            .trim()
+            .to_owned();
+        validate_object_id(&expected_tree)?;
+        let prepared = PreparedHostCommit {
+            intent,
+            isolated_index: index,
+            expected_tree,
+        };
+        self.validate_prepared(worktree, &prepared, &repo)?;
+        self.verify_prepared_tree(&repo, &prepared)?;
+        Ok(Some(prepared))
+    }
+
     pub fn execute(
         &self,
         worktree: &ManagedWorktree,
@@ -460,7 +599,12 @@ impl HostCommitter {
             None,
         )?;
         let index_synchronized = self
-            .sync_normal_index(&repo, &observed_head, &prepared.intent.normal_index)
+            .sync_normal_index(
+                &repo,
+                &observed_head,
+                &actual_tree,
+                &prepared.intent.normal_index,
+            )
             .is_ok();
         Ok(HostCommitReceipt {
             operation_id: prepared.intent.operation_id.clone(),
@@ -498,16 +642,14 @@ impl HostCommitter {
         if head == prepared.intent.expected_head {
             return Ok(None);
         }
-        let parent = self
-            .git_text(
-                &repo,
-                "resolve current commit parent",
-                ["rev-parse", "--verify", &format!("{head}^{{commit}}")],
-                None,
-                None,
-            )?
-            .trim()
-            .to_owned();
+        let parents = self.git_text(
+            &repo,
+            "resolve current commit parents",
+            ["show", "-s", "--format=%P", &head],
+            None,
+            None,
+        )?;
+        let parents = parents.split_whitespace().collect::<Vec<_>>();
         let tree = self
             .git_text(
                 &repo,
@@ -525,9 +667,13 @@ impl HostCommitter {
             None,
             None,
         )?;
-        if parent != prepared.intent.expected_head
+        // `git show --format=%B` includes Git's pretty-format terminator after
+        // the commit object's message. Compare only after removing terminal LF
+        // characters; whitespace, body lines, and trailers remain significant.
+        if parents.len() != 1
+            || parents[0] != prepared.intent.expected_head
             || tree != prepared.expected_tree
-            || message != prepared.intent.message
+            || message.trim_end_matches('\n') != prepared.intent.message.trim_end_matches('\n')
         {
             return Err(HostCommitError::Conflict(
                 "current HEAD is not the exact interrupted host commit".into(),
@@ -553,7 +699,7 @@ impl HostCommitter {
             None,
         )?;
         let index_synchronized = self
-            .sync_normal_index(&repo, &head, &prepared.intent.normal_index)
+            .sync_reconciled_normal_index(&repo, &head, &tree, &prepared.intent)
             .is_ok();
         Ok(Some(HostCommitReceipt {
             operation_id: prepared.intent.operation_id.clone(),
@@ -620,7 +766,7 @@ impl HostCommitter {
         mut index: Option<&mut IndexEnvironment>,
     ) -> Result<ProcessOutput, HostCommitError> {
         let mut environment = self.options.git_environment.clone();
-        environment.retain(|key, _| !key.to_string_lossy().starts_with("GIT_"));
+        process::clear_git_repository_environment(&mut environment);
         environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
         if let Some(index) = index.as_mut() {
             environment.insert("GIT_INDEX_FILE".into(), index.path.clone().into_os_string());
@@ -908,13 +1054,217 @@ impl HostCommitter {
         &self,
         repo: &Path,
         new_head: &str,
+        expected_tree: &str,
         expected: &IndexIdentity,
     ) -> Result<(), HostCommitError> {
-        self.require_same_index(repo, expected)?;
         let normal_index = self.index_path(repo)?;
-        let replacement = expected
-            .canonical_path
-            .with_extension(format!("index.rex-projects-{}", std::process::id()));
+        let mut lock = GitIndexLock::acquire(&normal_index)?;
+        let before = self.index_identity(repo)?;
+        if &before != expected {
+            return Err(HostCommitError::Conflict(
+                "normal Git index changed after preparation".into(),
+            ));
+        }
+        if self.normal_index_has_unsupported_flags(repo)? {
+            return Err(HostCommitError::Conflict(
+                "normal Git index has flags that cannot be synchronized safely".into(),
+            ));
+        }
+        let replacement =
+            self.prepare_normal_index_replacement(repo, &normal_index, new_head, expected_tree)?;
+        if self.index_identity(repo)? != before {
+            return Err(HostCommitError::Conflict(
+                "normal Git index changed while synchronizing the host commit".into(),
+            ));
+        }
+        lock.replace(&normal_index, &replacement)?;
+        Ok(())
+    }
+
+    fn sync_reconciled_normal_index(
+        &self,
+        repo: &Path,
+        new_head: &str,
+        expected_tree: &str,
+        intent: &HostCommitIntent,
+    ) -> Result<(), HostCommitError> {
+        let expected = &intent.normal_index;
+        let normal_index = self.index_path(repo)?;
+        let mut lock = GitIndexLock::acquire(&normal_index)?;
+        let before = self.index_identity(repo)?;
+        if before.canonical_path != expected.canonical_path || before.device != expected.device {
+            return Err(HostCommitError::Conflict(
+                "normal Git index moved after host-commit preparation".into(),
+            ));
+        }
+
+        if self.normal_index_has_unsupported_flags(repo)? {
+            return Err(HostCommitError::Conflict(
+                "normal Git index has flags that cannot be reconciled safely".into(),
+            ));
+        }
+
+        // A previous attempt may have synchronized the index and lost only its
+        // dispatcher receipt. Leave that index byte-for-byte intact on replay.
+        let current_tree = self.normal_index_tree(repo, &normal_index)?;
+        if current_tree == expected_tree {
+            if self.index_identity(repo)? != before {
+                return Err(HostCommitError::Conflict(
+                    "normal Git index changed while reconciling the host commit".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        // A commit may also have been created before the original index was
+        // replaced. Accept that case only when its current bytes still match
+        // the private, immutable snapshot captured during preparation.
+        let backup = read_regular_file_nofollow(&intent.normal_index_backup)?;
+        if backup.len() as u64 != expected.byte_count || digest(&backup) != expected.digest {
+            return Err(HostCommitError::Conflict(
+                "normal index backup does not match its prepared identity".into(),
+            ));
+        }
+        let current = read_regular_file_nofollow(&normal_index)?;
+        if before.byte_count != expected.byte_count
+            || before.digest != expected.digest
+            || current != backup
+        {
+            return Err(HostCommitError::Conflict(
+                "normal Git index contains changes after host-commit preparation".into(),
+            ));
+        }
+        let base_tree = self.git_text(
+            repo,
+            "resolve prepared base tree",
+            [
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{tree}}", intent.expected_head),
+            ],
+            None,
+            None,
+        )?;
+        if current_tree != base_tree.trim() {
+            return Err(HostCommitError::Conflict(
+                "normal Git index has staged changes unrelated to the host commit".into(),
+            ));
+        }
+
+        let replacement =
+            self.prepare_normal_index_replacement(repo, &normal_index, new_head, expected_tree)?;
+        if self.index_identity(repo)? != before {
+            return Err(HostCommitError::Conflict(
+                "normal Git index changed while recovering the host commit".into(),
+            ));
+        }
+        lock.replace(&normal_index, &replacement)?;
+        Ok(())
+    }
+
+    fn normal_index_tree(
+        &self,
+        repo: &Path,
+        normal_index: &Path,
+    ) -> Result<String, HostCommitError> {
+        let bytes = read_regular_file_nofollow(normal_index)?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| HostCommitError::Io(error.to_string()))?
+            .as_nanos();
+        let inspection_index = normal_index.with_extension(format!(
+            "index.rex-projects-inspect-{}-{nonce}",
+            std::process::id()
+        ));
+        let inspection_lock = appended_path_suffix(&inspection_index, ".lock");
+        ensure_missing(&inspection_index)?;
+        ensure_missing(&inspection_lock)?;
+        let _cleanup = TemporaryPaths(vec![inspection_index.clone(), inspection_lock]);
+        write_private_file(&inspection_index, &bytes)?;
+        let tree = self.git_text(
+            repo,
+            "inspect normal Git index tree",
+            ["write-tree"],
+            None,
+            Some(&mut IndexEnvironment::new(inspection_index)),
+        )?;
+        let tree = tree.trim().to_owned();
+        validate_object_id(&tree)?;
+        Ok(tree)
+    }
+
+    fn normal_index_has_unsupported_flags(&self, repo: &Path) -> Result<bool, HostCommitError> {
+        let output = self.run_git(
+            repo,
+            ["ls-files", "--debug", "-z"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            Vec::new(),
+            None,
+        )?;
+        check_output("inspect normal Git index flags", &output)?;
+        if output.stdout_truncated {
+            return Err(HostCommitError::Git(
+                "inspect normal Git index flags",
+                "bounded output was truncated".into(),
+            ));
+        }
+
+        if output.stdout.is_empty() {
+            return Ok(false);
+        }
+        let mut cursor = 0;
+        take_nul_terminated_index_path(&output.stdout, &mut cursor)?;
+        let mut unsupported_flags = false;
+        loop {
+            parse_debug_pair(
+                take_debug_line(&output.stdout, &mut cursor)?,
+                b"  ctime: ",
+                b":",
+            )?;
+            parse_debug_pair(
+                take_debug_line(&output.stdout, &mut cursor)?,
+                b"  mtime: ",
+                b":",
+            )?;
+            parse_debug_pair(
+                take_debug_line(&output.stdout, &mut cursor)?,
+                b"  dev: ",
+                b"\tino: ",
+            )?;
+            parse_debug_pair(
+                take_debug_line(&output.stdout, &mut cursor)?,
+                b"  uid: ",
+                b"\tgid: ",
+            )?;
+            unsupported_flags |=
+                parse_debug_index_flags(take_debug_line(&output.stdout, &mut cursor)?)?;
+            if cursor == output.stdout.len() {
+                break;
+            }
+            take_nul_terminated_index_path(&output.stdout, &mut cursor)?;
+        }
+        Ok(unsupported_flags)
+    }
+
+    fn prepare_normal_index_replacement(
+        &self,
+        repo: &Path,
+        normal_index: &Path,
+        new_head: &str,
+        expected_tree: &str,
+    ) -> Result<Vec<u8>, HostCommitError> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| HostCommitError::Io(error.to_string()))?
+            .as_nanos();
+        let replacement = normal_index
+            .with_extension(format!("index.rex-projects-{}-{nonce}", std::process::id()));
+        ensure_missing(&replacement)?;
+        let replacement_lock = appended_path_suffix(&replacement, ".lock");
+        ensure_missing(&replacement_lock)?;
+        let _cleanup = TemporaryPaths(vec![replacement.clone(), replacement_lock]);
         let mut index = IndexEnvironment::new(replacement.clone());
         self.git_status(
             repo,
@@ -923,9 +1273,20 @@ impl HostCommitter {
             None,
             Some(&mut index),
         )?;
-        self.require_same_index(repo, expected)?;
-        fs::rename(&replacement, &normal_index).map_err(io_error)?;
-        Ok(())
+        let generated_tree = self.git_text(
+            repo,
+            "verify synchronized index tree",
+            ["write-tree"],
+            None,
+            Some(&mut IndexEnvironment::new(replacement.clone())),
+        )?;
+        if generated_tree.trim() != expected_tree {
+            return Err(HostCommitError::Conflict(
+                "synchronized index does not match the verified commit tree".into(),
+            ));
+        }
+        let bytes = read_regular_file_nofollow(&replacement)?;
+        Ok(bytes)
     }
 
     fn reject_submodule_paths(
@@ -992,6 +1353,126 @@ impl IndexEnvironment {
     fn new(path: PathBuf) -> Self {
         Self { path }
     }
+}
+
+struct GitIndexLock {
+    path: Option<PathBuf>,
+    file: File,
+}
+
+impl GitIndexLock {
+    fn acquire(index: &Path) -> Result<Self, HostCommitError> {
+        let path = appended_path_suffix(index, ".lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(HostCommitError::Conflict(
+                    "normal Git index lock is held".into(),
+                ));
+            }
+            Err(error) => return Err(io_error(error)),
+        };
+        Ok(Self {
+            path: Some(path),
+            file,
+        })
+    }
+
+    fn replace(&mut self, index: &Path, bytes: &[u8]) -> Result<(), HostCommitError> {
+        if !self.owns_lock_path() {
+            return Err(HostCommitError::Conflict(
+                "normal Git index lock changed during synchronization".into(),
+            ));
+        }
+        self.file.set_len(0).map_err(io_error)?;
+        self.file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        self.file.write_all(bytes).map_err(io_error)?;
+        self.file.sync_all().map_err(io_error)?;
+        self.file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        let mut written = Vec::new();
+        self.file.read_to_end(&mut written).map_err(io_error)?;
+        if written != bytes || !self.owns_lock_path() {
+            return Err(HostCommitError::Conflict(
+                "normal Git index lock changed while writing the synchronized index".into(),
+            ));
+        }
+        let path = self.path.as_ref().ok_or_else(|| {
+            HostCommitError::Conflict("normal Git index lock is no longer owned".into())
+        })?;
+        fs::rename(path, index).map_err(io_error)?;
+        self.path = None;
+        Ok(())
+    }
+
+    fn owns_lock_path(&self) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        let Ok(path_metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return false;
+        }
+        let Ok(file_metadata) = self.file.metadata() else {
+            return false;
+        };
+        same_file(&path_metadata, &file_metadata)
+    }
+}
+
+impl Drop for GitIndexLock {
+    fn drop(&mut self) {
+        if self.owns_lock_path()
+            && let Some(path) = self.path.take()
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct TemporaryPaths(Vec<PathBuf>);
+
+impl Drop for TemporaryPaths {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn appended_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn ensure_missing(path: &Path) -> Result<(), HostCommitError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(error)),
+        Ok(_) => Err(HostCommitError::Conflict(
+            "temporary Git index path already exists".into(),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
 }
 
 fn validate_prepared(
@@ -1079,6 +1560,7 @@ fn validate_relative_path(value: &str) -> Result<(), HostCommitError> {
         let part = part.to_string_lossy();
         if part.eq_ignore_ascii_case(".git")
             || part.eq_ignore_ascii_case(".rex-projects-mailbox")
+            || part.eq_ignore_ascii_case(".rex-projects-control")
             || part.eq_ignore_ascii_case(".rex-projects")
         {
             return Err(HostCommitError::Invalid(
@@ -1269,6 +1751,31 @@ fn open_read_nofollow(path: &Path) -> Result<File, HostCommitError> {
     }
 }
 
+fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>, HostCommitError> {
+    let before = fs::symlink_metadata(path).map_err(io_error)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(HostCommitError::Conflict(
+            "expected a regular no-follow file".into(),
+        ));
+    }
+    let mut file = open_read_nofollow(path)?;
+    let opened = file.metadata().map_err(io_error)?;
+    if !same_file(&before, &opened) {
+        return Err(HostCommitError::Conflict(
+            "file changed while opening".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io_error)?;
+    let after = fs::symlink_metadata(path).map_err(io_error)?;
+    if !same_file(&after, &opened) {
+        return Err(HostCommitError::Conflict(
+            "file changed while reading".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 fn manifest_digest(manifest: &ChangeManifest) -> Result<Digest, HostCommitError> {
     let bytes =
         serde_json::to_vec(manifest).map_err(|error| HostCommitError::Io(error.to_string()))?;
@@ -1292,6 +1799,92 @@ fn validate_object_id(value: &str) -> Result<(), HostCommitError> {
         ));
     }
     Ok(())
+}
+
+fn take_nul_terminated_index_path(bytes: &[u8], cursor: &mut usize) -> Result<(), HostCommitError> {
+    let end = bytes[*cursor..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|offset| *cursor + offset)
+        .ok_or_else(|| {
+            HostCommitError::Conflict("Git returned an invalid normal index path record".into())
+        })?;
+    if end == *cursor {
+        return Err(HostCommitError::Conflict(
+            "Git returned an empty normal index path record".into(),
+        ));
+    }
+    *cursor = end + 1;
+    Ok(())
+}
+
+fn take_debug_line<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], HostCommitError> {
+    let end = bytes[*cursor..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| *cursor + offset)
+        .ok_or_else(|| {
+            HostCommitError::Conflict("Git returned an incomplete normal index debug record".into())
+        })?;
+    let line = &bytes[*cursor..end];
+    *cursor = end + 1;
+    Ok(line)
+}
+
+fn parse_debug_pair(line: &[u8], prefix: &[u8], separator: &[u8]) -> Result<(), HostCommitError> {
+    let value = line.strip_prefix(prefix).ok_or_else(|| {
+        HostCommitError::Conflict("Git returned an unexpected normal index debug record".into())
+    })?;
+    let split = value
+        .iter()
+        .position(|byte| *byte == separator[0])
+        .ok_or_else(|| {
+            HostCommitError::Conflict("Git returned an invalid normal index debug pair".into())
+        })?;
+    let first = &value[..split];
+    let second = value[split + 1..]
+        .strip_prefix(&separator[1..])
+        .ok_or_else(|| {
+            HostCommitError::Conflict("Git returned an invalid normal index debug pair".into())
+        })?;
+    if first.is_empty()
+        || second.is_empty()
+        || !first.iter().all(u8::is_ascii_digit)
+        || !second.iter().all(u8::is_ascii_digit)
+    {
+        return Err(HostCommitError::Conflict(
+            "Git returned an invalid normal index debug pair".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_debug_index_flags(line: &[u8]) -> Result<bool, HostCommitError> {
+    let value = line.strip_prefix(b"  size: ").ok_or_else(|| {
+        HostCommitError::Conflict("Git returned an unexpected normal index debug record".into())
+    })?;
+    let split = value
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| {
+            HostCommitError::Conflict("Git returned an invalid normal index flags record".into())
+        })?;
+    let size = &value[..split];
+    let flags = &value[split + 1..];
+    if !size.iter().all(u8::is_ascii_digit) || size.is_empty() || !flags.starts_with(b"flags: ") {
+        return Err(HostCommitError::Conflict(
+            "Git returned an invalid normal index flags record".into(),
+        ));
+    }
+    let flags = flags
+        .strip_prefix(b"flags: ")
+        .filter(|flags| !flags.is_empty() && flags.iter().all(u8::is_ascii_hexdigit))
+        .and_then(|flags| std::str::from_utf8(flags).ok())
+        .and_then(|flags| u32::from_str_radix(flags, 16).ok())
+        .ok_or_else(|| {
+            HostCommitError::Conflict("Git returned an invalid normal index flags record".into())
+        })?;
+    Ok(flags != 0)
 }
 
 fn check_output(operation: &'static str, output: &ProcessOutput) -> Result<(), HostCommitError> {
@@ -1392,6 +1985,37 @@ mod tests {
             "fixture Git operation failed: {args:?}"
         );
         String::from_utf8(result.stdout).unwrap()
+    }
+
+    fn create_interrupted_host_commit(fixture: &Fixture, prepared: &PreparedHostCommit) {
+        let mut environment = fixture.environment.clone();
+        environment.insert(
+            OsString::from("GIT_INDEX_FILE"),
+            prepared.isolated_index.clone().into_os_string(),
+        );
+        let result = run(
+            Path::new("/usr/bin/git"),
+            &fixture.worktree.path,
+            &["commit", "-S", "--file", "-"],
+            prepared.intent.message.as_bytes(),
+            &environment,
+        );
+        assert!(
+            result.status.is_some_and(|status| status.success()),
+            "fixture signed host commit failed"
+        );
+    }
+
+    fn replace_normal_index(fixture: &Fixture, bytes: &[u8]) -> PathBuf {
+        let index = fixture
+            .committer
+            .index_path(&fixture.worktree.path)
+            .unwrap();
+        let replacement =
+            index.with_extension(format!("index.fixture-replacement-{}", std::process::id()));
+        write_private_file(&replacement, bytes).unwrap();
+        fs::rename(&replacement, &index).unwrap();
+        index
     }
 
     fn fixture() -> Fixture {
@@ -1541,6 +2165,100 @@ mod tests {
             schema_version: 1,
             entries,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_commit_preserves_signing_and_authentication_environment_without_repo_redirects() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let signer = successful_git(
+            repo,
+            &["config", "--get", "user.signingkey"],
+            &fixture.environment,
+        );
+        successful_git(
+            repo,
+            &[
+                "config",
+                "--local",
+                "user.signingkey",
+                "missing-fixture-key",
+            ],
+            &fixture.environment,
+        );
+        let allowed_signers = fixture._temp.path().join("allowed_signers");
+        fs::write(&allowed_signers, b"fixture trust configuration\n").unwrap();
+        let redirected_index = fixture._temp.path().join("must-not-create.index");
+        fixture.committer.options.git_environment.extend([
+            ("GIT_CONFIG_COUNT".into(), "2".into()),
+            ("GIT_CONFIG_KEY_0".into(), "user.signingkey".into()),
+            ("GIT_CONFIG_VALUE_0".into(), signer.trim().into()),
+            (
+                "GIT_CONFIG_KEY_1".into(),
+                "gpg.ssh.allowedSignersFile".into(),
+            ),
+            (
+                "GIT_CONFIG_VALUE_1".into(),
+                allowed_signers.clone().into_os_string(),
+            ),
+            (
+                "GIT_SSH_COMMAND".into(),
+                "fixture-ssh --preserved-authentication".into(),
+            ),
+            (
+                "GIT_DIR".into(),
+                fixture._temp.path().join("wrong.git").into_os_string(),
+            ),
+            ("GIT_WORK_TREE".into(), fixture._temp.path().into()),
+            (
+                "GIT_INDEX_FILE".into(),
+                redirected_index.clone().into_os_string(),
+            ),
+        ]);
+        assert_eq!(
+            fixture
+                .committer
+                .git_text(
+                    repo,
+                    "read inherited signing trust",
+                    ["config", "--get", "gpg.ssh.allowedSignersFile"],
+                    None,
+                    None
+                )
+                .unwrap()
+                .trim(),
+            allowed_signers.to_str().unwrap()
+        );
+        let hook = repo.join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            b"#!/bin/sh\n[ \"${GIT_SSH_COMMAND:-}\" = 'fixture-ssh --preserved-authentication' ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(repo.join("change.txt"), b"configuration preserved\n").unwrap();
+        let prepared = fixture.committer.prepare(
+            &fixture.worktree,
+            OperationId::parse("preserved-git-environment").unwrap(),
+            manifest(vec![write_entry("change.txt", b"configuration preserved\n", FileMode::Regular0644)]),
+            repo,
+            "fix: preserve configured Git environment\n\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
+        ).unwrap();
+        let receipt = fixture
+            .committer
+            .execute(&fixture.worktree, &prepared)
+            .unwrap();
+        assert!(
+            receipt.signature_verified && receipt.hooks_completed && receipt.index_synchronized
+        );
+        assert!(!redirected_index.exists());
+        assert_eq!(
+            successful_git(repo, &["rev-parse", "HEAD^"], &fixture.environment).trim(),
+            fixture.worktree.base_sha
+        );
     }
 
     #[cfg(unix)]
@@ -1723,6 +2441,908 @@ mod tests {
                 .committer
                 .reconcile(&fixture.worktree, &prepared)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn loads_and_reconciles_commit_after_commit_before_dispatcher_receipt() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before receipt\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let original_manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-after-commit").unwrap();
+        let message = "feat: apply host manifest\n\nThe dispatcher receipt is intentionally absent.\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                original_manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        assert_eq!(prepared.intent.expected_head, fixture.worktree.base_sha);
+
+        // Model a crash after Git created the commit, before the dispatcher persisted
+        // the effect receipt. Reconciliation must recover the immutable intent.
+        let first_receipt = fixture
+            .committer
+            .execute(&fixture.worktree, &prepared)
+            .unwrap();
+        let post_commit_head = successful_git(repo, &["rev-parse", "HEAD"], &fixture.environment);
+        assert_eq!(post_commit_head.trim(), first_receipt.observed_head);
+        assert_eq!(
+            successful_git(repo, &["rev-list", "--count", "HEAD"], &fixture.environment).trim(),
+            "2"
+        );
+        let actual_parent = successful_git(
+            repo,
+            &["-C", repo.to_str().unwrap(), "rev-parse", "HEAD^"],
+            &fixture.environment,
+        );
+        assert_eq!(actual_parent.trim(), fixture.worktree.base_sha);
+        let actual_tree = successful_git(
+            repo,
+            &["-C", repo.to_str().unwrap(), "rev-parse", "HEAD^{tree}"],
+            &fixture.environment,
+        );
+        assert_eq!(actual_tree.trim(), prepared.expected_tree);
+        let actual_message = successful_git(
+            repo,
+            &[
+                "-C",
+                repo.to_str().unwrap(),
+                "show",
+                "-s",
+                "--format=%B",
+                "HEAD",
+            ],
+            &fixture.environment,
+        );
+        assert_eq!(
+            actual_message.trim_end_matches('\n'),
+            message.trim_end_matches('\n')
+        );
+
+        let loaded = fixture
+            .committer
+            .load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &original_manifest,
+                repo,
+                message,
+            )
+            .unwrap()
+            .expect("persisted prepared intent should load at post-commit HEAD");
+        assert_eq!(loaded.intent, prepared.intent);
+        assert_eq!(loaded.expected_tree, prepared.expected_tree);
+        let recovered_receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should be recognized");
+        assert_eq!(recovered_receipt.observed_head, first_receipt.observed_head);
+        assert_eq!(recovered_receipt.tree, first_receipt.tree);
+        assert!(recovered_receipt.index_synchronized);
+        assert!(!recovered_receipt.index_sync_conflict);
+        assert_eq!(
+            successful_git(repo, &["rev-parse", "HEAD"], &fixture.environment).trim(),
+            first_receipt.observed_head
+        );
+        assert_eq!(
+            successful_git(repo, &["rev-list", "--count", "HEAD"], &fixture.environment).trim(),
+            "2",
+            "recovery must not create a duplicate commit"
+        );
+        let synchronized_index = fixture.committer.index_identity(repo).unwrap();
+        let replayed_receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("replaying reconciliation should return the same receipt");
+        assert_eq!(replayed_receipt, recovered_receipt);
+        assert_eq!(
+            fixture.committer.index_identity(repo).unwrap(),
+            synchronized_index
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciles_commit_when_original_index_bytes_are_replaced() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before normal index synchronization\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-replaced-index").unwrap();
+        let message =
+            "feat: recover a replaced normal index\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        let original_index = fs::read(&prepared.intent.normal_index.canonical_path).unwrap();
+        create_interrupted_host_commit(&fixture, &prepared);
+        let index = replace_normal_index(&fixture, &original_index);
+        let before = fixture.committer.index_identity(repo).unwrap();
+        assert_ne!(before.inode, prepared.intent.normal_index.inode);
+        assert_eq!(before.digest, prepared.intent.normal_index.digest);
+
+        let loaded = fixture
+            .committer
+            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .unwrap()
+            .expect("the durable host-commit intent should load");
+        let receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should reconcile");
+
+        assert!(receipt.index_synchronized);
+        assert!(!receipt.index_sync_conflict);
+        assert_eq!(
+            fixture.committer.normal_index_tree(repo, &index).unwrap(),
+            receipt.tree
+        );
+        assert_ne!(
+            fixture.committer.index_identity(repo).unwrap().inode,
+            before.inode
+        );
+        assert_eq!(
+            successful_git(repo, &["rev-list", "--count", "HEAD"], &fixture.environment).trim(),
+            "2"
+        );
+        assert!(index.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_preserves_staged_index_changes() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before staged index change\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-staged-index").unwrap();
+        let message = "feat: recover without overwriting staged changes\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        create_interrupted_host_commit(&fixture, &prepared);
+        fs::write(repo.join("staged-only.txt"), b"keep staged\n").unwrap();
+        successful_git(repo, &["add", "staged-only.txt"], &fixture.environment);
+        fs::remove_file(repo.join("staged-only.txt")).unwrap();
+        let before = fixture.committer.index_identity(repo).unwrap();
+
+        let loaded = fixture
+            .committer
+            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .unwrap()
+            .expect("the durable host-commit intent should load");
+        let receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should still be recognized");
+
+        assert!(!receipt.index_synchronized);
+        assert!(receipt.index_sync_conflict);
+        assert_eq!(fixture.committer.index_identity(repo).unwrap(), before);
+        assert_eq!(
+            successful_git(
+                repo,
+                &["ls-files", "--error-unmatch", "staged-only.txt"],
+                &fixture.environment,
+            )
+            .trim(),
+            "staged-only.txt"
+        );
+        assert!(
+            !fixture
+                .committer
+                .index_path(repo)
+                .unwrap()
+                .with_extension("lock")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_does_not_ignore_intent_to_add_entries() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before intent-to-add\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-intent-to-add").unwrap();
+        let message =
+            "feat: recover around intent-to-add\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        create_interrupted_host_commit(&fixture, &prepared);
+        fs::write(repo.join("intent.txt"), b"pending add\n").unwrap();
+        successful_git(
+            repo,
+            &["add", "--intent-to-add", "intent.txt"],
+            &fixture.environment,
+        );
+        fs::remove_file(repo.join("intent.txt")).unwrap();
+        let index = fixture.committer.index_path(repo).unwrap();
+        let before = fixture.committer.index_identity(repo).unwrap();
+        assert!(
+            fixture
+                .committer
+                .normal_index_has_unsupported_flags(repo)
+                .unwrap()
+        );
+
+        let loaded = fixture
+            .committer
+            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .unwrap()
+            .expect("the durable host-commit intent should load");
+        let receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should still be recognized");
+
+        assert!(!receipt.index_synchronized);
+        assert!(receipt.index_sync_conflict);
+        assert_eq!(fixture.committer.index_identity(repo).unwrap(), before);
+        assert!(index.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_rejects_assume_unchanged_flags_on_a_matching_tree() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before assume-unchanged\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-assume-unchanged").unwrap();
+        let message =
+            "feat: reject unsupported index flags\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        fixture
+            .committer
+            .execute(&fixture.worktree, &prepared)
+            .unwrap();
+        successful_git(
+            repo,
+            &["update-index", "--assume-unchanged", "README.md"],
+            &fixture.environment,
+        );
+        let before = fixture.committer.index_identity(repo).unwrap();
+        assert!(
+            fixture
+                .committer
+                .normal_index_has_unsupported_flags(repo)
+                .unwrap()
+        );
+        let index = fixture.committer.index_path(repo).unwrap();
+        assert_eq!(
+            fixture.committer.normal_index_tree(repo, &index).unwrap(),
+            prepared.expected_tree
+        );
+
+        let loaded = fixture
+            .committer
+            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .unwrap()
+            .expect("the durable host-commit intent should load");
+        let receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should still be recognized");
+
+        assert!(!receipt.index_synchronized);
+        assert!(receipt.index_sync_conflict);
+        assert_eq!(fixture.committer.index_identity(repo).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_index_sync_preserves_assume_unchanged_flags() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        successful_git(
+            repo,
+            &["update-index", "--assume-unchanged", "README.md"],
+            &fixture.environment,
+        );
+        let before = fixture.committer.index_identity(repo).unwrap();
+        let bytes = fs::read(&before.canonical_path).unwrap();
+        let head = successful_git(repo, &["rev-parse", "HEAD"], &fixture.environment);
+        let tree = successful_git(repo, &["rev-parse", "HEAD^{tree}"], &fixture.environment);
+
+        let result = fixture
+            .committer
+            .sync_normal_index(repo, head.trim(), tree.trim(), &before);
+
+        assert!(result.is_err());
+        assert_eq!(fixture.committer.index_identity(repo).unwrap(), before);
+        assert_eq!(fs::read(&before.canonical_path).unwrap(), bytes);
+        assert!(!before.canonical_path.with_extension("lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_rejects_unmerged_index_entries() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before unmerged index\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-unmerged-index").unwrap();
+        let message =
+            "feat: reject unmerged index entries\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        create_interrupted_host_commit(&fixture, &prepared);
+        let blob = successful_git(repo, &["rev-parse", "HEAD:README.md"], &fixture.environment);
+        let zero = "0000000000000000000000000000000000000000";
+        let unmerged = format!(
+            "0 {zero}\tREADME.md\n100644 {} 1\tREADME.md\n100644 {} 2\tREADME.md\n100644 {} 3\tREADME.md\n",
+            blob.trim(),
+            blob.trim(),
+            blob.trim()
+        );
+        let result = run(
+            Path::new("/usr/bin/git"),
+            repo,
+            &["update-index", "--index-info"],
+            unmerged.as_bytes(),
+            &fixture.environment,
+        );
+        assert!(
+            result.status.is_some_and(|status| status.success()),
+            "fixture unmerged index setup failed"
+        );
+        let before = fixture.committer.index_identity(repo).unwrap();
+        assert!(
+            fixture
+                .committer
+                .normal_index_has_unsupported_flags(repo)
+                .unwrap()
+        );
+
+        let loaded = fixture
+            .committer
+            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .unwrap()
+            .expect("the durable host-commit intent should load");
+        let receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should still be recognized");
+
+        assert!(!receipt.index_synchronized);
+        assert!(receipt.index_sync_conflict);
+        assert_eq!(fixture.committer.index_identity(repo).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_preserves_a_held_git_index_lock() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before index lock\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-index-lock").unwrap();
+        let message = "feat: recover around an existing Git lock\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        create_interrupted_host_commit(&fixture, &prepared);
+        let index = fixture.committer.index_path(repo).unwrap();
+        let index_lock = index.with_extension("lock");
+        let lock_contents = b"another Git process owns this lock\n";
+        write_private_file(&index_lock, lock_contents).unwrap();
+        let before = fixture.committer.index_identity(repo).unwrap();
+
+        let loaded = fixture
+            .committer
+            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .unwrap()
+            .expect("the durable host-commit intent should load");
+        let receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should still be recognized");
+
+        assert!(!receipt.index_synchronized);
+        assert!(receipt.index_sync_conflict);
+        assert_eq!(fixture.committer.index_identity(repo).unwrap(), before);
+        assert_eq!(fs::read(&index_lock).unwrap(), lock_contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_rejects_a_symlinked_normal_index() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"committed before index symlink\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-index-symlink").unwrap();
+        let message =
+            "feat: reject a symlinked index\n\nCo-authored-by: Codex <noreply@openai.com>";
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        create_interrupted_host_commit(&fixture, &prepared);
+        let index = fixture.committer.index_path(repo).unwrap();
+        let index_target = index.with_extension("saved-index");
+        fs::rename(&index, &index_target).unwrap();
+        symlink(&index_target, &index).unwrap();
+        let target_bytes = fs::read(&index_target).unwrap();
+
+        let loaded = fixture
+            .committer
+            .load_prepared(&fixture.worktree, &operation_id, &manifest, repo, message)
+            .unwrap()
+            .expect("the durable host-commit intent should load");
+        let receipt = fixture
+            .committer
+            .reconcile(&fixture.worktree, &loaded)
+            .unwrap()
+            .expect("the exact interrupted commit should still be recognized");
+
+        assert!(!receipt.index_synchronized);
+        assert!(receipt.index_sync_conflict);
+        assert!(
+            fs::symlink_metadata(&index)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&index_target).unwrap(), target_bytes);
+    }
+
+    #[test]
+    fn load_prepared_rejects_a_changed_durable_commit_request() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let contents = b"durable request\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let original_manifest = manifest(vec![write_entry(
+            "change.txt",
+            contents,
+            FileMode::Regular0644,
+        )]);
+        let operation_id = OperationId::parse("op-recover-request-mismatch").unwrap();
+        let message = "feat: apply host manifest";
+        fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                operation_id.clone(),
+                original_manifest.clone(),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+
+        let changed_manifest = manifest(vec![write_entry(
+            "change.txt",
+            b"different request\n",
+            FileMode::Regular0644,
+        )]);
+        assert!(matches!(
+            fixture.committer.load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &changed_manifest,
+                repo,
+                message
+            ),
+            Err(HostCommitError::Conflict(_))
+        ));
+        assert!(matches!(
+            fixture.committer.load_prepared(
+                &fixture.worktree,
+                &operation_id,
+                &original_manifest,
+                repo,
+                "feat: changed request"
+            ),
+            Err(HostCommitError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn reconcile_rejects_a_different_commit_message_with_the_expected_tree() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let repo_arg = repo.to_str().unwrap();
+        let contents = b"expected tree, wrong commit message\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                OperationId::parse("op-recover-wrong-message").unwrap(),
+                manifest(vec![write_entry(
+                    "change.txt",
+                    contents,
+                    FileMode::Regular0644,
+                )]),
+                repo,
+                "feat: expected message".into(),
+            )
+            .unwrap();
+
+        let wrong_message_head = successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "commit-tree",
+                &prepared.expected_tree,
+                "-p",
+                &fixture.worktree.base_sha,
+                "-m",
+                "feat: different message",
+            ],
+            &fixture.environment,
+        );
+        let branch = successful_git(
+            repo,
+            &["-C", repo_arg, "symbolic-ref", "HEAD"],
+            &fixture.environment,
+        );
+        successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "update-ref",
+                branch.trim(),
+                wrong_message_head.trim(),
+            ],
+            &fixture.environment,
+        );
+
+        assert!(matches!(
+            fixture.committer.reconcile(&fixture.worktree, &prepared),
+            Err(HostCommitError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn reconcile_rejects_an_expected_tree_with_an_unexpected_parent() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let repo_arg = repo.to_str().unwrap();
+        let contents = b"expected tree, unexpected history\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                OperationId::parse("op-recover-wrong-parent").unwrap(),
+                manifest(vec![write_entry(
+                    "change.txt",
+                    contents,
+                    FileMode::Regular0644,
+                )]),
+                repo,
+                "feat: expected message".into(),
+            )
+            .unwrap();
+
+        let base_tree = successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "rev-parse",
+                &format!("{}^{{tree}}", fixture.worktree.base_sha),
+            ],
+            &fixture.environment,
+        );
+        let extra_parent = successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "commit-tree",
+                base_tree.trim(),
+                "-p",
+                &fixture.worktree.base_sha,
+                "-m",
+                "unexpected intermediate commit",
+            ],
+            &fixture.environment,
+        );
+        let wrong_parent_head = successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "commit-tree",
+                &prepared.expected_tree,
+                "-p",
+                extra_parent.trim(),
+                "-m",
+                "feat: expected message",
+            ],
+            &fixture.environment,
+        );
+        let branch = successful_git(
+            repo,
+            &["-C", repo_arg, "symbolic-ref", "HEAD"],
+            &fixture.environment,
+        );
+        successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "update-ref",
+                branch.trim(),
+                wrong_parent_head.trim(),
+            ],
+            &fixture.environment,
+        );
+
+        assert!(matches!(
+            fixture.committer.reconcile(&fixture.worktree, &prepared),
+            Err(HostCommitError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn reconcile_rejects_a_merge_with_expected_first_parent_and_unexpected_second_parent() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let repo_arg = repo.to_str().unwrap();
+        let contents = b"expected tree, unexpected second parent\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                OperationId::parse("op-recover-wrong-second-parent").unwrap(),
+                manifest(vec![write_entry(
+                    "change.txt",
+                    contents,
+                    FileMode::Regular0644,
+                )]),
+                repo,
+                "feat: expected message".into(),
+            )
+            .unwrap();
+
+        let base_tree = successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "rev-parse",
+                &format!("{}^{{tree}}", fixture.worktree.base_sha),
+            ],
+            &fixture.environment,
+        );
+        let unexpected_parent = successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "commit-tree",
+                base_tree.trim(),
+                "-p",
+                &fixture.worktree.base_sha,
+                "-m",
+                "unexpected second parent",
+            ],
+            &fixture.environment,
+        );
+        let merge_head = successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "commit-tree",
+                &prepared.expected_tree,
+                "-p",
+                &fixture.worktree.base_sha,
+                "-p",
+                unexpected_parent.trim(),
+                "-m",
+                "feat: expected message",
+            ],
+            &fixture.environment,
+        );
+        let branch = successful_git(
+            repo,
+            &["-C", repo_arg, "symbolic-ref", "HEAD"],
+            &fixture.environment,
+        );
+        successful_git(
+            repo,
+            &[
+                "-C",
+                repo_arg,
+                "update-ref",
+                branch.trim(),
+                merge_head.trim(),
+            ],
+            &fixture.environment,
+        );
+
+        assert!(matches!(
+            fixture.committer.reconcile(&fixture.worktree, &prepared),
+            Err(HostCommitError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn required_authorship_trailer_parsing_preserves_multiline_commit_message() {
+        let fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let message = concat!(
+            "feat: apply host manifest\n",
+            "\n",
+            "Details span multiple lines.\n",
+            "The body can mention Co-authored-by: Codex <noreply@openai.com> as text.\n",
+            "\n",
+            "Co-authored-by: Codex <noreply@openai.com>\n",
+            "Co-authored-by: Claude <noreply@anthropic.com>",
+        );
+        fixture
+            .committer
+            .validate_required_trailer(
+                &fixture.worktree,
+                message,
+                "Co-authored-by: Codex <noreply@openai.com>",
+            )
+            .unwrap();
+        fixture
+            .committer
+            .validate_required_trailer(
+                &fixture.worktree,
+                message,
+                "Co-authored-by: Claude <noreply@anthropic.com>",
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .committer
+                .validate_required_trailer(
+                    &fixture.worktree,
+                    message,
+                    "Co-authored-by: Missing <missing@example.invalid>",
+                )
+                .is_err()
+        );
+
+        let contents = b"trailer test\n";
+        fs::write(repo.join("change.txt"), contents).unwrap();
+        let prepared = fixture
+            .committer
+            .prepare(
+                &fixture.worktree,
+                OperationId::parse("op-trailer-message").unwrap(),
+                manifest(vec![write_entry(
+                    "change.txt",
+                    contents,
+                    FileMode::Regular0644,
+                )]),
+                repo,
+                message.into(),
+            )
+            .unwrap();
+        let receipt = fixture
+            .committer
+            .execute(&fixture.worktree, &prepared)
+            .unwrap();
+        let stored_message = successful_git(
+            repo,
+            &["show", "-s", "--format=%B", &receipt.observed_head],
+            &fixture.environment,
+        );
+        assert_eq!(
+            stored_message.trim_end_matches('\n'),
+            message.trim_end_matches('\n')
         );
     }
 }

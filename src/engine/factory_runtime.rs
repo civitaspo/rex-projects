@@ -138,6 +138,16 @@ pub trait FactoryRuntimeServices {
         &mut self,
     ) -> Result<std::collections::BTreeMap<crate::domain::ids::RepositoryId, String>, String>;
 
+    /// Observe a host-persisted Worker worktree using the configured bounded Git adapter.
+    /// The default deliberately fails closed so test/runtime implementations cannot assert
+    /// that a recovery worktree is at the expected revision without observing it.
+    fn observe_worker_recovery_head(
+        &self,
+        _candidate: &crate::engine::orchestration::WorkerRecoveryCandidate,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     fn configuration_digest(&self) -> &Digest;
 
     fn human_evidence_documents(
@@ -1541,57 +1551,37 @@ fn apply_reviewer_result(
         return Err("Reviewer result does not match the current publication transition".into());
     }
     let publications = snapshot.publication_receipts();
-    crate::delivery_runtime::validate_implementation_publication_receipt(
-        &accepted.proposal,
-        snapshot.prepared_receipt(),
-        &run.project_id,
-        &config.repositories,
-        publications,
-    )?;
+    let validated_publications =
+        crate::delivery_runtime::validate_implementation_publication_receipt(
+            &accepted.proposal,
+            snapshot.prepared_receipt(),
+            &run.project_id,
+            &config.repositories,
+            publications,
+        )?;
     let RoleResultPayload::ReviewReady(assessment) = &result.validated.typed_payload else {
         return Err("validated ReviewReady kind has a different typed payload".into());
     };
     if assessment.subject_kind != "implementation_publication_set" {
         return Err("Reviewer assessment names a different subject kind".into());
     }
-    let mut publication_facts = publications
-        .iter()
-        .map(|receipt| {
-            let published: crate::delivery_runtime::ImplementationPublicationReceipt =
-                serde_json::from_str(receipt.receipt_json()).map_err(|error| {
-                    format!("invalid implementation publication receipt: {error}")
-                })?;
-            Ok(serde_json::json!({
-                "work_node_id": published.work_node_id,
-                "repository_id": published.repository_id,
-                "pull_request_number": published.pull_request.number,
-                "pull_request_node_id": published.pull_request.node_id,
-                "pull_request_head": published.pull_request.source_head,
-                "published_head": published.push.pushed_head,
-                "receipt_digest": sha256_hex(receipt.receipt_json().as_bytes()),
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    publication_facts
-        .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
-    let subject = serde_json::json!({
-        "ticket_run_id": ticket_run_id,
-        "accepted_plan_digest": accepted.plan_digest,
-        "publications": publication_facts,
-    });
-    let subject_bytes = serde_json::to_vec(&subject).map_err(|error| error.to_string())?;
-    let expected_subject_digest = sha256_hex(&subject_bytes);
+    let subject = crate::delivery_runtime::implementation_publication_set_subject(
+        &accepted.plan_digest,
+        &accepted.proposal,
+        &validated_publications,
+        publications,
+        snapshot.publication_revision(),
+    )?;
+    let expected_subject_digest = subject.digest()?.to_string();
     if assessment.subject_digest.as_str() != expected_subject_digest {
         return Err(
             "Reviewer assessment does not match the current published PR and head set".into(),
         );
     }
-    let expected_coverage = accepted
-        .proposal
-        .nodes
+    let expected_coverage = subject
+        .coverage
         .iter()
-        .filter(|node| !node.investigation)
-        .map(|node| node.id.as_str().to_owned())
+        .map(|node| node.as_str().to_owned())
         .collect::<BTreeSet<_>>();
     let actual_coverage = assessment
         .evidence_coverage
@@ -1673,11 +1663,6 @@ fn review_transition(
         D::StartMergeDecision => (Input::ReviewConverged, "review_converged"),
         D::HumanRequiredAtRoundLimit => (Input::ReviewConverged, "review_round_limit_reached"),
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn apply_operator_result(
@@ -2681,10 +2666,10 @@ fn apply_coordinator_spawn_request(
     else {
         return Err("validated SpawnRequest kind has a different typed payload".into());
     };
-    if matches!(
-        request.role,
-        Role::Worker | Role::Supervisor | Role::Coordinator
-    ) {
+    if matches!(request.role, Role::Supervisor | Role::Coordinator)
+        || (request.role == Role::Worker && request.worker_recovery.is_none())
+        || (request.role != Role::Worker && request.worker_recovery.is_some())
+    {
         return Err("Coordinator SpawnRequest targets a role without a generic launch path".into());
     }
     let project_record = store
@@ -2752,6 +2737,91 @@ fn apply_coordinator_spawn_request(
                 .any(|node| node.id == request.work_node)
         {
             return Err("Coordinator SpawnRequest does not match an accepted plan node".into());
+        }
+        if request.role == Role::Worker {
+            let project = config
+                .projects
+                .get(&binding.project_id)
+                .ok_or("Worker recovery Project is no longer configured")?;
+            let expected_profile =
+                crate::config::effective_project_roles(&binding.project_id, &config.projects)?
+                    .get(&Role::Worker)
+                    .cloned()
+                    .ok_or("Project has no Worker profile")?;
+            let expected_profile = current
+                .recipe_id
+                .as_ref()
+                .and_then(|recipe_id| config.operation_recipes.get(recipe_id))
+                .and_then(|recipe| recipe.roles.get(&Role::Worker))
+                .cloned()
+                .unwrap_or(expected_profile);
+            if request.profile_id != expected_profile {
+                return Err("Worker recovery profile differs from current Project policy".into());
+            }
+            let validated = accepted.validate_for(project, configuration_digest)?;
+            let node = validated
+                .nodes_in_execution_order
+                .iter()
+                .find(|node| node.id == request.work_node && node.role == Role::Worker)
+                .ok_or("Worker recovery request does not name an accepted Worker node")?;
+            if request.allowed_repositories.as_slice() != [node.repository.clone()] {
+                return Err(
+                    "Worker recovery repository scope differs from the accepted node".into(),
+                );
+            }
+            let recovery = request
+                .worker_recovery
+                .as_ref()
+                .ok_or("Worker recovery request lacks its prior Worker identity")?;
+            let candidate = store.worker_recovery_candidates(
+                owner_generation,
+                &current,
+                &accepted,
+                project,
+                configuration_digest,
+            )?.into_iter().find(|candidate| {
+                candidate.prior_worker_agent_run_id == recovery.prior_worker_agent_run_id
+                    && candidate.ticket_revision == current.revision
+                    && candidate.work_node_id == request.work_node
+                    && candidate.accepted_plan_digest == accepted.plan_digest
+                    && candidate.prior_host_commit_operation_id == recovery.prior_host_commit_operation_id
+            }).ok_or("Worker recovery request does not match a current host-verified retry candidate")?;
+            if services
+                .observe_worker_recovery_head(&candidate)?
+                .as_deref()
+                != Some(candidate.expected_head.as_str())
+            {
+                return Err(
+                    "Worker recovery worktree HEAD is not the host-accepted continuation point"
+                        .into(),
+                );
+            }
+            let authorization = crate::engine::orchestration::WorkerRecoveryAuthorization {
+                schema_version: 1,
+                ticket_run_id: current.ticket_run_id.clone(),
+                ticket_revision: candidate.ticket_revision,
+                work_node_id: candidate.work_node_id,
+                accepted_plan_digest: candidate.accepted_plan_digest,
+                prior_worker_agent_run_id: candidate.prior_worker_agent_run_id,
+                prior_terminal_digest: candidate.prior_terminal_digest,
+                prior_absence_digest: candidate.prior_absence_digest,
+                prior_host_commit_operation_id: candidate.prior_host_commit_operation_id,
+                prior_host_commit_receipt_digest: candidate.prior_host_commit_receipt_digest,
+                expected_head: candidate.expected_head,
+                source_coordinator_evidence_id: result.receipt.evidence_id().to_owned(),
+                prior_worker_result_evidence_id: candidate.prior_worker_result_evidence_id,
+                prior_artifact_refs: candidate.prior_artifact_refs,
+            };
+            store.persist_worker_recovery_wake(
+                owner_generation,
+                result,
+                &authorization,
+                source_revision.0,
+            )?;
+            return Ok(true);
+        }
+        if request.worker_recovery.is_some() {
+            return Err("non-Worker SpawnRequest cannot carry Worker recovery context".into());
         }
     }
     let mut expected_profile =

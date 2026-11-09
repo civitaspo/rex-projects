@@ -83,6 +83,14 @@ impl RuntimeDelivery {
         Ok(observation)
     }
 
+    fn observe_monitor_snapshot(
+        &self,
+        repository_id: &RepositoryId,
+        branch: &str,
+    ) -> Option<crate::delivery_runtime::RepositoryPublicationObservation> {
+        self.observe_snapshot(repository_id, branch).ok()
+    }
+
     /// Build a human adoption request from the latest unresolved event and a new host-side
     /// observation. The requested resource must still be present in that complete observation.
     pub fn publication_adoption_request(
@@ -218,7 +226,11 @@ impl RuntimeDelivery {
             return Ok(PublicationMonitorTick::EffectReconciling);
         }
         let Some(mut baseline) = store.load_publication_baseline(&resource)? else {
-            let observation = self.observe_snapshot(&resource.repository_id, &resource.branch)?;
+            let Some(observation) =
+                self.observe_monitor_snapshot(&resource.repository_id, &resource.branch)
+            else {
+                return Ok(PublicationMonitorTick::Unknown);
+            };
             let digest = canonical_observation_digest(&observation)?;
             let saved = store.record_publication_irregularity(owner_generation, &crate::store::publication_monitor::PublicationIrregularity {
                 resource, observation_digest: digest, observed_at_unix: now_unix, facts: serde_json::json!({"reason":"prepared work node has no trusted pre-mutation baseline","observed_remote_head":observation.remote_head,"pull_requests":observation.pull_requests}),
@@ -230,7 +242,11 @@ impl RuntimeDelivery {
         if baseline.configuration_digest != self.configuration_digest {
             return Ok(PublicationMonitorTick::Unknown);
         }
-        let observation = self.observe_snapshot(&resource.repository_id, &resource.branch)?;
+        let Some(observation) =
+            self.observe_monitor_snapshot(&resource.repository_id, &resource.branch)
+        else {
+            return Ok(PublicationMonitorTick::Unknown);
+        };
         let publication = receipts
             .iter()
             .filter(|entry| entry.intent().kind == "publish_implementation")
@@ -572,6 +588,39 @@ mod tests {
             fs::set_permissions(path, permissions).unwrap();
         }
         root.to_owned()
+    }
+
+    #[test]
+    fn failed_remote_observation_is_unknown_to_monitor_but_blocks_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = tool_path(&temp.path().join("bin"));
+        fs::write(bin.join("git"), "#!/bin/sh\nexit 17\n").unwrap();
+        let env = BTreeMap::from([(OsString::from("PATH"), bin.into_os_string())]);
+        let delivery = build(
+            &applied_config("git@github.com:acme/demo.git", "github"),
+            temp.path(),
+            &env,
+            &crate::domain::ids::Digest::parse("a".repeat(64)).unwrap(),
+        )
+        .unwrap();
+        let repository = RepositoryId::parse("repo").unwrap();
+        assert!(
+            delivery
+                .observe_monitor_snapshot(&repository, "main")
+                .is_none()
+        );
+        let resource = crate::store::publication_monitor::PublicationResource {
+            project_id: ProjectId::parse("project").unwrap(),
+            ticket_run_id: crate::domain::ids::TicketRunId::parse("ticket-run").unwrap(),
+            repository_id: repository,
+            branch: "main".into(),
+        };
+        assert!(
+            crate::human_runtime::PublicationAdoptionSource::observe_publication(
+                &delivery, &resource,
+            )
+            .is_err()
+        );
     }
 
     #[test]

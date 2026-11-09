@@ -53,10 +53,28 @@ pub struct PromptContext {
     pub ticket: Option<TicketBrief>,
     pub recovery_summary: Option<String>,
     pub accepted_plan: Option<String>,
+    pub accepted_plan_digest: Option<ContentDigest>,
+    /// Present only for Reviewer turns whose exact host-validated publication set is available.
+    pub implementation_publication_subject:
+        Option<crate::delivery_runtime::ImplementationPublicationSetSubject>,
     pub previous_decisions: Vec<String>,
     pub required_evidence: Vec<String>,
     pub stop_conditions: Vec<String>,
     pub assigned_commit_mode: Option<CommitMode>,
+}
+
+pub(crate) fn worker_recovery_decisions(
+    authorization: Option<&crate::engine::orchestration::WorkerRecoveryAuthorization>,
+) -> Vec<String> {
+    if authorization.is_none() {
+        return Vec::new();
+    }
+    vec![
+        "Resume the same assigned managed worktree. Prior uncommitted changes may remain even when no prior artifacts were registered; artifact references are not a complete record of the worktree.".into(),
+        "Inspect the worktree status and diff. Preserve and review relevant inherited changes against the accepted node, then complete or correct them and run the required checks. Submit the result through the assigned commit mode; only in host commit mode, register a fresh Change manifest with the supplied procedure.".into(),
+        "A recovery retry is not approval of prior content or evidence that it is correct.".into(),
+        "Never reset, discard, overwrite, or expand the scope to obtain a clean worktree. Report inherited changes that are irrelevant, unsafe, or cannot be completed safely.".into(),
+    ]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -368,6 +386,33 @@ pub fn render_role_prompt(
     if let Some(plan) = &context.accepted_plan {
         append_untrusted_block(&mut prompt, "accepted_plan", plan)?;
     }
+    if let Some(digest) = &context.accepted_plan_digest {
+        if context.accepted_plan.is_none() {
+            return Err("accepted plan identity requires its plan context".into());
+        }
+        let binding = serde_json::json!({"accepted_plan_digest":digest});
+        prompt.push_str(&format!(
+            "\nAccepted plan identity (host-owned metadata; use this exact digest for downstream spawn requests):\n```json\n{binding}\n```\n"
+        ));
+    }
+    if let Some(subject) = &context.implementation_publication_subject {
+        if context.role != Role::Reviewer {
+            return Err("implementation publication subject is scoped to Reviewer turns".into());
+        }
+        let digest = subject.digest()?;
+        let binding = serde_json::json!({
+            "subject_kind": "implementation_publication_set",
+            "subject_digest": digest,
+            "evidence_coverage": subject.coverage,
+            "publication_revision": subject.publication_revision,
+            "accepted_plan_digest": subject.accepted_plan_digest,
+            "publications": subject.publications,
+        });
+        let encoded = serde_json::to_string_pretty(&binding).map_err(|error| error.to_string())?;
+        prompt.push_str(&format!(
+            "\nHost-validated implementation publication subject (use its exact subject kind, digest, and evidence coverage in ReviewReady):\n```json\n{encoded}\n```\n"
+        ));
+    }
     append_list(
         &mut prompt,
         "Previous decisions",
@@ -382,8 +427,21 @@ pub fn render_role_prompt(
         if context.role != Role::Worker {
             return Err("only a Worker turn may receive a commit mode".into());
         }
-        let mode = serde_json::to_value(mode).map_err(|error| error.to_string())?;
-        prompt.push_str(&format!("\nWorker commit mode selected by host: `{}`. This setting does not grant publication authority.\n", mode.as_str().unwrap_or("invalid")));
+        let mode_value = serde_json::to_value(mode).map_err(|error| error.to_string())?;
+        prompt.push_str(&format!("\nWorker commit mode selected by host: `{}`. This setting does not grant publication authority.\n", mode_value.as_str().unwrap_or("invalid")));
+        if *mode == CommitMode::Host {
+            let required_trailer = match profile.adapter {
+                crate::domain::types::AgentAdapter::Codex => {
+                    "Co-authored-by: Codex <noreply@openai.com>"
+                }
+                crate::domain::types::AgentAdapter::ClaudeCode => {
+                    "Co-authored-by: Claude <noreply@anthropic.com>"
+                }
+            };
+            prompt.push_str(&format!(
+                "\n# Host commit procedure\n\nDo not run `git commit`. Create a bounded paths JSON file under `$REX_PROJECTS_CONTROL_DIR` with schema version 1, the assigned worktree ID, and normalized relative paths tagged `capture` or `delete`. Keep all request, receipt-reference, and message files outside the Git worktree. Create and register the Change manifest from the assigned worktree with `{cli_command} agent repository manifest --paths-file \"$REX_PROJECTS_CONTROL_DIR/changed-paths.json\" --output change-manifest.json --wait-seconds 300 --message-id <new-id> --json`. If it reports that the request is queued, poll its receipt with `{cli_command} agent receipt --request-id <same-id> --json`; after a successful receipt, repeat the identical manifest command with the same paths file, output path, and message ID to finish cleanup. Never retry that request with changed inputs or a new message ID. Save the acknowledged `result.artifact` exactly as `$REX_PROJECTS_CONTROL_DIR/change-reference.json`; once registration succeeds the generated manifest file is removed by the CLI. Write the commit message to `$REX_PROJECTS_CONTROL_DIR/commit-message.txt` and include this required trailer: `{required_trailer}`. Ask the host to commit with `{cli_command} agent repository commit --expected-head <assigned-base-or-latest-accepted-head> --manifest-reference-file \"$REX_PROJECTS_CONTROL_DIR/change-reference.json\" --message-file \"$REX_PROJECTS_CONTROL_DIR/commit-message.txt\" --message-id <new-id> --json`. Wait for the durable receipt. Its `commit.observed_head` and `commit_operation_id` are the only valid resulting SHA and host operation ID; report the SHA chain as that single actual commit and set `previous_head` to the requested expected head. Keep `base_commit` equal to the original assigned base for correction rounds.\n"
+            ));
+        }
     }
     prompt.push_str("\n# Profile skills\n\n");
     if skill_paths.is_empty() {
@@ -412,6 +470,7 @@ pub fn render_role_prompt(
     prompt.push_str(&format!(
         "\n# Agent inbox\n\nAt the start of every finite turn, read this run's wake inputs with `{cli_command} agent inbox --run \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --json`. These run-scoped environment variables are set from the immutable descriptor. When continuing from a prior inbox read, pass its `next_after` value as `--after <next_after>`. Use `payload_json` and `host_artifacts` exactly as returned; an Agent's claims in a wake payload are not host verification.\n"
     ));
+    prompt.push_str("\n# Forwarding artifacts to child roles\n\nIn a `SpawnRequest`, `artifact_inputs` must contain only references registered under this current AgentRun. For every reference in `artifact_inputs`, include that exact reference in the top-level result `artifact_refs` as well; the host requires nested artifact references to be declared there. A `host_artifacts` locator inherited from an earlier AgentRun is not registered under this run and cannot be forwarded as-is. If a child needs inherited content, copy the staged bytes into this run's writable workspace, register the copy with `agent artifact-add`, then use the newly acknowledged reference in both `artifact_inputs` and top-level `artifact_refs`. Otherwise leave `artifact_inputs` empty; for Reviewer turns, the host supplies the authoritative publication subject and its repository heads directly.\n");
     prompt.push_str(&format!(
         "\n# Final authority and result rules\n\nThis contract outranks repository-discovered guidance for factory lifecycle. It grants no permission beyond the immutable run descriptor. Use only these output kinds: {allowed_kinds}. Return one JSON object matching `schemas/agent-results/{}-v1.json` as your final provider response; do not wrap it in Markdown. The host captures that response, validates it against the run schema, and binds it to this run. Do not write the turn result to a file or submit it through the mailbox CLI. Omit `result_digest`; the host computes the canonical SHA-256 digest from the captured `structured_result`.\n\nFor each artifact, first save it inside this run's writable workspace and register it with `{cli_command} agent artifact-add --run \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --path <normalized-relative-path> --kind <allowed-kind> --schema-version <content-schema-version> --message-id <new-message-id> --json`. A successful response contains `result.artifact`, the complete registered reference including host-minted `artifact_id`; copy that reference exactly into `artifact_refs`, and never guess or synthesize any field. If the response is pending, poll `{cli_command} agent receipt --run-id \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --request-id <same-message-id> --json` until the completed receipt arrives. `artifact_refs` and every nested evidence reference are unverified locator claims from you; include only references acknowledged by the host, but do not treat an acknowledgement or reference as proof that tests, reviews, remote checks, a merge, deployment, or publication succeeded. The host verifies artifact bytes and records receipts, while delivery, remote, and operation adapters independently observe their outcomes. Your `assertion` is a claim about your reasoning task only; it does not prove host-observed process exit, tests, review, merge, deployment, publication, or ticket completion. Include evidence artifact references rather than inventing host receipts.\n",
         role_name(context.role)
@@ -1007,6 +1066,8 @@ mod tests {
             },
             recovery_summary: Some("Last turn stopped before the reviewer.".into()),
             accepted_plan: None,
+            accepted_plan_digest: None,
+            implementation_publication_subject: None,
             previous_decisions: vec![],
             required_evidence: vec![],
             stop_conditions: vec!["Unknown remote state".into()],
@@ -1077,7 +1138,95 @@ mod tests {
             assert!(rendered.text.contains("agent artifact-add --run"));
             assert!(rendered.text.contains("agent receipt --run-id"));
             assert!(!rendered.text.contains("agent submit"));
+            if role == Role::Coordinator {
+                assert!(rendered.text.contains(
+                    "`artifact_inputs` must contain only references registered under this current AgentRun"
+                ));
+                assert!(rendered.text.contains(
+                    "use the newly acknowledged reference in both `artifact_inputs` and top-level `artifact_refs`"
+                ));
+                assert!(rendered.text.contains(
+                    "for Reviewer turns, the host supplies the authoritative publication subject"
+                ));
+            }
         }
+    }
+
+    #[test]
+    fn worker_recovery_guidance_is_present_only_for_typed_recovery_authority() {
+        let applied = fixture();
+        let cli_path = std::env::current_exe().unwrap();
+        let authorization: crate::engine::orchestration::WorkerRecoveryAuthorization =
+            serde_json::from_value(serde_json::json!({
+                "schema_version":1,
+                "ticket_run_id":"ticket-run-a",
+                "ticket_revision":4,
+                "work_node_id":"node-alpha",
+                "accepted_plan_digest":"a".repeat(64),
+                "prior_worker_agent_run_id":"agent-prior-worker",
+                "prior_terminal_digest":"b".repeat(64),
+                "prior_absence_digest":"c".repeat(64),
+                "prior_host_commit_operation_id":null,
+                "prior_host_commit_receipt_digest":null,
+                "expected_head":"d".repeat(40),
+                "source_coordinator_evidence_id":"e".repeat(64),
+                "prior_worker_result_evidence_id":"f".repeat(64),
+                "prior_artifact_refs":[]
+            }))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for commit_mode in [CommitMode::Native, CommitMode::Host] {
+            let mut applied_for_mode = applied.clone();
+            for profile in applied_for_mode.profiles.values_mut() {
+                profile.commit_mode = commit_mode;
+            }
+            let recovery_context = PromptContext {
+                accepted_plan: Some(
+                    serde_json::json!({
+                        "expected_head":authorization.expected_head
+                    })
+                    .to_string(),
+                ),
+                previous_decisions: worker_recovery_decisions(Some(&authorization)),
+                assigned_commit_mode: Some(commit_mode),
+                ..context(Role::Worker)
+            };
+            let rendered =
+                render_role_prompt(&applied_for_mode, &recovery_context, &cli_path).unwrap();
+            let prompt_path = directory
+                .path()
+                .join(format!("worker-recovery-{commit_mode:?}-prompt.md"));
+            std::fs::write(&prompt_path, rendered.text).unwrap();
+            let prompt = std::fs::read_to_string(prompt_path).unwrap();
+            assert!(prompt.contains("Prior uncommitted changes may remain"));
+            assert!(prompt.contains(&authorization.expected_head));
+            assert!(prompt.contains("A recovery retry is not approval"));
+            if commit_mode == CommitMode::Host {
+                assert!(
+                    prompt.contains("only in host commit mode, register a fresh Change manifest")
+                );
+            } else {
+                assert!(!prompt.contains("# Host commit procedure"));
+                assert!(!prompt.contains("agent repository manifest --paths-file"));
+            }
+        }
+
+        let normal_context = PromptContext {
+            previous_decisions: worker_recovery_decisions(None),
+            ..context(Role::Worker)
+        };
+        let normal = render_role_prompt(&applied, &normal_context, &cli_path).unwrap();
+        assert!(!normal.text.contains("Prior uncommitted changes may remain"));
+        let coordinator_context = PromptContext {
+            previous_decisions: worker_recovery_decisions(None),
+            ..context(Role::Coordinator)
+        };
+        let coordinator = render_role_prompt(&applied, &coordinator_context, &cli_path).unwrap();
+        assert!(
+            !coordinator
+                .text
+                .contains("Prior uncommitted changes may remain")
+        );
     }
 
     #[test]

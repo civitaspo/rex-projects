@@ -2367,15 +2367,26 @@ impl ConfigStore {
                 .as_str()
                 .ok_or_else(|| "reducer effect kind was not a string".to_owned())?
                 .to_owned();
-            let request = serde_json::json!({
-                "schema_version": 1,
-                "project_id": key.project_id.as_str(),
-                "ticket_run_id": ticket_run_id.as_str(),
-                "role": "coordinator",
-                "recipe_id": recipe_id,
-                "project_epoch": project_epoch,
-                "observed_revision": observed_revision,
-            });
+            let request = if effect.kind == crate::engine::reducer::EffectKind::PublishTicketStatus
+            {
+                let payload = crate::engine::ticket_effects::PublishTicketStatus {
+                    schema_version: 1,
+                    project_id: key.project_id.clone(),
+                    namespace: key.namespace.clone(),
+                    ticket_id: ticket.clone(),
+                    ticket_run_id: ticket_run_id.clone(),
+                    ticket_run_revision: 1,
+                    expected_external_revision: observed_revision.clone(),
+                    desired_status: TicketStatus::InProgress,
+                    reason: "TicketRun dispatched after Supervisor authorization".into(),
+                };
+                payload.validate()?;
+                serde_json::to_value(payload).map_err(|error| error.to_string())?
+            } else {
+                return Err(format!(
+                    "dispatch effect {serialized_kind} has no typed request builder"
+                ));
+            };
             let request_json =
                 serde_json::to_string(&request).map_err(|error| error.to_string())?;
             let digest = format!("{:x}", sha2::Sha256::digest(request_json.as_bytes()));

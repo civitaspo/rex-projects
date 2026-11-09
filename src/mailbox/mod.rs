@@ -320,6 +320,19 @@ impl MailboxCapability {
         }
     }
 
+    pub(crate) fn has_queued_request(&self, request_id: &str, now: u64) -> Result<bool, String> {
+        self.check_live(now)?;
+        if !valid_request_id(request_id) {
+            return Err("invalid mailbox request id".into());
+        }
+        let name = format!("{REQUEST_PREFIX}{}.json", key(request_id));
+        match self.read_bounded(&name, self.limits.max_request_bytes) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("inspect queued mailbox request: {error}")),
+        }
+    }
+
     pub fn pending(&self, now: u64) -> Result<Vec<MailboxRequest>, String> {
         self.check_live(now)?;
         let mut paths = self
@@ -807,6 +820,7 @@ mod tests {
     fn queues_valid_request_and_replays_same_receipt_key() {
         let root = tempfile::tempdir().unwrap();
         let mailbox = capability(root.path());
+        assert!(!mailbox.has_queued_request("r-1", 1).unwrap());
         let bytes = request("r-1", "same");
         assert!(matches!(
             mailbox.queue("r-1", &bytes, 1).unwrap(),
@@ -820,6 +834,10 @@ mod tests {
         let receipt = br#"{"schema_version":1,"request_id":"r-1","result":{"accepted":true}}"#;
         mailbox.publish_receipt("r-1", receipt, 1).unwrap();
         assert_eq!(mailbox.read_receipt("r-1", 1).unwrap().unwrap(), receipt);
+        assert!(mailbox.pending(1).unwrap().is_empty());
+        assert!(mailbox.has_queued_request("r-1", 1).unwrap());
+        assert!(mailbox.has_queued_request("../invalid", 1).is_err());
+        assert!(mailbox.has_queued_request("r-1", 11).is_err());
     }
 
     #[test]

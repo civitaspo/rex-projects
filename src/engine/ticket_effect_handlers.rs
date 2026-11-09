@@ -1584,6 +1584,126 @@ mod tests {
     }
 
     #[test]
+    fn initial_dispatch_status_outbox_reaches_ticket_adapter() {
+        use crate::domain::ids::{AdapterId, Digest, TicketId, TicketNamespace};
+        use crate::store::scheduler::{
+            ObservedTicket, SupervisorDispatchAuthority, TicketScanKey, TicketScanPage,
+        };
+
+        let (_temp, mut store, project, owner) = test_store();
+        store
+            .set_project_lifecycle(owner, &project, "running")
+            .unwrap();
+        let namespace = TicketNamespace::parse("fixture:workspace").unwrap();
+        let ticket = TicketId::parse("ticket-dispatch-status").unwrap();
+        let key = TicketScanKey {
+            project_id: project.clone(),
+            adapter_id: AdapterId::parse("tickets").unwrap(),
+            namespace: namespace.clone(),
+            scope_digest: Digest::parse("a".repeat(64)).unwrap(),
+            filter_digest: Digest::parse("b".repeat(64)).unwrap(),
+            status: TicketStatus::Ready,
+        };
+        let observed = ObservedTicket {
+            id: ticket.clone(),
+            revision: Some("revision-1".into()),
+            status: TicketStatus::Ready,
+            title: "Dispatch status fixture".into(),
+            labels: Vec::new(),
+            created_at: None,
+            observed_at_unix: 2,
+        };
+        store
+            .record_ticket_scan_page(
+                owner,
+                TicketScanPage {
+                    key: &key,
+                    expected_cursor: None,
+                    expected_generation: 0,
+                    expected_page_count: 0,
+                    next_cursor: None,
+                    tickets: std::slice::from_ref(&observed),
+                    now_unix: 2,
+                    poll_seconds: 60,
+                },
+            )
+            .unwrap();
+        let run = store
+            .create_dispatched_ticket_run(
+                owner,
+                &key,
+                &ticket,
+                Some("docs_only"),
+                &[TicketStatus::Ready],
+                1,
+                &SupervisorDispatchAuthority {
+                    evidence_id: "dispatch-status-evidence".into(),
+                    priority: 3,
+                    expected_external_revision: "revision-1".into(),
+                },
+                3,
+            )
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .claim_next_due_effect(owner, 4, &["publish_ticket_status".into()])
+            .unwrap();
+        let request: EffectRequest = claimed
+            .expect("dispatch creates a durable status effect")
+            .into();
+        assert_eq!(request.intent.subject_id, run.as_str());
+        assert_eq!(
+            request.intent.request_digest,
+            hash(&request.intent.request_json)
+        );
+        let payload: PublishTicketStatus =
+            serde_json::from_str(&request.intent.request_json).unwrap();
+        assert_eq!(payload.namespace, namespace);
+        assert_eq!(payload.ticket_id, ticket);
+        assert_eq!(
+            payload.expected_external_revision.as_deref(),
+            Some("revision-1")
+        );
+        assert_eq!(payload.desired_status, TicketStatus::InProgress);
+
+        let fake = FakeAdapter::new(
+            scope(),
+            payload.namespace.as_str(),
+            payload.ticket_id.as_str(),
+            NormalizedTicketStatus::Ready,
+        );
+        fake.ticket.lock().unwrap().revision = Some("revision-1".into());
+        let adapter = Arc::new(fake);
+        let handler = PublishTicketStatusHandler::new(
+            adapter.clone(),
+            BTreeMap::from([(project.clone(), scope())]),
+        );
+        let mut context = EffectContext {
+            store: &mut store,
+            owner_generation: owner,
+            now_unix: 4,
+        };
+        let observation = handler
+            .handle(EffectMode::Submit, &request, &mut context)
+            .unwrap();
+        let EffectObservation::Applied { receipt } = observation else {
+            panic!("status handler did not return its adapter receipt");
+        };
+        let receipt: ScopedTicketResult = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt.ticket.id, ticket.as_str());
+        assert_eq!(
+            receipt.ticket.status.value,
+            NormalizedTicketStatus::InProgress
+        );
+        assert_eq!(receipt.ticket.revision.as_deref(), Some("revision-2"));
+        assert_eq!(*adapter.calls.lock().unwrap(), ["get", "update"]);
+        assert_eq!(
+            adapter.ticket.lock().unwrap().status.value,
+            NormalizedTicketStatus::InProgress
+        );
+    }
+
+    #[test]
     fn goal_create_records_host_verified_candidate_from_cli_receipt() {
         let (_temp, mut store, project, owner) = test_store();
         let namespace = TicketNamespace::parse("fixture:workspace").unwrap();

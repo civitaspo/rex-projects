@@ -4,9 +4,10 @@
 //! launch reservation and authority, then hands one supported request to its durable host API.
 
 use rusqlite::OptionalExtension;
+use sha2::{Digest as _, Sha256};
 
 use crate::artifacts::ArtifactStore;
-use crate::domain::ids::{AgentRunId, Digest};
+use crate::domain::ids::{AgentRunId, Digest, OperationId};
 use crate::mailbox::{MailboxCapability, MailboxLimits};
 
 type MailboxRunAuthorityStateRow = (
@@ -56,6 +57,10 @@ impl crate::store::ConfigStore {
         agent_run_id: &str,
         now_unix: i64,
         artifact_store: &ArtifactStore,
+        profiles: &std::collections::BTreeMap<
+            crate::domain::ids::ProfileId,
+            crate::config::Profile,
+        >,
     ) -> Result<bool, AgentMailboxProcessingError> {
         let tx = self
             .connection
@@ -238,6 +243,41 @@ impl crate::store::ConfigStore {
 
         let method = serde_json::to_value(&mailbox_request.envelope.method)
             .map_err(|error| error.to_string())?;
+        if method.as_str() == Some("repository.commit") {
+            let request: crate::agent_api::RepositoryCommitRequest = serde_json::from_value(
+                mailbox_request.envelope.params.clone(),
+            )
+            .map_err(|error| {
+                AgentMailboxProcessingError::LocalMailbox(format!(
+                    "invalid repository.commit params: {error}"
+                ))
+            })?;
+            request
+                .validate()
+                .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+            let profile = profiles
+                .get(&authority.profile_id)
+                .ok_or("repository.commit Agent profile is no longer configured")?;
+            let required_trailer = match profile.adapter {
+                crate::domain::types::AgentAdapter::Codex => {
+                    "Co-authored-by: Codex <noreply@openai.com>"
+                }
+                crate::domain::types::AgentAdapter::ClaudeCode => {
+                    "Co-authored-by: Claude <noreply@anthropic.com>"
+                }
+            };
+            self.process_repository_commit(
+                owner_generation,
+                &authority,
+                &reservation,
+                artifact_store,
+                &mailbox,
+                &mailbox_request,
+                &request,
+                required_trailer,
+            )?;
+            return Ok(true);
+        }
         if method.as_str() != Some("artifact.add") {
             let response = crate::protocol::ResponseEnvelope {
                 schema_version: crate::protocol::SCHEMA_VERSION,
@@ -296,6 +336,239 @@ impl crate::store::ConfigStore {
         )?;
         Ok(true)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_repository_commit(
+        &mut self,
+        owner_generation: u64,
+        authority: &crate::launch::AgentLaunchAuthority,
+        reservation: &crate::launch::AgentLaunchReservation,
+        artifact_store: &ArtifactStore,
+        mailbox: &MailboxCapability,
+        mailbox_request: &crate::mailbox::MailboxRequest,
+        request: &crate::agent_api::RepositoryCommitRequest,
+        required_trailer: &str,
+    ) -> Result<(), AgentMailboxProcessingError> {
+        use crate::delivery_runtime::{
+            CommitWorkerManifestEffectPayload, PrepareWorktreesEffectPayload,
+            canonical_delivery_payload,
+        };
+        use crate::engine::reducer::{EffectKind, effect_name};
+        use crate::store::EffectIntent;
+
+        let assignment = reservation
+            .worker_assignment
+            .as_ref()
+            .ok_or("repository.commit requires an immutable Worker assignment")?;
+        let ticket_run_id = authority
+            .ticket_run_id
+            .as_ref()
+            .ok_or("repository.commit Worker has no TicketRun")?;
+        let ticket_revision = authority
+            .ticket_revision
+            .ok_or("repository.commit Worker has no TicketRun revision")?;
+        let expected_head = match reservation.wake_snapshot.worker_recovery_authorization()? {
+            Some(recovery) => {
+                if recovery.ticket_run_id != *ticket_run_id
+                    || recovery.ticket_revision != ticket_revision.0
+                    || recovery.work_node_id != assignment.node_id
+                    || recovery.accepted_plan_digest != assignment.plan_digest
+                    || recovery.prior_worker_agent_run_id == authority.agent_run_id
+                    || (recovery.prior_host_commit_operation_id.is_none()
+                        && recovery.expected_head != assignment.base_sha)
+                {
+                    return Err(AgentMailboxProcessingError::Authority(
+                        "Worker recovery authority differs from the immutable accepted assignment"
+                            .into(),
+                    ));
+                }
+                recovery.expected_head
+            }
+            None => assignment.base_sha.clone(),
+        };
+        let envelope = &mailbox_request.envelope;
+        if authority.role != crate::domain::types::Role::Worker
+            || assignment.commit_mode != crate::domain::types::CommitMode::Host
+            || request.worktree_id != assignment.node_id.as_str()
+            || envelope.request_id.as_str() != request.message_id
+            || mailbox_request.request_id != request.message_id
+            || envelope.operation_id.as_ref() != Some(&authority.operation_id)
+            || envelope.project_id.as_ref() != Some(&authority.project_id)
+            || envelope.run_id.as_deref() != Some(authority.agent_run_id.as_str())
+            || envelope.role != Some(authority.role)
+            || envelope.attempt != Some(authority.attempt)
+            || envelope.run_epoch != Some(authority.run_epoch)
+            || envelope.expected_subject_revision != Some(ticket_revision.0)
+            || request.expected_head != expected_head
+        {
+            return Err(AgentMailboxProcessingError::LocalMailbox(
+                "repository.commit request differs from immutable Worker authority".into(),
+            ));
+        }
+        let prepared = self
+            .succeeded_effect_receipt(&assignment.prepare_operation_id)?
+            .ok_or("repository.commit prepared-worktree effect is not durably succeeded")?;
+        if prepared.intent().kind != effect_name(&EffectKind::PrepareWorktrees) {
+            return Err("repository.commit preparation reference has the wrong effect kind".into());
+        }
+        let prepared_payload: PrepareWorktreesEffectPayload =
+            crate::protocol::parse_unique(prepared.intent().request_json.as_bytes())?;
+        let prepared_node = prepared_payload
+            .work_nodes
+            .iter()
+            .filter(|node| node.work_node_id == assignment.node_id)
+            .collect::<Vec<_>>();
+        if prepared_payload.ticket_run_id != *ticket_run_id
+            || prepared_payload.configuration_digest != authority.config_digest
+            || prepared_node.len() != 1
+            || prepared_node[0].repository_id != assignment.repository_id
+            || prepared_node[0].expected_base_sha != assignment.base_sha
+            || prepared_node[0].commit_mode != crate::domain::types::CommitMode::Host
+        {
+            return Err(
+                "repository.commit assignment differs from its succeeded preparation".into(),
+            );
+        }
+        let verified = self
+            .lookup_verified_artifact(artifact_store, authority, &request.manifest)?
+            .ok_or("repository.commit manifest is not registered to this Worker")?;
+        let bytes = verified.read_bytes(artifact_store)?;
+        let digest = Digest::parse(format!("{:x}", Sha256::digest(&bytes)))?;
+        if digest != request.manifest_digest || digest != request.manifest.digest {
+            return Err(
+                "repository.commit manifest digest differs from registered artifact bytes".into(),
+            );
+        }
+        let manifest: crate::host_commit::ChangeManifest = crate::protocol::parse_unique(&bytes)?;
+        if manifest.schema_version != 1
+            || manifest.entries.is_empty()
+            || serde_json::to_vec(&manifest).map_err(|error| error.to_string())? != bytes
+        {
+            return Err("repository.commit manifest is empty or noncanonical".into());
+        }
+        let message_digest = mailbox_request.digest.as_str();
+        let operation_id = OperationId::parse(format!("repo-commit-{message_digest}"))?;
+        let payload = CommitWorkerManifestEffectPayload {
+            schema_version: 1,
+            agent_run_id: authority.agent_run_id.clone(),
+            project_id: authority.project_id.clone(),
+            message_id: request.message_id.clone(),
+            configuration_digest: authority.config_digest.clone(),
+            ticket_revision: ticket_revision.0,
+            ticket_namespace: prepared_payload.ticket_namespace.clone(),
+            ticket_id: prepared_payload.ticket_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            work_node_id: assignment.node_id.clone(),
+            repository_id: assignment.repository_id.clone(),
+            worktree_path: assignment.worktree_path.clone(),
+            branch: assignment.branch.clone(),
+            prepare_operation_id: OperationId::parse(assignment.prepare_operation_id.clone())?,
+            expected_base_sha: assignment.base_sha.clone(),
+            expected_head: request.expected_head.clone(),
+            manifest_artifact: verified.reference().clone(),
+            manifest_digest: digest,
+            manifest,
+            commit_message: request.commit_message.clone(),
+            required_trailer: required_trailer.to_owned(),
+        };
+        let (request_json, request_digest) = canonical_delivery_payload(&payload)?;
+        let intent = EffectIntent {
+            project_id: authority.project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.as_str().into(),
+            operation_id: operation_id.as_str().to_owned(),
+            logical_key: format!(
+                "repository.commit:{}:{message_digest}",
+                authority.agent_run_id
+            ),
+            kind: effect_name(&EffectKind::CommitWorkerManifest).into(),
+            request_json,
+            request_digest,
+            expected_revision: Some(ticket_revision.0),
+        };
+        if let Some(existing) = self.effect_by_logical_key(&intent.logical_key)? {
+            if existing != intent {
+                return Err(
+                    "repository.commit message ID was reused with different request content".into(),
+                );
+            }
+        } else {
+            self.enqueue_effect(owner_generation, &intent)?;
+        }
+        let status: Option<(String, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT status,last_error FROM effects WHERE operation_id=?1",
+                [&intent.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((status, last_error)) = status
+            && matches!(status.as_str(), "failed" | "cancelled")
+        {
+            let response = crate::protocol::ResponseEnvelope::<serde_json::Value> {
+                schema_version: crate::protocol::SCHEMA_VERSION,
+                request_id: mailbox_request.envelope.request_id.clone(),
+                result: None,
+                error: Some(crate::protocol::ProtocolError {
+                    code: crate::protocol::ErrorCode::Unavailable,
+                    message: format!(
+                        "host repository.commit effect {status}: {}",
+                        last_error.unwrap_or_else(|| "effect was cancelled".into())
+                    ),
+                    retryable: false,
+                    retry_after_ms: None,
+                    details: Default::default(),
+                }),
+                extensions: Default::default(),
+            };
+            let bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+            mailbox
+                .publish_receipt(
+                    &request.message_id,
+                    &bytes,
+                    crate::mailbox::unix_time_now()?,
+                )
+                .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+            return Ok(());
+        }
+        let Some(receipt) = self.succeeded_effect_receipt(&intent.operation_id)? else {
+            // Keep the mailbox request pending. The normal dispatcher will execute/reconcile the
+            // durable effect; this method will publish the receipt on a later controller pass.
+            return Ok(());
+        };
+        if receipt.intent() != &intent {
+            return Err("repository.commit durable receipt has a different intent".into());
+        }
+        let committed: crate::delivery_runtime::CommitWorkerManifestEffectReceipt =
+            crate::protocol::parse_unique(receipt.receipt_json().as_bytes())?;
+        let response = crate::protocol::ResponseEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: mailbox_request.envelope.request_id.clone(),
+            result: Some(crate::agent_api::RepositoryCommitReceipt {
+                schema_version: 1,
+                message_id: request.message_id.clone(),
+                commit_operation_id: operation_id,
+                worktree_id: assignment.node_id.to_string(),
+                repository_id: assignment.repository_id.to_string(),
+                base_sha: assignment.base_sha.clone(),
+                manifest_artifact: verified.reference().clone(),
+                commit: committed.commit,
+            }),
+            error: None,
+            extensions: Default::default(),
+        };
+        let response_bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+        mailbox
+            .publish_receipt(
+                &request.message_id,
+                &response_bytes,
+                crate::mailbox::unix_time_now()?,
+            )
+            .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -324,17 +597,35 @@ mod tests {
 
         assert!(
             !store
-                .process_one_agent_mailbox_request(7, "run-a", 1, &artifact_store)
+                .process_one_agent_mailbox_request(
+                    7,
+                    "run-a",
+                    1,
+                    &artifact_store,
+                    &Default::default()
+                )
                 .unwrap()
         );
         assert!(
             !store
-                .process_one_agent_mailbox_request(7, "run-b", 1, &artifact_store)
+                .process_one_agent_mailbox_request(
+                    7,
+                    "run-b",
+                    1,
+                    &artifact_store,
+                    &Default::default()
+                )
                 .unwrap()
         );
         assert!(
             store
-                .process_one_agent_mailbox_request(8, "run-a", 1, &artifact_store)
+                .process_one_agent_mailbox_request(
+                    8,
+                    "run-a",
+                    1,
+                    &artifact_store,
+                    &Default::default()
+                )
                 .is_err()
         );
     }

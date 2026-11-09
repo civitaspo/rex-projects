@@ -11,8 +11,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{ArtifactId, Digest, ProjectId};
-use crate::engine::orchestration::{RoleArtifactKind, RoleArtifactReference};
+use crate::domain::ids::{ArtifactId, Digest, OperationId, ProjectId};
+use crate::engine::orchestration::{
+    RoleArtifactKind, RoleArtifactReference, WorkerRecoveryAuthorization,
+};
 
 const MAX_INBOX_BYTES: usize = 1024 * 1024;
 const MAX_WAKE_ITEMS: usize = 256;
@@ -91,6 +93,42 @@ fn is_lower_hex_64(value: &str) -> bool {
 }
 
 impl AgentWakeSnapshot {
+    pub fn worker_recovery_authorization(
+        &self,
+    ) -> Result<Option<WorkerRecoveryAuthorization>, String> {
+        let mut authorization = None;
+        for input in &self.inputs {
+            if input.source_type != "worker_recovery_authorization" {
+                continue;
+            }
+            let value = input
+                .payload_json
+                .get("authorization")
+                .cloned()
+                .ok_or("Worker recovery wake has no host authorization")?;
+            let parsed: WorkerRecoveryAuthorization = serde_json::from_value(value)
+                .map_err(|error| format!("invalid Worker recovery authorization: {error}"))?;
+            parsed.validate()?;
+            let expected_session = format!(
+                "ticket:{}:worker:{}",
+                parsed.ticket_run_id, parsed.work_node_id
+            );
+            if self.role_session_id != expected_session
+                || input.source_id != parsed.prior_worker_result_evidence_id
+                || input.source_revision != parsed.ticket_revision
+            {
+                return Err(
+                    "Worker recovery wake differs from its canonical node session or source result"
+                        .into(),
+                );
+            }
+            if authorization.replace(parsed).is_some() {
+                return Err("Worker wake contains multiple recovery authorizations".into());
+            }
+        }
+        Ok(authorization)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1
             || self.role_session_id.trim().is_empty()
@@ -122,8 +160,13 @@ impl AgentWakeSnapshot {
                 return Err("Agent inbox item exceeds the 256 artifact limit".into());
             }
             artifact_count += item.host_artifacts.len();
-            if !item.host_artifacts.is_empty() && item.source_type != "agent_result" {
-                return Err("host artifact locators must accompany an Agent result wake".into());
+            if !item.host_artifacts.is_empty()
+                && !matches!(
+                    item.source_type.as_str(),
+                    "agent_result" | "worker_recovery_authorization"
+                )
+            {
+                return Err("host artifact locators must accompany a verified result or Worker recovery wake".into());
             }
             let mut seen_artifacts = std::collections::BTreeSet::new();
             for artifact in &item.host_artifacts {
@@ -191,6 +234,64 @@ pub struct ArtifactAddReceipt {
     pub artifact: RoleArtifactReference,
 }
 
+/// Host-mode Worker request to commit the exact Change artifact previously registered for this run.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryCommitRequest {
+    pub schema_version: u32,
+    pub message_id: String,
+    pub worktree_id: String,
+    pub expected_head: String,
+    pub manifest: RoleArtifactReference,
+    pub manifest_digest: Digest,
+    pub commit_message: String,
+}
+
+impl RepositoryCommitRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_message_id(&self.message_id)?;
+        if self.schema_version != 1
+            || self.worktree_id.trim().is_empty()
+            || self.worktree_id.chars().any(char::is_control)
+            || !matches!(self.expected_head.len(), 40 | 64)
+            || !self
+                .expected_head
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.manifest.kind != RoleArtifactKind::Change
+            || self.manifest.schema_version != 1
+            || self.manifest.digest != self.manifest_digest
+            || self.commit_message.trim().is_empty()
+            || self.commit_message.len() > 16_000
+            || self.commit_message.chars().any(|character| {
+                character == '\0'
+                    || character == '\r'
+                    || (character.is_control() && character != '\n' && character != '\t')
+            })
+        {
+            return Err(
+                "repository commit request is malformed or does not identify a v1 Change manifest"
+                    .into(),
+            );
+        }
+        validate_relative_path(&self.manifest.path)
+    }
+}
+
+/// Mailbox result returned only after the normal effect journal records a succeeded host commit.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryCommitReceipt {
+    pub schema_version: u32,
+    pub message_id: String,
+    pub commit_operation_id: OperationId,
+    pub worktree_id: String,
+    pub repository_id: String,
+    pub base_sha: String,
+    pub manifest_artifact: RoleArtifactReference,
+    pub commit: crate::host_commit::HostCommitReceipt,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryManifestRequest {
@@ -240,9 +341,23 @@ impl RepositoryManifestRequest {
     pub fn build(&self, root: &Path) -> Result<crate::host_commit::ChangeManifest, String> {
         let root =
             fs::canonicalize(root).map_err(|error| format!("canonicalize worktree: {error}"))?;
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for item in &self.entries {
+        let mut items = self.entries.clone();
+        items.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut entries = Vec::with_capacity(items.len());
+        for item in &items {
             let relative = Path::new(&item.path);
+            if relative.components().any(|component| {
+                let std::path::Component::Normal(part) = component else {
+                    return true;
+                };
+                let part = part.to_string_lossy();
+                part.eq_ignore_ascii_case(".git")
+                    || part.eq_ignore_ascii_case(".rex-projects")
+                    || part.eq_ignore_ascii_case(".rex-projects-mailbox")
+                    || part.eq_ignore_ascii_case(".rex-projects-control")
+            }) {
+                return Err("manifest path names a reserved Git or mailbox location".into());
+            }
             let full = root.join(relative);
             match item.operation {
                 ManifestOperation::Delete => {
@@ -556,5 +671,58 @@ mod tests {
         snapshot.validate().unwrap();
         snapshot.inputs[0].host_artifacts[0].path = "../../outside".into();
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn recovery_wake_decodes_only_host_authorized_same_node_input() {
+        let authorization = WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: crate::domain::ids::TicketRunId::parse("ticket-run-1").unwrap(),
+            ticket_revision: 3,
+            work_node_id: crate::engine::orchestration::WorkNodeId::parse("worker-1").unwrap(),
+            accepted_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            prior_worker_agent_run_id: crate::domain::ids::AgentRunId::parse("worker-run-1")
+                .unwrap(),
+            prior_terminal_digest: Digest::parse("b".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("c".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: None,
+            prior_host_commit_receipt_digest: None,
+            expected_head: "d".repeat(40),
+            source_coordinator_evidence_id: "coordinator-evidence".into(),
+            prior_worker_result_evidence_id: "worker-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        };
+        let mut snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role_session_id: "ticket:ticket-run-1:worker:worker-1".into(),
+            agent_run_id: "worker-run-2".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: vec![AgentWakeItem {
+                wake_input_id: 1,
+                source_type: "worker_recovery_authorization".into(),
+                source_id: "worker-evidence".into(),
+                source_revision: 3,
+                priority: 10,
+                payload_json: serde_json::json!({"authorization": authorization}),
+                host_artifacts: Vec::new(),
+            }],
+        };
+        snapshot.digest = snapshot.content_digest().unwrap();
+        snapshot.validate().unwrap();
+        assert_eq!(
+            snapshot
+                .worker_recovery_authorization()
+                .unwrap()
+                .unwrap()
+                .expected_head,
+            "d".repeat(40)
+        );
+
+        snapshot.role_session_id = "ticket:ticket-run-1:worker:worker-2".into();
+        assert!(snapshot.worker_recovery_authorization().is_err());
+        snapshot.role_session_id = "ticket:ticket-run-1:worker:worker-1".into();
+        snapshot.inputs[0].source_revision = 2;
+        assert!(snapshot.worker_recovery_authorization().is_err());
     }
 }

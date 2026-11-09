@@ -346,6 +346,10 @@ enum AgentCommand {
         #[arg(long, default_value_t = 60)]
         wait_seconds: u64,
     },
+    Repository {
+        #[command(subcommand)]
+        command: AgentRepositoryCommand,
+    },
     Receipt {
         #[arg(long, env = "REX_PROJECTS_CONTROL_DIR")]
         control_dir: PathBuf,
@@ -362,6 +366,37 @@ enum AgentCommand {
         #[arg(long, default_value_t = 0)]
         after: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentRepositoryCommand {
+    /// Build and register a Change manifest from this launch's assigned worktree.
+    Manifest {
+        #[arg(long)]
+        paths_file: PathBuf,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long, default_value_t = 60)]
+        wait_seconds: u64,
+    },
+    /// Ask the host to commit a registered Change manifest and return its durable receipt.
+    Commit(AgentRepositoryCommitArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentRepositoryCommitArgs {
+    #[arg(long)]
+    expected_head: String,
+    #[arg(long)]
+    manifest_reference_file: PathBuf,
+    #[arg(long)]
+    message_file: PathBuf,
+    #[arg(long)]
+    message_id: String,
+    #[arg(long, default_value_t = 300)]
+    wait_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -2813,7 +2848,7 @@ fn publish_owner_projection(
 }
 
 fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
-    use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+    use crate::mailbox::{MailboxCapability, unix_time_now};
     use crate::protocol::RequestEnvelope;
     use serde_json::Value;
     match command {
@@ -2903,9 +2938,8 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                     "mailbox requests require matching run_id/request_id and complete Project, attempt, epoch, revision, role, and type scope",
                 ));
             }
-            let capability =
-                MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
-                    .map_err(CliError::unavailable)?;
+            let capability = MailboxCapability::open_registered_for_run(&run_id, &control_dir)
+                .map_err(CliError::unavailable)?;
             let now = unix_time_now().map_err(CliError::unexpected)?;
             let queued = capability
                 .queue(&request_id, &bytes, now)
@@ -2953,14 +2987,24 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
             wait_seconds,
             json,
         ),
+        AgentCommand::Repository { command } => match command {
+            AgentRepositoryCommand::Manifest {
+                paths_file,
+                output,
+                message_id,
+                wait_seconds,
+            } => agent_repository_manifest(paths_file, output, message_id, wait_seconds, json),
+            AgentRepositoryCommand::Commit(args) => {
+                agent_repository_commit(control_dir_for_agent()?, run_id_for_agent()?, args, json)
+            }
+        },
         AgentCommand::Receipt {
             control_dir,
             run_id,
             request_id,
         } => {
-            let capability =
-                MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
-                    .map_err(CliError::unavailable)?;
+            let capability = MailboxCapability::open_registered_for_run(&run_id, &control_dir)
+                .map_err(CliError::unavailable)?;
             let receipt = capability
                 .read_receipt(&request_id, unix_time_now().map_err(CliError::unexpected)?)
                 .map_err(CliError::unexpected)?;
@@ -3007,6 +3051,335 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
     }
 }
 
+fn agent_repository_manifest(
+    paths_file: PathBuf,
+    output: String,
+    message_id: String,
+    wait_seconds: u64,
+    json: bool,
+) -> Result<(), CliError> {
+    if std::env::var("REX_PROJECTS_AGENT").as_deref() != Ok("1")
+        || std::env::var("REX_PROJECTS_ROLE").as_deref() != Ok("worker")
+        || std::env::var("REX_PROJECTS_COMMIT_MODE").as_deref() != Ok("host")
+    {
+        return Err(CliError::conflict(
+            "agent repository manifest requires a host-commit Worker launch",
+        ));
+    }
+    let worktree = std::env::var_os("REX_PROJECTS_WORKTREE_PATH")
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::conflict("immutable Worker worktree assignment is absent"))?;
+    let worktree_id = std::env::var("REX_PROJECTS_WORKTREE_ID")
+        .map_err(|_| CliError::conflict("immutable Worker node assignment is absent"))?;
+    let request =
+        crate::agent_api::RepositoryManifestRequest::from_paths_file(worktree_id, &paths_file)
+            .map_err(CliError::usage)?;
+    let manifest = request.build(&worktree).map_err(CliError::usage)?;
+    crate::agent_api::validate_relative_path(&output).map_err(CliError::usage)?;
+    let root = std::env::current_dir()
+        .map_err(|error| CliError::unexpected(error.to_string()))?
+        .canonicalize()
+        .map_err(|error| CliError::unexpected(error.to_string()))?;
+    let destination = root.join(&output);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| CliError::usage("manifest output must name a file"))?;
+    std::fs::create_dir_all(parent).map_err(|error| CliError::unavailable(error.to_string()))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|error| CliError::unavailable(error.to_string()))?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(CliError::usage(
+            "manifest output escapes the Agent workspace",
+        ));
+    }
+    let destination = canonical_parent.join(
+        destination
+            .file_name()
+            .ok_or_else(|| CliError::usage("manifest output must name a file"))?,
+    );
+    let bytes =
+        serde_json::to_vec(&manifest).map_err(|error| CliError::unexpected(error.to_string()))?;
+    let control_dir = control_dir_for_agent()?;
+    let run_id = run_id_for_agent()?;
+    let mailbox =
+        crate::mailbox::MailboxCapability::open_registered_for_run(run_id.clone(), &control_dir)
+            .map_err(CliError::unavailable)?;
+    let created_output = match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(CliError::conflict(
+                    "manifest output already exists and is not a regular file",
+                ));
+            }
+            if std::fs::read(&destination)
+                .map_err(|error| CliError::unavailable(error.to_string()))?
+                != bytes
+            {
+                return Err(CliError::conflict(
+                    "manifest output already exists with different content",
+                ));
+            }
+            if acknowledged_manifest_receipt(&mailbox, &message_id, &bytes)?.is_none() {
+                return Err(CliError::conflict(
+                    "manifest output already exists without its matching artifact receipt",
+                ));
+            }
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .map_err(|error| {
+                    CliError::unavailable(format!("create manifest output: {error}"))
+                })?;
+            std::io::Write::write_all(&mut file, &bytes)
+                .map_err(|error| CliError::unavailable(error.to_string()))?;
+            true
+        }
+        Err(error) => return Err(CliError::unavailable(error.to_string())),
+    };
+    let add_result = agent_artifact_add(
+        control_dir.clone(),
+        run_id.clone(),
+        output,
+        AgentArtifactKind::Change,
+        1,
+        message_id.clone(),
+        wait_seconds,
+        json,
+    );
+    if let Ok(()) = add_result
+        && acknowledged_manifest_receipt(&mailbox, &message_id, &bytes)?.is_some()
+    {
+        remove_unchanged_manifest_output(&destination, &bytes)?;
+    } else if created_output
+        && add_result.is_err()
+        && let Ok(now) = crate::mailbox::unix_time_now()
+        && matches!(mailbox.has_queued_request(&message_id, now), Ok(false))
+    {
+        // A failed queue attempt must not strand this invocation's generated output.
+        remove_unchanged_manifest_output(&destination, &bytes)?;
+    }
+    add_result
+}
+
+fn remove_unchanged_manifest_output(destination: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && std::fs::read(destination)
+                    .map_err(|error| CliError::unavailable(error.to_string()))?
+                    == bytes =>
+        {
+            std::fs::remove_file(destination).map_err(|error| {
+                CliError::unavailable(format!("remove generated manifest: {error}"))
+            })
+        }
+        Ok(_) => Err(CliError::conflict(
+            "manifest output changed during registration; preserved it",
+        )),
+        Err(error) => Err(CliError::unavailable(error.to_string())),
+    }
+}
+
+fn acknowledged_manifest_receipt(
+    mailbox: &crate::mailbox::MailboxCapability,
+    message_id: &str,
+    manifest_bytes: &[u8],
+) -> Result<Option<Vec<u8>>, CliError> {
+    use crate::mailbox::unix_time_now;
+    use sha2::Digest as _;
+
+    let Some(receipt) = mailbox
+        .read_receipt(message_id, unix_time_now().map_err(CliError::unexpected)?)
+        .map_err(CliError::unexpected)?
+    else {
+        return Ok(None);
+    };
+    let response: ResponseEnvelope<serde_json::Value> =
+        crate::protocol::parse_unique(&receipt).map_err(CliError::unexpected)?;
+    response
+        .validate_for(&RequestId::new(message_id).map_err(CliError::usage)?)
+        .map_err(CliError::unexpected)?;
+    let Some(result) = response.result else {
+        return Err(CliError::conflict(
+            "controller rejected manifest artifact registration",
+        ));
+    };
+    let result: crate::agent_api::ArtifactAddReceipt =
+        serde_json::from_value(result).map_err(|error| CliError::unexpected(error.to_string()))?;
+    crate::agent_api::validate_relative_path(&result.artifact.path)
+        .map_err(CliError::unexpected)?;
+    let expected_digest = format!("{:x}", sha2::Sha256::digest(manifest_bytes));
+    if result.schema_version != 1
+        || result.message_id != message_id
+        || result.artifact.kind != crate::engine::orchestration::RoleArtifactKind::Change
+        || result.artifact.schema_version != 1
+        || result.artifact.digest.as_str() != expected_digest
+        || result.artifact.bytes != manifest_bytes.len() as u64
+    {
+        return Err(CliError::conflict(
+            "artifact receipt does not acknowledge this Change manifest",
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+fn agent_repository_commit(
+    control_dir: PathBuf,
+    run_id: String,
+    args: AgentRepositoryCommitArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    use crate::mailbox::{MailboxCapability, unix_time_now};
+    let AgentRepositoryCommitArgs {
+        expected_head,
+        manifest_reference_file,
+        message_file,
+        message_id,
+        wait_seconds,
+    } = args;
+    if wait_seconds > 300 {
+        return Err(CliError::usage(
+            "repository commit receipt wait is limited to five minutes",
+        ));
+    }
+    let required = |name: &str| {
+        std::env::var(name)
+            .map_err(|_| CliError::usage(format!("required Agent context `{name}` is absent")))
+    };
+    if required("REX_PROJECTS_AGENT")? != "1"
+        || required("REX_PROJECTS_ROLE")? != "worker"
+        || required("REX_PROJECTS_COMMIT_MODE")? != "host"
+    {
+        return Err(CliError::conflict(
+            "agent repository commit requires a host-commit Worker launch",
+        ));
+    }
+    let worktree_id = required("REX_PROJECTS_WORKTREE_ID")?;
+    let message =
+        std::fs::read(&message_file).map_err(|error| CliError::unavailable(error.to_string()))?;
+    if message.len() > 16_000 {
+        return Err(CliError::usage("commit message exceeds 16,000 bytes"));
+    }
+    let commit_message =
+        String::from_utf8(message).map_err(|error| CliError::usage(error.to_string()))?;
+    let reference_bytes = std::fs::read(&manifest_reference_file)
+        .map_err(|error| CliError::unavailable(error.to_string()))?;
+    if reference_bytes.len() > 64 * 1024 {
+        return Err(CliError::usage("manifest reference exceeds 64 KiB"));
+    }
+    let manifest: crate::engine::orchestration::RoleArtifactReference =
+        crate::protocol::parse_unique(&reference_bytes).map_err(CliError::usage)?;
+    let request = crate::agent_api::RepositoryCommitRequest {
+        schema_version: 1,
+        message_id: message_id.clone(),
+        worktree_id,
+        expected_head,
+        manifest_digest: manifest.digest.clone(),
+        manifest,
+        commit_message,
+    };
+    request.validate().map_err(CliError::usage)?;
+    let project_id =
+        ProjectId::parse(required("REX_PROJECTS_PROJECT_ID")?).map_err(CliError::usage)?;
+    let operation_id =
+        crate::domain::ids::OperationId::parse(required("REX_PROJECTS_OPERATION_ID")?)
+            .map_err(CliError::usage)?;
+    let role = serde_json::from_value::<crate::domain::types::Role>(serde_json::Value::String(
+        required("REX_PROJECTS_ROLE")?,
+    ))
+    .map_err(|error| CliError::usage(format!("invalid Agent role context: {error}")))?;
+    let attempt = required("REX_PROJECTS_ATTEMPT")?
+        .parse::<u32>()
+        .map_err(|error| CliError::usage(error.to_string()))?;
+    let run_epoch = required("REX_PROJECTS_RUN_EPOCH")?
+        .parse::<u64>()
+        .map_err(|error| CliError::usage(error.to_string()))?;
+    let expected_subject_revision = required("REX_PROJECTS_SUBJECT_REVISION")?
+        .parse::<u64>()
+        .map_err(|error| CliError::usage(error.to_string()))?;
+    let envelope = RequestEnvelope {
+        schema_version: crate::protocol::SCHEMA_VERSION,
+        request_id: crate::protocol::RequestId::new(message_id.clone()).map_err(CliError::usage)?,
+        operation_id: Some(operation_id),
+        method: crate::protocol::MethodName::new("repository.commit").map_err(CliError::usage)?,
+        project_id: Some(project_id),
+        run_id: Some(run_id.clone()),
+        attempt: Some(attempt),
+        run_epoch: Some(run_epoch),
+        expected_subject_revision: Some(expected_subject_revision),
+        role: Some(role),
+        request_type: Some("repository_commit".into()),
+        params: serde_json::to_value(request)
+            .map_err(|error| CliError::unexpected(error.to_string()))?,
+    };
+    let bytes =
+        serde_json::to_vec(&envelope).map_err(|error| CliError::unexpected(error.to_string()))?;
+    let mailbox = MailboxCapability::open_registered_for_run(run_id, &control_dir)
+        .map_err(CliError::unavailable)?;
+    mailbox
+        .queue(
+            &message_id,
+            &bytes,
+            unix_time_now().map_err(CliError::unexpected)?,
+        )
+        .map_err(CliError::conflict)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait_seconds);
+    loop {
+        if let Some(receipt) = mailbox
+            .read_receipt(&message_id, unix_time_now().map_err(CliError::unexpected)?)
+            .map_err(CliError::unexpected)?
+        {
+            let response: ResponseEnvelope<serde_json::Value> =
+                crate::protocol::parse_unique(&receipt).map_err(CliError::unexpected)?;
+            response
+                .validate_for(
+                    &crate::protocol::RequestId::new(message_id.clone())
+                        .map_err(CliError::usage)?,
+                )
+                .map_err(CliError::unexpected)?;
+            if let Some(error) = response.error {
+                return Err(CliError::conflict(format!(
+                    "controller rejected repository.commit: {}",
+                    error.message
+                )));
+            }
+            std::io::Write::write_all(&mut std::io::stdout().lock(), &receipt)
+                .map_err(|error| CliError::unexpected(error.to_string()))?;
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pending = serde_json::json!({"state":"queued","request_id":message_id});
+    if json {
+        print_json(&pending)
+    } else {
+        println!("Repository commit request is queued; host receipt is pending.");
+        Ok(())
+    }
+}
+
+fn control_dir_for_agent() -> Result<PathBuf, CliError> {
+    std::env::var_os("REX_PROJECTS_CONTROL_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::usage("required Agent context `REX_PROJECTS_CONTROL_DIR` is absent")
+        })
+}
+
+fn run_id_for_agent() -> Result<String, CliError> {
+    std::env::var("REX_PROJECTS_RUN_ID")
+        .map_err(|_| CliError::usage("required Agent context `REX_PROJECTS_RUN_ID` is absent"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn agent_artifact_add(
     control_dir: PathBuf,
@@ -3018,7 +3391,7 @@ fn agent_artifact_add(
     wait_seconds: u64,
     json: bool,
 ) -> Result<(), CliError> {
-    use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+    use crate::mailbox::{MailboxCapability, unix_time_now};
     if wait_seconds > 300 {
         return Err(CliError::usage(
             "artifact receipt wait is limited to five minutes",
@@ -3077,9 +3450,8 @@ fn agent_artifact_add(
     };
     let bytes =
         serde_json::to_vec(&envelope).map_err(|error| CliError::unexpected(error.to_string()))?;
-    let mailbox =
-        MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
-            .map_err(CliError::unavailable)?;
+    let mailbox = MailboxCapability::open_registered_for_run(run_id, &control_dir)
+        .map_err(CliError::unavailable)?;
     mailbox
         .queue(
             &message_id,

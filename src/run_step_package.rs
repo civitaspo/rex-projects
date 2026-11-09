@@ -224,6 +224,7 @@ mod tests {
                 controller_generation: 1,
                 workspace: "/tmp/workspace".into(),
                 control_dir: "/tmp/control".into(),
+                worker_assignment: None,
                 rex_session_id: "session".into(),
                 rex_block_id: RexBlockId::parse("block").unwrap(),
                 profile_digest: profile_digest.clone(),

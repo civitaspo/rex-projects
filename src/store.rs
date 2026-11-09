@@ -3388,6 +3388,17 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
+        tx.execute(
+            "UPDATE controller_commands \
+             SET state='rejected',result_json=?1,applied_by_generation=?2,applied_at_unix=?3 \
+             WHERE kind='machine_stop' AND state='pending' AND expected_generation!=?2",
+            params![
+                serde_json::json!({"error":"owner generation changed"}).to_string(),
+                owner_generation,
+                now_unix()?,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         let row: Option<PendingControlRow> = tx.query_row(
             "SELECT request_id, kind, project_id, lifecycle, payload_json, created_at_unix FROM controller_commands WHERE state='pending' ORDER BY sequence LIMIT 1",
             [],
@@ -5249,6 +5260,89 @@ mod tests {
     }
 
     #[test]
+    fn stale_machine_stop_is_rejected_without_stopping_the_new_owner() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: nonce.into(),
+            executable_path: "/tmp/rex-projects-test".into(),
+            executable_digest: "f".repeat(64),
+            rex_endpoint: None,
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let first_generation = store.start_owner(&owner("first")).unwrap();
+        let stop = |request_id: &str| ControlCommand {
+            request_id: request_id.into(),
+            kind: "machine_stop".into(),
+            project_id: None,
+            lifecycle: None,
+            created_at_unix: 1,
+            applied_config: None,
+        };
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-first-owner",
+            &stop("stop-first-owner"),
+            first_generation,
+        )
+        .unwrap();
+
+        store.stop_owner(first_generation).unwrap();
+        let second_generation = store.start_owner(&owner("second")).unwrap();
+        assert!(
+            store
+                .process_next_control(second_generation)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.should_stop(second_generation).unwrap());
+        assert!(
+            store
+                .process_next_control(second_generation)
+                .unwrap()
+                .is_none()
+        );
+
+        let stale: (String, u64, String) = store
+            .connection
+            .query_row(
+                "SELECT state,applied_by_generation,result_json FROM controller_commands WHERE request_id='stop-first-owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stale.0, "rejected");
+        assert_eq!(stale.1, second_generation);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stale.2).unwrap()["error"],
+            "owner generation changed"
+        );
+
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-second-owner",
+            &stop("stop-second-owner"),
+            second_generation,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .process_next_control(second_generation)
+                .unwrap()
+                .unwrap()
+                .kind,
+            "machine_stop"
+        );
+        assert!(store.should_stop(second_generation).unwrap());
+    }
+
+    #[test]
     fn append_control_waits_for_concurrent_writer_before_validating_owner() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -6933,40 +7027,28 @@ mod tests {
         );
 
         let accepted = corrected_snapshot.accepted_plan();
-        let mut publication_facts = corrected_snapshot
-            .publication_receipts()
+        let validated_publications =
+            crate::delivery_runtime::validate_implementation_publication_receipt(
+                &accepted.proposal,
+                corrected_snapshot.prepared_receipt(),
+                &project_id,
+                &config.repositories,
+                corrected_snapshot.publication_receipts(),
+            )
+            .unwrap();
+        let subject = crate::delivery_runtime::implementation_publication_set_subject(
+            &accepted.plan_digest,
+            &accepted.proposal,
+            &validated_publications,
+            corrected_snapshot.publication_receipts(),
+            corrected_snapshot.publication_revision(),
+        )
+        .unwrap();
+        let subject_digest = subject.digest().unwrap().to_string();
+        let evidence_coverage = subject
+            .coverage
             .iter()
-            .map(|receipt| {
-                let publication: ImplementationPublicationReceipt =
-                    serde_json::from_str(receipt.receipt_json()).unwrap();
-                serde_json::json!({
-                    "work_node_id": publication.work_node_id,
-                    "repository_id": publication.repository_id,
-                    "pull_request_number": publication.pull_request.number,
-                    "pull_request_node_id": publication.pull_request.node_id,
-                    "pull_request_head": publication.pull_request.source_head,
-                    "published_head": publication.push.pushed_head,
-                    "receipt_digest": format!("{:x}", sha2::Sha256::digest(receipt.receipt_json().as_bytes())),
-                })
-            })
-            .collect::<Vec<_>>();
-        publication_facts
-            .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
-        let publication_subject = serde_json::json!({
-            "ticket_run_id": ticket_run_id,
-            "accepted_plan_digest": accepted.plan_digest,
-            "publications": publication_facts,
-        });
-        let subject_digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&publication_subject).unwrap())
-        );
-        let evidence_coverage = accepted
-            .proposal
-            .nodes
-            .iter()
-            .filter(|node| !node.investigation)
-            .map(|node| node.id.as_str().to_owned())
+            .map(|id| id.as_str())
             .collect::<Vec<_>>();
         let structured_result = serde_json::json!({
             "subject_kind": "implementation_publication_set",
@@ -7017,6 +7099,24 @@ mod tests {
                 &config,
                 config_digest.clone(),
                 &tampered,
+            )
+            .is_err()
+        );
+        let mut wrong_coverage = reviewer_evidence.ingested.clone();
+        let crate::engine::orchestration::RoleResultPayload::ReviewReady(assessment) =
+            &mut wrong_coverage.validated.typed_payload
+        else {
+            panic!("validated reviewer evidence has the wrong payload type");
+        };
+        assessment.evidence_coverage = vec!["different-node".into()];
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &wrong_coverage,
             )
             .is_err()
         );

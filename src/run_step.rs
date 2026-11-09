@@ -139,6 +139,9 @@ pub struct RunDescriptor {
     pub controller_generation: u64,
     pub workspace: PathBuf,
     pub control_dir: PathBuf,
+    /// Host-validated Worker assignment copied from the immutable launch reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_assignment: Option<crate::launch::WorkerLaunchBinding>,
     pub rex_session_id: String,
     pub rex_block_id: RexBlockId,
     pub profile_digest: Digest,
@@ -1970,6 +1973,25 @@ fn factory_environment(
             OsString::from(ticket_run_id.as_str()),
         );
     }
+    if let Some(worker) = &descriptor.worker_assignment {
+        let commit_mode = match worker.commit_mode {
+            CommitMode::Auto => "auto",
+            CommitMode::Native => "native",
+            CommitMode::Host => "host",
+        };
+        environment.insert(
+            OsString::from("REX_PROJECTS_COMMIT_MODE"),
+            OsString::from(commit_mode),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_WORKTREE_ID"),
+            OsString::from(worker.node_id.as_str()),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_WORKTREE_PATH"),
+            worker.worktree_path.as_os_str().to_owned(),
+        );
+    }
     environment.insert(
         OsString::from("REX_SESSION"),
         OsString::from(&descriptor.rex_session_id),
@@ -2240,6 +2262,7 @@ mod tests {
             controller_generation: 3,
             workspace: root.join("workspace"),
             control_dir: root.join("control"),
+            worker_assignment: None,
             rex_session_id: "session-a".into(),
             rex_block_id: RexBlockId::parse("block-a").unwrap(),
             profile_digest: profile_digest.clone(),
@@ -2548,6 +2571,261 @@ mod tests {
             env.get(OsStr::new("PATH")).and_then(|v| v.to_str()),
             Some("/usr/bin")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_worker_environment_can_queue_the_actual_repository_manifest_cli() {
+        use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+
+        let root = tempdir().unwrap();
+        let mut turn = request(root.path(), AgentAdapter::Codex, "/bin/sh");
+        turn.profile.commit_mode = CommitMode::Host;
+        turn.descriptor.provider_capability = fixture_capability(
+            &turn.profile,
+            turn.descriptor.profile_digest.clone(),
+            &turn.descriptor.result_schema,
+        );
+        turn.descriptor.worker_assignment = Some(
+            serde_json::from_value(json!({
+                "schema_version": 1,
+                "accepted_revision": 1,
+                "ticket_revision": 1,
+                "configuration_digest": "a".repeat(64),
+                "plan_digest": "b".repeat(64),
+                "node_id": "documentation-node",
+                "repository_id": "repository-a",
+                "commit_mode": "host",
+                "worktree_path": turn.descriptor.workspace,
+                "branch": "rex-projects/documentation-node",
+                "base_sha": "1".repeat(40),
+                "prepare_operation_id": "prepare-a",
+                "prepare_receipt_digest": "c".repeat(64),
+                "source_evidence_id": "evidence-a",
+                "source_agent_run_id": "coordinator-a",
+                "source_message_id": "plan-a",
+                "source_result_digest": "d".repeat(64),
+                "coordinator_agent_run_id": "coordinator-a",
+                "coordinator_role_session_id": "coordinator-session-a",
+                "coordinator_authority_digest": "e".repeat(64),
+            }))
+            .unwrap(),
+        );
+        for key in [
+            "REX_PROJECTS_COMMIT_MODE",
+            "REX_PROJECTS_WORKTREE_ID",
+            "REX_PROJECTS_WORKTREE_PATH",
+        ] {
+            turn.environment.insert(key.into(), "stale".into());
+        }
+        let mailbox = MailboxCapability::create(
+            turn.descriptor.run_id.as_str(),
+            &turn.descriptor.control_dir,
+            unix_time_now().unwrap() + 60,
+            MailboxLimits::default(),
+        )
+        .unwrap();
+        fs::write(
+            turn.descriptor.workspace.join("documentation.md"),
+            "Verified documentation.\n",
+        )
+        .unwrap();
+        let paths = turn.descriptor.control_dir.join("paths.json");
+        fs::write(
+            &paths,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "worktree_id": "documentation-node",
+                "entries": [{"path":"documentation.md", "operation":"capture"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let prepared = prepare_with_qualification(&turn, true, false).unwrap();
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("rex-projects");
+        let run_manifest = |output_path: &str, message_id: &str| {
+            std::process::Command::new(&binary)
+                .args(["agent", "repository", "manifest", "--paths-file"])
+                .arg(&paths)
+                .args(["--output", output_path, "--message-id", message_id])
+                .args(["--wait-seconds", "0", "--json"])
+                .env_clear()
+                .envs(&prepared.environment)
+                .current_dir(&prepared.working_directory)
+                .output()
+                .unwrap()
+        };
+        let collision = turn.descriptor.workspace.join("collision.json");
+        fs::write(&collision, "ordinary user file\n").unwrap();
+        let collision_result = run_manifest("collision.json", "worker-collision");
+        assert!(!collision_result.status.success());
+        assert_eq!(fs::read(&collision).unwrap(), b"ordinary user file\n");
+        fs::remove_file(&collision).unwrap();
+
+        let symlink_target = turn.descriptor.workspace.join("documentation.md");
+        let symlink_output = turn.descriptor.workspace.join("symlink.json");
+        std::os::unix::fs::symlink(&symlink_target, &symlink_output).unwrap();
+        let symlink_result = run_manifest("symlink.json", "worker-symlink");
+        assert!(!symlink_result.status.success());
+        assert!(
+            fs::symlink_metadata(&symlink_output)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&symlink_output).unwrap();
+
+        let output = run_manifest("manifest.json", "worker-manifest");
+        assert!(
+            output.status.success(),
+            "actual manifest CLI failed: {} {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let manifest: crate::host_commit::ChangeManifest = serde_json::from_slice(
+            &fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&manifest).unwrap()["entries"][0]["path"],
+            "documentation.md"
+        );
+        assert_eq!(manifest.entries.len(), 1);
+        let pending = mailbox.pending(unix_time_now().unwrap()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&pending[0].envelope.method).unwrap(),
+            "artifact.add"
+        );
+        assert_eq!(pending[0].envelope.params["path"], "manifest.json");
+
+        for index in 0..31 {
+            let message_id = format!("queue-fill-{index}");
+            let mut request = serde_json::to_value(&pending[0].envelope).unwrap();
+            request["request_id"] = json!(message_id);
+            request["params"]["message_id"] = json!(message_id);
+            mailbox
+                .queue(
+                    &message_id,
+                    &serde_json::to_vec(&request).unwrap(),
+                    unix_time_now().unwrap(),
+                )
+                .unwrap();
+        }
+        let full = run_manifest("queue-retry.json", "worker-queue-retry");
+        assert!(!full.status.success());
+        assert!(String::from_utf8_lossy(&full.stdout).contains("pending request count"));
+        assert!(
+            !turn.descriptor.workspace.join("queue-retry.json").exists(),
+            "an unqueued, newly generated manifest must not strand a retry"
+        );
+        mailbox
+            .publish_receipt(
+                "queue-fill-0",
+                &serde_json::to_vec(&json!({
+                    "schema_version":1,"request_id":"queue-fill-0","result":{}
+                }))
+                .unwrap(),
+                unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let retry = run_manifest("queue-retry.json", "worker-queue-retry");
+        assert!(
+            retry.status.success(),
+            "queue capacity retry: {} {}",
+            String::from_utf8_lossy(&retry.stdout),
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        assert!(
+            mailbox
+                .pending(unix_time_now().unwrap())
+                .unwrap()
+                .iter()
+                .any(|request| request.request_id == "worker-queue-retry")
+        );
+
+        use sha2::Digest as _;
+        let manifest_bytes = fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap();
+        let premature_retry = run_manifest("manifest.json", "worker-manifest");
+        assert!(!premature_retry.status.success());
+        assert_eq!(
+            fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+            manifest_bytes
+        );
+        fs::write(
+            turn.descriptor.workspace.join("manifest.json"),
+            "changed while receipt was pending\n",
+        )
+        .unwrap();
+        let manifest_digest = crate::domain::ids::Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(&manifest_bytes)
+        ))
+        .unwrap();
+        let receipt = crate::protocol::ResponseEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new("worker-manifest").unwrap(),
+            result: Some(crate::agent_api::ArtifactAddReceipt {
+                schema_version: 1,
+                message_id: "worker-manifest".into(),
+                artifact: crate::engine::orchestration::RoleArtifactReference {
+                    artifact_id: crate::domain::ids::ArtifactId::parse("f".repeat(64)).unwrap(),
+                    kind: crate::engine::orchestration::RoleArtifactKind::Change,
+                    schema_version: 1,
+                    path: "artifacts/manifest.json".into(),
+                    digest: manifest_digest,
+                    bytes: manifest_bytes.len() as u64,
+                },
+            }),
+            error: None,
+            extensions: Default::default(),
+        };
+        mailbox
+            .publish_receipt(
+                "worker-manifest",
+                &serde_json::to_vec(&receipt).unwrap(),
+                unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let changed_result = run_manifest("manifest.json", "worker-manifest");
+        assert!(!changed_result.status.success());
+        assert_eq!(
+            fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+            b"changed while receipt was pending\n"
+        );
+        fs::write(
+            turn.descriptor.workspace.join("manifest.json"),
+            &manifest_bytes,
+        )
+        .unwrap();
+        let retried = run_manifest("manifest.json", "worker-manifest");
+        assert!(
+            retried.status.success(),
+            "actual manifest retry failed: {} {}",
+            String::from_utf8_lossy(&retried.stderr),
+            String::from_utf8_lossy(&retried.stdout)
+        );
+        assert!(!turn.descriptor.workspace.join("manifest.json").exists());
+
+        turn.descriptor.worker_assignment = None;
+        turn.descriptor.role = Role::Coordinator;
+        let coordinator = factory_environment(&turn.environment, &turn.descriptor).unwrap();
+        for key in [
+            "REX_PROJECTS_COMMIT_MODE",
+            "REX_PROJECTS_WORKTREE_ID",
+            "REX_PROJECTS_WORKTREE_PATH",
+        ] {
+            assert!(
+                !coordinator.contains_key(OsStr::new(key)),
+                "{key} leaked into Coordinator"
+            );
+        }
     }
 
     #[cfg(unix)]
