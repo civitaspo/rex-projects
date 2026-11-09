@@ -26,6 +26,7 @@ const COORDINATOR_INBOX_STAGE: &str = "supervisor_coordinator_inbox";
 const COORDINATOR_BLOCK_LOSS_STAGE: &str = "supervisor_coordinator_block_loss";
 const COORDINATOR_WORKER_INBOX_STAGE: &str = "supervisor_coordinator_worker_inbox";
 const HOST_COMMIT_REVIEWER_INBOX_STAGE: &str = "host_commit_reviewer_inbox";
+const WORKER_RECOVERY_INBOX_STAGE: &str = "worker_recovery_inbox";
 const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
 const FIXTURE_PROJECT_ID: &str = "operations_project";
 const FIXTURE_TICKET_NAMESPACE: &str = "fixture/acceptance";
@@ -58,6 +59,7 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
             if stage == COORDINATOR_INBOX_STAGE
                 || stage == COORDINATOR_BLOCK_LOSS_STAGE
                 || stage == COORDINATOR_WORKER_INBOX_STAGE
+                || stage == WORKER_RECOVERY_INBOX_STAGE
                 || stage == HOST_COMMIT_REVIEWER_INBOX_STAGE =>
         {
             Ok(Some(stage))
@@ -88,11 +90,13 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let coordinator_worker_inbox_stage = stage.as_deref() == Some(COORDINATOR_WORKER_INBOX_STAGE);
     let host_commit_reviewer_inbox_stage =
         stage.as_deref() == Some(HOST_COMMIT_REVIEWER_INBOX_STAGE);
-    let worker_connection_stage =
-        coordinator_worker_inbox_stage || host_commit_reviewer_inbox_stage;
+    let worker_recovery_inbox_stage = stage.as_deref() == Some(WORKER_RECOVERY_INBOX_STAGE);
+    let worker_connection_stage = coordinator_worker_inbox_stage
+        || host_commit_reviewer_inbox_stage
+        || worker_recovery_inbox_stage;
     let provider_roles: &[&str] = if host_commit_reviewer_inbox_stage {
         &["supervisor", "coordinator", "planner", "worker", "reviewer"]
-    } else if coordinator_worker_inbox_stage {
+    } else if coordinator_worker_inbox_stage || worker_recovery_inbox_stage {
         &["supervisor", "coordinator", "planner", "worker"]
     } else if bounded_coordinator_stage {
         &["supervisor", "coordinator"]
@@ -117,10 +121,15 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         &request,
         &executable,
         request.cli,
-        bounded_coordinator_stage && !worker_connection_stage,
-        coordinator_worker_inbox_stage,
-        false,
-        host_commit_reviewer_inbox_stage || coordinator_worker_inbox_stage,
+        ProfilePreparation {
+            hold_coordinator_after_inbox: bounded_coordinator_stage && !worker_connection_stage,
+            hold_worker_after_inbox: coordinator_worker_inbox_stage,
+            hold_reviewer_after_inbox: false,
+            host_worker: host_commit_reviewer_inbox_stage
+                || coordinator_worker_inbox_stage
+                || worker_recovery_inbox_stage,
+            worker_recovery_stage: worker_recovery_inbox_stage,
+        },
     )?;
     trace.push(json!({"step":"local_bare_repository_and_profiles","status":"passed","provider":"EMULATED"}));
 
@@ -472,6 +481,20 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                     break;
                 }
             }
+            if worker_recovery_inbox_stage {
+                for observation in &observations {
+                    if let Some(evidence) = worker_recovery_inbox_evidence(observation)? {
+                        trace.push(json!({"step":"typed_worker_recovery_wake_materialized","status":"passed","evidence":evidence}));
+                        worker_boundary_reached = true;
+                        let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
+                        trace.push(json!({"step":"bounded_stage_stop_request","status":if stop.status.is_some_and(|status| status.success()) {"queued"} else {"rejected"},"evidence":json_stdout(&stop)}));
+                        break;
+                    }
+                }
+                if worker_boundary_reached {
+                    break;
+                }
+            }
             if host_commit_reviewer_inbox_stage {
                 for observation in &observations {
                     if let Some(evidence) =
@@ -608,6 +631,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             .is_some_and(|proof| proof["status"] == "passed")
         && coordinator_boundary_reached
         && (!coordinator_worker_inbox_stage || worker_boundary_reached)
+        && (!worker_recovery_inbox_stage || worker_boundary_reached)
         && (!host_commit_reviewer_inbox_stage || host_commit_reviewer_boundary_reached)
         && stopped
         && coordinator_observation.is_some()
@@ -848,6 +872,95 @@ fn is_prepared_worker_inbox_observation(
         "base_sha":binding.base_sha,
         "prepare_operation_id":binding.prepare_operation_id,
         "prepare_receipt_digest":binding.prepare_receipt_digest.as_str()
+    })))
+}
+
+/// Proves the recovery wake reached the next actual production-generated Worker package and
+/// immutable snapshot. The native provider is deliberately not required for this connection gate.
+fn worker_recovery_inbox_evidence(observation: &Value) -> Result<Option<Value>, String> {
+    if observation["role"] != "worker" {
+        return Ok(None);
+    }
+    let Some(inputs) = observation["inbox_inputs"].as_array() else {
+        return Ok(None);
+    };
+    let Some(input) = inputs.iter().find(|input| {
+        input["source_type"] == "worker_recovery_authorization"
+            && input
+                .pointer("/payload_json/authorization/prior_worker_agent_run_id")
+                .is_some()
+    }) else {
+        return Ok(None);
+    };
+    let package_path = observation
+        .pointer("/input_files/package_path")
+        .and_then(Value::as_str)
+        .ok_or("recovery Worker observation has no package path")?;
+    let snapshot_path = observation
+        .pointer("/input_files/snapshot_path")
+        .and_then(Value::as_str)
+        .ok_or("recovery Worker observation has no wake snapshot path")?;
+    let package: Value = serde_json::from_slice(
+        &fs::read(package_path)
+            .map_err(|error| format!("read recovery Worker package: {error}"))?,
+    )
+    .map_err(|error| format!("parse recovery Worker package: {error}"))?;
+    let snapshot: Value = serde_json::from_slice(
+        &fs::read(snapshot_path)
+            .map_err(|error| format!("read recovery wake snapshot: {error}"))?,
+    )
+    .map_err(|error| format!("parse recovery wake snapshot: {error}"))?;
+    let package_bytes = fs::read(package_path)
+        .map_err(|error| format!("read recovery Worker package for digest check: {error}"))?;
+    let snapshot_bytes = fs::read(snapshot_path)
+        .map_err(|error| format!("read recovery wake snapshot for digest check: {error}"))?;
+    let package_digest = format!("{:x}", Sha256::digest(&package_bytes));
+    let snapshot_digest = format!("{:x}", Sha256::digest(&snapshot_bytes));
+    let authorization = &input["payload_json"]["authorization"];
+    let Some(prior_run_id) = authorization["prior_worker_agent_run_id"].as_str() else {
+        return Ok(None);
+    };
+    let snapshot_has_authorization = snapshot["inputs"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["source_type"] == "worker_recovery_authorization"
+                && item["payload_json"]["authorization"] == *authorization
+        })
+    });
+    let prompt = package["prompt"].as_str().unwrap_or_default();
+    let assignment = &observation["worker_assignment"];
+    let matching_input = snapshot_has_authorization
+        && observation
+            .pointer("/input_files/package_sha256")
+            .and_then(Value::as_str)
+            == Some(package_digest.as_str())
+        && observation
+            .pointer("/input_files/snapshot_digest")
+            .and_then(Value::as_str)
+            == Some(snapshot_digest.as_str())
+        && snapshot["agent_run_id"] == observation["run_id"]
+        && package["descriptor"]["role"] == "worker"
+        && package["descriptor"]["ticket_run_id"] == observation["ticket_run_id"]
+        && prompt.contains(prior_run_id)
+        && authorization["ticket_run_id"] == observation["ticket_run_id"]
+        && authorization["ticket_revision"] == input["source_revision"]
+        && authorization["work_node_id"] == assignment["node_id"]
+        && authorization["accepted_plan_digest"] == assignment["accepted_plan_digest"]
+        && authorization["expected_head"]
+            .as_str()
+            .is_some_and(|head| prompt.contains(head));
+    if !matching_input {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "run_id":observation["run_id"],
+        "ticket_run_id":observation["ticket_run_id"],
+        "prior_worker_agent_run_id":prior_run_id,
+        "work_node_id":assignment["node_id"],
+        "accepted_plan_digest":assignment["accepted_plan_digest"],
+        "expected_head":authorization["expected_head"],
+        "package_path":package_path,
+        "snapshot_path":snapshot_path,
+        "snapshot_contains_exact_authorization":snapshot_has_authorization
     })))
 }
 
@@ -1157,14 +1270,20 @@ fn prepare_local_repository(request: &Request<'_>, executable: &Path) -> Result<
     Ok(())
 }
 
-fn prepare_profiles(
-    request: &Request<'_>,
-    executable: &Path,
-    runtime_binary: &Path,
+#[derive(Clone, Copy, Default)]
+struct ProfilePreparation {
     hold_coordinator_after_inbox: bool,
     hold_worker_after_inbox: bool,
     hold_reviewer_after_inbox: bool,
     host_worker: bool,
+    worker_recovery_stage: bool,
+}
+
+fn prepare_profiles(
+    request: &Request<'_>,
+    executable: &Path,
+    runtime_binary: &Path,
+    preparation: ProfilePreparation,
 ) -> Result<(), String> {
     let profiles = request.fixture_root.join("profiles");
     let contexts = request.fixture_root.join("contexts");
@@ -1185,10 +1304,14 @@ fn prepare_profiles(
         fs::create_dir_all(&profile).map_err(|error| error.to_string())?;
         let scenario = format!("acceptance_{role}");
         let context = contexts.join(format!("{role}.json"));
-        let messages = profile_messages(role, host_worker)?;
-        let hold = (hold_coordinator_after_inbox && role == "coordinator")
-            || (hold_worker_after_inbox && role == "worker")
-            || (hold_reviewer_after_inbox && role == "reviewer");
+        let messages = if preparation.worker_recovery_stage {
+            profile_messages_with_worker_recovery(role, preparation.host_worker)?
+        } else {
+            profile_messages(role, preparation.host_worker)?
+        };
+        let hold = (preparation.hold_coordinator_after_inbox && role == "coordinator")
+            || (preparation.hold_worker_after_inbox && role == "worker")
+            || (preparation.hold_reviewer_after_inbox && role == "reviewer");
         fs::write(
             &context,
             serde_json::to_vec(
@@ -1210,7 +1333,7 @@ fn prepare_profiles(
                 .to_string(),
             runtime_binary.display().to_string()
         );
-        let commit_mode = if role == "worker" && host_worker {
+        let commit_mode = if role == "worker" && preparation.host_worker {
             "host"
         } else {
             "native"
@@ -1221,6 +1344,58 @@ fn prepare_profiles(
         fs::write(profile.join("config.toml"), config).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn profile_messages_with_worker_recovery(
+    role: &str,
+    host_worker: bool,
+) -> Result<Vec<Value>, String> {
+    let mut messages = profile_messages(role, host_worker)?;
+    match role {
+        "coordinator" => {
+            let workflow_indices = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message["lane"] == "workflow")
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if workflow_indices.len() < 3 {
+                return Err("Coordinator fixture has fewer than three workflow actions".into());
+            }
+            let indices = &workflow_indices;
+            messages[indices[2]] = message(
+                "coordinator",
+                "spawn_request",
+                json!({
+                    "work_node":"acceptance-node","role":"worker","profile_id":"fixture_worker",
+                    "plan_digest":{"$fixture_ref":"prompt.accepted_plan_digest"},
+                    "worker_recovery":{"$fixture_ref":"prompt.recovery_candidate"},
+                    "allowed_repositories":["fixture"],"artifact_inputs":[],"parent_run_id":null
+                }),
+            )
+            .with_lane("workflow");
+            messages.truncate(indices[2] + 1);
+        }
+        "worker" => {
+            let position = messages
+                .iter()
+                .position(|message| message["lane"] == "workflow")
+                .ok_or("Worker fixture has no workflow message")?;
+            let retry = messages[position].clone();
+            messages[position] = json!({
+                "role":"worker","lane":"workflow","kind":"progress",
+                "assertion":{"assertion":"blocked","reason":"fixture blocker before any commit"},
+                "structured_result":{
+                    "summary":"Blocked before making changes; retry this accepted node after the blocker is resolved.",
+                    "completed_node_keys":[],"pending_node_keys":["acceptance-node"],
+                    "evidence":[],"next_observation_at":null
+                }
+            });
+            messages.push(retry);
+        }
+        _ => {}
+    }
+    Ok(messages)
 }
 
 pub(crate) fn profile_messages(role: &str, host_worker: bool) -> Result<Vec<Value>, String> {
@@ -2498,6 +2673,10 @@ mod tests {
             parse_acceptance_stage(Some(HOST_COMMIT_REVIEWER_INBOX_STAGE.into())).unwrap(),
             Some(HOST_COMMIT_REVIEWER_INBOX_STAGE.into())
         );
+        assert_eq!(
+            parse_acceptance_stage(Some(WORKER_RECOVERY_INBOX_STAGE.into())).unwrap(),
+            Some(WORKER_RECOVERY_INBOX_STAGE.into())
+        );
         assert!(parse_acceptance_stage(Some("unknown".into())).is_err());
     }
 
@@ -2701,10 +2880,10 @@ mod tests {
             &request,
             &executable,
             request.cli,
-            true,
-            false,
-            false,
-            false,
+            ProfilePreparation {
+                hold_coordinator_after_inbox: true,
+                ..ProfilePreparation::default()
+            },
         )
         .unwrap();
         fs::write(root.join("config.toml"), config_text(&request, &executable)).unwrap();
@@ -2756,10 +2935,11 @@ mod tests {
                 &request,
                 &executable,
                 request.cli,
-                false,
-                hold_worker,
-                false,
-                expected_mode == rex_projects::domain::types::CommitMode::Host,
+                ProfilePreparation {
+                    hold_worker_after_inbox: hold_worker,
+                    host_worker: expected_mode == rex_projects::domain::types::CommitMode::Host,
+                    ..ProfilePreparation::default()
+                },
             )
             .unwrap();
             fs::write(root.join("config.toml"), config_text(&request, &executable)).unwrap();
@@ -2799,10 +2979,7 @@ mod tests {
             &request,
             &executable,
             request.cli,
-            false,
-            false,
-            false,
-            false,
+            ProfilePreparation::default(),
         )
         .unwrap();
 
@@ -2927,6 +3104,59 @@ mod tests {
     }
 
     #[test]
+    fn worker_recovery_fixture_spawns_same_node_from_a_prompt_candidate() {
+        let coordinator = profile_messages_with_worker_recovery("coordinator", true).unwrap();
+        let workflow = coordinator
+            .iter()
+            .filter(|message| message["lane"] == "workflow")
+            .collect::<Vec<_>>();
+        assert_eq!(workflow.len(), 3);
+        assert_eq!(workflow[2]["kind"], "spawn_request");
+        assert_eq!(workflow[2]["structured_result"]["role"], "worker");
+        assert_eq!(
+            workflow[2]["structured_result"]["work_node"],
+            "acceptance-node"
+        );
+        assert_eq!(
+            workflow[2]["structured_result"]["worker_recovery"]["$fixture_ref"],
+            "prompt.recovery_candidate"
+        );
+        assert_eq!(
+            workflow[2]["structured_result"]["plan_digest"]["$fixture_ref"],
+            "prompt.accepted_plan_digest"
+        );
+
+        let worker = profile_messages_with_worker_recovery("worker", true).unwrap();
+        let workflow = worker
+            .iter()
+            .filter(|message| message["lane"] == "workflow")
+            .collect::<Vec<_>>();
+        assert_eq!(workflow[0]["kind"], "progress");
+        assert_eq!(workflow[0]["assertion"]["assertion"], "blocked");
+        assert_eq!(workflow[1]["kind"], "implementation_ready");
+    }
+
+    #[test]
+    fn recovery_context_uses_the_production_fixture_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let context_path = root.path().join("coordinator.json");
+        fs::write(
+            &context_path,
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "scenario":"acceptance_coordinator",
+                "messages":profile_messages_with_worker_recovery("coordinator", true).unwrap()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = crate::fixtures::agent::read_context(&context_path)
+            .expect("production fixture reader accepts the generated recovery recipe");
+        assert_eq!(context.scenario, "acceptance_coordinator");
+    }
+
+    #[test]
     fn generated_supervisor_context_keeps_qualification_progress_separate_from_dispatch() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("acceptance");
@@ -2943,10 +3173,7 @@ mod tests {
             &request,
             &executable,
             request.cli,
-            false,
-            false,
-            false,
-            false,
+            ProfilePreparation::default(),
         )
         .unwrap();
         let context =
@@ -3045,10 +3272,7 @@ mod tests {
             &request,
             &executable,
             request.cli,
-            false,
-            false,
-            false,
-            false,
+            ProfilePreparation::default(),
         )
         .unwrap();
         let config = root.join("config.toml");

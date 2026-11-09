@@ -1543,7 +1543,20 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                     .map(|node| vec![node.repository.clone()])
                     .unwrap_or_else(|| project.repositories.clone()),
                 ticket,
-                recovery_summary: None,
+                recovery_summary: match (&active_run, &accepted_plan) {
+                    (Some(run), Some(plan)) if reservation.role == Role::Coordinator => {
+                        coordinator_worker_recovery_summary(
+                            store,
+                            owner_generation,
+                            run,
+                            plan,
+                            project,
+                            &self.applied_config.digest,
+                            &self.delivery_effects,
+                        )?
+                    }
+                    _ => None,
+                },
                 accepted_plan: match (&worker_context, &accepted_plan) {
                     (Some(context), _) => {
                         let recovery_authorization =
@@ -3102,35 +3115,21 @@ impl RuntimeServices {
                 recovery_summary: if candidate.role == Role::Coordinator
                     && active_run.phase == crate::engine::reducer::Phase::Implementing
                 {
-                    let candidates = if let Some(plan) = &accepted_plan {
-                        store.worker_recovery_candidates(
-                            self.owner_generation,
-                            &active_run,
-                            plan,
-                            &project,
-                            &self.configuration_digest,
-                        )?
-                    } else {
-                        Vec::new()
-                    };
-                    let mut verified_candidates = Vec::new();
-                    for candidate in candidates {
-                        let head = self
-                            .delivery
-                            .effects()
-                            .observe_local_head_at(&candidate.worktree_path)?;
-                        if head == candidate.expected_head {
-                            verified_candidates.push(candidate);
-                        }
-                    }
-                    if verified_candidates.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            serde_json::to_string(&verified_candidates)
-                                .map_err(|error| error.to_string())?,
-                        )
-                    }
+                    accepted_plan
+                        .as_ref()
+                        .map(|plan| {
+                            coordinator_worker_recovery_summary(
+                                store,
+                                self.owner_generation,
+                                &active_run,
+                                plan,
+                                &project,
+                                &self.configuration_digest,
+                                self.delivery.effects(),
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
                 } else {
                     None
                 },
@@ -3991,6 +3990,47 @@ fn resolve_prepared_worker_context_for_reservation(
     })
 }
 
+fn coordinator_worker_recovery_summary(
+    store: &ConfigStore,
+    owner_generation: u64,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    plan: &crate::store::accepted_plans::AcceptedWorkPlanRecord,
+    project: &crate::config::ProjectConfig,
+    configuration_digest: &Digest,
+    delivery: &crate::delivery_runtime::RepositoryDeliveryEffects,
+) -> Result<Option<String>, String> {
+    if run.phase != crate::engine::reducer::Phase::Implementing {
+        return Ok(None);
+    }
+    let candidates = store.worker_recovery_candidates(
+        owner_generation,
+        run,
+        plan,
+        project,
+        configuration_digest,
+    )?;
+    verified_worker_recovery_summary(candidates, |path| delivery.observe_local_head_at(path))
+}
+
+fn verified_worker_recovery_summary(
+    candidates: Vec<crate::engine::orchestration::WorkerRecoveryCandidate>,
+    mut observe_head: impl FnMut(&Path) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let mut verified = Vec::new();
+    for candidate in candidates {
+        if observe_head(&candidate.worktree_path)? == candidate.expected_head {
+            verified.push(candidate);
+        }
+    }
+    if verified.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_string(&verified)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<String, String> {
     let WorkerAssignmentContext {
         plan_record,
@@ -4106,6 +4146,107 @@ fn worker_recovery_authorization_from_inputs(
         return Err("non-Worker role cannot consume a Worker recovery authority".into());
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod coordinator_worker_recovery_prompt_tests {
+    use super::*;
+    use crate::domain::ids::{AgentRunId, Digest, TicketId};
+    use crate::domain::types::Role;
+    use crate::engine::orchestration::{WorkNodeId, WorkerRecoveryCandidate};
+    use crate::roles::{PromptContext, TicketBrief};
+    use std::process::Command;
+
+    fn git_head(path: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn verified_recovery_summary_reaches_the_coordinator_prompt_file() {
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let head = git_head(checkout);
+        let candidate = WorkerRecoveryCandidate {
+            work_node_id: WorkNodeId::parse("worker-node-a").unwrap(),
+            ticket_revision: 4,
+            worktree_path: checkout.to_owned(),
+            accepted_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            prior_worker_agent_run_id: AgentRunId::parse("prior-worker-run").unwrap(),
+            prior_host_commit_operation_id: None,
+            expected_head: head.clone(),
+            prior_terminal_digest: Digest::parse("b".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("c".repeat(64)).unwrap(),
+            prior_host_commit_receipt_digest: None,
+            prior_worker_result_evidence_id: "worker-result-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        };
+        let summary = verified_worker_recovery_summary(vec![candidate], |path| Ok(git_head(path)))
+            .unwrap()
+            .expect("matching host-observed HEAD should be advertised");
+        let applied = crate::config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
+        )
+        .expect("load the repository fixture configuration");
+        let rendered = crate::roles::render_role_prompt(
+            &applied,
+            &PromptContext {
+                project_id: crate::domain::ids::ProjectId::parse("goal_project").unwrap(),
+                profile_id: None,
+                role: Role::Coordinator,
+                operation_recipe: None,
+                repositories: vec![crate::domain::ids::RepositoryId::parse("example").unwrap()],
+                ticket: Some(TicketBrief {
+                    ticket_id: TicketId::parse("PAY-12").unwrap(),
+                    ticket_revision: 4,
+                    title: "Recover a blocked worker".into(),
+                    body: "Retry the same accepted node after the blocker is removed.".into(),
+                    acceptance: Vec::new(),
+                }),
+                recovery_summary: Some(summary),
+                accepted_plan: None,
+                accepted_plan_digest: None,
+                implementation_publication_subject: None,
+                previous_decisions: Vec::new(),
+                required_evidence: Vec::new(),
+                stop_conditions: Vec::new(),
+                assigned_commit_mode: None,
+            },
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let prompt_path = workspace.path().join("coordinator-prompt.md");
+        std::fs::write(&prompt_path, rendered.text).unwrap();
+        let observed_prompt = std::fs::read_to_string(prompt_path).unwrap();
+        assert!(observed_prompt.contains("prior-worker-run"));
+        assert!(observed_prompt.contains(&head));
+
+        let stale = WorkerRecoveryCandidate {
+            work_node_id: WorkNodeId::parse("worker-node-a").unwrap(),
+            ticket_revision: 4,
+            worktree_path: checkout.to_owned(),
+            accepted_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            prior_worker_agent_run_id: AgentRunId::parse("stale-worker-run").unwrap(),
+            prior_host_commit_operation_id: None,
+            expected_head: "0".repeat(40),
+            prior_terminal_digest: Digest::parse("b".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("c".repeat(64)).unwrap(),
+            prior_host_commit_receipt_digest: None,
+            prior_worker_result_evidence_id: "stale-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        };
+        assert!(
+            verified_worker_recovery_summary(vec![stale], |path| Ok(git_head(path)))
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 fn validate_worker_recovery_assignment(

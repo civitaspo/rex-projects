@@ -513,6 +513,7 @@ fn validate_recipe_references(value: &Value) -> Result<(), String> {
                     | "worker.commit_shas"
                     | "worker.host_commit_operation_id"
                     | "prompt.accepted_plan_digest"
+                    | "prompt.recovery_candidate"
                     | "prompt.subject_digest"
                     | "prompt.evidence_coverage"
                     | "prompt.assessment_id"
@@ -1305,6 +1306,18 @@ fn resolve_references(
             if name == "ticket_revision" {
                 return Ok(json!(prompt_ticket(prompt)?.1));
             }
+            if name == "prompt.recovery_candidate" {
+                let summary = recovery_summary_from_prompt(prompt)?;
+                let candidates: Vec<Value> = serde_json::from_str(&summary)
+                    .map_err(|error| format!("parse Coordinator recovery candidates: {error}"))?;
+                let candidate = candidates
+                    .first()
+                    .ok_or("Coordinator recovery summary is empty")?;
+                return Ok(json!({
+                    "prior_worker_agent_run_id":candidate["prior_worker_agent_run_id"],
+                    "prior_host_commit_operation_id":candidate["prior_host_commit_operation_id"]
+                }));
+            }
             if name == "project_id" {
                 return Ok(json!(invocation.scope.project_id));
             }
@@ -1328,6 +1341,20 @@ fn resolve_references(
             .map(Value::Array),
         primitive => Ok(primitive),
     }
+}
+
+fn recovery_summary_from_prompt(prompt: &str) -> Result<String, String> {
+    let (_, tail) = prompt
+        .split_once("Untrusted recovery_summary ")
+        .ok_or("Coordinator prompt has no recovery_summary section")?;
+    let (_, fenced) = tail
+        .split_once("```json\n")
+        .ok_or("Coordinator recovery_summary has no JSON block")?;
+    let (encoded, _) = fenced
+        .split_once("\n```")
+        .ok_or("Coordinator recovery_summary JSON block is incomplete")?;
+    serde_json::from_str::<String>(encoded)
+        .map_err(|error| format!("decode Coordinator recovery summary string: {error}"))
 }
 
 /// Resolve only unique values from JSON blocks actually rendered into the host prompt.

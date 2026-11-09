@@ -2649,23 +2649,39 @@ mod tests {
             .parent()
             .unwrap()
             .join("rex-projects");
-        let output = std::process::Command::new(binary)
-            .args(["agent", "repository", "manifest", "--paths-file"])
-            .arg(&paths)
-            .args([
-                "--output",
-                "manifest.json",
-                "--message-id",
-                "worker-manifest",
-                "--wait-seconds",
-                "0",
-                "--json",
-            ])
-            .env_clear()
-            .envs(&prepared.environment)
-            .current_dir(&prepared.working_directory)
-            .output()
-            .unwrap();
+        let run_manifest = |output_path: &str, message_id: &str| {
+            std::process::Command::new(&binary)
+                .args(["agent", "repository", "manifest", "--paths-file"])
+                .arg(&paths)
+                .args(["--output", output_path, "--message-id", message_id])
+                .args(["--wait-seconds", "0", "--json"])
+                .env_clear()
+                .envs(&prepared.environment)
+                .current_dir(&prepared.working_directory)
+                .output()
+                .unwrap()
+        };
+        let collision = turn.descriptor.workspace.join("collision.json");
+        fs::write(&collision, "ordinary user file\n").unwrap();
+        let collision_result = run_manifest("collision.json", "worker-collision");
+        assert!(!collision_result.status.success());
+        assert_eq!(fs::read(&collision).unwrap(), b"ordinary user file\n");
+        fs::remove_file(&collision).unwrap();
+
+        let symlink_target = turn.descriptor.workspace.join("documentation.md");
+        let symlink_output = turn.descriptor.workspace.join("symlink.json");
+        std::os::unix::fs::symlink(&symlink_target, &symlink_output).unwrap();
+        let symlink_result = run_manifest("symlink.json", "worker-symlink");
+        assert!(!symlink_result.status.success());
+        assert!(
+            fs::symlink_metadata(&symlink_output)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&symlink_output).unwrap();
+
+        let output = run_manifest("manifest.json", "worker-manifest");
         assert!(
             output.status.success(),
             "actual manifest CLI failed: {} {}",
@@ -2688,6 +2704,114 @@ mod tests {
             "artifact.add"
         );
         assert_eq!(pending[0].envelope.params["path"], "manifest.json");
+
+        for index in 0..31 {
+            let message_id = format!("queue-fill-{index}");
+            let mut request = serde_json::to_value(&pending[0].envelope).unwrap();
+            request["request_id"] = json!(message_id);
+            request["params"]["message_id"] = json!(message_id);
+            mailbox
+                .queue(
+                    &message_id,
+                    &serde_json::to_vec(&request).unwrap(),
+                    unix_time_now().unwrap(),
+                )
+                .unwrap();
+        }
+        let full = run_manifest("queue-retry.json", "worker-queue-retry");
+        assert!(!full.status.success());
+        assert!(String::from_utf8_lossy(&full.stdout).contains("pending request count"));
+        assert!(
+            !turn.descriptor.workspace.join("queue-retry.json").exists(),
+            "an unqueued, newly generated manifest must not strand a retry"
+        );
+        mailbox
+            .publish_receipt(
+                "queue-fill-0",
+                &serde_json::to_vec(&json!({
+                    "schema_version":1,"request_id":"queue-fill-0","result":{}
+                }))
+                .unwrap(),
+                unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let retry = run_manifest("queue-retry.json", "worker-queue-retry");
+        assert!(
+            retry.status.success(),
+            "queue capacity retry: {} {}",
+            String::from_utf8_lossy(&retry.stdout),
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        assert!(
+            mailbox
+                .pending(unix_time_now().unwrap())
+                .unwrap()
+                .iter()
+                .any(|request| request.request_id == "worker-queue-retry")
+        );
+
+        use sha2::Digest as _;
+        let manifest_bytes = fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap();
+        let premature_retry = run_manifest("manifest.json", "worker-manifest");
+        assert!(!premature_retry.status.success());
+        assert_eq!(
+            fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+            manifest_bytes
+        );
+        fs::write(
+            turn.descriptor.workspace.join("manifest.json"),
+            "changed while receipt was pending\n",
+        )
+        .unwrap();
+        let manifest_digest = crate::domain::ids::Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(&manifest_bytes)
+        ))
+        .unwrap();
+        let receipt = crate::protocol::ResponseEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new("worker-manifest").unwrap(),
+            result: Some(crate::agent_api::ArtifactAddReceipt {
+                schema_version: 1,
+                message_id: "worker-manifest".into(),
+                artifact: crate::engine::orchestration::RoleArtifactReference {
+                    artifact_id: crate::domain::ids::ArtifactId::parse("f".repeat(64)).unwrap(),
+                    kind: crate::engine::orchestration::RoleArtifactKind::Change,
+                    schema_version: 1,
+                    path: "artifacts/manifest.json".into(),
+                    digest: manifest_digest,
+                    bytes: manifest_bytes.len() as u64,
+                },
+            }),
+            error: None,
+            extensions: Default::default(),
+        };
+        mailbox
+            .publish_receipt(
+                "worker-manifest",
+                &serde_json::to_vec(&receipt).unwrap(),
+                unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let changed_result = run_manifest("manifest.json", "worker-manifest");
+        assert!(!changed_result.status.success());
+        assert_eq!(
+            fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+            b"changed while receipt was pending\n"
+        );
+        fs::write(
+            turn.descriptor.workspace.join("manifest.json"),
+            &manifest_bytes,
+        )
+        .unwrap();
+        let retried = run_manifest("manifest.json", "worker-manifest");
+        assert!(
+            retried.status.success(),
+            "actual manifest retry failed: {} {}",
+            String::from_utf8_lossy(&retried.stderr),
+            String::from_utf8_lossy(&retried.stdout)
+        );
+        assert!(!turn.descriptor.workspace.join("manifest.json").exists());
 
         turn.descriptor.worker_assignment = None;
         turn.descriptor.role = Role::Coordinator;

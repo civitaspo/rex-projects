@@ -3100,15 +3100,47 @@ fn agent_repository_manifest(
     );
     let bytes =
         serde_json::to_vec(&manifest).map_err(|error| CliError::unexpected(error.to_string()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&destination)
-        .map_err(|error| CliError::unavailable(format!("create manifest output: {error}")))?;
-    std::io::Write::write_all(&mut file, &bytes)
-        .map_err(|error| CliError::unavailable(error.to_string()))?;
     let control_dir = control_dir_for_agent()?;
     let run_id = run_id_for_agent()?;
+    let mailbox =
+        crate::mailbox::MailboxCapability::open_registered_for_run(run_id.clone(), &control_dir)
+            .map_err(CliError::unavailable)?;
+    let created_output = match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(CliError::conflict(
+                    "manifest output already exists and is not a regular file",
+                ));
+            }
+            if std::fs::read(&destination)
+                .map_err(|error| CliError::unavailable(error.to_string()))?
+                != bytes
+            {
+                return Err(CliError::conflict(
+                    "manifest output already exists with different content",
+                ));
+            }
+            if acknowledged_manifest_receipt(&mailbox, &message_id, &bytes)?.is_none() {
+                return Err(CliError::conflict(
+                    "manifest output already exists without its matching artifact receipt",
+                ));
+            }
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .map_err(|error| {
+                    CliError::unavailable(format!("create manifest output: {error}"))
+                })?;
+            std::io::Write::write_all(&mut file, &bytes)
+                .map_err(|error| CliError::unavailable(error.to_string()))?;
+            true
+        }
+        Err(error) => return Err(CliError::unavailable(error.to_string())),
+    };
     let add_result = agent_artifact_add(
         control_dir.clone(),
         run_id.clone(),
@@ -3119,24 +3151,82 @@ fn agent_repository_manifest(
         wait_seconds,
         json,
     );
-    if let Ok(()) = add_result {
-        use crate::mailbox::{MailboxCapability, unix_time_now};
-        if let Ok(mailbox) = MailboxCapability::open_registered_for_run(run_id, &control_dir)
-            && let Ok(Some(receipt)) =
-                mailbox.read_receipt(&message_id, unix_time_now().unwrap_or(0))
-            && let Ok(response) =
-                crate::protocol::parse_unique::<ResponseEnvelope<serde_json::Value>>(&receipt)
-            && response.error.is_none()
-            && response.result.is_some()
-        {
-            // ArtifactStore has copied and acknowledged the bytes; remove generated Git-worktree
-            // metadata so it cannot appear as an unmanifested working-tree change.
-            std::fs::remove_file(&destination).map_err(|error| {
-                CliError::unavailable(format!("remove acknowledged manifest file: {error}"))
-            })?;
-        }
+    if let Ok(()) = add_result
+        && acknowledged_manifest_receipt(&mailbox, &message_id, &bytes)?.is_some()
+    {
+        remove_unchanged_manifest_output(&destination, &bytes)?;
+    } else if created_output
+        && add_result.is_err()
+        && let Ok(now) = crate::mailbox::unix_time_now()
+        && matches!(mailbox.has_queued_request(&message_id, now), Ok(false))
+    {
+        // A failed queue attempt must not strand this invocation's generated output.
+        remove_unchanged_manifest_output(&destination, &bytes)?;
     }
     add_result
+}
+
+fn remove_unchanged_manifest_output(destination: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && std::fs::read(destination)
+                    .map_err(|error| CliError::unavailable(error.to_string()))?
+                    == bytes =>
+        {
+            std::fs::remove_file(destination).map_err(|error| {
+                CliError::unavailable(format!("remove generated manifest: {error}"))
+            })
+        }
+        Ok(_) => Err(CliError::conflict(
+            "manifest output changed during registration; preserved it",
+        )),
+        Err(error) => Err(CliError::unavailable(error.to_string())),
+    }
+}
+
+fn acknowledged_manifest_receipt(
+    mailbox: &crate::mailbox::MailboxCapability,
+    message_id: &str,
+    manifest_bytes: &[u8],
+) -> Result<Option<Vec<u8>>, CliError> {
+    use crate::mailbox::unix_time_now;
+    use sha2::Digest as _;
+
+    let Some(receipt) = mailbox
+        .read_receipt(message_id, unix_time_now().map_err(CliError::unexpected)?)
+        .map_err(CliError::unexpected)?
+    else {
+        return Ok(None);
+    };
+    let response: ResponseEnvelope<serde_json::Value> =
+        crate::protocol::parse_unique(&receipt).map_err(CliError::unexpected)?;
+    response
+        .validate_for(&RequestId::new(message_id).map_err(CliError::usage)?)
+        .map_err(CliError::unexpected)?;
+    let Some(result) = response.result else {
+        return Err(CliError::conflict(
+            "controller rejected manifest artifact registration",
+        ));
+    };
+    let result: crate::agent_api::ArtifactAddReceipt =
+        serde_json::from_value(result).map_err(|error| CliError::unexpected(error.to_string()))?;
+    crate::agent_api::validate_relative_path(&result.artifact.path)
+        .map_err(CliError::unexpected)?;
+    let expected_digest = format!("{:x}", sha2::Sha256::digest(manifest_bytes));
+    if result.schema_version != 1
+        || result.message_id != message_id
+        || result.artifact.kind != crate::engine::orchestration::RoleArtifactKind::Change
+        || result.artifact.schema_version != 1
+        || result.artifact.digest.as_str() != expected_digest
+        || result.artifact.bytes != manifest_bytes.len() as u64
+    {
+        return Err(CliError::conflict(
+            "artifact receipt does not acknowledge this Change manifest",
+        ));
+    }
+    Ok(Some(receipt))
 }
 
 fn agent_repository_commit(
