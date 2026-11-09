@@ -888,6 +888,88 @@ impl ConfigStore {
         .collect()
     }
 
+    /// Return one stable page of active TicketRuns for a runnable Project. The
+    /// per-Project query avoids starvation when another Project owns many old
+    /// nonterminal runs; callers must continue with the returned page length.
+    pub fn active_ticket_runs_page_for_project(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<ActiveTicketRun>, String> {
+        if limit == 0 || limit > 256 {
+            return Err("active TicketRun page limit must be between 1 and 256".into());
+        }
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT t.project_id,t.ticket_run_id,t.namespace,t.ticket_id,t.revision,t.internal_phase,t.activity,t.external_status,t.required_review_revision,c.project_epoch,c.recipe_id FROM ticket_runs t JOIN ticket_run_context c USING(project_id,ticket_run_id) JOIN projects p USING(project_id) JOIN project_runtimes r USING(project_id) WHERE t.project_id=?1 AND t.internal_phase NOT IN ('done','canceled') AND p.desired_lifecycle='running' AND r.observed_lifecycle='running' AND r.controller_generation=?2 ORDER BY t.ticket_run_id LIMIT ?3 OFFSET ?4",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![project_id.as_str(), owner_generation, limit as u64, offset],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<u64>>(8)?,
+                        row.get::<_, u64>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (
+                project,
+                run,
+                namespace,
+                ticket,
+                revision,
+                phase,
+                activity,
+                external_status,
+                required_review_revision,
+                project_epoch,
+                recipe_id,
+            ) = row.map_err(|error| error.to_string())?;
+            Ok(ActiveTicketRun {
+                project_id: ProjectId::parse(project)?,
+                ticket_run_id: TicketRunId::parse(run)?,
+                namespace: TicketNamespace::parse(namespace)?,
+                ticket_id: TicketId::parse(ticket)?,
+                revision,
+                phase: serde_json::from_str(&format!("\"{phase}\""))
+                    .map_err(|error| format!("stored TicketRun phase is invalid: {error}"))?,
+                activity: serde_json::from_str(&format!("\"{activity}\""))
+                    .map_err(|error| format!("stored TicketRun activity is invalid: {error}"))?,
+                external_status: serde_json::from_str(&format!("\"{external_status}\""))
+                    .map_err(|error| format!("stored TicketRun status is invalid: {error}"))?,
+                required_review_revision,
+                project_epoch,
+                recipe_id,
+            })
+        })
+        .collect()
+    }
+
     /// Return the active Rex view currently bound to a TicketRun.
     pub fn active_ticket_view_id(
         &self,
