@@ -136,6 +136,7 @@ struct WorkerAssignmentContext<'a> {
     branch: &'a str,
     base_sha: &'a str,
     expected_head: &'a str,
+    host_artifacts: &'a [crate::agent_api::HostArtifactLocator],
     verification: Option<&'a WorkerVerificationAssignment>,
     recovery_authorization: Option<&'a crate::engine::orchestration::WorkerRecoveryAuthorization>,
     retained_host_commit: Option<&'a crate::delivery_runtime::CommitWorkerManifestEffectReceipt>,
@@ -1883,6 +1884,11 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                                 .as_ref()
                                 .map(|authorization| authorization.expected_head.as_str())
                                 .unwrap_or_else(|| context.token.expected_head()),
+                            host_artifacts: &store.persisted_worker_host_artifacts(
+                                context.token.project_id(),
+                                context.token.ticket_run_id(),
+                                &context.token.reservation_binding(),
+                            )?,
                             verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
                             retained_host_commit: retained_host_commit(
@@ -3864,6 +3870,11 @@ impl RuntimeServices {
                             branch: context.token.branch(),
                             base_sha: context.token.base_sha(),
                             expected_head,
+                            host_artifacts: &store.persisted_worker_host_artifacts(
+                                context.token.project_id(),
+                                context.token.ticket_run_id(),
+                                &context.token.reservation_binding(),
+                            )?,
                             verification: worker_verification.as_ref(),
                             recovery_authorization: worker_recovery_authorization.as_ref(),
                             retained_host_commit: retained_host_commit(
@@ -4829,6 +4840,11 @@ pub(crate) fn prepared_worker_assignment_for_test(
         expected_head: recovery_authorization
             .map(|authorization| authorization.expected_head.as_str())
             .unwrap_or_else(|| token.expected_head()),
+        host_artifacts: &store.persisted_worker_host_artifacts(
+            token.project_id(),
+            token.ticket_run_id(),
+            &token.reservation_binding(),
+        )?,
         verification: verification.as_ref(),
         recovery_authorization,
         retained_host_commit: retained.as_ref(),
@@ -4989,6 +5005,7 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
         branch,
         base_sha,
         expected_head,
+        host_artifacts,
         verification,
         recovery_authorization,
         retained_host_commit,
@@ -5052,6 +5069,7 @@ fn worker_assignment_context(context: &WorkerAssignmentContext<'_>) -> Result<St
             "branch":branch,
             "base_sha":base_sha,
             "expected_head":expected_head,
+            "host_artifacts":host_artifacts,
             "verification_only":verification.is_some(),
             "accepted_publication":verification.map(|value| serde_json::json!({
                 "publication_revision":value.publication_revision,
@@ -5697,6 +5715,7 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &base_sha,
+            host_artifacts: &[],
             verification: None,
             recovery_authorization: None,
             retained_host_commit: None,
@@ -5740,6 +5759,7 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &publication_head,
+            host_artifacts: &[],
             verification: Some(&verification),
             recovery_authorization: None,
             retained_host_commit: None,
@@ -5803,6 +5823,7 @@ mod worker_assignment_context_tests {
             branch: "agent/run-a/worker-b",
             base_sha: &base_sha,
             expected_head: &recovery.expected_head,
+            host_artifacts: &[],
             verification: None,
             recovery_authorization: Some(&recovery),
             retained_host_commit: Some(&retained),

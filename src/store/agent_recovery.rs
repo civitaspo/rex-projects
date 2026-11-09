@@ -913,6 +913,16 @@ impl ConfigStore {
             params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, snapshot.process_tree_digest.as_str(), detail_json],
         )
         .map_err(|error| error.to_string())?;
+        let launch_changed = tx.execute(
+            "UPDATE agent_launch_state SET state='cancelled',last_observed_at_unix=?2,updated_at_unix=?2
+             WHERE agent_run_id=?1 AND state=?3 AND state IN ('running','unknown')
+               AND result_receipt_json IS NULL AND terminal_request_id IS NULL
+               AND terminal_request_digest IS NULL AND result_digest IS NULL",
+            params![run.agent_run_id.as_str(), observed_at_unix, run.launch_state],
+        ).map_err(|error| error.to_string())?;
+        if launch_changed != 1 {
+            return Err("Agent launch state changed before missing-block terminal proof".into());
+        }
         let run_changed = tx.execute(
             "UPDATE agent_runs SET state='cancelled',finished_at_unix=COALESCE(finished_at_unix,?2),controller_generation=?3
              WHERE agent_run_id=?1 AND controller_generation=?3 AND state IN ('launch_pending','running','unknown')",
@@ -3105,6 +3115,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(released, ("released".into(), generation));
+        let terminal_projection: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT r.state,l.state FROM agent_runs r
+                 JOIN agent_launch_state l USING(agent_run_id) WHERE r.agent_run_id=?1",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            terminal_projection,
+            ("cancelled".into(), "cancelled".into())
+        );
+        let terminal_receipt_exists: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1)",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!terminal_receipt_exists);
+        let lifecycle_facts: (u64, u64) = store
+            .connection
+            .query_row(
+                "SELECT SUM(fact_type='exit_confirmed'),SUM(fact_type='slot_released')
+                 FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=7",
+                [agent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_facts, (1, 1));
         let unrelated: (String, u64) = store
             .connection
             .query_row(

@@ -8223,6 +8223,29 @@ pub(crate) mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let mut second_recovery = recovery_authorization.clone();
+        second_recovery.ticket_revision = second_correcting.revision;
+        let assignment_json = crate::runtime_services::prepared_worker_assignment_for_test(
+            &second_correction_store,
+            owner_generation,
+            &verification_plan,
+            &validated_verification_plan,
+            &second_correction_prepared,
+            verification_node,
+            Some(&second_recovery),
+        )
+        .unwrap();
+        let assignment_path = temp.path().join("recovered-worker-assignment.json");
+        std::fs::write(&assignment_path, assignment_json).unwrap();
+        let assignment: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&assignment_path).unwrap()).unwrap();
+        let inherited_artifacts = &second_worker_reservation.wake_snapshot.inputs[0].host_artifacts;
+        assert!(!inherited_artifacts.is_empty());
+        assert_eq!(
+            assignment["prepared_worktree"]["host_artifacts"],
+            serde_json::to_value(inherited_artifacts).unwrap(),
+            "a recovery wake with no artifact claims must still describe the persisted host copies"
+        );
         assert_registered_staging_survives_verification(
             &mut second_correction_store,
             temp.path(),
