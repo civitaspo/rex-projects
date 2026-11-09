@@ -1559,6 +1559,50 @@ fn next_message(
             artifact_refs: Vec::new(),
         });
     }
+    if role == Role::Coordinator
+        && let Some(inbox) = inbox
+        && let Some(ticket_run_id) = invocation.scope.ticket_run_id.as_deref()
+        && invocation.subject_revision.is_some_and(|revision| {
+            inbox.has_current_reviewer_correction(
+                &invocation.scope.project_id,
+                ticket_run_id,
+                revision,
+            ) && !inbox.has_current_worker_verification(
+                &invocation.scope.project_id,
+                ticket_run_id,
+                revision,
+            )
+        })
+    {
+        let mut progress = context
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == role
+                    && message.lane == Some(invocation.scope.lane)
+                    && message.kind == RoleOutputKind::Progress
+            })
+            .cloned()
+            .ok_or("Coordinator correction wait has no Progress recipe")?;
+        progress.recipe.structured_result["summary"] =
+            json!("A current Reviewer correction is waiting for its Worker verification result.");
+        validate_payload(progress.kind, &progress.recipe.structured_result)?;
+        ledger_tx.commit().map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec(&progress.recipe.structured_result)
+            .map_err(|error| format!("serialize Coordinator correction wait: {error}"))?;
+        return Ok(AgentMessage {
+            schema_version: 1,
+            message_id: format!(
+                "fixture-coordinator-correction-wait-{:x}",
+                Sha256::digest(invocation.run_id.as_bytes())
+            ),
+            kind: progress.kind,
+            assertion: progress.assertion,
+            structured_result: progress.recipe.structured_result,
+            result_digest: format!("{:x}", Sha256::digest(bytes)),
+            artifact_refs: Vec::new(),
+        });
+    }
     let ordinal: i64 = ledger_tx
         .query_row(
             "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM invocations WHERE scope_digest=?1",
@@ -1869,6 +1913,82 @@ impl FixtureInbox {
                     .into(),
             ),
         }
+    }
+
+    fn has_current_reviewer_correction(
+        &self,
+        project_id: &str,
+        ticket_run_id: &str,
+        ticket_revision: u64,
+    ) -> bool {
+        self.inputs.iter().any(|item| {
+            let source_revision = item.get("source_revision").and_then(Value::as_u64);
+            item.get("source_type").and_then(Value::as_str) == Some("agent_result")
+                && source_revision.and_then(|revision| revision.checked_add(1))
+                    == Some(ticket_revision)
+                && item.pointer("/payload_json/kind").and_then(Value::as_str)
+                    == Some("validated_agent_result")
+                && item
+                    .pointer("/payload_json/source/role")
+                    .and_then(Value::as_str)
+                    == Some("reviewer")
+                && item
+                    .pointer("/payload_json/source/project_id")
+                    .and_then(Value::as_str)
+                    == Some(project_id)
+                && item
+                    .pointer("/payload_json/source/ticket_run_id")
+                    .and_then(Value::as_str)
+                    == Some(ticket_run_id)
+                && item
+                    .pointer("/payload_json/source/ticket_revision")
+                    .and_then(Value::as_u64)
+                    == source_revision
+                && item
+                    .pointer("/payload_json/result/kind")
+                    .and_then(Value::as_str)
+                    == Some("review_ready")
+                && item
+                    .pointer("/payload_json/result/structured_result/disposition")
+                    .and_then(Value::as_str)
+                    == Some("changes_requested")
+        })
+    }
+
+    fn has_current_worker_verification(
+        &self,
+        project_id: &str,
+        ticket_run_id: &str,
+        ticket_revision: u64,
+    ) -> bool {
+        self.inputs.iter().any(|item| {
+            let source_revision = item.get("source_revision").and_then(Value::as_u64);
+            item.get("source_type").and_then(Value::as_str) == Some("agent_result")
+                && source_revision.and_then(|revision| revision.checked_add(1))
+                    == Some(ticket_revision)
+                && item.pointer("/payload_json/kind").and_then(Value::as_str)
+                    == Some("validated_agent_result")
+                && item
+                    .pointer("/payload_json/source/role")
+                    .and_then(Value::as_str)
+                    == Some("worker")
+                && item
+                    .pointer("/payload_json/source/project_id")
+                    .and_then(Value::as_str)
+                    == Some(project_id)
+                && item
+                    .pointer("/payload_json/source/ticket_run_id")
+                    .and_then(Value::as_str)
+                    == Some(ticket_run_id)
+                && item
+                    .pointer("/payload_json/source/ticket_revision")
+                    .and_then(Value::as_u64)
+                    == source_revision
+                && item
+                    .pointer("/payload_json/result/kind")
+                    .and_then(Value::as_str)
+                    == Some("verification_ready")
+        })
     }
 
     fn has_ticket_run_dispatch(&self, ticket_run_id: &str) -> bool {
@@ -2548,6 +2668,274 @@ mod tests {
         validate_source_prompt, worker_assignment, worker_node_id, worker_node_id_for_lane,
     };
     use std::path::Path;
+
+    #[test]
+    fn coordinator_waits_for_worker_verification_without_advancing_on_review_correction() {
+        use super::RoleOutputKind;
+        use rex_projects::domain::ids::{Digest, ProfileId, ProjectId, RepositoryId, TicketId};
+        use rex_projects::engine::orchestration::SpawnRequestPayload;
+        use rex_projects::roles::{PromptContext, TicketBrief, render_role_prompt};
+        use sha2::{Digest as _, Sha256};
+        use std::fs;
+
+        let generated =
+            crate::acceptance::profile_messages_with_worker_verification("coordinator").unwrap();
+        let fixture_root = tempfile::tempdir().unwrap();
+        let generated_context_path = fixture_root.path().join("generated-context.json");
+        fs::write(
+            &generated_context_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version":1,
+                "scenario":"acceptance_coordinator",
+                "messages":generated
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let generated_context = super::read_context(&generated_context_path).unwrap();
+        let reviewer_spawn = generated_context
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == Role::Coordinator
+                    && message.lane == Some(FixtureLane::Workflow)
+                    && message.kind == RoleOutputKind::SpawnRequest
+                    && message.recipe.structured_result["role"] == "reviewer"
+            })
+            .unwrap()
+            .clone();
+        let progress = generated_context
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == Role::Coordinator
+                    && message.lane == Some(FixtureLane::Workflow)
+                    && message.kind == RoleOutputKind::Progress
+            })
+            .unwrap()
+            .clone();
+        let context_json = serde_json::json!({
+            "schema_version":1,
+            "scenario":generated_context.scenario,
+            "messages":[reviewer_spawn,progress]
+        });
+        let context_path = fixture_root.path().join("coordinator-context.json");
+        fs::write(&context_path, serde_json::to_vec(&context_json).unwrap()).unwrap();
+        let context = super::read_context(&context_path).unwrap();
+        let config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/fixture/config.toml");
+        let applied = rex_projects::config::load(&config_path).unwrap();
+        let accepted_plan_json = serde_json::to_string(&serde_json::json!({
+            "nodes":[{"id":"acceptance-node","repository":"example","task":"Check the published change.","depends_on":[],"required_evidence":["The verification evidence matches the published head."],"investigation":false}],
+            "requested_investigation_children":0
+        })).unwrap();
+        let accepted_plan_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(accepted_plan_json.as_bytes())
+        ))
+        .unwrap();
+        let prompt = render_role_prompt(
+            &applied,
+            &PromptContext {
+                project_id: ProjectId::parse("operations_project").unwrap(),
+                profile_id: Some(ProfileId::parse("judgment_claude").unwrap()),
+                role: Role::Coordinator,
+                operation_recipe: None,
+                repositories: vec![RepositoryId::parse("example").unwrap()],
+                ticket: Some(TicketBrief {
+                    ticket_id: TicketId::parse("ticket-a").unwrap(),
+                    ticket_revision: 7,
+                    title: "Acceptance ticket".into(),
+                    body: "Exercise the correction and verification arrival order.".into(),
+                    acceptance: vec![
+                        "The same accepted node is reviewed after verification.".into(),
+                    ],
+                }),
+                recovery_summary: None,
+                accepted_plan: Some(accepted_plan_json),
+                accepted_plan_digest: Some(accepted_plan_digest),
+                implementation_publication_subject: None,
+                previous_decisions: Vec::new(),
+                required_evidence: Vec::new(),
+                stop_conditions: Vec::new(),
+                assigned_commit_mode: None,
+            },
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap()
+        .text;
+        let prompt_path = fixture_root.path().join("coordinator.prompt");
+        fs::write(&prompt_path, prompt).unwrap();
+        let prompt = fs::read_to_string(prompt_path).unwrap();
+
+        let reviewer_correction = |run_id: &str, ticket_revision: u64| {
+            FixtureInbox::parse(
+                serde_json::json!({
+                    "run_id":run_id,"after":0,"next_after":2,
+                    "inputs":[
+                        {
+                            "wake_input_id":1,"source_type":"ticket_run_dispatch",
+                            "source_id":"ticket-run-a","source_revision":1,"priority":30,
+                            "payload_json":{"ticket_run_id":"ticket-run-a","supervisor_evidence_id":"dispatch-evidence"},
+                            "host_artifacts":[]
+                        },
+                        {
+                            "wake_input_id":2,"source_type":"agent_result",
+                            "source_id":"reviewer-run","source_revision":ticket_revision - 1,"priority":30,
+                            "payload_json":{
+                                "kind":"validated_agent_result",
+                                "source":{"role":"reviewer","project_id":"operations_project","ticket_run_id":"ticket-run-a","ticket_revision":ticket_revision - 1},
+                                "result":{"kind":"review_ready","structured_result":{"disposition":"changes_requested"}}
+                            },
+                            "host_artifacts":[]
+                        }
+                    ]
+                }),
+                run_id,
+            ).unwrap()
+        };
+        let worker_ready = |run_id: &str| {
+            FixtureInbox::parse(
+                serde_json::json!({
+                    "run_id":run_id,"after":0,"next_after":3,
+                    "inputs":[
+                        {
+                            "wake_input_id":1,"source_type":"ticket_run_dispatch",
+                            "source_id":"ticket-run-a","source_revision":1,"priority":30,
+                            "payload_json":{"ticket_run_id":"ticket-run-a","supervisor_evidence_id":"dispatch-evidence"},
+                            "host_artifacts":[]
+                        },
+                        {
+                            "wake_input_id":2,"source_type":"agent_result",
+                            "source_id":"reviewer-run","source_revision":5,"priority":30,
+                            "payload_json":{
+                                "kind":"validated_agent_result",
+                                "source":{"role":"reviewer","project_id":"operations_project","ticket_run_id":"ticket-run-a","ticket_revision":5},
+                                "result":{"kind":"review_ready","structured_result":{"disposition":"changes_requested"}}
+                            },
+                            "host_artifacts":[]
+                        },
+                        {
+                            "wake_input_id":3,"source_type":"agent_result",
+                            "source_id":"worker-run","source_revision":6,"priority":30,
+                            "payload_json":{
+                                "kind":"validated_agent_result",
+                                "source":{"role":"worker","project_id":"operations_project","ticket_run_id":"ticket-run-a","ticket_revision":6},
+                                "result":{"kind":"verification_ready","structured_result":{}}
+                            },
+                            "host_artifacts":[]
+                        }
+                    ]
+                }),
+                run_id,
+            ).unwrap()
+        };
+        let invocation = |run_id: &str, subject_revision| FixtureInvocation {
+            scope: FixtureScope {
+                scenario: "acceptance_coordinator".into(),
+                context: "coordinator-context.json".into(),
+                lane: FixtureLane::Workflow,
+                project_id: "operations_project".into(),
+                role: Role::Coordinator,
+                ticket_run_id: Some("ticket-run-a".into()),
+                work_node_id: None,
+            },
+            run_id: run_id.into(),
+            operation_id: None,
+            attempt: Some(1),
+            run_epoch: Some(1),
+            subject_revision: Some(subject_revision),
+            prompt_digest: "a".repeat(64),
+        };
+        let check_schedule = |state_name: &str, correction_first: bool| {
+            let state = fixture_root.path().join(state_name);
+            fs::create_dir_all(&state).unwrap();
+            let (correction, verified) = if correction_first {
+                let wait = next_message(
+                    &context,
+                    &invocation("coordinator-correction-first", 6),
+                    &state,
+                    None,
+                    &prompt,
+                    Some(&reviewer_correction("coordinator-correction-first", 6)),
+                )
+                .unwrap();
+                assert_eq!(wait.kind, RoleOutputKind::Progress);
+                let count: i64 = rusqlite::Connection::open(state.join("invocations.sqlite"))
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "the correction wait must not consume the workflow recipe"
+                );
+                (
+                    Some(wait),
+                    next_message(
+                        &context,
+                        &invocation("coordinator-worker-first", 7),
+                        &state,
+                        None,
+                        &prompt,
+                        Some(&worker_ready("coordinator-worker-first")),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                let ready = next_message(
+                    &context,
+                    &invocation("coordinator-worker-first", 7),
+                    &state,
+                    None,
+                    &prompt,
+                    Some(&worker_ready("coordinator-worker-first")),
+                )
+                .unwrap();
+                let wait = next_message(
+                    &context,
+                    &invocation("coordinator-correction-first", 6),
+                    &state,
+                    None,
+                    &prompt,
+                    Some(&reviewer_correction("coordinator-correction-first", 6)),
+                )
+                .unwrap();
+                (Some(wait), ready)
+            };
+            assert_eq!(correction.unwrap().kind, RoleOutputKind::Progress);
+            assert_eq!(verified.kind, RoleOutputKind::SpawnRequest);
+            let spawn: SpawnRequestPayload =
+                serde_json::from_value(verified.structured_result).unwrap();
+            assert_eq!(spawn.role, Role::Reviewer);
+            assert!(
+                !reviewer_correction("stale", 6).has_current_reviewer_correction(
+                    "operations_project",
+                    "ticket-run-a",
+                    7
+                )
+            );
+            let wrong_run = FixtureInbox::parse(
+                serde_json::json!({
+                    "run_id":"wrong-run","after":0,"next_after":1,
+                    "inputs":[{
+                        "wake_input_id":1,"source_type":"agent_result","source_id":"reviewer-run",
+                        "source_revision":5,"priority":30,
+                        "payload_json":{"kind":"validated_agent_result","source":{"role":"reviewer","project_id":"operations_project","ticket_run_id":"other-ticket-run","ticket_revision":5},"result":{"kind":"review_ready","structured_result":{"disposition":"changes_requested"}}},
+                        "host_artifacts":[]
+                    }]
+                }),
+                "wrong-run",
+            ).unwrap();
+            assert!(!wrong_run.has_current_reviewer_correction(
+                "operations_project",
+                "ticket-run-a",
+                6
+            ));
+        };
+
+        check_schedule("reviewer-first", true);
+        check_schedule("worker-first", false);
+    }
 
     fn supervisor_context() -> AgentContext {
         serde_json::from_value(serde_json::json!({

@@ -1842,7 +1842,7 @@ fn profile_messages_with_review_rework(role: &str) -> Result<Vec<Value>, String>
     Ok(messages)
 }
 
-fn profile_messages_with_worker_verification(role: &str) -> Result<Vec<Value>, String> {
+pub(crate) fn profile_messages_with_worker_verification(role: &str) -> Result<Vec<Value>, String> {
     let mut messages = profile_messages_with_review_rework(role)?;
     match role {
         "worker" => {
