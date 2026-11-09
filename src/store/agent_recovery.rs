@@ -9,9 +9,26 @@ use crate::launch::{AgentLaunchAuthority, ObservedProviderStart, ObservedWrapper
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::run_step_spool::BlockLossCleanupSnapshot;
 
+use super::agent_results::VerifiedAgentCleanup;
 use super::{ConfigStore, validate_active_generation};
 
 type AgentAdoptionLookupRow = (String, u64, u64, String, u64, String, String, String);
+type CancelledAgentReconciliationRow = (
+    String,
+    String,
+    String,
+    u64,
+    u64,
+    String,
+    String,
+    u32,
+    String,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoverableAgentRun {
@@ -736,6 +753,180 @@ impl ConfigStore {
             "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
              VALUES (?1,?2,?3,'slot_released',?4,?5,?6) ON CONFLICT DO NOTHING",
             params![run.agent_run_id.as_str(), reservation_epoch, authority.rex_block_id, observed_at_unix, snapshot.process_tree_digest.as_str(), released_detail],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Commit cancellation-only lifecycle evidence after the host has revalidated the exact
+    /// accepted start, cancelled provider receipt, complete family, and fresh process absence.
+    /// This is deliberately separate from the continuous fork-watch proof path.
+    pub(crate) fn reconcile_cancelled_agent_block(
+        &mut self,
+        owner_generation: u64,
+        run: &RecoverableAgentRun,
+        snapshot: &BlockLossCleanupSnapshot,
+        cleanup: &VerifiedAgentCleanup,
+    ) -> Result<bool, String> {
+        snapshot.validate()?;
+        cleanup.verify_reconciliation_binding(run, owner_generation, snapshot)?;
+        if run.current_generation != owner_generation || snapshot.cleanup_covered {
+            return Err(
+                "cancelled Agent cleanup is not bound to an uncovered current recovery".into(),
+            );
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let (
+            authority_json,
+            authority_digest,
+            project_id,
+            reservation_epoch,
+            slot_generation,
+            slot_disposition,
+            pool,
+            slot_index,
+            agent_state,
+            run_generation,
+            launch_state,
+            start_request_digest,
+            result_receipt_json,
+            terminal_request_id,
+        ): CancelledAgentReconciliationRow = tx
+            .query_row(
+                "SELECT a.authority_json,a.authority_digest,r.project_id,s.reservation_epoch,
+                        s.controller_generation,s.disposition,s.pool,s.slot_index,r.state,
+                        r.controller_generation,l.state,l.start_request_digest,
+                        l.result_receipt_json,l.terminal_request_id
+                 FROM agent_launch_authority a
+                 JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id
+                 JOIN agent_runs r ON r.agent_run_id=a.agent_run_id
+                 JOIN agent_launch_state l ON l.agent_run_id=a.agent_run_id
+                 WHERE a.agent_run_id=?1",
+                [run.agent_run_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let exact_authority_json =
+            serde_json::to_string(&run.authority).map_err(|error| error.to_string())?;
+        if authority_json != exact_authority_json
+            || authority_digest != run.authority_digest.as_str()
+            || run.authority.digest()? != run.authority_digest
+            || project_id != run.authority.project_id.as_str()
+            || reservation_epoch != run.reservation_epoch
+            || slot_generation != run.previous_generation
+            || slot_disposition != run.slot_disposition
+            || pool != run.pool
+            || slot_index != run.slot_index
+            || run_generation != owner_generation
+            || agent_state != run.agent_state
+            || !matches!(
+                agent_state.as_str(),
+                "launch_pending" | "running" | "unknown"
+            )
+            || !matches!(
+                slot_disposition.as_str(),
+                "launch_pending" | "live" | "unknown"
+            )
+            || !matches!(launch_state.as_str(), "running" | "unknown")
+            || start_request_digest.as_deref() != Some(cleanup.start_request_digest().as_str())
+            || result_receipt_json.is_some()
+            || terminal_request_id.is_some()
+        {
+            return Err(
+                "cancelled Agent cleanup lost its exact launch, run, or slot binding".into(),
+            );
+        }
+        let changed_launch = tx.execute(
+            "UPDATE agent_launch_state SET state='cancelled',last_observed_at_unix=?2,updated_at_unix=?2
+             WHERE agent_run_id=?1 AND state IN ('running','unknown')
+               AND start_request_digest=?3 AND result_receipt_json IS NULL
+               AND terminal_request_id IS NULL AND terminal_request_digest IS NULL
+               AND result_digest IS NULL",
+            params![run.agent_run_id.as_str(), cleanup.observed_at_unix(), cleanup.start_request_digest().as_str()],
+        ).map_err(|error| error.to_string())?;
+        if changed_launch != 1 {
+            return Err("Agent launch state changed before cancelled cleanup was recorded".into());
+        }
+        let run_changed = tx.execute(
+            "UPDATE agent_runs SET state='cancelled',finished_at_unix=COALESCE(finished_at_unix,?2),controller_generation=?3
+             WHERE agent_run_id=?1 AND controller_generation=?3 AND state IN ('launch_pending','running','unknown')",
+            params![run.agent_run_id.as_str(), cleanup.observed_at_unix(), owner_generation],
+        ).map_err(|error| error.to_string())?;
+        if run_changed != 1 {
+            return Err("AgentRun changed before cancelled cleanup was recorded".into());
+        }
+        let slot_changed = tx
+            .execute(
+                "UPDATE execution_slots SET disposition='released',controller_generation=?5
+             WHERE pool=?1 AND slot_index=?2 AND owner_kind='agent_run' AND owner_id=?3
+               AND reservation_epoch=?4 AND project_id=?6 AND controller_generation=?7
+               AND disposition IN ('launch_pending','live','unknown')",
+                params![
+                    pool,
+                    slot_index,
+                    run.agent_run_id.as_str(),
+                    reservation_epoch,
+                    owner_generation,
+                    project_id,
+                    run.previous_generation
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if slot_changed != 1 {
+            return Err("exact AgentRun slot changed before cancelled cleanup release".into());
+        }
+        let details = serde_json::to_string(&serde_json::json!({
+            "cleanup_proof_digest": cleanup.proof_digest(),
+            "provider_result_digest": cleanup.result_digest(),
+            "run_family_digest": cleanup.family_digest(),
+            "process_absence_digest": cleanup.absence_digest(),
+            "process_tree_digest": snapshot.process_tree_digest,
+            "snapshot_digest": cleanup.snapshot_digest(),
+            "start_request_digest": cleanup.start_request_digest(),
+            "process_tree_absent": true,
+        }))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
+             VALUES (?1,?2,?3,'exit_confirmed',?4,?5,?6) ON CONFLICT DO NOTHING",
+            params![run.agent_run_id.as_str(), reservation_epoch, run.authority.rex_block_id,
+                cleanup.observed_at_unix(), cleanup.proof_digest().as_str(), details],
+        ).map_err(|error| error.to_string())?;
+        let release_details = serde_json::to_string(&serde_json::json!({
+            "reservation_epoch": reservation_epoch,
+            "cleanup_proof_digest": cleanup.proof_digest(),
+            "provider_result_digest": cleanup.result_digest(),
+            "run_family_digest": cleanup.family_digest(),
+            "process_absence_digest": cleanup.absence_digest(),
+            "snapshot_digest": cleanup.snapshot_digest(),
+        }))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json)
+             VALUES (?1,?2,?3,'slot_released',?4,?5,?6) ON CONFLICT DO NOTHING",
+            params![run.agent_run_id.as_str(), reservation_epoch, run.authority.rex_block_id,
+                cleanup.observed_at_unix(), cleanup.proof_digest().as_str(), release_details],
         ).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
@@ -2423,5 +2614,177 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unrelated, ("unknown".into(), first_generation));
+
+        let cleanup_run_id = AgentRunId::parse("agent-run-cancelled-cleanup").unwrap();
+        let mut cleanup_authority = authority.clone();
+        cleanup_authority.agent_run_id = cleanup_run_id.clone();
+        cleanup_authority.operation_id = OperationId::parse("operation-cancelled-cleanup").unwrap();
+        cleanup_authority.rex_block_id = "cancelled-cleanup-block".into();
+        let cleanup_authority_digest = cleanup_authority.digest().unwrap();
+        let cleanup_authority_json = serde_json::to_string(&cleanup_authority).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,logical_owner,finite_turn,launch_operation_id,state,controller_generation)
+             VALUES (?1,?2,'test',1,?3,'test',1,?4,'unknown',?5)",
+            rusqlite::params![cleanup_run_id.as_str(), project_id.as_str(), cleanup_authority.config_digest.as_str(), cleanup_authority.operation_id.as_str(), generation],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix)
+             VALUES (?1,?2,'supervisor','role-session',1,?3,1,1,?4,?5,?6,?7,?8,'/tmp/descriptor',?9,'test-profile',?10,?11,?12,?13,'server','session','window',?14,'/tmp/workspace','/tmp/control',?15,?16,?17,1)",
+            rusqlite::params![
+                cleanup_run_id.as_str(), project_id.as_str(), cleanup_authority.config_digest.as_str(),
+                first_generation, cleanup_authority.operation_id.as_str(), cleanup_authority.rex_view_id.as_str(),
+                cleanup_authority.descriptor_digest.as_str(), cleanup_authority.runtime_binary_digest.as_str(),
+                cleanup_authority.environment_snapshot_id.as_str(), cleanup_authority.profile_digest.as_str(),
+                cleanup_authority.instruction_digest.as_str(), cleanup_authority.result_schema_digest.as_str(),
+                cleanup_authority.qualification_receipt_digest.as_str(), cleanup_authority.rex_block_id,
+                cleanup_authority.mailbox_capability_digest.as_str(), cleanup_authority_json,
+                cleanup_authority_digest.as_str()
+            ],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO execution_slots(pool,slot_index,project_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition)
+             VALUES ('agent',2,?1,'agent_run',?2,8,?3,'unknown')",
+            rusqlite::params![project_id.as_str(), cleanup_run_id.as_str(), first_generation],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_launch_state(agent_run_id,state,start_request_digest,last_observed_at_unix,updated_at_unix)
+             VALUES (?1,'running',?2,1,1)",
+            rusqlite::params![cleanup_run_id.as_str(), "a".repeat(64)],
+        ).unwrap();
+        let cleanup_run = RecoverableAgentRun {
+            agent_run_id: cleanup_run_id.clone(),
+            current_generation: generation,
+            previous_generation: first_generation,
+            authority: cleanup_authority,
+            authority_digest: cleanup_authority_digest.clone(),
+            agent_state: "unknown".into(),
+            started_at_unix: Some(1),
+            launch_state: "running".into(),
+            process_identity_json: None,
+            wrapper_identity_json: None,
+            provider_tree_json: None,
+            pool: "agent".into(),
+            slot_index: 2,
+            reservation_epoch: 8,
+            slot_disposition: "unknown".into(),
+        };
+        let cleanup_process_tree = identities
+            .iter()
+            .map(|process| ProcessIdentity {
+                pid: process.pid,
+                parent_pid: process.parent_pid,
+                process_group_id: process.process_group_id,
+                start_identity: process.start_identity.clone(),
+                command: String::new(),
+                quality: process.identity_quality,
+            })
+            .collect::<Vec<_>>();
+        let cleanup_snapshot = BlockLossCleanupSnapshot {
+            schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
+            agent_run_id: cleanup_run_id.clone(),
+            reservation_epoch: 8,
+            authority_digest: cleanup_authority_digest,
+            launch_tree_digest: launch_tree_digest.clone(),
+            observed_at_unix: 2,
+            cleanup_covered: false,
+            process_tree_digest: Digest::parse(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&cleanup_process_tree).unwrap())
+            ))
+            .unwrap(),
+            process_tree: cleanup_process_tree,
+        };
+        let cleanup_proof = crate::store::agent_results::test_verified_agent_cleanup(
+            &cleanup_run,
+            generation,
+            &cleanup_snapshot,
+        );
+        assert!(
+            store
+                .reconcile_cancelled_agent_block(
+                    first_generation,
+                    &cleanup_run,
+                    &cleanup_snapshot,
+                    &cleanup_proof,
+                )
+                .is_err()
+        );
+        let mut stale_epoch = cleanup_run.clone();
+        stale_epoch.reservation_epoch += 1;
+        assert!(
+            store
+                .reconcile_cancelled_agent_block(
+                    generation,
+                    &stale_epoch,
+                    &cleanup_snapshot,
+                    &cleanup_proof,
+                )
+                .is_err()
+        );
+        let mut wrong_authority = cleanup_run.clone();
+        wrong_authority.authority_digest = Digest::parse("e".repeat(64)).unwrap();
+        assert!(
+            store
+                .reconcile_cancelled_agent_block(
+                    generation,
+                    &wrong_authority,
+                    &cleanup_snapshot,
+                    &cleanup_proof,
+                )
+                .is_err()
+        );
+        let mut unknown_cleanup = cleanup_snapshot.clone();
+        unknown_cleanup.cleanup_covered = true;
+        assert!(
+            store
+                .reconcile_cancelled_agent_block(
+                    generation,
+                    &cleanup_run,
+                    &unknown_cleanup,
+                    &cleanup_proof,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .reconcile_cancelled_agent_block(
+                    generation,
+                    &cleanup_run,
+                    &cleanup_snapshot,
+                    &cleanup_proof,
+                )
+                .unwrap()
+        );
+        let cancelled_state: (String, String, String, u64) = store
+            .connection
+            .query_row(
+                "SELECT r.state,l.state,s.disposition,s.controller_generation
+             FROM agent_runs r JOIN agent_launch_state l USING(agent_run_id)
+             JOIN execution_slots s ON s.owner_id=r.agent_run_id WHERE r.agent_run_id=?1",
+                [cleanup_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            cancelled_state,
+            (
+                "cancelled".into(),
+                "cancelled".into(),
+                "released".into(),
+                generation
+            )
+        );
+        let lifecycle_facts: (u64, u64) = store
+            .connection
+            .query_row(
+                "SELECT
+                SUM(fact_type='exit_confirmed'),
+                SUM(fact_type='slot_released')
+             FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=8",
+                [cleanup_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_facts, (1, 1));
     }
 }

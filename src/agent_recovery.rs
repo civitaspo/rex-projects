@@ -991,6 +991,30 @@ fn reconcile_missing_block(
             make_block_loss_snapshot(run, provider, process_tree, policy.now_unix, false)?
         }
     };
+    if !snapshot.cleanup_covered
+        && producer_complete
+        && let Some(family) = family.as_ref()
+    {
+        let cancelled_cleanup = (|| {
+            let start = spool.read_start_request()?;
+            let result = spool.read_turn_result(&start)?;
+            crate::store::agent_results::verify_cancelled_agent_cleanup(
+                store,
+                owner_generation,
+                run,
+                &start,
+                &result,
+                family,
+                &snapshot,
+            )
+        })();
+        if let Ok(cleanup) = cancelled_cleanup
+            && store.reconcile_cancelled_agent_block(owner_generation, run, &snapshot, &cleanup)?
+        {
+            runtime.fork_watches.remove(&run.agent_run_id);
+            return Ok(AgentRecoveryDisposition::BlockLossTerminal);
+        }
+    }
     if !producer_complete {
         return stop_known_processes_without_watch(
             store,

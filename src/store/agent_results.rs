@@ -20,10 +20,15 @@ use crate::engine::orchestration::{
     RoleResultBinding, RoleResultSubmission, ValidatedRoleResult, WakeSessionKey,
 };
 use crate::launch::{AgentLaunchAuthority, ProviderQualification};
+use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::roles::RoleResultMessage;
 use crate::run_step::{CleanupState, TurnOutcome};
-use crate::run_step_spool::{AgentTurnResult, StartRequestEnvelope};
+use crate::run_step_spool::{
+    AgentTurnResult, BlockLossCleanupSnapshot, RunFamilyCoverage, RunFamilyRecord,
+    StartRequestEnvelope,
+};
 use crate::store::ConfigStore;
+use crate::store::agent_recovery::RecoverableAgentRun;
 
 const MAX_TERMINAL_BYTES: usize = 2 * 1024 * 1024;
 type ObsoleteConfigurationSourceRow = (
@@ -65,6 +70,7 @@ type ArtifactSourceWithAuthorityRow = (
     String,
     String,
 );
+type CancelledCleanupLaunchStateRow = (String, Option<String>, Option<String>, Option<String>);
 
 /// An immutable host receipt proving that the persisted provider run completed and its observed
 /// process tree is absent. Its private fields prevent callers from manufacturing or deserializing
@@ -80,6 +86,141 @@ pub struct VerifiedAgentTerminal {
     terminal_digest: Digest,
     absence_digest: Digest,
     result: AgentTurnResult,
+}
+
+/// Host-only proof that an exact cancelled provider run and its Rex wrapper are absent.
+/// It authorizes lifecycle reconciliation only; it is not a successful Agent terminal.
+pub(crate) struct VerifiedAgentCleanup {
+    agent_run_id: AgentRunId,
+    owner_generation: u64,
+    reservation_epoch: u64,
+    authority_digest: Digest,
+    start_request_digest: Digest,
+    result_digest: Digest,
+    family_digest: Digest,
+    snapshot_digest: Digest,
+    absence_digest: Digest,
+    proof_digest: Digest,
+    observed_at_unix: i64,
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_agent_cleanup(
+    run: &RecoverableAgentRun,
+    owner_generation: u64,
+    snapshot: &BlockLossCleanupSnapshot,
+) -> VerifiedAgentCleanup {
+    let start_request_digest = Digest::parse("a".repeat(64)).unwrap();
+    let result_digest = Digest::parse("b".repeat(64)).unwrap();
+    let family_digest = Digest::parse("c".repeat(64)).unwrap();
+    let snapshot_digest = digest(&serde_json::to_vec(snapshot).unwrap()).unwrap();
+    let absence_digest = Digest::parse("d".repeat(64)).unwrap();
+    let observed_at_unix = 10;
+    let proof_digest = digest(
+        &serde_json::to_vec(&(
+            "rex-projects-cancelled-agent-cleanup-v1",
+            &run.agent_run_id,
+            owner_generation,
+            run.reservation_epoch,
+            &run.authority_digest,
+            &start_request_digest,
+            &result_digest,
+            &family_digest,
+            &snapshot_digest,
+            &absence_digest,
+            observed_at_unix,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    VerifiedAgentCleanup {
+        agent_run_id: run.agent_run_id.clone(),
+        owner_generation,
+        reservation_epoch: run.reservation_epoch,
+        authority_digest: run.authority_digest.clone(),
+        start_request_digest,
+        result_digest,
+        family_digest,
+        snapshot_digest,
+        absence_digest,
+        proof_digest,
+        observed_at_unix,
+    }
+}
+
+impl VerifiedAgentCleanup {
+    pub(crate) fn verify_reconciliation_binding(
+        &self,
+        run: &RecoverableAgentRun,
+        owner_generation: u64,
+        snapshot: &BlockLossCleanupSnapshot,
+    ) -> Result<(), String> {
+        let snapshot_bytes = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+        if self.agent_run_id != run.agent_run_id
+            || self.owner_generation != owner_generation
+            || owner_generation != run.current_generation
+            || self.reservation_epoch != run.reservation_epoch
+            || self.authority_digest != run.authority_digest
+            || self.start_request_digest.as_str().is_empty()
+            || self.result_digest.as_str().is_empty()
+            || self.family_digest.as_str().is_empty()
+            || self.snapshot_digest != digest(&snapshot_bytes)?
+            || snapshot.cleanup_covered
+            || self.observed_at_unix < snapshot.observed_at_unix
+        {
+            return Err(
+                "cancelled Agent cleanup proof does not match the current recovery snapshot".into(),
+            );
+        }
+        let expected = digest(
+            &serde_json::to_vec(&(
+                "rex-projects-cancelled-agent-cleanup-v1",
+                &self.agent_run_id,
+                self.owner_generation,
+                self.reservation_epoch,
+                &self.authority_digest,
+                &self.start_request_digest,
+                &self.result_digest,
+                &self.family_digest,
+                &self.snapshot_digest,
+                &self.absence_digest,
+                self.observed_at_unix,
+            ))
+            .map_err(|error| error.to_string())?,
+        )?;
+        if self.proof_digest != expected {
+            return Err("cancelled Agent cleanup proof digest is invalid".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn proof_digest(&self) -> &Digest {
+        &self.proof_digest
+    }
+
+    pub(crate) fn result_digest(&self) -> &Digest {
+        &self.result_digest
+    }
+
+    pub(crate) fn family_digest(&self) -> &Digest {
+        &self.family_digest
+    }
+
+    pub(crate) fn absence_digest(&self) -> &Digest {
+        &self.absence_digest
+    }
+
+    pub(crate) fn snapshot_digest(&self) -> &Digest {
+        &self.snapshot_digest
+    }
+
+    pub(crate) fn start_request_digest(&self) -> &Digest {
+        &self.start_request_digest
+    }
+
+    pub(crate) fn observed_at_unix(&self) -> i64 {
+        self.observed_at_unix
+    }
 }
 
 impl VerifiedAgentTerminal {
@@ -183,6 +324,588 @@ impl ResultDisposition {
             Self::RejectedByHost => "rejected_by_host",
         }
     }
+}
+
+/// Verify a cancellation-only cleanup receipt for a missing Rex block. The receipt proves no
+/// role result and never creates or reuses `VerifiedAgentTerminal`.
+pub(crate) fn verify_cancelled_agent_cleanup(
+    store: &ConfigStore,
+    owner_generation: u64,
+    run: &RecoverableAgentRun,
+    start: &StartRequestEnvelope,
+    result: &AgentTurnResult,
+    family: &RunFamilyRecord,
+    snapshot: &BlockLossCleanupSnapshot,
+) -> Result<VerifiedAgentCleanup, String> {
+    start.validate()?;
+    result.validate_for(start)?;
+    family.validate()?;
+    snapshot.validate()?;
+
+    let authority = store
+        .agent_launch_authority(&run.agent_run_id)?
+        .ok_or("cancelled cleanup has no persisted launch authority")?;
+    let authority_digest = authority.digest()?;
+    if authority != run.authority
+        || authority_digest != run.authority_digest
+        || authority.agent_run_id != run.agent_run_id
+        || run.current_generation != owner_generation
+    {
+        return Err(
+            "cancelled cleanup does not match the current immutable launch authority".into(),
+        );
+    }
+    validate_request_authority(&authority, start)?;
+    verify_accepted_start_receipt(store, start)?;
+    let active_generation: Option<u64> = store
+        .connection
+        .query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if active_generation != Some(owner_generation) {
+        return Err("cancelled cleanup requires the active controller generation".into());
+    }
+
+    let qualification = load_qualification(&store.connection, &authority)?;
+    validate_cancelled_result_for_start(&authority, start, result, &qualification)?;
+    validate_descriptor_and_projection(&authority, result, &qualification)?;
+
+    let expected_binding = crate::run_step_spool::RunFamilyBinding {
+        schema_version: 1,
+        agent_run_id: run.agent_run_id.clone(),
+        reservation_epoch: run.reservation_epoch,
+        authority_digest: run.authority_digest.clone(),
+        descriptor_digest: authority.descriptor_digest.clone(),
+        wrapper_pid: start.request.wrapper_pid,
+        wrapper_start_identity: start.request.wrapper_start_identity.clone(),
+    };
+    let wrapper: crate::launch::ObservedWrapperIdentity = crate::protocol::parse_unique(
+        run.wrapper_identity_json
+            .as_deref()
+            .ok_or("cancelled cleanup has no saved wrapper identity")?
+            .as_bytes(),
+    )?;
+    wrapper.matches_start_request(&start.request)?;
+    if family.binding != expected_binding
+        || family.coverage != RunFamilyCoverage::Complete
+        || family.provider_executable_path != qualification.executable_path
+        || family.provider_executable_digest != qualification.executable_digest
+        || family.wrapper_process.pid != wrapper.pid
+        || family.wrapper_process.start_identity != wrapper.start_identity
+        || family.wrapper_process.quality != ProcessIdentityQuality::KernelBirthToken
+        || family.provider_root.parent_pid != wrapper.pid
+        || family.provider_root.quality != ProcessIdentityQuality::KernelBirthToken
+    {
+        return Err("cancelled cleanup family does not match the exact accepted launch".into());
+    }
+
+    let launch_state: Option<CancelledCleanupLaunchStateRow> = store
+        .connection
+        .query_row(
+            "SELECT state,start_request_digest,provider_process_tree_json,wrapper_process_identity_json FROM agent_launch_state WHERE agent_run_id=?1",
+            [run.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((state, start_digest, provider_tree_json, wrapper_json)) = launch_state else {
+        return Err("cancelled cleanup has no persisted launch state".into());
+    };
+    if !matches!(state.as_str(), "running" | "unknown")
+        || start_digest.as_deref() != Some(start.request_digest.as_str())
+        || run.wrapper_identity_json.as_deref() != wrapper_json.as_deref()
+        || start.request.wrapper_pid != wrapper.pid
+        || start.request.wrapper_start_identity != wrapper.start_identity
+        || start.request.rex_session_id != wrapper.rex_session_id
+        || start.request.rex_block_id != wrapper.rex_block_id
+    {
+        return Err("cancelled cleanup start request is no longer active".into());
+    }
+    let provider_tree_json = provider_tree_json
+        .ok_or("cancelled cleanup has no persisted provider-start observation")?;
+    let provider: crate::launch::ObservedProviderStart =
+        crate::protocol::parse_unique(provider_tree_json.as_bytes())?;
+    provider.validate_complete_process_tree(&qualification)?;
+    verify_provider_start_observation(
+        &authority,
+        &Some(provider_tree_json),
+        result,
+        &qualification,
+    )?;
+    if provider.provider_pid != family.provider_root.pid
+        || provider.provider_start_identity != family.provider_root.start_identity
+        || !family
+            .process_tree
+            .iter()
+            .any(|process| same_process_identity(process, &family.provider_root))
+        || !provider
+            .process_tree
+            .iter()
+            .any(|process| same_provider_identity(&family.provider_root, process))
+        || !family_covers_provider_tree(
+            &provider.process_tree,
+            &family.wrapper_process,
+            &family.process_tree,
+        )
+    {
+        return Err(
+            "cancelled cleanup family does not preserve the host-observed provider tree".into(),
+        );
+    }
+
+    if snapshot.cleanup_covered
+        || snapshot.agent_run_id != run.agent_run_id
+        || snapshot.reservation_epoch != run.reservation_epoch
+        || snapshot.authority_digest != run.authority_digest
+        || snapshot.launch_tree_digest != provider.process_tree_digest
+        || !same_identity_sets(&result.receipt.processes, &family.process_tree)
+        || !same_snapshot_family_union(snapshot, family, &family.wrapper_process)
+    {
+        return Err(
+            "cancelled cleanup result, family, and cumulative snapshot identities differ".into(),
+        );
+    }
+
+    let exact_identities = std::iter::once(&family.wrapper_process)
+        .chain(family.process_tree.iter())
+        .map(|process| crate::run_step::ObservedProcess {
+            pid: process.pid,
+            parent_pid: process.parent_pid,
+            process_group_id: process.process_group_id,
+            start_identity: process.start_identity.clone(),
+            command: String::new(),
+            identity_quality: match process.quality {
+                ProcessIdentityQuality::KernelBirthToken => "kernel_birth_token",
+                ProcessIdentityQuality::SecondPrecision => "second_precision",
+            }
+            .into(),
+        })
+        .collect::<Vec<_>>();
+    let absence_digest = verify_process_tree_absent(&exact_identities)?;
+    let family_digest = digest(&serde_json::to_vec(family).map_err(|error| error.to_string())?)?;
+    let snapshot_digest =
+        digest(&serde_json::to_vec(snapshot).map_err(|error| error.to_string())?)?;
+    let result_digest = digest(&serde_json::to_vec(result).map_err(|error| error.to_string())?)?;
+    let observed_at_unix = unix_now()?;
+    let proof_digest = digest(
+        &serde_json::to_vec(&(
+            "rex-projects-cancelled-agent-cleanup-v1",
+            &run.agent_run_id,
+            owner_generation,
+            run.reservation_epoch,
+            &run.authority_digest,
+            &Digest::parse(start.request_digest.clone())?,
+            &result_digest,
+            &family_digest,
+            &snapshot_digest,
+            &absence_digest,
+            observed_at_unix,
+        ))
+        .map_err(|error| error.to_string())?,
+    )?;
+    Ok(VerifiedAgentCleanup {
+        agent_run_id: run.agent_run_id.clone(),
+        owner_generation,
+        reservation_epoch: run.reservation_epoch,
+        authority_digest: run.authority_digest.clone(),
+        start_request_digest: Digest::parse(start.request_digest.clone())?,
+        result_digest,
+        family_digest,
+        snapshot_digest,
+        absence_digest,
+        proof_digest,
+        observed_at_unix,
+    })
+}
+
+fn verify_accepted_start_receipt(
+    store: &ConfigStore,
+    start: &StartRequestEnvelope,
+) -> Result<(), String> {
+    if store
+        .persisted_start_receipt(&start.request)?
+        .is_none_or(|receipt| receipt.decision != crate::launch::LaunchDecision::Accepted)
+    {
+        return Err("cancelled cleanup has no persisted accepted start receipt".into());
+    }
+    Ok(())
+}
+
+fn validate_cancelled_result_for_start(
+    authority: &AgentLaunchAuthority,
+    start: &StartRequestEnvelope,
+    result: &AgentTurnResult,
+    qualification: &ProviderQualification,
+) -> Result<(), String> {
+    let receipt = &result.receipt;
+    if receipt.run_id != authority.agent_run_id
+        || receipt.attempt != authority.attempt
+        || receipt.provider != qualification.adapter
+        || receipt.capability_receipt_digest.as_ref()
+            != Some(&authority.qualification_receipt_digest)
+        || !matches!(receipt.outcome, TurnOutcome::Cancelled)
+        || !matches!(receipt.cleanup, CleanupState::Confirmed)
+        || receipt.timed_out
+        || receipt.cancellation_signal.is_none_or(|signal| signal <= 0)
+        || receipt.exit_code.is_some()
+        || receipt.result_digest.is_some()
+        || result.structured_result.is_some()
+    {
+        return Err("provider run receipt is not an exact cleanup-confirmed cancellation".into());
+    }
+    if result.start_request_digest != start.request_digest {
+        return Err("cancelled provider result does not match its start request".into());
+    }
+    Ok(())
+}
+
+fn same_provider_identity(
+    family: &ProcessIdentity,
+    provider: &crate::launch::ProviderProcessIdentity,
+) -> bool {
+    family.pid == provider.pid
+        && family.parent_pid == provider.parent_pid
+        && family.process_group_id == provider.process_group_id
+        && family.start_identity == provider.start_identity
+        && family.quality == provider.identity_quality
+}
+
+fn same_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> bool {
+    left.pid == right.pid
+        && left.parent_pid == right.parent_pid
+        && left.process_group_id == right.process_group_id
+        && left.start_identity == right.start_identity
+        && left.quality == right.quality
+}
+
+fn family_covers_provider_tree(
+    provider_tree: &[crate::launch::ProviderProcessIdentity],
+    wrapper: &ProcessIdentity,
+    family_tree: &[ProcessIdentity],
+) -> bool {
+    provider_tree.iter().all(|saved| {
+        if saved.pid == wrapper.pid && saved.start_identity == wrapper.start_identity {
+            same_provider_identity(wrapper, saved)
+        } else {
+            family_tree
+                .iter()
+                .any(|process| same_provider_identity(process, saved))
+        }
+    })
+}
+
+#[cfg(test)]
+mod cancelled_cleanup_tests {
+    use super::*;
+    use crate::domain::types::AgentAdapter;
+
+    fn start_for(authority: &AgentLaunchAuthority) -> StartRequestEnvelope {
+        let request = crate::launch::AgentStartRequest {
+            schema_version: 1,
+            operation_id: authority.operation_id.clone(),
+            agent_run_id: authority.agent_run_id.clone(),
+            project_id: authority.project_id.clone(),
+            controller_generation: authority.controller_generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            wrapper_pid: std::process::id(),
+            wrapper_start_identity: "wrapper-birth".into(),
+            rex_session_id: authority.rex_session_id.clone(),
+            rex_block_id: authority.rex_block_id.clone(),
+        };
+        StartRequestEnvelope {
+            schema_version: 1,
+            request_digest: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&request).unwrap())
+            ),
+            request,
+        }
+    }
+
+    fn cancelled_result(
+        authority: &AgentLaunchAuthority,
+        start: &StartRequestEnvelope,
+        cleanup: CleanupState,
+    ) -> AgentTurnResult {
+        let schema_projection = crate::providers::project_result_schema(&serde_json::json!({
+            "type": "object"
+        }))
+        .unwrap()
+        .identity;
+        AgentTurnResult {
+            schema_version: 1,
+            start_request_digest: start.request_digest.clone(),
+            receipt: crate::run_step::RunReceipt {
+                run_id: authority.agent_run_id.clone(),
+                attempt: authority.attempt,
+                provider: AgentAdapter::Codex,
+                effective_permission_mode: "workspace_write".into(),
+                conversation_id: None,
+                provider_version: Some("fixture".into()),
+                capability_receipt_digest: Some(authority.qualification_receipt_digest.clone()),
+                schema_projection,
+                launch_pid_hint: None,
+                exit_code: None,
+                timed_out: false,
+                cancellation_signal: Some(1),
+                cleanup,
+                cleanup_detail: None,
+                processes: Vec::new(),
+                result_digest: None,
+                provider_result_failure: None,
+                provider_process_failure: None,
+                outcome: TurnOutcome::Cancelled,
+            },
+            structured_result: None,
+            result_digest: "e".repeat(64),
+        }
+    }
+
+    #[test]
+    fn complete_family_keeps_wrapper_separate_from_provider_members() {
+        let process = |pid, parent_pid, process_group_id, start_identity: &str| ProcessIdentity {
+            pid,
+            parent_pid,
+            process_group_id,
+            start_identity: start_identity.into(),
+            command: String::new(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let provider_identity = |pid, parent_pid, process_group_id, start_identity: &str| {
+            crate::launch::ProviderProcessIdentity {
+                pid,
+                parent_pid,
+                process_group_id,
+                start_identity: start_identity.into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            }
+        };
+        let wrapper = process(84122, 100, 100, "wrapper-birth");
+        let provider = process(84201, 84122, 84201, "provider-birth");
+        let shell = process(84638, 84201, 84201, "shell-birth");
+        let provider_tree = vec![
+            provider_identity(84122, 100, 100, "wrapper-birth"),
+            provider_identity(84201, 84122, 84201, "provider-birth"),
+            provider_identity(84638, 84201, 84201, "shell-birth"),
+        ];
+
+        assert!(family_covers_provider_tree(
+            &provider_tree,
+            &wrapper,
+            &[provider.clone(), shell.clone()]
+        ));
+
+        let missing_shell = vec![provider.clone()];
+        assert!(!family_covers_provider_tree(
+            &provider_tree,
+            &wrapper,
+            &missing_shell
+        ));
+
+        let wrong_wrapper_birth = process(84122, 100, 100, "reused-wrapper-pid");
+        assert!(!family_covers_provider_tree(
+            &provider_tree,
+            &wrong_wrapper_birth,
+            &[provider, shell]
+        ));
+    }
+
+    #[test]
+    fn cancelled_result_requires_explicit_confirmed_cleanup_and_no_role_output() {
+        let authority = tests::test_authority();
+        let start = start_for(&authority);
+        let qualification = tests::reviewer_qualification(&authority);
+        let result = cancelled_result(&authority, &start, CleanupState::Confirmed);
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &result, &qualification)
+                .is_ok()
+        );
+
+        let unknown_cleanup = cancelled_result(&authority, &start, CleanupState::Unknown);
+        assert!(
+            validate_cancelled_result_for_start(
+                &authority,
+                &start,
+                &unknown_cleanup,
+                &qualification
+            )
+            .is_err()
+        );
+
+        let mut role_output = result;
+        role_output.structured_result = Some(serde_json::json!({"assertion":"succeeded"}));
+        assert!(
+            validate_cancelled_result_for_start(&authority, &start, &role_output, &qualification)
+                .is_err()
+        );
+
+        let mut wrong_start = start;
+        wrong_start.request.descriptor_digest = Digest::parse("f".repeat(64)).unwrap();
+        assert!(validate_request_authority(&authority, &wrong_start).is_err());
+    }
+
+    #[test]
+    fn cancelled_cleanup_requires_persisted_accepted_start_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::open_test(temp.path()).unwrap();
+        let start = start_for(&tests::test_authority());
+        assert!(verify_accepted_start_receipt(&store, &start).is_err());
+    }
+
+    #[test]
+    fn cancelled_cleanup_rejects_extra_snapshot_identity_and_live_survivor() {
+        let wrapper = ProcessIdentity {
+            pid: 84122,
+            parent_pid: 100,
+            process_group_id: 100,
+            start_identity: "wrapper-birth".into(),
+            command: String::new(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let provider = ProcessIdentity {
+            pid: 84201,
+            parent_pid: 84122,
+            process_group_id: 84201,
+            start_identity: "provider-birth".into(),
+            command: String::new(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let family = RunFamilyRecord {
+            schema_version: 2,
+            binding: crate::run_step_spool::RunFamilyBinding {
+                schema_version: 1,
+                agent_run_id: AgentRunId::parse("worker-run").unwrap(),
+                reservation_epoch: 4,
+                authority_digest: Digest::parse("a".repeat(64)).unwrap(),
+                descriptor_digest: Digest::parse("b".repeat(64)).unwrap(),
+                wrapper_pid: wrapper.pid,
+                wrapper_start_identity: wrapper.start_identity.clone(),
+            },
+            observed_at_unix: 1,
+            coverage: RunFamilyCoverage::Complete,
+            wrapper_process: wrapper.clone(),
+            provider_root: provider.clone(),
+            provider_executable_path: "/bin/codex".into(),
+            provider_executable_digest: Digest::parse("c".repeat(64)).unwrap(),
+            process_tree: vec![provider.clone()],
+            process_tree_digest: Digest::parse("d".repeat(64)).unwrap(),
+        };
+        let observed = |identity: &ProcessIdentity| crate::run_step::ObservedProcess {
+            pid: identity.pid,
+            parent_pid: identity.parent_pid,
+            process_group_id: identity.process_group_id,
+            start_identity: identity.start_identity.clone(),
+            command: String::new(),
+            identity_quality: "kernel_birth_token".into(),
+        };
+        assert!(same_identity_sets(
+            &[observed(&provider)],
+            &family.process_tree
+        ));
+        assert!(same_snapshot_family_union(
+            &BlockLossCleanupSnapshot {
+                schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
+                agent_run_id: family.binding.agent_run_id.clone(),
+                reservation_epoch: family.binding.reservation_epoch,
+                authority_digest: family.binding.authority_digest.clone(),
+                launch_tree_digest: Digest::parse("e".repeat(64)).unwrap(),
+                observed_at_unix: 1,
+                cleanup_covered: false,
+                process_tree: vec![wrapper.clone(), provider.clone()],
+                process_tree_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+            &family,
+            &wrapper
+        ));
+        let extra = ProcessIdentity {
+            pid: 84202,
+            parent_pid: 84201,
+            process_group_id: 84201,
+            start_identity: "unexplained-birth".into(),
+            command: String::new(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        assert!(!same_identity_sets(
+            &[observed(&provider), observed(&extra)],
+            &family.process_tree
+        ));
+        assert!(!same_snapshot_family_union(
+            &BlockLossCleanupSnapshot {
+                schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
+                agent_run_id: family.binding.agent_run_id.clone(),
+                reservation_epoch: family.binding.reservation_epoch,
+                authority_digest: family.binding.authority_digest.clone(),
+                launch_tree_digest: Digest::parse("e".repeat(64)).unwrap(),
+                observed_at_unix: 1,
+                cleanup_covered: false,
+                process_tree: vec![wrapper, provider, extra],
+                process_tree_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+            &family,
+            &family.wrapper_process
+        ));
+
+        let self_identity = crate::process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| {
+                process.pid == std::process::id()
+                    && process.quality == ProcessIdentityQuality::KernelBirthToken
+            })
+            .unwrap();
+        let live = crate::run_step::ObservedProcess {
+            pid: self_identity.pid,
+            parent_pid: self_identity.parent_pid,
+            process_group_id: self_identity.process_group_id,
+            start_identity: self_identity.start_identity,
+            command: self_identity.command,
+            identity_quality: "kernel_birth_token".into(),
+        };
+        assert!(verify_process_tree_absent(&[live]).is_err());
+    }
+}
+
+fn same_identity_sets(
+    result: &[crate::run_step::ObservedProcess],
+    family: &[ProcessIdentity],
+) -> bool {
+    result.len() == family.len()
+        && family.iter().all(|process| {
+            result.iter().any(|observed| {
+                observed.pid == process.pid
+                    && observed.parent_pid == process.parent_pid
+                    && observed.process_group_id == process.process_group_id
+                    && observed.start_identity == process.start_identity
+                    && observed.identity_quality == "kernel_birth_token"
+                    && process.quality == ProcessIdentityQuality::KernelBirthToken
+            })
+        })
+}
+
+fn same_snapshot_family_union(
+    snapshot: &BlockLossCleanupSnapshot,
+    family: &RunFamilyRecord,
+    wrapper: &ProcessIdentity,
+) -> bool {
+    let mut expected = family.process_tree.clone();
+    expected.push(wrapper.clone());
+    snapshot.process_tree.len() == expected.len()
+        && expected.iter().all(|process| {
+            snapshot.process_tree.iter().any(|observed| {
+                observed.pid == process.pid
+                    && observed.parent_pid == process.parent_pid
+                    && observed.process_group_id == process.process_group_id
+                    && observed.start_identity == process.start_identity
+                    && observed.quality == process.quality
+            })
+        })
 }
 
 /// Store a provider result only after exact launch matching and a fresh host process-table check.
