@@ -1856,7 +1856,24 @@ impl RepositoryDeliveryEffects {
         let reservation = store
             .agent_launch_reservation_for_run(&payload.agent_run_id)?
             .ok_or("repository.commit launch reservation is missing")?;
-        store.validate_active_agent_run_owner(&authority, owner_generation)?;
+        if let Err(active_owner_error) =
+            store.validate_active_agent_run_owner(&authority, owner_generation)
+        {
+            store
+                .validate_terminal_commit_reconciliation(
+                    owner_generation,
+                    &authority,
+                    &reservation,
+                    &request.intent,
+                    payload.ticket_revision,
+                    &payload.configuration_digest,
+                )
+                .map_err(|terminal_error| {
+                    format!(
+                        "repository.commit Worker is not owned by the active controller ({active_owner_error}); terminal reconciliation rejected ({terminal_error})"
+                    )
+                })?;
+        }
         if authority.project_id != payload.project_id
             || authority.role != crate::domain::types::Role::Worker
             || authority.ticket_run_id.as_ref() != Some(&payload.ticket_run_id)
@@ -2105,13 +2122,17 @@ impl RepositoryDeliveryEffects {
                 "prepared Worker worktree identity changed before repository.commit".into(),
             );
         }
-        self.delivery
-            .validate_required_commit_trailer(
-                &work,
-                &payload.commit_message,
-                &payload.required_trailer,
-            )
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.delivery.validate_required_commit_trailer(
+            &work,
+            &payload.commit_message,
+            &payload.required_trailer,
+        ) {
+            let error_message = error.to_string();
+            if let Some(observation) = rejected_commit_trailer_validation(error) {
+                return Ok(observation);
+            }
+            return Err(error_message);
+        }
         let operation_id = OperationId::parse(request.intent.operation_id.clone())?;
         let commit = match mode {
             EffectMode::Submit => {
@@ -3485,6 +3506,15 @@ fn rejected_delivery_effect(error: String) -> EffectObservation {
     }
 }
 
+fn rejected_commit_trailer_validation(error: DeliveryError) -> Option<EffectObservation> {
+    match error {
+        DeliveryError::HostCommit(HostCommitError::Invalid(message)) => {
+            Some(rejected_delivery_effect(message))
+        }
+        _ => None,
+    }
+}
+
 fn decode_effect_payload<T>(request: &EffectRequest) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned,
@@ -3702,6 +3732,104 @@ mod tests {
             .map(|directory| directory.join("git"))
             .find(|path| path.is_file())
             .expect("git is installed for local repository fixtures")
+    }
+
+    #[test]
+    fn invalid_commit_trailer_is_rejected_while_git_failure_remains_retryable() {
+        let rejected = rejected_commit_trailer_validation(DeliveryError::HostCommit(
+            HostCommitError::Invalid(
+                "host commit message is missing the required authorship trailer: Co-authored-by: Codex <noreply@openai.com>"
+                    .into(),
+            ),
+        ))
+        .expect("invalid commit content must become a terminal effect rejection");
+        let EffectObservation::Rejected { receipt } = rejected else {
+            panic!("invalid commit content must be persisted as a rejection");
+        };
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["schema_version"], 1);
+        assert_eq!(receipt["outcome"], "rejected");
+        assert!(
+            receipt["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Co-authored-by")
+        );
+
+        assert!(
+            rejected_commit_trailer_validation(DeliveryError::HostCommit(HostCommitError::Git(
+                "parse required commit trailer",
+                "git unavailable".into()
+            ),))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn literal_newline_commit_trailer_rejection_does_not_mutate_the_managed_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let (bare, base_sha) = seed_local_remote(temp.path(), &executable);
+        let delivery = RepositoryDelivery::new(
+            &temp.path().join("state"),
+            GitOptions {
+                executable,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(5),
+            },
+            BTreeMap::new(),
+            HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        let identity = WorkNodeIdentity {
+            project_id: ProjectId::parse("project").unwrap(),
+            repository_id: RepositoryId::parse("demo").unwrap(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-50").unwrap(),
+            ticket_run_id: TicketRunId::parse("run-50").unwrap(),
+            work_node_id: "docs".into(),
+        };
+        let work = delivery
+            .prepare_worktree(
+                identity,
+                &fixture_repository_config(bare.to_string_lossy().into_owned()),
+                &base_sha,
+                CommitMode::Host,
+            )
+            .unwrap();
+        let error = delivery
+            .validate_required_commit_trailer(
+                &work,
+                "docs: fix\\n\\nCo-authored-by: Codex <noreply@openai.com>\\n",
+                "Co-authored-by: Codex <noreply@openai.com>",
+            )
+            .unwrap_err();
+        let observation = rejected_commit_trailer_validation(error)
+            .expect("the malformed immutable message must terminate as a rejection");
+        let EffectObservation::Rejected { receipt } = observation else {
+            panic!("malformed commit message was not rejected");
+        };
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["outcome"], "rejected");
+        assert!(
+            receipt["reason"]
+                .as_str()
+                .unwrap()
+                .contains("missing the required")
+        );
+        assert_eq!(
+            delivery.observe_local_head_at(&work.worktree.path).unwrap(),
+            base_sha
+        );
+        assert!(
+            !temp
+                .path()
+                .join("state/host-commits/invalid-message")
+                .exists()
+        );
     }
 
     fn git(executable: &Path, cwd: &Path, args: &[&str]) {

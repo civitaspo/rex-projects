@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, TicketRunId};
-use crate::launch::{AgentLaunchAuthority, ObservedProviderStart, ObservedWrapperIdentity};
+use crate::launch::{
+    AgentLaunchAuthority, AgentLaunchReservation, ObservedProviderStart, ObservedWrapperIdentity,
+};
 use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::run_step_spool::BlockLossCleanupSnapshot;
 
@@ -151,6 +153,108 @@ pub(crate) fn validate_agent_run_current_owner(
 }
 
 impl ConfigStore {
+    /// Permit replay of an already accepted repository commit effect after its Worker has
+    /// terminated and the controller has restarted. This is a reconciliation gate only: it
+    /// cannot create an effect and requires the immutable intent, current TicketRun scope,
+    /// absence of another active turn in the same role session, and fresh terminal proof.
+    pub(crate) fn validate_terminal_commit_reconciliation(
+        &self,
+        owner_generation: u64,
+        authority: &AgentLaunchAuthority,
+        reservation: &AgentLaunchReservation,
+        intent: &super::EffectIntent,
+        ticket_revision: u64,
+        configuration_digest: &Digest,
+    ) -> Result<(), String> {
+        let ticket_run_id = authority
+            .ticket_run_id
+            .as_ref()
+            .ok_or("terminal repository.commit Worker has no TicketRun")?;
+        if intent.kind != "commit_worker_manifest"
+            || intent.project_id != authority.project_id
+            || intent.subject_type != "ticket_run"
+            || intent.subject_id != ticket_run_id.as_str()
+            || intent.expected_revision != Some(ticket_revision)
+            || authority.role != crate::domain::types::Role::Worker
+            || authority.ticket_revision.map(|revision| revision.0) != Some(ticket_revision)
+            || authority.config_digest != *configuration_digest
+            || reservation.project_id != authority.project_id
+            || reservation.agent_run_id != authority.agent_run_id
+            || reservation.project_epoch == 0
+        {
+            return Err(
+                "terminal repository.commit intent is outside its immutable Worker scope".into(),
+            );
+        }
+        let persisted = self
+            .effect_by_logical_key(&intent.logical_key)?
+            .ok_or("terminal repository.commit has no previously accepted effect intent")?;
+        if persisted != *intent {
+            return Err(
+                "terminal repository.commit differs from its previously accepted intent".into(),
+            );
+        }
+        let ticket_scope: Option<(u64, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT revision,config_digest,internal_phase FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                params![ticket_run_id.as_str(), authority.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((revision, config_digest, phase)) = ticket_scope else {
+            return Err("terminal repository.commit TicketRun is no longer present".into());
+        };
+        if revision != ticket_revision
+            || config_digest != configuration_digest.as_str()
+            || matches!(phase.as_str(), "done" | "canceled")
+        {
+            return Err(
+                "terminal repository.commit no longer matches the active TicketRun revision".into(),
+            );
+        }
+        let project_scope: Option<(String, String, String, u64)> = self
+            .connection
+            .query_row(
+                "SELECT p.config_digest,p.desired_lifecycle,r.desired_lifecycle,r.project_epoch FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+                [authority.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((project_config_digest, project_lifecycle, runtime_lifecycle, project_epoch)) =
+            project_scope
+        else {
+            return Err("terminal repository.commit Project is no longer present".into());
+        };
+        if project_config_digest != configuration_digest.as_str()
+            || project_lifecycle != "running"
+            || runtime_lifecycle != "running"
+            || project_epoch != reservation.project_epoch
+        {
+            return Err("terminal repository.commit Project lifecycle or epoch changed".into());
+        }
+        let another_active_turn: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE role_session_id=?1 AND agent_run_id!=?2 AND state IN ('launch_pending','running','unknown'))",
+                params![authority.role_session_id, authority.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if another_active_turn {
+            return Err("another active Agent turn owns this Worker role session".into());
+        }
+        super::agent_results::verify_agent_terminal(
+            self,
+            owner_generation,
+            &authority.agent_run_id,
+        )
+        .map_err(|error| format!("terminal repository.commit Worker proof is invalid: {error}"))?;
+        Ok(())
+    }
+
     pub(crate) fn validate_active_agent_run_owner(
         &self,
         authority: &AgentLaunchAuthority,

@@ -592,39 +592,59 @@ impl crate::store::ConfigStore {
         } else {
             self.enqueue_effect(owner_generation, &intent)?;
         }
-        if mode == MailboxDispatchMode::TerminalReceiptReplay {
-            let Some(receipt) = self.succeeded_effect_receipt(&intent.operation_id)? else {
-                return Ok(false);
-            };
-            if receipt.intent() != &intent {
-                return Err("terminal repository.commit receipt has a different intent".into());
-            }
-        }
-        let status: Option<(String, Option<String>)> = self
+        let status: Option<(String, Option<String>, Option<String>)> = self
             .connection
             .query_row(
-                "SELECT status,last_error FROM effects WHERE operation_id=?1",
+                "SELECT status,last_error,receipt_json FROM effects WHERE operation_id=?1",
                 [&intent.operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some((status, last_error)) = status
+        if mode == MailboxDispatchMode::TerminalReceiptReplay {
+            match status.as_ref().map(|(status, _, _)| status.as_str()) {
+                Some("succeeded") => {
+                    let Some(receipt) = self.succeeded_effect_receipt(&intent.operation_id)? else {
+                        return Ok(false);
+                    };
+                    if receipt.intent() != &intent {
+                        return Err(
+                            "terminal repository.commit receipt has a different intent".into()
+                        );
+                    }
+                }
+                Some("failed")
+                    if status
+                        .as_ref()
+                        .and_then(|(status, _, receipt)| {
+                            terminal_rejected_commit_reason(status, receipt.as_deref())
+                        })
+                        .is_some() =>
+                {
+                    // A completed Worker may replay an already accepted terminal rejection.
+                    // The exact immutable intent was checked above; this path never enqueues.
+                }
+                _ => return Ok(false),
+            }
+        }
+        if let Some((status, last_error, receipt_json)) = status
             && matches!(status.as_str(), "failed" | "cancelled")
         {
-            if mode == MailboxDispatchMode::TerminalReceiptReplay {
+            if mode == MailboxDispatchMode::TerminalReceiptReplay
+                && terminal_rejected_commit_reason(&status, receipt_json.as_deref()).is_none()
+            {
                 return Ok(false);
             }
+            let reason = persisted_rejection_reason(receipt_json.as_deref())
+                .or(last_error)
+                .unwrap_or_else(|| "effect was cancelled".into());
             let response = crate::protocol::ResponseEnvelope::<serde_json::Value> {
                 schema_version: crate::protocol::SCHEMA_VERSION,
                 request_id: mailbox_request.envelope.request_id.clone(),
                 result: None,
                 error: Some(crate::protocol::ProtocolError {
                     code: crate::protocol::ErrorCode::Unavailable,
-                    message: format!(
-                        "host repository.commit effect {status}: {}",
-                        last_error.unwrap_or_else(|| "effect was cancelled".into())
-                    ),
+                    message: format!("host repository.commit effect {status}: {reason}"),
                     retryable: false,
                     retry_after_ms: None,
                     details: Default::default(),
@@ -701,10 +721,64 @@ impl crate::store::ConfigStore {
     }
 }
 
+fn persisted_rejection_reason(receipt_json: Option<&str>) -> Option<String> {
+    let receipt: serde_json::Value =
+        crate::protocol::parse_unique(receipt_json?.as_bytes()).ok()?;
+    (receipt["schema_version"].as_u64() == Some(1)
+        && receipt["outcome"].as_str() == Some("rejected"))
+    .then(|| {
+        receipt["reason"]
+            .as_str()
+            .filter(|reason| !reason.is_empty())
+            .map(str::to_owned)
+    })
+    .flatten()
+}
+
+fn terminal_rejected_commit_reason(status: &str, receipt_json: Option<&str>) -> Option<String> {
+    (status == "failed")
+        .then(|| persisted_rejection_reason(receipt_json))
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn terminal_commit_replay_requires_a_persisted_typed_rejection_receipt() {
+        let receipt = serde_json::json!({
+            "schema_version": 1,
+            "outcome": "rejected",
+            "reason": "host commit message is missing the required authorship trailer"
+        })
+        .to_string();
+        assert_eq!(
+            persisted_rejection_reason(Some(&receipt)).as_deref(),
+            Some("host commit message is missing the required authorship trailer")
+        );
+        assert!(persisted_rejection_reason(None).is_none());
+        assert!(persisted_rejection_reason(Some("{} ")).is_none());
+        assert!(
+            persisted_rejection_reason(Some(
+                r#"{"schema_version":1,"outcome":"applied","reason":"ok"}"#
+            ))
+            .is_none()
+        );
+        assert!(
+            persisted_rejection_reason(Some(
+                r#"{"schema_version":1,"outcome":"rejected","reason":""}"#
+            ))
+            .is_none()
+        );
+        assert_eq!(
+            terminal_rejected_commit_reason("failed", Some(&receipt)).as_deref(),
+            Some("host commit message is missing the required authorship trailer")
+        );
+        assert!(terminal_rejected_commit_reason("cancelled", Some(&receipt)).is_none());
+        assert!(terminal_rejected_commit_reason("failed", None).is_none());
+    }
 
     fn adopt_fixture_run(
         fixture: &mut crate::store::agent_runtime::tests::CompletedBlockLossFixture,

@@ -452,32 +452,33 @@ pub(crate) fn verify_cancelled_agent_cleanup(
             .process_tree
             .iter()
             .any(|process| same_provider_identity(&family.provider_root, process))
-        || !family_covers_provider_tree(
-            &provider.process_tree,
-            &family.wrapper_process,
-            &family.process_tree,
-        )
     {
         return Err(
             "cancelled cleanup family does not preserve the host-observed provider tree".into(),
         );
     }
 
+    let cumulative_tree = cumulative_provider_family_tree(
+        &provider.process_tree,
+        &family.process_tree,
+        &family.wrapper_process,
+    )
+    .ok_or("cancelled cleanup process observations have conflicting identities")?;
     if snapshot.cleanup_covered
         || snapshot.agent_run_id != run.agent_run_id
         || snapshot.reservation_epoch != run.reservation_epoch
         || snapshot.authority_digest != run.authority_digest
         || snapshot.launch_tree_digest != provider.process_tree_digest
         || !same_identity_sets(&result.receipt.processes, &family.process_tree)
-        || !same_snapshot_family_union(snapshot, family, &family.wrapper_process)
+        || !same_process_identity_sets(&snapshot.process_tree, &cumulative_tree)
     {
         return Err(
             "cancelled cleanup result, family, and cumulative snapshot identities differ".into(),
         );
     }
 
-    let exact_identities = std::iter::once(&family.wrapper_process)
-        .chain(family.process_tree.iter())
+    let exact_identities = cumulative_tree
+        .iter()
         .map(|process| crate::run_step::ObservedProcess {
             pid: process.pid,
             parent_pid: process.parent_pid,
@@ -600,22 +601,6 @@ fn same_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> boo
         && left.quality == right.quality
 }
 
-fn family_covers_provider_tree(
-    provider_tree: &[crate::launch::ProviderProcessIdentity],
-    wrapper: &ProcessIdentity,
-    family_tree: &[ProcessIdentity],
-) -> bool {
-    provider_tree.iter().all(|saved| {
-        if saved.pid == wrapper.pid && saved.start_identity == wrapper.start_identity {
-            same_provider_identity(wrapper, saved)
-        } else {
-            family_tree
-                .iter()
-                .any(|process| same_provider_identity(process, saved))
-        }
-    })
-}
-
 #[cfg(test)]
 mod cancelled_cleanup_tests {
     use super::*;
@@ -729,25 +714,26 @@ mod cancelled_cleanup_tests {
             provider_identity(84638, 84201, 84201, "shell-birth"),
         ];
 
-        assert!(family_covers_provider_tree(
-            &provider_tree,
+        let historical = provider_identity(84500, 84201, 84201, "exited-helper-birth");
+        let launch_tree = [provider_tree.as_slice(), std::slice::from_ref(&historical)].concat();
+        let union = cumulative_provider_family_tree(
+            &launch_tree,
+            &[provider.clone(), shell.clone()],
             &wrapper,
-            &[provider.clone(), shell.clone()]
-        ));
+        )
+        .expect("a launch-only historical process belongs in the cumulative evidence");
+        assert_eq!(union.len(), 4);
+        assert!(union.iter().any(|identity| {
+            identity.pid == historical.pid && identity.start_identity == historical.start_identity
+        }));
 
-        let missing_shell = vec![provider.clone()];
-        assert!(!family_covers_provider_tree(
-            &provider_tree,
-            &wrapper,
-            &missing_shell
-        ));
-
-        let wrong_wrapper_birth = process(84122, 100, 100, "reused-wrapper-pid");
-        assert!(!family_covers_provider_tree(
-            &provider_tree,
-            &wrong_wrapper_birth,
-            &[provider, shell]
-        ));
+        let reused_pid = provider_identity(84500, 84201, 84201, "reused-helper-pid");
+        let conflicting_launch_tree =
+            [launch_tree.as_slice(), std::slice::from_ref(&reused_pid)].concat();
+        assert!(
+            cumulative_provider_family_tree(&conflicting_launch_tree, &[provider, shell], &wrapper)
+                .is_none()
+        );
     }
 
     #[test]
@@ -915,7 +901,47 @@ mod cancelled_cleanup_tests {
             &[observed(&provider)],
             &family.process_tree
         ));
-        assert!(same_snapshot_family_union(
+        let launch_tree = vec![
+            crate::launch::ProviderProcessIdentity {
+                pid: provider.pid,
+                parent_pid: provider.parent_pid,
+                process_group_id: provider.process_group_id,
+                start_identity: provider.start_identity.clone(),
+                identity_quality: provider.quality,
+            },
+            crate::launch::ProviderProcessIdentity {
+                pid: 84202,
+                parent_pid: provider.pid,
+                process_group_id: provider.process_group_id,
+                start_identity: "historical-launch-only-birth".into(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+        ];
+        let historical = ProcessIdentity {
+            pid: 84202,
+            parent_pid: provider.pid,
+            process_group_id: provider.process_group_id,
+            start_identity: "historical-launch-only-birth".into(),
+            command: String::new(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        assert!(same_snapshot_provider_union(
+            &BlockLossCleanupSnapshot {
+                schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
+                agent_run_id: family.binding.agent_run_id.clone(),
+                reservation_epoch: family.binding.reservation_epoch,
+                authority_digest: family.binding.authority_digest.clone(),
+                launch_tree_digest: Digest::parse("e".repeat(64)).unwrap(),
+                observed_at_unix: 1,
+                cleanup_covered: false,
+                process_tree: vec![wrapper.clone(), provider.clone(), historical.clone()],
+                process_tree_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+            &launch_tree,
+            &family,
+            &wrapper
+        ));
+        assert!(!same_snapshot_provider_union(
             &BlockLossCleanupSnapshot {
                 schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
                 agent_run_id: family.binding.agent_run_id.clone(),
@@ -927,6 +953,7 @@ mod cancelled_cleanup_tests {
                 process_tree: vec![wrapper.clone(), provider.clone()],
                 process_tree_digest: Digest::parse("f".repeat(64)).unwrap(),
             },
+            &launch_tree,
             &family,
             &wrapper
         ));
@@ -942,7 +969,14 @@ mod cancelled_cleanup_tests {
             &[observed(&provider), observed(&extra)],
             &family.process_tree
         ));
-        assert!(!same_snapshot_family_union(
+        let launch_tree = vec![crate::launch::ProviderProcessIdentity {
+            pid: provider.pid,
+            parent_pid: provider.parent_pid,
+            process_group_id: provider.process_group_id,
+            start_identity: provider.start_identity.clone(),
+            identity_quality: provider.quality,
+        }];
+        assert!(!same_snapshot_provider_union(
             &BlockLossCleanupSnapshot {
                 schema_version: crate::run_step_spool::BLOCK_LOSS_SNAPSHOT_VERSION,
                 agent_run_id: family.binding.agent_run_id.clone(),
@@ -954,11 +988,12 @@ mod cancelled_cleanup_tests {
                 process_tree: vec![wrapper, provider, extra],
                 process_tree_digest: Digest::parse("f".repeat(64)).unwrap(),
             },
+            &launch_tree,
             &family,
             &family.wrapper_process
         ));
 
-        let self_identity = crate::process::inspect_process_table()
+        let live = crate::process::inspect_process_table()
             .unwrap()
             .into_iter()
             .find(|process| {
@@ -966,15 +1001,35 @@ mod cancelled_cleanup_tests {
                     && process.quality == ProcessIdentityQuality::KernelBirthToken
             })
             .unwrap();
-        let live = crate::run_step::ObservedProcess {
-            pid: self_identity.pid,
-            parent_pid: self_identity.parent_pid,
-            process_group_id: self_identity.process_group_id,
-            start_identity: self_identity.start_identity,
-            command: self_identity.command,
-            identity_quality: "kernel_birth_token".into(),
-        };
-        assert!(verify_process_tree_absent(&[live]).is_err());
+        let live_provider_tree = [
+            launch_tree.as_slice(),
+            &[crate::launch::ProviderProcessIdentity {
+                pid: live.pid,
+                parent_pid: live.parent_pid,
+                process_group_id: live.process_group_id,
+                start_identity: live.start_identity.clone(),
+                identity_quality: live.quality,
+            }],
+        ]
+        .concat();
+        let live_union = cumulative_provider_family_tree(
+            &live_provider_tree,
+            &family.process_tree,
+            &family.wrapper_process,
+        )
+        .unwrap();
+        let observed_live_union = live_union
+            .iter()
+            .map(|identity| crate::run_step::ObservedProcess {
+                pid: identity.pid,
+                parent_pid: identity.parent_pid,
+                process_group_id: identity.process_group_id,
+                start_identity: identity.start_identity.clone(),
+                command: String::new(),
+                identity_quality: "kernel_birth_token".into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(verify_process_tree_absent(&observed_live_union).is_err());
     }
 }
 
@@ -995,23 +1050,71 @@ fn same_identity_sets(
         })
 }
 
-fn same_snapshot_family_union(
+fn same_process_identity_sets(left: &[ProcessIdentity], right: &[ProcessIdentity]) -> bool {
+    left.len() == right.len()
+        && right.iter().all(|expected| {
+            left.iter()
+                .any(|observed| same_process_identity(observed, expected))
+        })
+}
+
+#[cfg(test)]
+fn same_snapshot_provider_union(
     snapshot: &BlockLossCleanupSnapshot,
+    provider_tree: &[crate::launch::ProviderProcessIdentity],
     family: &RunFamilyRecord,
     wrapper: &ProcessIdentity,
 ) -> bool {
-    let mut expected = family.process_tree.clone();
-    expected.push(wrapper.clone());
-    snapshot.process_tree.len() == expected.len()
-        && expected.iter().all(|process| {
-            snapshot.process_tree.iter().any(|observed| {
-                observed.pid == process.pid
-                    && observed.parent_pid == process.parent_pid
-                    && observed.process_group_id == process.process_group_id
-                    && observed.start_identity == process.start_identity
-                    && observed.quality == process.quality
-            })
-        })
+    let Some(expected) =
+        cumulative_provider_family_tree(provider_tree, &family.process_tree, wrapper)
+    else {
+        return false;
+    };
+    same_process_identity_sets(&snapshot.process_tree, &expected)
+}
+
+fn cumulative_provider_family_tree(
+    provider_tree: &[crate::launch::ProviderProcessIdentity],
+    family_tree: &[ProcessIdentity],
+    wrapper: &ProcessIdentity,
+) -> Option<Vec<ProcessIdentity>> {
+    let mut identities = std::collections::BTreeMap::<u32, ProcessIdentity>::new();
+    let mut insert = |process: ProcessIdentity| {
+        if process.pid == 0
+            || process.process_group_id == 0
+            || process.start_identity.trim().is_empty()
+            || process.quality != ProcessIdentityQuality::KernelBirthToken
+        {
+            return false;
+        }
+        match identities.entry(process.pid) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(process);
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                same_process_identity(entry.get(), &process)
+            }
+        }
+    };
+    for process in provider_tree {
+        if !insert(ProcessIdentity {
+            pid: process.pid,
+            parent_pid: process.parent_pid,
+            process_group_id: process.process_group_id,
+            start_identity: process.start_identity.clone(),
+            command: String::new(),
+            quality: process.identity_quality,
+        }) {
+            return None;
+        }
+    }
+    for process in family_tree.iter().chain(std::iter::once(wrapper)) {
+        if !insert(process.clone()) {
+            return None;
+        }
+    }
+    Some(identities.into_values().collect())
 }
 
 /// Store a provider result only after exact launch matching and a fresh host process-table check.
@@ -4688,10 +4791,77 @@ pub(crate) mod tests {
         use crate::roles::RoleResultMessage;
         use crate::store::accepted_plans::{AcceptedWorkPlanRecord, PersistedWorkPlan};
         use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
 
         let root = tempfile::tempdir().unwrap();
+        let git_executable = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("git"))
+            .find(|path| path.is_file())
+            .expect("git is installed for local repository fixtures");
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new(&git_executable)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fixture git command failed: {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let bare_remote = root.path().join("origin.git");
+        let seed_repository = root.path().join("seed");
+        run_git(&["init", "--bare", bare_remote.to_str().unwrap()]);
+        run_git(&[
+            "init",
+            "--initial-branch=main",
+            seed_repository.to_str().unwrap(),
+        ]);
+        run_git(&[
+            "-C",
+            seed_repository.to_str().unwrap(),
+            "config",
+            "user.name",
+            "Fixture",
+        ]);
+        run_git(&[
+            "-C",
+            seed_repository.to_str().unwrap(),
+            "config",
+            "user.email",
+            "fixture@example.invalid",
+        ]);
+        std::fs::write(seed_repository.join("README.md"), "base\n").unwrap();
+        run_git(&["-C", seed_repository.to_str().unwrap(), "add", "README.md"]);
+        run_git(&[
+            "-C",
+            seed_repository.to_str().unwrap(),
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "base",
+        ]);
+        run_git(&[
+            "-C",
+            seed_repository.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            bare_remote.to_str().unwrap(),
+        ]);
+        run_git(&[
+            "-C",
+            seed_repository.to_str().unwrap(),
+            "push",
+            "origin",
+            "main",
+        ]);
+        let base_commit = run_git(&["-C", seed_repository.to_str().unwrap(), "rev-parse", "HEAD"]);
+        let base = base_commit.as_str();
         let worker_id = AgentRunId::parse("fixture-prior-worker").unwrap();
-        let base = "0000000000000000000000000000000000000000";
         let blocked = serde_json::json!({
             "summary":"blocked on a missing dependency",
             "completed_node_keys":[], "pending_node_keys":["node-a"],
@@ -4810,8 +4980,50 @@ pub(crate) mod tests {
             .agent_launch_authority(&worker_id)
             .unwrap()
             .unwrap();
-        let worktree = root.path().join("worker-worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
+        let git_options = crate::worktrees::GitOptions {
+            executable: git_executable.clone(),
+            environment: BTreeMap::new(),
+            timeout: Duration::from_secs(20),
+        };
+        let repository_config = crate::config::RepositoryConfig {
+            clone_url: bare_remote.to_string_lossy().into_owned(),
+            base_branch: "main".into(),
+            forge: "github".into(),
+            worktree_root: None,
+            instruction_files: Vec::new(),
+            role_instruction_files: BTreeMap::new(),
+            rex_projects_hooks: Vec::new(),
+            merge: crate::config::MergeConfig::default(),
+            operations: None,
+        };
+        let delivery_state = root.path().join("delivery-state");
+        let delivery = crate::delivery_runtime::RepositoryDelivery::new(
+            &delivery_state,
+            git_options.clone(),
+            BTreeMap::new(),
+            crate::host_jobs::HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        let prepared_work = delivery
+            .prepare_worktree(
+                crate::delivery_runtime::WorkNodeIdentity {
+                    project_id: project.clone(),
+                    repository_id: repository.clone(),
+                    ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+                    ticket_id: TicketId::parse("T-1").unwrap(),
+                    ticket_run_id: ticket.clone(),
+                    work_node_id: node_id.to_string(),
+                },
+                &repository_config,
+                base,
+                CommitMode::Host,
+            )
+            .unwrap();
+        let worktree = prepared_work.worktree.path.clone();
+        let branch = prepared_work.worktree.branch.clone();
         let prepare_operation = OperationId::parse("prepare-worker-recovery").unwrap();
         let prepare_request = crate::delivery_runtime::PrepareWorktreesEffectPayload {
             schema_version: 1,
@@ -4834,7 +5046,7 @@ pub(crate) mod tests {
                 work_node_id: node_id.clone(),
                 repository_id: repository.clone(),
                 worktree_path: worktree.clone(),
-                branch: "agent/fixture/node-a".into(),
+                branch: branch.clone(),
                 base_sha: base.into(),
                 commit_mode: CommitMode::Host,
             }],
@@ -4869,7 +5081,7 @@ pub(crate) mod tests {
             repository_id: repository.clone(),
             commit_mode: CommitMode::Host,
             worktree_path: worktree.clone(),
-            branch: "agent/fixture/node-a".into(),
+            branch: branch.clone(),
             base_sha: base.into(),
             expected_head: None,
             prepare_operation_id: prepare_operation.to_string(),
@@ -5314,6 +5526,295 @@ pub(crate) mod tests {
             &stored_reservation.mailbox_directory,
         )
         .unwrap();
+        let invalid_request_id = "terminal-restart-invalid-commit-trailer";
+        let invalid_commit_message =
+            "docs: fixture retained commit\\n\\nCo-authored-by: Codex <noreply@openai.com>";
+        let invalid_request = crate::agent_api::RepositoryCommitRequest {
+            schema_version: 1,
+            message_id: invalid_request_id.into(),
+            worktree_id: stored_assignment.node_id.to_string(),
+            expected_head: base.into(),
+            manifest: manifest_artifact.reference.clone(),
+            manifest_digest: manifest_artifact.reference.digest.clone(),
+            commit_message: invalid_commit_message.into(),
+        };
+        let invalid_envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(invalid_request_id).unwrap(),
+            operation_id: Some(prior_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("repository.commit").unwrap(),
+            project_id: Some(project.clone()),
+            run_id: Some(worker_id.to_string()),
+            attempt: Some(prior_authority.attempt),
+            run_epoch: Some(prior_authority.run_epoch),
+            expected_subject_revision: Some(current.revision),
+            role: Some(Role::Worker),
+            request_type: None,
+            params: serde_json::to_value(&invalid_request).unwrap(),
+        };
+        mailbox
+            .queue(
+                invalid_request_id,
+                &serde_json::to_vec(&invalid_envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let invalid_mailbox_request = mailbox
+            .pending(crate::mailbox::unix_time_now().unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let invalid_payload = crate::delivery_runtime::CommitWorkerManifestEffectPayload {
+            schema_version: 1,
+            agent_run_id: worker_id.clone(),
+            project_id: project.clone(),
+            message_id: invalid_request.message_id.clone(),
+            configuration_digest: prior_authority.config_digest.clone(),
+            ticket_revision: current.revision,
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket.clone(),
+            work_node_id: stored_assignment.node_id.clone(),
+            repository_id: repository.clone(),
+            worktree_path: worktree.clone(),
+            branch: branch.clone(),
+            prepare_operation_id: prepare_operation.clone(),
+            expected_base_sha: base.into(),
+            expected_head: invalid_request.expected_head.clone(),
+            manifest_artifact: invalid_request.manifest.clone(),
+            manifest_digest: invalid_request.manifest_digest.clone(),
+            manifest: manifest.clone(),
+            commit_message: invalid_request.commit_message.clone(),
+            required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let (invalid_request_json, invalid_request_digest) =
+            crate::delivery_runtime::canonical_delivery_payload(&invalid_payload).unwrap();
+        let invalid_operation =
+            OperationId::parse(format!("repo-commit-{}", invalid_mailbox_request.digest)).unwrap();
+        let invalid_intent = crate::store::EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket.to_string(),
+            operation_id: invalid_operation.to_string(),
+            logical_key: format!(
+                "repository.commit:{worker_id}:{}",
+                invalid_mailbox_request.digest
+            ),
+            kind: "commit_worker_manifest".into(),
+            request_json: invalid_request_json,
+            request_digest: invalid_request_digest,
+            expected_revision: Some(current.revision),
+        };
+        worker
+            .store
+            .enqueue_effect(restarted_generation, &invalid_intent)
+            .unwrap();
+        let gh_executable = root.path().join("gh-fixture");
+        std::fs::write(&gh_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&gh_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let delivery_effects = crate::delivery_runtime::RepositoryDeliveryEffects::new(
+            crate::delivery_runtime::RepositoryDeliveryEffectConfig {
+                state_root: delivery_state.clone(),
+                git: git_options,
+                inherited_environment: BTreeMap::new(),
+                environment_binding: crate::host_jobs::HostJobEnvironmentBinding {
+                    snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                    policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+                },
+                gh_executable,
+                gh_environment: BTreeMap::new(),
+                timeout: Duration::from_secs(5),
+                configuration_digest: configuration_digest.clone(),
+                repositories: BTreeMap::from([(repository.clone(), repository_config)]),
+                project_repositories: BTreeMap::from([(
+                    project.clone(),
+                    std::collections::BTreeSet::from([repository.clone()]),
+                )]),
+                max_hook_attempts: 3,
+            },
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::host_jobs::HostJobPool::new(2, 2).unwrap(),
+            )),
+        )
+        .unwrap();
+        let commit_handler =
+            delivery_effects.commit_worker_manifest_handler(worker.artifacts.clone());
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 10,
+            max_age: Duration::from_secs(900),
+            retry_base: Duration::from_secs(1),
+            retry_max: Duration::from_secs(10),
+        };
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE projects SET desired_lifecycle='stopped' WHERE project_id=?1",
+                [project.as_str()],
+            )
+            .unwrap();
+        let stopped_project_tick = crate::effects::EffectDispatcher::tick(
+            &mut worker.store,
+            restarted_generation,
+            crate::store::now_unix().unwrap() + 2,
+            &[&commit_handler],
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            stopped_project_tick,
+            crate::effects::DispatchTick::WaitingForReconciliation { .. }
+        ));
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                [project.as_str()],
+            )
+            .unwrap();
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=?2 WHERE ticket_run_id=?1",
+                rusqlite::params![ticket.as_str(), current.revision + 1],
+            )
+            .unwrap();
+        let stale_revision_tick = crate::effects::EffectDispatcher::tick(
+            &mut worker.store,
+            restarted_generation,
+            crate::store::now_unix().unwrap() + 4,
+            &[&commit_handler],
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            stale_revision_tick,
+            crate::effects::DispatchTick::WaitingForReconciliation { .. }
+        ));
+        worker
+            .store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=?2 WHERE ticket_run_id=?1",
+                rusqlite::params![ticket.as_str(), current.revision],
+            )
+            .unwrap();
+        worker.store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) SELECT 'fixture-newer-worker',project_id,config_source,config_revision,config_digest,role_session_id,'fixture-newer-worker',finite_turn,launch_operation_id||'-newer','running',?2 FROM agent_runs WHERE agent_run_id=?1",
+            rusqlite::params![worker_id.as_str(), restarted_generation],
+        ).unwrap();
+        let newer_worker_tick = crate::effects::EffectDispatcher::tick(
+            &mut worker.store,
+            restarted_generation,
+            crate::store::now_unix().unwrap() + 8,
+            &[&commit_handler],
+            limits,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                newer_worker_tick,
+                crate::effects::DispatchTick::WaitingForReconciliation { .. }
+            ),
+            "unexpected newer-worker reconciliation: {newer_worker_tick:?}"
+        );
+        worker
+            .store
+            .connection
+            .execute(
+                "DELETE FROM agent_runs WHERE agent_run_id='fixture-newer-worker'",
+                [],
+            )
+            .unwrap();
+        let tick = crate::effects::EffectDispatcher::tick(
+            &mut worker.store,
+            restarted_generation,
+            crate::store::now_unix().unwrap() + 30,
+            &[&commit_handler],
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            tick,
+            crate::effects::DispatchTick::Completed {
+                operation_id: invalid_intent.operation_id.clone()
+            }
+        );
+        let (invalid_status, invalid_receipt): (String, String) = worker
+            .store
+            .connection
+            .query_row(
+                "SELECT status,receipt_json FROM effects WHERE operation_id=?1",
+                [invalid_intent.operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(invalid_status, "failed");
+        let invalid_receipt: serde_json::Value =
+            crate::protocol::parse_unique(invalid_receipt.as_bytes()).unwrap();
+        assert_eq!(invalid_receipt["schema_version"], 1);
+        assert_eq!(invalid_receipt["outcome"], "rejected");
+        assert!(
+            invalid_receipt["reason"]
+                .as_str()
+                .unwrap()
+                .contains("trailer")
+        );
+        let observed_head = delivery.observe_local_head_at(&worktree).unwrap();
+        assert_eq!(observed_head, base);
+        let index_status = run_git(&["-C", worktree.to_str().unwrap(), "status", "--porcelain"]);
+        assert!(
+            index_status.is_empty(),
+            "invalid request mutated worktree: {index_status}"
+        );
+        let effect_count_before_invalid_replay: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        let profiles = BTreeMap::from([(
+            prior_authority.profile_id.clone(),
+            serde_json::from_value(serde_json::json!({
+                "adapter":"codex", "command":["fixture"], "commit_mode":"host"
+            }))
+            .unwrap(),
+        )]);
+        assert!(
+            worker
+                .store
+                .process_one_agent_mailbox_request(
+                    restarted_generation,
+                    worker_id.as_str(),
+                    crate::store::now_unix().unwrap(),
+                    &worker.artifacts,
+                    &profiles,
+                )
+                .unwrap()
+        );
+        let invalid_mailbox_receipt: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(
+                &mailbox
+                    .read_receipt(invalid_request_id, crate::mailbox::unix_time_now().unwrap())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let invalid_error = invalid_mailbox_receipt.error.unwrap();
+        assert!(!invalid_error.retryable);
+        assert!(invalid_error.message.contains("trailer"));
+        let effect_count_after_invalid_replay: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            effect_count_after_invalid_replay,
+            effect_count_before_invalid_replay
+        );
+
         let terminal_request_id = "terminal-restart-replay-scope-check";
         let request = crate::agent_api::RepositoryCommitRequest {
             schema_version: 1,
@@ -5369,7 +5870,7 @@ pub(crate) mod tests {
             work_node_id: stored_assignment.node_id.clone(),
             repository_id: repository.clone(),
             worktree_path: worktree.clone(),
-            branch: "agent/fixture/node-a".into(),
+            branch: branch.clone(),
             prepare_operation_id: prepare_operation.clone(),
             expected_base_sha: base.into(),
             expected_head: request.expected_head.clone(),
@@ -5562,13 +6063,6 @@ pub(crate) mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
             .unwrap();
-        let profiles = BTreeMap::from([(
-            prior_authority.profile_id.clone(),
-            serde_json::from_value(serde_json::json!({
-                "adapter":"codex", "command":["fixture"], "commit_mode":"host"
-            }))
-            .unwrap(),
-        )]);
         let mut foreign_receipt = effect_receipt.clone();
         foreign_receipt.agent_run_id = AgentRunId::parse("foreign-worker").unwrap();
         let foreign_receipt_json = serde_json::to_string(&foreign_receipt).unwrap();
