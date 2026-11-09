@@ -2030,6 +2030,13 @@ mod tests {
                 identity_quality: process.quality,
             }
         }));
+        provider_tree.push(ProviderProcessIdentity {
+            pid: u32::MAX - 1,
+            parent_pid: observing.provider_root.pid,
+            process_group_id: observing.provider_root.process_group_id,
+            start_identity: "historical-launch-only-birth".into(),
+            identity_quality: ProcessIdentityQuality::KernelBirthToken,
+        });
         let provider_tree_digest = Digest::parse(format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&provider_tree).unwrap())
@@ -2090,10 +2097,29 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let mut snapshot_processes = family.process_tree.clone();
+        let mut snapshot_processes = provider
+            .process_tree
+            .iter()
+            .map(|process| ProcessIdentity {
+                pid: process.pid,
+                parent_pid: process.parent_pid,
+                process_group_id: process.process_group_id,
+                start_identity: process.start_identity.clone(),
+                command: String::new(),
+                quality: process.identity_quality,
+            })
+            .collect::<Vec<_>>();
+        snapshot_processes.extend(family.process_tree.clone());
         snapshot_processes.push(family.wrapper_process.clone());
         snapshot_processes.sort_by(|left, right| {
             (left.pid, &left.start_identity).cmp(&(right.pid, &right.start_identity))
+        });
+        snapshot_processes.dedup_by(|right, left| {
+            right.pid == left.pid
+                && right.parent_pid == left.parent_pid
+                && right.process_group_id == left.process_group_id
+                && right.start_identity == left.start_identity
+                && right.quality == left.quality
         });
         let snapshot_bytes = serde_json::to_vec(&snapshot_processes).unwrap();
         let snapshot = BlockLossCleanupSnapshot {
