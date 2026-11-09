@@ -1694,6 +1694,38 @@ fn observe_provider_start(
         initial_block_id: Some(authority.rex_block_id.clone()),
         disposition: CreateDisposition::Existing,
     };
+    // `observe_process` cannot distinguish a finished block from an unavailable
+    // observation on every Rex backend. Confirm block absence first so the
+    // immutable run-family proof can bridge a completed start. Absence by itself
+    // never promotes a provider or releases its slot.
+    match pinned_rex.agent_block_is_present(
+        &window,
+        authority.agent_run_id.as_str(),
+        &authority.rex_block_id,
+    ) {
+        Ok(false) => {
+            let Some(expected_executable) = verified_qualification_executable(&qualification)
+            else {
+                return Ok(AgentRecoveryDisposition::Unresolved {
+                    reason: RecoveryUnknown::ProviderIdentityMismatch,
+                });
+            };
+            return observe_completed_provider_start_from_family(
+                store,
+                owner_generation,
+                run,
+                wrapper,
+                &qualification,
+                &expected_executable,
+            );
+        }
+        Ok(true) => {}
+        Err(_) => {
+            return Ok(AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::RexObservationUnavailable,
+            });
+        }
+    }
     let rex_observation = match pinned_rex.observe_process(
         &window,
         authority.agent_run_id.as_str(),
@@ -2341,6 +2373,356 @@ mod tests {
             reservation_epoch: 1,
             slot_disposition: "live".into(),
         }
+    }
+
+    fn awaiting_provider_test_context(
+        root: &std::path::Path,
+        rex_view_fails: bool,
+    ) -> (
+        ConfigStore,
+        u64,
+        RecoverableAgentRun,
+        ObservedWrapperIdentity,
+        RexCliTransport,
+    ) {
+        use crate::store::OwnerMetadata;
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        let state_root = root.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &crate::store::agent_runtime::tests::applied(),
+                crate::store::ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = crate::domain::ids::ProjectId::parse("project-a").unwrap();
+        store
+            .insert_project(&crate::store::ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: applied.digest,
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: crate::domain::ids::Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "awaiting-provider-test".into(),
+                state_root: state_root.display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-start".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        let mut qualification = crate::store::agent_runtime::tests::qualification();
+        let executable = fs::canonicalize("/bin/sleep").unwrap();
+        qualification.executable_path = executable.display().to_string();
+        qualification.executable_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(fs::read(&executable).unwrap())
+        ))
+        .unwrap();
+        let qualification_digest = store
+            .store_provider_qualification(generation, &qualification)
+            .unwrap();
+
+        let run_root = root.join("run");
+        fs::create_dir_all(&run_root).unwrap();
+        let mut run = writer_cutoff_test_run(&run_root);
+        run.authority.controller_generation = generation;
+        run.authority.qualification_receipt_digest = qualification_digest;
+        run.authority.rex_server_identity = "rex-instance".into();
+        run.authority.rex_session_id = "session".into();
+        run.authority.rex_window_id = "window".into();
+        run.authority.rex_block_id = "block".into();
+        run.launch_state = "awaiting_provider".into();
+        crate::store::agent_runtime::tests::test_insert_unknown_execution_slot(
+            &mut store,
+            "project-a",
+            run.agent_run_id.as_str(),
+            run.slot_index,
+            run.reservation_epoch,
+        );
+        let wrapper = ObservedWrapperIdentity {
+            pid: 42_001,
+            start_identity: "wrapper-born-42001".into(),
+            rex_session_id: "session".into(),
+            rex_block_id: "block".into(),
+            runtime_binary_digest: run.authority.runtime_binary_digest.clone(),
+        };
+        run.wrapper_identity_json = Some(serde_json::to_string(&wrapper).unwrap());
+
+        let rex_script = root.join("rex-fixture");
+        fs::write(
+            &rex_script,
+            r#"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/rex-test.sock","instance_id":"rex-instance","host_id":"fixture-host","rex_version":"1.2.3"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*)
+    if [ "$REX_TEST_FAIL_VIEW" = 1 ]; then exit 7; fi
+    printf '%s\n' '{"session_id":"session","windows":[{"window_id":"window","layers":[]}]}' ;;
+  *) exit 3 ;;
+esac
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rex_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let environment = if rex_view_fails {
+            BTreeMap::from([(OsString::from("REX_TEST_FAIL_VIEW"), OsString::from("1"))])
+        } else {
+            BTreeMap::new()
+        };
+        let rex = RexCliTransport::connect(
+            &rex_script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "rex-instance".into(),
+            "session".into(),
+            environment,
+        )
+        .unwrap();
+        (store, generation, run, wrapper, rex)
+    }
+
+    #[test]
+    fn awaiting_provider_absent_block_without_complete_family_retains_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut store, generation, run, _wrapper, rex) =
+            awaiting_provider_test_context(root.path(), false);
+        let mut policy = policy();
+        policy.rex_session_id = "session".into();
+        let disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut store,
+                generation,
+                &rex,
+                &policy,
+                &run,
+                "rex-instance",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            disposition,
+            AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProviderIdentityMismatch,
+            }
+        );
+        assert_eq!(run.launch_state, "awaiting_provider");
+        assert!(run.provider_tree_json.is_none());
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &store,
+                run.agent_run_id.as_str(),
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn awaiting_provider_unavailable_rex_observation_retains_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut store, generation, run, _wrapper, rex) =
+            awaiting_provider_test_context(root.path(), true);
+        let mut policy = policy();
+        policy.rex_session_id = "session".into();
+        let disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut store,
+                generation,
+                &rex,
+                &policy,
+                &run,
+                "rex-instance",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            disposition,
+            AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::RexObservationUnavailable,
+            }
+        );
+        assert_eq!(run.launch_state, "awaiting_provider");
+        assert!(run.provider_tree_json.is_none());
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &store,
+                run.agent_run_id.as_str(),
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn awaiting_provider_incomplete_family_retains_unknown_slot() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture =
+            crate::store::agent_runtime::tests::completed_block_loss_fixture(root.path(), false);
+        let rex_script = root.path().join("rex-cli");
+        fs::write(
+            &rex_script,
+            r#"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/rex-test.sock","instance_id":"rex-instance","host_id":"fixture-host","rex_version":"1.2.3"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*) printf '%s\n' '{"session_id":"session","windows":[{"window_id":"window","layers":[]}]}' ;;
+  *) exit 3 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&rex_script, fs::Permissions::from_mode(0o755)).unwrap();
+        let rex = RexCliTransport::connect(
+            &rex_script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "rex-instance".into(),
+            "session".into(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let mut policy = policy();
+        policy.rex_session_id = "session".into();
+        let disposition = AgentRecoveryRuntime::default()
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &fixture.run,
+                "rex-instance",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            disposition,
+            AgentRecoveryDisposition::Unresolved {
+                reason: RecoveryUnknown::ProviderIdentityMismatch,
+            }
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn completed_family_promotes_provider_then_releases_only_exact_cancelled_slot() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture =
+            crate::store::agent_runtime::tests::completed_block_loss_fixture(root.path(), true);
+        let wrapper_json = serde_json::to_string(&fixture.wrapper).unwrap();
+        assert_eq!(
+            fixture.run.wrapper_identity_json.as_deref(),
+            Some(wrapper_json.as_str())
+        );
+        let rex_script = root.path().join("rex-cli");
+        fs::write(
+            &rex_script,
+            r#"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/rex-test.sock","instance_id":"rex-instance","host_id":"fixture-host","rex_version":"1.2.3"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*) printf '%s\n' '{"session_id":"session","windows":[{"window_id":"window","layers":[]}]}' ;;
+  *) exit 3 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&rex_script, fs::Permissions::from_mode(0o755)).unwrap();
+        let rex = RexCliTransport::connect(
+            &rex_script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "rex-instance".into(),
+            "session".into(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let mut policy = policy();
+        policy.rex_session_id = "session".into();
+        let mut runtime = AgentRecoveryRuntime::default();
+
+        let start = runtime
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &fixture.run,
+                "rex-instance",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(start, AgentRecoveryDisposition::ProviderStarted);
+        fixture.run.agent_state = "running".into();
+        fixture.run.started_at_unix = Some(10);
+        fixture.run.launch_state = "running".into();
+        fixture.run.provider_tree_json = Some(serde_json::to_string(&fixture.provider).unwrap());
+        fixture.run.process_identity_json = Some(
+            serde_json::json!({
+                "provider_pid": fixture.provider.provider_pid,
+                "provider_start_identity": fixture.provider.provider_start_identity,
+                "executable_digest": fixture.provider.executable_digest,
+                "process_tree_digest": fixture.provider.process_tree_digest,
+                "process_tree": fixture.provider.process_tree,
+            })
+            .to_string(),
+        );
+
+        let terminal = runtime
+            .observe_one(
+                &mut fixture.store,
+                fixture.generation,
+                &rex,
+                &policy,
+                &fixture.run,
+                "rex-instance",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(terminal, AgentRecoveryDisposition::BlockLossTerminal);
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                &fixture.slot_owner_id,
+            ),
+            "released"
+        );
+        assert_eq!(
+            crate::store::agent_runtime::tests::test_execution_slot_disposition(
+                &fixture.store,
+                "unrelated-run",
+            ),
+            "unknown"
+        );
     }
 
     #[cfg(unix)]

@@ -1301,7 +1301,7 @@ fn load_exact_wake_inputs(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
@@ -1564,7 +1564,7 @@ mod tests {
         assert_eq!(row_count, 1, "failed conversion preserves the source row");
     }
 
-    fn applied() -> AppliedConfig {
+    pub(crate) fn applied() -> AppliedConfig {
         let config = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "adapters": { "tickets": {
@@ -1597,7 +1597,7 @@ mod tests {
         }
     }
 
-    fn qualification() -> ProviderQualification {
+    pub(crate) fn qualification() -> ProviderQualification {
         let markers = [
             "REX_PROJECTS_AGENT",
             "REX_PROJECTS_CONTEXT",
@@ -1646,6 +1646,465 @@ mod tests {
             },
             status: QualificationStatus::Verified,
         }
+    }
+
+    fn fixture_digest_json<T: serde::Serialize + ?Sized>(value: &T) -> Digest {
+        Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(value).unwrap())
+        ))
+        .unwrap()
+    }
+
+    pub(crate) struct CompletedBlockLossFixture {
+        pub store: ConfigStore,
+        pub generation: u64,
+        pub run: crate::store::agent_recovery::RecoverableAgentRun,
+        pub wrapper: crate::launch::ObservedWrapperIdentity,
+        pub provider: ObservedProviderStart,
+        pub slot_owner_id: String,
+    }
+
+    pub(crate) fn completed_block_loss_fixture(
+        root: &std::path::Path,
+        complete_family: bool,
+    ) -> CompletedBlockLossFixture {
+        use crate::domain::ids::{AgentRunId, OperationId, ProfileId, ProjectId, Revision};
+        use crate::domain::types::{AgentAdapter, Role};
+        use crate::launch::{
+            AgentLaunchAuthority, AgentStartRequest, ObservedWrapperIdentity,
+            ProviderProcessIdentity, RexView, RexViewKind,
+        };
+        use crate::process::ProcessIdentityQuality;
+        use crate::run_step::{
+            CleanupState, ProviderCapabilityEvidence, ProviderQualificationStatus, RunDescriptor,
+            TurnOutcome, TurnResult,
+        };
+        use crate::run_step_spool::{
+            RunFamilyBinding, RunFamilyCoverage, RunFamilyRecord, RunStepSpool,
+        };
+        use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
+        use sha2::Digest as _;
+
+        let root = std::fs::canonicalize(root).unwrap();
+        let state_root = root.join("state");
+        let control_dir = root.join("control");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::create_dir_all(&control_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let mut config = applied();
+        let profile_id = ProfileId::parse("supervisor").unwrap();
+        let profile = config.profiles.get_mut(&profile_id).unwrap();
+        profile.command = vec!["/bin/sleep".into()];
+        let profile_digest = crate::store::agent_profile_digest(profile).unwrap();
+        let applied_snapshot = store
+            .apply_snapshot("factory", &config, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let project_id = ProjectId::parse("project-a").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied_snapshot.revision,
+                config_digest: applied_snapshot.digest.clone(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "completed-block-loss-test".into(),
+                state_root: state_root.display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "owner-start".into(),
+                executable_path: "/tmp/rex-projects-fixture".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-test.sock".into()),
+                rex_server_identity: Some("rex-instance".into()),
+                rex_session_id: Some("session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE project_runtimes SET desired_lifecycle='running',observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+                rusqlite::params![project_id.as_str(), generation],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                [project_id.as_str()],
+            )
+            .unwrap();
+
+        let mut qualification = qualification();
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        qualification.project_id = project_id.clone();
+        qualification.profile_digest = profile_digest.clone();
+        qualification.executable_path = executable.display().to_string();
+        qualification.executable_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(std::fs::read(&executable).unwrap())
+        ))
+        .unwrap();
+        let qualification_digest = store
+            .store_provider_qualification(generation, &qualification)
+            .unwrap();
+        let view = RexView {
+            view_id: crate::launch::RexView::derive_id(
+                &project_id,
+                RexViewKind::Supervisor,
+                None,
+                None,
+                1,
+            )
+            .unwrap(),
+            project_id: project_id.clone(),
+            kind: RexViewKind::Supervisor,
+            ticket_namespace: None,
+            ticket_id: None,
+            view_epoch: 1,
+            rex_server_identity: "rex-instance".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+        };
+        store.register_rex_view(generation, &view).unwrap();
+
+        let run_id = AgentRunId::parse("run-completed-block-loss-test").unwrap();
+        let operation_id = OperationId::parse("operation-completed-block-loss-test").unwrap();
+        let wrapper = ObservedWrapperIdentity {
+            pid: u32::MAX - 20,
+            start_identity: "wrapper-born-test".into(),
+            rex_session_id: "session".into(),
+            rex_block_id: "block-test".into(),
+            runtime_binary_digest: digest('4'),
+        };
+        let provider_pid = u32::MAX - 19;
+        let provider_start_identity = "provider-born-test".to_owned();
+        let result_schema = serde_json::json!({"type":"object"});
+        let schema_projection = crate::providers::project_result_schema(&result_schema)
+            .unwrap()
+            .identity;
+        let result_schema_digest = schema_projection.source_schema_digest.clone();
+        let authority_base = AgentLaunchAuthority {
+            agent_run_id: run_id.clone(),
+            project_id: project_id.clone(),
+            role: Role::Supervisor,
+            role_session_id: "project:project-a:supervisor".into(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: applied_snapshot.revision,
+            config_digest: applied_snapshot.digest.clone(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: generation,
+            operation_id: operation_id.clone(),
+            operation_recipe_id: None,
+            rex_view_id: view.view_id.clone(),
+            descriptor_digest: digest('0'),
+            runtime_binary_digest: wrapper.runtime_binary_digest.clone(),
+            descriptor_path: root.join("run-step.package.json"),
+            environment_snapshot_id: digest('5'),
+            profile_id: profile_id.clone(),
+            profile_digest: profile_digest.clone(),
+            instruction_digest: digest('6'),
+            result_schema_digest: result_schema_digest.clone(),
+            wake_snapshot_digest: digest('7'),
+            qualification_receipt_digest: qualification_digest.clone(),
+            rex_server_identity: "rex-instance".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+            rex_block_id: "block-test".into(),
+            workspace_path: workspace.clone(),
+            control_dir: control_dir.clone(),
+            mailbox_capability_digest: digest('8'),
+        };
+        let result_projection = schema_projection.clone();
+        let package = crate::run_step_package::RunStepPackage {
+            schema_version: 2,
+            execution_slot_epoch: 7,
+            descriptor: RunDescriptor {
+                schema_version: 1,
+                project_id: project_id.clone(),
+                run_id: run_id.clone(),
+                operation_id: operation_id.clone(),
+                role: Role::Supervisor,
+                ticket_run_id: None,
+                expected_subject_revision: 0,
+                attempt: 1,
+                run_epoch: 1,
+                controller_generation: generation,
+                workspace: workspace.clone(),
+                control_dir: control_dir.clone(),
+                worker_assignment: None,
+                rex_session_id: "session".into(),
+                rex_block_id: crate::domain::ids::RexBlockId::parse("block-test").unwrap(),
+                profile_digest: profile_digest.clone(),
+                instruction_digest: authority_base.instruction_digest.clone(),
+                plan_digest: None,
+                environment_snapshot_id: authority_base.environment_snapshot_id.clone(),
+                wake_snapshot_digest: authority_base.wake_snapshot_digest.clone(),
+                provider_capability: ProviderCapabilityEvidence {
+                    schema_version: 1,
+                    adapter: qualification.adapter,
+                    profile_digest: profile_digest.clone(),
+                    version: qualification.provider_version.clone(),
+                    executable_path: executable.clone(),
+                    executable_digest: qualification.executable_digest.clone(),
+                    permission_mode: qualification.permission_mode.clone(),
+                    invocation_options_digest: qualification.invocation_options_digest.clone(),
+                    commit_mode: qualification.commit_mode,
+                    schema_projection: result_projection,
+                    receipt_digest: qualification_digest.clone(),
+                    status: ProviderQualificationStatus::Verified,
+                },
+                result_schema: result_schema.clone(),
+            },
+            operation_id: operation_id.clone(),
+            project_id: project_id.clone(),
+            controller_generation: generation,
+            runtime_binary_digest: authority_base.runtime_binary_digest.clone(),
+            qualification_receipt_digest: qualification_digest.clone(),
+            rex_cli_path: "/bin/rex".into(),
+            rex_search_path: Vec::new(),
+            rex_endpoint: "unix:///tmp/rex-test.sock".into(),
+            rex_server_identity: "rex-instance".into(),
+            rex_window_id: "window".into(),
+            profile: config.profiles[&profile_id].clone(),
+            role_contract: "fixture".into(),
+            prompt: "fixture".into(),
+            continuation: None,
+            shutdown_grace_seconds: 30,
+            start_ack_timeout_seconds: 30,
+        };
+        let mut authority = authority_base;
+        authority.descriptor_digest = package.publish_once(&authority.descriptor_path).unwrap();
+        let authority_digest = authority.digest().unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,?5,'supervisor','test',1,?6,'launch_pending',?7)",
+            rusqlite::params![run_id.as_str(), project_id.as_str(), authority.config_revision.0, authority.config_digest.as_str(), authority.role_session_id, operation_id.as_str(), generation],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,4102444800,1048576,32)",
+            rusqlite::params![run_id.as_str(), control_dir.display().to_string(), authority.mailbox_capability_digest.as_str()],
+        ).unwrap();
+        store
+            .register_agent_launch_authority(generation, &authority)
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO execution_slots(pool,slot_index,project_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',0,?1,'agent_run',?2,7,0,'unknown')",
+            rusqlite::params![project_id.as_str(), run_id.as_str()],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO execution_slots(pool,slot_index,project_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',1,?1,'agent_run','unrelated-run',99,0,'unknown')",
+            [project_id.as_str()],
+        ).unwrap();
+
+        let start_request = AgentStartRequest {
+            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            agent_run_id: run_id.clone(),
+            project_id: project_id.clone(),
+            controller_generation: generation,
+            descriptor_digest: authority.descriptor_digest.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            qualification_receipt_digest: qualification_digest.clone(),
+            wrapper_pid: wrapper.pid,
+            wrapper_start_identity: wrapper.start_identity.clone(),
+            rex_session_id: wrapper.rex_session_id.clone(),
+            rex_block_id: wrapper.rex_block_id.clone(),
+        };
+        let start_receipt = crate::launch::authorize_start(
+            generation,
+            &authority.expectation(&qualification),
+            &qualification,
+            &start_request,
+        )
+        .unwrap();
+        let request_json = serde_json::to_string(&start_request).unwrap();
+        let request_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(request_json.as_bytes())
+        ))
+        .unwrap();
+        store.connection.execute(
+            "UPDATE agent_launch_state SET state='awaiting_provider',start_request_id=?2,start_request_digest=?3,wrapper_process_identity_json=?4,launch_receipt_json=?5 WHERE agent_run_id=?1",
+            rusqlite::params![run_id.as_str(), operation_id.as_str(), request_digest.as_str(), serde_json::to_string(&wrapper).unwrap(), serde_json::to_string(&start_receipt).unwrap()],
+        ).unwrap();
+        let spool = RunStepSpool::open(&control_dir).unwrap();
+        let start = spool.publish_start_once(start_request.clone()).unwrap();
+        spool.publish_start_receipt(&start, start_receipt).unwrap();
+
+        let wrapper_process = crate::process::ProcessIdentity {
+            pid: wrapper.pid,
+            parent_pid: 1,
+            process_group_id: wrapper.pid,
+            start_identity: wrapper.start_identity.clone(),
+            command: "rex-wrapper-test".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let family_process = crate::process::ProcessIdentity {
+            pid: provider_pid,
+            parent_pid: wrapper.pid,
+            process_group_id: provider_pid,
+            start_identity: provider_start_identity.clone(),
+            command: executable.display().to_string(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        };
+        let binding = RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: run_id.clone(),
+            reservation_epoch: 7,
+            authority_digest: authority_digest.clone(),
+            descriptor_digest: authority.descriptor_digest.clone(),
+            wrapper_pid: wrapper.pid,
+            wrapper_start_identity: wrapper.start_identity.clone(),
+        };
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let make_family = |coverage| RunFamilyRecord {
+            schema_version: 2,
+            binding: binding.clone(),
+            observed_at_unix: 10,
+            coverage,
+            wrapper_process: wrapper_process.clone(),
+            provider_root: family_process.clone(),
+            provider_executable_path: executable.clone(),
+            provider_executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest: fixture_digest_json(std::slice::from_ref(&family_process)),
+            process_tree: vec![family_process.clone()],
+        };
+        spool
+            .write_run_family_record(&make_family(RunFamilyCoverage::Observing))
+            .unwrap();
+        let family = make_family(RunFamilyCoverage::Complete);
+        if complete_family {
+            spool.write_run_family_record(&family).unwrap();
+        }
+        let provider_tree = vec![
+            ProviderProcessIdentity {
+                pid: wrapper.pid,
+                parent_pid: wrapper_process.parent_pid,
+                process_group_id: wrapper_process.process_group_id,
+                start_identity: wrapper.start_identity.clone(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+            ProviderProcessIdentity {
+                pid: provider_pid,
+                parent_pid: wrapper.pid,
+                process_group_id: provider_pid,
+                start_identity: provider_start_identity.clone(),
+                identity_quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+        ];
+        let provider = ObservedProviderStart {
+            agent_run_id: run_id.clone(),
+            operation_id,
+            provider_pid,
+            provider_start_identity,
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest: fixture_digest_json(&provider_tree),
+            process_tree_confirmed: true,
+            process_tree: provider_tree,
+        };
+        provider
+            .validate_complete_process_tree(&qualification)
+            .unwrap();
+        if complete_family {
+            let observed_process = crate::run_step::ObservedProcess {
+                pid: family_process.pid,
+                parent_pid: family_process.parent_pid,
+                process_group_id: family_process.process_group_id,
+                start_identity: family_process.start_identity.clone(),
+                command: family_process.command.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            };
+            let turn = TurnResult {
+                receipt: crate::run_step::RunReceipt {
+                    run_id: run_id.clone(),
+                    attempt: 1,
+                    provider: AgentAdapter::Codex,
+                    effective_permission_mode: qualification.permission_mode.clone(),
+                    conversation_id: None,
+                    provider_version: Some(qualification.provider_version.clone()),
+                    capability_receipt_digest: Some(qualification_digest),
+                    schema_projection,
+                    launch_pid_hint: Some(provider.provider_pid),
+                    exit_code: None,
+                    timed_out: false,
+                    cancellation_signal: Some(1),
+                    cleanup: CleanupState::Confirmed,
+                    cleanup_detail: None,
+                    processes: vec![observed_process],
+                    result_digest: None,
+                    provider_result_failure: None,
+                    provider_process_failure: None,
+                    outcome: TurnOutcome::Cancelled,
+                },
+                structured_result: None,
+            };
+            let terminal = spool.publish_turn_result_once(&start, turn).unwrap();
+            assert!(matches!(terminal.receipt.outcome, TurnOutcome::Cancelled));
+        }
+        let slot_owner_id = run_id.to_string();
+
+        CompletedBlockLossFixture {
+            store,
+            generation,
+            run: crate::store::agent_recovery::RecoverableAgentRun {
+                agent_run_id: run_id,
+                current_generation: generation,
+                previous_generation: 0,
+                authority,
+                authority_digest,
+                agent_state: "launch_pending".into(),
+                started_at_unix: None,
+                launch_state: "awaiting_provider".into(),
+                process_identity_json: None,
+                wrapper_identity_json: Some(serde_json::to_string(&wrapper).unwrap()),
+                provider_tree_json: None,
+                pool: "agent".into(),
+                slot_index: 0,
+                reservation_epoch: 7,
+                slot_disposition: "unknown".into(),
+            },
+            wrapper,
+            provider,
+            slot_owner_id,
+        }
+    }
+
+    pub(crate) fn test_execution_slot_disposition(store: &ConfigStore, owner_id: &str) -> String {
+        store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [owner_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn test_insert_unknown_execution_slot(
+        store: &mut ConfigStore,
+        project_id: &str,
+        owner_id: &str,
+        slot_index: u32,
+        reservation_epoch: u64,
+    ) {
+        store.connection.execute(
+            "INSERT INTO execution_slots(pool,slot_index,project_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',?1,?2,'agent_run',?3,?4,0,'unknown')",
+            rusqlite::params![slot_index, project_id, owner_id, reservation_epoch],
+        ).unwrap();
     }
 
     #[test]
