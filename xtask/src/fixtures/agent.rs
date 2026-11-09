@@ -79,6 +79,12 @@ pub enum FixtureAction {
         schema_version: u32,
         message_id: String,
     },
+    /// Invoke the production host manifest and commit commands for the files created earlier in
+    /// this turn. This action never runs `git commit` itself.
+    RepositoryCommit {
+        action_id: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -185,7 +191,7 @@ pub fn run(
     let inbox = if invocation.scope.lane == FixtureLane::Workflow
         && matches!(
             role,
-            Role::Supervisor | Role::Coordinator | Role::Planner | Role::Worker
+            Role::Supervisor | Role::Coordinator | Role::Planner | Role::Worker | Role::Reviewer
         ) {
         Some(read_public_inbox(
             runtime_binary,
@@ -196,7 +202,7 @@ pub fn run(
     } else {
         None
     };
-    if matches!(role, Role::Coordinator | Role::Worker)
+    if matches!(role, Role::Coordinator | Role::Worker | Role::Reviewer)
         && invocation.scope.lane == FixtureLane::Workflow
         && context.hold_after_inbox
     {
@@ -505,8 +511,10 @@ fn validate_recipe_references(value: &Value) -> Result<(), String> {
                     | "worker.previous_head"
                     | "worker.branch_head"
                     | "worker.commit_shas"
+                    | "worker.host_commit_operation_id"
                     | "prompt.accepted_plan_digest"
                     | "prompt.subject_digest"
+                    | "prompt.evidence_coverage"
                     | "prompt.assessment_id"
                     | "prompt.operation_plan_digest"
                     | "prompt.node_key"
@@ -597,6 +605,17 @@ fn validate_action(action: &FixtureAction) -> Result<(), String> {
                 return Err("artifact schema version must be positive".into());
             }
         }
+        FixtureAction::RepositoryCommit { action_id, message } => {
+            validate_local_id(action_id, "repository commit action ID")?;
+            if message.trim().is_empty()
+                || message.len() > 200
+                || message.chars().any(char::is_control)
+            {
+                return Err(
+                    "fixture repository commit message must be bounded printable text".into(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -611,6 +630,37 @@ fn validate_local_id(value: &str, label: &str) -> Result<(), String> {
         return Err(format!("{label} must be a bounded local identifier"));
     }
     Ok(())
+}
+
+fn write_fixture_control_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("fixture control file has no parent directory")?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create fixture control directory: {error}"))?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && fs::read(path).map_err(|error| error.to_string())? == bytes =>
+        {
+            return Ok(());
+        }
+        Ok(_) => {
+            return Err("existing fixture control file differs from the idempotent action".into());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect fixture control file: {error}")),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create fixture control file: {error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("write fixture control file: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync fixture control file: {error}"))
 }
 
 fn validate_workspace_file(path: &str) -> Result<(), String> {
@@ -636,28 +686,39 @@ struct FixtureFacts {
 }
 
 fn execute_actions(
+    role: Role,
     actions: &[FixtureAction],
     runtime_binary: Option<&Path>,
     prompt: &str,
+    cwd: &Path,
 ) -> Result<FixtureFacts, String> {
     let mut facts = FixtureFacts::default();
     if actions.is_empty() {
         return Ok(facts);
     }
-    let cwd = std::env::current_dir()
-        .map_err(|error| format!("inspect actual provider workspace: {error}"))?;
-    let worker = if actions.iter().any(|action| {
+    let has_write = actions
+        .iter()
+        .any(|action| matches!(action, FixtureAction::WriteFile { .. }));
+    let has_commit = actions.iter().any(|action| {
         matches!(
             action,
-            FixtureAction::WriteFile { .. } | FixtureAction::GitCommit { .. }
+            FixtureAction::GitCommit { .. } | FixtureAction::RepositoryCommit { .. }
         )
-    }) {
-        Some(worker_assignment(prompt, &cwd)?)
+    });
+    if has_commit && role != Role::Worker {
+        return Err("fixture commits are only permitted for the Worker role".into());
+    }
+    let worker = if has_commit || (has_write && role == Role::Worker) {
+        Some(worker_assignment(prompt, cwd)?)
     } else {
         None
     };
     if let Some(worker) = &worker {
-        let before = git_query(&cwd, &["rev-parse", "--verify", "HEAD"])?;
+        let before = if worker.commit_mode == json!("host") {
+            worker.base_sha.clone()
+        } else {
+            git_query(cwd, &["rev-parse", "--verify", "HEAD"])?
+        };
         facts
             .values
             .insert("worker.previous_head".into(), json!(before));
@@ -676,6 +737,7 @@ fn execute_actions(
     }
     let mut writes = std::collections::BTreeSet::new();
     let mut commits = 0;
+    let mut repository_commits = 0;
     for action in actions {
         match action {
             FixtureAction::WriteFile { path, contents } => {
@@ -719,16 +781,16 @@ fn execute_actions(
                         "fixture Git commit requires the host-visible native commit mode".into(),
                     );
                 }
-                let head = git_query(&cwd, &["rev-parse", "--verify", "HEAD"])?;
+                let head = git_query(cwd, &["rev-parse", "--verify", "HEAD"])?;
                 let run_id = std::env::var("REX_PROJECTS_RUN_ID")
                     .map_err(|_| "missing host-provided Agent run ID for idempotent Git action")?;
                 validate_local_id(&run_id, "host Agent run ID")?;
                 let action_trailer =
                     format!("Rex-Projects-Fixture-Action: {action_id}; Run: {run_id}");
-                let latest = git_query(&cwd, &["log", "-1", "--format=%B"])?;
+                let latest = git_query(cwd, &["log", "-1", "--format=%B"])?;
                 let already_committed = latest.lines().any(|line| line == action_trailer);
                 if already_committed {
-                    let parent = git_query(&cwd, &["rev-parse", "--verify", "HEAD^"])?;
+                    let parent = git_query(cwd, &["rev-parse", "--verify", "HEAD^"])?;
                     if parent.len() != 40 || !parent.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                         return Err(
                             "idempotent fixture commit has no valid actual predecessor commit"
@@ -747,14 +809,14 @@ fn execute_actions(
                     return Err("workspace HEAD changed outside this fixture action".into());
                 } else {
                     for path in &writes {
-                        git_run(&cwd, &["add", "--", path])?;
+                        git_run(cwd, &["add", "--", path])?;
                     }
-                    let index = git_query_allow_failure(&cwd, &["diff", "--cached", "--quiet"])?;
+                    let index = git_query_allow_failure(cwd, &["diff", "--cached", "--quiet"])?;
                     if index.status.is_some_and(|status| status.success()) {
                         return Err("fixture Git commit has no staged change".into());
                     }
                     git_run(
-                        &cwd,
+                        cwd,
                         &[
                             "commit",
                             "-m",
@@ -766,13 +828,203 @@ fn execute_actions(
                         ],
                     )?;
                 }
-                let head = git_query(&cwd, &["rev-parse", "--verify", "HEAD"])?;
+                let head = git_query(cwd, &["rev-parse", "--verify", "HEAD"])?;
                 facts
                     .values
                     .insert("worker.branch_head".into(), json!(head));
                 facts
                     .values
                     .insert("worker.commit_shas".into(), json!([head]));
+            }
+            FixtureAction::RepositoryCommit { action_id, message } => {
+                repository_commits += 1;
+                if repository_commits > 1 || writes.is_empty() || commits != 0 {
+                    return Err("a host repository commit requires prior fixture file creation and permits one commit per turn".into());
+                }
+                let worker = worker
+                    .as_ref()
+                    .filter(|assignment| assignment.commit_mode == json!("host"))
+                    .ok_or(
+                        "fixture repository commit requires the host-visible host commit mode",
+                    )?;
+                let binary = runtime_binary
+                    .ok_or("host repository commit needs the pinned product CLI path")?;
+                let run_id = std::env::var("REX_PROJECTS_RUN_ID")
+                    .map_err(|_| "missing host-provided Agent run ID")?;
+                validate_local_id(&run_id, "host Agent run ID")?;
+                let control_dir = PathBuf::from(
+                    std::env::var_os("REX_PROJECTS_CONTROL_DIR")
+                        .ok_or("missing host-provided Agent control directory")?,
+                );
+                if !control_dir.is_absolute() {
+                    return Err("host-provided control directory is not absolute".into());
+                }
+                let manifest_message_id = format!("{action_id}-manifest");
+                let commit_message_id = format!("{action_id}-commit");
+                validate_local_id(&manifest_message_id, "manifest message ID")?;
+                validate_local_id(&commit_message_id, "commit message ID")?;
+                let paths_path = control_dir.join(format!("{action_id}-paths.json"));
+                let paths = json!({
+                    "schema_version": 1,
+                    "worktree_id": worker.node_id,
+                    "entries": writes.iter().map(|path| json!({"path":path,"operation":"capture"})).collect::<Vec<_>>(),
+                });
+                write_fixture_control_file(
+                    &paths_path,
+                    &serde_json::to_vec(&paths).map_err(|error| error.to_string())?,
+                )?;
+                let manifest_filename = format!(".rex-projects-fixture-{action_id}-manifest.json");
+                let manifest_output = run_process(ProcessRequest {
+                    executable: binary.to_path_buf(),
+                    args: vec![
+                        "agent".into(),
+                        "repository".into(),
+                        "manifest".into(),
+                        "--paths-file".into(),
+                        paths_path.as_os_str().to_owned(),
+                        "--output".into(),
+                        manifest_filename.clone().into(),
+                        "--message-id".into(),
+                        manifest_message_id.clone().into(),
+                        "--wait-seconds".into(),
+                        "300".into(),
+                        "--json".into(),
+                    ],
+                    stdin: Vec::new(),
+                    cwd: Some(cwd.to_path_buf()),
+                    clear_environment: false,
+                    environment: Default::default(),
+                    timeout: Duration::from_secs(300),
+                    shutdown_grace: Duration::from_secs(2),
+                    stdout_limit: 64 * 1024,
+                    stderr_tail_limit: 8 * 1024,
+                })
+                .map_err(|error| format!("launch actual repository manifest CLI: {error}"))?;
+                if manifest_output.timed_out
+                    || !manifest_output.cleanup_confirmed
+                    || !manifest_output
+                        .status
+                        .is_some_and(|status| status.success())
+                {
+                    return Err(format!(
+                        "repository manifest CLI failed or remains uncertain: {}",
+                        String::from_utf8_lossy(&manifest_output.stderr_tail)
+                    ));
+                }
+                let manifest_response: Value = serde_json::from_slice(&manifest_output.stdout)
+                    .map_err(|error| {
+                        format!("repository manifest CLI returned invalid JSON: {error}")
+                    })?;
+                let reference = manifest_response.pointer("/result/artifact").cloned()
+                    .ok_or("repository manifest CLI did not return the host-registered artifact reference")?;
+                let parsed_reference: RoleArtifactReference =
+                    serde_json::from_value(reference.clone()).map_err(|error| {
+                        format!("repository manifest reference is invalid: {error}")
+                    })?;
+                if parsed_reference.kind
+                    != rex_projects::engine::orchestration::RoleArtifactKind::Change
+                {
+                    return Err("repository manifest CLI registered the wrong artifact kind".into());
+                }
+                let reference_path =
+                    control_dir.join(format!("{action_id}-manifest-reference.json"));
+                write_fixture_control_file(
+                    &reference_path,
+                    &serde_json::to_vec(&reference).map_err(|error| error.to_string())?,
+                )?;
+                let commit_message_path =
+                    control_dir.join(format!("{action_id}-commit-message.txt"));
+                let commit_message =
+                    format!("{message}\n\nCo-authored-by: Codex <noreply@openai.com>\n");
+                write_fixture_control_file(&commit_message_path, commit_message.as_bytes())?;
+                let commit_output = run_process(ProcessRequest {
+                    executable: binary.to_path_buf(),
+                    args: vec![
+                        "agent".into(),
+                        "repository".into(),
+                        "commit".into(),
+                        "--expected-head".into(),
+                        worker.base_sha.clone().into(),
+                        "--manifest-reference-file".into(),
+                        reference_path.as_os_str().to_owned(),
+                        "--message-file".into(),
+                        commit_message_path.as_os_str().to_owned(),
+                        "--message-id".into(),
+                        commit_message_id.into(),
+                        "--json".into(),
+                    ],
+                    stdin: Vec::new(),
+                    cwd: Some(cwd.to_path_buf()),
+                    clear_environment: false,
+                    environment: Default::default(),
+                    timeout: Duration::from_secs(300),
+                    shutdown_grace: Duration::from_secs(2),
+                    stdout_limit: 64 * 1024,
+                    stderr_tail_limit: 8 * 1024,
+                })
+                .map_err(|error| format!("launch actual repository commit CLI: {error}"))?;
+                if commit_output.timed_out
+                    || !commit_output.cleanup_confirmed
+                    || !commit_output.status.is_some_and(|status| status.success())
+                {
+                    return Err(format!(
+                        "repository commit CLI failed or remains uncertain: {}",
+                        String::from_utf8_lossy(&commit_output.stderr_tail)
+                    ));
+                }
+                let commit_response: Value = serde_json::from_slice(&commit_output.stdout)
+                    .map_err(|error| {
+                        format!("repository commit CLI returned invalid JSON: {error}")
+                    })?;
+                let receipt = commit_response
+                    .get("result")
+                    .cloned()
+                    .ok_or("repository commit CLI returned no host receipt")?;
+                let operation_id = receipt["commit_operation_id"]
+                    .as_str()
+                    .ok_or("repository commit receipt has no operation ID")?;
+                let head = receipt
+                    .pointer("/commit/observed_head")
+                    .and_then(Value::as_str)
+                    .ok_or("repository commit receipt has no observed host commit")?;
+                if receipt
+                    .pointer("/commit/expected_head")
+                    .and_then(Value::as_str)
+                    != facts
+                        .values
+                        .get("worker.previous_head")
+                        .and_then(Value::as_str)
+                    || receipt["base_sha"].as_str() != Some(worker.base_sha.as_str())
+                    || receipt
+                        .pointer("/commit/signature_verified")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                    || receipt
+                        .pointer("/commit/hooks_completed")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                    || head == worker.base_sha
+                {
+                    return Err(
+                        "host commit receipt does not match the fixture's exact assigned commit"
+                            .into(),
+                    );
+                }
+                facts.values.insert("artifact.change".into(), reference);
+                facts
+                    .values
+                    .insert("worker.branch_head".into(), json!(head));
+                facts
+                    .values
+                    .insert("worker.commit_shas".into(), json!([head]));
+                facts.values.insert(
+                    "worker.host_commit_operation_id".into(),
+                    json!(operation_id),
+                );
+                facts.values.insert("worker.commit_receipt".into(), receipt);
+                for path in [paths_path, reference_path, commit_message_path] {
+                    let _ = fs::remove_file(path);
+                }
             }
             FixtureAction::RegisterArtifact {
                 action_id,
@@ -787,8 +1039,7 @@ fn execute_actions(
                     executable: binary.to_path_buf(),
                     args: vec![
                         "agent".into(),
-                        "artifact".into(),
-                        "add".into(),
+                        "artifact-add".into(),
                         "--run".into(),
                         OsString::from(
                             std::env::var("REX_PROJECTS_RUN_ID")
@@ -810,7 +1061,7 @@ fn execute_actions(
                         "--json".into(),
                     ],
                     stdin: Vec::new(),
-                    cwd: Some(cwd.clone()),
+                    cwd: Some(cwd.to_path_buf()),
                     clear_environment: false,
                     environment: Default::default(),
                     timeout: Duration::from_secs(300),
@@ -1288,7 +1539,9 @@ fn next_message(
             _ => {}
         }
     }
-    let mut facts = execute_actions(&template.actions, runtime_binary, prompt)?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("inspect actual provider workspace: {error}"))?;
+    let mut facts = execute_actions(role, &template.actions, runtime_binary, prompt, &cwd)?;
     if let Some(inbox) = inbox {
         if let Some(ticket) = inbox.ticket_observation()? {
             facts
@@ -2152,8 +2405,8 @@ mod tests {
     use super::Role;
     use super::{
         AgentContext, FixtureAction, FixtureInbox, FixtureInvocation, FixtureLane, FixtureScope,
-        RunInputEvidence, next_message, parse_shell_words, prompt_ticket, source_schema,
-        validate_action, validate_coordinator_dispatch, validate_recipe_references,
+        RunInputEvidence, next_message, parse_shell_words, prompt_json_field, prompt_ticket,
+        source_schema, validate_action, validate_coordinator_dispatch, validate_recipe_references,
         validate_source_prompt, worker_assignment, worker_node_id, worker_node_id_for_lane,
     };
     use std::path::Path;
@@ -2402,33 +2655,54 @@ mod tests {
 
     #[test]
     fn source_prompt_schema_matches_each_current_product_role_schema() {
-        const OPEN: &str = "<rex-projects-authoritative-result-schema>\n";
-        const CLOSE: &str = "\n</rex-projects-authoritative-result-schema>";
-        for role in [
-            Role::Supervisor,
-            Role::Coordinator,
-            Role::Planner,
-            Role::Worker,
-            Role::Reviewer,
-            Role::MergeDecision,
-            Role::Operator,
-            Role::Postmortem,
-        ] {
-            let schema = source_schema(role).unwrap();
-            let prompt = format!(
-                "Return only a JSON object with exactly one property named result.\n{OPEN}{}{CLOSE}",
-                serde_json::to_string(&schema).unwrap()
-            );
-            validate_source_prompt(role, &prompt)
-                .unwrap_or_else(|error| panic!("{role:?} source schema rejected: {error}"));
+        use rex_projects::domain::ids::ProfileId;
+        use rex_projects::providers::{InvocationPaths, build_invocation, project_result_schema};
 
-            let mut changed = schema;
-            changed["additionalProperties"] = serde_json::json!(true);
-            let tampered = format!(
-                "Return only a JSON object with exactly one property named result.\n{OPEN}{}{CLOSE}",
-                serde_json::to_string(&changed).unwrap()
-            );
-            assert!(validate_source_prompt(role, &tampered).is_err());
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/fixture");
+        let applied = rex_projects::config::load(&fixture_root.join("config.toml")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let schema_path = root.path().join("provider.schema.json");
+        for role in Role::ALL {
+            let schema = rex_projects::roles::result_schema(role);
+            assert_eq!(source_schema(role).unwrap(), schema);
+            let projection = project_result_schema(&schema).unwrap();
+            std::fs::write(
+                &schema_path,
+                serde_json::to_vec(&projection.schema).unwrap(),
+            )
+            .unwrap();
+            for (provider, profile_id) in [
+                (super::Provider::Codex, "worker_codex"),
+                (super::Provider::Claude, "judgment_claude"),
+            ] {
+                let mut profile = applied.profiles[&ProfileId::parse(profile_id).unwrap()].clone();
+                profile.command = vec![std::env::current_exe().unwrap().display().to_string()];
+                let invocation = build_invocation(
+                    &profile,
+                    "Follow the host role contract.",
+                    "Read the generated run inputs.",
+                    &schema,
+                    InvocationPaths {
+                        schema_path: &schema_path,
+                        control_dir: None,
+                    },
+                    None,
+                )
+                .unwrap();
+                let args = invocation
+                    .args
+                    .iter()
+                    .map(|arg| arg.to_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                let prompt = super::extract_prompt(provider, role, &args)
+                    .unwrap_or_else(|error| panic!("{role:?}/{provider:?}: {error}"));
+                let tampered = prompt.replace(
+                    "\"additionalProperties\":false",
+                    "\"additionalProperties\":true",
+                );
+                assert_ne!(tampered, prompt);
+                assert!(validate_source_prompt(role, &tampered).is_err());
+            }
         }
     }
 
@@ -2621,6 +2895,347 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_reviewer_recipe_uses_the_host_rendered_accepted_plan_digest() {
+        use rex_projects::domain::ids::{Digest, ProfileId, ProjectId, RepositoryId, TicketId};
+        use rex_projects::roles::{PromptContext, TicketBrief, render_role_prompt};
+        use sha2::{Digest as _, Sha256};
+
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/fixture");
+        let applied = rex_projects::config::load(&fixture_root.join("config.toml")).unwrap();
+        let accepted_plan = serde_json::json!({
+            "nodes":[{
+                "id":"acceptance-node",
+                "repository":"example",
+                "task":"Update the documented interface.",
+                "depends_on":[],
+                "required_evidence":["The updated interface passes its documented checks."],
+                "investigation":false
+            }],
+            "requested_investigation_children":0
+        });
+        let accepted_plan_json = serde_json::to_string(&accepted_plan).unwrap();
+        let accepted_plan_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(accepted_plan_json.as_bytes())
+        ))
+        .unwrap();
+        let render_prompt = |digest| {
+            render_role_prompt(
+                &applied,
+                &PromptContext {
+                    project_id: ProjectId::parse("operations_project").unwrap(),
+                    profile_id: Some(ProfileId::parse("judgment_claude").unwrap()),
+                    role: Role::Coordinator,
+                    operation_recipe: None,
+                    repositories: vec![RepositoryId::parse("example").unwrap()],
+                    ticket: Some(TicketBrief {
+                        ticket_id: TicketId::parse("acceptance-ticket").unwrap(),
+                        ticket_revision: 5,
+                        title: "Acceptance ticket".into(),
+                        body: "Exercise the coordinator continuation.".into(),
+                        acceptance: vec!["The reviewer spawn names the accepted plan.".into()],
+                    }),
+                    recovery_summary: None,
+                    accepted_plan: Some(accepted_plan_json.clone()),
+                    accepted_plan_digest: digest,
+                    implementation_publication_subject: None,
+                    previous_decisions: Vec::new(),
+                    required_evidence: Vec::new(),
+                    stop_conditions: Vec::new(),
+                    assigned_commit_mode: None,
+                },
+                &std::env::current_exe().unwrap(),
+            )
+            .unwrap()
+            .text
+        };
+        let missing_digest_prompt = render_prompt(None);
+        let prompt = render_prompt(Some(accepted_plan_digest.clone()));
+        let prompt_root = tempfile::tempdir().unwrap();
+        let prompt_path = prompt_root.path().join("coordinator.prompt");
+        std::fs::write(&prompt_path, &prompt).unwrap();
+        let prompt = std::fs::read_to_string(&prompt_path).unwrap();
+        assert_eq!(
+            prompt_json_field(&prompt, "accepted_plan_digest").unwrap(),
+            serde_json::json!(accepted_plan_digest.as_str())
+        );
+
+        let context_root = tempfile::tempdir().unwrap();
+        let context_path = context_root.path().join("coordinator.json");
+        let context_json = serde_json::json!({
+            "schema_version":1,
+            "scenario":"acceptance_coordinator",
+            "messages":crate::acceptance::profile_messages("coordinator", false).unwrap()
+        });
+        std::fs::write(&context_path, serde_json::to_vec(&context_json).unwrap()).unwrap();
+        let context = super::read_context(&context_path).unwrap();
+        let ticket_run_id = "ticket-run-acceptance";
+        let scope = FixtureScope {
+            scenario: "acceptance_coordinator".into(),
+            context: "agent".into(),
+            lane: FixtureLane::Workflow,
+            project_id: "operations_project".into(),
+            role: Role::Coordinator,
+            ticket_run_id: Some(ticket_run_id.into()),
+            work_node_id: None,
+        };
+        let invocation = |run_id: &str, prompt: &str| FixtureInvocation {
+            scope: scope.clone(),
+            run_id: run_id.into(),
+            operation_id: Some(format!("start-{run_id}")),
+            attempt: Some(1),
+            run_epoch: Some(5),
+            subject_revision: Some(5),
+            prompt_digest: format!("{:x}", Sha256::digest(prompt.as_bytes())),
+        };
+        let dispatch_inbox = |run_id: &str| {
+            FixtureInbox::parse(
+                serde_json::json!({
+                    "run_id":run_id,"after":0,"next_after":1,
+                    "inputs":[{
+                        "wake_input_id":1,"source_type":"ticket_run_dispatch","source_id":"ticket-run-acceptance",
+                        "source_revision":1,"priority":1,
+                        "payload_json":{"ticket_run_id":ticket_run_id,"supervisor_evidence_id":"host-evidence"}
+                    }]
+                }),
+                run_id,
+            )
+            .unwrap()
+        };
+        let planner_inbox = |run_id: &str| {
+            FixtureInbox::parse(
+                serde_json::json!({
+                    "run_id":run_id,"after":0,"next_after":1,
+                    "inputs":[{
+                        "wake_input_id":1,"source_type":"agent_result","source_id":"planner-evidence",
+                        "source_revision":1,"priority":1,
+                        "payload_json":{
+                            "kind":"validated_agent_result",
+                            "source":{"role":"planner","project_id":"operations_project","ticket_run_id":ticket_run_id},
+                            "result":{"kind":"plan_ready","structured_result":{
+                                "plan":{"nodes":[{
+                                    "id":"acceptance-node","repository":"example","task":"Update the documented interface.",
+                                    "depends_on":[],"required_evidence":["The updated interface passes its documented checks."],
+                                    "investigation":false
+                                }],"requested_investigation_children":0},
+                                "unresolved_questions":[]
+                            }}
+                        }
+                    }]
+                }),
+                run_id,
+            )
+            .unwrap()
+        };
+        let continuation_inbox = |run_id: &str| {
+            FixtureInbox::parse(
+                serde_json::json!({
+                    "run_id":run_id,"after":0,"next_after":11,
+                    "inputs":[
+                        {
+                            "wake_input_id":10,"source_type":"agent_recovery_attention","source_id":"worker-run",
+                            "source_revision":1,"priority":100,
+                            "payload_json":{"kind":"agent_recovery_attention","agent_run_id":"worker-run","attempt":1,"run_epoch":3,"reason":"HeartbeatMissingOrInvalid","instruction":"Inspect the AgentRun."}
+                        },
+                        {
+                            "wake_input_id":11,"source_type":"agent_result","source_id":"worker-evidence",
+                            "source_revision":1,"priority":0,
+                            "payload_json":{"kind":"validated_agent_result","source":{"role":"worker","project_id":"operations_project","ticket_run_id":ticket_run_id},"result":{"kind":"implementation_ready","structured_result":{}}}
+                        }
+                    ]
+                }),
+                run_id,
+            )
+            .unwrap()
+        };
+
+        let run_sequence = |state_dir: &Path, turn_prompt: &str| {
+            let first_run = "coordinator-dispatch";
+            let first = next_message(
+                &context,
+                &invocation(first_run, turn_prompt),
+                state_dir,
+                None,
+                turn_prompt,
+                Some(&dispatch_inbox(first_run)),
+            )
+            .unwrap();
+            assert_eq!(first.kind, super::RoleOutputKind::SpawnRequest);
+            let second_run = "coordinator-planner-result";
+            let second = next_message(
+                &context,
+                &invocation(second_run, turn_prompt),
+                state_dir,
+                None,
+                turn_prompt,
+                Some(&planner_inbox(second_run)),
+            )
+            .unwrap();
+            assert_eq!(second.kind, super::RoleOutputKind::PlanReady);
+            let third_run = "coordinator-after-worker";
+            next_message(
+                &context,
+                &invocation(third_run, turn_prompt),
+                state_dir,
+                None,
+                turn_prompt,
+                Some(&continuation_inbox(third_run)),
+            )
+        };
+
+        let omitted_digest_state = tempfile::tempdir().unwrap();
+        let error = run_sequence(omitted_digest_state.path(), &missing_digest_prompt).unwrap_err();
+        assert!(
+            error.contains(
+                "host prompt must expose exactly one `accepted_plan_digest` value; found 0"
+            )
+        );
+
+        let complete_state = tempfile::tempdir().unwrap();
+        let reviewer = run_sequence(complete_state.path(), &prompt).unwrap();
+        assert_eq!(reviewer.kind, super::RoleOutputKind::SpawnRequest);
+        super::validate_payload(reviewer.kind, &reviewer.structured_result).unwrap();
+        assert_eq!(reviewer.structured_result["role"], "reviewer");
+        assert_eq!(
+            reviewer.structured_result["plan_digest"],
+            accepted_plan_digest.as_str()
+        );
+    }
+
+    #[test]
+    fn reviewer_recipe_reads_subject_digest_and_coverage_from_generated_prompt_file() {
+        use rex_projects::delivery_runtime::{
+            ImplementationPublicationSetSubject, ImplementationPublicationSubjectFact,
+        };
+        use rex_projects::domain::ids::{
+            Digest, ProfileId, ProjectId, RepositoryId, TicketId, TicketRunId,
+        };
+        use rex_projects::engine::orchestration::WorkNodeId;
+        use rex_projects::roles::{PromptContext, TicketBrief, render_role_prompt};
+        use sha2::{Digest as _, Sha256};
+
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/fixture");
+        let applied = rex_projects::config::load(&fixture_root.join("config.toml")).unwrap();
+        let subject = ImplementationPublicationSetSubject {
+            ticket_run_id: TicketRunId::parse("ticket-run-reviewer").unwrap(),
+            accepted_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            publications: vec![ImplementationPublicationSubjectFact {
+                work_node_id: WorkNodeId::parse("acceptance-node").unwrap(),
+                repository_id: RepositoryId::parse("example").unwrap(),
+                pull_request_number: 41,
+                pull_request_node_id: "PR_node_41".into(),
+                pull_request_head: "b".repeat(40),
+                published_head: "c".repeat(40),
+                receipt_digest: "d".repeat(64),
+            }],
+            coverage: vec![WorkNodeId::parse("acceptance-node").unwrap()],
+            publication_revision: 7,
+        };
+        let expected_digest = subject.digest().unwrap();
+        let prompt = render_role_prompt(
+            &applied,
+            &PromptContext {
+                project_id: ProjectId::parse("operations_project").unwrap(),
+                profile_id: Some(ProfileId::parse("judgment_claude").unwrap()),
+                role: Role::Reviewer,
+                operation_recipe: None,
+                repositories: vec![RepositoryId::parse("example").unwrap()],
+                ticket: Some(TicketBrief {
+                    ticket_id: TicketId::parse("acceptance-ticket").unwrap(),
+                    ticket_revision: 7,
+                    title: "Review publication".into(),
+                    body: "Review the exact published implementation.".into(),
+                    acceptance: Vec::new(),
+                }),
+                recovery_summary: None,
+                accepted_plan: Some("{}".into()),
+                accepted_plan_digest: Some(subject.accepted_plan_digest.clone()),
+                implementation_publication_subject: Some(subject),
+                previous_decisions: Vec::new(),
+                required_evidence: Vec::new(),
+                stop_conditions: Vec::new(),
+                assigned_commit_mode: None,
+            },
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap()
+        .text;
+        let prompt_root = tempfile::tempdir().unwrap();
+        let prompt_path = prompt_root.path().join("reviewer.prompt");
+        std::fs::write(&prompt_path, prompt).unwrap();
+        let prompt = std::fs::read_to_string(prompt_path).unwrap();
+        assert_eq!(
+            prompt_json_field(&prompt, "subject_kind").unwrap(),
+            "implementation_publication_set"
+        );
+        assert_eq!(
+            prompt_json_field(&prompt, "subject_digest").unwrap(),
+            expected_digest.as_str()
+        );
+        assert_eq!(
+            prompt_json_field(&prompt, "evidence_coverage").unwrap(),
+            serde_json::json!(["acceptance-node"])
+        );
+
+        let messages = crate::acceptance::profile_messages("reviewer", false).unwrap();
+        let review_message = messages
+            .iter()
+            .find(|message| message["kind"] == "review_ready")
+            .unwrap();
+        let actions = review_message["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(serde_json::from_value::<super::FixtureAction>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let error =
+            super::execute_actions(Role::Reviewer, &actions, None, &prompt, prompt_root.path())
+                .err()
+                .expect("Reviewer action should reach the pinned CLI requirement");
+        assert_eq!(
+            error,
+            "artifact registration needs the pinned product CLI path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prompt_root.path().join("fixture-review.md")).unwrap(),
+            "# Review evidence\n\nThe bounded fixture change meets the acceptance criterion.\n"
+        );
+        let invocation = FixtureInvocation {
+            scope: FixtureScope {
+                scenario: "acceptance_host_commit".into(),
+                context: "agent".into(),
+                lane: FixtureLane::Workflow,
+                project_id: "operations_project".into(),
+                role: Role::Reviewer,
+                ticket_run_id: Some("ticket-run-reviewer".into()),
+                work_node_id: None,
+            },
+            run_id: "reviewer-run".into(),
+            operation_id: Some("start-reviewer-run".into()),
+            attempt: Some(1),
+            run_epoch: Some(5),
+            subject_revision: Some(7),
+            prompt_digest: format!("{:x}", Sha256::digest(prompt.as_bytes())),
+        };
+        let result = super::resolve_references(
+            review_message["structured_result"].clone(),
+            &super::FixtureFacts::default(),
+            &invocation,
+            &prompt,
+        )
+        .unwrap();
+        assert_eq!(result["subject_kind"], "implementation_publication_set");
+        assert_eq!(result["subject_digest"], expected_digest.as_str());
+        assert_eq!(
+            result["evidence_coverage"],
+            serde_json::json!(["acceptance-node"])
+        );
+        super::validate_payload(super::RoleOutputKind::ReviewReady, &result).unwrap();
+    }
+
+    #[test]
     fn worker_actions_require_prompt_path_to_equal_actual_provider_worktree() {
         let root = tempfile::tempdir().unwrap();
         let assignment = serde_json::json!({
@@ -2637,5 +3252,37 @@ mod tests {
             "node-alpha"
         );
         assert!(worker_assignment(&prompt, Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn worker_workspace_actions_require_assignment_even_without_commit_action() {
+        let root = tempfile::tempdir().unwrap();
+        let actions = [
+            FixtureAction::WriteFile {
+                path: "worker-output.md".into(),
+                contents: "worker output".into(),
+            },
+            FixtureAction::GitCommit {
+                action_id: "worker-commit".into(),
+                message: "test: fixture commit".into(),
+            },
+            FixtureAction::RepositoryCommit {
+                action_id: "worker-repository-commit".into(),
+                message: "test: fixture repository commit".into(),
+            },
+        ];
+        for action in actions {
+            let error = super::execute_actions(
+                Role::Worker,
+                &[action],
+                None,
+                "prompt with no worker assignment",
+                root.path(),
+            )
+            .err()
+            .expect("Worker action should require its assignment");
+            assert!(error.contains("accepted_plan block"), "{error}");
+        }
+        assert!(!root.path().join("worker-output.md").exists());
     }
 }

@@ -517,6 +517,7 @@ impl ProfileTrialStartEffectHandler {
             controller_generation: generation,
             workspace: workspace.to_owned(),
             control_dir: control_dir.to_owned(),
+            worker_assignment: None,
             rex_session_id: block.session_id.clone(),
             rex_block_id: RexBlockId::parse(block.block_id.clone())?,
             profile_digest: snapshot.profile_digest.clone(),

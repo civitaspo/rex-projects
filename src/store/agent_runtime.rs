@@ -531,6 +531,26 @@ impl ConfigStore {
         Ok(Some(reservation))
     }
 
+    /// Load the immutable reservation by run identity and verify its stored digest.
+    pub fn agent_launch_reservation_for_run(
+        &self,
+        agent_run_id: &crate::domain::ids::AgentRunId,
+    ) -> Result<Option<AgentLaunchReservation>, String> {
+        let digest: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT reservation_digest FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(digest) = digest else {
+            return Ok(None);
+        };
+        self.agent_launch_reservation(agent_run_id, &Digest::parse(digest)?)
+    }
+
     /// Close phase two after host authority and the real Rex block have both been
     /// persisted. This is idempotent and never turns an unknown block into success.
     pub fn finalize_agent_launch_reservation(
@@ -2118,6 +2138,7 @@ mod tests {
                 generation,
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
+                &Default::default(),
                 &mut mailbox_cursor,
             )
             .unwrap()
@@ -2136,6 +2157,7 @@ mod tests {
                 generation,
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
+                &Default::default(),
                 &mut mailbox_cursor,
             )
             .unwrap()
@@ -2146,6 +2168,7 @@ mod tests {
                 generation + 1,
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
+                &Default::default(),
                 &mut mailbox_cursor,
             )
             .is_err()
@@ -2163,6 +2186,7 @@ mod tests {
                 generation,
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
+                &Default::default(),
                 &mut mailbox_cursor,
             )
             .unwrap()

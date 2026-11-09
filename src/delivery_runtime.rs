@@ -491,14 +491,64 @@ impl RepositoryDelivery {
                 "host manifest expected HEAD differs from the current worktree".into(),
             ));
         }
+        let mut commit_worktree = work.worktree.clone();
+        commit_worktree.base_sha = expected_head.to_owned();
         self.commits
             .prepare(
-                &work.worktree,
+                &commit_worktree,
                 operation_id,
                 manifest,
                 manifest_root,
                 message,
             )
+            .map_err(DeliveryError::HostCommit)
+    }
+
+    pub fn load_prepared_host_manifest(
+        &self,
+        work: &PreparedRepositoryWork,
+        operation_id: &OperationId,
+        expected_head: &str,
+        manifest: &ChangeManifest,
+        manifest_root: &Path,
+        message: &str,
+    ) -> Result<Option<PreparedHostCommit>, DeliveryError> {
+        if work.commit_mode != CommitMode::Host {
+            return Err(DeliveryError::Invalid(
+                "host manifest recovery does not match the selected commit mode".into(),
+            ));
+        }
+        validate_git_sha(expected_head)?;
+        let _lease = self
+            .worktrees
+            .acquire_writer_lease(work.worktree.clone())
+            .map_err(DeliveryError::Worktree)?;
+        let mut commit_worktree = work.worktree.clone();
+        commit_worktree.base_sha = expected_head.to_owned();
+        self.commits
+            .load_prepared(
+                &commit_worktree,
+                operation_id,
+                manifest,
+                manifest_root,
+                message,
+            )
+            .map_err(DeliveryError::HostCommit)
+    }
+
+    pub fn validate_required_commit_trailer(
+        &self,
+        work: &PreparedRepositoryWork,
+        message: &str,
+        required_trailer: &str,
+    ) -> Result<(), DeliveryError> {
+        if work.commit_mode != CommitMode::Host {
+            return Err(DeliveryError::Invalid(
+                "host commit trailer validation requires host commit mode".into(),
+            ));
+        }
+        self.commits
+            .validate_required_trailer(&work.worktree, message, required_trailer)
             .map_err(DeliveryError::HostCommit)
     }
 
@@ -512,8 +562,10 @@ impl RepositoryDelivery {
             .worktrees
             .acquire_writer_lease(work.worktree.clone())
             .map_err(DeliveryError::Worktree)?;
+        let mut commit_worktree = work.worktree.clone();
+        commit_worktree.base_sha = prepared.intent.expected_head.clone();
         self.commits
-            .execute(&work.worktree, prepared)
+            .execute(&commit_worktree, prepared)
             .map_err(DeliveryError::HostCommit)
     }
 
@@ -527,8 +579,10 @@ impl RepositoryDelivery {
             .worktrees
             .acquire_writer_lease(work.worktree.clone())
             .map_err(DeliveryError::Worktree)?;
+        let mut commit_worktree = work.worktree.clone();
+        commit_worktree.base_sha = prepared.intent.expected_head.clone();
         self.commits
-            .reconcile(&work.worktree, prepared)
+            .reconcile(&commit_worktree, prepared)
             .map_err(DeliveryError::HostCommit)
     }
 
@@ -1213,6 +1267,47 @@ pub struct PreparedWorktreeNodeRequest {
     pub commit_mode: CommitMode,
 }
 
+/// A host-owned, run-scoped request to commit a Worker manifest before its final result is accepted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitWorkerManifestEffectPayload {
+    pub schema_version: u32,
+    pub agent_run_id: crate::domain::ids::AgentRunId,
+    pub project_id: ProjectId,
+    pub message_id: String,
+    pub configuration_digest: Digest,
+    pub ticket_revision: u64,
+    pub ticket_namespace: TicketNamespace,
+    pub ticket_id: TicketId,
+    pub ticket_run_id: TicketRunId,
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub prepare_operation_id: OperationId,
+    pub expected_base_sha: String,
+    pub expected_head: String,
+    pub manifest_artifact: crate::engine::orchestration::RoleArtifactReference,
+    pub manifest_digest: Digest,
+    pub manifest: crate::host_commit::ChangeManifest,
+    pub commit_message: String,
+    pub required_trailer: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitWorkerManifestEffectReceipt {
+    pub schema_version: u32,
+    pub agent_run_id: crate::domain::ids::AgentRunId,
+    pub message_id: String,
+    pub ticket_run_id: TicketRunId,
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub base_sha: String,
+    pub manifest_artifact: crate::engine::orchestration::RoleArtifactReference,
+    pub commit: crate::host_commit::HostCommitReceipt,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerDeliveryCommit {
@@ -1221,10 +1316,11 @@ pub enum WorkerDeliveryCommit {
         worker_reported_head: String,
         required_trailer: String,
     },
-    HostManifest {
+    HostReceipt {
+        operation_id: OperationId,
         expected_head: String,
-        manifest: ChangeManifest,
-        message: String,
+        worker_reported_head: String,
+        receipt: Box<CommitWorkerManifestEffectReceipt>,
     },
 }
 
@@ -1397,6 +1493,16 @@ impl RepositoryDeliveryEffects {
     pub fn publish_implementation_handler(self: &Arc<Self>) -> PublishImplementationEffectHandler {
         PublishImplementationEffectHandler {
             effects: Arc::clone(self),
+        }
+    }
+
+    pub fn commit_worker_manifest_handler(
+        self: &Arc<Self>,
+        artifacts: crate::artifacts::ArtifactStore,
+    ) -> CommitWorkerManifestEffectHandler {
+        CommitWorkerManifestEffectHandler {
+            effects: Arc::clone(self),
+            artifacts,
         }
     }
 
@@ -1613,6 +1719,301 @@ impl RepositoryDeliveryEffects {
         })
     }
 
+    fn commit_worker_manifest(
+        &self,
+        mode: EffectMode,
+        request: &EffectRequest,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        artifacts: &crate::artifacts::ArtifactStore,
+    ) -> Result<EffectObservation, String> {
+        validate_effect_kind(request, EffectKind::CommitWorkerManifest)?;
+        let payload: CommitWorkerManifestEffectPayload = decode_effect_payload(request)?;
+        if payload.schema_version != 1
+            || request.intent.subject_type != "ticket_run"
+            || request.intent.subject_id != payload.ticket_run_id.as_str()
+            || request.intent.project_id != payload.project_id
+            || request.intent.expected_revision != Some(payload.ticket_revision)
+            || payload.manifest_artifact.kind
+                != crate::engine::orchestration::RoleArtifactKind::Change
+            || payload.manifest_artifact.schema_version != 1
+            || payload.manifest_artifact.digest != payload.manifest_digest
+            || payload.commit_message.trim().is_empty()
+            || payload.commit_message.contains('\0')
+        {
+            return Err("Worker commit effect does not match its immutable mailbox scope".into());
+        }
+        validate_git_sha(&payload.expected_base_sha).map_err(|error| error.to_string())?;
+        validate_git_sha(&payload.expected_head).map_err(|error| error.to_string())?;
+
+        let authority = store
+            .agent_launch_authority(&payload.agent_run_id)?
+            .ok_or("repository.commit launch authority is missing")?;
+        let reservation = store
+            .agent_launch_reservation_for_run(&payload.agent_run_id)?
+            .ok_or("repository.commit launch reservation is missing")?;
+        if authority.controller_generation != owner_generation
+            || authority.project_id != payload.project_id
+            || authority.role != crate::domain::types::Role::Worker
+            || authority.ticket_run_id.as_ref() != Some(&payload.ticket_run_id)
+            || authority.ticket_revision.map(|value| value.0) != Some(payload.ticket_revision)
+            || authority.config_digest != payload.configuration_digest
+            || reservation.controller_generation != owner_generation
+            || reservation.agent_run_id != payload.agent_run_id
+            || reservation.project_id != authority.project_id
+            || reservation.role != authority.role
+            || reservation.ticket_run_id.as_ref() != Some(&payload.ticket_run_id)
+            || reservation.ticket_revision.map(|value| value.0) != Some(payload.ticket_revision)
+            || reservation.config_digest != payload.configuration_digest
+        {
+            return Err(
+                "repository.commit effect no longer matches the active Worker authority".into(),
+            );
+        }
+        let assignment = reservation
+            .worker_assignment
+            .as_ref()
+            .ok_or("repository.commit Worker has no prepared-worktree assignment")?;
+        if assignment.commit_mode != CommitMode::Host
+            || assignment.node_id != payload.work_node_id
+            || assignment.repository_id != payload.repository_id
+            || assignment.worktree_path != payload.worktree_path
+            || assignment.branch != payload.branch
+            || assignment.base_sha != payload.expected_base_sha
+            || assignment.prepare_operation_id != payload.prepare_operation_id.as_str()
+        {
+            return Err(
+                "repository.commit effect differs from the immutable Worker assignment".into(),
+            );
+        }
+
+        let prior_publications = store.list_succeeded_effect_receipts(
+            owner_generation,
+            &authority.project_id,
+            "ticket_run",
+            payload.ticket_run_id.as_str(),
+            256,
+        )?;
+        let mut latest_published_head = None;
+        for publication in &prior_publications {
+            if publication.intent().kind
+                != crate::engine::reducer::effect_name(&EffectKind::PublishImplementation)
+            {
+                continue;
+            }
+            let published: ImplementationPublicationReceipt =
+                serde_json::from_str(publication.receipt_json())
+                    .map_err(|error| format!("stored publication receipt is invalid: {error}"))?;
+            if published.work_node_id == payload.work_node_id
+                && published.repository_id == payload.repository_id
+                && published.ticket_run_id == payload.ticket_run_id
+            {
+                latest_published_head = Some(published.commit.head().to_owned());
+            }
+        }
+        let trusted_previous_head = latest_published_head
+            .as_deref()
+            .unwrap_or(payload.expected_base_sha.as_str());
+        if payload.expected_head != trusted_previous_head {
+            return Err(
+                "repository.commit expected HEAD is not the current host-accepted work-node head"
+                    .into(),
+            );
+        }
+        for prior in &prior_publications {
+            if prior.intent().kind
+                != crate::engine::reducer::effect_name(&EffectKind::CommitWorkerManifest)
+            {
+                continue;
+            }
+            let previous: CommitWorkerManifestEffectReceipt =
+                serde_json::from_str(prior.receipt_json())
+                    .map_err(|error| format!("stored Worker commit receipt is invalid: {error}"))?;
+            if previous.agent_run_id == payload.agent_run_id
+                && previous.work_node_id == payload.work_node_id
+                && prior.intent().operation_id != request.intent.operation_id
+            {
+                return Err("Worker already submitted a repository.commit request for this run and work node".into());
+            }
+        }
+
+        let prepared_effect = store
+            .succeeded_effect_receipt(payload.prepare_operation_id.as_str())?
+            .ok_or("repository.commit prepared-worktree effect is no longer succeeded")?;
+        let (validated_prepared, prepared_receipt) =
+            validate_prepared_worktree_stage(&prepared_effect)?;
+        let prepare_request: PrepareWorktreesEffectPayload =
+            serde_json::from_str(&prepared_effect.intent().request_json)
+                .map_err(|error| format!("prepared-worktree request is invalid: {error}"))?;
+        let prepared_node = prepared_receipt
+            .work_nodes
+            .iter()
+            .find(|node| node.work_node_id == payload.work_node_id)
+            .ok_or("prepared-worktree receipt omits the Worker node")?;
+        if validated_prepared.project_id != authority.project_id
+            || validated_prepared.ticket_run_id != payload.ticket_run_id
+            || prepare_request.ticket_namespace != payload.ticket_namespace
+            || prepare_request.ticket_id != payload.ticket_id
+            || prepare_request.configuration_digest != payload.configuration_digest
+            || prepare_request
+                .work_nodes
+                .iter()
+                .filter(|node| {
+                    node.work_node_id == payload.work_node_id
+                        && node.repository_id == payload.repository_id
+                        && node.expected_base_sha == payload.expected_base_sha
+                        && node.commit_mode == CommitMode::Host
+                })
+                .count()
+                != 1
+            || prepared_node.repository_id != payload.repository_id
+            || prepared_node.worktree_path != payload.worktree_path
+            || prepared_node.branch != payload.branch
+            || prepared_node.base_sha != payload.expected_base_sha
+            || prepared_node.commit_mode != CommitMode::Host
+        {
+            return Err(
+                "repository.commit effect differs from its succeeded worktree preparation".into(),
+            );
+        }
+        let verified_artifact = store
+            .lookup_verified_artifact(artifacts, &authority, &payload.manifest_artifact)?
+            .ok_or("repository.commit manifest is not registered to the Worker run")?;
+        let manifest_bytes = verified_artifact.read_bytes(artifacts)?;
+        let manifest_digest = Digest::parse(format!("{:x}", Sha256::digest(&manifest_bytes)))?;
+        if manifest_digest != payload.manifest_digest {
+            return Err(
+                "repository.commit manifest bytes differ from the registered digest".into(),
+            );
+        }
+        let manifest: ChangeManifest = crate::protocol::parse_unique(&manifest_bytes)?;
+        if manifest.schema_version != 1
+            || manifest.entries.is_empty()
+            || serde_json::to_vec(&manifest).map_err(|error| error.to_string())? != manifest_bytes
+            || manifest != payload.manifest
+        {
+            return Err(
+                "repository.commit manifest is not the registered canonical manifest".into(),
+            );
+        }
+
+        let identity = WorkNodeIdentity {
+            project_id: authority.project_id.clone(),
+            repository_id: payload.repository_id.clone(),
+            ticket_namespace: payload.ticket_namespace.clone(),
+            ticket_id: payload.ticket_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            work_node_id: payload.work_node_id.to_string(),
+        };
+        let repository_config = self.repository(&payload.repository_id)?;
+        let work = self
+            .delivery
+            .prepare_worktree(
+                identity,
+                repository_config,
+                &payload.expected_base_sha,
+                CommitMode::Host,
+            )
+            .map_err(|error| error.to_string())?;
+        if work.worktree.path != payload.worktree_path || work.worktree.branch != payload.branch {
+            return Err(
+                "prepared Worker worktree identity changed before repository.commit".into(),
+            );
+        }
+        self.delivery
+            .validate_required_commit_trailer(
+                &work,
+                &payload.commit_message,
+                &payload.required_trailer,
+            )
+            .map_err(|error| error.to_string())?;
+        let operation_id = OperationId::parse(request.intent.operation_id.clone())?;
+        let commit = match mode {
+            EffectMode::Submit => {
+                let prepared = self
+                    .delivery
+                    .prepare_host_manifest(
+                        &work,
+                        operation_id.clone(),
+                        &payload.expected_head,
+                        payload.manifest.clone(),
+                        &work.worktree.path,
+                        payload.commit_message.clone(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.delivery
+                    .execute_host_commit(&work, &prepared)
+                    .map_err(|error| error.to_string())?
+            }
+            EffectMode::Reconcile => {
+                let Some(prepared) = self
+                    .delivery
+                    .load_prepared_host_manifest(
+                        &work,
+                        &operation_id,
+                        &payload.expected_head,
+                        &payload.manifest,
+                        &work.worktree.path,
+                        &payload.commit_message,
+                    )
+                    .map_err(|error| error.to_string())?
+                else {
+                    return absent_effect(
+                        EffectKind::CommitWorkerManifest,
+                        request,
+                        "managed_host_commit_intent",
+                        "no prepared host commit exists yet for this durable operation".into(),
+                    );
+                };
+                match self
+                    .delivery
+                    .reconcile_host_commit(&work, &prepared)
+                    .map_err(|error| error.to_string())?
+                {
+                    Some(receipt) => receipt,
+                    None => {
+                        return absent_effect(
+                            EffectKind::CommitWorkerManifest,
+                            request,
+                            "managed_git_worktree_head",
+                            format!(
+                                "the owned branch remains at expected head {}",
+                                payload.expected_head
+                            ),
+                        );
+                    }
+                }
+            }
+        };
+        if commit.operation_id != operation_id
+            || commit.repository_id != payload.repository_id
+            || commit.expected_head != payload.expected_head
+            || commit.observed_head == payload.expected_head
+            || !commit.signature_verified
+            || !commit.hooks_completed
+            || !commit.index_synchronized
+            || commit.index_sync_conflict
+        {
+            return Err(
+                "host commit receipt does not prove the requested signed repository change".into(),
+            );
+        }
+        let receipt = CommitWorkerManifestEffectReceipt {
+            schema_version: 1,
+            agent_run_id: payload.agent_run_id,
+            message_id: payload.message_id,
+            ticket_run_id: payload.ticket_run_id,
+            work_node_id: payload.work_node_id,
+            repository_id: payload.repository_id,
+            base_sha: payload.expected_base_sha,
+            manifest_artifact: payload.manifest_artifact,
+            commit,
+        };
+        Ok(EffectObservation::Applied {
+            receipt: serde_json::to_string(&receipt).map_err(|error| error.to_string())?,
+        })
+    }
+
     fn validate_prepare_payload(
         &self,
         request: &EffectRequest,
@@ -1699,16 +2100,24 @@ impl RepositoryDeliveryEffects {
                 }
             }
             (
-                WorkerDeliveryCommit::HostManifest {
+                WorkerDeliveryCommit::HostReceipt {
                     expected_head,
-                    message,
+                    worker_reported_head,
+                    receipt,
                     ..
                 },
                 CommitMode::Host,
             ) => {
                 validate_git_sha(expected_head).map_err(|error| error.to_string())?;
-                if message.trim().is_empty() {
-                    return Err("host commit message must not be empty".into());
+                validate_git_sha(worker_reported_head).map_err(|error| error.to_string())?;
+                if receipt.schema_version != 1
+                    || receipt.commit.expected_head != *expected_head
+                    || receipt.commit.observed_head != *worker_reported_head
+                    || !receipt.commit.signature_verified
+                    || !receipt.commit.hooks_completed
+                    || receipt.commit.expected_head == receipt.commit.observed_head
+                {
+                    return Err("host receipt does not identify one verified host commit".into());
                 }
             }
             _ => return Err("commit payload does not match the configured commit mode".into()),
@@ -1809,55 +2218,47 @@ impl RepositoryDeliveryEffects {
                     .map_err(|error| error.to_string())?
             }
             (
-                WorkerDeliveryCommit::HostManifest {
+                WorkerDeliveryCommit::HostReceipt {
+                    operation_id,
                     expected_head,
-                    manifest,
-                    message,
+                    worker_reported_head,
+                    receipt,
                 },
                 CommitMode::Host,
                 _,
             ) => {
-                let host_operation = derived_operation_id(
-                    &request.intent.operation_id,
-                    &payload.repository_id,
-                    payload.work_node_id.as_str(),
-                    "commit",
-                )?;
-                let prepared = self
-                    .delivery
-                    .prepare_host_manifest(
-                        &work,
-                        host_operation,
-                        expected_head,
-                        manifest.clone(),
-                        &work.worktree.path,
-                        message.clone(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if mode == EffectMode::Reconcile {
-                    match self
-                        .delivery
-                        .reconcile_host_commit(&work, &prepared)
-                        .map_err(|error| error.to_string())?
-                    {
-                        Some(receipt) => VerifiedCommit::Host { receipt },
-                        None => {
-                            return absent_effect(
-                                EffectKind::PublishImplementation,
-                                request,
-                                "managed_git_worktree_head",
-                                format!(
-                                    "the owned branch remains at expected head {expected_head}"
-                                ),
-                            );
-                        }
-                    }
-                } else {
-                    let receipt = self
-                        .delivery
-                        .execute_host_commit(&work, &prepared)
-                        .map_err(|error| error.to_string())?;
-                    VerifiedCommit::Host { receipt }
+                let stored = store
+                    .succeeded_effect_receipt(operation_id.as_str())?
+                    .ok_or("Worker host commit receipt is not durably succeeded")?;
+                if stored.intent().kind
+                    != crate::engine::reducer::effect_name(&EffectKind::CommitWorkerManifest)
+                    || stored.intent().project_id != request.intent.project_id
+                    || stored.intent().subject_id != payload.ticket_run_id.as_str()
+                {
+                    return Err(
+                        "Worker host commit effect receipt has the wrong durable scope".into(),
+                    );
+                }
+                let persisted_receipt: CommitWorkerManifestEffectReceipt =
+                    serde_json::from_str(stored.receipt_json()).map_err(|error| {
+                        format!("stored Worker commit receipt is invalid: {error}")
+                    })?;
+                if &persisted_receipt != receipt.as_ref()
+                    || receipt.commit.operation_id != *operation_id
+                    || receipt.ticket_run_id != payload.ticket_run_id
+                    || receipt.work_node_id != payload.work_node_id
+                    || receipt.repository_id != payload.repository_id
+                    || receipt.base_sha != payload.expected_base_sha
+                    || receipt.commit.expected_head != *expected_head
+                    || receipt.commit.observed_head != *worker_reported_head
+                    || receipt.commit.observed_head == *expected_head
+                {
+                    return Err(
+                        "Worker result does not match the durable host commit receipt".into(),
+                    );
+                }
+                VerifiedCommit::Host {
+                    receipt: receipt.commit.clone(),
                 }
             }
             _ => return Err("commit payload does not match the configured commit mode".into()),
@@ -2149,6 +2550,62 @@ pub struct ImplementationPublicationReceipt {
     pub pull_request: PublishedPullRequest,
 }
 
+/// Host-derived identity and coverage for the exact implementation publications under review.
+/// The revision and coverage are prompt metadata; `digest()` intentionally hashes only the
+/// historical three-field subject JSON consumed by ReviewReady validation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationPublicationSetSubject {
+    pub ticket_run_id: TicketRunId,
+    pub accepted_plan_digest: Digest,
+    pub publications: Vec<ImplementationPublicationSubjectFact>,
+    pub coverage: Vec<WorkNodeId>,
+    pub publication_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationPublicationSubjectFact {
+    pub work_node_id: WorkNodeId,
+    pub repository_id: RepositoryId,
+    pub pull_request_number: u64,
+    pub pull_request_node_id: String,
+    pub pull_request_head: String,
+    pub published_head: String,
+    pub receipt_digest: String,
+}
+
+impl ImplementationPublicationSetSubject {
+    /// This is deliberately the exact JSON value and field set historically accepted by the
+    /// ReviewReady consumer. Do not add revision or coverage to this digest.
+    pub fn digest(&self) -> Result<Digest, String> {
+        let mut publications = self
+            .publications
+            .iter()
+            .map(|publication| {
+                serde_json::json!({
+                    "work_node_id": publication.work_node_id,
+                    "repository_id": publication.repository_id,
+                    "pull_request_number": publication.pull_request_number,
+                    "pull_request_node_id": publication.pull_request_node_id,
+                    "pull_request_head": publication.pull_request_head,
+                    "published_head": publication.published_head,
+                    "receipt_digest": publication.receipt_digest,
+                })
+            })
+            .collect::<Vec<_>>();
+        publications
+            .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
+        let subject = serde_json::json!({
+            "ticket_run_id": self.ticket_run_id,
+            "accepted_plan_digest": self.accepted_plan_digest,
+            "publications": publications,
+        });
+        let bytes = serde_json::to_vec(&subject).map_err(|error| error.to_string())?;
+        Digest::parse(sha256_hex(&bytes))
+    }
+}
+
 /// Opaque proof that the dispatcher’s durable Applied output matches its typed request.
 /// Only this module can mint the capability; callers cannot fabricate a reviewer wake.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2270,6 +2727,77 @@ impl ValidatedImplementationPublication {
             && digest_json(&(&self.work_node_ids, &self.receipt_bindings))
                 .is_ok_and(|digest| digest == self.publication_set_digest)
     }
+}
+
+/// Build the Reviewer subject only from a validated complete publication capability.
+/// The capability and persisted receipt set must still agree exactly at the call site.
+pub fn implementation_publication_set_subject(
+    accepted_plan_digest: &Digest,
+    work_plan: &WorkPlan,
+    validated: &ValidatedImplementationPublication,
+    publications: &[crate::store::SucceededEffectReceipt],
+    publication_revision: u64,
+) -> Result<ImplementationPublicationSetSubject, String> {
+    let expected = work_plan
+        .nodes
+        .iter()
+        .filter(|node| !node.investigation)
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let bindings = validated
+        .receipt_bindings
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    if expected.is_empty()
+        || expected.iter().cloned().collect::<Vec<_>>() != validated.work_node_ids
+        || bindings.len() != validated.receipt_bindings.len()
+        || bindings.keys().cloned().collect::<BTreeSet<_>>() != expected
+        || publications.len() != bindings.len()
+    {
+        return Err(
+            "validated publication capability differs from the accepted implementation plan".into(),
+        );
+    }
+    let mut facts = Vec::with_capacity(publications.len());
+    let mut seen_work_node_ids = BTreeSet::new();
+    for publication in publications {
+        let receipt: ImplementationPublicationReceipt =
+            serde_json::from_str(publication.receipt_json())
+                .map_err(|error| format!("invalid implementation publication receipt: {error}"))?;
+        let receipt_digest = sha256_hex(publication.receipt_json().as_bytes());
+        if bindings.get(&receipt.work_node_id) != Some(&receipt_digest)
+            || !seen_work_node_ids.insert(receipt.work_node_id.clone())
+            || receipt.ticket_run_id != validated.ticket_run_id
+        {
+            return Err(
+                "publication receipt differs from the validated publication capability".into(),
+            );
+        }
+        facts.push(ImplementationPublicationSubjectFact {
+            work_node_id: receipt.work_node_id,
+            repository_id: receipt.repository_id,
+            pull_request_number: receipt.pull_request.number,
+            pull_request_node_id: receipt.pull_request.node_id,
+            pull_request_head: receipt.pull_request.source_head,
+            published_head: receipt.push.pushed_head,
+            receipt_digest,
+        });
+    }
+    if seen_work_node_ids != expected {
+        return Err(
+            "publication receipts do not cover each validated work node exactly once".into(),
+        );
+    }
+    facts.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
+    let coverage = expected.into_iter().collect::<Vec<_>>();
+    Ok(ImplementationPublicationSetSubject {
+        ticket_run_id: validated.ticket_run_id.clone(),
+        accepted_plan_digest: accepted_plan_digest.clone(),
+        publications: facts,
+        coverage,
+        publication_revision,
+    })
 }
 
 /// Validate the complete planned work-node set against prepared nodes and durable Applied receipts.
@@ -2524,27 +3052,25 @@ fn validate_one_implementation_publication_receipt(
             && commit.commits.last().is_some_and(|last| last == head) => {}
         (
             VerifiedCommit::Host { receipt: commit },
-            WorkerDeliveryCommit::HostManifest {
+            WorkerDeliveryCommit::HostReceipt {
+                operation_id,
                 expected_head,
-                manifest,
-                ..
+                worker_reported_head,
+                receipt: commit_receipt,
             },
         ) if payload.commit_mode == CommitMode::Host
-            && commit.operation_id
-                == derived_operation_id(
-                    &request.intent.operation_id,
-                    &payload.repository_id,
-                    payload.work_node_id.as_str(),
-                    "commit",
-                )?
+            && commit.operation_id == *operation_id
+            && commit_receipt.commit.operation_id == *operation_id
+            && commit_receipt.commit.repository_id == payload.repository_id
             && commit.repository_id == payload.repository_id
             && commit.expected_head == *expected_head
+            && commit.observed_head == *worker_reported_head
             && commit.observed_head == *head
+            && commit_receipt.commit.manifest_digest == commit_receipt.manifest_artifact.digest
             && commit.signature_verified
             && commit.hooks_completed
             && commit.index_synchronized
-            && !commit.index_sync_conflict
-            && digest_json(manifest)? == commit.manifest_digest.as_str() => {}
+            && !commit.index_sync_conflict => {}
         _ => {
             return Err("implementation receipt commit does not match the requested commit".into());
         }
@@ -2669,6 +3195,32 @@ impl EffectHandler for PrepareWorktreesEffectHandler {
 
 pub struct PublishImplementationEffectHandler {
     effects: Arc<RepositoryDeliveryEffects>,
+}
+
+pub struct CommitWorkerManifestEffectHandler {
+    effects: Arc<RepositoryDeliveryEffects>,
+    artifacts: crate::artifacts::ArtifactStore,
+}
+
+impl EffectHandler for CommitWorkerManifestEffectHandler {
+    fn kind(&self) -> EffectKind {
+        EffectKind::CommitWorkerManifest
+    }
+
+    fn handle(
+        &self,
+        mode: EffectMode,
+        request: &EffectRequest,
+        context: &mut EffectContext<'_>,
+    ) -> Result<EffectObservation, String> {
+        self.effects.commit_worker_manifest(
+            mode,
+            request,
+            context.store,
+            context.owner_generation,
+            &self.artifacts,
+        )
+    }
 }
 
 impl EffectHandler for PublishImplementationEffectHandler {
@@ -2847,6 +3399,48 @@ fn validate_hook_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_subject_digest_keeps_the_existing_three_field_contract() {
+        let subject = ImplementationPublicationSetSubject {
+            ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+            accepted_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            publications: vec![ImplementationPublicationSubjectFact {
+                work_node_id: WorkNodeId::parse("node-1").unwrap(),
+                repository_id: RepositoryId::parse("repo-1").unwrap(),
+                pull_request_number: 9,
+                pull_request_node_id: "PR_node_9".into(),
+                pull_request_head: "b".repeat(40),
+                published_head: "c".repeat(40),
+                receipt_digest: "d".repeat(64),
+            }],
+            coverage: vec![WorkNodeId::parse("node-1").unwrap()],
+            publication_revision: 5,
+        };
+        let legacy_value = serde_json::json!({
+            "ticket_run_id": "run-1",
+            "accepted_plan_digest": "a".repeat(64),
+            "publications": [{
+                "work_node_id": "node-1",
+                "repository_id": "repo-1",
+                "pull_request_number": 9,
+                "pull_request_node_id": "PR_node_9",
+                "pull_request_head": "b".repeat(40),
+                "published_head": "c".repeat(40),
+                "receipt_digest": "d".repeat(64),
+            }]
+        });
+        let legacy_digest =
+            Digest::parse(sha256_hex(&serde_json::to_vec(&legacy_value).unwrap())).unwrap();
+        assert_eq!(subject.digest().unwrap(), legacy_digest);
+
+        let mut metadata_changed = subject;
+        metadata_changed.publication_revision += 1;
+        metadata_changed
+            .coverage
+            .push(WorkNodeId::parse("extra-node").unwrap());
+        assert_eq!(metadata_changed.digest().unwrap(), legacy_digest);
+    }
     use crate::config::MergeConfig;
     use crate::process::ProcessRequest;
     use std::ffi::OsString;

@@ -141,6 +141,7 @@ pub fn maintain_view(
 
     for record in records
         .iter()
+        .filter(|record| record.block.lifecycle != RexBlockLifecycle::Closed)
         .take(policy.max_blocks_per_tab.min(MAX_BLOCKS_PER_TICK))
     {
         let block = &record.block;
@@ -197,7 +198,15 @@ pub fn maintain_view(
         let absent = observation.last_exit.is_some()
             && observation.child.is_none()
             && observation.foreground.is_none()
-            && observation.ancestors.as_ref().is_some_and(Vec::is_empty);
+            && observation.ancestors.as_ref().is_none_or(Vec::is_empty)
+            && matches!(
+                crate::store::agent_results::verify_agent_terminal_if_recorded(
+                    store,
+                    owner_generation,
+                    run_id,
+                ),
+                Ok(Some(_))
+            );
         let mut lifecycle = match (absent, observation.last_exit.as_ref()) {
             (true, Some(exit)) if exit.exit_code == 0 => RexBlockLifecycle::Completed,
             (true, Some(_)) => RexBlockLifecycle::Failed,
@@ -213,14 +222,16 @@ pub fn maintain_view(
         {
             lifecycle = RexBlockLifecycle::Unknown;
         }
-        store.observe_rex_view_block(
-            owner_generation,
-            &view.view.view_id,
-            &block.block_id,
-            lifecycle,
-            absent,
-            absent.then_some(now_unix),
-        )?;
+        if lifecycle != block.lifecycle || absent != block.process_absent_confirmed {
+            store.observe_rex_view_block(
+                owner_generation,
+                &view.view.view_id,
+                &block.block_id,
+                lifecycle,
+                absent,
+                absent.then_some(now_unix),
+            )?;
+        }
         if absent && record.archive_digest.is_none() {
             let output = transport
                 .capture_agent_block(&window, run_id.as_str(), &block.block_id)
@@ -721,5 +732,240 @@ mod tests {
         };
         assert!(is_tracked_view_block(&[], Some(&anchor), "status-anchor"));
         assert!(!is_tracked_view_block(&[], Some(&anchor), "user-pane"));
+    }
+
+    #[cfg(unix)]
+    struct CompletedBlockFixture {
+        terminal: crate::store::agent_results::host_validation_fixture::TestTerminalResultFixture,
+        view: RexViewRecord,
+        transport: RexCliTransport,
+        root: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CompletedBlockFixture {
+        fn new(observation: serde_json::Value) -> Self {
+            use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut terminal = crate::store::agent_results::host_validation_fixture::host_validated_terminal_result(
+                crate::domain::types::Role::Coordinator,
+                crate::roles::RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "view-completed-plan".into(),
+                    kind: RoleOutputKind::PlanReady,
+                    assertion: AgentAssertion::Succeeded,
+                    result_digest: None,
+                    structured_result: serde_json::json!({
+                        "plan": {"nodes": [], "requested_investigation_children": 0},
+                        "unresolved_questions": []
+                    }),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+            let authority = terminal
+                .store
+                .agent_launch_authority(terminal.terminal.agent_run_id())
+                .unwrap()
+                .unwrap();
+            let view = terminal
+                .store
+                .rex_view_history(&authority.project_id)
+                .unwrap()
+                .into_iter()
+                .find(|view| view.view.view_id == authority.rex_view_id)
+                .unwrap();
+            terminal
+                .store
+                .register_rex_view_block(
+                    terminal.owner_generation,
+                    &crate::launch::RexViewBlock {
+                        view_id: view.view.view_id.clone(),
+                        block_id: authority.rex_block_id.clone(),
+                        agent_run_id: Some(authority.agent_run_id.clone()),
+                        role: Some(authority.role),
+                        ownership: RexBlockOwnership::Factory,
+                        lifecycle: RexBlockLifecycle::Unknown,
+                        process_absent_confirmed: false,
+                        retained_until_unix: None,
+                    },
+                )
+                .unwrap();
+            let root = terminal._temp.path().join("rex-view-fixture");
+            std::fs::create_dir(&root).unwrap();
+            let label = owned_ticket_window_label("fixture", "T-1").unwrap();
+            let user_block = serde_json::json!({"block_id":"user-notes", "label":"notes", "flavor":"com.superlogical.terminal.shell"});
+            let make_view = |blocks: Vec<serde_json::Value>| {
+                serde_json::json!({
+                    "session_id": authority.rex_session_id,
+                    "windows": [{"window_id":authority.rex_window_id,"label":label,"layers":[{"blocks":blocks}]}]
+                })
+            };
+            let before = make_view(vec![
+                user_block.clone(),
+                serde_json::json!({"block_id": authority.rex_block_id, "label":owned_agent_block_label(authority.agent_run_id.as_str()).unwrap(),"flavor":"com.superlogical.terminal.shell"}),
+            ]);
+            for (name, value) in [
+                ("before.json", before),
+                ("after.json", make_view(vec![user_block])),
+                ("process.json", observation),
+                (
+                    "whoami.json",
+                    serde_json::json!({"endpoint":"unix:///tmp/view-fixture.sock","instance_id":authority.rex_server_identity,"host_id":"fixture-host","rex_version":"fixture"}),
+                ),
+                (
+                    "api.json",
+                    serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}),
+                ),
+            ] {
+                std::fs::write(root.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            let script = root.join("rex");
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+fixture_dir=${0%/*}
+case "$*" in
+  *"whoami --json"*) /bin/cat "$fixture_dir/whoami.json" ;;
+  *"api list --json"*) /bin/cat "$fixture_dir/api.json" ;;
+  *"session.view"*)
+    if [ -f "$fixture_dir/closed" ]; then
+      /bin/cat "$fixture_dir/after.json"
+    else
+      /bin/cat "$fixture_dir/before.json"
+    fi ;;
+  *"terminal.process"*) /bin/cat "$fixture_dir/process.json" ;;
+  *"block.close"*) /usr/bin/touch "$fixture_dir/closed"; printf '{}\n' ;;
+  *"capture"*) printf 'Archived completed Agent output\n' ;;
+  *) exit 3 ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let transport = RexCliTransport::connect(
+                &script,
+                &[],
+                "unix:///tmp/view-fixture.sock".into(),
+                authority.rex_server_identity,
+                authority.rex_session_id,
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            Self {
+                terminal,
+                view,
+                transport,
+                root,
+            }
+        }
+
+        fn maintain(&mut self, keep: usize) {
+            maintain_view(
+                &mut self.terminal.store,
+                self.terminal.owner_generation,
+                100,
+                &self.view,
+                &self.transport,
+                RexViewLifecyclePolicy {
+                    max_blocks_per_tab: 2,
+                    completed_blocks_to_keep: keep,
+                    completed_ticket_tab_retention_seconds: 3600,
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        fn owned_block(&self) -> crate::launch::RexViewBlockRecord {
+            self.terminal
+                .store
+                .rex_view_blocks(&self.view.view.view_id)
+                .unwrap()
+                .into_iter()
+                .find(|record| record.block.agent_run_id.is_some())
+                .unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_block_with_omitted_ancestors_is_archived_then_recycled_from_terminal_proof() {
+        let mut fixture =
+            CompletedBlockFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}));
+        fixture.maintain(1);
+        fixture.maintain(1);
+        let record = fixture.owned_block();
+        assert_eq!(record.block.lifecycle, RexBlockLifecycle::Completed);
+        assert!(record.block.process_absent_confirmed);
+        assert!(record.archive_digest.is_some());
+        assert!(!fixture.root.join("closed").exists());
+        fixture.maintain(0);
+        assert!(fixture.root.join("closed").exists());
+        let records = fixture
+            .terminal
+            .store
+            .rex_view_blocks(&fixture.view.view.view_id)
+            .unwrap();
+        assert_eq!(
+            fixture.owned_block().block.lifecycle,
+            RexBlockLifecycle::Closed
+        );
+        let window = RexWindow {
+            server_instance_id: fixture.view.view.rex_server_identity.clone(),
+            session_id: fixture.view.view.rex_session_id.clone(),
+            window_id: fixture.view.view.rex_window_id.clone(),
+            label: owned_ticket_window_label("fixture", "T-1").unwrap(),
+            initial_block_id: None,
+            disposition: CreateDisposition::Existing,
+        };
+        let observed = fixture
+            .transport
+            .list_window_blocks(&window, &window.label)
+            .unwrap();
+        assert!(has_block_capacity(&records, &observed, 2));
+        assert_eq!(observed[0].block_id, "user-notes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_receipt_never_overrides_live_or_incomplete_rex_observations() {
+        let process = serde_json::json!({"pid":42,"user_id":501,"name":"running"});
+        for observation in [
+            serde_json::json!({"last_exit":{"exit_code":0},"child":process}),
+            serde_json::json!({"last_exit":{"exit_code":0},"foreground":process}),
+            serde_json::json!({"last_exit":{"exit_code":0},"ancestors":[process]}),
+            serde_json::json!({}),
+        ] {
+            let mut fixture = CompletedBlockFixture::new(observation);
+            fixture.maintain(0);
+            let record = fixture.owned_block();
+            assert!(!record.block.process_absent_confirmed);
+            assert!(record.archive_digest.is_none());
+            assert!(!fixture.root.join("closed").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omitted_ancestors_with_invalid_terminal_evidence_retains_block_capacity() {
+        let mut fixture =
+            CompletedBlockFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}));
+        fixture
+            .terminal
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE agent_runs SET state='unknown' WHERE agent_run_id=?1",
+                [fixture.terminal.terminal.agent_run_id().as_str()],
+            )
+            .unwrap();
+        fixture.maintain(0);
+        let record = fixture.owned_block();
+        assert_eq!(record.block.lifecycle, RexBlockLifecycle::Unknown);
+        assert!(!record.block.process_absent_confirmed);
+        assert!(record.archive_digest.is_none());
+        assert!(!fixture.root.join("closed").exists());
     }
 }

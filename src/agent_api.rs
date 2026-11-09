@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{ArtifactId, Digest, ProjectId};
+use crate::domain::ids::{ArtifactId, Digest, OperationId, ProjectId};
 use crate::engine::orchestration::{RoleArtifactKind, RoleArtifactReference};
 
 const MAX_INBOX_BYTES: usize = 1024 * 1024;
@@ -191,6 +191,64 @@ pub struct ArtifactAddReceipt {
     pub artifact: RoleArtifactReference,
 }
 
+/// Host-mode Worker request to commit the exact Change artifact previously registered for this run.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryCommitRequest {
+    pub schema_version: u32,
+    pub message_id: String,
+    pub worktree_id: String,
+    pub expected_head: String,
+    pub manifest: RoleArtifactReference,
+    pub manifest_digest: Digest,
+    pub commit_message: String,
+}
+
+impl RepositoryCommitRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_message_id(&self.message_id)?;
+        if self.schema_version != 1
+            || self.worktree_id.trim().is_empty()
+            || self.worktree_id.chars().any(char::is_control)
+            || !matches!(self.expected_head.len(), 40 | 64)
+            || !self
+                .expected_head
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.manifest.kind != RoleArtifactKind::Change
+            || self.manifest.schema_version != 1
+            || self.manifest.digest != self.manifest_digest
+            || self.commit_message.trim().is_empty()
+            || self.commit_message.len() > 16_000
+            || self.commit_message.chars().any(|character| {
+                character == '\0'
+                    || character == '\r'
+                    || (character.is_control() && character != '\n' && character != '\t')
+            })
+        {
+            return Err(
+                "repository commit request is malformed or does not identify a v1 Change manifest"
+                    .into(),
+            );
+        }
+        validate_relative_path(&self.manifest.path)
+    }
+}
+
+/// Mailbox result returned only after the normal effect journal records a succeeded host commit.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryCommitReceipt {
+    pub schema_version: u32,
+    pub message_id: String,
+    pub commit_operation_id: OperationId,
+    pub worktree_id: String,
+    pub repository_id: String,
+    pub base_sha: String,
+    pub manifest_artifact: RoleArtifactReference,
+    pub commit: crate::host_commit::HostCommitReceipt,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryManifestRequest {
@@ -240,9 +298,23 @@ impl RepositoryManifestRequest {
     pub fn build(&self, root: &Path) -> Result<crate::host_commit::ChangeManifest, String> {
         let root =
             fs::canonicalize(root).map_err(|error| format!("canonicalize worktree: {error}"))?;
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for item in &self.entries {
+        let mut items = self.entries.clone();
+        items.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut entries = Vec::with_capacity(items.len());
+        for item in &items {
             let relative = Path::new(&item.path);
+            if relative.components().any(|component| {
+                let std::path::Component::Normal(part) = component else {
+                    return true;
+                };
+                let part = part.to_string_lossy();
+                part.eq_ignore_ascii_case(".git")
+                    || part.eq_ignore_ascii_case(".rex-projects")
+                    || part.eq_ignore_ascii_case(".rex-projects-mailbox")
+                    || part.eq_ignore_ascii_case(".rex-projects-control")
+            }) {
+                return Err("manifest path names a reserved Git or mailbox location".into());
+            }
             let full = root.join(relative);
             match item.operation {
                 ManifestOperation::Delete => {

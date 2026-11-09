@@ -81,6 +81,7 @@ pub fn finalize_and_ack_start(
         || package.descriptor.wake_snapshot_digest != reservation.wake_snapshot.digest
         || package.descriptor.workspace != reservation.workspace_path
         || package.descriptor.control_dir != reservation.control_dir
+        || package.descriptor.worker_assignment != reservation.worker_assignment
         || package.descriptor.rex_session_id != observed_block.session_id
         || package.descriptor.rex_block_id.as_str() != observed_block.block_id
         || package.rex_server_identity != observed_block.server_instance_id

@@ -444,6 +444,7 @@ mod marker_probe_tests {
             controller_generation: 1,
             workspace: workspace.clone(),
             control_dir: control_dir.clone(),
+            worker_assignment: None,
             rex_session_id: "session-1".into(),
             rex_block_id: RexBlockId::parse("block-1").unwrap(),
             profile_digest: profile_digest.clone(),

@@ -1541,57 +1541,37 @@ fn apply_reviewer_result(
         return Err("Reviewer result does not match the current publication transition".into());
     }
     let publications = snapshot.publication_receipts();
-    crate::delivery_runtime::validate_implementation_publication_receipt(
-        &accepted.proposal,
-        snapshot.prepared_receipt(),
-        &run.project_id,
-        &config.repositories,
-        publications,
-    )?;
+    let validated_publications =
+        crate::delivery_runtime::validate_implementation_publication_receipt(
+            &accepted.proposal,
+            snapshot.prepared_receipt(),
+            &run.project_id,
+            &config.repositories,
+            publications,
+        )?;
     let RoleResultPayload::ReviewReady(assessment) = &result.validated.typed_payload else {
         return Err("validated ReviewReady kind has a different typed payload".into());
     };
     if assessment.subject_kind != "implementation_publication_set" {
         return Err("Reviewer assessment names a different subject kind".into());
     }
-    let mut publication_facts = publications
-        .iter()
-        .map(|receipt| {
-            let published: crate::delivery_runtime::ImplementationPublicationReceipt =
-                serde_json::from_str(receipt.receipt_json()).map_err(|error| {
-                    format!("invalid implementation publication receipt: {error}")
-                })?;
-            Ok(serde_json::json!({
-                "work_node_id": published.work_node_id,
-                "repository_id": published.repository_id,
-                "pull_request_number": published.pull_request.number,
-                "pull_request_node_id": published.pull_request.node_id,
-                "pull_request_head": published.pull_request.source_head,
-                "published_head": published.push.pushed_head,
-                "receipt_digest": sha256_hex(receipt.receipt_json().as_bytes()),
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    publication_facts
-        .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
-    let subject = serde_json::json!({
-        "ticket_run_id": ticket_run_id,
-        "accepted_plan_digest": accepted.plan_digest,
-        "publications": publication_facts,
-    });
-    let subject_bytes = serde_json::to_vec(&subject).map_err(|error| error.to_string())?;
-    let expected_subject_digest = sha256_hex(&subject_bytes);
+    let subject = crate::delivery_runtime::implementation_publication_set_subject(
+        &accepted.plan_digest,
+        &accepted.proposal,
+        &validated_publications,
+        publications,
+        snapshot.publication_revision(),
+    )?;
+    let expected_subject_digest = subject.digest()?.to_string();
     if assessment.subject_digest.as_str() != expected_subject_digest {
         return Err(
             "Reviewer assessment does not match the current published PR and head set".into(),
         );
     }
-    let expected_coverage = accepted
-        .proposal
-        .nodes
+    let expected_coverage = subject
+        .coverage
         .iter()
-        .filter(|node| !node.investigation)
-        .map(|node| node.id.as_str().to_owned())
+        .map(|node| node.as_str().to_owned())
         .collect::<BTreeSet<_>>();
     let actual_coverage = assessment
         .evidence_coverage
@@ -1673,11 +1653,6 @@ fn review_transition(
         D::StartMergeDecision => (Input::ReviewConverged, "review_converged"),
         D::HumanRequiredAtRoundLimit => (Input::ReviewConverged, "review_round_limit_reached"),
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn apply_operator_result(

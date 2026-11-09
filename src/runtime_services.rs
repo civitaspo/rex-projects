@@ -99,6 +99,52 @@ struct WorkerAssignmentContext<'a> {
     repository_id: &'a crate::domain::ids::RepositoryId,
 }
 
+struct ReviewerPublicationConfig<'a> {
+    project: &'a crate::config::ProjectConfig,
+    configuration_digest: &'a Digest,
+    repositories: &'a BTreeMap<crate::domain::ids::RepositoryId, crate::config::RepositoryConfig>,
+}
+
+fn reviewer_publication_subject(
+    store: &ConfigStore,
+    owner_generation: u64,
+    project_id: &crate::domain::ids::ProjectId,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    revision: u64,
+    config: &ReviewerPublicationConfig<'_>,
+) -> Result<crate::delivery_runtime::ImplementationPublicationSetSubject, String> {
+    let snapshot = store.accepted_implementation_publication_snapshot(
+        owner_generation,
+        project_id,
+        ticket_run_id,
+        revision,
+    )?;
+    if snapshot.publication_revision() != revision {
+        return Err(
+            "Reviewer prompt is not at the current implementation publication revision".into(),
+        );
+    }
+    let accepted = snapshot.accepted_plan();
+    if accepted.configuration_digest != *config.configuration_digest {
+        return Err("accepted work plan belongs to a stale configuration snapshot".into());
+    }
+    accepted.validate_for(config.project, config.configuration_digest)?;
+    let validated = crate::delivery_runtime::validate_implementation_publication_receipt(
+        &accepted.proposal,
+        snapshot.prepared_receipt(),
+        project_id,
+        config.repositories,
+        snapshot.publication_receipts(),
+    )?;
+    crate::delivery_runtime::implementation_publication_set_subject(
+        &accepted.plan_digest,
+        &accepted.proposal,
+        &validated,
+        snapshot.publication_receipts(),
+        snapshot.publication_revision(),
+    )
+}
+
 impl RuntimeServices {
     pub fn new(
         applied_config: &AppliedConfig,
@@ -169,6 +215,11 @@ impl RuntimeServices {
             &environment.metadata().id,
         )?;
         let mut handlers: Vec<Box<dyn EffectHandler>> = Vec::new();
+        handlers.push(Box::new(
+            delivery
+                .shared_effects()
+                .commit_worker_manifest_handler(artifacts.clone()),
+        ));
         let profile_trial_handler =
             crate::profile_trial_runtime::ProfileTrialStartEffectHandler::new(
                 applied_config.clone(),
@@ -504,6 +555,7 @@ impl RuntimeServices {
             controller_generation: self.owner_generation,
             workspace: workspace.clone(),
             control_dir,
+            worker_assignment: None,
             rex_session_id: rex_receipt.session_id().to_owned(),
             rex_block_id: crate::domain::ids::RexBlockId::parse(rex_receipt.block_id().to_owned())?,
             profile_digest: profile_digest.clone(),
@@ -1447,6 +1499,25 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             None
         };
         let worker_node = worker_context.as_ref().map(|context| context.node.clone());
+        let implementation_publication_subject = if reservation.role == Role::Reviewer {
+            let run = active_run
+                .as_ref()
+                .ok_or("Reviewer reservation has no TicketRun")?;
+            Some(reviewer_publication_subject(
+                store,
+                self.owner_generation,
+                &run.project_id,
+                &run.ticket_run_id,
+                run.revision,
+                &ReviewerPublicationConfig {
+                    project,
+                    configuration_digest: &self.applied_config.digest,
+                    repositories: &self.applied_config.config.repositories,
+                },
+            )?)
+        } else {
+            None
+        };
         let accepted_plan = if let Some(run) = active_run.as_ref() {
             let accepted = store.latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?;
             if let Some(plan) = &accepted {
@@ -1487,6 +1558,11 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                     ),
                     (None, None) => None,
                 },
+                accepted_plan_digest: accepted_plan
+                    .as_ref()
+                    .filter(|_| worker_context.is_none())
+                    .map(|plan| plan.plan_digest.clone()),
+                implementation_publication_subject,
                 previous_decisions: Vec::new(),
                 required_evidence: worker_node
                     .as_ref()
@@ -1567,6 +1643,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             controller_generation: reservation.controller_generation,
             workspace: reservation.workspace_path.clone(),
             control_dir: reservation.control_dir.clone(),
+            worker_assignment: reservation.worker_assignment.clone(),
             rex_session_id: observed_block.session_id.clone(),
             rex_block_id,
             profile_digest: reservation.profile_digest.clone(),
@@ -1656,6 +1733,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             owner_generation,
             now_unix,
             &self.artifacts,
+            &self.applied_config.profiles,
             &mut self.mailbox_cursor,
         )
     }
@@ -1953,27 +2031,48 @@ impl FactoryRuntimeServices for RuntimeServices {
                             .into(),
                     );
                 }
-                let authority = store
-                    .agent_launch_authority(&binding.agent_run_id)?
-                    .ok_or("Worker launch authority is missing")?;
-                let verified = store
-                    .lookup_verified_artifact(&self.artifacts, &authority, source[0])?
-                    .ok_or("Worker Change artifact is not registered to its launch")?;
-                let manifest: crate::host_commit::ChangeManifest =
-                    crate::protocol::parse_unique(&verified.read_bytes(&self.artifacts)?)
-                        .map_err(|error| error.to_string())?;
-                if manifest.schema_version != 1 || manifest.entries.is_empty() {
+                let operation_id = crate::domain::ids::OperationId::parse(
+                    change
+                        .host_commit_operation_id
+                        .clone()
+                        .ok_or("host-commit Worker result omits repository.commit operation ID")?,
+                )?;
+                let committed_effect = store
+                    .succeeded_effect_receipt(operation_id.as_str())?
+                    .ok_or("Worker repository.commit operation has no durable succeeded receipt")?;
+                if committed_effect.intent().kind
+                    != crate::engine::reducer::effect_name(
+                        &crate::engine::reducer::EffectKind::CommitWorkerManifest,
+                    )
+                    || committed_effect.intent().project_id != binding.project_id
+                    || committed_effect.intent().subject_id != ticket_run_id.as_str()
+                {
                     return Err(
-                        "Worker Change manifest is empty or has an unsupported schema".into(),
+                        "Worker repository.commit receipt has the wrong durable scope".into(),
                     );
                 }
-                WorkerDeliveryCommit::HostManifest {
-                    expected_head: prepared.base_sha().to_owned(),
-                    manifest,
-                    message: format!(
-                        "Implement {}",
-                        node.task.lines().next().unwrap_or("planned work")
-                    ),
+                let receipt: crate::delivery_runtime::CommitWorkerManifestEffectReceipt =
+                    crate::protocol::parse_unique(committed_effect.receipt_json().as_bytes())?;
+                if receipt.agent_run_id != binding.agent_run_id
+                    || receipt.message_id.trim().is_empty()
+                    || receipt.ticket_run_id != *ticket_run_id
+                    || receipt.work_node_id != node_id
+                    || receipt.repository_id != node.repository
+                    || receipt.base_sha != prepared.base_sha()
+                    || receipt.manifest_artifact != **source.first().expect("one Change artifact")
+                    || receipt.commit.operation_id != operation_id
+                    || receipt.commit.expected_head != change.previous_head.as_str()
+                    || receipt.commit.observed_head != change.branch_head.as_str()
+                    || receipt.commit.observed_head == receipt.commit.expected_head
+                    || change.commit_shas.as_slice() != [change.branch_head.clone()]
+                {
+                    return Err("Worker result does not match its exact host commit receipt".into());
+                }
+                WorkerDeliveryCommit::HostReceipt {
+                    operation_id,
+                    expected_head: change.previous_head.as_str().to_owned(),
+                    worker_reported_head: change.branch_head.as_str().to_owned(),
+                    receipt: Box::new(receipt),
                 }
             }
             CommitMode::Auto => {
@@ -2331,6 +2430,8 @@ impl FactoryRuntimeServices for RuntimeServices {
                 ticket: None,
                 recovery_summary: None,
                 accepted_plan: None,
+                accepted_plan_digest: None,
+                implementation_publication_subject: None,
                 previous_decisions: Vec::new(),
                 required_evidence: Vec::new(),
                 stop_conditions: Vec::new(),
@@ -2429,6 +2530,7 @@ pub(crate) fn process_one_registered_agent_request(
     owner_generation: u64,
     now_unix: i64,
     artifacts: &ArtifactStore,
+    profiles: &BTreeMap<crate::domain::ids::ProfileId, crate::config::Profile>,
     mailbox_cursor: &mut Option<String>,
 ) -> Result<bool, String> {
     let mailboxes = store.registered_agent_mailboxes(owner_generation)?;
@@ -2451,6 +2553,7 @@ pub(crate) fn process_one_registered_agent_request(
             &registration.agent_run_id,
             now_unix,
             artifacts,
+            profiles,
         ) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
@@ -2772,14 +2875,12 @@ impl RuntimeServices {
             .ok_or("ticket role profile is absent from applied configuration")?
             .clone();
         let profile_digest = crate::store::agent_profile_digest(&profile)?;
-        let runtime_identity = crate::run_step::profile_runtime_identity(&profile)
-            .map_err(|error| error.to_string())?;
-        let Some(qualification) = self.verified_qualification(
+        let Some(qualification) = exact_profile_qualification(
             store,
             &candidate.project_id,
             &profile_id,
+            &profile,
             &profile_digest,
-            &runtime_identity,
         )?
         else {
             eprintln!(
@@ -2844,6 +2945,22 @@ impl RuntimeServices {
             .as_ref()
             .map(|plan| plan.validate_for(&project, &self.configuration_digest))
             .transpose()?;
+        let implementation_publication_subject = if candidate.role == Role::Reviewer {
+            Some(reviewer_publication_subject(
+                store,
+                self.owner_generation,
+                &active_run.project_id,
+                ticket_run_id,
+                active_run.revision,
+                &ReviewerPublicationConfig {
+                    project: &project,
+                    configuration_digest: &self.configuration_digest,
+                    repositories: &self.applied_config.config.repositories,
+                },
+            )?)
+        } else {
+            None
+        };
         let worker_node = worker_context
             .as_ref()
             .and_then(|context| {
@@ -2905,6 +3022,11 @@ impl RuntimeServices {
                     ),
                     _ => None,
                 },
+                accepted_plan_digest: accepted_plan
+                    .as_ref()
+                    .filter(|_| candidate.role != Role::Worker)
+                    .map(|plan| plan.plan_digest.clone()),
+                implementation_publication_subject,
                 previous_decisions: Vec::new(),
                 required_evidence: worker_node
                     .as_ref()
@@ -2942,10 +3064,12 @@ impl RuntimeServices {
         } else if candidate.role == Role::Worker {
             None
         } else {
-            Some(
-                store
-                    .coordinator_child_parent(&candidate.project_id, &candidate.role_session_id)?,
-            )
+            let Some(parent) = store
+                .coordinator_child_parent(&candidate.project_id, &candidate.role_session_id)?
+            else {
+                return Ok(false);
+            };
+            Some(parent)
         };
         if let Some(expected_parent_role) = expected_parent_role {
             let parent_authority = parent_authority
@@ -3104,30 +3228,6 @@ impl RuntimeServices {
             crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. } => Ok(true),
             crate::store::agent_runtime::LaunchPreparationOutcome::CapacityUnavailable => Ok(false),
         }
-    }
-
-    fn verified_qualification(
-        &self,
-        store: &ConfigStore,
-        project_id: &crate::domain::ids::ProjectId,
-        profile_id: &crate::domain::ids::ProfileId,
-        profile_digest: &Digest,
-        runtime_identity: &crate::run_step::ProfileRuntimeIdentity,
-    ) -> Result<Option<crate::launch::ProviderQualification>, String> {
-        let qualification = store
-            .verified_provider_qualifications(project_id, profile_id, profile_digest, 32)?
-            .into_iter()
-            .find(|qualification| {
-                qualification.adapter == runtime_identity.adapter
-                    && qualification.executable_path
-                        == runtime_identity.executable_path.display().to_string()
-                    && qualification.executable_digest == runtime_identity.executable_digest
-                    && qualification.commit_mode == runtime_identity.commit_mode
-                    && qualification.invocation_options_digest
-                        == runtime_identity.invocation_options_digest
-                    && qualification.permission_mode == runtime_identity.effective_permission_mode
-            });
-        Ok(qualification)
     }
 
     fn view_has_block_capacity(

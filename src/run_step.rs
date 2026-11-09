@@ -139,6 +139,9 @@ pub struct RunDescriptor {
     pub controller_generation: u64,
     pub workspace: PathBuf,
     pub control_dir: PathBuf,
+    /// Host-validated Worker assignment copied from the immutable launch reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_assignment: Option<crate::launch::WorkerLaunchBinding>,
     pub rex_session_id: String,
     pub rex_block_id: RexBlockId,
     pub profile_digest: Digest,
@@ -2240,6 +2243,7 @@ mod tests {
             controller_generation: 3,
             workspace: root.join("workspace"),
             control_dir: root.join("control"),
+            worker_assignment: None,
             rex_session_id: "session-a".into(),
             rex_block_id: RexBlockId::parse("block-a").unwrap(),
             profile_digest: profile_digest.clone(),

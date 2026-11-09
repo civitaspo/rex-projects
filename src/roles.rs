@@ -53,6 +53,10 @@ pub struct PromptContext {
     pub ticket: Option<TicketBrief>,
     pub recovery_summary: Option<String>,
     pub accepted_plan: Option<String>,
+    pub accepted_plan_digest: Option<ContentDigest>,
+    /// Present only for Reviewer turns whose exact host-validated publication set is available.
+    pub implementation_publication_subject:
+        Option<crate::delivery_runtime::ImplementationPublicationSetSubject>,
     pub previous_decisions: Vec<String>,
     pub required_evidence: Vec<String>,
     pub stop_conditions: Vec<String>,
@@ -368,6 +372,33 @@ pub fn render_role_prompt(
     if let Some(plan) = &context.accepted_plan {
         append_untrusted_block(&mut prompt, "accepted_plan", plan)?;
     }
+    if let Some(digest) = &context.accepted_plan_digest {
+        if context.accepted_plan.is_none() {
+            return Err("accepted plan identity requires its plan context".into());
+        }
+        let binding = serde_json::json!({"accepted_plan_digest":digest});
+        prompt.push_str(&format!(
+            "\nAccepted plan identity (host-owned metadata; use this exact digest for downstream spawn requests):\n```json\n{binding}\n```\n"
+        ));
+    }
+    if let Some(subject) = &context.implementation_publication_subject {
+        if context.role != Role::Reviewer {
+            return Err("implementation publication subject is scoped to Reviewer turns".into());
+        }
+        let digest = subject.digest()?;
+        let binding = serde_json::json!({
+            "subject_kind": "implementation_publication_set",
+            "subject_digest": digest,
+            "evidence_coverage": subject.coverage,
+            "publication_revision": subject.publication_revision,
+            "accepted_plan_digest": subject.accepted_plan_digest,
+            "publications": subject.publications,
+        });
+        let encoded = serde_json::to_string_pretty(&binding).map_err(|error| error.to_string())?;
+        prompt.push_str(&format!(
+            "\nHost-validated implementation publication subject (use its exact subject kind, digest, and evidence coverage in ReviewReady):\n```json\n{encoded}\n```\n"
+        ));
+    }
     append_list(
         &mut prompt,
         "Previous decisions",
@@ -382,8 +413,21 @@ pub fn render_role_prompt(
         if context.role != Role::Worker {
             return Err("only a Worker turn may receive a commit mode".into());
         }
-        let mode = serde_json::to_value(mode).map_err(|error| error.to_string())?;
-        prompt.push_str(&format!("\nWorker commit mode selected by host: `{}`. This setting does not grant publication authority.\n", mode.as_str().unwrap_or("invalid")));
+        let mode_value = serde_json::to_value(mode).map_err(|error| error.to_string())?;
+        prompt.push_str(&format!("\nWorker commit mode selected by host: `{}`. This setting does not grant publication authority.\n", mode_value.as_str().unwrap_or("invalid")));
+        if *mode == CommitMode::Host {
+            let required_trailer = match profile.adapter {
+                crate::domain::types::AgentAdapter::Codex => {
+                    "Co-authored-by: Codex <noreply@openai.com>"
+                }
+                crate::domain::types::AgentAdapter::ClaudeCode => {
+                    "Co-authored-by: Claude <noreply@anthropic.com>"
+                }
+            };
+            prompt.push_str(&format!(
+                "\n# Host commit procedure\n\nDo not run `git commit`. Create a bounded paths JSON file under `$REX_PROJECTS_CONTROL_DIR` with schema version 1, the assigned worktree ID, and normalized relative paths tagged `capture` or `delete`. Keep all request, receipt-reference, and message files outside the Git worktree. Create and register the Change manifest from the assigned worktree with `{cli_command} agent repository manifest --paths-file \"$REX_PROJECTS_CONTROL_DIR/changed-paths.json\" --output change-manifest.json --wait-seconds 300 --message-id <new-id> --json`. Save the acknowledged `result.artifact` exactly as `$REX_PROJECTS_CONTROL_DIR/change-reference.json`; once registration succeeds the generated manifest file is removed by the CLI. Write the commit message to `$REX_PROJECTS_CONTROL_DIR/commit-message.txt` and include this required trailer: `{required_trailer}`. Ask the host to commit with `{cli_command} agent repository commit --expected-head <assigned-base-or-latest-accepted-head> --manifest-reference-file \"$REX_PROJECTS_CONTROL_DIR/change-reference.json\" --message-file \"$REX_PROJECTS_CONTROL_DIR/commit-message.txt\" --message-id <new-id> --json`. Wait for the durable receipt. Its `commit.observed_head` and `commit_operation_id` are the only valid resulting SHA and host operation ID; report the SHA chain as that single actual commit and set `previous_head` to the requested expected head. Keep `base_commit` equal to the original assigned base for correction rounds.\n"
+            ));
+        }
     }
     prompt.push_str("\n# Profile skills\n\n");
     if skill_paths.is_empty() {
@@ -1007,6 +1051,8 @@ mod tests {
             },
             recovery_summary: Some("Last turn stopped before the reviewer.".into()),
             accepted_plan: None,
+            accepted_plan_digest: None,
+            implementation_publication_subject: None,
             previous_decisions: vec![],
             required_evidence: vec![],
             stop_conditions: vec!["Unknown remote state".into()],

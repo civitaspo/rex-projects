@@ -113,6 +113,13 @@
           "minItems": 1,
           "type": "array"
         },
+        "host_commit_operation_id": {
+          "description": "Host-mode commits must name the durable `repository.commit` receipt whose SHA is reported above.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "previous_head": {
           "maxLength": 64,
           "minLength": 40,

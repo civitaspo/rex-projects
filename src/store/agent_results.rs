@@ -1923,8 +1923,8 @@ pub(crate) mod tests {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT);
-                 INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:planner','coordinator_child','evidence-spawn');
+                "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, lifecycle TEXT);
+                 INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:planner','coordinator_child','evidence-spawn','pending');
                  CREATE TABLE agent_result_evidence(evidence_id TEXT,agent_run_id TEXT,project_id TEXT,role TEXT,outcome TEXT);
                  INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed');
                  CREATE TABLE agent_launch_authority(agent_run_id TEXT,authority_json TEXT,descriptor_digest TEXT,authority_digest TEXT);",
@@ -1955,9 +1955,23 @@ pub(crate) mod tests {
                 &ProjectId::parse("project-a").unwrap(),
                 "ticket_run:ticket-run:planner",
             )
-            .unwrap();
+            .unwrap()
+            .expect("pending Coordinator child wake has parent authority");
         assert_eq!(parent.agent_run_id.as_str(), "coordinator-run");
         assert_eq!(parent.role, Role::Coordinator);
+        store
+            .connection
+            .execute("UPDATE role_wake_inputs SET lifecycle='consumed'", [])
+            .unwrap();
+        assert!(
+            store
+                .coordinator_child_parent(
+                    &ProjectId::parse("project-a").unwrap(),
+                    "ticket_run:ticket-run:planner",
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2110,6 +2124,7 @@ pub(crate) mod tests {
                 controller_generation: authority.controller_generation,
                 workspace: authority.workspace_path.clone(),
                 control_dir: authority.control_dir.clone(),
+                worker_assignment: None,
                 rex_session_id: authority.rex_session_id.clone(),
                 rex_block_id: crate::domain::ids::RexBlockId::parse(authority.rex_block_id.clone())
                     .unwrap(),
@@ -4295,20 +4310,24 @@ impl ConfigStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    /// Resolve a child wake's parent from immutable host-validated result evidence.
+    /// Resolve a pending child wake's parent from host-validated result evidence.
     pub fn coordinator_child_parent(
         &self,
         project_id: &crate::domain::ids::ProjectId,
         role_session_id: &str,
-    ) -> Result<crate::launch::AgentLaunchAuthority, String> {
-        let evidence_id: String = self
+    ) -> Result<Option<crate::launch::AgentLaunchAuthority>, String> {
+        let evidence_id: Option<String> = self
             .connection
             .query_row(
-                "SELECT w.source_id FROM role_wake_inputs w JOIN agent_result_evidence e ON e.evidence_id=w.source_id WHERE w.project_id=?1 AND w.role_session_id=?2 AND w.source_type='coordinator_child' ORDER BY w.wake_input_id LIMIT 1",
+                "SELECT w.source_id FROM role_wake_inputs w JOIN agent_result_evidence e ON e.evidence_id=w.source_id WHERE w.project_id=?1 AND w.role_session_id=?2 AND w.source_type='coordinator_child' AND w.lifecycle='pending' ORDER BY w.wake_input_id LIMIT 1",
                 rusqlite::params![project_id.as_str(), role_session_id],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(|error| error.to_string())?;
+        let Some(evidence_id) = evidence_id else {
+            return Ok(None);
+        };
         let parent_run: String = self
             .connection
             .query_row(
@@ -4325,7 +4344,7 @@ impl ConfigStore {
         {
             return Err("Coordinator child source authority has the wrong role or Project".into());
         }
-        Ok(authority)
+        Ok(Some(authority))
     }
 
     /// Resolve a TicketRun Coordinator's Supervisor from its immutable dispatch source.

@@ -619,6 +619,9 @@ pub struct ChangeReference {
     pub previous_head: GitCommitId,
     pub branch_head: GitCommitId,
     pub commit_shas: Vec<GitCommitId>,
+    /// Host-mode commits must name the durable `repository.commit` receipt whose SHA is reported above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_commit_operation_id: Option<String>,
 }
 
 role_payload!(ImplementationReadyPayload {
@@ -901,6 +904,14 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
                 if change.commit_shas.is_empty()
                     || change.commit_shas.last() != Some(&change.branch_head)
                     || change.previous_head == change.branch_head
+                    || match change.commit_mode {
+                        CommitMode::Native => change.host_commit_operation_id.is_some(),
+                        CommitMode::Host => change
+                            .host_commit_operation_id
+                            .as_ref()
+                            .is_none_or(|operation| operation.trim().is_empty()),
+                        CommitMode::Auto => true,
+                    }
                     || !work_nodes.insert((&change.repository, &change.worktree_id))
                 {
                     return Err(

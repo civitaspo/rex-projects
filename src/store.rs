@@ -6933,40 +6933,28 @@ mod tests {
         );
 
         let accepted = corrected_snapshot.accepted_plan();
-        let mut publication_facts = corrected_snapshot
-            .publication_receipts()
+        let validated_publications =
+            crate::delivery_runtime::validate_implementation_publication_receipt(
+                &accepted.proposal,
+                corrected_snapshot.prepared_receipt(),
+                &project_id,
+                &config.repositories,
+                corrected_snapshot.publication_receipts(),
+            )
+            .unwrap();
+        let subject = crate::delivery_runtime::implementation_publication_set_subject(
+            &accepted.plan_digest,
+            &accepted.proposal,
+            &validated_publications,
+            corrected_snapshot.publication_receipts(),
+            corrected_snapshot.publication_revision(),
+        )
+        .unwrap();
+        let subject_digest = subject.digest().unwrap().to_string();
+        let evidence_coverage = subject
+            .coverage
             .iter()
-            .map(|receipt| {
-                let publication: ImplementationPublicationReceipt =
-                    serde_json::from_str(receipt.receipt_json()).unwrap();
-                serde_json::json!({
-                    "work_node_id": publication.work_node_id,
-                    "repository_id": publication.repository_id,
-                    "pull_request_number": publication.pull_request.number,
-                    "pull_request_node_id": publication.pull_request.node_id,
-                    "pull_request_head": publication.pull_request.source_head,
-                    "published_head": publication.push.pushed_head,
-                    "receipt_digest": format!("{:x}", sha2::Sha256::digest(receipt.receipt_json().as_bytes())),
-                })
-            })
-            .collect::<Vec<_>>();
-        publication_facts
-            .sort_by_key(|fact| fact["work_node_id"].as_str().unwrap_or_default().to_owned());
-        let publication_subject = serde_json::json!({
-            "ticket_run_id": ticket_run_id,
-            "accepted_plan_digest": accepted.plan_digest,
-            "publications": publication_facts,
-        });
-        let subject_digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&publication_subject).unwrap())
-        );
-        let evidence_coverage = accepted
-            .proposal
-            .nodes
-            .iter()
-            .filter(|node| !node.investigation)
-            .map(|node| node.id.as_str().to_owned())
+            .map(|id| id.as_str())
             .collect::<Vec<_>>();
         let structured_result = serde_json::json!({
             "subject_kind": "implementation_publication_set",
@@ -7017,6 +7005,24 @@ mod tests {
                 &config,
                 config_digest.clone(),
                 &tampered,
+            )
+            .is_err()
+        );
+        let mut wrong_coverage = reviewer_evidence.ingested.clone();
+        let crate::engine::orchestration::RoleResultPayload::ReviewReady(assessment) =
+            &mut wrong_coverage.validated.typed_payload
+        else {
+            panic!("validated reviewer evidence has the wrong payload type");
+        };
+        assessment.evidence_coverage = vec!["different-node".into()];
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &wrong_coverage,
             )
             .is_err()
         );
