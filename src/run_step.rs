@@ -1973,6 +1973,25 @@ fn factory_environment(
             OsString::from(ticket_run_id.as_str()),
         );
     }
+    if let Some(worker) = &descriptor.worker_assignment {
+        let commit_mode = match worker.commit_mode {
+            CommitMode::Auto => "auto",
+            CommitMode::Native => "native",
+            CommitMode::Host => "host",
+        };
+        environment.insert(
+            OsString::from("REX_PROJECTS_COMMIT_MODE"),
+            OsString::from(commit_mode),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_WORKTREE_ID"),
+            OsString::from(worker.node_id.as_str()),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_WORKTREE_PATH"),
+            worker.worktree_path.as_os_str().to_owned(),
+        );
+    }
     environment.insert(
         OsString::from("REX_SESSION"),
         OsString::from(&descriptor.rex_session_id),
@@ -2552,6 +2571,137 @@ mod tests {
             env.get(OsStr::new("PATH")).and_then(|v| v.to_str()),
             Some("/usr/bin")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_worker_environment_can_queue_the_actual_repository_manifest_cli() {
+        use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+
+        let root = tempdir().unwrap();
+        let mut turn = request(root.path(), AgentAdapter::Codex, "/bin/sh");
+        turn.profile.commit_mode = CommitMode::Host;
+        turn.descriptor.provider_capability = fixture_capability(
+            &turn.profile,
+            turn.descriptor.profile_digest.clone(),
+            &turn.descriptor.result_schema,
+        );
+        turn.descriptor.worker_assignment = Some(
+            serde_json::from_value(json!({
+                "schema_version": 1,
+                "accepted_revision": 1,
+                "ticket_revision": 1,
+                "configuration_digest": "a".repeat(64),
+                "plan_digest": "b".repeat(64),
+                "node_id": "documentation-node",
+                "repository_id": "repository-a",
+                "commit_mode": "host",
+                "worktree_path": turn.descriptor.workspace,
+                "branch": "rex-projects/documentation-node",
+                "base_sha": "1".repeat(40),
+                "prepare_operation_id": "prepare-a",
+                "prepare_receipt_digest": "c".repeat(64),
+                "source_evidence_id": "evidence-a",
+                "source_agent_run_id": "coordinator-a",
+                "source_message_id": "plan-a",
+                "source_result_digest": "d".repeat(64),
+                "coordinator_agent_run_id": "coordinator-a",
+                "coordinator_role_session_id": "coordinator-session-a",
+                "coordinator_authority_digest": "e".repeat(64),
+            }))
+            .unwrap(),
+        );
+        for key in [
+            "REX_PROJECTS_COMMIT_MODE",
+            "REX_PROJECTS_WORKTREE_ID",
+            "REX_PROJECTS_WORKTREE_PATH",
+        ] {
+            turn.environment.insert(key.into(), "stale".into());
+        }
+        let mailbox = MailboxCapability::create(
+            turn.descriptor.run_id.as_str(),
+            &turn.descriptor.control_dir,
+            unix_time_now().unwrap() + 60,
+            MailboxLimits::default(),
+        )
+        .unwrap();
+        fs::write(
+            turn.descriptor.workspace.join("documentation.md"),
+            "Verified documentation.\n",
+        )
+        .unwrap();
+        let paths = turn.descriptor.control_dir.join("paths.json");
+        fs::write(
+            &paths,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "worktree_id": "documentation-node",
+                "entries": [{"path":"documentation.md", "operation":"capture"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let prepared = prepare_with_qualification(&turn, true, false).unwrap();
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("rex-projects");
+        let output = std::process::Command::new(binary)
+            .args(["agent", "repository", "manifest", "--paths-file"])
+            .arg(&paths)
+            .args([
+                "--output",
+                "manifest.json",
+                "--message-id",
+                "worker-manifest",
+                "--wait-seconds",
+                "0",
+                "--json",
+            ])
+            .env_clear()
+            .envs(&prepared.environment)
+            .current_dir(&prepared.working_directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "actual manifest CLI failed: {} {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let manifest: crate::host_commit::ChangeManifest = serde_json::from_slice(
+            &fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&manifest).unwrap()["entries"][0]["path"],
+            "documentation.md"
+        );
+        assert_eq!(manifest.entries.len(), 1);
+        let pending = mailbox.pending(unix_time_now().unwrap()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&pending[0].envelope.method).unwrap(),
+            "artifact.add"
+        );
+        assert_eq!(pending[0].envelope.params["path"], "manifest.json");
+
+        turn.descriptor.worker_assignment = None;
+        turn.descriptor.role = Role::Coordinator;
+        let coordinator = factory_environment(&turn.environment, &turn.descriptor).unwrap();
+        for key in [
+            "REX_PROJECTS_COMMIT_MODE",
+            "REX_PROJECTS_WORKTREE_ID",
+            "REX_PROJECTS_WORKTREE_PATH",
+        ] {
+            assert!(
+                !coordinator.contains_key(OsStr::new(key)),
+                "{key} leaked into Coordinator"
+            );
+        }
     }
 
     #[cfg(unix)]

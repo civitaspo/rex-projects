@@ -411,6 +411,97 @@ fn agent_inbox_reads_the_scoped_snapshot_without_opening_state() {
 }
 
 #[test]
+fn agent_artifact_add_uses_limits_registered_for_its_run() {
+    use rex_projects::mailbox::{MailboxCapability, MailboxLimits};
+
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let run_id = "worker-run";
+    let limits = MailboxLimits {
+        max_request_bytes: 1_048_576,
+        max_pending_requests: 32,
+    };
+    MailboxCapability::create(run_id, &control_dir, u64::MAX, limits).unwrap();
+    std::fs::write(control_dir.join("evidence.json"), b"{}").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .args([
+            "agent",
+            "artifact-add",
+            "--control-dir",
+            control_dir.to_str().unwrap(),
+            "--run",
+            run_id,
+            "--path",
+            "evidence.json",
+            "--kind",
+            "change",
+            "--message-id",
+            "artifact-request",
+            "--wait-seconds",
+            "0",
+            "--json",
+        ])
+        .env("REX_PROJECTS_AGENT", "1")
+        .env("REX_PROJECTS_PROJECT_ID", "project1")
+        .env("REX_PROJECTS_OPERATION_ID", "operation-1")
+        .env("REX_PROJECTS_ROLE", "worker")
+        .env("REX_PROJECTS_ATTEMPT", "1")
+        .env("REX_PROJECTS_RUN_EPOCH", "1")
+        .env("REX_PROJECTS_SUBJECT_REVISION", "3")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["state"], "queued");
+    assert_eq!(response["request_id"], "artifact-request");
+
+    let mailbox = MailboxCapability::open_registered_for_run(run_id, &control_dir).unwrap();
+    let pending = mailbox.pending(u64::MAX - 1).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&pending[0].envelope.method).unwrap(),
+        "artifact.add"
+    );
+    assert_eq!(pending[0].envelope.run_id.as_deref(), Some(run_id));
+    assert_eq!(pending[0].envelope.params["path"], "evidence.json");
+
+    let wrong_run = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .args([
+            "agent",
+            "artifact-add",
+            "--control-dir",
+            control_dir.to_str().unwrap(),
+            "--run",
+            "another-run",
+            "--path",
+            "evidence.json",
+            "--kind",
+            "change",
+            "--message-id",
+            "wrong-run-request",
+            "--wait-seconds",
+            "0",
+            "--json",
+        ])
+        .env("REX_PROJECTS_AGENT", "1")
+        .env("REX_PROJECTS_PROJECT_ID", "project1")
+        .env("REX_PROJECTS_OPERATION_ID", "operation-1")
+        .env("REX_PROJECTS_ROLE", "worker")
+        .env("REX_PROJECTS_ATTEMPT", "1")
+        .env("REX_PROJECTS_RUN_EPOCH", "1")
+        .env("REX_PROJECTS_SUBJECT_REVISION", "3")
+        .output()
+        .unwrap();
+    assert!(!wrong_run.status.success());
+    assert_eq!(mailbox.pending(u64::MAX - 1).unwrap().len(), 1);
+}
+
+#[test]
 #[ignore = "subprocess fixture invoked by the bounded stderr test"]
 fn stderr_exit_fixture() {
     use std::io::Write;

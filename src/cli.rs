@@ -2848,7 +2848,7 @@ fn publish_owner_projection(
 }
 
 fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
-    use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+    use crate::mailbox::{MailboxCapability, unix_time_now};
     use crate::protocol::RequestEnvelope;
     use serde_json::Value;
     match command {
@@ -2938,9 +2938,8 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
                     "mailbox requests require matching run_id/request_id and complete Project, attempt, epoch, revision, role, and type scope",
                 ));
             }
-            let capability =
-                MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
-                    .map_err(CliError::unavailable)?;
+            let capability = MailboxCapability::open_registered_for_run(&run_id, &control_dir)
+                .map_err(CliError::unavailable)?;
             let now = unix_time_now().map_err(CliError::unexpected)?;
             let queued = capability
                 .queue(&request_id, &bytes, now)
@@ -3004,9 +3003,8 @@ fn agent_command(command: AgentCommand, json: bool) -> Result<(), CliError> {
             run_id,
             request_id,
         } => {
-            let capability =
-                MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
-                    .map_err(CliError::unavailable)?;
+            let capability = MailboxCapability::open_registered_for_run(&run_id, &control_dir)
+                .map_err(CliError::unavailable)?;
             let receipt = capability
                 .read_receipt(&request_id, unix_time_now().map_err(CliError::unexpected)?)
                 .map_err(CliError::unexpected)?;
@@ -3122,9 +3120,8 @@ fn agent_repository_manifest(
         json,
     );
     if let Ok(()) = add_result {
-        use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
-        if let Ok(mailbox) =
-            MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
+        use crate::mailbox::{MailboxCapability, unix_time_now};
+        if let Ok(mailbox) = MailboxCapability::open_registered_for_run(run_id, &control_dir)
             && let Ok(Some(receipt)) =
                 mailbox.read_receipt(&message_id, unix_time_now().unwrap_or(0))
             && let Ok(response) =
@@ -3148,7 +3145,7 @@ fn agent_repository_commit(
     args: AgentRepositoryCommitArgs,
     json: bool,
 ) -> Result<(), CliError> {
-    use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+    use crate::mailbox::{MailboxCapability, unix_time_now};
     let AgentRepositoryCommitArgs {
         expected_head,
         manifest_reference_file,
@@ -3233,9 +3230,8 @@ fn agent_repository_commit(
     };
     let bytes =
         serde_json::to_vec(&envelope).map_err(|error| CliError::unexpected(error.to_string()))?;
-    let mailbox =
-        MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
-            .map_err(CliError::unavailable)?;
+    let mailbox = MailboxCapability::open_registered_for_run(run_id, &control_dir)
+        .map_err(CliError::unavailable)?;
     mailbox
         .queue(
             &message_id,
@@ -3305,7 +3301,7 @@ fn agent_artifact_add(
     wait_seconds: u64,
     json: bool,
 ) -> Result<(), CliError> {
-    use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+    use crate::mailbox::{MailboxCapability, unix_time_now};
     if wait_seconds > 300 {
         return Err(CliError::usage(
             "artifact receipt wait is limited to five minutes",
@@ -3364,9 +3360,8 @@ fn agent_artifact_add(
     };
     let bytes =
         serde_json::to_vec(&envelope).map_err(|error| CliError::unexpected(error.to_string()))?;
-    let mailbox =
-        MailboxCapability::open_registered(run_id, &control_dir, MailboxLimits::default())
-            .map_err(CliError::unavailable)?;
+    let mailbox = MailboxCapability::open_registered_for_run(run_id, &control_dir)
+        .map_err(CliError::unavailable)?;
     mailbox
         .queue(
             &message_id,
