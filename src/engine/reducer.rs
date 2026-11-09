@@ -239,6 +239,7 @@ pub fn reduce(
             next.phase = Phase::Operating;
             next.activity = Activity::Running;
             wakes.push(WakeTarget::TicketRole(Role::Operator));
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         Input::OperationFailed if matches!(current.phase, Phase::Operating | Phase::Postmortem) => {
             next.activity = Activity::Blocked;
@@ -250,6 +251,7 @@ pub fn reduce(
             next.phase = Phase::Postmortem;
             next.activity = Activity::Running;
             wakes.push(WakeTarget::TicketRole(Role::Postmortem));
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         Input::KnowledgePublished if current.phase == Phase::Postmortem => {
             next.phase = Phase::Completing;
@@ -421,26 +423,45 @@ mod tests {
     #[test]
     fn role_work_is_always_durably_routed_as_a_wake() {
         let cases = [
-            (Phase::Queued, Input::Dispatch, Role::Coordinator),
-            (Phase::Reviewing, Input::CorrectionsRemain, Role::Worker),
+            (Phase::Queued, Input::Dispatch, vec![Role::Coordinator]),
+            (
+                Phase::Reviewing,
+                Input::CorrectionsRemain,
+                vec![Role::Worker],
+            ),
             (
                 Phase::Reviewing,
                 Input::ReviewConverged,
-                Role::MergeDecision,
+                vec![Role::MergeDecision],
             ),
-            (Phase::AwaitingMerge, Input::MergeVerified, Role::Operator),
+            (
+                Phase::AwaitingMerge,
+                Input::MergeVerified,
+                vec![Role::Operator, Role::Coordinator],
+            ),
             (
                 Phase::Operating,
                 Input::OperationsSucceeded,
-                Role::Postmortem,
+                vec![Role::Postmortem, Role::Coordinator],
+            ),
+            (
+                Phase::Operating,
+                Input::OperationsNotRequired,
+                vec![Role::Postmortem, Role::Coordinator],
             ),
         ];
-        for (phase, input, target) in cases {
+        for (phase, input, targets) in cases {
             let mut current = run();
             current.phase = phase;
             current.activity = Activity::Running;
             let decision = reduce(&current, current.revision, input).unwrap();
-            assert_eq!(decision.wakes, [WakeTarget::TicketRole(target)]);
+            assert_eq!(
+                decision.wakes,
+                targets
+                    .into_iter()
+                    .map(WakeTarget::TicketRole)
+                    .collect::<Vec<_>>()
+            );
             assert!(
                 decision
                     .effects
