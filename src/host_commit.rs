@@ -766,7 +766,7 @@ impl HostCommitter {
         mut index: Option<&mut IndexEnvironment>,
     ) -> Result<ProcessOutput, HostCommitError> {
         let mut environment = self.options.git_environment.clone();
-        environment.retain(|key, _| !key.to_string_lossy().starts_with("GIT_"));
+        process::clear_git_repository_environment(&mut environment);
         environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
         if let Some(index) = index.as_mut() {
             environment.insert("GIT_INDEX_FILE".into(), index.path.clone().into_os_string());
@@ -2165,6 +2165,100 @@ mod tests {
             schema_version: 1,
             entries,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_commit_preserves_signing_and_authentication_environment_without_repo_redirects() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = fixture();
+        let repo = &fixture.worktree.path;
+        let signer = successful_git(
+            repo,
+            &["config", "--get", "user.signingkey"],
+            &fixture.environment,
+        );
+        successful_git(
+            repo,
+            &[
+                "config",
+                "--local",
+                "user.signingkey",
+                "missing-fixture-key",
+            ],
+            &fixture.environment,
+        );
+        let allowed_signers = fixture._temp.path().join("allowed_signers");
+        fs::write(&allowed_signers, b"fixture trust configuration\n").unwrap();
+        let redirected_index = fixture._temp.path().join("must-not-create.index");
+        fixture.committer.options.git_environment.extend([
+            ("GIT_CONFIG_COUNT".into(), "2".into()),
+            ("GIT_CONFIG_KEY_0".into(), "user.signingkey".into()),
+            ("GIT_CONFIG_VALUE_0".into(), signer.trim().into()),
+            (
+                "GIT_CONFIG_KEY_1".into(),
+                "gpg.ssh.allowedSignersFile".into(),
+            ),
+            (
+                "GIT_CONFIG_VALUE_1".into(),
+                allowed_signers.clone().into_os_string(),
+            ),
+            (
+                "GIT_SSH_COMMAND".into(),
+                "fixture-ssh --preserved-authentication".into(),
+            ),
+            (
+                "GIT_DIR".into(),
+                fixture._temp.path().join("wrong.git").into_os_string(),
+            ),
+            ("GIT_WORK_TREE".into(), fixture._temp.path().into()),
+            (
+                "GIT_INDEX_FILE".into(),
+                redirected_index.clone().into_os_string(),
+            ),
+        ]);
+        assert_eq!(
+            fixture
+                .committer
+                .git_text(
+                    repo,
+                    "read inherited signing trust",
+                    ["config", "--get", "gpg.ssh.allowedSignersFile"],
+                    None,
+                    None
+                )
+                .unwrap()
+                .trim(),
+            allowed_signers.to_str().unwrap()
+        );
+        let hook = repo.join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            b"#!/bin/sh\n[ \"${GIT_SSH_COMMAND:-}\" = 'fixture-ssh --preserved-authentication' ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(repo.join("change.txt"), b"configuration preserved\n").unwrap();
+        let prepared = fixture.committer.prepare(
+            &fixture.worktree,
+            OperationId::parse("preserved-git-environment").unwrap(),
+            manifest(vec![write_entry("change.txt", b"configuration preserved\n", FileMode::Regular0644)]),
+            repo,
+            "fix: preserve configured Git environment\n\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
+        ).unwrap();
+        let receipt = fixture
+            .committer
+            .execute(&fixture.worktree, &prepared)
+            .unwrap();
+        assert!(
+            receipt.signature_verified && receipt.hooks_completed && receipt.index_synchronized
+        );
+        assert!(!redirected_index.exists());
+        assert_eq!(
+            successful_git(repo, &["rev-parse", "HEAD^"], &fixture.environment).trim(),
+            fixture.worktree.base_sha
+        );
     }
 
     #[cfg(unix)]

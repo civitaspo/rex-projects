@@ -173,15 +173,15 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             "XDG_STATE_HOME={}",
             request.fixture_root.join("xdg-state").display()
         )),
-        OsString::from("GIT_CONFIG_COUNT=1"),
-        OsString::from(format!(
-            "GIT_CONFIG_KEY_0=url.file://{}.insteadOf",
-            request
-                .fixture_root
-                .join("git/fixture/repository.git")
-                .display()
-        )),
-        OsString::from("GIT_CONFIG_VALUE_0=https://github.com/fixture/repository.git"),
+    ]);
+    let environment =
+        fixture_git_environment(request.fixture_root, &std::env::vars_os().collect())?;
+    rex_args.extend(environment.into_iter().map(|(mut key, value)| {
+        key.push("=");
+        key.push(value);
+        key
+    }));
+    rex_args.extend([
         request.cli.as_os_str().to_owned(),
         OsString::from("--config"),
         config_path.as_os_str().to_owned(),
@@ -1057,6 +1057,43 @@ fn read_probe_diagnostic(fixture_root: &Path, project: &str, role: &str) -> Opti
         }
     }
     None
+}
+
+fn fixture_git_environment(
+    root: &Path,
+    snapshot: &BTreeMap<OsString, OsString>,
+) -> Result<BTreeMap<OsString, OsString>, String> {
+    let mut environment = snapshot
+        .iter()
+        .filter(|(key, _)| key.to_string_lossy().starts_with("GIT_CONFIG_"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let count = environment
+        .get(std::ffi::OsStr::new("GIT_CONFIG_COUNT"))
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or("Git config count is not UTF-8")?
+                .parse::<usize>()
+                .map_err(|_| "Git config count is not an unsigned integer")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let next = count.checked_add(1).ok_or("Git config count overflow")?;
+    environment.insert("GIT_CONFIG_COUNT".into(), next.to_string().into());
+    environment.insert(
+        format!("GIT_CONFIG_KEY_{count}").into(),
+        format!(
+            "url.file://{}.insteadOf",
+            root.join("git/fixture/repository.git").display()
+        )
+        .into(),
+    );
+    environment.insert(
+        format!("GIT_CONFIG_VALUE_{count}").into(),
+        "https://github.com/fixture/repository.git".into(),
+    );
+    Ok(environment)
 }
 
 fn prepare_local_repository(request: &Request<'_>, executable: &Path) -> Result<(), String> {
@@ -2814,6 +2851,47 @@ mod tests {
                 let payload = resolve_test_references(message["structured_result"].clone());
                 crate::fixtures::agent::validate_payload(kind, &payload).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn fixture_git_environment_retains_signature_verification_and_authentication_config() {
+        let root = tempfile::tempdir().unwrap();
+        let signers = root.path().join("allowed_signers");
+        fs::write(&signers, "configured public signer\n").unwrap();
+        let snapshot = BTreeMap::from([
+            ("GIT_CONFIG_COUNT".into(), "2".into()),
+            (
+                "GIT_CONFIG_KEY_0".into(),
+                "gpg.ssh.allowedSignersFile".into(),
+            ),
+            ("GIT_CONFIG_VALUE_0".into(), signers.as_os_str().to_owned()),
+            ("GIT_CONFIG_KEY_1".into(), "credential.helper".into()),
+            ("GIT_CONFIG_VALUE_1".into(), "configured-user-helper".into()),
+        ]);
+        let environment = fixture_git_environment(root.path(), &snapshot).unwrap();
+        for (key, expected) in [
+            ("gpg.ssh.allowedSignersFile", signers.to_str().unwrap()),
+            ("credential.helper", "configured-user-helper"),
+            (
+                &format!(
+                    "url.file://{}.insteadOf",
+                    root.path().join("git/fixture/repository.git").display()
+                ),
+                "https://github.com/fixture/repository.git",
+            ),
+        ] {
+            let output = std::process::Command::new("git")
+                .args(["config", "--get", key])
+                .envs(&environment)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git config failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
         }
     }
 
