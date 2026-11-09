@@ -1877,7 +1877,14 @@ fn profile_messages_with_worker_verification(role: &str) -> Result<Vec<Value>, S
                 })
                 .cloned()
                 .ok_or("Coordinator fixture has no Reviewer spawn request")?;
-            messages.push(reviewer);
+            let correction_result = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message["lane"] == "workflow")
+                .nth(3)
+                .map(|(index, _)| index)
+                .ok_or("Coordinator fixture has no correction-result response")?;
+            messages[correction_result] = reviewer;
             messages.push(
                 message(
                     "coordinator",
@@ -3728,14 +3735,23 @@ mod tests {
                         "approved"
                     );
                 }
-                "coordinator" => assert_eq!(
-                    workflow
-                        .iter()
-                        .filter(|message| message.kind == RoleOutputKind::SpawnRequest
-                            && message.recipe.structured_result["role"] == "reviewer")
-                        .count(),
-                    2
-                ),
+                "coordinator" => {
+                    let request: rex_projects::engine::orchestration::SpawnRequestPayload =
+                        serde_json::from_value(resolve_test_references(
+                            workflow[3].recipe.structured_result.clone(),
+                        ))
+                        .expect("the correction Worker result must prompt an immediate Reviewer request");
+                    assert_eq!(request.role, rex_projects::domain::types::Role::Reviewer);
+                    assert_eq!(request.work_node.as_str(), "acceptance-node");
+                    assert_eq!(
+                        workflow
+                            .iter()
+                            .filter(|message| message.kind == RoleOutputKind::SpawnRequest
+                                && message.recipe.structured_result["role"] == "reviewer")
+                            .count(),
+                        2
+                    );
+                }
                 _ => {}
             }
         }
