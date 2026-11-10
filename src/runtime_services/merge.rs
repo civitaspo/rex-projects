@@ -667,7 +667,29 @@ impl RuntimeMergeEvidenceSource {
             return Err("exact human MergeWorkItem approval is absent, stale, or rejected".into());
         };
         let assessment = &work_item.document.assessment;
-        let (evidence_now, _) = self.observe_merge_item(&work_item)?;
+        // A body effect can have crossed the provider boundary before the
+        // execution-time base guard rejected our local attempt. Reconciliation
+        // must still run against the immutable operation key even if the base
+        // has moved since assessment; no new mutation is allowed in this mode.
+        let reconcile_exact_first_body = mode == crate::effects::EffectMode::Reconcile
+            && step_request.prior_receipts.is_empty()
+            && work_item
+                .document
+                .procedure
+                .steps
+                .first()
+                .is_some_and(|step| {
+                    step.key == step_request.step_key
+                        && matches!(
+                            step.operation,
+                            crate::merge_policy::MergeProcedureOperation::UpdatePullRequestBody { .. }
+                        )
+                });
+        let evidence_now = if reconcile_exact_first_body {
+            work_item.document.evidence.clone()
+        } else {
+            self.observe_merge_item(&work_item)?.0
+        };
         let (forge, pull) = self.forge_for_item(&work_item)?;
         let approval = crate::merge_executor::HumanMergeApproval::from_host_validated_receipt(
             accepted.receipt(),

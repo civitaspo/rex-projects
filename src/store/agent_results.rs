@@ -5184,7 +5184,10 @@ pub(crate) mod tests {
                 branch: branch.clone(),
                 base_sha: base.into(),
                 commit_mode: CommitMode::Host,
+                base_refresh: None,
+                base_refresh_source: None,
             }],
+            base_refreshes: Vec::new(),
         };
         let request_json = crate::store::canonical_json(&prepare_request).unwrap();
         let request_digest = digest(request_json.as_bytes()).unwrap();

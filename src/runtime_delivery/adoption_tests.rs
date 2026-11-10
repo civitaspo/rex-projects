@@ -315,7 +315,10 @@ fn run_connected_adoption(root: PathBuf) {
             branch: "rex-projects/t-1".into(),
             base_sha: head.into(),
             commit_mode: CommitMode::Native,
+            base_refresh: None,
+            base_refresh_source: None,
         }],
+        base_refreshes: Vec::new(),
     };
     store.test_connection().execute(
         "INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,status,attempt_count,next_attempt_at_unix,owner_generation,receipt_json,created_at_unix) VALUES ('prepare-worktrees',?1,'ticket_run',?2,'prepare-worktrees','prepare_worktrees',?3,?4,1,'succeeded',1,0,NULL,?5,1)",

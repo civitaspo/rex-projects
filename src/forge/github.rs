@@ -857,17 +857,21 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 ),
             });
         }
-        let endpoint = self.endpoint(
-            &intent.pull.repository,
-            &format!("pulls/{}", intent.pull.number),
-        )?;
-        self.mutate(
-            "PATCH",
-            &endpoint,
-            serde_json::json!({"body": intent.exact_body}),
-            &intent.operation_key,
-            &request_digest,
-        )
+        // GitHub exposes no compare-and-swap precondition for PR bodies. A
+        // GET followed by PATCH can overwrite a concurrent human edit, so
+        // this adapter only accepts an already-present exact body.
+        Ok(EffectAcknowledgement {
+            operation_key: intent.operation_key.clone(),
+            request_digest,
+            certainty: EffectCertainty::DefinitelyAbsent,
+            external_id: None,
+            external_url: None,
+            resulting_head_sha: Some(before.head_sha),
+            resulting_merge_sha: None,
+            reason: Some(
+                "GitHub PR body updates are not conditional; prepare the exact approved body externally and request a fresh merge assessment".into(),
+            ),
+        })
     }
 
     fn post_comment(&self, intent: &CommentIntent) -> Result<EffectAcknowledgement, ForgeError> {
@@ -1794,25 +1798,22 @@ mod tests {
     }
 
     #[test]
-    fn approved_body_update_rechecks_head_and_prior_body_before_patch() {
+    fn approved_body_update_never_patches_without_conditional_provider_support() {
         let prior_body = "original PR body";
         let exact_body = "original PR body\n\nCo-authored-by: Agent <agent@example.com>";
         let head_sha = "a".repeat(40);
         let base_sha = "b".repeat(40);
-        let forge = fixture_forge_responses(vec![
-            serde_json::json!({
-                "id": 1,
-                "node_id": "PR_node",
-                "number": 7,
-                "state": "open",
-                "draft": false,
-                "merged": false,
-                "head": {"sha": head_sha, "ref": "feature", "repo": {"id": 1}},
-                "base": {"sha": base_sha, "ref": "main", "repo": {"id": 1}},
-                "body": prior_body
-            }),
-            serde_json::json!({"id": 7, "html_url": "https://github.com/octo/repo/pull/7"}),
-        ]);
+        let forge = fixture_forge_responses(vec![serde_json::json!({
+            "id": 1,
+            "node_id": "PR_node",
+            "number": 7,
+            "state": "open",
+            "draft": false,
+            "merged": false,
+            "head": {"sha": head_sha, "ref": "feature", "repo": {"id": 1}},
+            "base": {"sha": base_sha, "ref": "main", "repo": {"id": 1}},
+            "body": prior_body
+        })]);
         let intent = BodyUpdateIntent {
             pull: test_pull(),
             operation_key: "body-op".into(),
@@ -1824,19 +1825,14 @@ mod tests {
 
         let acknowledgement = forge.update_body(&intent).unwrap();
 
-        assert_eq!(acknowledgement.certainty, EffectCertainty::Applied);
+        assert_eq!(acknowledgement.certainty, EffectCertainty::DefinitelyAbsent);
         assert_eq!(acknowledgement.operation_key, "body-op");
         assert_eq!(
             acknowledgement.request_digest,
             canonical_digest(&intent).unwrap()
         );
         let requests = forge.runner.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let mutation = &requests[1];
-        assert!(mutation.args.iter().any(|arg| arg == "--method"));
-        assert!(mutation.args.iter().any(|arg| arg == "PATCH"));
-        let body: Value = serde_json::from_slice(&mutation.stdin).unwrap();
-        assert_eq!(body["body"], exact_body);
+        assert_eq!(requests.len(), 1);
     }
 
     #[test]

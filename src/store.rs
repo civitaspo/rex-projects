@@ -3347,12 +3347,17 @@ impl ConfigStore {
                         crate::engine::factory_runtime::role_name(*role),
                     ),
                 };
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "ticket_run_id": ticket_run_id.as_str(),
                     "target": target_name,
                     "message_id": input.message_id,
                     "revision": decision_run.revision.0
                 });
+                if let Ok(transition) = serde_json::from_str::<serde_json::Value>(&input.payload)
+                    && transition["kind"] == "merge_reassessment_required"
+                {
+                    payload["transition_evidence"] = transition;
+                }
                 let inserted = tx.execute(
                     "INSERT INTO role_wake_inputs(project_id, role_session_id, source_type, source_id, source_revision, priority, payload_json, lifecycle, created_at_unix) VALUES (?1, ?2, 'ticket_run_transition', ?3, ?4, 0, ?5, 'pending', ?6)",
                     params![project_id.as_str(), role_session_id, input.message_id, decision_run.revision.0, payload.to_string(), now],
@@ -6530,17 +6535,22 @@ pub(crate) mod tests {
 
     #[test]
     fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
-        published_publication_fixture(false, false);
+        published_publication_fixture(false, false, false);
     }
 
     #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
-        published_publication_fixture(true, false);
+        published_publication_fixture(true, false, false);
     }
 
     #[test]
     fn repeated_merge_reference_mismatch_blocks_and_notifies_supervisor_once() {
-        published_publication_fixture(true, true);
+        published_publication_fixture(true, true, false);
+    }
+
+    #[test]
+    fn host_base_refresh_publication_drives_fresh_reviewer_subject() {
+        published_publication_fixture(true, false, true);
     }
 
     fn assert_registered_staging_survives_verification(
@@ -6644,7 +6654,11 @@ pub(crate) mod tests {
         }
     }
 
-    fn published_publication_fixture(single_publication: bool, reject_twice: bool) {
+    fn published_publication_fixture(
+        single_publication: bool,
+        reject_twice: bool,
+        base_refresh: bool,
+    ) {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
         use crate::delivery_runtime::{
@@ -6921,7 +6935,10 @@ pub(crate) mod tests {
                 branch: root_branch.into(),
                 base_sha: observed_base.clone(),
                 commit_mode: CommitMode::Native,
+                base_refresh: None,
+                base_refresh_source: None,
             }],
+            base_refreshes: Vec::new(),
         };
         let root_prepare_intent = staged_plan_effect(
             &project_id,
@@ -7053,6 +7070,145 @@ pub(crate) mod tests {
             )
             .unwrap()
         );
+        if base_refresh {
+            use crate::delivery_runtime::{BaseRefreshSource, StackRepairReceipt};
+
+            let refreshed_base = "e".repeat(40);
+            let refreshed_head = "f".repeat(40);
+            let mut refreshed_plan = persisted.clone();
+            refreshed_plan
+                .observed_base_shas
+                .insert(repository_id.clone(), refreshed_base.clone());
+            let refreshed_plan_json = crate::store::canonical_json(&refreshed_plan).unwrap();
+            store.connection.execute(
+                "INSERT INTO accepted_work_plans SELECT project_id,ticket_run_id,6,configuration_digest,?1,?2,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix FROM accepted_work_plans WHERE ticket_run_id=?3 AND accepted_revision=2",
+                rusqlite::params![content_digest(&refreshed_plan_json),refreshed_plan_json,ticket_run_id.as_str()],
+            ).unwrap();
+            store.connection.execute(
+                "UPDATE ticket_runs SET revision=6,internal_phase='preparing' WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            ).unwrap();
+            let refresh = StackRepairReceipt {
+                repository_id: repository_id.clone(),
+                branch: root_branch.into(),
+                old_parent_sha: observed_base.clone(),
+                new_parent_sha: refreshed_base.clone(),
+                old_child_head: first_head.clone(),
+                new_child_head: refreshed_head.clone(),
+                verified_commits: vec![refreshed_head.clone()],
+                hook_gate: HookGateReceipt {
+                    repository_id: repository_id.clone(),
+                    head: refreshed_head.clone(),
+                    configuration_digest: config_digest.clone(),
+                    hook_receipts: Vec::new(),
+                },
+                protection_observation_digest: Digest::parse("c".repeat(64)).unwrap(),
+            };
+            let exact_body = "Details\n\n<!-- rex-projects-operation:prior-publication -->\n\nCo-authored-by: Codex <noreply@openai.com>";
+            let source = BaseRefreshSource {
+                merge_work_id: Digest::parse("1".repeat(64)).unwrap(),
+                merge_receipt_digest: Digest::parse("2".repeat(64)).unwrap(),
+                prior_prepare_operation_id: OperationId::parse(
+                    root_prepare_intent.operation_id.clone(),
+                )
+                .unwrap(),
+                prior_prepare_receipt_digest: Digest::parse(content_digest(
+                    &serde_json::to_string(&root_prepared).unwrap(),
+                ))
+                .unwrap(),
+                prior_publication_operation_id: OperationId::parse(
+                    first_publish_intent.operation_id.clone(),
+                )
+                .unwrap(),
+                prior_publication_receipt_digest: Digest::parse(content_digest(
+                    &serde_json::to_string(&first_publish_receipt).unwrap(),
+                ))
+                .unwrap(),
+                pull_request_number: first_publish_receipt.pull_request.number,
+                pull_request_node_id: first_publish_receipt.pull_request.node_id.clone(),
+                pull_request_url: first_publish_receipt.pull_request.url.clone(),
+                pull_request_title: first_publish_receipt.pull_request.title.clone(),
+                exact_body: exact_body.into(),
+            };
+            let mut refresh_prepare = root_prepare.clone();
+            refresh_prepare.source_revision = 6;
+            refresh_prepare.work_nodes[0].expected_base_sha = refreshed_base.clone();
+            let mut refresh_prepared = root_prepared.clone();
+            refresh_prepared.work_nodes[0].base_sha = refreshed_base;
+            refresh_prepared.work_nodes[0].base_refresh = Some(refresh.clone());
+            refresh_prepared.work_nodes[0].base_refresh_source = Some(source.clone());
+            refresh_prepared.base_refreshes = vec![refresh.clone()];
+            let refresh_prepare_intent = staged_plan_effect(
+                &project_id,
+                &ticket_run_id,
+                "prepare-base-refresh",
+                "prepare_worktrees",
+                6,
+                &refresh_prepare,
+            );
+            insert_succeeded_test_effect(&mut store, &refresh_prepare_intent, &refresh_prepared);
+            assert!(
+                crate::engine::host_transitions::consume_one_host_transition(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    &config_digest,
+                )
+                .unwrap()
+            );
+            let publishing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+            assert_eq!(publishing.phase, Phase::Publishing);
+            assert_eq!(publishing.revision, 7);
+            let generated = store
+                .effect_by_logical_key(&format!("{ticket_run_id}:7:host-base-refresh-publication"))
+                .unwrap()
+                .unwrap();
+            let payload: PublishImplementationEffectPayload =
+                crate::protocol::parse_unique(generated.request_json.as_bytes()).unwrap();
+            assert_eq!(payload.source_revision, publishing.revision);
+            assert_eq!(payload.pull_request.body, exact_body);
+            assert_eq!(
+                payload.pull_request.update_target.as_ref().unwrap().number,
+                source.pull_request_number
+            );
+            assert!(
+                matches!(&payload.commit, WorkerDeliveryCommit::HostBaseRefresh { prepare_operation_id, receipt, .. } if prepare_operation_id.as_str() == refresh_prepare_intent.operation_id && receipt.as_ref() == &refresh)
+            );
+            let mut refreshed_publication = first_publish_receipt.clone();
+            refreshed_publication.effect_operation_id = generated.operation_id.clone();
+            refreshed_publication.source_revision = publishing.revision;
+            refreshed_publication.commit = VerifiedCommit::BaseRefresh {
+                receipt: refresh.clone(),
+            };
+            refreshed_publication.hook_gate = refresh.hook_gate.clone();
+            refreshed_publication.push.expected_remote_head = Some(first_head.clone());
+            refreshed_publication.push.observed_remote_head = refreshed_head.clone();
+            refreshed_publication.push.pushed_head = refreshed_head.clone();
+            refreshed_publication.push.force_with_lease = true;
+            refreshed_publication.pull_request.source_head = refreshed_head;
+            refreshed_publication.pull_request.body_digest = content_digest(exact_body);
+            let pr_key = format!(
+                "{}\0{}\0{}\0pull-request",
+                generated.operation_id, repository_id, root_id
+            );
+            refreshed_publication.pull_request.operation_id =
+                OperationId::parse(format!("rp-{}", content_digest(&pr_key))).unwrap();
+            store.connection.execute(
+                "UPDATE effects SET status='succeeded',attempt_count=1,receipt_json=?2 WHERE operation_id=?1 AND status='pending'",
+                rusqlite::params![generated.operation_id,serde_json::to_string(&refreshed_publication).unwrap()],
+            ).unwrap();
+            assert!(
+                crate::engine::host_transitions::consume_one_host_transition(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    &config_digest,
+                )
+                .unwrap()
+            );
+        }
         if single_publication {
             let reviewing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
             assert_eq!(reviewing.phase, Phase::Reviewing);
@@ -7065,6 +7221,24 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             assert_eq!(publication_snapshot.publication_receipts().len(), 1);
+            if base_refresh {
+                assert_eq!(
+                    publication_snapshot.prepared_receipt().base_refreshes.len(),
+                    1
+                );
+                let mut detached = publication_snapshot.prepared_receipt().clone();
+                detached.work_nodes[0].base_refresh_source = None;
+                assert!(
+                    crate::delivery_runtime::validate_implementation_publication_receipt(
+                        &plan,
+                        &detached,
+                        &project_id,
+                        &config.repositories,
+                        publication_snapshot.publication_receipts(),
+                    )
+                    .is_err()
+                );
+            }
             let accepted = publication_snapshot.accepted_plan();
             let validated_publications =
                 crate::delivery_runtime::validate_implementation_publication_receipt(
@@ -7133,6 +7307,15 @@ pub(crate) mod tests {
             );
             let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
             assert_eq!(assessing.phase, Phase::Assessing);
+            if base_refresh {
+                assert_eq!(subject.publications[0].published_head, "f".repeat(40));
+                assert_eq!(
+                    subject.publications[0].pull_request_number,
+                    first_publish_receipt.pull_request.number
+                );
+                assert_eq!(assessing.revision, 9);
+                return;
+            }
 
             let merge_result_json = serde_json::json!({
                 "pr_references": [format!("https://github.com/acme/repo-a/pull/{} (PR_{}); head {}; base main", subject.publications[0].pull_request_number, subject.publications[0].pull_request_node_id, subject.publications[0].published_head)],
@@ -7997,7 +8180,10 @@ pub(crate) mod tests {
                 branch: staged_branch.into(),
                 base_sha: first_head.clone(),
                 commit_mode: CommitMode::Native,
+                base_refresh: None,
+                base_refresh_source: None,
             }],
+            base_refreshes: Vec::new(),
         };
         let staged_intent = EffectIntent {
             request_json: pending.0.clone(),

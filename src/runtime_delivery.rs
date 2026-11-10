@@ -335,6 +335,14 @@ impl RuntimeDelivery {
         else {
             return Ok(PublicationMonitorTick::Unknown);
         };
+        if base_refresh_publication_is_not_yet_queued(
+            &resource,
+            &receipts,
+            &baseline,
+            &observation,
+        )? {
+            return Ok(PublicationMonitorTick::EffectReconciling);
+        }
         let publication = receipts
             .iter()
             .filter(|entry| entry.intent().kind == "publish_implementation")
@@ -372,6 +380,28 @@ impl RuntimeDelivery {
                 host.confirmed_pull_request = Some(pull.clone());
             }
         }
+        let mut reconciled_body_effect = None;
+        if host.confirmed_pull_request.is_none()
+            && let Some((_, receipt)) = publication.as_ref()
+            && let Some((pull, body_effect)) = reconciled_prepared_body_observation(
+                store,
+                &resource,
+                receipt,
+                &receipts,
+                &observation,
+                &baseline,
+            )?
+        {
+            host.confirmed_pull_request = Some(pull);
+            reconciled_body_effect = Some(body_effect);
+        }
+        if host.confirmed_pull_request.is_none()
+            && store.has_inflight_prepared_body_merge_effect(&resource, &observation)?
+        {
+            // The exact body is visible before the durable effect has been
+            // provider-reconciled. Keep the baseline unchanged and retry later.
+            return Ok(PublicationMonitorTick::Unknown);
+        }
         match store.classify_publication_observation(&resource, &observation, &host)? {
             crate::publication_monitor::PublicationClassification::Unchanged => {
                 Ok(PublicationMonitorTick::Unchanged)
@@ -400,13 +430,24 @@ impl RuntimeDelivery {
                         revision: saved.revision,
                     });
                 }
-                baseline = store.advance_publication_baseline(
-                    owner_generation,
-                    &baseline,
-                    &observation,
-                    succeeded,
-                    now_unix,
-                )?;
+                baseline = if let Some(body_effect) = reconciled_body_effect.as_ref() {
+                    store.advance_publication_baseline_after_merge_body(
+                        owner_generation,
+                        &baseline,
+                        &observation,
+                        succeeded,
+                        body_effect,
+                        now_unix,
+                    )?
+                } else {
+                    store.advance_publication_baseline(
+                        owner_generation,
+                        &baseline,
+                        &observation,
+                        succeeded,
+                        now_unix,
+                    )?
+                };
                 Ok(PublicationMonitorTick::BaselineAdvanced {
                     revision: baseline.revision,
                 })
@@ -690,6 +731,78 @@ impl RuntimeDelivery {
     }
 }
 
+fn base_refresh_publication_is_not_yet_queued(
+    resource: &crate::store::publication_monitor::PublicationResource,
+    receipts: &[crate::store::SucceededEffectReceipt],
+    baseline: &crate::store::publication_monitor::PublicationBaseline,
+    current: &crate::delivery_runtime::RepositoryPublicationObservation,
+) -> Result<bool, String> {
+    for prepare in receipts
+        .iter()
+        .filter(|entry| entry.intent().kind == "prepare_worktrees")
+    {
+        let prepared: crate::delivery_runtime::PreparedWorktreesEffectReceipt =
+            crate::protocol::parse_unique(prepare.receipt_json().as_bytes())
+                .map_err(|e| e.to_string())?;
+        for node in prepared.work_nodes.iter().filter(|node| {
+            node.repository_id == resource.repository_id && node.branch == resource.branch
+        }) {
+            let (Some(refresh), Some(source)) = (&node.base_refresh, &node.base_refresh_source)
+            else {
+                continue;
+            };
+            let queued = receipts.iter().any(|entry| {
+                if entry.intent().kind != "publish_implementation" { return false; }
+                serde_json::from_str::<crate::delivery_runtime::PublishImplementationEffectPayload>(
+                    &entry.intent().request_json,
+                ).is_ok_and(|payload| matches!(payload.commit,
+                    crate::delivery_runtime::WorkerDeliveryCommit::HostBaseRefresh { prepare_operation_id, .. }
+                        if prepare_operation_id.as_str() == prepare.intent().operation_id
+                ))
+            });
+            if queued {
+                continue;
+            }
+            if baseline.observation.remote_head.as_deref() != Some(refresh.old_child_head.as_str())
+                || current.remote_head.as_deref() != Some(refresh.new_child_head.as_str())
+            {
+                continue;
+            }
+            let (
+                crate::delivery_forge::ObservationCapability::Known(old_pulls),
+                crate::delivery_forge::ObservationCapability::Known(new_pulls),
+            ) = (&baseline.observation.pull_requests, &current.pull_requests)
+            else {
+                continue;
+            };
+            let old = old_pulls
+                .iter()
+                .find(|pull| pull.number == source.pull_request_number);
+            let new = new_pulls
+                .iter()
+                .find(|pull| pull.number == source.pull_request_number);
+            if old.zip(new).is_some_and(|(old, new)| {
+                old.node_id == source.pull_request_node_id
+                    && new.node_id == source.pull_request_node_id
+                    && new.url == source.pull_request_url
+                    && new.state == "open"
+                    && !new.merged
+                    && new.merged_at.is_none()
+                    && new.source_branch == node.branch
+                    && new.source_head == refresh.new_child_head
+                    && new.base_branch == old.base_branch
+                    && new.base_sha == refresh.new_parent_sha
+                    && new.title == source.pull_request_title
+                    && new.body.as_deref() == Some(source.exact_body.as_str())
+                    && old.body.as_deref() == Some(source.exact_body.as_str())
+            }) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 impl crate::human_runtime::PublicationAdoptionSource for RuntimeDelivery {
     fn observe_publication(
         &self,
@@ -803,6 +916,140 @@ pub fn build(
 
 fn valid_git_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn reconciled_prepared_body_observation(
+    store: &crate::store::ConfigStore,
+    resource: &crate::store::publication_monitor::PublicationResource,
+    publication: &crate::delivery_runtime::ImplementationPublicationReceipt,
+    receipts: &[crate::store::SucceededEffectReceipt],
+    observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+    baseline: &crate::store::publication_monitor::PublicationBaseline,
+) -> Result<
+    Option<(
+        crate::delivery_forge::ObservedPullRequest,
+        crate::store::SucceededEffectReceipt,
+    )>,
+    String,
+> {
+    use crate::forge::MergeEffectOperation;
+    use crate::merge_executor::{MergeStepEffectRequest, MergeStepReceipt};
+    use crate::merge_policy::MergeProcedureOperation;
+
+    if observation.remote_head != baseline.observation.remote_head {
+        return Ok(None);
+    }
+    let crate::delivery_forge::ObservationCapability::Known(previous) =
+        &baseline.observation.pull_requests
+    else {
+        return Ok(None);
+    };
+    let crate::delivery_forge::ObservationCapability::Known(current) = &observation.pull_requests
+    else {
+        return Ok(None);
+    };
+    if previous.len() != current.len() {
+        return Ok(None);
+    }
+    let Some(prior) = previous.iter().find(|pull| {
+        pull.number == publication.pull_request.number
+            && pull.node_id == publication.pull_request.node_id
+    }) else {
+        return Ok(None);
+    };
+    for stored in receipts.iter().filter(|entry| {
+        entry.intent().kind
+            == crate::engine::reducer::effect_name(&crate::effects::EffectKind::Merge)
+            && entry.intent().project_id == resource.project_id
+            && entry.intent().subject_type == "ticket_run"
+            && entry.intent().subject_id == resource.ticket_run_id.as_str()
+    }) {
+        let request: MergeStepEffectRequest =
+            match serde_json::from_str(&stored.intent().request_json) {
+                Ok(request) => request,
+                Err(_) => continue,
+            };
+        let receipt: MergeStepReceipt = match serde_json::from_str(stored.receipt_json()) {
+            Ok(receipt) => receipt,
+            Err(_) => continue,
+        };
+        let outer_request_digest = sha256(stored.intent().request_json.as_bytes());
+        let Some(work) = store.merge_work_item(
+            &resource.project_id,
+            &resource.ticket_run_id,
+            crate::domain::ids::Revision(request.awaiting_merge_revision.0),
+        )?
+        else {
+            continue;
+        };
+        if request.work_id != work.work_id
+            || request.assessed_revision != work.assessed_revision
+            || stored.intent().request_digest != outer_request_digest
+            || !request.prior_receipts.is_empty()
+            || work.document.authority.execution_time_base_guard
+                == crate::merge_policy::EvidenceState::Pass
+            || work.document.procedure.steps.first().is_none_or(|step| {
+                step.key != request.step_key
+                    || !matches!(
+                        step.operation,
+                        MergeProcedureOperation::UpdatePullRequestBody { .. }
+                    )
+            })
+            || receipt.step_key != request.step_key
+            || !matches!(
+                receipt.certainty,
+                crate::forge::EffectCertainty::Applied | crate::forge::EffectCertainty::Recovered
+            )
+            || receipt.request_digest != receipt.effect_intent.request_digest
+            || receipt.acknowledgement.operation_key != receipt.operation_key
+            || receipt.acknowledgement.request_digest != receipt.request_digest
+            || stored.intent().expected_revision != Some(request.awaiting_merge_revision.0)
+        {
+            continue;
+        }
+        let MergeEffectOperation::UpdateBody(body) = &receipt.effect_intent.operation else {
+            continue;
+        };
+        let subject = &work.document.assessment.subject;
+        if body.pull.number.to_string() != subject.pull_request_id
+            || body.pull.expected_node_id.as_deref() != Some(subject.pull_request_node_id.as_str())
+            || body.pull.repository.expected_id != Some(subject.forge_repository_id)
+            || body.pull.repository.host != subject.forge_host
+            || body.expected_head_sha != subject.head_sha
+            || work.document.prepared_body.as_deref() != Some(body.exact_body.as_str())
+            || sha256(body.exact_body.as_bytes()) != body.approved_body_digest.as_str()
+            || publication.pull_request.source_head != body.expected_head_sha
+            || publication.pull_request.number != body.pull.number
+            || publication.pull_request.node_id != subject.pull_request_node_id
+        {
+            continue;
+        }
+        let Some(pull) = current.iter().find(|pull| pull.number == prior.number) else {
+            continue;
+        };
+        let only_body_changed = pull.number == prior.number
+            && pull.node_id == prior.node_id
+            && pull.url == prior.url
+            && pull.state == prior.state
+            && pull.merged == prior.merged
+            && pull.merged_at == prior.merged_at
+            && pull.source_branch == prior.source_branch
+            && pull.source_head == prior.source_head
+            && pull.base_branch == prior.base_branch
+            && pull.base_sha == prior.base_sha
+            && pull.title == prior.title
+            && pull.timeline == prior.timeline
+            && pull.body.as_deref() == Some(body.exact_body.as_str())
+            && pull.source_branch == resource.branch
+            && pull.source_head == publication.pull_request.source_head
+            && pull.base_branch == publication.pull_request.base_branch
+            && pull.state == "open"
+            && !pull.merged;
+        if only_body_changed {
+            return Ok(Some((pull.clone(), stored.clone())));
+        }
+    }
+    Ok(None)
 }
 
 fn selected_publication_resource(

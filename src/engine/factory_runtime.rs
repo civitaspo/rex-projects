@@ -651,6 +651,59 @@ pub(crate) fn queue_ready_worker_recovery_wakes(
     Ok(queued)
 }
 
+fn validate_merge_reassessment_plan_scope(
+    store: &ConfigStore,
+    owner_generation: u64,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    proposal: &crate::engine::orchestration::PlanReadyPayload,
+) -> Result<(), String> {
+    let Some((transition_revision, evidence)) = store
+        .ticket_run_transition_evidence(
+            owner_generation,
+            &run.project_id,
+            &run.ticket_run_id,
+            0,
+            256,
+        )?
+        .into_iter()
+        .find(|(_, evidence)| evidence["kind"] == "merge_reassessment_required")
+    else {
+        return Ok(());
+    };
+    if transition_revision > run.revision {
+        return Err("Coordinator rework plan is not after its host reassessment request".into());
+    }
+    let source_revision = evidence["source_revision"]
+        .as_u64()
+        .ok_or("merge reassessment lacks its immutable source revision")?;
+    if evidence["ticket_run_id"].as_str() != Some(run.ticket_run_id.as_str())
+        || source_revision >= transition_revision
+    {
+        return Err("merge reassessment transition has an invalid TicketRun scope".into());
+    }
+    let work = store
+        .merge_work_item(
+            &run.project_id,
+            &run.ticket_run_id,
+            crate::domain::ids::Revision(source_revision),
+        )?
+        .ok_or("merge reassessment lost its immutable MergeWorkItem")?;
+    let prior = store
+        .latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
+        .ok_or("merge reassessment has no prior accepted work plan")?;
+    if evidence["work_id"].as_str() != Some(work.work_id.as_str())
+        || evidence["prior_accepted_plan_digest"].as_str()
+            != Some(work.accepted_plan_digest.as_str())
+        || prior.plan_digest != work.accepted_plan_digest
+        || evidence["prior_accepted_plan"]
+            != serde_json::to_value(&prior.proposal).map_err(|error| error.to_string())?
+        || proposal.plan != prior.proposal
+    {
+        return Err("Coordinator rework plan changed the prior accepted tasks, repositories, nodes, or dependencies; only freshly observed bases may change".into());
+    }
+    Ok(())
+}
+
 fn apply_agent_result(
     store: &mut ConfigStore,
     owner_generation: u64,
@@ -941,6 +994,7 @@ fn apply_agent_result(
     let RoleResultPayload::PlanReady(proposal) = &result.validated.typed_payload else {
         return Err("validated PlanReady kind has a different typed payload".into());
     };
+    validate_merge_reassessment_plan_scope(store, owner_generation, &current, proposal)?;
     let observed_bases = services.observe_base_heads()?;
     let validated = crate::engine::orchestration::validate_work_plan(
         ticket_run_id,

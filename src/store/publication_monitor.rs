@@ -44,6 +44,105 @@ pub struct PublicationBaseline {
 }
 
 impl ConfigStore {
+    /// True only while the exact first prepared-body Merge operation is still
+    /// pending, claimed, or uncertain for the PR observed by the monitor. This
+    /// suppresses a false irregularity during provider reconciliation; it does
+    /// not advance the baseline or treat the body as an authorized receipt.
+    pub fn has_inflight_prepared_body_merge_effect(
+        &self,
+        resource: &PublicationResource,
+        observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+    ) -> Result<bool, String> {
+        use crate::merge_executor::MergeStepEffectRequest;
+        use crate::merge_policy::MergeProcedureOperation;
+
+        let crate::delivery_forge::ObservationCapability::Known(pulls) = &observation.pull_requests
+        else {
+            return Ok(false);
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT request_json,request_digest,expected_revision FROM effects WHERE project_id=?1 AND subject_type='ticket_run' AND subject_id=?2 AND kind='merge' AND status IN ('pending','claimed','uncertain') ORDER BY created_at_unix DESC LIMIT 64",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    resource.project_id.as_str(),
+                    resource.ticket_run_id.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for (json, digest, expected_revision) in rows {
+            if format!("{:x}", Sha256::digest(json.as_bytes())) != digest {
+                continue;
+            }
+            let request: MergeStepEffectRequest =
+                match crate::protocol::parse_unique(json.as_bytes()) {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+            if expected_revision != Some(request.awaiting_merge_revision.0)
+                || !request.prior_receipts.is_empty()
+            {
+                continue;
+            }
+            let Some(work) = self.merge_work_item(
+                &resource.project_id,
+                &resource.ticket_run_id,
+                crate::domain::ids::Revision(request.awaiting_merge_revision.0),
+            )?
+            else {
+                continue;
+            };
+            let Some(step) = work.document.procedure.steps.first() else {
+                continue;
+            };
+            if request.work_id != work.work_id
+                || request.assessed_revision != work.assessed_revision
+                || request.step_key != step.key
+                || step.key != request.step_key
+                || !matches!(
+                    step.operation,
+                    MergeProcedureOperation::UpdatePullRequestBody { .. }
+                )
+                || work.document.authority.execution_time_base_guard
+                    == crate::merge_policy::EvidenceState::Pass
+            {
+                continue;
+            }
+            let pull_id = &work.document.assessment.subject.pull_request_id;
+            let expected_node = &work.document.assessment.subject.pull_request_node_id;
+            let Some(pull) = pulls.iter().find(|pull| {
+                pull.number.to_string() == *pull_id
+                    && pull.node_id == *expected_node
+                    && pull.source_branch == resource.branch
+                    && pull.source_head == work.document.assessment.subject.head_sha
+                    && pull.state == "open"
+                    && !pull.merged
+            }) else {
+                continue;
+            };
+            let Some(body) = &work.document.prepared_body else {
+                continue;
+            };
+            // The exact body is part of the immutable MergeWorkItem. This is
+            // only a classification hold while the matching effect is active;
+            // baseline advancement still requires a succeeded provider receipt.
+            if pull.body.as_deref() == Some(body.as_str()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// A ticket Coordinator must wait for implementation publication to settle before it
     /// reserves a new turn. Publication advances the TicketRun revision, and a reservation
     /// made against the preceding revision cannot be launched safely afterward.
@@ -284,6 +383,169 @@ impl ConfigStore {
             return Err("publication baseline changed before compare-and-swap".into());
         }
         tx.commit().map_err(|e| e.to_string())?;
+        self.load_publication_baseline(&expected.resource)?
+            .ok_or_else(|| "advanced publication baseline disappeared".into())
+    }
+
+    /// Advance a publication baseline for the one body-only mutation that was
+    /// provider-reconciled from an exact, previously approved MergeWork step.
+    /// This deliberately does not reinterpret a Merge receipt as a publish
+    /// receipt and permits no other PR field or timeline change.
+    pub fn advance_publication_baseline_after_merge_body(
+        &mut self,
+        owner_generation: u64,
+        expected: &PublicationBaseline,
+        next: &crate::delivery_runtime::RepositoryPublicationObservation,
+        publication: &super::SucceededEffectReceipt,
+        body_effect: &super::SucceededEffectReceipt,
+        now_unix: i64,
+    ) -> Result<PublicationBaseline, String> {
+        use crate::forge::MergeEffectOperation;
+        use crate::merge_executor::{MergeStepEffectRequest, MergeStepReceipt};
+        use crate::merge_policy::MergeProcedureOperation;
+
+        let publish_intent = publication.intent();
+        if publish_intent.kind != "publish_implementation"
+            || publish_intent.project_id != expected.resource.project_id
+            || publish_intent.subject_type != "ticket_run"
+            || publish_intent.subject_id != expected.resource.ticket_run_id.as_str()
+        {
+            return Err("body-only baseline advance lacks its original publication receipt".into());
+        }
+        let publish_request: crate::delivery_runtime::PublishImplementationEffectPayload =
+            crate::protocol::parse_unique(publish_intent.request_json.as_bytes())?;
+        let publish_receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+            crate::protocol::parse_unique(publication.receipt_json().as_bytes())?;
+        let merge_intent = body_effect.intent();
+        let outer_request_digest =
+            format!("{:x}", Sha256::digest(merge_intent.request_json.as_bytes()));
+        if merge_intent.kind
+            != crate::engine::reducer::effect_name(&crate::engine::reducer::EffectKind::Merge)
+            || merge_intent.project_id != expected.resource.project_id
+            || merge_intent.subject_type != "ticket_run"
+            || merge_intent.subject_id != expected.resource.ticket_run_id.as_str()
+            || merge_intent.request_digest != outer_request_digest
+        {
+            return Err("body-only baseline advance lacks a succeeded Merge effect".into());
+        }
+        let merge_request: MergeStepEffectRequest =
+            crate::protocol::parse_unique(merge_intent.request_json.as_bytes())?;
+        let merge_receipt: MergeStepReceipt =
+            crate::protocol::parse_unique(body_effect.receipt_json().as_bytes())?;
+        let work = self
+            .merge_work_item(
+                &expected.resource.project_id,
+                &expected.resource.ticket_run_id,
+                crate::domain::ids::Revision(merge_request.awaiting_merge_revision.0),
+            )?
+            .ok_or("body-only baseline advance has no immutable MergeWorkItem")?;
+        let MergeEffectOperation::UpdateBody(body) = &merge_receipt.effect_intent.operation else {
+            return Err("succeeded Merge receipt is not a PR body update".into());
+        };
+        let crate::delivery_forge::ObservationCapability::Known(previous) =
+            &expected.observation.pull_requests
+        else {
+            return Err("body-only baseline advance has no complete prior PR observation".into());
+        };
+        let crate::delivery_forge::ObservationCapability::Known(current) = &next.pull_requests
+        else {
+            return Err("body-only baseline advance has no complete current PR observation".into());
+        };
+        let prior = previous
+            .iter()
+            .find(|pull| {
+                pull.number == publish_receipt.pull_request.number
+                    && pull.node_id == publish_receipt.pull_request.node_id
+            })
+            .ok_or("body-only baseline prior PR identity differs from publication")?;
+        let pull = current
+            .iter()
+            .find(|pull| pull.number == prior.number)
+            .ok_or("body-only baseline current PR is absent")?;
+        let subject = &work.document.assessment.subject;
+        if publish_request.ticket_run_id != expected.resource.ticket_run_id
+            || merge_request.assessed_revision != work.assessed_revision
+            || publish_receipt.repository_id != expected.resource.repository_id
+            || publish_receipt.pull_request.source_branch != expected.resource.branch
+            || publish_receipt.pull_request.source_head != body.expected_head_sha
+            || merge_request.work_id != work.work_id
+            || !merge_request.prior_receipts.is_empty()
+            || merge_request.step_key
+                != work
+                    .document
+                    .procedure
+                    .steps
+                    .first()
+                    .map(|s| s.key.as_str())
+                    .unwrap_or_default()
+            || !matches!(
+                work.document.procedure.steps.first().map(|s| &s.operation),
+                Some(MergeProcedureOperation::UpdatePullRequestBody { .. })
+            )
+            || work.document.authority.execution_time_base_guard
+                == crate::merge_policy::EvidenceState::Pass
+            || merge_receipt.step_key != merge_request.step_key
+            || merge_receipt.operation_key
+                != format!("{}:{}", merge_intent.operation_id, merge_request.step_key)
+            || merge_receipt.effect_intent.operation_key != merge_receipt.operation_key
+            || merge_receipt.request_digest != merge_receipt.effect_intent.request_digest
+            || merge_receipt.acknowledgement.operation_key != merge_receipt.operation_key
+            || merge_receipt.acknowledgement.request_digest != merge_receipt.request_digest
+            || !matches!(
+                merge_receipt.certainty,
+                crate::forge::EffectCertainty::Applied | crate::forge::EffectCertainty::Recovered
+            )
+            || merge_intent.expected_revision != Some(merge_request.awaiting_merge_revision.0)
+            || body.pull.number.to_string() != subject.pull_request_id
+            || body.pull.expected_node_id.as_deref() != Some(subject.pull_request_node_id.as_str())
+            || body.pull.repository.expected_id != Some(subject.forge_repository_id)
+            || body.pull.repository.host != subject.forge_host
+            || body.expected_head_sha != subject.head_sha
+            || work.document.prepared_body.as_deref() != Some(body.exact_body.as_str())
+            || format!("{:x}", Sha256::digest(body.exact_body.as_bytes()))
+                != body.approved_body_digest.as_str()
+            || format!(
+                "{:x}",
+                Sha256::digest(prior.body.as_deref().unwrap_or_default().as_bytes())
+            ) != body.expected_prior_body_digest.as_str()
+            || next.remote_head != expected.observation.remote_head
+            || previous.len() != current.len()
+            || pull.number != prior.number
+            || pull.node_id != prior.node_id
+            || pull.url != prior.url
+            || pull.state != prior.state
+            || pull.merged != prior.merged
+            || pull.merged_at != prior.merged_at
+            || pull.source_branch != prior.source_branch
+            || pull.source_head != prior.source_head
+            || pull.base_branch != prior.base_branch
+            || pull.base_sha != prior.base_sha
+            || pull.title != prior.title
+            || pull.timeline != prior.timeline
+            || pull.body.as_deref() != Some(body.exact_body.as_str())
+            || pull.source_branch != expected.resource.branch
+            || pull.source_head != publish_receipt.pull_request.source_head
+            || pull.base_branch != expected.base_branch
+            || pull.state != "open"
+            || pull.merged
+        {
+            return Err("body-only baseline change is not bound to the exact prepared PR body and unchanged publication subject".into());
+        }
+        let json = super::canonical_json(next)?;
+        let digest = baseline_digest(json.as_bytes());
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let changed = tx.execute(
+            "UPDATE publication_baselines SET current_snapshot_json=?5,current_digest=?6,revision=revision+1,last_effect_operation_id=?7,updated_at_unix=?8 WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4 AND revision=?9 AND current_digest=?10 AND (last_effect_operation_id IS NULL OR last_effect_operation_id<>?7)",
+            params![expected.resource.project_id.as_str(),expected.resource.ticket_run_id.as_str(),expected.resource.repository_id.as_str(),expected.resource.branch,json,digest,merge_intent.operation_id,now_unix,expected.revision,expected.digest],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("publication baseline changed before body-only compare-and-swap".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
         self.load_publication_baseline(&expected.resource)?
             .ok_or_else(|| "advanced publication baseline disappeared".into())
     }
