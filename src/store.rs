@@ -6695,6 +6695,15 @@ pub(crate) mod tests {
         ]);
         let corrected_head = run_git(&["rev-parse", "HEAD"]);
         let mut applied = snapshot(&"a".repeat(64));
+        applied.source_files[0].sha256 = Digest::parse(content_digest("x")).unwrap();
+        applied.source_files.push(crate::config::SourceFile {
+            kind: crate::config::SourceKind::Directory,
+            path: "/tmp/config/profiles/worker_codex".into(),
+            canonical_path: "/tmp/config/profiles/worker_codex".into(),
+            sha256: Digest::parse("0".repeat(64)).unwrap(),
+            bytes: 0,
+            contents: String::new(),
+        });
         let project_id = ProjectId::parse("project-a").unwrap();
         let repository_id = RepositoryId::parse("repo-a").unwrap();
         applied.config.repositories.insert(
@@ -6703,7 +6712,7 @@ pub(crate) mod tests {
                 "clone_url": "https://github.com/acme/repo-a.git",
                 "base_branch": "main",
                 "forge": "github",
-                "merge": {"instructions": "# Merge instructions\nPrepare the body, execute the configured merge, then verify the result.\n"}
+                "merge": {"executor": "request", "instructions": "# Merge instructions\nPrepare the body, request the configured merge, then verify the result.\n/merge\n"}
             }))
             .unwrap(),
         );
@@ -7627,18 +7636,56 @@ pub(crate) mod tests {
                     .target_body_digest
                     .as_str()
             );
+            let rendered_merge_prompt = crate::roles::render_role_prompt(
+                &applied,
+                &crate::roles::PromptContext {
+                    project_id: project_id.clone(),
+                    profile_id: None,
+                    role: crate::domain::types::Role::MergeDecision,
+                    operation_recipe: None,
+                    repositories: vec![repository_id.clone()],
+                    ticket: Some(crate::roles::TicketBrief {
+                        ticket_id: ticket_id.clone(),
+                        ticket_revision: assessing.revision,
+                        title: "Improve safety".into(),
+                        body: "Implement the requested change".into(),
+                        acceptance: vec!["The change is verified".into()],
+                    }),
+                    recovery_summary: None,
+                    accepted_plan: Some(serde_json::to_string(&accepted.proposal).unwrap()),
+                    accepted_plan_digest: Some(accepted.plan_digest.clone()),
+                    implementation_publication_subject: Some(subject.clone()),
+                    completion_context: None,
+                    previous_decisions: Vec::new(),
+                    required_evidence: Vec::new(),
+                    stop_conditions: Vec::new(),
+                    assigned_commit_mode: None,
+                },
+                &std::env::current_exe().unwrap(),
+            )
+            .unwrap();
+            let merge_instruction_source = rendered_merge_prompt
+                .instruction_sources
+                .iter()
+                .find(|source| {
+                    source.layer == "merge-procedure"
+                        && source.source == format!("repository:{repository_id}:merge")
+                })
+                .expect("rendered MergeDecision prompt includes the repository merge source")
+                .source
+                .clone();
             let typed_intent = serde_json::json!({
                 "assessment_id": public_assessment["assessment_id"],
                 "pr_identities": [public_assessment["pull_request_reference"].as_str().unwrap()],
                 "policy_digest": public_assessment["policy_digest"],
                 "prepared_body_digest": public_assessment["prepared_body_proposal"]["target_body_digest"],
                 "steps": [
-                    {"kind":"update_pull_request_body","instruction_reference":"merge.instructions#body","rationale":"add the host-prepared authorship trailer"},
-                    {"kind":"direct_merge","instruction_reference":"merge.instructions#execute","rationale":"execute the configured merge"},
-                    {"kind":"verify_merge_commit","instruction_reference":"merge.instructions#verify","rationale":"verify the resulting merge commit"}
+                    {"kind":"update_pull_request_body","instruction_reference":format!("{merge_instruction_source}#prepare-body"),"rationale":"add the host-prepared authorship trailer"},
+                    {"kind":"request_merge","instruction_reference":format!("{merge_instruction_source}#request-merge"),"rationale":"request the configured merge"},
+                    {"kind":"verify_merge_commit","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"verify the resulting merge commit"}
                 ],
                 "post_merge_verification": [
-                    {"kind":"merge_commit_recorded","instruction_reference":"merge.instructions#verify","rationale":"confirm the remote merge commit"}
+                    {"kind":"merge_commit_recorded","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"confirm the remote merge commit"}
                 ]
             });
             let intent_message = crate::roles::RoleResultMessage {
@@ -7702,6 +7749,25 @@ pub(crate) mod tests {
                     document_replies,
                 )
                 .unwrap();
+            assert!(matches!(
+                document.procedure.steps[1].operation,
+                crate::merge_policy::MergeProcedureOperation::RequestMerge { ref exact_comment }
+                    if exact_comment == "/merge"
+            ));
+            let trusted_merge_source = document
+                .authority
+                .sources
+                .get(&merge_instruction_source)
+                .expect("the rendered merge source is carried into host authority");
+            assert_eq!(
+                trusted_merge_source.bytes,
+                applied.config.repositories[&repository_id]
+                    .merge
+                    .instructions
+                    .as_deref()
+                    .unwrap()
+                    .as_bytes()
+            );
             for (index, invalid_identity) in
                 ["acme/repo-a#4", "https://github.com/foreign/repo/pull/4"]
                     .into_iter()
