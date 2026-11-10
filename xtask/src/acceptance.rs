@@ -102,6 +102,176 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
     }
 }
 
+fn qualification_roles_for_stage(stage: Option<&str>) -> &'static [&'static str] {
+    if stage == Some(NATIVE_WORKER_BLOCK_LOSS_STAGE) {
+        &["planner", "worker", "supervisor", "coordinator"]
+    } else if matches!(
+        stage,
+        Some(HOST_COMMIT_REVIEWER_INBOX_STAGE)
+            | Some(HOST_COMMIT_WORKER_REWORK_STAGE)
+            | Some(HOST_COMMIT_VERIFICATION_REVIEWER_STAGE)
+    ) {
+        &["supervisor", "coordinator", "planner", "worker", "reviewer"]
+    } else if matches!(
+        stage,
+        Some(COORDINATOR_WORKER_INBOX_STAGE) | Some(WORKER_RECOVERY_INBOX_STAGE)
+    ) {
+        &["supervisor", "coordinator", "planner", "worker"]
+    } else if stage.is_some() {
+        &["supervisor", "coordinator"]
+    } else {
+        &PROVIDER_ROLES
+    }
+}
+
+struct QualificationOutcome {
+    qualifications: Vec<(String, String, String, String, Value)>,
+    terminal_qualifications: BTreeMap<String, String>,
+    project_started: bool,
+    coordinator_qualification_wait_proof: Option<Value>,
+    qualification_failure: bool,
+}
+
+fn qualify_profiles(
+    request: &Request<'_>,
+    provider_roles: &[&str],
+    bounded_coordinator_stage: bool,
+    trace: &mut Vec<Value>,
+    mut run_product: impl FnMut(&[&str]) -> Result<ProcessOutput, String>,
+    mut observe_coordinator_wait: impl FnMut() -> Value,
+) -> Result<QualificationOutcome, String> {
+    let mut qualifications = Vec::new();
+    let mut terminal_qualifications = BTreeMap::new();
+    let mut project_started = false;
+    let mut coordinator_qualification_wait_proof = None;
+    let qualification_deadline = Instant::now() + QUALIFICATION_LIMIT;
+    let mut qualification_failure = false;
+    for role in provider_roles.iter().copied() {
+        let phase_start = qualifications.len();
+        for project in ["operations_project"] {
+            let request_id = format!("acceptance-{project}-{role}");
+            let output = run_product(&[
+                "provider",
+                "qualify",
+                "--project",
+                project,
+                "--role",
+                role,
+                "--request-id",
+                &request_id,
+                "--json",
+            ])?;
+            if !output.status.is_some_and(|status| status.success()) {
+                trace.push(json!({"step":"provider_qualification_queue","project":project,"role":role,"status":"rejected","stderr":String::from_utf8_lossy(&output.stderr_tail)}));
+                break;
+            }
+            let response = json_stdout(&output);
+            let digest = response["request_digest"]
+                .as_str()
+                .ok_or("provider qualify response omitted request_digest")?;
+            trace.push(json!({"step":"provider_qualification_queue","project":project,"role":role,"status":"queued","request_id":request_id,"request_digest":digest,"emulator":"EMULATED"}));
+            qualifications.push((
+                project.to_owned(),
+                role.to_owned(),
+                request_id,
+                digest.to_owned(),
+                response,
+            ));
+        }
+        loop {
+            let mut phase_pending = false;
+            for (project, role, request_id, expected_digest, queued) in
+                &qualifications[phase_start..]
+            {
+                if terminal_qualifications.contains_key(request_id) {
+                    continue;
+                }
+                let output =
+                    run_product(&["--json", "provider", "status", "--request-id", request_id])?;
+                if !output.status.is_some_and(|status| status.success()) {
+                    phase_pending = true;
+                    continue;
+                }
+                let status = json_stdout(&output);
+                if status["request_digest"].as_str() != Some(expected_digest)
+                    || status["project_id"] != queued["project_id"]
+                    || status["role"] != queued["role"]
+                    || status["profile_id"] != queued["profile_id"]
+                    || status["config_revision"] != queued["config_revision"]
+                    || status["config_digest"] != queued["config_digest"]
+                {
+                    phase_pending = true;
+                    continue;
+                }
+                let status_name = status["status"].as_str().unwrap_or("invalid");
+                if status_name == "verified" {
+                    if status["qualification_receipt_digest"]
+                        .as_str()
+                        .is_none_or(|digest| {
+                            digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                    {
+                        trace.push(json!({"step":"provider_qualification_status","project":project,"role":role,"request_id":request_id,"status":"invalid_receipt_digest","evidence":status,"emulator":"EMULATED"}));
+                        qualification_failure = true;
+                        break;
+                    }
+                    trace.push(json!({"step":"provider_qualification_status","project":project,"role":role,"request_id":request_id,"status":status_name,"evidence":status,"emulator":"EMULATED"}));
+                    terminal_qualifications.insert(request_id.clone(), status_name.to_owned());
+                } else if status_name == "failed" || status_name == "unknown" {
+                    trace.push(json!({"step":"provider_qualification_status","project":project,"role":role,"request_id":request_id,"status":status_name,"evidence":status,"emulator":"EMULATED"}));
+                    let diagnostic = read_probe_diagnostic(request.fixture_root, project, role);
+                    if let Some(diagnostic) = diagnostic {
+                        trace.push(json!({"step":"emulated_provider_probe_diagnostic","project":project,"role":role,"request_id":request_id,"evidence":diagnostic,"emulator":"EMULATED"}));
+                    }
+                    terminal_qualifications.insert(request_id.clone(), status_name.to_owned());
+                    qualification_failure = true;
+                    break;
+                } else {
+                    phase_pending = true;
+                }
+            }
+            if qualification_failure || !phase_pending {
+                break;
+            }
+            if Instant::now() >= qualification_deadline {
+                trace.push(json!({"step":"provider_qualification_poll","status":"timed_out","role":role,"phase_request_count":qualifications.len()-phase_start}));
+                qualification_failure = true;
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        if qualification_failure {
+            break;
+        }
+        if bounded_coordinator_stage && role == "supervisor" {
+            let project = FIXTURE_PROJECT_ID;
+            let output = run_product(&["project", "start", project, "--json"])?;
+            if !output.status.is_some_and(|status| status.success()) {
+                trace.push(json!({"step":"project_start_after_supervisor_qualification","project":project,"status":"rejected","evidence":json_stdout(&output)}));
+                qualification_failure = true;
+                break;
+            }
+            project_started = true;
+            trace.push(json!({"step":"project_start_after_supervisor_qualification","project":project,"status":"queued","evidence":json_stdout(&output)}));
+            let proof = observe_coordinator_wait();
+            trace.push(json!({"step":"coordinator_missing_qualification_wait","status":proof["status"],"evidence":proof}));
+            if proof["status"] != "passed" {
+                qualification_failure = true;
+                coordinator_qualification_wait_proof = Some(proof);
+                break;
+            }
+            coordinator_qualification_wait_proof = Some(proof);
+        }
+    }
+    Ok(QualificationOutcome {
+        qualifications,
+        terminal_qualifications,
+        project_started,
+        coordinator_qualification_wait_proof,
+        qualification_failure,
+    })
+}
+
 /// Start from real external boundaries: generate private fixture configuration and a local bare
 /// remote, apply it through the product CLI, and run the product controller in an owned Rex
 /// window. The report preserves the last actual dashboard/status snapshot when later stages are
@@ -137,18 +307,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         || host_commit_reviewer_inbox_stage
         || worker_recovery_inbox_stage
         || native_worker_block_loss_stage;
-    let provider_roles: &[&str] = if host_commit_reviewer_inbox_stage {
-        &["supervisor", "coordinator", "planner", "worker", "reviewer"]
-    } else if coordinator_worker_inbox_stage
-        || worker_recovery_inbox_stage
-        || native_worker_block_loss_stage
-    {
-        &["supervisor", "coordinator", "planner", "worker"]
-    } else if bounded_coordinator_stage {
-        &["supervisor", "coordinator"]
-    } else {
-        &PROVIDER_ROLES
-    };
+    let provider_roles = qualification_roles_for_stage(stage.as_deref());
     fs::create_dir_all(request.fixture_root).map_err(|error| error.to_string())?;
     let state_root = request.fixture_root.join("state");
     fs::create_dir(&state_root).map_err(|error| error.to_string())?;
@@ -298,139 +457,28 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     // We qualify roles in pipeline order, polling the public durable status endpoint before
     // moving on. Fixture transport is explicitly EMULATED; it never writes qualification rows
     // or synthesizes host receipts.
-    let mut qualifications = Vec::new();
-    let mut terminal_qualifications = BTreeMap::new();
-    let mut project_started = false;
-    let mut coordinator_qualification_wait_proof = None;
-    let qualification_deadline = Instant::now() + QUALIFICATION_LIMIT;
-    let mut qualification_failure = false;
-    for role in provider_roles.iter().copied() {
-        let phase_start = qualifications.len();
-        for project in ["operations_project"] {
-            let request_id = format!("acceptance-{project}-{role}");
-            let output = product(
-                &request,
-                &state_root,
-                &[
-                    "provider",
-                    "qualify",
-                    "--project",
-                    project,
-                    "--role",
-                    role,
-                    "--request-id",
-                    &request_id,
-                    "--json",
-                ],
-            )?;
-            if !output.status.is_some_and(|status| status.success()) {
-                trace.push(json!({"step":"provider_qualification_queue","project":project,"role":role,"status":"rejected","stderr":String::from_utf8_lossy(&output.stderr_tail)}));
-                break;
-            }
-            let response = json_stdout(&output);
-            let digest = response["request_digest"]
-                .as_str()
-                .ok_or("provider qualify response omitted request_digest")?;
-            trace.push(json!({"step":"provider_qualification_queue","project":project,"role":role,"status":"queued","request_id":request_id,"request_digest":digest,"emulator":"EMULATED"}));
-            qualifications.push((project, role, request_id, digest.to_owned(), response));
-        }
-        loop {
-            let mut phase_pending = false;
-            for (project, role, request_id, expected_digest, queued) in
-                &qualifications[phase_start..]
-            {
-                if terminal_qualifications.contains_key(request_id) {
-                    continue;
-                }
-                let output = product(
-                    &request,
-                    &state_root,
-                    &["--json", "provider", "status", "--request-id", request_id],
-                )?;
-                if !output.status.is_some_and(|status| status.success()) {
-                    phase_pending = true;
-                    continue;
-                }
-                let status = json_stdout(&output);
-                if status["request_digest"].as_str() != Some(expected_digest)
-                    || status["project_id"] != queued["project_id"]
-                    || status["role"] != queued["role"]
-                    || status["profile_id"] != queued["profile_id"]
-                    || status["config_revision"] != queued["config_revision"]
-                    || status["config_digest"] != queued["config_digest"]
-                {
-                    phase_pending = true;
-                    continue;
-                }
-                let status_name = status["status"].as_str().unwrap_or("invalid");
-                if status_name == "verified" {
-                    if status["qualification_receipt_digest"]
-                        .as_str()
-                        .is_none_or(|digest| {
-                            digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())
-                        })
-                    {
-                        trace.push(json!({"step":"provider_qualification_status","project":project,"role":role,"request_id":request_id,"status":"invalid_receipt_digest","evidence":status,"emulator":"EMULATED"}));
-                        qualification_failure = true;
-                        break;
-                    }
-                    trace.push(json!({"step":"provider_qualification_status","project":project,"role":role,"request_id":request_id,"status":status_name,"evidence":status,"emulator":"EMULATED"}));
-                    terminal_qualifications.insert(request_id.clone(), status_name.to_owned());
-                } else if status_name == "failed" || status_name == "unknown" {
-                    trace.push(json!({"step":"provider_qualification_status","project":project,"role":role,"request_id":request_id,"status":status_name,"evidence":status,"emulator":"EMULATED"}));
-                    let diagnostic = read_probe_diagnostic(request.fixture_root, project, role);
-                    if let Some(diagnostic) = diagnostic {
-                        trace.push(json!({"step":"emulated_provider_probe_diagnostic","project":project,"role":role,"request_id":request_id,"evidence":diagnostic,"emulator":"EMULATED"}));
-                    }
-                    terminal_qualifications.insert(request_id.clone(), status_name.to_owned());
-                    qualification_failure = true;
-                    break;
-                } else {
-                    phase_pending = true;
-                }
-            }
-            if qualification_failure || !phase_pending {
-                break;
-            }
-            if Instant::now() >= qualification_deadline {
-                trace.push(json!({"step":"provider_qualification_poll","status":"timed_out","role":role,"phase_request_count":qualifications.len()-phase_start}));
-                qualification_failure = true;
-                break;
-            }
-            std::thread::sleep(POLL_INTERVAL);
-        }
-        if qualification_failure {
-            break;
-        }
-        if bounded_coordinator_stage && role == "supervisor" {
-            let project = FIXTURE_PROJECT_ID;
-            let output = product(
-                &request,
-                &state_root,
-                &["project", "start", project, "--json"],
-            )?;
-            if !output.status.is_some_and(|status| status.success()) {
-                trace.push(json!({"step":"project_start_after_supervisor_qualification","project":project,"status":"rejected","evidence":json_stdout(&output)}));
-                qualification_failure = true;
-                break;
-            }
-            project_started = true;
-            trace.push(json!({"step":"project_start_after_supervisor_qualification","project":project,"status":"queued","evidence":json_stdout(&output)}));
-            let proof = observe_coordinator_qualification_wait(
+    let qualification = qualify_profiles(
+        &request,
+        provider_roles,
+        bounded_coordinator_stage,
+        &mut trace,
+        |words| product(&request, &state_root, words),
+        || {
+            observe_coordinator_qualification_wait(
                 &request,
                 &state_root,
                 &block,
                 "fixture_coordinator",
-            );
-            trace.push(json!({"step":"coordinator_missing_qualification_wait","status":proof["status"],"evidence":proof}));
-            if proof["status"] != "passed" {
-                qualification_failure = true;
-                coordinator_qualification_wait_proof = Some(proof);
-                break;
-            }
-            coordinator_qualification_wait_proof = Some(proof);
-        }
-    }
+            )
+        },
+    )?;
+    let QualificationOutcome {
+        qualifications,
+        terminal_qualifications,
+        project_started,
+        coordinator_qualification_wait_proof,
+        qualification_failure,
+    } = qualification;
     let all_verified = !qualification_failure
         && qualifications.len() == provider_roles.len()
         && qualifications.iter().all(|(_, _, request_id, _, _)| {
@@ -3954,6 +4002,209 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn native_worker_qualifies_planner_and_worker_before_project_start() {
+        use std::cell::RefCell;
+        use std::collections::{BTreeSet, HashMap};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let cli = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .expect("xtask unit-test binary is under target/debug/deps")
+            .join("rex-projects");
+        assert!(
+            cli.is_file(),
+            "the actual product CLI is built beside xtask"
+        );
+        let rex = Path::new("/usr/bin/true");
+        let request = Request {
+            cli: &cli,
+            rex,
+            rex_server: "unix:///fixture.sock",
+            rex_session: "qualification-sequence-test",
+            expected_instance: "fixture-instance",
+            fixture_root: root,
+        };
+        let executable = std::env::current_exe().unwrap();
+        prepare_profiles(&request, &executable, &cli, ProfilePreparation::default()).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            config_text(&request, &executable, true),
+        )
+        .unwrap();
+        let state_root = root.join("state");
+        fs::create_dir(&state_root).unwrap();
+        prepare_local_repository(&request, &executable).unwrap();
+        let applied = product(
+            &request,
+            &state_root,
+            &["config", "apply", "--bootstrap", "--json"],
+        )
+        .unwrap();
+        require_success("apply isolated test configuration", &applied).unwrap();
+
+        let verified_roles = RefCell::new(BTreeSet::new());
+        let queued = RefCell::new(HashMap::<String, Value>::new());
+        let commands = RefCell::new(Vec::<Vec<String>>::new());
+        let mut trace = Vec::new();
+        let roles = qualification_roles_for_stage(Some(NATIVE_WORKER_BLOCK_LOSS_STAGE));
+        let qualification = qualify_profiles(
+            &request,
+            roles,
+            true,
+            &mut trace,
+            |words| {
+                let words = words.iter().map(|word| (*word).to_owned()).collect::<Vec<_>>();
+                let command = words.iter().map(String::as_str).collect::<Vec<_>>();
+                assert_product_command_reaches_expected_runtime_error(
+                    &request,
+                    &state_root,
+                    &words,
+                );
+                commands.borrow_mut().push(words.clone());
+                match command.as_slice() {
+                    ["provider", "qualify", "--project", project, "--role", role, "--request-id", request_id, "--json"] => {
+                        assert_eq!(*project, "operations_project");
+                        let request_digest = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+                        let response = json!({
+                            "request_id":request_id,
+                            "request_digest":request_digest,
+                            "status":"queued",
+                            "project_id":project,
+                            "role":role,
+                            "profile_id":format!("fixture_{role}"),
+                            "profile_digest":"d".repeat(64),
+                            "config_revision":1,
+                            "config_digest":"c".repeat(64)
+                        });
+                        queued.borrow_mut().insert(request_id.to_string(), response.clone());
+                        Ok(successful_process_output(response))
+                    }
+                    ["--json", "provider", "status", "--request-id", request_id] => {
+                        let mut response = queued
+                            .borrow()
+                            .get(*request_id)
+                            .expect("status follows a queued request")
+                            .clone();
+                        response["status"] = json!("verified");
+                        response["qualification_receipt_digest"] = json!("e".repeat(64));
+                        verified_roles
+                            .borrow_mut()
+                            .insert(response["role"].as_str().unwrap().to_owned());
+                        Ok(successful_process_output(response))
+                    }
+                    ["project", "start", project, "--json"] => {
+                        assert_eq!(*project, "operations_project");
+                        let verified = verified_roles.borrow();
+                        assert!(
+                            verified.contains("planner") && verified.contains("worker"),
+                            "Planner and Worker qualifications must be verified before Project start; got {verified:?}"
+                        );
+                        assert!(
+                            !verified.contains("coordinator"),
+                            "Coordinator must remain unqualified for the existing missing-qualification guard"
+                        );
+                        Ok(successful_process_output(json!({"accepted":true,"state":"queued"})))
+                    }
+                    other => panic!("qualification loop generated unexpected command: {other:?}"),
+                }
+            },
+            || {
+                assert!(!verified_roles.borrow().contains("coordinator"));
+                json!({"status":"passed","parked_diagnostic":"missing exact Coordinator qualification"})
+            },
+        )
+        .unwrap();
+
+        assert!(qualification.project_started);
+        assert_eq!(
+            qualification.coordinator_qualification_wait_proof.unwrap()["status"],
+            "passed"
+        );
+        assert!(
+            qualification
+                .terminal_qualifications
+                .values()
+                .all(|status| status == "verified")
+        );
+        assert_eq!(
+            qualification
+                .qualifications
+                .iter()
+                .map(|(_, role, _, _, _)| role.as_str())
+                .collect::<Vec<_>>(),
+            ["planner", "worker", "supervisor", "coordinator"]
+        );
+        assert_eq!(
+            commands.borrow().last().unwrap(),
+            &[
+                "--json".to_owned(),
+                "provider".to_owned(),
+                "status".to_owned(),
+                "--request-id".to_owned(),
+                "acceptance-operations_project-coordinator".to_owned()
+            ]
+        );
+    }
+
+    fn successful_process_output(value: Value) -> ProcessOutput {
+        let status = std::process::Command::new("/usr/bin/true")
+            .status()
+            .expect("test success status helper is available");
+        ProcessOutput {
+            status: Some(status),
+            stdout: serde_json::to_vec(&value).unwrap(),
+            stderr_tail: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            cleanup_confirmed: true,
+        }
+    }
+
+    fn assert_product_command_reaches_expected_runtime_error(
+        request: &Request<'_>,
+        state_root: &Path,
+        words: &[String],
+    ) {
+        let mut args = vec![
+            OsString::from("--config"),
+            request.fixture_root.join("config.toml").into_os_string(),
+            OsString::from("--state-root"),
+            state_root.as_os_str().to_owned(),
+        ];
+        args.extend(words.iter().map(OsString::from));
+        let xdg_state = OsString::from("XDG_STATE_HOME");
+        let xdg_state_value = request.fixture_root.join("xdg-state").into_os_string();
+        let output = invoke(
+            request.cli,
+            &args,
+            Some(request.fixture_root),
+            Some((xdg_state, xdg_state_value)),
+            STEP_TIMEOUT,
+        )
+        .expect("actual product CLI can parse the generated command vector");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr_tail)
+        );
+        let command = words.iter().map(String::as_str).collect::<Vec<_>>();
+        let expected = match command.as_slice() {
+            ["provider", "qualify", ..] => "no foreground machine controller is running",
+            ["project", "start", ..] => "no foreground machine controller is running",
+            ["--json", "provider", "status", ..] => "provider qualification request",
+            _ => panic!("unexpected product command vector: {words:?}"),
+        };
+        assert!(
+            text.contains(expected),
+            "actual product CLI did not reach expected post-parse response `{expected}` for {words:?}: {text}"
+        );
     }
 
     #[test]

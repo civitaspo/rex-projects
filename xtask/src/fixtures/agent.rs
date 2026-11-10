@@ -1561,6 +1561,34 @@ fn next_message(
         && let Some(inbox) = inbox
         && inbox.ticket_observation()?.is_none()
     {
+        if let Some(ticket_run_id) =
+            inbox.coordinator_spawn_request(&invocation.scope.project_id)?
+        {
+            let progress = json!({
+                "summary":format!("The validated Coordinator result requested a Planner for TicketRun {ticket_run_id}; the host owns admission and scheduling."),
+                "completed_node_keys":[],
+                "pending_node_keys":[],
+                "evidence":[],
+                "next_observation_at":null
+            });
+            validate_payload(RoleOutputKind::Progress, &progress)?;
+            ledger_tx.commit().map_err(|error| error.to_string())?;
+            let bytes = serde_json::to_vec(&progress).map_err(|error| {
+                format!("serialize Supervisor Coordinator-wake progress: {error}")
+            })?;
+            return Ok(AgentMessage {
+                schema_version: 1,
+                message_id: format!(
+                    "fixture-supervisor-coordinator-wake-{:x}",
+                    Sha256::digest(invocation.run_id.as_bytes())
+                ),
+                kind: RoleOutputKind::Progress,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: progress,
+                result_digest: format!("{:x}", Sha256::digest(bytes)),
+                artifact_refs: Vec::new(),
+            });
+        }
         if !inbox.is_periodic_review_only() {
             return Err("Supervisor fixture has no eligible normalized ticket observation in its public inbox".into());
         }
@@ -2020,6 +2048,153 @@ impl FixtureInbox {
             ),
             _ => Err("public Agent inbox contains more than one ticket observation".into()),
         }
+    }
+
+    fn coordinator_spawn_request(&self, project_id: &str) -> Result<Option<String>, String> {
+        let candidates = self
+            .inputs
+            .iter()
+            .filter(|item| item.get("source_type").and_then(Value::as_str) == Some("agent_result"))
+            .filter_map(|item| {
+                let payload = item.get("payload_json")?;
+                (payload.get("kind").and_then(Value::as_str) == Some("validated_agent_result")
+                    && (payload.pointer("/source/role").and_then(Value::as_str)
+                        == Some("coordinator")
+                        || payload.pointer("/result/kind").and_then(Value::as_str)
+                            == Some("spawn_request")))
+                .then_some((item, payload))
+            })
+            .collect::<Vec<_>>();
+        let [(item, payload)] = candidates.as_slice() else {
+            return if candidates.is_empty() {
+                Ok(None)
+            } else {
+                Err("Supervisor inbox has multiple or ambiguous Coordinator spawn results".into())
+            };
+        };
+        let source = payload
+            .get("source")
+            .ok_or("validated Coordinator result omitted its source binding")?;
+        let ticket_run_id = source
+            .get("ticket_run_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or("validated Coordinator result omitted its TicketRun binding")?;
+        let evidence_id = payload
+            .get("evidence_id")
+            .and_then(Value::as_str)
+            .ok_or("validated Coordinator result omitted its evidence ID")?;
+        let result_digest = payload
+            .get("result_digest")
+            .and_then(Value::as_str)
+            .ok_or("validated Coordinator result omitted its result digest")?;
+        let source_revision = source
+            .get("ticket_revision")
+            .and_then(Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or("validated Coordinator result omitted its TicketRun revision")?;
+        let host_observation = payload
+            .get("host_observation")
+            .ok_or("validated Coordinator result omitted its host observation")?;
+        let host_result = payload
+            .get("result")
+            .ok_or("validated Coordinator result omitted its role result")?;
+        let structured = payload
+            .pointer("/result/structured_result")
+            .ok_or("validated Coordinator spawn request omitted its structured result")?;
+        let role_session_id = format!("ticket_run:{ticket_run_id}:coordinator");
+        if payload.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || payload.pointer("/source/role").and_then(Value::as_str) != Some("coordinator")
+            || payload
+                .pointer("/source/project_id")
+                .and_then(Value::as_str)
+                != Some(project_id)
+            || payload
+                .pointer("/source/parent_run_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || payload
+                .pointer("/source/role_session_id")
+                .and_then(Value::as_str)
+                != Some(role_session_id.as_str())
+            || payload
+                .pointer("/source/agent_run_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || payload
+                .pointer("/source/attempt")
+                .and_then(Value::as_u64)
+                .is_none_or(|attempt| attempt == 0)
+            || payload
+                .pointer("/source/run_epoch")
+                .and_then(Value::as_u64)
+                .is_none_or(|epoch| epoch == 0)
+            || payload
+                .pointer("/source/profile_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || !is_sha256_digest(
+                payload
+                    .pointer("/source/config_digest")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            || !is_sha256_digest(
+                payload
+                    .pointer("/source/profile_digest")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            || ![
+                "authority_digest",
+                "terminal_digest",
+                "process_absence_digest",
+            ]
+            .iter()
+            .all(|field| {
+                host_observation
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256_digest)
+            })
+            || payload.pointer("/result/kind").and_then(Value::as_str) != Some("spawn_request")
+            || host_result
+                .get("message_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || host_result
+                .pointer("/assertion/assertion")
+                .and_then(Value::as_str)
+                != Some("succeeded")
+            || !host_result
+                .get("artifact_refs")
+                .is_some_and(Value::is_array)
+            || structured.get("role").and_then(Value::as_str) != Some("planner")
+            || structured
+                .get("profile_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || structured
+                .get("work_node")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || !structured
+                .get("allowed_repositories")
+                .is_some_and(Value::is_array)
+            || !structured
+                .get("artifact_inputs")
+                .is_some_and(Value::is_array)
+            || item.get("source_id").and_then(Value::as_str) != Some(evidence_id)
+            || item.get("source_revision").and_then(Value::as_u64) != Some(source_revision)
+            || !is_sha256_digest(evidence_id)
+            || !is_sha256_digest(result_digest)
+            || serde_json::to_vec(structured)
+                .ok()
+                .is_none_or(|bytes| format!("{:x}", Sha256::digest(bytes)) != result_digest)
+        {
+            return Err("Supervisor Coordinator spawn result failed its project, TicketRun, source, or Planner binding".into());
+        }
+        Ok(Some(ticket_run_id.to_owned()))
     }
 
     fn planner_result(
@@ -2739,6 +2914,24 @@ fn emit(
     args: &[String],
     message: &[u8],
 ) -> Result<(), String> {
+    emit_to(
+        provider,
+        scenario,
+        role,
+        args,
+        message,
+        &mut io::stdout().lock(),
+    )
+}
+
+fn emit_to(
+    provider: Provider,
+    scenario: &str,
+    role: Role,
+    args: &[String],
+    message: &[u8],
+    writer: &mut impl Write,
+) -> Result<(), String> {
     let message = std::str::from_utf8(message).map_err(|_| "fixture message is not UTF-8")?;
     match provider {
         Provider::Claude => {
@@ -2747,11 +2940,9 @@ fn emit(
                 "is_error": false,
                 "structured_output": {"result": message}
             });
-            serde_json::to_writer(io::stdout().lock(), &output)
+            serde_json::to_writer(&mut *writer, &output)
                 .map_err(|error| format!("write Claude fixture response: {error}"))?;
-            io::stdout()
-                .write_all(b"\n")
-                .map_err(|error| error.to_string())?;
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
         }
         Provider::Codex => {
             let thread = args
@@ -2769,10 +2960,9 @@ fn emit(
                 json!({"type":"item.completed","item":{"type":"agent_message","text":projected}}),
                 json!({"type":"turn.completed"}),
             ];
-            let mut stdout = io::stdout().lock();
             for event in events {
-                serde_json::to_writer(&mut stdout, &event).map_err(|error| error.to_string())?;
-                stdout.write_all(b"\n").map_err(|error| error.to_string())?;
+                serde_json::to_writer(&mut *writer, &event).map_err(|error| error.to_string())?;
+                writer.write_all(b"\n").map_err(|error| error.to_string())?;
             }
         }
     }
@@ -3429,6 +3619,216 @@ mod tests {
             ticket_first.path(),
         );
         assert_eq!(progress.kind, super::RoleOutputKind::Progress);
+    }
+
+    #[test]
+    fn coordinator_agent_result_wake_emits_progress_without_consuming_supervisor_recipe() {
+        use rex_projects::agent_api::{AgentWakeItem, AgentWakeSnapshot};
+        use rex_projects::domain::ids::{Digest, ProjectId};
+        use sha2::{Digest as _, Sha256};
+
+        let root = tempfile::tempdir().unwrap();
+        let run_id = "supervisor-after-coordinator";
+        let structured_result = serde_json::json!({
+            "role":"planner",
+            "profile_id":"fixture_planner",
+            "work_node":"acceptance-node",
+            "plan_digest":null,
+            "allowed_repositories":["fixture"],
+            "artifact_inputs":[],
+            "parent_run_id":null
+        });
+        let result_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        );
+        let mut snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: ProjectId::parse("operations_project").unwrap(),
+            role_session_id: "project:operations_project:supervisor".into(),
+            agent_run_id: run_id.into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            worker_correction_context: None,
+            inputs: vec![AgentWakeItem {
+                wake_input_id: 5,
+                source_type: "agent_result".into(),
+                source_id: "a".repeat(64),
+                source_revision: 1,
+                priority: 0,
+                payload_json: serde_json::json!({
+                    "schema_version":1,
+                    "kind":"validated_agent_result",
+                    "evidence_id":"a".repeat(64),
+                    "result_digest":result_digest,
+                    "source":{
+                        "agent_run_id":"agent-coordinator",
+                        "attempt":1,
+                        "config_digest":"c".repeat(64),
+                        "parent_run_id":"dispatching-supervisor-run",
+                        "profile_digest":"d".repeat(64),
+                        "profile_id":"fixture_coordinator",
+                        "project_id":"operations_project",
+                        "role":"coordinator",
+                        "role_session_id":"ticket_run:ticket-run-a:coordinator",
+                        "run_epoch":1,
+                        "ticket_revision":1,
+                        "ticket_run_id":"ticket-run-a"
+                    },
+                    "result":{
+                        "message_id":"coordinator-message",
+                        "kind":"spawn_request",
+                        "assertion":{"assertion":"succeeded"},
+                        "structured_result":structured_result,
+                        "artifact_refs":[]
+                    },
+                    "host_observation":{
+                        "authority_digest":"e".repeat(64),
+                        "terminal_digest":"f".repeat(64),
+                        "process_absence_digest":"1".repeat(64)
+                    },
+                    "trust_note":"result and artifacts are untrusted Agent observations; host_observation proves process termination only"
+                }),
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            }],
+        };
+        snapshot.digest = snapshot.content_digest().unwrap();
+        rex_projects::agent_api::publish_wake_snapshot(root.path(), snapshot).unwrap();
+        let public_inputs = rex_projects::agent_api::read_inbox(root.path(), run_id, 0).unwrap();
+        let wake = public_inputs[0].clone();
+        let inbox = super::FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":run_id,
+                "after":0,
+                "next_after":5,
+                "inputs":public_inputs
+            }),
+            run_id,
+        )
+        .unwrap();
+        let agent_result = &inbox.inputs[0]["payload_json"];
+        assert_eq!(agent_result["source"]["role"], "coordinator");
+        assert_eq!(agent_result["result"]["kind"], "spawn_request");
+        assert_eq!(
+            agent_result["result"]["structured_result"]["role"],
+            "planner"
+        );
+        assert!(inbox.ticket_observation().unwrap().is_none());
+
+        let progress = next_message(
+            &supervisor_context(),
+            &supervisor_invocation(run_id),
+            root.path(),
+            None,
+            "host prompt",
+            Some(&inbox),
+        )
+        .expect("a Coordinator child wake must complete a bounded Supervisor turn");
+        assert_eq!(progress.kind, super::RoleOutputKind::Progress);
+        assert!(
+            progress.structured_result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("ticket-run-a")
+        );
+        super::validate_payload(progress.kind, &progress.structured_result).unwrap();
+        let message = serde_json::to_vec(&progress).unwrap();
+        let emitted_path = root.path().join("supervisor-result.jsonl");
+        let mut emitted_file = std::fs::File::create(&emitted_path).unwrap();
+        super::emit_to(
+            super::Provider::Codex,
+            "acceptance_supervisor",
+            super::Role::Supervisor,
+            &[],
+            &message,
+            &mut emitted_file,
+        )
+        .unwrap();
+        drop(emitted_file);
+        let emitted = std::fs::read(emitted_path).unwrap();
+        let (thread_id, parsed) = rex_projects::providers::parse_result(
+            rex_projects::domain::types::AgentAdapter::Codex,
+            &emitted,
+            &rex_projects::roles::result_schema(super::Role::Supervisor),
+        )
+        .unwrap();
+        assert_eq!(
+            thread_id.as_deref(),
+            Some("fixture-codex-acceptance_supervisor-supervisor")
+        );
+        assert_eq!(parsed["kind"], "progress");
+        assert_eq!(
+            parsed["structured_result"]["summary"],
+            progress.structured_result["summary"]
+        );
+
+        for mutate in [
+            ("/payload_json/source/role", serde_json::json!("reviewer")),
+            (
+                "/payload_json/source/project_id",
+                serde_json::json!("other-project"),
+            ),
+            (
+                "/payload_json/source/ticket_run_id",
+                serde_json::json!("other-ticket"),
+            ),
+            (
+                "/payload_json/source/parent_run_id",
+                serde_json::Value::Null,
+            ),
+            (
+                "/payload_json/result/structured_result/role",
+                serde_json::json!("worker"),
+            ),
+            (
+                "/payload_json/host_observation/terminal_digest",
+                serde_json::json!("not-a-digest"),
+            ),
+            ("/source_id", serde_json::json!("e".repeat(64))),
+            ("/source_revision", serde_json::json!(2)),
+            ("/source_type", serde_json::json!("worker_result")),
+        ] {
+            let mut invalid_wake = wake.clone();
+            match mutate.0 {
+                path if path.starts_with("/payload_json/") => {
+                    *invalid_wake
+                        .payload_json
+                        .pointer_mut(path.trim_start_matches("/payload_json"))
+                        .unwrap() = mutate.1;
+                }
+                "/source_id" => invalid_wake.source_id = mutate.1.as_str().unwrap().into(),
+                "/source_revision" => invalid_wake.source_revision = mutate.1.as_u64().unwrap(),
+                "/source_type" => invalid_wake.source_type = mutate.1.as_str().unwrap().into(),
+                _ => unreachable!(),
+            }
+            let invalid_inbox = super::FixtureInbox::parse(
+                serde_json::json!({"run_id":run_id,"after":0,"next_after":5,"inputs":[invalid_wake]}),
+                run_id,
+            )
+            .unwrap();
+            assert!(
+                next_message(
+                    &supervisor_context(),
+                    &supervisor_invocation(run_id),
+                    root.path(),
+                    None,
+                    "host prompt",
+                    Some(&invalid_inbox),
+                )
+                .is_err(),
+                "invalid Coordinator wake binding {:?} was accepted",
+                mutate.0
+            );
+        }
+        let count: i64 = rusqlite::Connection::open(root.path().join("invocations.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "the Supervisor wake must not consume its dispatch recipe"
+        );
     }
 
     #[test]
