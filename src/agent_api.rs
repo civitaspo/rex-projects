@@ -11,7 +11,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{ArtifactId, Digest, OperationId, ProjectId, TicketId, TicketRunId};
+use crate::domain::ids::{
+    ArtifactId, Digest, HumanRequestId, OperationId, ProjectId, TicketId, TicketRunId,
+};
 use crate::engine::orchestration::{
     ReviewReadyPayload, RoleArtifactKind, RoleArtifactReference, WorkerRecoveryAuthorization,
 };
@@ -100,6 +102,19 @@ pub struct HostCompletionContext {
     pub scope: HostCompletionScope,
     pub operation_completion: HostOperationCompletion,
     pub implementation_publication: HostImplementationPublication,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_decision: Option<HostHumanDecisionEvidence>,
+}
+
+/// Historical evidence for a completed merge; this value grants no approval capability.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostHumanDecisionEvidence {
+    pub request_id: HumanRequestId,
+    pub work_id: Digest,
+    pub request_digest: Digest,
+    pub receipt_digest: Digest,
+    pub receipt: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

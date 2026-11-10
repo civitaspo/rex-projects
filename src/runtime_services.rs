@@ -384,7 +384,7 @@ fn postmortem_completion_context(
             {
                 return None;
             }
-            Some((receipt, verified))
+            Some((receipt, verified, request.request_id))
         })
         .ok_or("Postmortem launch lacks the exact succeeded MergeWork verification receipt")?;
     let merge_receipt_json: serde_json::Value = serde_json::from_str(merge_effect.0.receipt_json())
@@ -393,8 +393,11 @@ fn postmortem_completion_context(
         "{:x}",
         sha2::Sha256::digest(merge_effect.0.receipt_json().as_bytes())
     ))?;
+    let human_decision =
+        store.historical_merge_work_review_evidence(&merge_effect.2, &merge_work)?;
     Ok(crate::agent_api::HostCompletionContext {
         schema_version: 1,
+        human_decision,
         scope: crate::agent_api::HostCompletionScope {
             project_id: run.project_id.clone(),
             ticket_run_id: run.ticket_run_id.clone(),
