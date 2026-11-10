@@ -2160,6 +2160,8 @@ impl HumanPresenterEffectHandler {
                     .into(),
             );
         }
+        create_private_dir(&artifact_root)
+            .map_err(|error| format!("create private human review artifact root: {error}"))?;
         Ok(Self {
             kind: EffectKind::RequestHumanReview,
             command,
@@ -2212,8 +2214,17 @@ impl HumanPresenterEffectHandler {
                     .into(),
             );
         }
-        let html_path = write_runtime_review_artifact(&self.artifact_root, review)
-            .map_err(|error| format!("write human review artifact: {error}"))?;
+        let existing = context.store.current_human_request(&review.request_id)?;
+        let html_path = if let Some(existing) = &existing {
+            if existing.request != *review || existing.rex_view_id != effect.rex_view_id {
+                return Err("human request ID was reused with different content".into());
+            }
+            refresh_existing_runtime_review_artifact(Path::new(&existing.bundle_path), review)
+                .map_err(|error| format!("validate existing human review artifact: {error}"))?
+        } else {
+            write_runtime_review_artifact(&self.artifact_root, review)
+                .map_err(|error| format!("write human review artifact: {error}"))?
+        };
         let inserted = if let Some(authority) = &effect.authority {
             context.store.register_human_request_with_authority(
                 context.owner_generation,
@@ -2334,10 +2345,13 @@ impl HumanPresenterEffectHandler {
             now,
             |store, human_request| self.observer.observe_current_subject(store, human_request),
         )?;
-        let summary = context
+        let Some(summary) = context
             .store
             .current_human_request(&effect.request.request_id)?
-            .ok_or_else(|| "durable human request is missing during reconciliation".to_owned())?;
+        else {
+            // A failed Submit can leave no request; replay the same immutable intent.
+            return self.present(request, context);
+        };
         if summary.lifecycle == HumanRequestLifecycle::Pending {
             // A crash or lost presenter reply may leave a durable request without a presentation
             // receipt. Reuse the stable request ID so command adapters can deduplicate safely.
@@ -2565,7 +2579,7 @@ pub fn write_runtime_review_artifact(
             ));
         }
     }
-    let directory = root.join(hex(&Sha256::digest(request.request_id.as_str().as_bytes())));
+    let directory = root.join(review_artifact_directory_name(request));
     create_private_dir(&directory)?;
     write_private_file(
         &directory.join("manifest.json"),
@@ -2583,6 +2597,31 @@ pub fn write_runtime_review_artifact(
     File::open(&directory)?.sync_all()?;
     File::open(&root)?.sync_all()?;
     Ok(directory.join("review.html"))
+}
+
+fn review_artifact_directory_name(request: &HumanRuntimeRequest) -> String {
+    hex(&Sha256::digest(request.request_id.as_str().as_bytes()))
+}
+
+fn refresh_existing_runtime_review_artifact(
+    html_path: &Path,
+    request: &HumanRuntimeRequest,
+) -> io::Result<PathBuf> {
+    let root = html_path.parent().and_then(Path::parent).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "review artifact has no root")
+    })?;
+    let expected_path = root
+        .join(review_artifact_directory_name(request))
+        .join("review.html");
+    if expected_path != html_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stored review artifact path does not match the request",
+        ));
+    }
+    let refreshed = write_runtime_review_artifact(root, request)?;
+    debug_assert_eq!(refreshed, html_path);
+    Ok(refreshed)
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
