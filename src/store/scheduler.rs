@@ -1037,18 +1037,23 @@ impl ConfigStore {
     }
 
     /// Return bounded role sessions that can be considered for another finite
-    /// Agent turn. Active or unknown AgentRuns suppress duplicate scheduling;
-    /// a future transactional launch-preparation call still owns the claim.
+    /// Agent turn. Pending inputs for exact terminal TicketRuns are superseded
+    /// in this active-owner transaction; other lifecycle states remain pending.
+    /// Active or unknown AgentRuns suppress duplicate scheduling, and launch
+    /// preparation still owns the claim.
     pub fn pending_role_wake_sessions(
-        &self,
+        &mut self,
         owner_generation: u64,
         limit: usize,
     ) -> Result<Vec<PendingRoleWakeSession>, String> {
         if limit == 0 || limit > 256 {
             return Err("pending role wake query limit must be between 1 and 256".into());
         }
-        let owner_is_active: bool = self
+        let tx = self
             .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let owner_is_active: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM controller_owners WHERE generation=?1 AND stopped_at_unix IS NULL)",
                 [owner_generation],
@@ -1058,7 +1063,7 @@ impl ConfigStore {
         if !owner_is_active {
             return Err("controller generation is not active".into());
         }
-        let mut statement = self.connection.prepare(
+        let mut statement = tx.prepare(
             "SELECT w.project_id,w.role_session_id,MAX(w.priority),MIN(w.created_at_unix),COUNT(*) \
              FROM role_wake_inputs w \
              JOIN projects p USING(project_id) \
@@ -1082,12 +1087,18 @@ impl ConfigStore {
                 ))
             })
             .map_err(|error| error.to_string())?;
-        rows.map(|row| {
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        let mut candidates = Vec::with_capacity(rows.len());
+        for row in rows {
             let (project, role_session_id, highest_priority, oldest_created_at_unix, pending_count) =
-                row.map_err(|error| error.to_string())?;
+                row;
             let (role, ticket_run_id, work_node_id) = parse_role_session_id(&role_session_id)?;
-            Ok(PendingRoleWakeSession {
-                project_id: ProjectId::parse(project)?,
+            let project_id = ProjectId::parse(project)?;
+            let candidate = PendingRoleWakeSession {
+                project_id,
                 role_session_id,
                 role,
                 ticket_run_id,
@@ -1095,9 +1106,32 @@ impl ConfigStore {
                 highest_priority,
                 oldest_created_at_unix,
                 pending_count,
-            })
-        })
-        .collect()
+            };
+            if let Some(ticket_run_id) = candidate.ticket_run_id.as_ref() {
+                let stored_run: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT project_id,internal_phase FROM ticket_runs WHERE ticket_run_id=?1",
+                        [ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                if let Some((stored_project, phase)) = stored_run
+                    && stored_project == candidate.project_id.as_str()
+                    && matches!(phase.as_str(), "done" | "canceled")
+                {
+                    tx.execute(
+                        "UPDATE role_wake_inputs SET lifecycle='superseded' WHERE project_id=?1 AND role_session_id=?2 AND lifecycle='pending'",
+                        params![candidate.project_id.as_str(), candidate.role_session_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    continue;
+                }
+            }
+            candidates.push(candidate);
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(candidates)
     }
 
     /// Verify a host status publication against the current persisted TicketRun state.
@@ -3179,13 +3213,15 @@ mod tests {
              CREATE TABLE project_runtimes(project_id TEXT PRIMARY KEY, observed_lifecycle TEXT NOT NULL, controller_generation INTEGER NOT NULL);
              CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY, role_session_id TEXT NOT NULL, state TEXT NOT NULL);
              CREATE TABLE role_wake_inputs(project_id TEXT NOT NULL, role_session_id TEXT NOT NULL, lifecycle TEXT NOT NULL, priority INTEGER NOT NULL, created_at_unix INTEGER NOT NULL);
+             CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, internal_phase TEXT NOT NULL);
              INSERT INTO controller_owners VALUES (7,NULL);
              INSERT INTO projects VALUES ('p-a','running'),('p-b','running');
              INSERT INTO project_runtimes VALUES ('p-a','running',7),('p-b','running',7);
+             INSERT INTO ticket_runs VALUES ('r-a','p-a','implementing');
              INSERT INTO role_wake_inputs VALUES ('p-a','ticket_run:r-a:coordinator','pending',2,10),('p-a','ticket_run:r-a:coordinator','pending',8,20),('p-b','project:p-b:supervisor','pending',9,15);
              INSERT INTO agent_runs VALUES ('run-active','project:p-b:supervisor','running');",
         ).unwrap();
-        let store = ConfigStore {
+        let mut store = ConfigStore {
             connection,
             _machine_lock: MachineLock { _file: None },
         };
@@ -3206,6 +3242,146 @@ mod tests {
             }
         );
         assert!(store.pending_role_wake_sessions(8, 10).is_err());
+    }
+
+    #[test]
+    fn terminal_ticket_wakes_do_not_starve_a_later_runnable_session() {
+        use super::ConfigStore;
+        use crate::store::MachineLock;
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE controller_owners(generation INTEGER PRIMARY KEY, stopped_at_unix INTEGER);
+             CREATE TABLE projects(project_id TEXT PRIMARY KEY, desired_lifecycle TEXT NOT NULL);
+             CREATE TABLE project_runtimes(project_id TEXT PRIMARY KEY, observed_lifecycle TEXT NOT NULL, controller_generation INTEGER NOT NULL);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY, role_session_id TEXT NOT NULL, state TEXT NOT NULL);
+             CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY, project_id TEXT NOT NULL, role_session_id TEXT NOT NULL, lifecycle TEXT NOT NULL, priority INTEGER NOT NULL, created_at_unix INTEGER NOT NULL);
+             CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, internal_phase TEXT NOT NULL);
+             INSERT INTO controller_owners VALUES (7,NULL);
+             INSERT INTO projects VALUES ('p-a','running');
+             INSERT INTO project_runtimes VALUES ('p-a','running',7);",
+        )
+        .unwrap();
+        for index in 0..33 {
+            let ticket_run_id = match index {
+                0 => "r",
+                1 => "r%_with:colon",
+                _ => "",
+            };
+            let ticket_run_id = if ticket_run_id.is_empty() {
+                format!("terminal-{index:02}")
+            } else {
+                ticket_run_id.to_owned()
+            };
+            let phase = if index == 32 { "canceled" } else { "done" };
+            let session = if index == 1 {
+                format!("ticket:{ticket_run_id}:worker:node-a")
+            } else {
+                format!("ticket_run:{ticket_run_id}:coordinator")
+            };
+            connection
+                .execute(
+                    "INSERT INTO ticket_runs VALUES (?1,'p-a',?2)",
+                    rusqlite::params![ticket_run_id, phase],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO role_wake_inputs(project_id,role_session_id,lifecycle,priority,created_at_unix) VALUES ('p-a',?1,'pending',10,?2)",
+                    rusqlite::params![session, index],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO ticket_runs VALUES ('r:child','p-a','implementing')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,lifecycle,priority,created_at_unix) VALUES ('p-a','ticket_run:r:child:coordinator','pending',10,100)",
+                [],
+            )
+            .unwrap();
+        let mut store = ConfigStore {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        };
+
+        assert!(store.pending_role_wake_sessions(7, 32).unwrap().is_empty());
+        let first_tick_superseded: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE lifecycle='superseded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_tick_superseded, 32);
+        let candidates = store.pending_role_wake_sessions(7, 32).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].ticket_run_id.as_ref().unwrap().as_str(),
+            "r:child"
+        );
+        let remaining_pending: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE lifecycle='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_pending, 1,
+            "terminal wake audit rows are retired from scheduling"
+        );
+        let total_wakes: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(total_wakes, 34, "superseding preserves wake audit rows");
+
+        for (ticket_run_id, stored_project) in
+            [("missing-run", None), ("other-project-run", Some("p-b"))]
+        {
+            if let Some(stored_project) = stored_project {
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO ticket_runs VALUES (?1,?2,'done')",
+                        rusqlite::params![ticket_run_id, stored_project],
+                    )
+                    .unwrap();
+            }
+            store
+                .connection
+                .execute(
+                    "INSERT INTO role_wake_inputs(project_id,role_session_id,lifecycle,priority,created_at_unix) VALUES ('p-a',?1,'pending',9,101)",
+                    [format!("ticket_run:{ticket_run_id}:coordinator")],
+                )
+                .unwrap();
+        }
+        let fail_closed_candidates = store.pending_role_wake_sessions(7, 32).unwrap();
+        assert_eq!(fail_closed_candidates.len(), 3);
+        assert!(fail_closed_candidates.iter().any(|candidate| {
+            candidate.ticket_run_id.as_ref().unwrap().as_str() == "missing-run"
+        }));
+        assert!(fail_closed_candidates.iter().any(|candidate| {
+            candidate.ticket_run_id.as_ref().unwrap().as_str() == "other-project-run"
+        }));
+        let unchanged_invalid_wakes: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE lifecycle='pending' AND role_session_id IN ('ticket_run:missing-run:coordinator','ticket_run:other-project-run:coordinator')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged_invalid_wakes, 2);
     }
 
     #[test]

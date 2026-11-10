@@ -6644,11 +6644,44 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(applied.revision.0, 2);
         let project_id = crate::domain::ids::ProjectId::parse("fixture-project").unwrap();
+        let ticket_run = crate::domain::ids::TicketRunId::parse("fixture-ticket-run").unwrap();
+        let coordinator_session = format!("ticket_run:{ticket_run}:coordinator");
         fixture
             .store
             .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
             .unwrap();
 
+        for index in 0..33 {
+            let ticket_run_id =
+                crate::domain::ids::TicketRunId::parse(format!("terminal-starvation-{index:02}"))
+                    .unwrap();
+            fixture
+                .store
+                .create_ticket_run(
+                    fixture.owner_generation,
+                    &project_id,
+                    &crate::domain::ids::TicketNamespace::parse("fixture").unwrap(),
+                    &crate::domain::ids::TicketId::parse(format!("TERMINAL-{index:02}")).unwrap(),
+                    &ticket_run_id,
+                    1,
+                    if index == 32 { "canceled" } else { "done" },
+                    if index == 32 { "canceled" } else { "done" },
+                )
+                .unwrap();
+            let role_session_id = if index == 1 {
+                format!("ticket:{ticket_run_id}:worker:node-a")
+            } else {
+                format!("ticket_run:{ticket_run_id}:coordinator")
+            };
+            fixture
+                .store
+                .test_connection()
+                .execute(
+                    "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_run_transition',?3,1,100,'{}','pending',1)",
+                    rusqlite::params![project_id.as_str(), role_session_id, ticket_run_id.as_str()],
+                )
+                .unwrap();
+        }
         let existing_qualification_json: String = fixture
             .store
             .test_connection()
@@ -6713,9 +6746,7 @@ pub(crate) mod tests {
             Some((4, "rejected_by_host".into()))
         );
 
-        let project = ProjectId::parse("fixture-project").unwrap();
-        let ticket_run = crate::domain::ids::TicketRunId::parse("fixture-ticket-run").unwrap();
-        let coordinator_session = format!("ticket_run:{ticket_run}:coordinator");
+        let project = project_id.clone();
         let pending_wakes = fixture
             .store
             .pending_role_wake_inputs(&project, &coordinator_session, 256)
@@ -6726,6 +6757,32 @@ pub(crate) mod tests {
             pending_wakes[0].source_id,
             fixture.ingested.receipt.evidence_id()
         );
+        assert!(
+            fixture
+                .store
+                .pending_role_wake_sessions(fixture.owner_generation, 32)
+                .unwrap()
+                .is_empty()
+        );
+        let launch_candidate = fixture
+            .store
+            .pending_role_wake_sessions(fixture.owner_generation, 32)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.role_session_id == coordinator_session)
+            .expect("the runnable Coordinator survives the bounded terminal-wake drain");
+        assert_eq!(launch_candidate.role, Role::Coordinator);
+        assert_eq!(launch_candidate.ticket_run_id.as_ref(), Some(&ticket_run));
+        let retired_terminal_wakes: u64 = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='ticket_run_transition' AND lifecycle='superseded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired_terminal_wakes, 33);
 
         let supervisor_view_id = crate::launch::RexView::derive_id(
             &project,
@@ -6901,7 +6958,7 @@ pub(crate) mod tests {
             agent_run_id: wake_run_id.clone(),
             project_id: project.clone(),
             role: Role::Coordinator,
-            role_session_id: coordinator_session.clone(),
+            role_session_id: launch_candidate.role_session_id.clone(),
             parent_run_id: Some(supervisor_run_id.clone()),
             parent_role: Some(Role::Supervisor),
             ticket_run_id: Some(ticket_run.clone()),
@@ -6943,6 +7000,19 @@ pub(crate) mod tests {
             fixture.store.prepare_role_launch(&reservation).unwrap(),
             crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. }
         ));
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT lifecycle FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='agent_result'",
+                    rusqlite::params![project.as_str(), coordinator_session],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "assigned",
+            "the real launch reservation assigns the selected wake"
+        );
         assert_eq!(
             fixture
                 .store
