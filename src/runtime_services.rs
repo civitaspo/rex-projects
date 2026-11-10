@@ -198,6 +198,12 @@ struct WorkerVerificationAssignment {
     published_head: String,
 }
 
+struct PostmortemArtifactEvidence {
+    artifacts: Vec<crate::agent_api::HostArtifactLocator>,
+    verification: Option<serde_json::Value>,
+    unavailable: Vec<String>,
+}
+
 struct ReviewerPublicationConfig<'a> {
     project: &'a crate::config::ProjectConfig,
     configuration_digest: &'a Digest,
@@ -230,6 +236,14 @@ fn accepted_publication_subject(
             "review or merge prompt is not at the current accepted publication or verification revision".into(),
         );
     }
+    publication_subject_for_snapshot(&snapshot, project_id, config)
+}
+
+fn publication_subject_for_snapshot(
+    snapshot: &crate::store::accepted_plans::AcceptedImplementationPublicationSnapshot,
+    project_id: &crate::domain::ids::ProjectId,
+    config: &ReviewerPublicationConfig<'_>,
+) -> Result<crate::delivery_runtime::ImplementationPublicationSetSubject, String> {
     let accepted = snapshot.accepted_plan();
     if accepted.configuration_digest != *config.configuration_digest {
         return Err("accepted work plan belongs to a stale configuration snapshot".into());
@@ -427,6 +441,7 @@ fn postmortem_completion_context(
             assessment: serde_json::to_value(&merge_work.document.assessment)
                 .map_err(|error| error.to_string())?,
             verification: None,
+            artifact_evidence_unavailable: None,
             merge_verification: crate::agent_api::HostMergeVerification {
                 work_id: merge_work.work_id,
                 configuration_digest: merge_work.configuration_digest,
@@ -3094,6 +3109,7 @@ impl FactoryRuntimeServices for RuntimeServices {
         create_private_dir(&control_dir)?;
         let wake_items = Self::wake_items_with_staged_artifacts(
             &self.artifacts,
+            &self.config,
             store,
             owner_generation,
             &candidate.project_id,
@@ -3383,8 +3399,210 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
 
 impl RuntimeServices {
     #[allow(clippy::too_many_arguments)]
+    fn stage_postmortem_artifacts(
+        artifact_store: &ArtifactStore,
+        config: &Config,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        project_id: &crate::domain::ids::ProjectId,
+        config_revision: u64,
+        config_digest: &Digest,
+        workspace: &Path,
+        context: &crate::agent_api::HostCompletionContext,
+    ) -> Result<PostmortemArtifactEvidence, String> {
+        let publication = &context.implementation_publication;
+        if context.scope.project_id != *project_id
+            || context.scope.configuration_digest != *config_digest
+        {
+            return Err("Postmortem evidence differs from the launch scope".into());
+        }
+        let work = store
+            .merge_work_item(
+                project_id,
+                &context.scope.ticket_run_id,
+                crate::domain::ids::Revision(publication.awaiting_merge_revision),
+            )?
+            .ok_or("Postmortem publication history has no MergeWork item")?;
+        if work.work_id != publication.merge_work_id
+            || work.accepted_plan_digest != publication.accepted_plan_digest
+            || work.configuration_digest != *config_digest
+            || work.assessed_revision.0 != publication.assessed_revision
+            || work.prepared_receipt_digest != publication.prepared_receipt_digest
+            || work.publication_set_digest != publication.publication_set_digest
+        {
+            return Err(
+                "Postmortem publication history differs from the completed MergeWork".into(),
+            );
+        }
+        let snapshot = store
+            .historical_implementation_publication_snapshot(owner_generation, &work)?
+            .ok_or("Postmortem publication history is unavailable for this completed merge")?;
+        let project = config
+            .projects
+            .get(project_id)
+            .ok_or("Postmortem Project configuration is unavailable")?;
+        let subject = publication_subject_for_snapshot(
+            &snapshot,
+            project_id,
+            &ReviewerPublicationConfig {
+                project,
+                configuration_digest: config_digest,
+                repositories: &config.repositories,
+            },
+        )?;
+        if snapshot.accepted_plan().plan_digest != work.accepted_plan_digest
+            || crate::forge::canonical_digest(snapshot.prepared_receipt())
+                .map_err(|error| error.to_string())?
+                != work.prepared_receipt_digest
+            || subject.digest()? != work.publication_set_digest
+        {
+            return Err(
+                "Postmortem evidence does not reproduce the completed publication subject".into(),
+            );
+        }
+        let (artifacts, unavailable) = Self::stage_publication_artifacts(
+            artifact_store,
+            store,
+            owner_generation,
+            project_id,
+            &context.scope.ticket_run_id,
+            config_revision,
+            config_digest,
+            workspace,
+            &snapshot,
+        );
+        let mut unique = BTreeMap::new();
+        for artifact in artifacts {
+            if let Some(prior) = unique.insert(artifact.artifact_id.clone(), artifact.clone())
+                && prior != artifact
+            {
+                return Err(
+                    "Postmortem artifact sources disagree on a repeated artifact ID".into(),
+                );
+            }
+        }
+        let artifacts = unique.into_values().collect::<Vec<_>>();
+        let total_bytes = artifacts
+            .iter()
+            .try_fold(0u64, |bytes, artifact| bytes.checked_add(artifact.bytes))
+            .ok_or("Postmortem artifact evidence exceeds its byte count limit")?;
+        if artifacts.len() > 256 || total_bytes > 64 * 1024 * 1024 {
+            return Err("Postmortem artifact evidence exceeds its 256 item or 64 MiB limit".into());
+        }
+        let verification = subject
+            .verification
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok(PostmortemArtifactEvidence {
+            artifacts,
+            verification,
+            unavailable,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_publication_artifacts(
+        artifact_store: &ArtifactStore,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        project_id: &crate::domain::ids::ProjectId,
+        ticket_run_id: &crate::domain::ids::TicketRunId,
+        config_revision: u64,
+        config_digest: &Digest,
+        workspace: &Path,
+        snapshot: &crate::store::accepted_plans::AcceptedImplementationPublicationSnapshot,
+    ) -> (Vec<crate::agent_api::HostArtifactLocator>, Vec<String>) {
+        let mut artifacts = Vec::new();
+        let mut unavailable = Vec::new();
+        for publication in snapshot.publication_receipts() {
+            let result = (|| {
+                let source = store.validated_worker_publication_source_for_node(
+                    artifact_store,
+                    owner_generation,
+                    project_id,
+                    ticket_run_id,
+                    publication,
+                )?;
+                let references = source
+                    .validated
+                    .claimed_artifact_refs
+                    .iter()
+                    .filter(|reference| {
+                        matches!(
+                            reference.kind,
+                            crate::engine::orchestration::RoleArtifactKind::TestReceipt
+                                | crate::engine::orchestration::RoleArtifactKind::General
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if references.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let authority = store
+                    .agent_launch_authority(&source.validated.binding.agent_run_id)?
+                    .ok_or("published Worker check evidence lost its launch authority")?;
+                crate::parent_artifacts::stage_verified_parent_artifacts(
+                    store,
+                    artifact_store,
+                    &authority,
+                    source.receipt.evidence_id(),
+                    project_id,
+                    config_revision,
+                    config_digest,
+                    workspace,
+                    &references,
+                )
+            })();
+            match result {
+                Ok(staged) => artifacts.extend(staged),
+                Err(error) => unavailable.push(format!(
+                    "publication {}: {error}",
+                    publication.intent().operation_id
+                )),
+            }
+        }
+        if let Some(verification) = snapshot.verification() {
+            let result = (|| {
+                let source = store.validated_worker_verification_source(
+                    artifact_store,
+                    owner_generation,
+                    project_id,
+                    ticket_run_id,
+                    verification,
+                )?;
+                let authority = store
+                    .agent_launch_authority(&source.validated.binding.agent_run_id)?
+                    .ok_or("verified Worker check evidence lost its launch authority")?;
+                crate::parent_artifacts::stage_verified_parent_artifacts(
+                    store,
+                    artifact_store,
+                    &authority,
+                    source.receipt.evidence_id(),
+                    project_id,
+                    config_revision,
+                    config_digest,
+                    workspace,
+                    &verification.test_receipt_artifacts,
+                )
+            })();
+            match result {
+                Ok(staged) => artifacts.extend(staged),
+                Err(error) => unavailable.push(format!(
+                    "verification {}: {error}",
+                    verification.source_evidence_id
+                )),
+            }
+        }
+        (artifacts, unavailable)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn wake_items_with_staged_artifacts(
         artifact_store: &ArtifactStore,
+        config: &Config,
         store: &mut ConfigStore,
         owner_generation: u64,
         project_id: &crate::domain::ids::ProjectId,
@@ -3397,6 +3615,11 @@ impl RuntimeServices {
         let mut items = Vec::with_capacity(wake_inputs.len());
         for input in wake_inputs {
             let mut host_artifacts = Vec::new();
+            let is_postmortem_transition = input.source_type == "ticket_run_transition"
+                && input.payload_json["target"] == "postmortem";
+            let mut host_completion_context = is_postmortem_transition
+                .then(|| completion_context.cloned())
+                .flatten();
             if input.source_type == "agent_result" {
                 let wake_id = i64::try_from(input.wake_input_id)
                     .map_err(|_| "Agent result wake ID exceeds the durable SQLite identity")?;
@@ -3531,77 +3754,51 @@ impl RuntimeServices {
                         "Reviewer wake does not name the current publication or verification subject".into(),
                     );
                 }
-                for publication in snapshot.publication_receipts() {
-                    let source = store.validated_worker_publication_source_for_node(
-                        artifact_store,
-                        owner_generation,
-                        project_id,
-                        &ticket_run_id,
-                        publication,
-                    )?;
-                    let references = source
-                        .validated
-                        .claimed_artifact_refs
-                        .iter()
-                        .filter(|reference| {
-                            matches!(
-                                reference.kind,
-                                crate::engine::orchestration::RoleArtifactKind::TestReceipt
-                                    | crate::engine::orchestration::RoleArtifactKind::General
-                            )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if references.is_empty() {
-                        continue;
-                    }
-                    let source_authority = store
-                        .agent_launch_authority(&source.validated.binding.agent_run_id)?
-                        .ok_or("published Worker check evidence lost its launch authority")?;
-                    let staged = crate::parent_artifacts::stage_verified_parent_artifacts(
-                        store,
-                        artifact_store,
-                        &source_authority,
-                        source.receipt.evidence_id(),
-                        project_id,
-                        config_revision,
-                        config_digest,
-                        workspace,
-                        &references,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "cannot stage published Worker check evidence for Reviewer: {error}"
-                        )
-                    })?;
-                    host_artifacts.extend(staged);
+                let (artifacts, unavailable) = Self::stage_publication_artifacts(
+                    artifact_store,
+                    store,
+                    owner_generation,
+                    project_id,
+                    &ticket_run_id,
+                    config_revision,
+                    config_digest,
+                    workspace,
+                    &snapshot,
+                );
+                if let Some(error) = unavailable.first() {
+                    return Err(format!(
+                        "cannot stage Worker check evidence for Reviewer: {error}"
+                    ));
                 }
-                if let Some(verification) = snapshot.verification() {
-                    let source = store.validated_worker_verification_source(
-                        artifact_store,
-                        owner_generation,
-                        project_id,
-                        &ticket_run_id,
-                        verification,
-                    )?;
-                    let source_authority = store
-                        .agent_launch_authority(&source.validated.binding.agent_run_id)?
-                        .ok_or("verified Worker check evidence lost its launch authority")?;
-                    let staged = crate::parent_artifacts::stage_verified_parent_artifacts(
-                        store,
-                        artifact_store,
-                        &source_authority,
-                        source.receipt.evidence_id(),
-                        project_id,
-                        config_revision,
-                        config_digest,
-                        workspace,
-                        &verification.test_receipt_artifacts,
-                    )
-                    .map_err(|error| {
-                        format!("cannot stage verification-only Worker TestReceipt evidence for Reviewer: {error}")
-                    })?;
-                    host_artifacts.extend(staged);
+                host_artifacts = artifacts;
+            }
+            if let Some(context) = &mut host_completion_context {
+                match Self::stage_postmortem_artifacts(
+                    artifact_store,
+                    config,
+                    store,
+                    owner_generation,
+                    project_id,
+                    config_revision,
+                    config_digest,
+                    workspace,
+                    context,
+                ) {
+                    Ok(evidence) => {
+                        host_artifacts = evidence.artifacts;
+                        context.implementation_publication.verification = evidence.verification;
+                        context
+                            .implementation_publication
+                            .artifact_evidence_unavailable = (!evidence.unavailable.is_empty())
+                            .then(|| evidence.unavailable.join("; ").chars().take(4096).collect());
+                    }
+                    Err(error) => {
+                        context.implementation_publication.verification = None;
+                        context
+                            .implementation_publication
+                            .artifact_evidence_unavailable =
+                            Some(error.chars().take(4096).collect());
+                    }
                 }
             }
             let host_artifact_source_evidence_ids =
@@ -3614,8 +3811,6 @@ impl RuntimeServices {
                 } else {
                     Vec::new()
                 };
-            let is_postmortem_transition = input.source_type == "ticket_run_transition"
-                && input.payload_json["target"] == "postmortem";
             items.push(crate::agent_api::AgentWakeItem {
                 wake_input_id: input.wake_input_id,
                 source_type: input.source_type,
@@ -3625,11 +3820,7 @@ impl RuntimeServices {
                 payload_json: input.payload_json,
                 host_artifact_source_evidence_ids,
                 host_artifacts,
-                host_completion_context: if is_postmortem_transition {
-                    completion_context.cloned()
-                } else {
-                    None
-                },
+                host_completion_context,
             });
         }
         Ok(items)
@@ -4144,6 +4335,7 @@ impl RuntimeServices {
         create_private_dir(&control_dir)?;
         let wake_items = Self::wake_items_with_staged_artifacts(
             &self.artifacts,
+            &self.config,
             store,
             self.owner_generation,
             &candidate.project_id,

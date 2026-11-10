@@ -449,6 +449,7 @@ pub fn render_role_prompt(
         let formatted =
             serde_json::to_string_pretty(completion_context).map_err(|error| error.to_string())?;
         prompt.push_str(&format!("\nHost-verified completion context (digest `{digest}`; cite these facts and preserve uncertainty):\n```json\n{formatted}\n```\n"));
+        prompt.push_str("Read the current inbox for registered implementation and validation artifacts copied into this workspace. Cite their source evidence IDs and digests. `artifact_evidence_unavailable` records evidence the host could not verify; preserve that limitation and do not infer successful checks from missing artifacts or publication alone.\n");
     } else if context.role == Role::Postmortem {
         return Err("Postmortem turn requires host-verified completion context".into());
     }
