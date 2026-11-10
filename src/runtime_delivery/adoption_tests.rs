@@ -315,19 +315,109 @@ fn run_connected_adoption(root: PathBuf) {
         "INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,status,attempt_count,next_attempt_at_unix,owner_generation,receipt_json,created_at_unix) VALUES ('prepare-worktrees',?1,'ticket_run',?2,'prepare-worktrees','prepare_worktrees',?3,?4,1,'succeeded',1,0,NULL,?5,1)",
         rusqlite::params![project_id.as_str(),ticket_run_id.as_str(),request_json,request_digest,serde_json::to_string(&receipt).unwrap()],
     ).unwrap();
-    store
-        .test_connection()
-        .execute(
-            "UPDATE ticket_runs SET revision=7 WHERE ticket_run_id=?1",
-            [ticket_run_id.as_str()],
+    let prepared_effects = store
+        .list_succeeded_effect_receipts(
+            owner_generation,
+            &project_id,
+            "ticket_run",
+            ticket_run_id.as_str(),
+            16,
         )
         .unwrap();
+    let prepare_effect = prepared_effects
+        .iter()
+        .find(|effect| effect.intent().kind == "prepare_worktrees")
+        .expect("fixture prepare receipt is durable");
+    let project_config = applied.config.projects.get(&project_id).unwrap();
     let resource = crate::store::publication_monitor::PublicationResource {
         project_id: project_id.clone(),
         ticket_run_id: ticket_run_id.clone(),
         repository_id: repository.clone(),
         branch: "rex-projects/t-1".into(),
     };
+    assert!(
+        store
+            .prepared_worker_launch(
+                owner_generation,
+                1,
+                &crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap(),
+                prepare_effect,
+                project_config,
+                &applied.digest,
+            )
+            .unwrap()
+            .is_some(),
+        "implementing phase must retain Worker launch authority"
+    );
+    let implementing_observation = store
+        .prepared_worktree_observation(
+            owner_generation,
+            1,
+            &crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap(),
+            prepare_effect,
+            project_config,
+            &applied.digest,
+        )
+        .unwrap()
+        .expect("implementing-phase prepared worktree remains observable");
+    assert_eq!(implementing_observation.resource, resource);
+    store
+        .test_connection()
+        .execute(
+            "UPDATE ticket_runs SET revision=7,internal_phase='publishing',activity='running' WHERE ticket_run_id=?1",
+            [ticket_run_id.as_str()],
+        )
+        .unwrap();
+    assert!(
+        store
+            .prepared_worker_launch(
+                owner_generation,
+                1,
+                &crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap(),
+                prepare_effect,
+                project_config,
+                &applied.digest,
+            )
+            .unwrap()
+            .is_none(),
+        "publication phase must not retain Worker launch authority"
+    );
+    let observation_proof = store
+        .prepared_worktree_observation(
+            owner_generation,
+            1,
+            &crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap(),
+            prepare_effect,
+            project_config,
+            &applied.digest,
+        )
+        .unwrap()
+        .expect("publishing-phase prepared worktree remains observable");
+    assert_eq!(observation_proof.resource, resource);
+    let mut altered_receipt: serde_json::Value =
+        serde_json::from_str(prepare_effect.receipt_json()).unwrap();
+    altered_receipt["work_nodes"][0]["worktree_path"] = serde_json::json!("relative/path");
+    let altered_receipt = crate::store::SucceededEffectReceipt::for_test(
+        &crate::effects::EffectRequest {
+            intent: prepare_effect.intent().clone(),
+            attempt_count: prepare_effect.attempt_count(),
+            created_at_unix: prepare_effect.created_at_unix(),
+        },
+        serde_json::to_string(&altered_receipt).unwrap(),
+    );
+    assert!(
+        store
+            .prepared_worktree_observation(
+                owner_generation,
+                1,
+                &crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap(),
+                &altered_receipt,
+                project_config,
+                &applied.digest,
+            )
+            .is_err(),
+        "publication observation must reject a tampered prepare receipt"
+    );
     store
         .record_publication_irregularity(
             owner_generation,
@@ -388,7 +478,7 @@ fn run_connected_adoption(root: PathBuf) {
         other => panic!("monitor did not enqueue human adoption review: {other:?}"),
     };
     let effect = store
-        .claim_next_due_effect(owner_generation, now, &["request_human_review".into()])
+        .claim_next_due_effect(owner_generation, now + 10, &["request_human_review".into()])
         .unwrap()
         .expect("monitor-generated presenter effect");
     let host_environment = environment.child_environment(

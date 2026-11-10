@@ -262,24 +262,16 @@ impl RuntimeDelivery {
                                 && planned.repository == node.repository_id
                                 && planned.role == crate::domain::types::Role::Worker
                         })
-                        && store
-                            .prepared_worker_launch(
-                                owner_generation,
-                                plan.accepted_revision,
-                                &node.work_node_id,
-                                receipt,
-                                project_config,
-                                &self.applied_config.digest,
-                            )?
-                            .is_some()
+                        && let Some(proof) = store.prepared_worktree_observation(
+                            owner_generation,
+                            plan.accepted_revision,
+                            &node.work_node_id,
+                            receipt,
+                            project_config,
+                            &self.applied_config.digest,
+                        )?
                     {
-                        let resource = crate::store::publication_monitor::PublicationResource {
-                            project_id: run.project_id.clone(),
-                            ticket_run_id: run.ticket_run_id.clone(),
-                            repository_id: node.repository_id.clone(),
-                            branch: node.branch.clone(),
-                        };
-                        candidates.push((resource, receipts.clone()));
+                        candidates.push((proof.resource, receipts.clone()));
                     }
                 }
             }
