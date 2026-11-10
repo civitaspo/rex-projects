@@ -783,7 +783,10 @@ impl RexCliTransport {
         self.check_window(window)?;
         let view = self.session_view()?;
         let matches = windows_with_label(&view, &window.label)?;
-        if matches.len() != 1 || !window_contains_block(&view, &window.window_id, anchor_block_id) {
+        if matches.len() != 1
+            || matches[0].0 != window.window_id
+            || !window_contains_block(&view, &window.window_id, anchor_block_id)
+        {
             return Err(RexError::Uncertain);
         }
         let args = json!({
@@ -803,12 +806,11 @@ impl RexCliTransport {
                 .map(str::to_owned)
                 .ok_or(RexError::Uncertain),
             Err(_) => {
+                self.verify_identity().map_err(|_| RexError::Uncertain)?;
                 let view = self.session_view().map_err(|_| RexError::Uncertain)?;
-                let found = blocks_in_window(
-                    &view,
-                    &window.window_id,
-                    Some(&format!("{OWNED_BLOCK_PREFIX}{}", spec.run_id)),
-                )?;
+                self.verify_identity().map_err(|_| RexError::Uncertain)?;
+                let expected_label = owned_block_label(&spec.run_id)?;
+                let found = blocks_in_window(&view, &window.window_id, Some(&expected_label))?;
                 if found.len() == 1 {
                     Ok(found[0].block_id.clone())
                 } else {
@@ -2117,23 +2119,45 @@ mod tests {
     fn create_agent_block_reconciles_response_loss_by_hashed_owned_label() {
         use std::os::unix::fs::PermissionsExt;
 
-        fn create_after_response_loss(candidates: &[(&str, String)]) -> Result<String, RexError> {
+        fn create_after_response_loss(
+            candidates: &[(&str, String)],
+            mismatched_saved_window: bool,
+            replace_identity_after: u8,
+        ) -> (Result<String, RexError>, bool, bool) {
             let dir = tempfile::tempdir().unwrap();
             let window_label = ticket_window_label("tracker", "T-9").unwrap();
             let run_id = "ticket-T-9-worker";
-            let before = serde_json::json!({"windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":[{"block_id":"anchor-1","label":owned_block_label("anchor-run").unwrap(),"flavor":SHELL_FLAVOR}]}]}]});
-            let mut blocks = vec![serde_json::json!({"block_id":"anchor-1","label":owned_block_label("anchor-run").unwrap(),"flavor":SHELL_FLAVOR})];
+            let before = if mismatched_saved_window {
+                serde_json::json!({"windows":[
+                    {"window_id":"window-1","label":"unrelated-window","layers":[{"blocks":[{"block_id":"anchor-1","label":owned_block_label("anchor-run").unwrap(),"flavor":SHELL_FLAVOR}]}]},
+                    {"window_id":"window-2","label":window_label,"layers":[{"blocks":[{"block_id":"other-anchor","label":owned_block_label("other-anchor").unwrap(),"flavor":SHELL_FLAVOR}]}]}
+                ]})
+            } else {
+                serde_json::json!({"windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":[{"block_id":"anchor-1","label":owned_block_label("anchor-run").unwrap(),"flavor":SHELL_FLAVOR}]}]}]})
+            };
+            let mut blocks = vec![
+                serde_json::json!({"block_id":"anchor-1","label":owned_block_label("anchor-run").unwrap(),"flavor":SHELL_FLAVOR}),
+            ];
             blocks.extend(candidates.iter().map(|(block_id, label)| serde_json::json!({"block_id":block_id,"label":label,"flavor":SHELL_FLAVOR})));
             let after = serde_json::json!({"windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":blocks}]}]});
             let whoami = serde_json::json!({"endpoint":"unix:///tmp/rex-test.sock","instance_id":"instance-1","host_id":"host-1","rex_version":"1.2.3"});
+            let replacement_whoami = serde_json::json!({"endpoint":"unix:///tmp/rex-test.sock","instance_id":"replacement-instance","host_id":"host-1","rex_version":"1.2.3"});
             let api = serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}});
             let marker = dir.path().join("split-created");
+            let recovery_view_marker = dir.path().join("recovery-view-read");
             let script = dir.path().join("rex fake");
             let body = format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{}' ;;\n  *\"api call session.view\"*) if [ -f '{}' ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi ;;\n  *\"api call session.new_split\"*) : > '{}'; exit 2 ;;\n  *) exit 3 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) if [ '{}' -eq 1 ] && [ -f '{}' ]; then printf '%s\\n' '{}'; elif [ '{}' -eq 2 ] && [ -f '{}' ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi ;;\n  *\"api list --json\"*) printf '%s\\n' '{}' ;;\n  *\"api call session.view\"*) if [ -f '{}' ]; then : > '{}'; printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi ;;\n  *\"api call session.new_split\"*) : > '{}'; exit 2 ;;\n  *) exit 3 ;;\nesac\n",
+                replace_identity_after,
+                marker.display(),
+                replacement_whoami,
+                replace_identity_after,
+                recovery_view_marker.display(),
+                replacement_whoami,
                 whoami,
                 api,
                 marker.display(),
+                recovery_view_marker.display(),
                 after,
                 before,
                 marker.display(),
@@ -2164,25 +2188,57 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 path_prepend: vec![PathBuf::from("/usr/bin")],
             };
-            transport.create_agent_block(&window, "anchor-1", &spec)
+            let result = transport.create_agent_block(&window, "anchor-1", &spec);
+            (result, marker.exists(), recovery_view_marker.exists())
         }
 
         let expected_label = owned_block_label("ticket-T-9-worker").unwrap();
         assert_eq!(
-            create_after_response_loss(&[("worker-1", expected_label.clone())]).unwrap(),
+            create_after_response_loss(&[("worker-1", expected_label.clone())], false, 0)
+                .0
+                .unwrap(),
             "worker-1"
         );
         assert!(matches!(
-            create_after_response_loss(&[("wrong-1", owned_block_label("other-run").unwrap())]),
+            create_after_response_loss(&[], false, 0).0,
             Err(RexError::Uncertain)
         ));
         assert!(matches!(
-            create_after_response_loss(&[
-                ("worker-1", expected_label.clone()),
-                ("worker-2", expected_label),
-            ]),
+            create_after_response_loss(
+                &[("wrong-1", owned_block_label("other-run").unwrap())],
+                false,
+                0
+            )
+            .0,
             Err(RexError::Uncertain)
         ));
+        assert!(matches!(
+            create_after_response_loss(
+                &[
+                    ("worker-1", expected_label.clone()),
+                    ("worker-2", expected_label.clone()),
+                ],
+                false,
+                0
+            )
+            .0,
+            Err(RexError::Uncertain)
+        ));
+        let (mismatched_window, split_was_attempted, _) = create_after_response_loss(&[], true, 0);
+        assert!(matches!(mismatched_window, Err(RexError::Uncertain)));
+        assert!(!split_was_attempted);
+
+        let (replacement_before_view, split_was_attempted, recovery_view_read) =
+            create_after_response_loss(&[("worker-1", expected_label.clone())], false, 1);
+        assert!(matches!(replacement_before_view, Err(RexError::Uncertain)));
+        assert!(split_was_attempted);
+        assert!(!recovery_view_read);
+
+        let (replacement_after_view, split_was_attempted, recovery_view_read) =
+            create_after_response_loss(&[("worker-1", expected_label)], false, 2);
+        assert!(matches!(replacement_after_view, Err(RexError::Uncertain)));
+        assert!(split_was_attempted);
+        assert!(recovery_view_read);
     }
 
     #[test]
