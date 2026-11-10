@@ -682,12 +682,29 @@ impl RepositoryDelivery {
         configuration_digest: &Digest,
         verified_commit: &VerifiedCommit,
     ) -> Result<HookGateReceipt, DeliveryError> {
-        let accepted_head = verified_commit.head();
-        validate_git_sha(accepted_head)?;
         let _lease = self
             .worktrees
             .acquire_writer_lease(work.worktree.clone())
             .map_err(DeliveryError::Worktree)?;
+        self.run_required_hooks_under_lease(
+            work,
+            repository_config,
+            configuration_digest,
+            verified_commit,
+            &_lease,
+        )
+    }
+
+    fn run_required_hooks_under_lease(
+        &self,
+        work: &PreparedRepositoryWork,
+        repository_config: &RepositoryConfig,
+        configuration_digest: &Digest,
+        verified_commit: &VerifiedCommit,
+        _lease: &crate::worktrees::WorktreeLease,
+    ) -> Result<HookGateReceipt, DeliveryError> {
+        let accepted_head = verified_commit.head();
+        validate_git_sha(accepted_head)?;
         let hook_receipts = self
             .hooks
             .run_required(
@@ -1230,13 +1247,14 @@ impl RepositoryDelivery {
         let mut rebased_prepared_work = prepared_work.clone();
         rebased_prepared_work.worktree = rebased_worktree;
         rebased_prepared_work.expected_base_sha = request.new_parent_sha.clone();
-        let hook_gate = self.run_required_hooks(
+        let hook_gate = self.run_required_hooks_under_lease(
             &rebased_prepared_work,
             repository_config,
             configuration_digest,
             &VerifiedCommit::Native {
                 receipt: verified.clone(),
             },
+            &_lease,
         )?;
         let refspec = format!("{rebased_head}:refs/heads/{}", worktree.branch);
         let lease = format!(
@@ -5326,6 +5344,222 @@ mod tests {
             merge: MergeConfig::default(),
             operations: None,
         }
+    }
+
+    #[test]
+    fn stacked_branch_repair_keeps_its_writer_lease_through_hooks_and_push() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let (bare, old_base) = seed_local_remote(temp.path(), &executable);
+        let signing_key = temp.path().join("stack-signing-key");
+        assert!(
+            std::process::Command::new("ssh-keygen")
+                .args([
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-C",
+                    "fixture@example.invalid",
+                    "-f"
+                ])
+                .arg(&signing_key)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let public_key = std::fs::read_to_string(signing_key.with_extension("pub")).unwrap();
+        let fields = public_key.split_whitespace().collect::<Vec<_>>();
+        let allowed_signers = temp.path().join("allowed-signers");
+        std::fs::write(
+            &allowed_signers,
+            format!("fixture@example.invalid {} {}\n", fields[0], fields[1]),
+        )
+        .unwrap();
+
+        let delivery = RepositoryDelivery::new(
+            &temp.path().join("state"),
+            GitOptions {
+                executable: executable.clone(),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(20),
+            },
+            BTreeMap::new(),
+            HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        let mut repository_config = fixture_repository_config(bare.to_string_lossy().into_owned());
+        repository_config
+            .rex_projects_hooks
+            .push(crate::config::HookConfig {
+                id: "stack-refresh".into(),
+                command: vec!["/bin/sh".into(), "-c".into(), "test -f child.txt".into()],
+                timeout_seconds: 10,
+            });
+        let identity = WorkNodeIdentity {
+            project_id: ProjectId::parse("project").unwrap(),
+            repository_id: RepositoryId::parse("demo").unwrap(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-50").unwrap(),
+            ticket_run_id: TicketRunId::parse("run-50").unwrap(),
+            work_node_id: "docs".into(),
+        };
+        let prepared = delivery
+            .prepare_worktree(identity, &repository_config, &old_base, CommitMode::Native)
+            .unwrap();
+        git(
+            &executable,
+            &prepared.worktree.path,
+            &["config", "user.name", "Fixture"],
+        );
+        git(
+            &executable,
+            &prepared.worktree.path,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        git(
+            &executable,
+            &prepared.worktree.path,
+            &["config", "user.signingkey", signing_key.to_str().unwrap()],
+        );
+        git(
+            &executable,
+            &prepared.worktree.path,
+            &["config", "gpg.format", "ssh"],
+        );
+        git(
+            &executable,
+            &prepared.worktree.path,
+            &[
+                "config",
+                "gpg.ssh.allowedSignersFile",
+                allowed_signers.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(prepared.worktree.path.join("child.txt"), "child change\n").unwrap();
+        git(&executable, &prepared.worktree.path, &["add", "child.txt"]);
+        git(
+            &executable,
+            &prepared.worktree.path,
+            &[
+                "-c",
+                "commit.gpgsign=true",
+                "commit",
+                "-m",
+                "docs: child change",
+                "-m",
+                "Co-authored-by: Codex <noreply@openai.com>",
+            ],
+        );
+        let child_head = delivery
+            .observe_local_head_at(&prepared.worktree.path)
+            .unwrap();
+        let branch = prepared.worktree.branch.clone();
+        git(
+            &executable,
+            &prepared.worktree.path,
+            &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        );
+
+        let seed = temp.path().join("seed");
+        std::fs::write(seed.join("README.md"), "base\nmain update\n").unwrap();
+        git(&executable, &seed, &["add", "README.md"]);
+        git(
+            &executable,
+            &seed,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "main update",
+            ],
+        );
+        git(&executable, &seed, &["push", "origin", "main"]);
+        let new_base = String::from_utf8(
+            process::run(ProcessRequest {
+                executable: executable.clone(),
+                args: ["rev-parse", "refs/heads/main"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(seed),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(5),
+                shutdown_grace: Duration::from_secs(1),
+                stdout_limit: 4096,
+                stderr_tail_limit: 4096,
+            })
+            .unwrap()
+            .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        git(
+            &executable,
+            &prepared.repository.path,
+            &["fetch", "origin", "main"],
+        );
+
+        let request = StackRepairRequest {
+            repository_id: prepared.identity.repository_id.clone(),
+            worktree_path: prepared.worktree.path.clone(),
+            branch: branch.clone(),
+            recorded_base_sha: old_base.clone(),
+            old_parent_sha: old_base,
+            new_parent_sha: new_base.clone(),
+            expected_child_head: child_head.clone(),
+            expected_remote_child_head: child_head,
+            default_branch: "main".into(),
+            observed_protected_branches: Vec::new(),
+            protection_observation_complete: true,
+            protection_observed_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            protection_observation_digest: Digest::parse("a".repeat(64)).unwrap(),
+            required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+        };
+        let receipt = delivery
+            .repair_stacked_branch(
+                &prepared,
+                &repository_config,
+                &Digest::parse("c".repeat(64)).unwrap(),
+                &request,
+            )
+            .unwrap();
+        assert_eq!(receipt.new_parent_sha, new_base);
+        assert_ne!(receipt.new_child_head, request.expected_child_head);
+        assert_eq!(
+            delivery
+                .remote_branch_head(&prepared.worktree.path, &branch)
+                .unwrap()
+                .as_deref(),
+            Some(receipt.new_child_head.as_str())
+        );
+        assert_eq!(receipt.hook_gate.head, receipt.new_child_head);
+        assert_eq!(receipt.hook_gate.hook_receipts.len(), 1);
+        assert!(receipt.hook_gate.hook_receipts[0].succeeded);
+        let replay = delivery
+            .repair_stacked_branch(
+                &prepared,
+                &repository_config,
+                &Digest::parse("c".repeat(64)).unwrap(),
+                &request,
+            )
+            .unwrap();
+        assert_eq!(replay.new_child_head, receipt.new_child_head);
     }
 
     fn correction_publication_fixture(
