@@ -1141,9 +1141,25 @@ impl ConfigStore {
         owner_generation: u64,
         payload: &crate::engine::ticket_effects::PublishTicketStatus,
     ) -> Result<(), String> {
+        Self::validate_ticket_status_publication_on_connection(
+            &self.connection,
+            owner_generation,
+            payload,
+        )
+    }
+
+    pub(crate) fn validate_ticket_status_publication_on_connection(
+        connection: &Connection,
+        owner_generation: u64,
+        payload: &crate::engine::ticket_effects::PublishTicketStatus,
+    ) -> Result<(), String> {
         payload.validate()?;
-        let active_owner: Option<u64> = self
-            .connection
+        if payload.expected_external_revision.is_none() {
+            return Err(
+                "ticket status effect has no external revision for conditional publication".into(),
+            );
+        }
+        let active_owner: Option<u64> = connection
             .query_row(
                 "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
                 [],
@@ -1154,8 +1170,7 @@ impl ConfigStore {
         if active_owner != Some(owner_generation) {
             return Err("controller owner generation is stale".into());
         }
-        let stored: Option<(String, String, String, u64, Option<String>)> = self
-            .connection
+        let stored: Option<(String, String, String, u64, Option<String>)> = connection
             .query_row(
                 "SELECT namespace,ticket_id,internal_phase,revision,external_revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
                 params![payload.ticket_run_id.as_str(), payload.project_id.as_str()],
@@ -1173,8 +1188,7 @@ impl ConfigStore {
         {
             return Err("ticket status effect is stale or has mismatched scope".into());
         }
-        let status: String = self
-            .connection
+        let status: String = connection
             .query_row(
                 "SELECT external_status FROM ticket_runs WHERE ticket_run_id=?1",
                 [payload.ticket_run_id.as_str()],
@@ -1197,6 +1211,45 @@ impl ConfigStore {
             return Err("ticket status is not authorized by the persisted TicketRun phase".into());
         }
         Ok(())
+    }
+
+    /// Return the external revision for one exact current TicketRun state.
+    /// Status effects must carry this value so each external mutation stays conditional.
+    pub fn ticket_run_external_revision(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        expected_ticket_run_revision: u64,
+    ) -> Result<String, String> {
+        let active_owner: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let run: Option<(String, String, u64, Option<String>)> = self.connection.query_row(
+            "SELECT namespace,ticket_id,revision,external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+            params![project_id.as_str(), ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((namespace, ticket_id, revision, Some(external_revision))) = run else {
+            return Err(
+                "TicketRun has no saved external revision for conditional status publication"
+                    .into(),
+            );
+        };
+        if revision != expected_ticket_run_revision {
+            return Err("TicketRun external revision request is stale".into());
+        }
+        TicketNamespace::parse(namespace)?;
+        TicketId::parse(ticket_id)?;
+        if external_revision.trim().is_empty() || external_revision.len() > 512 {
+            return Err("TicketRun saved external revision is invalid".into());
+        }
+        Ok(external_revision)
     }
 
     /// Refresh the persisted ticket revision and enqueue one conditional Done status intent after

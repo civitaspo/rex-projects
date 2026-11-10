@@ -2276,6 +2276,12 @@ fn apply_merge_intent(
         request_json,
         expected_revision: Some(review_revision.0),
     };
+    let expected_external_revision = store.ticket_run_external_revision(
+        owner_generation,
+        &run.project_id,
+        ticket_run_id,
+        run.revision,
+    )?;
     let status_payload = crate::engine::ticket_effects::PublishTicketStatus {
         schema_version: 1,
         project_id: run.project_id.clone(),
@@ -2283,7 +2289,7 @@ fn apply_merge_intent(
         ticket_id: run.ticket_id.clone(),
         ticket_run_id: ticket_run_id.clone(),
         ticket_run_revision: review_revision.0,
-        expected_external_revision: None,
+        expected_external_revision: Some(expected_external_revision),
         desired_status: crate::domain::types::TicketStatus::InReview,
         reason: "MergeDecision requires human review of the exact host-validated merge procedure"
             .into(),

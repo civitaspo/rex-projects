@@ -109,6 +109,12 @@ pub fn consume_one_host_transition(
                 &format!("merge-review-approved:{}", approval.receipt().response_id()),
                 &payload_json,
             );
+            let expected_external_revision = store.ticket_run_external_revision(
+                owner_generation,
+                &run.project_id,
+                &run.ticket_run_id,
+                run.revision,
+            )?;
             let status_payload = crate::engine::ticket_effects::PublishTicketStatus {
                 schema_version: 1,
                 project_id: run.project_id.clone(),
@@ -116,7 +122,7 @@ pub fn consume_one_host_transition(
                 ticket_id: run.ticket_id.clone(),
                 ticket_run_id: run.ticket_run_id.clone(),
                 ticket_run_revision: next_revision.0,
-                expected_external_revision: None,
+                expected_external_revision: Some(expected_external_revision),
                 desired_status: crate::domain::types::TicketStatus::InProgress,
                 reason: "human approved the exact merge procedure".into(),
             };
