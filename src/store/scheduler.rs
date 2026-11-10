@@ -3209,6 +3209,101 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ticket_wakes_do_not_starve_a_later_runnable_session() {
+        use super::ConfigStore;
+        use crate::store::MachineLock;
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE controller_owners(generation INTEGER PRIMARY KEY, stopped_at_unix INTEGER);
+             CREATE TABLE projects(project_id TEXT PRIMARY KEY, desired_lifecycle TEXT NOT NULL);
+             CREATE TABLE project_runtimes(project_id TEXT PRIMARY KEY, observed_lifecycle TEXT NOT NULL, controller_generation INTEGER NOT NULL);
+             CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY, role_session_id TEXT NOT NULL, state TEXT NOT NULL);
+             CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY, project_id TEXT NOT NULL, role_session_id TEXT NOT NULL, lifecycle TEXT NOT NULL, priority INTEGER NOT NULL, created_at_unix INTEGER NOT NULL);
+             CREATE TABLE ticket_runs(ticket_run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, internal_phase TEXT NOT NULL);
+             INSERT INTO controller_owners VALUES (7,NULL);
+             INSERT INTO projects VALUES ('p-a','running');
+             INSERT INTO project_runtimes VALUES ('p-a','running',7);",
+        )
+        .unwrap();
+        for index in 0..33 {
+            let ticket_run_id = match index {
+                0 => "r",
+                1 => "r%_with:colon",
+                _ => "",
+            };
+            let ticket_run_id = if ticket_run_id.is_empty() {
+                format!("terminal-{index:02}")
+            } else {
+                ticket_run_id.to_owned()
+            };
+            let phase = if index == 32 { "canceled" } else { "done" };
+            let session = if index == 1 {
+                format!("ticket:{ticket_run_id}:worker:node-a")
+            } else {
+                format!("ticket_run:{ticket_run_id}:coordinator")
+            };
+            connection
+                .execute(
+                    "INSERT INTO ticket_runs VALUES (?1,'p-a',?2)",
+                    rusqlite::params![ticket_run_id, phase],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO role_wake_inputs(project_id,role_session_id,lifecycle,priority,created_at_unix) VALUES ('p-a',?1,'pending',10,?2)",
+                    rusqlite::params![session, index],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO ticket_runs VALUES ('r:child','p-a','implementing')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,lifecycle,priority,created_at_unix) VALUES ('p-a','ticket_run:r:child:coordinator','pending',10,100)",
+                [],
+            )
+            .unwrap();
+        let store = ConfigStore {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        };
+
+        for _ in 0..3 {
+            store.pending_role_wake_sessions(7, 32).unwrap();
+        }
+        let candidates = store.pending_role_wake_sessions(7, 32).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].ticket_run_id.as_ref().unwrap().as_str(),
+            "r:child"
+        );
+        let remaining_pending: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE lifecycle='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_pending, 1,
+            "terminal wake audit rows are retired from scheduling"
+        );
+        let total_wakes: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(total_wakes, 34, "superseding preserves wake audit rows");
+    }
+
+    #[test]
     fn role_session_ids_bind_their_project_or_ticket_scope() {
         use super::parse_role_session_id;
         use crate::domain::types::Role;
