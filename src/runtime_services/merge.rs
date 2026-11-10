@@ -1441,6 +1441,43 @@ pub(crate) mod tests {
         requests: Mutex<Vec<crate::process::ProcessRequest>>,
     }
 
+    pub(crate) fn observe_publication_for_store_test(
+        applied: crate::config::AppliedConfig,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        replies: Vec<serde_json::Value>,
+    ) -> Result<crate::merge_runtime::MergeEvidenceObservation, String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let binary_dir = root.path().join("bin");
+        std::fs::create_dir(&binary_dir).map_err(|error| error.to_string())?;
+        let gh_path = binary_dir.join("gh");
+        std::fs::write(&gh_path, "#!/bin/sh\nexit 0\n").map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        let runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(
+                replies
+                    .into_iter()
+                    .map(|response| {
+                        serde_json::to_vec(&response).map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        RuntimeMergeEvidenceSource::with_github_runner(
+            applied,
+            vec![binary_dir],
+            BTreeMap::new(),
+            runner,
+        )
+        .observe_publication_subject(subject, result)
+    }
+
     pub(crate) fn observe_and_prepare_for_store_test(
         applied: crate::config::AppliedConfig,
         subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
@@ -1491,7 +1528,8 @@ pub(crate) mod tests {
             claim,
             &result.validated.result_digest,
             &observation,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let ticket_run_id = result
             .validated
             .binding

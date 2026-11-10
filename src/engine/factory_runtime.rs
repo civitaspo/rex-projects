@@ -1857,6 +1857,12 @@ fn apply_merge_assessment(
     let source_revision = binding
         .ticket_revision
         .ok_or("MergeAssessment result lacks TicketRun revision")?;
+    if store
+        .validated_agent_result_ack(result.receipt.evidence_id())?
+        .is_some()
+    {
+        return Ok(true);
+    }
     let run = store
         .active_ticket_runs(owner_generation, 128)?
         .into_iter()
@@ -1961,11 +1967,27 @@ fn apply_merge_assessment(
     let RoleResultPayload::MergeAssessment(claim) = &result.validated.typed_payload else {
         return Err("validated MergeAssessment kind has a different typed payload".into());
     };
-    let trusted = crate::merge_runtime::assess_merge_claim(
+    let trusted = match crate::merge_runtime::assess_merge_claim(
         claim,
         &result.validated.result_digest,
         &observation,
-    )?;
+    ) {
+        Ok(trusted) => trusted,
+        Err(crate::merge_runtime::MergeAssessmentError::PullRequestReferenceMismatch(reason)) => {
+            store.reject_merge_assessment_claim(
+                owner_generation,
+                result,
+                publication_set_digest.as_str(),
+                &observation.pull_request_reference,
+                &reason,
+            )?;
+            return Ok(true);
+        }
+        Err(
+            crate::merge_runtime::MergeAssessmentError::InvalidAgentClaim(error)
+            | crate::merge_runtime::MergeAssessmentError::Host(error),
+        ) => return Err(error),
+    };
     let assessment_id = crate::merge_runtime::assessment_id(
         &run.project_id,
         ticket_run_id,
@@ -3366,6 +3388,15 @@ fn apply_coordinator_spawn_request(
     if current.project_id != binding.project_id || current.revision != source_revision.0 {
         return Err("Coordinator SpawnRequest is stale or outside its TicketRun".into());
     }
+    if current.activity == Activity::Blocked {
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            current.revision,
+            crate::store::agent_results::ResultDisposition::RejectedByHost,
+        )?;
+        return Ok(true);
+    }
     if !config
         .projects
         .get(&binding.project_id)
@@ -3995,7 +4026,7 @@ pub(crate) mod tests {
         configuration_digest: Digest,
         result: &crate::store::agent_results::IngestedAgentResult,
         observation: crate::merge_runtime::MergeEvidenceObservation,
-        proposal: crate::store::merge_work::PreparedMergeBodyProposal,
+        proposal: Option<crate::store::merge_work::PreparedMergeBodyProposal>,
     ) -> Result<bool, String> {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
@@ -4003,7 +4034,7 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: Some(observation),
-            merge_body_proposal: Some(proposal),
+            merge_body_proposal: proposal,
         };
         super::apply_merge_assessment(
             store,

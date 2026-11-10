@@ -39,18 +39,41 @@ pub struct MergeEvidenceObservation {
     pub baseline_issue_comments: Vec<crate::forge::IssueComment>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeAssessmentError {
+    PullRequestReferenceMismatch(String),
+    InvalidAgentClaim(String),
+    Host(String),
+}
+
+impl std::fmt::Display for MergeAssessmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PullRequestReferenceMismatch(message)
+            | Self::InvalidAgentClaim(message)
+            | Self::Host(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for MergeAssessmentError {}
+
 pub fn assess_merge_claim(
     claim: &MergeAssessmentPayload,
     result_digest: &Digest,
     observation: &MergeEvidenceObservation,
-) -> Result<HostMergeAssessment, String> {
+) -> Result<HostMergeAssessment, MergeAssessmentError> {
     let evidence = &observation.evidence;
     let policy = &observation.policy;
     if evidence.subject != evidence.current_subject {
-        return Err("cannot assess a stale host-observed merge subject".into());
+        return Err(MergeAssessmentError::Host(
+            "cannot assess a stale host-observed merge subject".into(),
+        ));
     }
     if claim.subject_digest != observation.publication_set_digest {
-        return Err("MergeDecision result names a different accepted publication subject".into());
+        return Err(MergeAssessmentError::InvalidAgentClaim(
+            "MergeDecision result names a different accepted publication subject".into(),
+        ));
     }
     let claimed_refs = claim
         .pr_references
@@ -60,9 +83,9 @@ pub fn assess_merge_claim(
     if claimed_refs.len() != claim.pr_references.len()
         || claimed_refs != BTreeSet::from([observation.pull_request_reference.as_str()])
     {
-        return Err(
+        return Err(MergeAssessmentError::PullRequestReferenceMismatch(
             "MergeDecision result does not identify the exact accepted pull request".into(),
-        );
+        ));
     }
     let host_gates = evidence
         .gates
@@ -77,7 +100,9 @@ pub fn assess_merge_claim(
             GateOutcome::Unknown => EvidenceState::Unknown,
         };
         if claim_gates.insert(gate.gate_id.as_str(), state).is_some() {
-            return Err("MergeDecision repeats deterministic gate evidence".into());
+            return Err(MergeAssessmentError::InvalidAgentClaim(
+                "MergeDecision repeats deterministic gate evidence".into(),
+            ));
         }
     }
     let host_gate_ids = host_gates.keys().copied().collect::<BTreeSet<_>>();
@@ -113,9 +138,10 @@ pub fn assess_merge_claim(
     if claim.rationale.trim().is_empty() {
         trusted_evidence.human_review_required = true;
     }
-    let assessment = evaluate_merge_policy(policy, &trusted_evidence)?;
-    let policy_digest =
-        crate::forge::canonical_digest(policy).map_err(|error| error.to_string())?;
+    let assessment = evaluate_merge_policy(policy, &trusted_evidence)
+        .map_err(|error| MergeAssessmentError::Host(error.to_string()))?;
+    let policy_digest = crate::forge::canonical_digest(policy)
+        .map_err(|error| MergeAssessmentError::Host(error.to_string()))?;
     Ok(HostMergeAssessment {
         publication_set_digest: observation.publication_set_digest.clone(),
         pull_request_reference: observation.pull_request_reference.clone(),
