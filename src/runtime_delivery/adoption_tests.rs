@@ -107,9 +107,15 @@ fn run_connected_adoption(root: PathBuf) {
     fs::create_dir_all(&state_root).unwrap();
     let artifact_root = state_root.join("artifacts");
     fs::create_dir_all(&artifact_root).unwrap();
-    let mut artifact_permissions = fs::metadata(&artifact_root).unwrap().permissions();
-    artifact_permissions.set_mode(0o700);
-    fs::set_permissions(&artifact_root, artifact_permissions).unwrap();
+    let mut shared_artifact_permissions = fs::metadata(&artifact_root).unwrap().permissions();
+    shared_artifact_permissions.set_mode(0o755);
+    fs::set_permissions(&artifact_root, shared_artifact_permissions).unwrap();
+    assert_ne!(
+        fs::metadata(&artifact_root).unwrap().permissions().mode() & 0o077,
+        0,
+        "shared artifact root is normally created without private permissions"
+    );
+    let human_artifact_root = state_root.join("human-review-artifacts");
     let config_file = root.join("factory.toml");
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
     let fixture_config = fs::read_to_string(example).unwrap();
@@ -515,27 +521,85 @@ fn run_connected_adoption(root: PathBuf) {
             crate::environment::ChildContext::HostOperation,
             &BTreeMap::new(),
         ),
-        artifact_root,
+        human_artifact_root.clone(),
         std::sync::Arc::new(observer),
     )
     .unwrap();
     let request_effect = crate::effects::EffectRequest::from(effect);
-    let mut context = crate::effects::EffectContext {
-        store: &mut store,
-        owner_generation,
-        now_unix: now,
+    let presentation = {
+        let mut context = crate::effects::EffectContext {
+            store: &mut store,
+            owner_generation,
+            now_unix: now,
+        };
+        crate::effects::EffectHandler::handle(
+            &presenter,
+            // The first Submit may have failed before registering a request; exercise the actual
+            // dispatcher retry mode against the exact durable presentation intent.
+            crate::effects::EffectMode::Reconcile,
+            &request_effect,
+            &mut context,
+        )
+        .unwrap()
     };
-    let presentation = crate::effects::EffectHandler::handle(
-        &presenter,
-        crate::effects::EffectMode::Submit,
-        &request_effect,
-        &mut context,
-    )
-    .unwrap();
     assert!(matches!(
         presentation,
         crate::effects::EffectObservation::Pending { .. }
     ));
+    assert_eq!(
+        fs::metadata(&human_artifact_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0,
+        "presenter creates a private review-only directory"
+    );
+    // Simulate a request persisted by an older runtime under the shared ArtifactStore root.
+    // The retry must keep that exact path from the previously valid private root.
+    let mut artifact_root_permissions = fs::metadata(&artifact_root).unwrap().permissions();
+    artifact_root_permissions.set_mode(0o700);
+    fs::set_permissions(&artifact_root, artifact_root_permissions).unwrap();
+    let legacy_path =
+        crate::human_runtime::write_runtime_review_artifact(&artifact_root, &request.request)
+            .unwrap();
+    store
+        .test_connection()
+        .execute(
+            "UPDATE human_requests SET artifact_path=?1 WHERE request_id=?2",
+            rusqlite::params![
+                legacy_path.to_string_lossy(),
+                request.request.request_id.as_str()
+            ],
+        )
+        .unwrap();
+    let retry_presentation = {
+        let mut retry_context = crate::effects::EffectContext {
+            store: &mut store,
+            owner_generation,
+            now_unix: now + 1,
+        };
+        crate::effects::EffectHandler::handle(
+            &presenter,
+            crate::effects::EffectMode::Reconcile,
+            &request_effect,
+            &mut retry_context,
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        retry_presentation,
+        crate::effects::EffectObservation::Pending { .. }
+    ));
+    assert_eq!(
+        store
+            .current_human_request(&request.request.request_id)
+            .unwrap()
+            .unwrap()
+            .bundle_path,
+        legacy_path,
+        "retry preserves the previously persisted artifact path"
+    );
     let request = store
         .current_human_request(&request.request.request_id)
         .unwrap()

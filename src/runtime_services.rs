@@ -473,6 +473,7 @@ impl RuntimeServices {
         let rex_events = rex.subscribe_events().ok();
         let artifact_root = state_root.join("artifacts");
         let artifacts = ArtifactStore::open(&artifact_root)?;
+        let human_review_artifact_root = state_root.join("human-review-artifacts");
         let delivery = crate::runtime_delivery::build(
             applied_config,
             state_root,
@@ -557,7 +558,7 @@ impl RuntimeServices {
                     &human.kind,
                     human.command.clone(),
                     host_environment.clone(),
-                    artifact_root.clone(),
+                    human_review_artifact_root,
                     Arc::new(observer),
                 )?,
             ));
