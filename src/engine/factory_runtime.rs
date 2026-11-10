@@ -2085,17 +2085,13 @@ fn apply_merge_intent(
     let RoleResultPayload::MergeIntent(intent) = &result.validated.typed_payload else {
         return Err("validated MergeIntent kind has a different typed payload".into());
     };
-    let expected_pr = format!(
-        "{}#{}",
-        trusted.evidence.subject.repository_id, trusted.evidence.subject.pull_request_id
-    );
     if trusted.project_id != run.project_id
         || trusted.ticket_run_id != *ticket_run_id
         || trusted.revision != Revision(run.revision)
         || trusted.configuration_digest != binding.config_digest
         || intent.assessment_id != trusted.assessment_id.as_str()
         || intent.policy_digest != trusted.policy_digest
-        || intent.pr_identities != [expected_pr]
+        || intent.pr_identities != [trusted.pull_request_reference.clone()]
         || trusted.evidence.subject.prepared_body_digest.is_none()
     {
         return Err("MergeIntent does not match the immutable host assessment, exact PR, policy, or reviewed body".into());
@@ -2222,8 +2218,41 @@ fn apply_merge_intent(
             ticket_run_id, run.revision, request_id
         ),
         kind: "request_human_review".into(),
-        request_digest: durable_input_digest("human_presentation", &request_json),
+        request_digest: format!("{:x}", sha2::Sha256::digest(request_json.as_bytes())),
         request_json,
+        expected_revision: Some(review_revision.0),
+    };
+    let status_payload = crate::engine::ticket_effects::PublishTicketStatus {
+        schema_version: 1,
+        project_id: run.project_id.clone(),
+        namespace: run.namespace.clone(),
+        ticket_id: run.ticket_id.clone(),
+        ticket_run_id: ticket_run_id.clone(),
+        ticket_run_revision: review_revision.0,
+        expected_external_revision: None,
+        desired_status: crate::domain::types::TicketStatus::InReview,
+        reason: "MergeDecision requires human review of the exact host-validated merge procedure"
+            .into(),
+    };
+    status_payload.validate()?;
+    let status_json = crate::store::canonical_json(&status_payload)?;
+    let status_effect = EffectIntent {
+        project_id: run.project_id.clone(),
+        subject_type: "ticket_run".into(),
+        subject_id: ticket_run_id.as_str().into(),
+        operation_id: OperationId::parse(format!(
+            "publish-status-merge-review-{}-{}",
+            ticket_run_id, run.revision
+        ))?
+        .as_str()
+        .into(),
+        logical_key: format!(
+            "{}:{}:publish-status-after-merge-review",
+            ticket_run_id, run.revision
+        ),
+        kind: "publish_ticket_status".into(),
+        request_digest: format!("{:x}", sha2::Sha256::digest(status_json.as_bytes())),
+        request_json: status_json,
         expected_revision: Some(review_revision.0),
     };
     let accepted_revision = review_revision;
@@ -2252,7 +2281,7 @@ fn apply_merge_intent(
         Input::RequireHumanReview,
         "host validated MergeIntent against the same-revision trusted assessment and persisted its exact review procedure",
         &input_payload,
-        &[review_effect],
+        &[review_effect, status_effect],
     )?;
     store.acknowledge_validated_agent_result(
         owner_generation,
@@ -3747,6 +3776,7 @@ pub(crate) mod tests {
         ticket_page: Option<super::ExternalTicketPage>,
         merge_observation: Option<crate::merge_runtime::MergeEvidenceObservation>,
         merge_body_proposal: Option<crate::store::merge_work::PreparedMergeBodyProposal>,
+        merge_work_document: Option<crate::store::merge_work::MergeWorkDocument>,
     }
 
     impl super::FactoryRuntimeServices for WorkerPublicationFixtureServices {
@@ -3860,6 +3890,19 @@ pub(crate) mod tests {
             self.merge_body_proposal
                 .clone()
                 .ok_or_else(|| "MergeAssessment fixture body proposal is missing".into())
+        }
+
+        fn resolve_merge_work_document(
+            &mut self,
+            _: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+            _: &crate::engine::orchestration::WorkPlan,
+            _: &crate::store::merge_work::TrustedMergeAssessment,
+            _: &crate::engine::orchestration::MergeIntentPayload,
+            _: &crate::store::agent_results::IngestedAgentResult,
+        ) -> Result<crate::store::merge_work::MergeWorkDocument, String> {
+            self.merge_work_document
+                .clone()
+                .ok_or_else(|| "MergeIntent fixture document is missing".into())
         }
 
         fn tick_profile_trials(
@@ -4003,6 +4046,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
         super::apply_agent_result(
             store,
@@ -4035,8 +4079,37 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: Some(observation),
             merge_body_proposal: proposal,
+            merge_work_document: None,
         };
         super::apply_merge_assessment(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            &mut services,
+            result,
+        )
+    }
+
+    pub(crate) fn apply_merge_intent_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        document: crate::store::merge_work::MergeWorkDocument,
+    ) -> Result<bool, String> {
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: None,
+            merge_observation: None,
+            merge_body_proposal: None,
+            merge_work_document: Some(document),
+        };
+        super::apply_merge_intent(
             store,
             owner_generation,
             now_unix,
@@ -4155,6 +4228,7 @@ pub(crate) mod tests {
                 ticket_page: None,
                 merge_observation: None,
                 merge_body_proposal: None,
+                merge_work_document: None,
             };
             let applied = super::apply_agent_result(
                 &mut fixture.store,
@@ -4255,6 +4329,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
 
         let error = super::FactoryRuntime::tick(
@@ -4519,6 +4594,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
         assert!(
             super::apply_agent_result(
@@ -4588,6 +4664,7 @@ pub(crate) mod tests {
             }),
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
         let absent_report = super::FactoryRuntime::tick(
             &mut fixture.store,
@@ -5239,6 +5316,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
 
         let tick = super::FactoryRuntime::tick(
@@ -5360,6 +5438,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
 
         assert!(
@@ -5488,6 +5567,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
 
         assert!(
@@ -5582,6 +5662,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
         let coordinator_session = "ticket_run:fixture-ticket-run:coordinator";
 
@@ -5925,6 +6006,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
         for _ in 0..2 {
             assert!(
@@ -6227,6 +6309,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
         for _ in 0..2 {
             assert!(
@@ -6382,6 +6465,7 @@ pub(crate) mod tests {
                 ticket_page: None,
                 merge_observation: None,
                 merge_body_proposal: None,
+                merge_work_document: None,
             };
             let wake_count_before: u32 = fixture
                 .store
@@ -6534,6 +6618,7 @@ pub(crate) mod tests {
             ticket_page: None,
             merge_observation: None,
             merge_body_proposal: None,
+            merge_work_document: None,
         };
 
         assert!(

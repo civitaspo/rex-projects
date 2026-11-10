@@ -7133,9 +7133,9 @@ pub(crate) mod tests {
                     {"gate_id":"review_threads_resolved","outcome":"pass","evidence_references":[]}
                 ],
                 "ratings": {
-                    "change_impact":{"rating":1,"source":"diff","rationale":"small change","evidence_references":[]},
-                    "complexity":{"rating":1,"source":"diff","rationale":"simple change","evidence_references":[]},
-                    "verification_gaps":{"rating":1,"source":"checks","rationale":"covered","evidence_references":[]},
+                    "change_impact":{"rating":2,"source":"diff","rationale":"moderate change","evidence_references":[]},
+                    "complexity":{"rating":2,"source":"diff","rationale":"moderate complexity","evidence_references":[]},
+                    "verification_gaps":{"rating":2,"source":"checks","rationale":"some verification gaps","evidence_references":[]},
                     "review_uncertainty":{"rating":1,"source":"review","rationale":"reviewed","evidence_references":[]},
                     "operational_exposure":{"rating":1,"source":"policy","rationale":"low exposure","evidence_references":[]}
                 },
@@ -7629,7 +7629,7 @@ pub(crate) mod tests {
             );
             let typed_intent = serde_json::json!({
                 "assessment_id": public_assessment["assessment_id"],
-                "pr_identities": [format!("{}#{}", public_assessment["evidence"]["subject"]["repository_id"].as_str().unwrap(), public_assessment["evidence"]["subject"]["pull_request_id"].as_str().unwrap())],
+                "pr_identities": [public_assessment["pull_request_reference"].as_str().unwrap()],
                 "policy_digest": public_assessment["policy_digest"],
                 "prepared_body_digest": public_assessment["prepared_body_proposal"]["target_body_digest"],
                 "steps": [
@@ -7671,7 +7671,7 @@ pub(crate) mod tests {
                     kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
                     assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
                     result_digest: None,
-                    structured_result: typed_intent,
+                    structured_result: typed_intent.clone(),
                     artifact_refs: Vec::new(),
                 },
                 crate::domain::ids::AgentRunId::parse("single-publication-intent-run").unwrap(),
@@ -7702,6 +7702,62 @@ pub(crate) mod tests {
                     document_replies,
                 )
                 .unwrap();
+            for (index, invalid_identity) in
+                ["acme/repo-a#4", "https://github.com/foreign/repo/pull/4"]
+                    .into_iter()
+                    .enumerate()
+            {
+                let mut invalid_intent = typed_intent.clone();
+                invalid_intent["pr_identities"] = serde_json::json!([invalid_identity]);
+                let invalid_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: format!("invalid-merge-intent-identity-{index}"),
+                        kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: None,
+                        structured_result: invalid_intent,
+                        artifact_refs: Vec::new(),
+                    },
+                    crate::domain::ids::AgentRunId::parse(format!(
+                        "single-publication-invalid-intent-{index}"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                let error = crate::engine::factory_runtime::tests::apply_merge_intent_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    &invalid_result.ingested,
+                    document.clone(),
+                )
+                .unwrap_err();
+                assert!(error.contains("MergeIntent does not match"), "{error}");
+                assert!(
+                    store
+                        .validated_agent_result_ack(invalid_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let human_effect_count: u64 = store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM effects WHERE kind='request_human_review' AND subject_id=?1",
+                    [ticket_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(human_effect_count, 0);
             let first_operation = &document.procedure.steps[0].operation;
             assert!(matches!(
                 first_operation,
@@ -7710,6 +7766,140 @@ pub(crate) mod tests {
                     ..
                 } if expected_prior_body_digest.as_str() == format!("{:x}", sha2::Sha256::digest(b""))
             ));
+            assert!(
+                crate::engine::factory_runtime::tests::apply_merge_intent_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    &host_intent.ingested,
+                    document,
+                )
+                .unwrap()
+            );
+            let human_effect_json: String = store
+                .connection
+                .query_row(
+                    "SELECT request_json FROM effects WHERE kind='request_human_review' ORDER BY created_at_unix DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let status_effect_json: String = store
+                .connection
+                .query_row(
+                    "SELECT request_json FROM effects WHERE kind='publish_ticket_status' AND subject_id=?1 ORDER BY created_at_unix DESC LIMIT 1",
+                    [ticket_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let status_payload: crate::engine::ticket_effects::PublishTicketStatus =
+                crate::protocol::parse_unique(status_effect_json.as_bytes()).unwrap();
+            assert_eq!(status_payload.project_id, project_id);
+            assert_eq!(status_payload.namespace, ticket_namespace);
+            assert_eq!(status_payload.ticket_id, ticket_id);
+            assert_eq!(status_payload.ticket_run_id, ticket_run_id);
+            assert_eq!(
+                status_payload.ticket_run_revision,
+                host_intent
+                    .ingested
+                    .validated
+                    .binding
+                    .ticket_revision
+                    .unwrap()
+                    .0
+                    + 1
+            );
+            assert_eq!(
+                status_payload.desired_status,
+                crate::domain::types::TicketStatus::InReview
+            );
+            status_payload.validate().unwrap();
+            let human_effect: crate::human_runtime::HumanPresentationEffect =
+                crate::protocol::parse_unique(human_effect_json.as_bytes()).unwrap();
+            assert_eq!(
+                human_effect.request.purpose,
+                crate::human_runtime::HumanPurpose::TicketReview
+            );
+            assert_eq!(
+                human_effect.request.subject.ticket_run_id.as_ref(),
+                Some(&ticket_run_id)
+            );
+            assert!(
+                human_effect
+                    .request
+                    .review_bundle
+                    .summary
+                    .contains("risk index: 43/100; human-facing rating: 2/4")
+            );
+            struct EchoHumanSubjectObserver;
+            impl crate::human_runtime::HumanSubjectObserver for EchoHumanSubjectObserver {
+                fn observe_current_subject(
+                    &self,
+                    _: &crate::store::ConfigStore,
+                    request: &crate::human_runtime::HumanRuntimeRequest,
+                ) -> Result<crate::human_runtime::HumanSubjectObservation, String> {
+                    Ok(crate::human_runtime::HumanSubjectObservation::Current(
+                        request.subject.clone(),
+                    ))
+                }
+            }
+            let effect_due_at: i64 = store
+                .connection
+                .query_row(
+                    "SELECT next_attempt_at_unix FROM effects WHERE kind='request_human_review' AND subject_id=?1",
+                    [ticket_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let claimed = store
+                .claim_next_due_effect(
+                    owner_generation,
+                    effect_due_at,
+                    &["request_human_review".into()],
+                )
+                .unwrap()
+                .expect("MergeIntent creates a due human review effect");
+            let handler = crate::human_runtime::HumanPresenterEffectHandler::new(
+                "local_html",
+                vec!["/usr/bin/true".into()],
+                [(
+                    std::ffi::OsString::from("PATH"),
+                    std::ffi::OsString::from("/usr/bin"),
+                )]
+                .into_iter()
+                .collect(),
+                temp.path().join("merge-intent-review-artifacts"),
+                std::sync::Arc::new(EchoHumanSubjectObserver),
+            )
+            .unwrap();
+            let mut effect_context = crate::effects::EffectContext {
+                store: &mut store,
+                owner_generation,
+                now_unix: 12,
+            };
+            let observation = crate::effects::EffectHandler::handle(
+                &handler,
+                crate::effects::EffectMode::Submit,
+                &crate::effects::EffectRequest::from(claimed),
+                &mut effect_context,
+            )
+            .unwrap();
+            assert!(matches!(
+                observation,
+                crate::effects::EffectObservation::Pending { .. }
+            ));
+            let saved_request = effect_context
+                .store
+                .current_human_request(&human_effect.request.request_id)
+                .unwrap()
+                .expect("MergeIntent reaches the durable human request store");
+            assert_eq!(saved_request.request, human_effect.request);
+            assert_eq!(
+                saved_request.lifecycle,
+                crate::human_runtime::HumanRequestLifecycle::Presented
+            );
             return;
         }
         let pending = store

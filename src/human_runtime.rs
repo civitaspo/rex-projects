@@ -2048,8 +2048,17 @@ fn merge_work_review_bundle(
         merge_steps.push(format!("{}: {summary}", step.key));
     }
     let unresolved_reasons = document.assessment.reasons.clone();
+    let risk_index_summary = document.assessment.risk_index.map_or_else(
+        || "risk index: unknown".to_owned(),
+        |risk_index| {
+            format!(
+                "risk index: {risk_index}/100; human-facing rating: {}/4",
+                review_risk_rating(Some(risk_index))
+            )
+        },
+    );
     let summary = format!(
-        "Host assessment for {} PR #{} at head {} against {}. Policy disposition: {:?}; reliability score: {}.",
+        "Host assessment for {} PR #{} at head {} against {}. Policy disposition: {:?}; reliability score: {}; {}.",
         subject.repository_id,
         subject.pull_request_id,
         subject.head_sha,
@@ -2059,6 +2068,7 @@ fn merge_work_review_bundle(
             .assessment
             .reliability_score
             .map_or_else(|| "unknown".into(), |score| score.to_string()),
+        risk_index_summary,
     );
     let bundle = ReviewBundle {
         title: format!(
@@ -2067,7 +2077,7 @@ fn merge_work_review_bundle(
         ),
         summary,
         risk: Some(ReviewRisk {
-            rating: document.assessment.risk_index.unwrap_or(4),
+            rating: review_risk_rating(document.assessment.risk_index),
             confidence: if document.assessment.risk_index.is_some() {
                 confidence
             } else {
@@ -2128,6 +2138,10 @@ fn merge_work_review_bundle(
     };
     bundle.validate()?;
     Ok(bundle)
+}
+
+fn review_risk_rating(risk_index: Option<u8>) -> u8 {
+    risk_index.map_or(4, |score| score.div_ceil(25).min(4))
 }
 
 /// Configured host-side presenter. Its effect request contains only host-built typed review
@@ -3166,5 +3180,22 @@ mod presenter_tests {
             resolve_human_child("review presenter", &environment).unwrap(),
             executable.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn merge_risk_percent_converts_conservatively_to_review_ordinal() {
+        for (risk_index, expected) in [
+            (Some(0), 0),
+            (Some(1), 1),
+            (Some(25), 1),
+            (Some(26), 2),
+            (Some(43), 2),
+            (Some(75), 3),
+            (Some(76), 4),
+            (Some(100), 4),
+            (None, 4),
+        ] {
+            assert_eq!(review_risk_rating(risk_index), expected);
+        }
     }
 }
