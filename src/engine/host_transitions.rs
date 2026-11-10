@@ -2041,7 +2041,7 @@ mod tests {
         store
             .test_connection()
             .execute(
-                "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision,required_review_revision) VALUES (?1,?2,'fixture',?3,?4,'github:org/repo','T-9',1,'waiting_human','blocked','in_progress','in_progress',5,5)",
+                "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision,required_review_revision,external_revision) VALUES (?1,?2,'fixture',?3,?4,'github:org/repo','T-9',1,'waiting_human','blocked','in_progress','in_progress',5,5,'ticket-revision-before-approval')",
                 params![ticket_run_id.as_str(), project_id.as_str(), applied.revision.0, loaded.digest.as_str()],
             )
             .unwrap();
@@ -2214,6 +2214,24 @@ mod tests {
             .unwrap();
         assert_eq!(awaiting.phase, super::Phase::AwaitingMerge);
         assert_eq!(awaiting.revision, 6);
+        let status_intent = store
+            .effect_by_logical_key(&format!(
+                "{}:5:publish-status-after-merge-review",
+                ticket_run_id
+            ))
+            .unwrap()
+            .unwrap();
+        let status_payload: crate::engine::ticket_effects::PublishTicketStatus =
+            serde_json::from_str(&status_intent.request_json).unwrap();
+        assert_eq!(
+            status_payload.desired_status,
+            crate::domain::types::TicketStatus::InProgress
+        );
+        assert_eq!(
+            status_payload.expected_external_revision.as_deref(),
+            Some("ticket-revision-before-approval"),
+            "human approval must preserve the current external CAS revision"
+        );
         let first = store
             .effect_by_logical_key(&format!(
                 "{}:6:{}:000:{}",

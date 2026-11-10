@@ -1933,61 +1933,57 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let claimed = store
-            .claim_next_due_effect(owner, 4, &["publish_ticket_status".into()])
-            .unwrap();
-        let request: EffectRequest = claimed
-            .expect("dispatch creates a durable status effect")
-            .into();
-        assert_eq!(request.intent.subject_id, run.as_str());
-        assert_eq!(
-            request.intent.request_digest,
-            hash(&request.intent.request_json)
-        );
-        let payload: PublishTicketStatus =
-            serde_json::from_str(&request.intent.request_json).unwrap();
-        assert_eq!(payload.namespace, namespace);
-        assert_eq!(payload.ticket_id, ticket);
-        assert_eq!(
-            payload.expected_external_revision.as_deref(),
-            Some("revision-1")
-        );
-        assert_eq!(payload.desired_status, TicketStatus::InProgress);
-
         let fake = FakeAdapter::new(
             scope(),
-            payload.namespace.as_str(),
-            payload.ticket_id.as_str(),
+            namespace.as_str(),
+            ticket.as_str(),
             NormalizedTicketStatus::Ready,
         );
         fake.ticket.lock().unwrap().revision = Some("revision-1".into());
         let adapter = Arc::new(fake);
-        let handler = PublishTicketStatusHandler::new(
+        let owned_handlers = TicketEffectHandlers::new(
             adapter.clone(),
             BTreeMap::from([(project.clone(), scope())]),
-        );
-        let mut context = EffectContext {
-            store: &mut store,
-            owner_generation: owner,
-            now_unix: 4,
-        };
-        let observation = handler
-            .handle(EffectMode::Submit, &request, &mut context)
-            .unwrap();
-        let EffectObservation::Applied { receipt } = observation else {
-            panic!("status handler did not return its adapter receipt");
-        };
-        let receipt: ScopedTicketResult = serde_json::from_str(&receipt).unwrap();
-        assert_eq!(receipt.ticket.id, ticket.as_str());
-        assert_eq!(
-            receipt.ticket.status.value,
-            NormalizedTicketStatus::InProgress
-        );
-        assert_eq!(receipt.ticket.revision.as_deref(), Some("revision-2"));
+        )
+        .into_handlers();
+        let handler_refs = owned_handlers
+            .iter()
+            .map(|handler| handler.as_ref())
+            .collect::<Vec<_>>();
+        let dispatched = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            owner,
+            4,
+            &handler_refs,
+            crate::effects::EffectLimits {
+                max_attempts: 5,
+                max_age: std::time::Duration::from_secs(300),
+                retry_base: std::time::Duration::from_secs(1),
+                retry_max: std::time::Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            dispatched,
+            crate::effects::DispatchTick::Completed { .. }
+        ));
         assert_eq!(*adapter.calls.lock().unwrap(), ["get", "update"]);
         assert_eq!(
             adapter.ticket.lock().unwrap().status.value,
             NormalizedTicketStatus::InProgress
+        );
+        let saved_revision: Option<String> = store
+            .test_connection()
+            .query_row(
+                "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.as_str(), run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            saved_revision.as_deref(),
+            Some("revision-2"),
+            "a successful ticket adapter status update must advance the saved CAS revision"
         );
     }
 
