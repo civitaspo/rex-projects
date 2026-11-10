@@ -7173,6 +7173,7 @@ pub(crate) mod tests {
                 serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
                 serde_json::json!([]),
                 serde_json::json!([]),
+                serde_json::json!({"name":"main","protected":true}),
                 serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
             ];
             let (observation, proposal) =
@@ -7374,6 +7375,7 @@ pub(crate) mod tests {
                 serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
                 serde_json::json!([]),
                 serde_json::json!([]),
+                serde_json::json!({"name":"main","protected":true}),
                 serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
             ];
             let document =

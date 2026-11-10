@@ -117,6 +117,12 @@ pub struct CheckRun {
     pub status: String,
     pub conclusion: Option<String>,
     pub app_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_suite_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
