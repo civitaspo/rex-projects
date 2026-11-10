@@ -2112,6 +2112,79 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn create_agent_block_reconciles_response_loss_by_hashed_owned_label() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn create_after_response_loss(candidates: &[(&str, String)]) -> Result<String, RexError> {
+            let dir = tempfile::tempdir().unwrap();
+            let window_label = ticket_window_label("tracker", "T-9").unwrap();
+            let run_id = "ticket-T-9-worker";
+            let before = serde_json::json!({"windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":[{"block_id":"anchor-1","label":owned_block_label("anchor-run").unwrap(),"flavor":SHELL_FLAVOR}]}]}]});
+            let mut blocks = vec![serde_json::json!({"block_id":"anchor-1","label":owned_block_label("anchor-run").unwrap(),"flavor":SHELL_FLAVOR})];
+            blocks.extend(candidates.iter().map(|(block_id, label)| serde_json::json!({"block_id":block_id,"label":label,"flavor":SHELL_FLAVOR})));
+            let after = serde_json::json!({"windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":blocks}]}]});
+            let whoami = serde_json::json!({"endpoint":"unix:///tmp/rex-test.sock","instance_id":"instance-1","host_id":"host-1","rex_version":"1.2.3"});
+            let api = serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}});
+            let marker = dir.path().join("split-created");
+            let script = dir.path().join("rex fake");
+            let body = format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{}' ;;\n  *\"api call session.view\"*) if [ -f '{}' ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi ;;\n  *\"api call session.new_split\"*) : > '{}'; exit 2 ;;\n  *) exit 3 ;;\nesac\n",
+                whoami,
+                api,
+                marker.display(),
+                after,
+                before,
+                marker.display(),
+            );
+            std::fs::write(&script, body).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let transport = RexCliTransport::connect(
+                &script,
+                &[],
+                "unix:///tmp/rex-test.sock".into(),
+                "instance-1".into(),
+                "session-1".into(),
+                BTreeMap::<OsString, OsString>::new(),
+            )
+            .unwrap();
+            let window = TicketWindow {
+                server_instance_id: "instance-1".into(),
+                session_id: "session-1".into(),
+                window_id: "window-1".into(),
+                label: window_label,
+                initial_block_id: Some("anchor-1".into()),
+                disposition: CreateDisposition::Existing,
+            };
+            let spec = AgentBlockSpec {
+                run_id: run_id.into(),
+                command: PathBuf::from("/usr/bin/true"),
+                args: vec![],
+                cwd: dir.path().to_path_buf(),
+                path_prepend: vec![PathBuf::from("/usr/bin")],
+            };
+            transport.create_agent_block(&window, "anchor-1", &spec)
+        }
+
+        let expected_label = owned_block_label("ticket-T-9-worker").unwrap();
+        assert_eq!(
+            create_after_response_loss(&[("worker-1", expected_label.clone())]).unwrap(),
+            "worker-1"
+        );
+        assert!(matches!(
+            create_after_response_loss(&[("wrong-1", owned_block_label("other-run").unwrap())]),
+            Err(RexError::Uncertain)
+        ));
+        assert!(matches!(
+            create_after_response_loss(&[
+                ("worker-1", expected_label.clone()),
+                ("worker-2", expected_label),
+            ]),
+            Err(RexError::Uncertain)
+        ));
+    }
+
     #[test]
     fn rex_event_parser_accepts_only_scoped_close_and_inventory_events() {
         assert_eq!(
