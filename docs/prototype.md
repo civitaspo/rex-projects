@@ -1428,6 +1428,7 @@ The following directory layout and `rex_projects` metadata are this application'
 ```
 
 A Postmortem receives the ticket, plan revisions, role outcomes, reviews, human decisions, retries, anomalies, actual merges, operation evidence, and local check receipts.
+Reconstruct implementation evidence from the exact completed MergeWork's accepted plan, configuration, prepared receipt, and publication-set digests. Copy only host-registered Worker validation artifacts into the Postmortem workspace, with immutable source evidence IDs and content digests in its inbox. Preserve independently verifiable sources when another historical source is unavailable, and record the missing proof explicitly. Artifact unavailability does not grant approval, establish successful checks, or add a new completion gate.
 It separates observed facts from inferences, records the earliest demonstrated cause of a failure, and proposes a concrete improvement.
 Do not store complete transcripts by default. Preserve compact sanitized evidence and configurable references with retention rules.
 The knowledge root is outside source repositories by default. Never copy private instructions into an OSS commit automatically.

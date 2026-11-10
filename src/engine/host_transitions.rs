@@ -1601,7 +1601,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use crate::delivery_runtime::{
@@ -1681,14 +1681,213 @@ mod tests {
         merge_review_approval_fixture(false, true);
     }
 
-    fn merge_review_approval_fixture(required_operations: bool, reassessment_case: bool) {
-        use crate::domain::ids::{
-            Digest, HumanRequestId, OperationId, ProjectId, Revision, TicketRunId,
-        };
+    pub(crate) fn merge_work_fixture_item(
+        project_id: crate::domain::ids::ProjectId,
+        ticket_run_id: TicketRunId,
+        config_digest: Digest,
+        accepted_plan_digest: Digest,
+        reassessment_case: bool,
+        head_sha: &str,
+    ) -> crate::store::merge_work::MergeWorkItem {
+        use crate::domain::ids::Revision;
         use crate::domain::types::{MergeExecutor, MergeMethod};
         use crate::engine::orchestration::{
             MergeProcedureStepKind, PostMergeVerification, PostMergeVerificationKind,
         };
+        use crate::merge_policy::{
+            Confidence, EvidenceState, MergeEvidenceSnapshot, MergePolicy, MergeProcedureOperation,
+            MergeProcedureStep, MergeSubject, RiskWeights, evaluate_merge_policy,
+        };
+        use crate::store::merge_work::{MergeWorkDocument, MergeWorkItem};
+        fn digest(ch: char) -> Digest {
+            Digest::parse(ch.to_string().repeat(64)).unwrap()
+        }
+        let comments = Vec::<crate::forge::IssueComment>::new();
+        let comments_digest = crate::forge::canonical_digest(&comments).unwrap();
+        let subject = MergeSubject {
+            repository_id: "example".into(),
+            forge: "github".into(),
+            forge_host: "github.com".into(),
+            forge_repository_id: 7,
+            pull_request_id: "9".into(),
+            pull_request_node_id: "PR_node".into(),
+            head_sha: head_sha.into(),
+            base_ref: "main".into(),
+            base_sha: "b".repeat(40),
+            config_digest: config_digest.clone(),
+            instruction_digest: digest('2'),
+            hooks_digest: digest('3'),
+            remote_checks_digest: digest('4'),
+            diff_digest: digest('5'),
+            merge_comments_digest: comments_digest,
+            base_guard_digest: Some(digest('6')),
+            review_digest: digest('7'),
+            prepared_body_digest: Some(if reassessment_case {
+                Digest::parse(super::sha256_hex(b"Prior body\n")).unwrap()
+            } else {
+                digest('8')
+            }),
+        };
+        let policy = MergePolicy {
+            auto_merge_enabled: false,
+            minimum_reliability_score: 90,
+            method: MergeMethod::Squash,
+            executor: MergeExecutor::Direct,
+            required_checks: Vec::new(),
+            required_approving_reviews: None,
+            risk_weights: RiskWeights::default(),
+        };
+        let evidence = MergeEvidenceSnapshot {
+            subject: subject.clone(),
+            current_subject: subject.clone(),
+            gates: Vec::new(),
+            risk: Vec::new(),
+            confidence: Confidence::High,
+            human_review_required: true,
+            execution_time_base_guard: if reassessment_case {
+                EvidenceState::Unknown
+            } else {
+                EvidenceState::Pass
+            },
+        };
+        let assessment = evaluate_merge_policy(&policy, &evidence).unwrap();
+        let mut procedure_steps = Vec::new();
+        if reassessment_case {
+            procedure_steps.push(MergeProcedureStep {
+                key: "body".into(),
+                prerequisites: Vec::new(),
+                operation: MergeProcedureOperation::UpdatePullRequestBody {
+                    expected_prior_body_digest: subject.prepared_body_digest.clone().unwrap(),
+                    approved_body_digest: Digest::parse(super::sha256_hex(b"Reviewed body\n"))
+                        .unwrap(),
+                },
+                instruction_digest: subject.instruction_digest.clone(),
+            });
+        }
+        procedure_steps.extend([
+            MergeProcedureStep {
+                key: "merge".into(),
+                prerequisites: if reassessment_case {
+                    vec!["body".into()]
+                } else {
+                    Vec::new()
+                },
+                operation: MergeProcedureOperation::ExecuteMerge {
+                    expected_head_sha: subject.head_sha.clone(),
+                    base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
+                },
+                instruction_digest: subject.instruction_digest.clone(),
+            },
+            MergeProcedureStep {
+                key: "verify".into(),
+                prerequisites: vec!["merge".into()],
+                operation: MergeProcedureOperation::VerifyMergeCommit {
+                    expected_trailers: vec!["Co-authored-by: Agent <agent@example.test>".into()],
+                },
+                instruction_digest: subject.instruction_digest.clone(),
+            },
+        ]);
+        let procedure = crate::merge_policy::build_merge_procedure(
+            policy.method,
+            policy.executor,
+            procedure_steps,
+            &subject,
+        )
+        .unwrap();
+        let policy_digest = crate::forge::canonical_digest(&policy).unwrap();
+        let intent = crate::engine::orchestration::MergeIntentPayload {
+            assessment_id: "assessment-1".into(),
+            pr_identities: vec!["example#9".into()],
+            policy_digest: policy_digest.clone(),
+            prepared_body_digest: if reassessment_case {
+                Digest::parse(super::sha256_hex(b"Reviewed body\n")).unwrap()
+            } else {
+                subject.prepared_body_digest.clone().unwrap()
+            },
+            steps: if reassessment_case {
+                vec![
+                    crate::engine::orchestration::MergeProcedureStep {
+                        kind: MergeProcedureStepKind::UpdatePullRequestBody,
+                        instruction_reference: "merge.instructions#body".into(),
+                        rationale: "ensure the prepared body is present".into(),
+                    },
+                    crate::engine::orchestration::MergeProcedureStep {
+                        kind: MergeProcedureStepKind::DirectMerge,
+                        instruction_reference: "merge.instructions#merge".into(),
+                        rationale: "execute the approved merge".into(),
+                    },
+                    crate::engine::orchestration::MergeProcedureStep {
+                        kind: MergeProcedureStepKind::VerifyMergeCommit,
+                        instruction_reference: "merge.instructions#verify".into(),
+                        rationale: "verify the resulting commit".into(),
+                    },
+                ]
+            } else {
+                vec![
+                    crate::engine::orchestration::MergeProcedureStep {
+                        kind: MergeProcedureStepKind::DirectMerge,
+                        instruction_reference: "merge.instructions#merge".into(),
+                        rationale: "execute the approved merge".into(),
+                    },
+                    crate::engine::orchestration::MergeProcedureStep {
+                        kind: MergeProcedureStepKind::VerifyMergeCommit,
+                        instruction_reference: "merge.instructions#verify".into(),
+                        rationale: "verify the resulting commit".into(),
+                    },
+                ]
+            },
+            post_merge_verification: vec![PostMergeVerification {
+                kind: PostMergeVerificationKind::MergeCommitRecorded,
+                instruction_reference: "merge.instructions#verify".into(),
+                rationale: "confirm the remote merge commit".into(),
+            }],
+        };
+        let document = MergeWorkDocument {
+            schema_version: 1,
+            assessment_id: "assessment-1".into(),
+            assessment_evidence_id: "assessment-evidence".into(),
+            assessment_result_digest: digest('a'),
+            intent_evidence_id: "intent-evidence".into(),
+            intent_result_digest: digest('b'),
+            policy: policy.clone(),
+            evidence,
+            baseline_issue_comments: comments,
+            assessment,
+            intent,
+            authority: crate::merge_executor::ResolvedMergeAuthority {
+                policy_digest,
+                instruction_digest: subject.instruction_digest.clone(),
+                sources: Default::default(),
+                request_comment_proofs: Vec::new(),
+                execution_time_base_guard: if reassessment_case {
+                    EvidenceState::Unknown
+                } else {
+                    EvidenceState::Pass
+                },
+                base_guard_digest: subject.base_guard_digest.clone(),
+            },
+            procedure,
+            prepared_body: reassessment_case.then(|| "Reviewed body\n".into()),
+        };
+        MergeWorkItem::new(
+            project_id,
+            ticket_run_id,
+            Revision(4),
+            Revision(6),
+            config_digest,
+            accepted_plan_digest,
+            digest('d'),
+            digest('e'),
+            document,
+        )
+        .unwrap()
+    }
+
+    fn merge_review_approval_fixture(required_operations: bool, reassessment_case: bool) {
+        use crate::domain::ids::{
+            Digest, HumanRequestId, OperationId, ProjectId, Revision, TicketRunId,
+        };
+        use crate::domain::types::MergeMethod;
         use crate::engine::reducer::EffectKind;
         use crate::forge::{
             BodyUpdateIntent, CommentIntent, CommitComparison, CommitObservation,
@@ -1704,11 +1903,6 @@ mod tests {
             MergeBaseAncestryProof, MergeMethodEvidence, MergeProcedureExecutor,
             MergeStepEffectRequest, MergeStepReceipt, MergeVerificationReceipt,
         };
-        use crate::merge_policy::{
-            Confidence, EvidenceState, MergeEvidenceSnapshot, MergePolicy, MergeProcedureOperation,
-            MergeProcedureStep, MergeSubject, RiskWeights, evaluate_merge_policy,
-        };
-        use crate::store::merge_work::{MergeWorkDocument, MergeWorkItem};
         use crate::store::{
             ConfigStore, EffectOutcome, ExpectedRevision, OwnerMetadata, ProjectRecord,
         };
@@ -1788,196 +1982,6 @@ mod tests {
             fn reconcile(&self, _: &MergeEffectIntent) -> Result<Reconciliation, ForgeError> {
                 Err(ForgeError("unused verification fixture method".into()))
             }
-        }
-
-        fn item(
-            project_id: ProjectId,
-            ticket_run_id: TicketRunId,
-            config_digest: Digest,
-            accepted_plan_digest: Digest,
-            reassessment_case: bool,
-        ) -> MergeWorkItem {
-            let comments = Vec::<crate::forge::IssueComment>::new();
-            let comments_digest = crate::forge::canonical_digest(&comments).unwrap();
-            let subject = MergeSubject {
-                repository_id: "example".into(),
-                forge: "github".into(),
-                forge_host: "github.com".into(),
-                forge_repository_id: 7,
-                pull_request_id: "9".into(),
-                pull_request_node_id: "PR_node".into(),
-                head_sha: "a".repeat(40),
-                base_ref: "main".into(),
-                base_sha: "b".repeat(40),
-                config_digest: config_digest.clone(),
-                instruction_digest: digest('2'),
-                hooks_digest: digest('3'),
-                remote_checks_digest: digest('4'),
-                diff_digest: digest('5'),
-                merge_comments_digest: comments_digest,
-                base_guard_digest: Some(digest('6')),
-                review_digest: digest('7'),
-                prepared_body_digest: Some(if reassessment_case {
-                    Digest::parse(super::sha256_hex(b"Prior body\n")).unwrap()
-                } else {
-                    digest('8')
-                }),
-            };
-            let policy = MergePolicy {
-                auto_merge_enabled: false,
-                minimum_reliability_score: 90,
-                method: MergeMethod::Squash,
-                executor: MergeExecutor::Direct,
-                required_checks: Vec::new(),
-                required_approving_reviews: None,
-                risk_weights: RiskWeights::default(),
-            };
-            let evidence = MergeEvidenceSnapshot {
-                subject: subject.clone(),
-                current_subject: subject.clone(),
-                gates: Vec::new(),
-                risk: Vec::new(),
-                confidence: Confidence::High,
-                human_review_required: true,
-                execution_time_base_guard: if reassessment_case {
-                    EvidenceState::Unknown
-                } else {
-                    EvidenceState::Pass
-                },
-            };
-            let assessment = evaluate_merge_policy(&policy, &evidence).unwrap();
-            let mut procedure_steps = Vec::new();
-            if reassessment_case {
-                procedure_steps.push(MergeProcedureStep {
-                    key: "body".into(),
-                    prerequisites: Vec::new(),
-                    operation: MergeProcedureOperation::UpdatePullRequestBody {
-                        expected_prior_body_digest: subject.prepared_body_digest.clone().unwrap(),
-                        approved_body_digest: Digest::parse(super::sha256_hex(b"Reviewed body\n"))
-                            .unwrap(),
-                    },
-                    instruction_digest: subject.instruction_digest.clone(),
-                });
-            }
-            procedure_steps.extend([
-                MergeProcedureStep {
-                    key: "merge".into(),
-                    prerequisites: if reassessment_case {
-                        vec!["body".into()]
-                    } else {
-                        Vec::new()
-                    },
-                    operation: MergeProcedureOperation::ExecuteMerge {
-                        expected_head_sha: subject.head_sha.clone(),
-                        base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
-                    },
-                    instruction_digest: subject.instruction_digest.clone(),
-                },
-                MergeProcedureStep {
-                    key: "verify".into(),
-                    prerequisites: vec!["merge".into()],
-                    operation: MergeProcedureOperation::VerifyMergeCommit {
-                        expected_trailers: vec![
-                            "Co-authored-by: Agent <agent@example.test>".into(),
-                        ],
-                    },
-                    instruction_digest: subject.instruction_digest.clone(),
-                },
-            ]);
-            let procedure = crate::merge_policy::build_merge_procedure(
-                policy.method,
-                policy.executor,
-                procedure_steps,
-                &subject,
-            )
-            .unwrap();
-            let policy_digest = crate::forge::canonical_digest(&policy).unwrap();
-            let intent = crate::engine::orchestration::MergeIntentPayload {
-                assessment_id: "assessment-1".into(),
-                pr_identities: vec!["example#9".into()],
-                policy_digest: policy_digest.clone(),
-                prepared_body_digest: if reassessment_case {
-                    Digest::parse(super::sha256_hex(b"Reviewed body\n")).unwrap()
-                } else {
-                    subject.prepared_body_digest.clone().unwrap()
-                },
-                steps: if reassessment_case {
-                    vec![
-                        crate::engine::orchestration::MergeProcedureStep {
-                            kind: MergeProcedureStepKind::UpdatePullRequestBody,
-                            instruction_reference: "merge.instructions#body".into(),
-                            rationale: "ensure the prepared body is present".into(),
-                        },
-                        crate::engine::orchestration::MergeProcedureStep {
-                            kind: MergeProcedureStepKind::DirectMerge,
-                            instruction_reference: "merge.instructions#merge".into(),
-                            rationale: "execute the approved merge".into(),
-                        },
-                        crate::engine::orchestration::MergeProcedureStep {
-                            kind: MergeProcedureStepKind::VerifyMergeCommit,
-                            instruction_reference: "merge.instructions#verify".into(),
-                            rationale: "verify the resulting commit".into(),
-                        },
-                    ]
-                } else {
-                    vec![
-                        crate::engine::orchestration::MergeProcedureStep {
-                            kind: MergeProcedureStepKind::DirectMerge,
-                            instruction_reference: "merge.instructions#merge".into(),
-                            rationale: "execute the approved merge".into(),
-                        },
-                        crate::engine::orchestration::MergeProcedureStep {
-                            kind: MergeProcedureStepKind::VerifyMergeCommit,
-                            instruction_reference: "merge.instructions#verify".into(),
-                            rationale: "verify the resulting commit".into(),
-                        },
-                    ]
-                },
-                post_merge_verification: vec![PostMergeVerification {
-                    kind: PostMergeVerificationKind::MergeCommitRecorded,
-                    instruction_reference: "merge.instructions#verify".into(),
-                    rationale: "confirm the remote merge commit".into(),
-                }],
-            };
-            let document = MergeWorkDocument {
-                schema_version: 1,
-                assessment_id: "assessment-1".into(),
-                assessment_evidence_id: "assessment-evidence".into(),
-                assessment_result_digest: digest('a'),
-                intent_evidence_id: "intent-evidence".into(),
-                intent_result_digest: digest('b'),
-                policy: policy.clone(),
-                evidence,
-                baseline_issue_comments: comments,
-                assessment,
-                intent,
-                authority: crate::merge_executor::ResolvedMergeAuthority {
-                    policy_digest,
-                    instruction_digest: subject.instruction_digest.clone(),
-                    sources: Default::default(),
-                    request_comment_proofs: Vec::new(),
-                    execution_time_base_guard: if reassessment_case {
-                        EvidenceState::Unknown
-                    } else {
-                        EvidenceState::Pass
-                    },
-                    base_guard_digest: subject.base_guard_digest.clone(),
-                },
-                procedure,
-                prepared_body: reassessment_case.then(|| "Reviewed body\n".into()),
-            };
-            MergeWorkItem::new(
-                project_id,
-                ticket_run_id,
-                Revision(4),
-                Revision(6),
-                config_digest,
-                accepted_plan_digest,
-                digest('d'),
-                digest('e'),
-                document,
-            )
-            .unwrap()
         }
 
         let temp = tempdir().unwrap();
@@ -2124,12 +2128,13 @@ mod tests {
             "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,2,?3,?4,?5,'source-evidence','coordinator-run','source-message',?6,'coordinator-run','coordinator-session',?7,1)",
             params![project_id.as_str(), ticket_run_id.as_str(), loaded.digest.as_str(), plan_digest.as_str(), plan_json, "a".repeat(64), "b".repeat(64)],
         ).unwrap();
-        let work_item = item(
+        let work_item = merge_work_fixture_item(
             project_id.clone(),
             ticket_run_id.clone(),
             loaded.digest.clone(),
             plan_digest,
             reassessment_case,
+            &"a".repeat(40),
         );
         let work_json = crate::store::canonical_json(&serde_json::json!({
             "schema_version": 1,

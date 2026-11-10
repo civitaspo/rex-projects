@@ -82,7 +82,7 @@ pub struct AgentWakeItem {
     pub source_revision: u64,
     pub priority: i32,
     pub payload_json: serde_json::Value,
-    /// Host evidence IDs whose artifacts accompany a Reviewer transition. Kept separate from
+    /// Host evidence IDs whose artifacts accompany a Reviewer or Postmortem transition. Kept separate from
     /// the durable payload so reservation can compare that payload byte-for-byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_artifact_source_evidence_ids: Vec<String>,
@@ -153,6 +153,8 @@ pub struct HostImplementationPublication {
     pub intent_result_digest: Digest,
     pub assessment: serde_json::Value,
     pub verification: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_evidence_unavailable: Option<String>,
     pub merge_verification: HostMergeVerification,
 }
 
@@ -347,11 +349,14 @@ impl AgentWakeSnapshot {
             let transition_artifact_sources = if item.source_type == "ticket_run_transition"
                 && !item.host_artifacts.is_empty()
             {
-                if item.payload_json["target"] != "reviewer"
+                let valid_target = item.payload_json["target"] == "reviewer"
+                    || item.payload_json["target"] == "postmortem"
+                        && item.host_completion_context.is_some();
+                if !valid_target
                     || item.payload_json["revision"].as_u64() != Some(item.source_revision)
                     || item.payload_json["message_id"].as_str() != Some(item.source_id.as_str())
                 {
-                    return Err("host artifacts may accompany only a current Reviewer publication transition".into());
+                    return Err("host artifacts require a current Reviewer publication or scoped Postmortem transition".into());
                 }
                 let sources = item
                     .host_artifact_source_evidence_ids
@@ -365,13 +370,14 @@ impl AgentWakeSnapshot {
                     || sources.len() != item.host_artifact_source_evidence_ids.len()
                 {
                     return Err(
-                        "Reviewer artifact source evidence IDs must be nonempty and unique".into(),
+                        "transition artifact source evidence IDs must be nonempty and unique"
+                            .into(),
                     );
                 }
                 Some(sources)
             } else {
                 if !item.host_artifact_source_evidence_ids.is_empty() {
-                    return Err("host artifact source evidence IDs may accompany only a Reviewer publication transition".into());
+                    return Err("host artifact source evidence IDs require a Reviewer publication or scoped Postmortem transition".into());
                 }
                 if !item.host_artifacts.is_empty()
                     && !matches!(
@@ -379,7 +385,7 @@ impl AgentWakeSnapshot {
                         "agent_result" | "worker_recovery_authorization"
                     )
                 {
-                    return Err("host artifact locators must accompany a verified result, Worker recovery wake, or Reviewer publication transition".into());
+                    return Err("host artifact locators require a verified result, Worker recovery wake, Reviewer publication, or scoped Postmortem transition".into());
                 }
                 None
             };
@@ -406,7 +412,9 @@ impl AgentWakeSnapshot {
                 .as_ref()
                 .is_some_and(|sources| sources != &actual_artifact_sources)
             {
-                return Err("Reviewer publication transition source evidence list differs from its host artifacts".into());
+                return Err(
+                    "transition source evidence list differs from its host artifacts".into(),
+                );
             }
         }
         if let Some(ticket_run_id) = self
@@ -1130,6 +1138,41 @@ mod tests {
         publish_wake_snapshot(directory.path(), snapshot.clone()).unwrap();
         let received = read_inbox(directory.path(), "agent-postmortem-a", 0).unwrap();
         assert_eq!(received, snapshot.inputs);
+        let artifact_bytes = b"Recorded validation output\n";
+        let artifact_id = "a".repeat(64);
+        let locator = HostArtifactLocator {
+            artifact_id: ArtifactId::parse(artifact_id.clone()).unwrap(),
+            kind: RoleArtifactKind::General,
+            schema_version: 1,
+            digest: sha256(artifact_bytes).unwrap(),
+            bytes: artifact_bytes.len() as u64,
+            path: format!(".rex-artifacts/sha256/aa/{artifact_id}"),
+            source_run_id: "worker-run-a".into(),
+            source_evidence_id: "e".repeat(64),
+            source_authority_digest: Digest::parse("d".repeat(64)).unwrap(),
+        };
+        let artifact_path = directory.path().join(&locator.path);
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, artifact_bytes).unwrap();
+        snapshot.inputs[0].host_artifact_source_evidence_ids =
+            vec![locator.source_evidence_id.clone()];
+        snapshot.inputs[0].host_artifacts = vec![locator];
+        snapshot.digest = snapshot.content_digest().unwrap();
+        publish_wake_snapshot(directory.path(), snapshot.clone()).unwrap();
+        let received = read_inbox(directory.path(), "agent-postmortem-a", 0).unwrap();
+        assert_eq!(received, snapshot.inputs);
+        let artifact = &received[0].host_artifacts[0];
+        let bytes = fs::read(directory.path().join(&artifact.path)).unwrap();
+        assert_eq!(sha256(&bytes).unwrap(), artifact.digest);
+        assert_eq!(bytes, artifact_bytes);
+        let mut missing_context = snapshot.clone();
+        missing_context.inputs[0].host_completion_context = None;
+        missing_context.digest = missing_context.content_digest().unwrap();
+        assert!(missing_context.validate().is_err());
+        let mut wrong_source = snapshot.clone();
+        wrong_source.inputs[0].host_artifact_source_evidence_ids = vec!["f".repeat(64)];
+        wrong_source.digest = wrong_source.content_digest().unwrap();
+        assert!(wrong_source.validate().is_err());
         snapshot.inputs[0].source_revision += 1;
         snapshot.digest = snapshot.content_digest().unwrap();
         assert!(snapshot.validate().is_err());

@@ -276,6 +276,81 @@ fn inbox_fixture_snapshot(run_id: &str) -> rex_projects::agent_api::AgentWakeSna
 }
 
 #[test]
+fn postmortem_inbox_cli_preserves_validation_artifacts_and_unavailability() {
+    use rex_projects::domain::ids::Digest;
+    use rex_projects::mailbox::{MailboxCapability, MailboxLimits};
+    use sha2::Digest as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let control = temp.path().join("control");
+    let workspace = temp.path().join("workspace");
+    let state = temp.path().join("unused-state");
+    let run_id = "postmortem-run";
+    MailboxCapability::create(
+        run_id,
+        &control,
+        u64::MAX,
+        MailboxLimits {
+            max_request_bytes: 1_048_576,
+            max_pending_requests: 32,
+        },
+    )
+    .unwrap();
+    let mut snapshot = inbox_fixture_snapshot(run_id);
+    snapshot.role_session_id = "ticket_run:ticket1:postmortem".into();
+    let item = &mut snapshot.inputs[0];
+    item.source_type = "ticket_run_transition".into();
+    item.source_revision = 8;
+    item.payload_json = serde_json::json!({"target":"postmortem","ticket_run_id":"ticket1","revision":8,"message_id":item.source_id});
+    item.host_artifact_source_evidence_ids =
+        vec![item.host_artifacts[0].source_evidence_id.clone()];
+    let bytes = b"check command: cargo test\nexit code: 0\n";
+    let artifact = &mut item.host_artifacts[0];
+    artifact.kind = rex_projects::engine::orchestration::RoleArtifactKind::TestReceipt;
+    artifact.source_run_id = "worker-run".into();
+    artifact.bytes = bytes.len() as u64;
+    artifact.digest = Digest::parse(format!("{:x}", sha2::Sha256::digest(bytes))).unwrap();
+    let path = workspace.join(&artifact.path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    item.host_completion_context = Some(serde_json::from_value(serde_json::json!({
+        "schema_version":1,
+        "scope":{"project_id":"project1","ticket_run_id":"ticket1","ticket_id":"ticket1","ticket_revision":8,"configuration_digest":"c".repeat(64)},
+        "operation_completion":{"plan_digest":"a".repeat(64),"state":"not_required","not_required_reason":"CLI fixture","receipts":[]},
+        "implementation_publication":{"accepted_plan_digest":"a".repeat(64),"configuration_digest":"c".repeat(64),"merge_work_id":"1".repeat(64),"assessed_revision":5,"awaiting_merge_revision":7,"prepared_receipt_digest":"2".repeat(64),"publication_set_digest":"3".repeat(64),"assessment_id":"assessment","assessment_evidence_id":"4".repeat(64),"assessment_result_digest":"5".repeat(64),"intent_evidence_id":"6".repeat(64),"intent_result_digest":"7".repeat(64),"assessment":{},"verification":null,"artifact_evidence_unavailable":"an earlier source is unavailable",
+            "merge_verification":{"work_id":"1".repeat(64),"configuration_digest":"c".repeat(64),"accepted_plan_digest":"a".repeat(64),"assessment_id":"assessment","source_revision":7,"merge_commit_sha":"8".repeat(40),"included_head_sha":"9".repeat(40),"receipt_digest":"0".repeat(64),"receipt":{}}}
+    })).unwrap());
+    snapshot.digest = snapshot.content_digest().unwrap();
+    rex_projects::agent_api::publish_wake_snapshot(&control, snapshot.clone()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .arg("--state-root")
+        .arg(&state)
+        .args(["agent", "inbox", "--json"])
+        .env("REX_PROJECTS_AGENT", "1")
+        .env("REX_PROJECTS_RUN_ID", run_id)
+        .env("REX_PROJECTS_CONTROL_DIR", &control)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let consumed: Vec<rex_projects::agent_api::AgentWakeItem> =
+        serde_json::from_value(report["inputs"].clone()).unwrap();
+    assert_eq!(consumed, snapshot.inputs);
+    let received = &consumed[0].host_artifacts[0];
+    let actual = std::fs::read(workspace.join(&received.path)).unwrap();
+    assert_eq!(actual, bytes);
+    assert_eq!(
+        format!("{:x}", sha2::Sha256::digest(&actual)),
+        received.digest.as_str()
+    );
+    assert!(!state.exists());
+}
+
+#[test]
 fn agent_inbox_reads_the_scoped_snapshot_without_opening_state() {
     use rex_projects::mailbox::{MailboxCapability, MailboxLimits};
 

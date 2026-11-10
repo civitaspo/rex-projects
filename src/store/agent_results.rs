@@ -5825,6 +5825,7 @@ pub(crate) mod tests {
         let wake_items =
             crate::runtime_services::RuntimeServices::wake_items_with_staged_artifacts(
                 &worker.artifacts,
+                &readiness_config,
                 &mut worker.store,
                 worker.owner_generation,
                 &project,

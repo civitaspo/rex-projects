@@ -6791,6 +6791,271 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn assert_postmortem_artifact_handoff(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        artifacts: &crate::artifacts::ArtifactStore,
+        generation: u64,
+        config: &crate::config::Config,
+        config_digest: &Digest,
+        run: &crate::store::scheduler::ActiveTicketRun,
+        publication_digest: &Digest,
+        published_head: &str,
+    ) {
+        let state = root.join("postmortem-evidence-state");
+        std::fs::create_dir_all(&state).unwrap();
+        store
+            .connection
+            .execute(
+                "VACUUM INTO ?1",
+                [state.join("state.sqlite3").to_str().unwrap()],
+            )
+            .unwrap();
+        let mut history = ConfigStore::open_test(&state).unwrap();
+        let snapshot = history
+            .accepted_implementation_publication_snapshot(
+                generation,
+                &run.project_id,
+                &run.ticket_run_id,
+                run.revision,
+            )
+            .unwrap();
+        let verification = snapshot.verification().unwrap().clone();
+        let template = crate::engine::host_transitions::tests::merge_work_fixture_item(
+            run.project_id.clone(),
+            run.ticket_run_id.clone(),
+            config_digest.clone(),
+            snapshot.accepted_plan().plan_digest.clone(),
+            false,
+            published_head,
+        );
+        let work = crate::store::merge_work::MergeWorkItem::new(
+            run.project_id.clone(),
+            run.ticket_run_id.clone(),
+            Revision(run.revision),
+            Revision(run.revision + 2),
+            config_digest.clone(),
+            snapshot.accepted_plan().plan_digest.clone(),
+            crate::forge::canonical_digest(snapshot.prepared_receipt()).unwrap(),
+            publication_digest.clone(),
+            template.document,
+        )
+        .unwrap();
+        history
+            .persist_merge_work_item(generation, &work, 20)
+            .unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &work)
+                .unwrap()
+                .is_none()
+        );
+        let revision = work.awaiting_merge_revision.0 + 1;
+        // This isolated history fixture tests evidence reads, not merge authorization or execution.
+        history.connection.execute(
+            "UPDATE ticket_runs SET internal_phase='postmortem',revision=?2 WHERE ticket_run_id=?1",
+            rusqlite::params![run.ticket_run_id.as_str(), revision],
+        ).unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &work)
+                .unwrap()
+                .is_none()
+        );
+        let evidence = serde_json::json!({"kind":"merge_verified", "source_revision":work.awaiting_merge_revision.0, "work_id":work.work_id});
+        history.connection.execute(
+            "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'ticket_run',?2,?3,?4,'postmortem-evidence-fixture','historical evidence fixture',?5,21)",
+            rusqlite::params![run.project_id.as_str(), run.ticket_run_id.as_str(), work.awaiting_merge_revision.0, revision, evidence.to_string()],
+        ).unwrap();
+        let historical = history
+            .historical_implementation_publication_snapshot(generation, &work)
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.verification(), Some(&verification));
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation + 1, &work)
+                .unwrap()
+                .is_none()
+        );
+        let mut foreign = work.clone();
+        foreign.project_id = ProjectId::parse("foreign-project").unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &foreign)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            history
+                .accepted_implementation_publication_snapshot(
+                    generation,
+                    &run.project_id,
+                    &run.ticket_run_id,
+                    run.revision
+                )
+                .is_err()
+        );
+        let context: crate::agent_api::HostCompletionContext = serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "scope":{"project_id":run.project_id,"ticket_run_id":run.ticket_run_id,"ticket_id":run.ticket_id,"ticket_revision":revision,"configuration_digest":config_digest},
+            "operation_completion":{"plan_digest":"c".repeat(64),"state":"not_required","not_required_reason":"evidence-only fixture","receipts":[]},
+            "implementation_publication":{
+                "accepted_plan_digest":work.accepted_plan_digest,"configuration_digest":config_digest,
+                "merge_work_id":work.work_id,"assessed_revision":work.assessed_revision.0,"awaiting_merge_revision":work.awaiting_merge_revision.0,
+                "prepared_receipt_digest":work.prepared_receipt_digest,"publication_set_digest":work.publication_set_digest,
+                "assessment_id":work.document.assessment_id,"assessment_evidence_id":work.document.assessment_evidence_id,
+                "assessment_result_digest":work.document.assessment_result_digest,"intent_evidence_id":work.document.intent_evidence_id,
+                "intent_result_digest":work.document.intent_result_digest,"assessment":work.document.assessment,"verification":null,
+                "merge_verification":{"work_id":work.work_id,"configuration_digest":config_digest,"accepted_plan_digest":work.accepted_plan_digest,
+                    "assessment_id":work.document.assessment_id,"source_revision":work.awaiting_merge_revision.0,
+                    "merge_commit_sha":"f".repeat(40),"included_head_sha":published_head,"receipt_digest":"e".repeat(64),"receipt":{}}
+            }
+        })).unwrap();
+        let wake = crate::store::agent_runtime::PendingRoleWakeInput {
+            wake_input_id: 1,
+            source_type: "ticket_run_transition".into(),
+            source_id: "postmortem-evidence-fixture".into(),
+            source_revision: revision,
+            priority: 1,
+            payload_json: serde_json::json!({"target":"postmortem","ticket_run_id":run.ticket_run_id,"revision":revision,"message_id":"postmortem-evidence-fixture"}),
+        };
+        let workspace = state.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config_revision = store
+            .project(&run.project_id)
+            .unwrap()
+            .unwrap()
+            .config_revision
+            .0;
+        let stage = |history: &mut ConfigStore,
+                     context: &crate::agent_api::HostCompletionContext| {
+            crate::runtime_services::RuntimeServices::wake_items_with_staged_artifacts(
+                artifacts,
+                config,
+                history,
+                generation,
+                &run.project_id,
+                config_revision,
+                config_digest,
+                &workspace,
+                vec![wake.clone()],
+                Some(context),
+            )
+            .unwrap()
+        };
+        let items = stage(&mut history, &context);
+        assert_eq!(items[0].host_artifacts.len(), 1);
+        let locator = &items[0].host_artifacts[0];
+        assert_eq!(
+            locator.artifact_id,
+            verification.test_receipt_artifacts[0].artifact_id
+        );
+        assert_eq!(
+            locator.kind,
+            crate::engine::orchestration::RoleArtifactKind::TestReceipt
+        );
+        assert_eq!(locator.source_evidence_id, verification.source_evidence_id);
+        assert_eq!(
+            items[0].host_artifact_source_evidence_ids,
+            vec![verification.source_evidence_id.clone()]
+        );
+        let enriched = items[0].host_completion_context.as_ref().unwrap();
+        assert_eq!(
+            enriched
+                .implementation_publication
+                .verification
+                .as_ref()
+                .unwrap()["source_evidence_id"],
+            verification.source_evidence_id
+        );
+        assert!(
+            enriched
+                .implementation_publication
+                .artifact_evidence_unavailable
+                .is_some(),
+            "synthetic publication sources must remain explicitly unavailable"
+        );
+        let mut inbox = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: run.project_id.clone(),
+            role_session_id: format!("ticket_run:{}:postmortem", run.ticket_run_id),
+            agent_run_id: "postmortem-evidence-run".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: items.clone(),
+            worker_correction_context: None,
+        };
+        inbox.digest = inbox.content_digest().unwrap();
+        crate::agent_api::publish_wake_snapshot(&workspace, inbox).unwrap();
+        let consumed =
+            crate::agent_api::read_inbox(&workspace, "postmortem-evidence-run", 0).unwrap();
+        assert_eq!(consumed, items);
+        let bytes = std::fs::read(workspace.join(&consumed[0].host_artifacts[0].path)).unwrap();
+        assert_eq!(
+            content_digest(std::str::from_utf8(&bytes).unwrap()),
+            locator.digest.as_str()
+        );
+        assert_eq!(bytes, b"# Test receipt\n\nAll configured checks passed.\n");
+        let mut stale = context.clone();
+        stale.implementation_publication.publication_set_digest =
+            Digest::parse("0".repeat(64)).unwrap();
+        let unavailable = stage(&mut history, &stale);
+        assert!(unavailable[0].host_artifacts.is_empty());
+        assert!(
+            unavailable[0]
+                .host_completion_context
+                .as_ref()
+                .unwrap()
+                .implementation_publication
+                .artifact_evidence_unavailable
+                .is_some()
+        );
+        let mut unrelated_merge = evidence.clone();
+        unrelated_merge["work_id"] = serde_json::json!("0".repeat(64));
+        history
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_id=?1 AND new_revision=?2",
+                rusqlite::params![
+                    run.ticket_run_id.as_str(),
+                    revision,
+                    unrelated_merge.to_string()
+                ],
+            )
+            .unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &work)
+                .unwrap()
+                .is_none()
+        );
+        history
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_id=?1 AND new_revision=?2",
+                rusqlite::params![run.ticket_run_id.as_str(), revision, evidence.to_string()],
+            )
+            .unwrap();
+        let object = root
+            .join("artifacts")
+            .join(&verification.test_receipt_artifacts[0].path);
+        let retained_object = state.join("retained-test-receipt");
+        std::fs::rename(&object, &retained_object).unwrap();
+        let unavailable = stage(&mut history, &context);
+        std::fs::rename(&retained_object, &object).unwrap();
+        assert!(unavailable[0].host_artifacts.is_empty());
+        assert!(
+            unavailable[0]
+                .host_completion_context
+                .as_ref()
+                .unwrap()
+                .implementation_publication
+                .artifact_evidence_unavailable
+                .is_some()
+        );
+    }
+
     fn published_publication_fixture(
         single_publication: bool,
         reject_twice: bool,
@@ -9908,6 +10173,17 @@ pub(crate) mod tests {
             corrected_review.revision
         );
         assert_eq!(merge_snapshot.publication_receipts().len(), 2);
+        assert_postmortem_artifact_handoff(
+            &mut store,
+            temp.path(),
+            &worker_result.artifacts,
+            owner_generation,
+            &config,
+            &config_digest,
+            &assessing,
+            &Digest::parse(subject_digest).unwrap(),
+            &corrected_head,
+        );
         assert!(
             !crate::engine::host_transitions::consume_one_host_transition(
                 &mut store,

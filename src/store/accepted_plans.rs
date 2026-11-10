@@ -1003,6 +1003,87 @@ impl ConfigStore {
         if active_generation != Some(owner_generation) {
             return Err("publication snapshot requires the active controller generation".into());
         }
+        self.implementation_publication_snapshot_at_review(
+            project_id,
+            ticket_run_id,
+            consumer_revision,
+            phase,
+            config_digest,
+        )
+    }
+
+    pub(crate) fn historical_implementation_publication_snapshot(
+        &self,
+        owner_generation: u64,
+        work: &crate::store::merge_work::MergeWorkItem,
+    ) -> Result<Option<AcceptedImplementationPublicationSnapshot>, String> {
+        let current: Option<(String, String, u64, String, u64)> = self.connection.query_row(
+            "SELECT r.project_id,r.internal_phase,r.revision,r.config_digest,o.generation FROM ticket_runs r CROSS JOIN controller_owners o WHERE r.ticket_run_id=?1 AND o.singleton=1 AND o.stopped_at_unix IS NULL",
+            [work.ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((project, phase, revision, config, generation)) = current else {
+            return Ok(None);
+        };
+        if project != work.project_id.as_str()
+            || phase != "postmortem"
+            || revision <= work.awaiting_merge_revision.0
+            || config != work.configuration_digest.as_str()
+            || generation != owner_generation
+            || self.merge_work_item(
+                &work.project_id,
+                &work.ticket_run_id,
+                work.awaiting_merge_revision,
+            )? != Some(work.clone())
+        {
+            return Ok(None);
+        }
+        let mut transitions = self.connection.prepare(
+            "SELECT new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC LIMIT 256",
+        ).map_err(|error| error.to_string())?;
+        let history = transitions
+            .query_map(
+                params![
+                    work.ticket_run_id.as_str(),
+                    work.project_id.as_str(),
+                    revision
+                ],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut matched_merge = false;
+        for entry in history {
+            let (transition_revision, json) = entry.map_err(|error| error.to_string())?;
+            let evidence: serde_json::Value = crate::protocol::parse_unique(json.as_bytes())?;
+            if evidence["kind"] == "merge_verified" {
+                matched_merge = work.awaiting_merge_revision.0.checked_add(1)
+                    == Some(transition_revision)
+                    && evidence["source_revision"].as_u64() == Some(work.awaiting_merge_revision.0)
+                    && evidence["work_id"].as_str() == Some(work.work_id.as_str());
+                break;
+            }
+        }
+        if !matched_merge {
+            return Ok(None);
+        }
+        self.implementation_publication_snapshot_at_review(
+            &work.project_id,
+            &work.ticket_run_id,
+            work.assessed_revision.0,
+            "assessing".into(),
+            config,
+        )
+        .map(Some)
+    }
+
+    fn implementation_publication_snapshot_at_review(
+        &self,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        consumer_revision: u64,
+        phase: String,
+        config_digest: String,
+    ) -> Result<AcceptedImplementationPublicationSnapshot, String> {
         let mut stmt = self.connection.prepare(
             "SELECT old_revision,new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC",
         ).map_err(|error| error.to_string())?;
