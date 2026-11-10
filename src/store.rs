@@ -5604,6 +5604,13 @@ pub(crate) mod tests {
         handler_error_stays_uncertain_and_keeps_diagnostic(crate::effects::EffectKind::Merge);
     }
 
+    #[test]
+    fn prepare_worktrees_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
+        handler_error_stays_uncertain_and_keeps_diagnostic(
+            crate::effects::EffectKind::PrepareWorktrees,
+        );
+    }
+
     fn handler_error_stays_uncertain_and_keeps_diagnostic(kind: crate::effects::EffectKind) {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
