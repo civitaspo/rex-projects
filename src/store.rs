@@ -5596,6 +5596,15 @@ pub(crate) mod tests {
 
     #[test]
     fn start_agent_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
+        handler_error_stays_uncertain_and_keeps_diagnostic(crate::effects::EffectKind::StartAgent);
+    }
+
+    #[test]
+    fn merge_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
+        handler_error_stays_uncertain_and_keeps_diagnostic(crate::effects::EffectKind::Merge);
+    }
+
+    fn handler_error_stays_uncertain_and_keeps_diagnostic(kind: crate::effects::EffectKind) {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
@@ -5640,10 +5649,7 @@ pub(crate) mod tests {
             subject_id: project_id.as_str().into(),
             operation_id: "start-error-operation".into(),
             logical_key: "start-error-intent".into(),
-            kind: crate::engine::reducer::effect_name(
-                &crate::engine::reducer::EffectKind::StartAgent,
-            )
-            .into(),
+            kind: crate::engine::reducer::effect_name(&kind).into(),
             request_json: request_json.into(),
             request_digest: content_digest(request_json),
             expected_revision: Some(0),
@@ -5657,10 +5663,10 @@ pub(crate) mod tests {
                 rusqlite::params![&intent.operation_id, prior_receipt],
             )
             .unwrap();
-        struct ErrorHandler;
+        struct ErrorHandler(crate::effects::EffectKind);
         impl crate::effects::EffectHandler for ErrorHandler {
             fn kind(&self) -> crate::effects::EffectKind {
-                crate::effects::EffectKind::StartAgent
+                self.0
             }
 
             fn handle(
@@ -5679,7 +5685,7 @@ pub(crate) mod tests {
                 })
             }
         }
-        let handler = ErrorHandler;
+        let handler = ErrorHandler(kind);
         let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
         let result = crate::effects::EffectDispatcher::tick(
             &mut store,

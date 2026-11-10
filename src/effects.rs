@@ -293,8 +293,8 @@ impl EffectDispatcher {
                 })
             }
             Err(error) => {
-                let diagnostic =
-                    (request.intent.kind == "start_agent").then(|| bounded_handler_error(&error));
+                let diagnostic = matches!(request.intent.kind.as_str(), "start_agent" | "merge")
+                    .then(|| bounded_handler_error(&error));
                 store
                     .defer_effect_reconciliation(
                         &request.intent.operation_id,
