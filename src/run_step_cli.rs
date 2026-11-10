@@ -1429,7 +1429,15 @@ mod tests {
         fs::create_dir_all(root.join("workspace")).unwrap();
         fs::create_dir_all(root.join("control")).unwrap();
         let executable = fs::canonicalize("/usr/bin/perl").unwrap();
-        let script = "$SIG{TERM} = 'IGNORE'; $SIG{INT} = 'IGNORE'; while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }";
+        let script = r#"
+while (-e $ARGV[2]) { select undef, undef, undef, 0.01; }
+$SIG{TERM} = 'IGNORE';
+$SIG{INT} = 'IGNORE';
+open my $ready, '>', $ARGV[1] or die $!;
+print {$ready} "$$\n";
+close $ready or die $!;
+while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
+"#;
         let profile = Profile {
             adapter: AgentAdapter::ClaudeCode,
             command: vec![
@@ -1437,6 +1445,8 @@ mod tests {
                 "-e".into(),
                 script.into(),
                 provider_exit_marker.display().to_string(),
+                root.join("provider-ready").display().to_string(),
+                root.join("provider-init-gate").display().to_string(),
             ],
             description: None,
             model: Some("fixture-model".into()),
@@ -2375,6 +2385,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let root = tempdir().unwrap();
+        fs::write(root.path().join("provider-init-gate"), b"").unwrap();
         let control_dir = root.path().join("control");
         fs::create_dir_all(&control_dir).unwrap();
         let spool = RunStepSpool::open(&control_dir).unwrap();
@@ -2396,6 +2407,23 @@ mod tests {
 
         let family = wait_for_observing_family(&spool);
         writer.observe(family.clone());
+        assert!(!root.path().join("provider-ready").exists());
+        fs::remove_file(root.path().join("provider-init-gate")).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready_pid = fs::read_to_string(root.path().join("provider-ready"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok());
+            if ready_pid == Some(family.provider_root.pid) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observed provider did not publish signal-handler readiness"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process_is_live(&family.provider_root));
         let start = spool.read_start_request().unwrap();
         let snapshot = block_loss_snapshot(&family);
         assert_eq!(
