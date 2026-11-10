@@ -7318,6 +7318,57 @@ pub(crate) mod tests {
         if single_publication {
             let reviewing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
             assert_eq!(reviewing.phase, Phase::Reviewing);
+            let coordinator_session = format!("ticket_run:{ticket_run_id}:coordinator");
+            let coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap();
+            let current_coordinator_wakes = coordinator_wakes
+                .iter()
+                .filter(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                current_coordinator_wakes.len(),
+                1,
+                "a completed publication must durably wake its Coordinator at Reviewing revision"
+            );
+            let reviewer_session = format!("ticket_run:{ticket_run_id}:reviewer");
+            let reviewer_wakes = store
+                .pending_role_wake_inputs(&project_id, &reviewer_session, 16)
+                .unwrap();
+            assert!(
+                !reviewer_wakes.iter().any(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "reviewer"
+                }),
+                "Reviewer must be woken only after Coordinator persists its authorized child request"
+            );
+            assert!(
+                !crate::engine::host_transitions::consume_one_host_transition(
+                    &mut store,
+                    owner_generation,
+                    13,
+                    &config,
+                    &config_digest,
+                )
+                .unwrap(),
+                "replaying the publication consumer must not apply a duplicate transition"
+            );
+            let replayed_coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap()
+                .into_iter()
+                .filter(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                })
+                .count();
+            assert_eq!(replayed_coordinator_wakes, 1);
             let publication_snapshot = store
                 .accepted_implementation_publication_snapshot(
                     owner_generation,
@@ -7429,6 +7480,24 @@ pub(crate) mod tests {
             );
             let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
             assert_eq!(assessing.phase, Phase::Assessing);
+            let post_review_coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap();
+            assert!(
+                post_review_coordinator_wakes.iter().any(|wake| {
+                    wake.source_type == "agent_result"
+                        && wake.source_id == reviewer.ingested.receipt.evidence_id()
+                }),
+                "the validated Reviewer result must retain its Coordinator parent wake after ReviewConverged"
+            );
+            assert!(
+                !post_review_coordinator_wakes.iter().any(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == assessing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                }),
+                "ReviewConverged must not add a duplicate Coordinator reducer wake"
+            );
             if base_refresh {
                 assert_eq!(subject.publications[0].published_head, "f".repeat(40));
                 assert_eq!(
