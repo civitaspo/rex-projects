@@ -1158,7 +1158,6 @@ pub fn record_and_verify_agent_terminal(
     super::validate_active_generation(&tx, owner_generation)?;
     verify_persisted_authority(&tx, &authority, &authority_digest)?;
     verify_agent_run_snapshot(&tx, &authority, owner_generation)?;
-    verify_ticket_snapshot(&tx, &authority)?;
     let launch_reservation = terminal_agent_launch_reservation(&tx, &authority)?;
     let prior: Option<(String, String)> = tx
         .query_row(
@@ -1850,21 +1849,47 @@ fn ingest_verified_terminal_result(
         }
     }
     if !valid {
-        record_rejected_role_result(store, owner_generation, terminal, &authority)?;
+        record_rejected_role_result(
+            store,
+            owner_generation,
+            terminal,
+            &authority,
+            "invalid_role_result",
+            "The process exited, but its role output failed semantic validation. No child or workflow transition was authorized. Inspect the immutable result and request a corrected turn; inherited artifact locators cannot be forwarded as current-run registrations.",
+        )?;
         eprintln!(
             "rex-projects: rejected role output from Agent {}; terminal evidence is retained; inspect the role input and use `ticket instruct` to request a corrected turn",
             authority.agent_run_id
         );
         return Ok(None);
     }
-    ingest_agent_result(
+    match ingest_agent_result(
         store,
         artifact_store,
         owner_generation,
         terminal,
         message.map_err(|error| error.to_string())?,
-    )
-    .map(Some)
+    ) {
+        Ok(result) => Ok(Some(result)),
+        Err(error)
+            if error == "TicketRun revision or config no longer matches Agent launch authority" =>
+        {
+            record_rejected_role_result(
+                store,
+                owner_generation,
+                terminal,
+                &authority,
+                "stale_launch_snapshot",
+                "The TicketRun revision or project configuration advanced after this Agent was launched. The process terminal and absence are verified, but this stale role output authorized no child or workflow transition. Continue from the current Coordinator state.",
+            )?;
+            eprintln!(
+                "rex-projects: retained terminal from stale Agent {}; role output was rejected because its TicketRun or config snapshot advanced",
+                authority.agent_run_id
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn record_rejected_role_result(
@@ -1872,6 +1897,8 @@ fn record_rejected_role_result(
     owner_generation: u64,
     terminal: &VerifiedAgentTerminal,
     authority: &AgentLaunchAuthority,
+    category: &str,
+    instruction: &str,
 ) -> Result<(), String> {
     let (recipient, lifecycle) = if let Some(parent_id) = &authority.parent_run_id {
         let parent = store
@@ -1891,9 +1918,10 @@ fn record_rejected_role_result(
     let payload = serde_json::json!({
         "kind":"role_result_rejected", "agent_run_id":authority.agent_run_id,
         "run_epoch":authority.run_epoch, "terminal_digest":terminal.terminal_digest,
-        "category":"invalid_role_result",
-        "instruction":"The process exited, but its role output failed semantic validation. No child or workflow transition was authorized. Inspect the immutable result and request a corrected turn; inherited artifact locators cannot be forwarded as current-run registrations."
-    }).to_string();
+        "category":category,
+        "instruction":instruction
+    })
+    .to_string();
     let tx = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4785,6 +4813,149 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stale_coordinator_terminal_is_rejected_after_ticket_advance_without_child_authority() {
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind, SpawnRequestPayload};
+        let mut fixture = host_validation_fixture::host_validated_terminal_result(
+            Role::Coordinator,
+            RoleResultMessage {
+                schema_version: 1,
+                message_id: "coordinator-before-postmortem".into(),
+                kind: RoleOutputKind::SpawnRequest,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: serde_json::to_value(SpawnRequestPayload {
+                    work_node: crate::engine::orchestration::WorkNodeId::parse("operator-release")
+                        .unwrap(),
+                    role: Role::Operator,
+                    profile_id: crate::domain::ids::ProfileId::parse("operator-default").unwrap(),
+                    plan_digest: None,
+                    worker_recovery: None,
+                    allowed_repositories: Vec::new(),
+                    artifact_inputs: Vec::new(),
+                    parent_run_id: None,
+                })
+                .unwrap(),
+                result_digest: None,
+                artifact_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+        let run_id = fixture.terminal.agent_run_id().as_str();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=revision+1,internal_phase='postmortem' WHERE ticket_run_id='fixture-ticket-run'",
+                [],
+            )
+            .unwrap();
+
+        // Reconcile the already recorded terminal after the workflow has advanced. The original
+        // fixture exercised process absence before this transition; this replay reaches the exact
+        // current-revision guard that also ran before first receipt insertion.
+        let terminal = record_and_verify_agent_terminal(
+            &mut fixture.store,
+            fixture.owner_generation,
+            &fixture.start,
+            &fixture.result,
+        )
+        .unwrap();
+        assert_eq!(terminal.terminal_digest, fixture.terminal.terminal_digest);
+
+        let ingested = ingest_next_spooled_agent_result(
+            &mut fixture.store,
+            &fixture.artifacts,
+            fixture.owner_generation,
+            8,
+        )
+        .unwrap();
+
+        assert!(
+            ingested.is_none(),
+            "stale role output must not reach the reducer"
+        );
+        let rejection: Option<String> = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let rejection: serde_json::Value =
+            serde_json::from_str(&rejection.expect("stale output must have a durable rejection"))
+                .unwrap();
+        assert_eq!(rejection["category"], "stale_launch_snapshot");
+        assert_eq!(
+            rejection["terminal_digest"],
+            fixture.terminal.terminal_digest.as_str()
+        );
+
+        let evidence_count: u64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_result_evidence WHERE agent_run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_count, 0, "stale evidence cannot authorize a child");
+        let child_wake_count: u64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='agent_result' AND source_id IN (SELECT evidence_id FROM agent_result_evidence WHERE agent_run_id=?1)",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_wake_count, 0);
+        let operator_child_count: u64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_launch_authority WHERE parent_run_id=?1 AND role='operator'",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            operator_child_count, 0,
+            "stale spawn cannot grant an Operator"
+        );
+        let slot_disposition: String = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slot_disposition, "released");
+        verify_agent_terminal(
+            &fixture.store,
+            fixture.owner_generation,
+            fixture.terminal.agent_run_id(),
+        )
+        .expect("verified process absence remains available after the workflow advances");
+
+        // Reprocessing must skip the durable rejection instead of poisoning the controller loop.
+        assert!(
+            ingest_next_spooled_agent_result(
+                &mut fixture.store,
+                &fixture.artifacts,
+                fixture.owner_generation,
+                8,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn host_validated_blocked_worker_can_receive_one_coordinator_recovery_wake() {
         use crate::config::ProjectConfig;
         use crate::domain::ids::{
@@ -7418,6 +7589,8 @@ pub(crate) mod host_validation_fixture {
         pub artifacts: crate::artifacts::ArtifactStore,
         pub owner_generation: u64,
         pub terminal: VerifiedAgentTerminal,
+        pub start: StartRequestEnvelope,
+        pub result: AgentTurnResult,
     }
 
     pub(crate) struct InPlaceValidatedResultFixture {
@@ -7429,6 +7602,8 @@ pub(crate) mod host_validation_fixture {
         pub(super) artifacts: crate::artifacts::ArtifactStore,
         pub(super) terminal: VerifiedAgentTerminal,
         pub(super) message: RoleResultMessage,
+        pub(super) start: StartRequestEnvelope,
+        pub(super) result: AgentTurnResult,
     }
 
     /// Builds real host terminal and result evidence around test-seeded running launch records.
@@ -7473,6 +7648,8 @@ pub(crate) mod host_validation_fixture {
             artifacts: fixture.artifacts,
             owner_generation: fixture.owner_generation,
             terminal: fixture.terminal,
+            start: fixture.start,
+            result: fixture.result,
         })
     }
 
@@ -7483,6 +7660,8 @@ pub(crate) mod host_validation_fixture {
         artifacts: crate::artifacts::ArtifactStore,
         terminal: VerifiedAgentTerminal,
         message: RoleResultMessage,
+        start: StartRequestEnvelope,
+        result: AgentTurnResult,
     }
 
     fn host_validated_result_setup(
@@ -7575,6 +7754,8 @@ pub(crate) mod host_validation_fixture {
             artifacts: evidence.artifacts,
             terminal: evidence.terminal,
             message: evidence.message,
+            start: evidence.start,
+            result: evidence.result,
         })
     }
 
@@ -8351,6 +8532,8 @@ pub(crate) mod host_validation_fixture {
             artifacts,
             terminal,
             message,
+            start,
+            result,
         })
     }
 
