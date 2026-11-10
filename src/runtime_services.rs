@@ -4322,8 +4322,6 @@ impl RuntimeServices {
             .rex
             .find_or_create_ticket_window(namespace.as_str(), ticket_id.as_str(), &spec)
             .map_err(|error| error.to_string())?;
-        let anchor_block_id = window.initial_block_id.clone();
-        let anchor_disposition = window.disposition;
         let view = crate::launch::RexView {
             view_id: crate::launch::RexView::derive_id(
                 project_id,
@@ -4342,13 +4340,13 @@ impl RuntimeServices {
             rex_window_id: window.window_id.clone(),
         };
         store.register_rex_view(self.owner_generation, &view)?;
-        self.record_created_view_anchor(
+        crate::rex_view_lifecycle::record_created_view_anchor(
             store,
+            self.owner_generation,
             &view,
             &window,
             &spec,
-            anchor_disposition,
-            anchor_block_id,
+            &self.rex,
         )?;
         let _ = now_unix;
         Ok(view)
@@ -4388,8 +4386,6 @@ impl RuntimeServices {
             .rex
             .find_or_create_project_window(project_id, &spec)
             .map_err(|error| error.to_string())?;
-        let anchor_block_id = window.initial_block_id.clone();
-        let anchor_disposition = window.disposition;
         let view = crate::launch::RexView {
             view_id: crate::launch::RexView::derive_id(
                 project_id,
@@ -4408,13 +4404,13 @@ impl RuntimeServices {
             rex_window_id: window.window_id.clone(),
         };
         store.register_rex_view(self.owner_generation, &view)?;
-        self.record_created_view_anchor(
+        crate::rex_view_lifecycle::record_created_view_anchor(
             store,
+            self.owner_generation,
             &view,
             &window,
             &spec,
-            anchor_disposition,
-            anchor_block_id,
+            &self.rex,
         )?;
         let _ = now_unix;
         Ok(view)
@@ -4437,48 +4433,6 @@ impl RuntimeServices {
             cwd: self.state_root.clone(),
             path_prepend: self.search_path(),
         }
-    }
-
-    fn record_created_view_anchor(
-        &self,
-        store: &mut ConfigStore,
-        view: &crate::launch::RexView,
-        window: &RexWindow,
-        spec: &AgentBlockSpec,
-        disposition: CreateDisposition,
-        block_id: Option<String>,
-    ) -> Result<(), String> {
-        if disposition != CreateDisposition::Created {
-            return Ok(());
-        }
-        let Some(block_id) = block_id else {
-            return Ok(());
-        };
-        let label = owned_agent_block_label(&spec.run_id).map_err(|error| error.to_string())?;
-        let blocks = self
-            .rex
-            .list_window_blocks(window, &window.label)
-            .map_err(|error| error.to_string())?;
-        if !blocks
-            .iter()
-            .any(|block| block.block_id == block_id && block.label == label)
-            || !self
-                .rex
-                .agent_block_matches_spec(window, spec, &block_id)
-                .map_err(|error| error.to_string())?
-        {
-            return Ok(());
-        }
-        let command_digest = crate::rex_view_lifecycle::anchor_command_digest(spec)?;
-        store.register_rex_view_anchor(
-            self.owner_generation,
-            &view.view_id,
-            &block_id,
-            &spec.run_id,
-            &label,
-            &command_digest,
-        )?;
-        Ok(())
     }
 }
 

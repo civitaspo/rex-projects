@@ -2419,7 +2419,7 @@ impl FixtureMessageExt for Value {
 fn config_text(request: &Request<'_>, executable: &Path, native_stage: bool) -> String {
     let db = request.fixture_root.join("tickets.sqlite");
     let native_runtime_limits = if native_stage {
-        "max_blocks_per_tab = 2\ncompleted_blocks_to_keep = 0\n"
+        "max_agent_runs = 1\nmax_blocks_per_tab = 2\ncompleted_blocks_to_keep = 0\n"
     } else {
         ""
     };
@@ -3088,10 +3088,11 @@ fn verify_fixture_session_is_fresh(session: &Value) -> Result<(), String> {
         owned_ticket_window_label(FIXTURE_TICKET_NAMESPACE, FIXTURE_TICKET_ID)
             .map_err(|error| error.to_string())?,
     ];
-    let windows = session
-        .get("windows")
-        .and_then(Value::as_array)
-        .ok_or("Rex session inspect omitted its windows array")?;
+    let windows: &[Value] = match session.get("windows") {
+        None => &[],
+        Some(Value::Array(windows)) => windows,
+        Some(_) => return Err("Rex session inspect returned an invalid windows field".into()),
+    };
     let has_existing_fixture_window = windows.iter().any(|window| {
         window
             .get("label")
@@ -4819,6 +4820,17 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_preflight_accepts_empty_session_without_windows_field() {
+        let session: Value =
+            serde_json::from_slice(br#"{"session_id":"fixture-session","label":"empty-session"}"#)
+                .unwrap();
+        verify_fixture_session_is_fresh(&session).unwrap();
+        for windows in [Value::Null, json!("not-an-array")] {
+            assert!(verify_fixture_session_is_fresh(&json!({"windows":windows})).is_err());
+        }
+    }
+
+    #[test]
     fn generated_fixture_contexts_deserialize_with_the_agent_contract() {
         for role in PROVIDER_ROLES {
             let scenario = format!("acceptance_{role}");
@@ -5385,9 +5397,10 @@ mod tests {
     }
 
     #[test]
-    fn generated_native_config_selects_low_retention_without_changing_defaults() {
-        for (native_stage, expected_max_blocks, expected_completed_keep) in
-            [(false, 8, 1), (true, 2, 0)]
+    fn generated_native_config_selects_native_worker_capacity_and_low_retention_without_changing_defaults()
+     {
+        for (native_stage, expected_max_agent_runs, expected_max_blocks, expected_completed_keep) in
+            [(false, 8, 8, 1), (true, 1, 2, 0)]
         {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().join("acceptance");
@@ -5416,6 +5429,10 @@ mod tests {
             .unwrap();
 
             let loaded = rex_projects::config::load(&config_path).unwrap();
+            assert_eq!(
+                loaded.config.runtime.max_agent_runs, expected_max_agent_runs,
+                "native_stage={native_stage}"
+            );
             assert_eq!(
                 loaded.config.runtime.max_blocks_per_tab, expected_max_blocks,
                 "native_stage={native_stage}"
