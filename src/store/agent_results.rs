@@ -316,6 +316,13 @@ pub enum ResultDisposition {
     RejectedByHost,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeClaimRejectionOutcome {
+    CoordinatorCorrectionQueued,
+    SupervisorEscalationQueued,
+    AlreadyRecorded,
+}
+
 impl ResultDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -7326,6 +7333,20 @@ impl ConfigStore {
             disposition,
         )
     }
+
+    pub fn validated_agent_result_ack(
+        &self,
+        evidence_id: &str,
+    ) -> Result<Option<(u64, String)>, String> {
+        self.connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -7718,8 +7739,18 @@ pub(crate) mod host_validation_fixture {
                     .map_or("fixture-ticket-run", TicketRunId::as_str),
                 worker_node_id.unwrap_or("node-a")
             ),
-            Role::Coordinator => "ticket_run:fixture-ticket-run:coordinator".into(),
-            Role::MergeDecision => "ticket_run:fixture-ticket-run:merge_decision".into(),
+            Role::Coordinator => format!(
+                "ticket_run:{}:coordinator",
+                ticket_run_id
+                    .as_ref()
+                    .map_or("fixture-ticket-run", TicketRunId::as_str)
+            ),
+            Role::MergeDecision => format!(
+                "ticket_run:{}:merge_decision",
+                ticket_run_id
+                    .as_ref()
+                    .map_or("fixture-ticket-run", TicketRunId::as_str)
+            ),
             Role::Supervisor => format!("project:{}:supervisor", project_id.as_str()),
             _ => format!("fixture-{:?}", role).to_lowercase(),
         };
@@ -7859,19 +7890,6 @@ pub(crate) mod host_validation_fixture {
             "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,1,'fixture-rex','fixture-session','fixture-window',0,'active',?6,?6) ON CONFLICT(view_id) DO NOTHING",
             rusqlite::params![view_id.as_str(), project_id.as_str(), view_kind_name, view_namespace, view_ticket, now],
         ).map_err(|error| error.to_string())?;
-        if parent_role == Role::Supervisor {
-            let supervisor_view_id = crate::launch::RexView::derive_id(
-                &project_id,
-                crate::launch::RexViewKind::Supervisor,
-                None,
-                None,
-                mailbox_now,
-            )?;
-            store.connection.execute(
-                "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'supervisor',NULL,NULL,?3,'fixture-rex','fixture-supervisor-session','fixture-supervisor-window',0,'active',?4,?4)",
-                rusqlite::params![supervisor_view_id.as_str(), project_id.as_str(), mailbox_now, now],
-            ).map_err(|error| error.to_string())?;
-        }
         authority.rex_view_id = view_id;
         authority.descriptor_path =
             root.join(format!("{}-run-step-package-final.json", agent_run_id));
@@ -7891,13 +7909,40 @@ pub(crate) mod host_validation_fixture {
             if parent_role == Role::Supervisor {
                 parent_authority.ticket_run_id = None;
                 parent_authority.ticket_revision = None;
-                parent_authority.rex_view_id = crate::launch::RexView::derive_id(
-                    &project_id,
-                    crate::launch::RexViewKind::Supervisor,
-                    None,
-                    None,
-                    mailbox_now,
-                )?;
+                let existing_view: Option<(String, String, String, String)> = store.connection.query_row(
+                    "SELECT view_id,rex_server_identity,rex_session_id,rex_window_id FROM rex_views WHERE project_id=?1 AND view_kind='supervisor' AND lifecycle='active' LIMIT 1",
+                    [project_id.as_str()],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                ).optional().map_err(|error| error.to_string())?;
+                let (supervisor_view_id, server_identity, session_id, window_id) = if let Some(
+                    existing,
+                ) =
+                    existing_view
+                {
+                    existing
+                } else {
+                    let view_id = crate::launch::RexView::derive_id(
+                        &project_id,
+                        crate::launch::RexViewKind::Supervisor,
+                        None,
+                        None,
+                        mailbox_now,
+                    )?;
+                    store.connection.execute(
+                            "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'supervisor',NULL,NULL,?3,'fixture-rex','fixture-supervisor-session','fixture-supervisor-window',0,'active',?4,?4)",
+                            rusqlite::params![view_id.as_str(), project_id.as_str(), mailbox_now, now],
+                        ).map_err(|error| error.to_string())?;
+                    (
+                        view_id.as_str().to_owned(),
+                        "fixture-rex".into(),
+                        "fixture-supervisor-session".into(),
+                        "fixture-supervisor-window".into(),
+                    )
+                };
+                parent_authority.rex_view_id = Digest::parse(supervisor_view_id)?;
+                parent_authority.rex_server_identity = server_identity;
+                parent_authority.rex_session_id = session_id;
+                parent_authority.rex_window_id = window_id;
             }
             parent_authority.operation_id = OperationId::parse(if has_run_id_override {
                 format!("{agent_run_id}-parent-op")
@@ -8968,6 +9013,245 @@ impl ConfigStore {
             tx.execute("INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'applied',?3)",rusqlite::params![result.receipt.evidence_id(),source_revision,super::now_unix()?]).map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Reject a structurally valid MergeDecision claim that disagrees with the host's
+    /// accepted publication identity. The first mismatch gets one exact Coordinator
+    /// correction; a second mismatch for that same publication/revision blocks the
+    /// TicketRun and notifies its Supervisor. The result ACK and wake/transition share
+    /// one SQLite transaction.
+    pub fn reject_merge_assessment_claim(
+        &mut self,
+        owner_generation: u64,
+        result: &IngestedAgentResult,
+        publication_set_digest: &str,
+        expected_pull_request_reference: &str,
+        reason: &str,
+    ) -> Result<MergeClaimRejectionOutcome, String> {
+        let binding = &result.validated.binding;
+        let ticket_run_id = binding
+            .ticket_run_id
+            .as_ref()
+            .ok_or("MergeDecision claim rejection requires TicketRun scope")?;
+        let source_revision = binding
+            .ticket_revision
+            .ok_or("MergeDecision claim rejection lacks TicketRun revision")?;
+        if binding.role != Role::MergeDecision
+            || result.validated.kind
+                != crate::engine::orchestration::RoleOutputKind::MergeAssessment
+            || result.validated.assertion != crate::engine::orchestration::AgentAssertion::Succeeded
+        {
+            return Err("claim rejection requires a succeeded MergeAssessment result".into());
+        }
+        if reason.is_empty() || reason.len() > 512 || expected_pull_request_reference.is_empty() {
+            return Err("claim rejection correction context is invalid".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::validate_active_generation(&tx, owner_generation)?;
+        let prior_ack: Option<(u64, String)> = tx.query_row(
+            "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+            [result.receipt.evidence_id()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some((_revision, disposition)) = prior_ack {
+            if disposition != "rejected_by_host" {
+                return Err(
+                    "MergeDecision evidence was already acknowledged with a different disposition"
+                        .into(),
+                );
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(MergeClaimRejectionOutcome::AlreadyRecorded);
+        }
+
+        let evidence: Option<(String, String, String, Option<String>, String, String)> = tx.query_row(
+            "SELECT agent_run_id,project_id,role,ticket_run_id,outcome,result_digest FROM agent_result_evidence WHERE evidence_id=?1",
+            [result.receipt.evidence_id()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((agent_run_id, project_id, role, evidence_ticket, outcome, result_digest)) =
+            evidence
+        else {
+            return Err("MergeDecision claim rejection source evidence is missing".into());
+        };
+        if agent_run_id != binding.agent_run_id.as_str()
+            || project_id != binding.project_id.as_str()
+            || role != "merge_decision"
+            || evidence_ticket.as_deref() != Some(ticket_run_id.as_str())
+            || outcome != "completed"
+            || result_digest != result.validated.result_digest.as_str()
+        {
+            return Err(
+                "MergeDecision claim rejection source evidence is not authoritative".into(),
+            );
+        }
+        let (authority_json, authority_digest): (String, String) = tx.query_row(
+            "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+            [binding.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|error| error.to_string())?;
+        let authority: AgentLaunchAuthority =
+            crate::protocol::parse_unique(authority_json.as_bytes())?;
+        authority.validate()?;
+        if authority.digest()?.as_str() != authority_digest
+            || binding_for(&authority)? != *binding
+            || authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || authority.ticket_revision != Some(source_revision)
+        {
+            return Err(
+                "MergeDecision claim rejection differs from immutable launch authority".into(),
+            );
+        }
+        let parent_id = authority
+            .parent_run_id
+            .as_ref()
+            .ok_or("MergeDecision launch authority has no Coordinator parent")?;
+        let (parent_json, parent_digest): (String, String) = tx
+            .query_row(
+                "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
+                [parent_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let parent: AgentLaunchAuthority = crate::protocol::parse_unique(parent_json.as_bytes())?;
+        parent.validate()?;
+        if parent.digest()?.as_str() != parent_digest
+            || parent.agent_run_id != *parent_id
+            || parent.role != Role::Coordinator
+            || parent.role_session_id != format!("ticket_run:{ticket_run_id}:coordinator")
+            || parent.project_id != authority.project_id
+            || parent.ticket_run_id != authority.ticket_run_id
+            || Some(parent.role) != authority.parent_role
+            || authority.role_session_id != format!("ticket_run:{}:merge_decision", ticket_run_id)
+        {
+            return Err("MergeDecision claim rejection parent lineage is invalid".into());
+        }
+        let current: Option<(String, String, String, u64, String)> = tx.query_row(
+            "SELECT internal_phase,activity,external_status,revision,project_id FROM ticket_runs WHERE ticket_run_id=?1",
+            [ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((phase, activity, external_status, revision, ticket_project)) = current else {
+            return Err("MergeDecision claim rejection TicketRun is missing".into());
+        };
+        if phase != "assessing"
+            || activity != "running"
+            || revision != source_revision.0
+            || ticket_project != binding.project_id.as_str()
+        {
+            return Err(
+                "MergeDecision claim rejection TicketRun is stale or not actively assessing".into(),
+            );
+        }
+        let trusted_assessment_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='host_merge_assessment' AND source_revision=?3 AND lifecycle IN ('pending','claimed','consumed'))",
+                rusqlite::params![binding.project_id.as_str(), authority.role_session_id, source_revision.0],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if trusted_assessment_exists {
+            tx.execute(
+                "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'rejected_by_host',?3)",
+                rusqlite::params![result.receipt.evidence_id(),source_revision.0,super::now_unix()?],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(MergeClaimRejectionOutcome::AlreadyRecorded);
+        }
+        let prior_count: u64 = tx.query_row(
+            "SELECT count(*) FROM role_wake_inputs WHERE project_id=?1 AND source_revision=?2 AND json_extract(payload_json,'$.ticket_run_id')=?3 AND json_extract(payload_json,'$.publication_set_digest')=?4 AND json_extract(payload_json,'$.kind')='merge_assessment_claim_rejected'",
+            rusqlite::params![binding.project_id.as_str(), source_revision.0, ticket_run_id.as_str(), publication_set_digest],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        let now = super::now_unix()?;
+        let (outcome, ack_revision) = if prior_count == 0 {
+            let payload = serde_json::json!({
+                "kind":"merge_assessment_claim_rejected",
+                "source_evidence_id":result.receipt.evidence_id(),
+                "ticket_run_id":ticket_run_id.as_str(),
+                "publication_set_digest":publication_set_digest,
+                "expected_pull_request_reference":expected_pull_request_reference,
+                "reason":reason,
+                "instruction":"You are the Coordinator. Do not write or revise the MergeAssessment yourself. Inspect this rejected claim and issue one explicit SpawnRequest for a new MergeDecision turn, using the configured MergeDecision profile and an accepted work node. The new MergeDecision turn will receive the host-validated publication subject and must put the expected pull request reference exactly as shown, without annotations or extra text, in pr_references. Do not request another correction after this one."
+            });
+            tx.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'merge_assessment_claim_rejected',?3,?4,100,?5,'pending',?6)",
+                rusqlite::params![binding.project_id.as_str(),parent.role_session_id,result.receipt.evidence_id(),source_revision.0,payload.to_string(),now],
+            ).map_err(|error| error.to_string())?;
+            (
+                MergeClaimRejectionOutcome::CoordinatorCorrectionQueued,
+                source_revision.0,
+            )
+        } else {
+            let current_run = crate::engine::reducer::TicketRun {
+                project_id: binding.project_id.clone(),
+                ticket_run_id: ticket_run_id.clone(),
+                revision: source_revision,
+                phase: crate::engine::reducer::Phase::Assessing,
+                activity: crate::engine::reducer::Activity::Running,
+                external_status: super::parse_ticket_status(&external_status)?,
+                required_review_revision: None,
+            };
+            let decision = crate::engine::reducer::reduce(
+                &current_run,
+                source_revision,
+                crate::engine::reducer::Input::MergeAssessmentCorrectionExhausted,
+            )?;
+            tx.execute(
+                "UPDATE ticket_runs SET internal_phase=?2,activity=?3,external_status=?4,required_review_revision=?5,revision=?6 WHERE ticket_run_id=?1 AND revision=?7",
+                rusqlite::params![ticket_run_id.as_str(),super::enum_string(&decision.ticket_run.phase)?,super::enum_string(&decision.ticket_run.activity)?,super::enum_string(&decision.ticket_run.external_status)?,decision.ticket_run.required_review_revision.map(|value| value.0),decision.ticket_run.revision.0,source_revision.0],
+            ).map_err(|error| error.to_string())?;
+            let message_id = format!(
+                "merge-assessment-correction-exhausted:{}",
+                result.receipt.evidence_id()
+            );
+            let payload = serde_json::json!({"source_evidence_id":result.receipt.evidence_id(),"publication_set_digest":publication_set_digest,"reason":reason,"expected_pull_request_reference":expected_pull_request_reference});
+            let payload_json = crate::store::canonical_json(&payload)?;
+            let input = crate::store::DurableInput {
+                producer_id: "rex-projects-agent-result".into(),
+                message_id: message_id.clone(),
+                content_digest: crate::store::durable_input_digest("ticket_run", &payload_json),
+                recipient: "ticket_run".into(),
+                payload: payload_json.clone(),
+            };
+            tx.execute(
+                "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'ticket_run',?2,?3,?4,?5,'MergeDecision claim correction exhausted',?6,?7)",
+                rusqlite::params![binding.project_id.as_str(),ticket_run_id.as_str(),source_revision.0,decision.ticket_run.revision.0,message_id,payload_json,now],
+            ).map_err(|error| error.to_string())?;
+            let supervisor_payload = serde_json::json!({
+                "kind":"merge_assessment_correction_exhausted",
+                "ticket_run_id":ticket_run_id.as_str(),
+                "source_evidence_id":result.receipt.evidence_id(),
+                "publication_set_digest":publication_set_digest,
+                "expected_pull_request_reference":expected_pull_request_reference,
+                "reason":reason,
+                "revision":decision.ticket_run.revision.0,
+                "instruction":"The one automatic MergeDecision correction still did not identify the accepted pull request exactly. This TicketRun is blocked; inspect and provide human direction before resuming."
+            });
+            tx.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'merge_assessment_correction_exhausted',?3,?4,100,?5,'pending',?6)",
+                rusqlite::params![binding.project_id.as_str(),format!("project:{}:supervisor",binding.project_id.as_str()),result.receipt.evidence_id(),decision.ticket_run.revision.0,supervisor_payload.to_string(),now],
+            ).map_err(|error| error.to_string())?;
+            let receipt = serde_json::json!({"accepted":true,"ticket_run_id":ticket_run_id.as_str(),"revision":decision.ticket_run.revision.0,"blocked":true});
+            tx.execute(
+                "INSERT INTO inbox(producer_id,message_id,content_digest,recipient,payload_json,receipt_json,received_at_unix,processed_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+                rusqlite::params![input.producer_id,input.message_id,input.content_digest,input.recipient,input.payload,receipt.to_string(),now],
+            ).map_err(|error| error.to_string())?;
+            (
+                MergeClaimRejectionOutcome::SupervisorEscalationQueued,
+                decision.ticket_run.revision.0,
+            )
+        };
+        tx.execute(
+            "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'rejected_by_host',?3)",
+            rusqlite::params![result.receipt.evidence_id(),ack_revision,now],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(outcome)
     }
 
     /// Reject a phase-ineligible child request and wake its canonical Coordinator atomically.

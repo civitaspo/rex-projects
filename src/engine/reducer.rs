@@ -60,6 +60,7 @@ pub enum Input {
     ReviewConverged,
     ReviewEscalationRequired,
     RequireHumanReview,
+    MergeAssessmentCorrectionExhausted,
     HumanReviewApproved,
     HumanReviewRevisionRequested,
     MergeVerified,
@@ -212,6 +213,12 @@ pub fn reduce(
             next.required_review_revision = Some(current.revision);
             effects.push(EffectKind::RequestHumanReview);
             effects.push(EffectKind::PublishTicketStatus);
+        }
+        Input::MergeAssessmentCorrectionExhausted if current.phase == Phase::Assessing => {
+            // No Agent assessment is trusted. Keep external status In Progress; the
+            // Supervisor must surface the blocked decision for human direction.
+            next.activity = Activity::Blocked;
+            wakes.push(WakeTarget::Supervisor);
         }
         Input::HumanReviewApproved
             if current.phase == Phase::WaitingHuman

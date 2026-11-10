@@ -430,6 +430,9 @@ pub fn render_role_prompt(
         prompt.push_str(&format!(
             "\nHost-validated implementation publication subject (use its exact subject kind, digest, and evidence coverage in {expected_result}):\n```json\n{encoded}\n```\n"
         ));
+        if context.role == Role::MergeDecision {
+            prompt.push_str("For each published pull request, put only its canonical URL in `pr_references` (one bare URL per accepted PR). Do not append node IDs, head/base details, Markdown, labels, or explanations to a URL. The host compares references exactly and will reject annotated or extra text.\n");
+        }
     }
     if let Some(completion_context) = &context.completion_context {
         if context.role != Role::Postmortem {
@@ -508,7 +511,7 @@ pub fn render_role_prompt(
     ));
     if context.role == Role::MergeDecision {
         prompt.push_str(
-            "\n# MergeDecision assessment handoff\n\nThe initial turn receives a host-validated implementation publication subject and returns `MergeAssessment`. A later turn may receive a `host_merge_assessment` wake for this exact TicketRun revision. Read that wake from the public inbox before producing `MergeIntent`; copy its assessment ID, policy digest, PR identity, and prepared body proposal target digest exactly. The host retains and rechecks the proposal's prior body digest. If the exact-current-revision wake is absent, do not guess values or begin another assessment-to-intent loop. The host currently supports only `merge_commit_recorded` as a post-merge verification check.\n",
+            "\n# MergeDecision assessment handoff\n\nA normally scheduled turn, or a new turn explicitly authorized by the Coordinator after a rejected claim, receives the host-validated implementation publication subject and returns `MergeAssessment`. The Coordinator must authorize any correction with an explicit `SpawnRequest`; never start a correction turn or reuse a previous claim on your own. A later turn may receive a `host_merge_assessment` wake for this exact TicketRun revision. Read that wake from the public inbox before producing `MergeIntent`; copy its assessment ID, policy digest, PR identity, and prepared body proposal target digest exactly. The host retains and rechecks the proposal's prior body digest. If the exact-current-revision wake is absent, do not guess values or begin an assessment-to-intent loop. The host currently supports only `merge_commit_recorded` as a post-merge verification check.\n",
         );
     }
     if context.role == Role::Worker {

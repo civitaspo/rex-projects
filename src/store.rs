@@ -6530,12 +6530,17 @@ pub(crate) mod tests {
 
     #[test]
     fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
-        published_publication_fixture(false);
+        published_publication_fixture(false, false);
     }
 
     #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
-        published_publication_fixture(true);
+        published_publication_fixture(true, false);
+    }
+
+    #[test]
+    fn repeated_merge_reference_mismatch_blocks_and_notifies_supervisor_once() {
+        published_publication_fixture(true, true);
     }
 
     fn assert_registered_staging_survives_verification(
@@ -6639,7 +6644,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn published_publication_fixture(single_publication: bool) {
+    fn published_publication_fixture(single_publication: bool, reject_twice: bool) {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
         use crate::delivery_runtime::{
@@ -6709,6 +6714,7 @@ pub(crate) mod tests {
                 "ticket_adapter": "tickets",
                 "repositories": ["repo-a"],
                 "roles": {
+                    "coordinator": "worker_codex",
                     "worker": "worker_codex",
                     "reviewer": "worker_codex",
                     "merge_decision": "worker_codex"
@@ -7120,7 +7126,7 @@ pub(crate) mod tests {
             assert_eq!(assessing.phase, Phase::Assessing);
 
             let merge_result_json = serde_json::json!({
-                "pr_references": [format!("https://github.com/acme/repo-a/pull/{}", subject.publications[0].pull_request_number)],
+                "pr_references": [format!("https://github.com/acme/repo-a/pull/{} (PR_{}); head {}; base main", subject.publications[0].pull_request_number, subject.publications[0].pull_request_node_id, subject.publications[0].published_head)],
                 "subject_digest": subject.digest().unwrap().as_str(),
                 "deterministic_gate_evidence": [
                     {"gate_id":"pull_request_open","outcome":"pass","evidence_references":[]},
@@ -7145,7 +7151,7 @@ pub(crate) mod tests {
                 result_digest: Some(
                     Digest::parse(content_digest(&merge_result_json.to_string())).unwrap(),
                 ),
-                structured_result: merge_result_json,
+                structured_result: merge_result_json.clone(),
                 artifact_refs: Vec::new(),
             };
             let merge_result =
@@ -7160,6 +7166,10 @@ pub(crate) mod tests {
                     crate::domain::ids::AgentRunId::parse("single-publication-merge-run").unwrap(),
                 )
                 .unwrap();
+            let expected_pr_reference = format!(
+                "https://github.com/acme/repo-a/pull/{}",
+                subject.publications[0].pull_request_number
+            );
             let publication = &subject.publications[0];
             let head = publication.published_head.clone();
             let replies = vec![
@@ -7176,21 +7186,22 @@ pub(crate) mod tests {
                 serde_json::json!({"name":"main","protected":true}),
                 serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
             ];
-            let (observation, proposal) =
-                crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
+            let observation =
+                crate::runtime_services::merge::tests::observe_publication_for_store_test(
                     applied.clone(),
                     &subject,
                     &merge_result.ingested,
-                    &accepted.proposal,
-                    &project_id,
-                    replies,
+                    replies.clone(),
                 )
                 .unwrap();
             assert_eq!(
                 observation.publication_set_digest,
                 subject.digest().unwrap()
             );
-            assert_eq!(proposal.publication_set_digest, subject.digest().unwrap());
+            store.connection.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'ticket_run:other-ticket-run:coordinator','merge_assessment_claim_rejected','other-ticket-evidence',?2,100,?3,'pending',1)",
+                rusqlite::params![project_id.as_str(),assessing.revision,serde_json::json!({"kind":"merge_assessment_claim_rejected","ticket_run_id":"other-ticket-run","publication_set_digest":subject.digest().unwrap().as_str()}).to_string()],
+            ).unwrap();
             assert!(
                 crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
                     &mut store,
@@ -7199,8 +7210,310 @@ pub(crate) mod tests {
                     &config,
                     config_digest.clone(),
                     &merge_result.ingested,
-                    observation,
-                    proposal,
+                    observation.clone(),
+                    None,
+                )
+                .unwrap()
+            );
+            let correction_wakes = store
+                .pending_role_wake_inputs(
+                    &project_id,
+                    &format!("ticket_run:{ticket_run_id}:coordinator"),
+                    8,
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|wake| {
+                    wake.source_type == "merge_assessment_claim_rejected"
+                        && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(correction_wakes.len(), 1);
+            assert_eq!(
+                correction_wakes[0].source_type,
+                "merge_assessment_claim_rejected"
+            );
+            assert_eq!(
+                correction_wakes[0].payload_json["expected_pull_request_reference"],
+                expected_pr_reference
+            );
+            let coordinator_wake = &correction_wakes[0];
+            let coordinator_wake_item = crate::agent_api::AgentWakeItem {
+                wake_input_id: coordinator_wake.wake_input_id,
+                source_type: coordinator_wake.source_type.clone(),
+                source_id: coordinator_wake.source_id.clone(),
+                source_revision: coordinator_wake.source_revision,
+                priority: coordinator_wake.priority,
+                payload_json: coordinator_wake.payload_json.clone(),
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            };
+            let merge_node = accepted.proposal.nodes.first().unwrap();
+            let coordinator_request = crate::engine::orchestration::SpawnRequestPayload {
+                work_node: merge_node.id.clone(),
+                role: crate::domain::types::Role::MergeDecision,
+                profile_id: crate::domain::ids::ProfileId::parse("worker_codex").unwrap(),
+                plan_digest: Some(accepted.plan_digest.clone()),
+                worker_recovery: None,
+                allowed_repositories: vec![repository_id.clone()],
+                artifact_inputs: Vec::new(),
+                parent_run_id: None,
+            };
+            let coordinator_payload = serde_json::to_value(&coordinator_request).unwrap();
+            let coordinator_result_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-coordinator-correct-merge-reference".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::SpawnRequest,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&coordinator_payload.to_string())).unwrap(),
+                ),
+                structured_result: coordinator_payload,
+                artifact_refs: Vec::new(),
+            };
+            let coordinator_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::Coordinator,
+                coordinator_result_message,
+                crate::domain::ids::AgentRunId::parse("single-publication-correct-merge-coordinator").unwrap(),
+                vec![coordinator_wake_item.clone()],
+            ).unwrap();
+            let coordinator_authority = store
+                .agent_launch_authority(&coordinator_result.ingested.validated.binding.agent_run_id)
+                .unwrap()
+                .unwrap();
+            let mut correction_snapshot = crate::agent_api::AgentWakeSnapshot {
+                schema_version: 1,
+                project_id: project_id.clone(),
+                role_session_id: coordinator_authority.role_session_id.clone(),
+                agent_run_id: coordinator_authority.agent_run_id.to_string(),
+                digest: Digest::parse("0".repeat(64)).unwrap(),
+                inputs: vec![coordinator_wake_item],
+                worker_correction_context: None,
+            };
+            correction_snapshot.digest = correction_snapshot.content_digest().unwrap();
+            let coordinator_mailbox = coordinator_authority.control_dir.join("mailbox");
+            crate::agent_api::publish_wake_snapshot(
+                &coordinator_mailbox,
+                correction_snapshot.clone(),
+            )
+            .unwrap();
+            let inbox_args = [
+                "rex-projects",
+                "agent",
+                "inbox",
+                "--control-dir",
+                coordinator_mailbox.to_str().unwrap(),
+                "--run",
+                coordinator_authority.agent_run_id.as_str(),
+                "--json",
+            ];
+            let inbox_bytes = crate::cli::dispatch_agent_inbox_for_test(&inbox_args).unwrap();
+            let inbox_report: serde_json::Value =
+                crate::protocol::parse_unique(&inbox_bytes).unwrap();
+            let correction_inbox: Vec<crate::agent_api::AgentWakeItem> =
+                serde_json::from_value(inbox_report["inputs"].clone()).unwrap();
+            assert_eq!(correction_inbox, correction_snapshot.inputs);
+            assert_eq!(
+                correction_inbox[0].payload_json["expected_pull_request_reference"],
+                expected_pr_reference
+            );
+            assert!(
+                crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    &coordinator_result.ingested,
+                )
+                .unwrap()
+            );
+            store
+                .connection
+                .execute(
+                    "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                    [project_id.as_str()],
+                )
+                .unwrap();
+            store.connection.execute(
+                "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+                rusqlite::params![project_id.as_str(), owner_generation],
+            ).unwrap();
+            let child_session = format!("ticket_run:{ticket_run_id}:merge_decision");
+            let correction_candidates = store
+                .pending_role_wake_sessions(owner_generation, 16)
+                .unwrap();
+            let merge_candidate = correction_candidates
+                .iter()
+                .find(|candidate| candidate.role_session_id == child_session)
+                .expect(
+                    "Coordinator correction SpawnRequest becomes a MergeDecision launch candidate",
+                );
+            assert_eq!(
+                merge_candidate.role,
+                crate::domain::types::Role::MergeDecision
+            );
+            assert_eq!(merge_candidate.ticket_run_id.as_ref(), Some(&ticket_run_id));
+            if reject_twice {
+                let second_bad_message = crate::roles::RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "single-publication-merge-assessment-still-annotated".into(),
+                    kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                    assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                    result_digest: Some(
+                        Digest::parse(content_digest(&merge_result_json.to_string())).unwrap(),
+                    ),
+                    structured_result: merge_result_json.clone(),
+                    artifact_refs: Vec::new(),
+                };
+                let second_bad_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    second_bad_message,
+                    crate::domain::ids::AgentRunId::parse("single-publication-merge-run-still-annotated").unwrap(),
+                ).unwrap();
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                        &mut store,
+                        owner_generation,
+                        12,
+                        &config,
+                        config_digest.clone(),
+                        &second_bad_result.ingested,
+                        observation.clone(),
+                        None,
+                    )
+                    .unwrap()
+                );
+                let blocked = store
+                    .active_ticket_runs(owner_generation, 10)
+                    .unwrap()
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == ticket_run_id)
+                    .unwrap();
+                assert_eq!(blocked.phase, Phase::Assessing);
+                assert_eq!(blocked.activity, crate::engine::reducer::Activity::Blocked);
+                assert_eq!(
+                    blocked.external_status,
+                    crate::domain::types::TicketStatus::InProgress
+                );
+                assert!(
+                    store
+                        .trusted_merge_assessment(
+                            &project_id,
+                            &ticket_run_id,
+                            Revision(assessing.revision)
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                let supervisor_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("project:{project_id}:supervisor"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| wake.source_type == "merge_assessment_correction_exhausted")
+                    .collect::<Vec<_>>();
+                assert_eq!(supervisor_wakes.len(), 1);
+                assert_eq!(
+                    supervisor_wakes[0].payload_json["ticket_run_id"],
+                    ticket_run_id.as_str()
+                );
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                        &mut store,
+                        owner_generation,
+                        12,
+                        &config,
+                        config_digest.clone(),
+                        &second_bad_result.ingested,
+                        observation,
+                        None,
+                    )
+                    .unwrap()
+                );
+                let replayed_supervisor_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("project:{project_id}:supervisor"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| wake.source_type == "merge_assessment_correction_exhausted")
+                    .count();
+                assert_eq!(replayed_supervisor_wakes, 1);
+                return;
+            }
+            let mut corrected_merge_json = merge_result_json.clone();
+            corrected_merge_json["pr_references"] = serde_json::json!([expected_pr_reference]);
+            let corrected_merge_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-merge-assessment-corrected".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&corrected_merge_json.to_string())).unwrap(),
+                ),
+                structured_result: corrected_merge_json,
+                artifact_refs: Vec::new(),
+            };
+            let corrected_merge_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::MergeDecision,
+                corrected_merge_message,
+                crate::domain::ids::AgentRunId::parse("single-publication-merge-run-corrected").unwrap(),
+            ).unwrap();
+            let (corrected_observation, proposal) =
+                crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &corrected_merge_result.ingested,
+                    &accepted.proposal,
+                    &project_id,
+                    replies,
+                )
+                .unwrap();
+            assert_eq!(
+                corrected_observation.publication_set_digest,
+                subject.digest().unwrap()
+            );
+            assert_eq!(proposal.publication_set_digest, subject.digest().unwrap());
+            assert_eq!(
+                crate::store::agent_results::host_validation_fixture::result_ack(
+                    &store,
+                    merge_result.ingested.receipt.evidence_id()
+                )
+                .unwrap(),
+                Some((assessing.revision, "rejected_by_host".into()))
+            );
+            assert!(
+                crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    &corrected_merge_result.ingested,
+                    corrected_observation,
+                    Some(proposal),
                 )
                 .unwrap()
             );
