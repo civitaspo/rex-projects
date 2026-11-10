@@ -2084,7 +2084,7 @@ impl ConfigStore {
             return Err("effect error diagnostic exceeds 512 bytes".into());
         }
         let changed = self.connection.execute(
-            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json),last_error=COALESCE(last_error,?5) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
+            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json),last_error=COALESCE(?5,last_error) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
             params![operation_id, owner_generation, receipt, next_reconciliation_at_unix, last_error],
         ).map_err(|error| error.to_string())?;
         if changed != 1 {
@@ -5745,7 +5745,7 @@ pub(crate) mod tests {
             (
                 "uncertain".into(),
                 Some(prior_receipt.into()),
-                Some("Rex wrapper request was not observed".into()),
+                Some("later Rex process observation failed".into()),
             )
         );
     }
