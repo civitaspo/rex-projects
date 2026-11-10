@@ -63,6 +63,14 @@ impl WorktreeLease {
     }
 }
 
+impl Drop for WorktreeLease {
+    fn drop(&mut self) {
+        // A forked child can retain this open-file description until it reaches exec. Unlock
+        // explicitly so dropping the parent lease releases writers immediately.
+        let _ = FileExt::unlock(&self._lock);
+    }
+}
+
 #[derive(Debug)]
 pub enum WorktreeError {
     Invalid(String),

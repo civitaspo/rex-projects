@@ -5439,6 +5439,114 @@ esac
     }
 
     #[test]
+    fn forked_pre_exec_child_temporarily_inherits_writer_lease() {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let (bare, _) = seed_local_remote(temp.path(), &executable);
+        let manager = crate::worktrees::WorktreeManager::new(
+            &temp.path().join("state"),
+            GitOptions {
+                executable,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(20),
+            },
+        )
+        .unwrap();
+        let repository_id = RepositoryId::parse("demo").unwrap();
+        let repository = manager
+            .ensure_repository(&repository_id, &bare.to_string_lossy())
+            .unwrap();
+        let worktree = manager
+            .prepare_worktree(
+                &repository,
+                "main",
+                &crate::worktrees::TicketKey {
+                    namespace: TicketNamespace::parse("fixture").unwrap(),
+                    ticket_id: TicketId::parse("T-10").unwrap(),
+                },
+            )
+            .unwrap();
+        let lease = manager.acquire_writer_lease(worktree.clone()).unwrap();
+        assert!(matches!(
+            manager.acquire_writer_lease(worktree.clone()),
+            Err(crate::worktrees::WorktreeError::Conflict(_))
+        ));
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let mut release_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
+        let ready_write_fd = pipe[1];
+        let release_read_fd = release_pipe[0];
+        let child = std::thread::spawn(move || {
+            let mut command = std::process::Command::new("/usr/bin/true");
+            unsafe {
+                command.pre_exec(move || {
+                    let ready = [1u8];
+                    if libc::write(ready_write_fd, ready.as_ptr().cast(), ready.len()) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut release = [0u8];
+                    if libc::read(release_read_fd, release.as_mut_ptr().cast(), release.len()) != 1
+                        || release != [1]
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap().wait().unwrap()
+        });
+        let mut ready = [0u8];
+        let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut readiness = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 5000) }, 1);
+        assert_ne!(readiness.revents & libc::POLLIN, 0);
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [1]);
+        unsafe {
+            libc::close(ready_write_fd);
+            libc::close(release_read_fd);
+        }
+        drop(lease);
+
+        let during_pre_exec = manager.acquire_writer_lease(worktree.clone());
+        let successor = during_pre_exec.ok();
+        if successor.is_some() {
+            assert!(matches!(
+                manager.acquire_writer_lease(worktree.clone()),
+                Err(crate::worktrees::WorktreeError::Conflict(_))
+            ));
+        }
+        let release = [1u8];
+        assert_eq!(
+            unsafe { libc::write(release_pipe[1], release.as_ptr().cast(), release.len(),) },
+            1
+        );
+        unsafe { libc::close(release_pipe[1]) };
+        assert!(child.join().unwrap().success());
+        assert!(
+            successor.is_some(),
+            "parent lease drop should unlock before exec"
+        );
+        let successor = successor.unwrap();
+        assert!(matches!(
+            manager.acquire_writer_lease(worktree.clone()),
+            Err(crate::worktrees::WorktreeError::Conflict(_))
+        ));
+        drop(successor);
+        assert!(manager.acquire_writer_lease(worktree).is_ok());
+    }
+
+    #[test]
     fn prepare_worktrees_effect_is_canonical_scoped_and_replayable() {
         let temp = tempfile::tempdir().unwrap();
         let executable = git_path();
