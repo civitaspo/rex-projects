@@ -2108,6 +2108,174 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_parent_uses_original_dispatch_revision_after_status_receipt() {
+        use crate::domain::ids::{Digest, ProjectId, TicketId, TicketNamespace, TicketRunId};
+        use crate::domain::types::{Role, TicketStatus};
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use crate::store::scheduler::{ObservedTicket, TicketScanKey, TicketScanPage};
+        use serde_json::json;
+
+        let payload = json!({
+            "ticket_reference": "43",
+            "expected_ticket_revision": "revision-1",
+            "coordinator_profile": "judgment_claude",
+            "priority": 3,
+            "rationale": "dispatch the observed ticket revision"
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Supervisor,
+                RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "supervisor-dispatch-revision-1".into(),
+                    kind: RoleOutputKind::DispatchRequest,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result: payload,
+                    result_digest: Some(result_digest),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let project = ProjectId::parse("fixture-project").unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project, "running")
+            .unwrap();
+        let mut config: crate::config::Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let mut project_config = config
+            .projects
+            .remove(&ProjectId::parse("goal_project").unwrap())
+            .unwrap();
+        project_config.dispatch_states = vec![TicketStatus::Ready];
+        config.projects.insert(project.clone(), project_config);
+        let project_config = config.projects.get(&project).unwrap();
+        let namespace = TicketNamespace::parse("fixture").unwrap();
+        let scan_key = TicketScanKey::for_project(
+            &project,
+            &project_config.ticket_adapter,
+            &namespace,
+            project_config,
+            TicketStatus::Ready,
+        )
+        .unwrap();
+        fixture
+            .store
+            .record_ticket_scan_page(
+                fixture.owner_generation,
+                TicketScanPage {
+                    key: &scan_key,
+                    expected_cursor: None,
+                    expected_generation: 0,
+                    expected_page_count: 0,
+                    next_cursor: None,
+                    tickets: &[ObservedTicket {
+                        id: TicketId::parse("43").unwrap(),
+                        revision: Some("revision-1".into()),
+                        status: TicketStatus::Ready,
+                        title: "Dispatch and status receipt fixture".into(),
+                        labels: Vec::new(),
+                        created_at: None,
+                        observed_at_unix: 1,
+                    }],
+                    now_unix: 1,
+                    poll_seconds: 60,
+                },
+            )
+            .unwrap();
+        let binding = &fixture.ingested.validated.binding;
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,1,?5,'{}','authorized',1,1)",
+                rusqlite::params![
+                    binding.agent_run_id.as_str(),
+                    binding.project_id.as_str(),
+                    binding.operation_id.as_str(),
+                    fixture.owner_generation,
+                    "d".repeat(64),
+                ],
+            )
+            .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut fixture.store,
+                fixture.owner_generation,
+                2,
+                &config,
+                Digest::parse("a".repeat(64)).unwrap(),
+                &fixture.ingested,
+            )
+            .unwrap()
+        );
+        let run = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT ticket_run_id FROM ticket_runs WHERE project_id=?1 AND ticket_id='43'",
+                [project.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let ticket_run = TicketRunId::parse(run).unwrap();
+        let adapter = Arc::new(FakeAdapter::new(
+            scope(),
+            namespace.as_str(),
+            "43",
+            NormalizedTicketStatus::Ready,
+        ));
+        let handlers = TicketEffectHandlers::new(
+            adapter.clone(),
+            BTreeMap::from([(project.clone(), scope())]),
+        )
+        .into_handlers();
+        let handler_refs = handlers
+            .iter()
+            .map(|handler| handler.as_ref())
+            .collect::<Vec<_>>();
+        let tick = crate::effects::EffectDispatcher::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            3,
+            &handler_refs,
+            crate::effects::EffectLimits {
+                max_attempts: 5,
+                max_age: std::time::Duration::from_secs(300),
+                retry_base: std::time::Duration::from_secs(1),
+                retry_max: std::time::Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            tick,
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        let saved_revision: Option<String> = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.as_str(), ticket_run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_revision.as_deref(), Some("revision-2"));
+
+        let parent = fixture
+            .store
+            .supervisor_parent_for_ticket_run(&project, &ticket_run)
+            .unwrap();
+        assert_eq!(parent.role, Role::Supervisor);
+    }
+
+    #[test]
     fn goal_create_records_host_verified_candidate_from_cli_receipt() {
         let (_temp, mut store, project, owner) = test_store();
         let namespace = TicketNamespace::parse("fixture:workspace").unwrap();
