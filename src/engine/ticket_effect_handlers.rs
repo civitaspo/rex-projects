@@ -87,13 +87,10 @@ impl PublishTicketStatusHandler {
         payload: &PublishTicketStatus,
         result: &ScopedTicketResult,
     ) -> Result<(), String> {
-        if result.ticket_namespace != payload.namespace.as_str()
-            || result.ticket.ticket_namespace != payload.namespace.as_str()
-            || result.ticket.id != payload.ticket_id.as_str()
-            || result.ticket.status.value != normalized_status(payload.desired_status)
-        {
+        validate_ticket_status_receipt(payload, result)?;
+        if result.ticket.scope != self.scope(payload)? {
             return Err(
-                "ticket adapter status receipt does not match the requested mutation".into(),
+                "ticket adapter status receipt is outside the configured Project scope".into(),
             );
         }
         Ok(())
@@ -318,6 +315,29 @@ impl PublishTicketStatusHandler {
             ),
         })
     }
+}
+
+pub(crate) fn validate_ticket_status_receipt(
+    payload: &PublishTicketStatus,
+    result: &ScopedTicketResult,
+) -> Result<(), String> {
+    payload.validate()?;
+    if result.ticket_namespace != payload.namespace.as_str()
+        || result.ticket.ticket_namespace != payload.namespace.as_str()
+        || result.ticket.id != payload.ticket_id.as_str()
+        || result.ticket.status.value != normalized_status(payload.desired_status)
+    {
+        return Err("ticket adapter status receipt does not match the requested mutation".into());
+    }
+    if result
+        .ticket
+        .revision
+        .as_deref()
+        .is_none_or(|revision| revision.trim().is_empty() || revision.len() > 512)
+    {
+        return Err("ticket adapter status receipt has no bounded external revision".into());
+    }
+    Ok(())
 }
 
 impl EffectHandler for PublishTicketStatusHandler {
@@ -1791,6 +1811,13 @@ mod tests {
                 owner, &project, &namespace, &ticket, &run, 1, "queued", "ready",
             )
             .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET external_revision='revision-1' WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.as_str(), run.as_str()],
+            )
+            .unwrap();
         let status = PublishTicketStatus {
             schema_version: 1,
             project_id: project.clone(),
@@ -1798,7 +1825,7 @@ mod tests {
             ticket_id: ticket.clone(),
             ticket_run_id: run.clone(),
             ticket_run_revision: 1,
-            expected_external_revision: None,
+            expected_external_revision: Some("revision-1".into()),
             desired_status: TicketStatus::InProgress,
             reason: "dispatch".into(),
         };
@@ -1834,6 +1861,13 @@ mod tests {
                 std::slice::from_ref(&status_intent),
             )
             .unwrap();
+        let mut missing_revision = status.clone();
+        missing_revision.expected_external_revision = None;
+        assert!(
+            store
+                .validate_ticket_status_publication(owner, &missing_revision)
+                .is_err()
+        );
         let adapter = Arc::new(FakeAdapter::new(
             scope(),
             namespace.as_str(),
@@ -1844,31 +1878,117 @@ mod tests {
             adapter.clone(),
             BTreeMap::from([(project.clone(), scope())]),
         );
+        let claimed = store
+            .claim_next_due_effect(owner, i64::MAX, &["publish_ticket_status".into()])
+            .unwrap()
+            .unwrap();
+        let request = EffectRequest {
+            intent: claimed.intent,
+            attempt_count: claimed.attempt_count,
+            created_at_unix: claimed.created_at_unix,
+        };
         let mut context = EffectContext {
             store: &mut store,
             owner_generation: owner,
             now_unix: 4,
         };
-        let observation = handler
-            .handle(
-                EffectMode::Submit,
-                &effect_request(
-                    &project,
-                    "ticket_run",
-                    run.as_str(),
+        let submission = handler
+            .handle(EffectMode::Submit, &request, &mut context)
+            .unwrap();
+        assert!(matches!(submission, EffectObservation::Applied { .. }));
+        context
+            .store
+            .defer_effect_reconciliation("op-status-publication", owner, None, None, 5)
+            .unwrap();
+        let uncertain = context
+            .store
+            .claim_next_due_effect(owner, 5, &["publish_ticket_status".into()])
+            .unwrap()
+            .unwrap();
+        let uncertain_request = EffectRequest {
+            intent: uncertain.intent,
+            attempt_count: uncertain.attempt_count,
+            created_at_unix: uncertain.created_at_unix,
+        };
+        let reconciled = handler
+            .handle(EffectMode::Reconcile, &uncertain_request, &mut context)
+            .unwrap();
+        let EffectObservation::Applied { receipt } = reconciled else {
+            panic!("operation lookup did not recover the applied status receipt");
+        };
+        let valid_result = ScopedTicketResult {
+            ticket_namespace: namespace.as_str().into(),
+            ticket: adapter.ticket.lock().unwrap().clone(),
+        };
+        let mut invalid_result = valid_result.clone();
+        invalid_result.ticket.revision = None;
+        let invalid_receipt = serde_json::to_string(&invalid_result).unwrap();
+        assert!(
+            context
+                .store
+                .finish_effect(
                     "op-status-publication",
-                    "publish_ticket_status",
-                    status_value,
-                ),
-                &mut context,
+                    owner,
+                    crate::store::EffectOutcome::Succeeded,
+                    Some(&invalid_receipt),
+                )
+                .is_err()
+        );
+        let claim_state: (String, Option<u64>, Option<String>) = context
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT status,owner_generation,receipt_json FROM effects WHERE operation_id='op-status-publication'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert!(matches!(observation, EffectObservation::Applied { .. }));
+        assert_eq!(claim_state.0, "claimed");
+        assert_eq!(claim_state.1, Some(owner));
+        assert_eq!(claim_state.2, None);
+        let revision_after_invalid_receipt: Option<String> = context
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.as_str(), run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            revision_after_invalid_receipt.as_deref(),
+            Some("revision-1")
+        );
+        context
+            .store
+            .finish_effect(
+                "op-status-publication",
+                owner,
+                crate::store::EffectOutcome::Succeeded,
+                Some(&receipt),
+            )
+            .unwrap();
         assert_eq!(*adapter.calls.lock().unwrap(), ["get", "update"]);
         assert_eq!(
             adapter.ticket.lock().unwrap().status.value,
             NormalizedTicketStatus::InProgress
         );
+        let saved_revision: Option<String> = context
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.as_str(), run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_revision.as_deref(), Some("revision-2"));
+        validate_ticket_status_receipt(&status, &valid_result).unwrap();
+        for invalid_revision in [None, Some(String::new()), Some("r".repeat(513))] {
+            let mut invalid_result = valid_result.clone();
+            invalid_result.ticket.revision = invalid_revision;
+            assert!(validate_ticket_status_receipt(&status, &invalid_result).is_err());
+        }
     }
 
     #[test]
@@ -1933,61 +2053,57 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let claimed = store
-            .claim_next_due_effect(owner, 4, &["publish_ticket_status".into()])
-            .unwrap();
-        let request: EffectRequest = claimed
-            .expect("dispatch creates a durable status effect")
-            .into();
-        assert_eq!(request.intent.subject_id, run.as_str());
-        assert_eq!(
-            request.intent.request_digest,
-            hash(&request.intent.request_json)
-        );
-        let payload: PublishTicketStatus =
-            serde_json::from_str(&request.intent.request_json).unwrap();
-        assert_eq!(payload.namespace, namespace);
-        assert_eq!(payload.ticket_id, ticket);
-        assert_eq!(
-            payload.expected_external_revision.as_deref(),
-            Some("revision-1")
-        );
-        assert_eq!(payload.desired_status, TicketStatus::InProgress);
-
         let fake = FakeAdapter::new(
             scope(),
-            payload.namespace.as_str(),
-            payload.ticket_id.as_str(),
+            namespace.as_str(),
+            ticket.as_str(),
             NormalizedTicketStatus::Ready,
         );
         fake.ticket.lock().unwrap().revision = Some("revision-1".into());
         let adapter = Arc::new(fake);
-        let handler = PublishTicketStatusHandler::new(
+        let owned_handlers = TicketEffectHandlers::new(
             adapter.clone(),
             BTreeMap::from([(project.clone(), scope())]),
-        );
-        let mut context = EffectContext {
-            store: &mut store,
-            owner_generation: owner,
-            now_unix: 4,
-        };
-        let observation = handler
-            .handle(EffectMode::Submit, &request, &mut context)
-            .unwrap();
-        let EffectObservation::Applied { receipt } = observation else {
-            panic!("status handler did not return its adapter receipt");
-        };
-        let receipt: ScopedTicketResult = serde_json::from_str(&receipt).unwrap();
-        assert_eq!(receipt.ticket.id, ticket.as_str());
-        assert_eq!(
-            receipt.ticket.status.value,
-            NormalizedTicketStatus::InProgress
-        );
-        assert_eq!(receipt.ticket.revision.as_deref(), Some("revision-2"));
+        )
+        .into_handlers();
+        let handler_refs = owned_handlers
+            .iter()
+            .map(|handler| handler.as_ref())
+            .collect::<Vec<_>>();
+        let dispatched = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            owner,
+            4,
+            &handler_refs,
+            crate::effects::EffectLimits {
+                max_attempts: 5,
+                max_age: std::time::Duration::from_secs(300),
+                retry_base: std::time::Duration::from_secs(1),
+                retry_max: std::time::Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            dispatched,
+            crate::effects::DispatchTick::Completed { .. }
+        ));
         assert_eq!(*adapter.calls.lock().unwrap(), ["get", "update"]);
         assert_eq!(
             adapter.ticket.lock().unwrap().status.value,
             NormalizedTicketStatus::InProgress
+        );
+        let saved_revision: Option<String> = store
+            .test_connection()
+            .query_row(
+                "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.as_str(), run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            saved_revision.as_deref(),
+            Some("revision-2"),
+            "a successful ticket adapter status update must advance the saved CAS revision"
         );
     }
 
@@ -2181,15 +2297,18 @@ mod tests {
                 "In Progress",
             )
             .unwrap();
-        if adopt_external_revision {
-            rusqlite::Connection::open(temp.path().join("state.sqlite3"))
-                .unwrap()
-                .execute(
-                    "UPDATE ticket_runs SET external_revision='revision-73' WHERE project_id=?1 AND ticket_run_id=?2",
-                    rusqlite::params![project.as_str(), run.as_str()],
-                )
-                .unwrap();
-        }
+        let initial_external_revision = if adopt_external_revision {
+            "revision-73"
+        } else {
+            "revision-1"
+        };
+        rusqlite::Connection::open(temp.path().join("state.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE ticket_runs SET external_revision=?1 WHERE project_id=?2 AND ticket_run_id=?3",
+                rusqlite::params![initial_external_revision, project.as_str(), run.as_str()],
+            )
+            .unwrap();
 
         let applied_snapshot = store.load_snapshot("factory").unwrap().unwrap();
         let applied = applied_snapshot.config;
@@ -2629,6 +2748,14 @@ mod tests {
         let namespace = TicketNamespace::parse("fixture").unwrap();
         let ticket = TicketId::parse("T-1").unwrap();
         let run = TicketRunId::parse("fixture-ticket-run").unwrap();
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET external_revision='revision-1' WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.as_str(), run.as_str()],
+            )
+            .unwrap();
         let applied_snapshot = fixture.store.load_snapshot("fixture").unwrap().unwrap();
         let applied = applied_snapshot.config;
         let plan = crate::operations::validate_recipe_value(
@@ -2835,7 +2962,9 @@ mod tests {
         let status = status_handler
             .handle(EffectMode::Submit, &status_request, &mut context)
             .unwrap();
-        assert!(matches!(status, EffectObservation::Applied { .. }));
+        let EffectObservation::Applied { receipt } = status else {
+            panic!("status publication did not return a terminal receipt");
+        };
         assert_eq!(
             adapter.ticket.lock().unwrap().status.value,
             NormalizedTicketStatus::Done
@@ -2846,7 +2975,7 @@ mod tests {
                 &status_effect.intent.operation_id,
                 owner,
                 EffectOutcome::Succeeded,
-                Some("external ticket status is Done"),
+                Some(&receipt),
             )
             .unwrap();
     }

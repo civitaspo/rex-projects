@@ -2159,10 +2159,103 @@ impl ConfigStore {
             EffectOutcome::Failed => "failed",
             EffectOutcome::Unknown => "uncertain",
         };
-        let changed = self.connection.execute("UPDATE effects SET status=?3, receipt_json=?4, owner_generation=NULL WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)", params![operation_id, owner_generation, status, receipt]).map_err(|e| e.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let effect = tx
+            .query_row(
+                "SELECT project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision FROM effects WHERE operation_id=?1 AND status='claimed' AND owner_generation=?2",
+                params![operation_id, owner_generation],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<u64>>(8)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(
+                |(
+                    project_id,
+                    subject_type,
+                    subject_id,
+                    operation_id,
+                    logical_key,
+                    kind,
+                    request_json,
+                    request_digest,
+                    expected_revision,
+                )| -> Result<EffectIntent, String> {
+                    Ok(EffectIntent {
+                        project_id: ProjectId::parse(project_id)?,
+                        subject_type,
+                        subject_id,
+                        operation_id,
+                        logical_key,
+                        kind,
+                        request_json,
+                        request_digest,
+                        expected_revision,
+                    })
+                },
+            )
+            .transpose()?;
+        let Some(effect) = effect else {
+            return Err("effect claim is stale or no longer active".into());
+        };
+
+        if matches!(outcome, EffectOutcome::Succeeded) && effect.kind == "publish_ticket_status" {
+            let request: crate::engine::ticket_effects::PublishTicketStatus =
+                crate::protocol::parse_unique(effect.request_json.as_bytes())?;
+            if canonical_json(&request)? != effect.request_json
+                || content_digest(&effect.request_json) != effect.request_digest
+                || effect.project_id != request.project_id
+                || effect.subject_type != "ticket_run"
+                || effect.subject_id != request.ticket_run_id.as_str()
+                || effect.expected_revision != Some(request.ticket_run_revision)
+            {
+                return Err(
+                    "ticket status effect request does not match its durable identity".into(),
+                );
+            }
+            let receipt = receipt.ok_or_else(|| {
+                "successful ticket status effect requires its adapter receipt".to_owned()
+            })?;
+            let result: crate::adapters::tickets::ScopedTicketResult =
+                crate::protocol::parse_unique(receipt.as_bytes())?;
+            crate::engine::ticket_effect_handlers::validate_ticket_status_receipt(
+                &request, &result,
+            )?;
+            Self::validate_ticket_status_publication_on_connection(
+                &tx,
+                owner_generation,
+                &request,
+            )?;
+            let external_revision = result
+                .ticket
+                .revision
+                .as_deref()
+                .ok_or("ticket status adapter receipt has no external revision")?;
+            let changed = tx
+                .execute(
+                    "UPDATE ticket_runs SET external_revision=?1 WHERE project_id=?2 AND ticket_run_id=?3 AND revision=?4 AND external_revision IS ?5",
+                    params![external_revision, request.project_id.as_str(), request.ticket_run_id.as_str(), request.ticket_run_revision, request.expected_external_revision],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "TicketRun external revision changed before status receipt could be recorded"
+                        .into(),
+                );
+            }
+        }
+
+        let changed = tx.execute(
+            "UPDATE effects SET status=?3, receipt_json=?4, owner_generation=NULL WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed'",
+            params![operation_id, owner_generation, status, receipt],
+        ).map_err(|error| error.to_string())?;
         if changed != 1 {
             return Err("effect claim is stale or no longer active".into());
         }
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -6831,7 +6924,7 @@ pub(crate) mod tests {
         store
             .connection
             .execute(
-                "UPDATE ticket_runs SET revision=4 WHERE ticket_run_id=?1",
+                "UPDATE ticket_runs SET revision=4,external_revision='revision-1' WHERE ticket_run_id=?1",
                 [ticket_run_id.as_str()],
             )
             .unwrap();
@@ -8078,6 +8171,10 @@ pub(crate) mod tests {
             assert_eq!(status_payload.namespace, ticket_namespace);
             assert_eq!(status_payload.ticket_id, ticket_id);
             assert_eq!(status_payload.ticket_run_id, ticket_run_id);
+            assert_eq!(
+                status_payload.expected_external_revision.as_deref(),
+                Some("revision-1")
+            );
             assert_eq!(
                 status_payload.ticket_run_revision,
                 host_intent
@@ -10567,6 +10664,13 @@ pub(crate) mod tests {
                 "ToDo",
             )
             .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET external_revision='revision-1' WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.id.as_str(), ticket_run.as_str()],
+            )
+            .unwrap();
         let transition_payload = r#"{"input":"dispatch"}"#;
         let transition_input = DurableInput {
             producer_id: "agent-run-coordinator-1".into(),
@@ -10575,22 +10679,30 @@ pub(crate) mod tests {
             recipient: "ticket_run".into(),
             payload: transition_payload.into(),
         };
-        let effect = |operation_id: &str, logical_key: &str, kind: &str| EffectIntent {
+        let status_payload = crate::engine::ticket_effects::PublishTicketStatus {
+            schema_version: 1,
+            project_id: project.id.clone(),
+            namespace: namespace.clone(),
+            ticket_id: ticket.clone(),
+            ticket_run_id: ticket_run.clone(),
+            ticket_run_revision: 1,
+            expected_external_revision: Some("revision-1".into()),
+            desired_status: TicketStatus::InProgress,
+            reason: "dispatch fixture".into(),
+        };
+        let request_json = canonical_json(&status_payload).unwrap();
+        let effect = EffectIntent {
             project_id: project.id.clone(),
             subject_type: "ticket_run".into(),
             subject_id: ticket_run.as_str().into(),
-            operation_id: operation_id.into(),
-            logical_key: logical_key.into(),
-            kind: kind.into(),
-            request_json: "{}".into(),
-            request_digest: content_digest("{}"),
+            operation_id: "publish-in-progress".into(),
+            logical_key: "publish-in-progress-r1".into(),
+            kind: "publish_ticket_status".into(),
+            request_digest: content_digest(&request_json),
+            request_json,
             expected_revision: Some(1),
         };
-        let effects = [effect(
-            "publish-in-progress",
-            "publish-in-progress-r1",
-            "publish_ticket_status",
-        )];
+        let effects = [effect];
         let receipt = store
             .commit_ticket_transition(
                 generation,
@@ -10645,6 +10757,41 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(coordinator_wake, 1);
+        let claimed = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.operation_id, "publish-in-progress");
+        let status_receipt = serde_json::json!({
+            "ticket_namespace": namespace.as_str(),
+            "ticket": {
+                "ticket_namespace": namespace.as_str(),
+                "scope": {"repository": "org/repo"},
+                "id": ticket.as_str(),
+                "revision": "revision-2",
+                "title": "Ticket 12",
+                "body": "Fixture",
+                "status": {"value": "in_progress"}
+            }
+        })
+        .to_string();
+        store
+            .finish_effect(
+                "publish-in-progress",
+                generation,
+                EffectOutcome::Succeeded,
+                Some(&status_receipt),
+            )
+            .unwrap();
+        let saved_external_revision: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.id.as_str(), ticket_run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_external_revision.as_deref(), Some("revision-2"));
         assert!(
             store
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &ticket_run, 1)
@@ -10893,19 +11040,6 @@ pub(crate) mod tests {
             store.project(&project.id).unwrap().unwrap().state_revision,
             Revision(1)
         );
-        let claimed = store
-            .next_due_effect(generation, i64::MAX)
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.operation_id, "publish-in-progress");
-        store
-            .finish_effect(
-                "publish-in-progress",
-                generation,
-                EffectOutcome::Succeeded,
-                Some("{}"),
-            )
-            .unwrap();
         let project_transition_effect = store
             .next_due_effect(generation, i64::MAX)
             .unwrap()
