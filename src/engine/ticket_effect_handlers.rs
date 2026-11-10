@@ -98,6 +98,226 @@ impl PublishTicketStatusHandler {
         }
         Ok(())
     }
+
+    fn replacement_for_adopted_done(
+        &self,
+        context: &crate::effects::EffectContext<'_>,
+        request: &EffectRequest,
+        payload: &PublishTicketStatus,
+    ) -> Result<Option<EffectIntent>, String> {
+        let key = format!("{}:adopted_done", request.intent.logical_key);
+        let Some(intent) = context.store.effect_by_logical_key(&key)? else {
+            return Ok(None);
+        };
+        let child: PublishTicketStatus = decode_payload(&EffectRequest {
+            intent: intent.clone(),
+            attempt_count: 0,
+            created_at_unix: request.created_at_unix,
+        })?;
+        if intent.operation_id != format!("{}-adopted-done", request.intent.operation_id)
+            || child.project_id != payload.project_id
+            || child.ticket_run_id != payload.ticket_run_id
+            || child.ticket_run_revision != payload.ticket_run_revision
+            || child.ticket_id != payload.ticket_id
+            || child.namespace != payload.namespace
+            || child.desired_status != TicketStatus::Done
+            || child.expected_external_revision.is_none()
+        {
+            return Err("deterministic Done replacement intent has mismatched scope".into());
+        }
+        Ok(Some(intent))
+    }
+
+    fn reconcile_done_external_revision(
+        &self,
+        request: &EffectRequest,
+        payload: &PublishTicketStatus,
+        scope: TicketScope,
+        context: &mut crate::effects::EffectContext<'_>,
+    ) -> Result<EffectObservation, String> {
+        let current = self
+            .adapter
+            .get(
+                request_id("status-adoption-get")?,
+                None,
+                TicketGetRequest {
+                    scope: scope.clone(),
+                    ticket_id: payload.ticket_id.as_str().into(),
+                    timeline_limit: Some(1),
+                },
+            )
+            .map_err(adapter_error)?;
+        validate_ticket_identity(
+            &current.ticket_namespace,
+            &current.ticket,
+            &payload.namespace,
+            &payload.ticket_id,
+        )?;
+        if current.ticket.scope != scope {
+            return Err(
+                "ticket status adoption observation is outside the configured Project scope".into(),
+            );
+        }
+        let current_revision = current
+            .ticket
+            .revision
+            .as_deref()
+            .filter(|revision| !revision.is_empty())
+            .ok_or(
+                "ticket adapter omitted the current revision required for guarded Done publication",
+            )?;
+        let currently_in_progress =
+            current.ticket.status.value == NormalizedTicketStatus::InProgress;
+        if !currently_in_progress
+            || payload.expected_external_revision.as_deref() == Some(current_revision)
+        {
+            return Ok(EffectObservation::Pending { receipt: "Done status publication remains unresolved; external ticket is not an adoptable changed In Progress revision".into() });
+        }
+        let proof = context
+            .store
+            .ticket_completion_proof(
+                context.owner_generation,
+                &payload.project_id,
+                &payload.ticket_run_id,
+                payload.ticket_run_revision.saturating_sub(1),
+            )?
+            .ok_or("Done status adoption requires the validated completion and Postmortem proof")?;
+        let Some(project) = context.store.project(&payload.project_id)? else {
+            return Err("Done status adoption Project is missing".into());
+        };
+        let identity = serde_json::to_vec(&(
+            &request.intent.operation_id,
+            &payload.project_id,
+            &payload.ticket_run_id,
+            payload.ticket_run_revision,
+            current_revision,
+            &project.config_digest,
+            proof.plan_digest(),
+            proof.postmortem_receipt_digest(),
+            proof.knowledge_manifest_digest(),
+        ))
+        .map_err(|error| error.to_string())?;
+        let stable_hex = format!("{:x}", Sha256::digest(identity));
+        let request_stable = format!("ticket-status-adoption-{}", &stable_hex[..32]);
+        let human_request_id = crate::domain::ids::HumanRequestId::parse(request_stable)?;
+        let expires_at = u64::try_from(context.now_unix)
+            .map_err(|_| "controller time is before Unix epoch")?
+            .saturating_add(7 * 24 * 60 * 60);
+        let authority = crate::human_runtime::TicketStatusAdoptionAuthority {
+            project_id: payload.project_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            ticket_run_revision: payload.ticket_run_revision,
+            namespace: payload.namespace.clone(),
+            ticket_id: payload.ticket_id.clone(),
+            original_effect_id: request.intent.operation_id.clone(),
+            previous_external_revision: payload.expected_external_revision.clone(),
+            current_ticket_json: serde_json::to_string(&current)
+                .map_err(|error| error.to_string())?,
+            completion_plan_digest: proof.plan_digest().clone(),
+            postmortem_receipt_digest: proof.postmortem_receipt_digest().clone(),
+            knowledge_operation_id: proof.knowledge_operation_id().to_owned(),
+            knowledge_manifest_digest: proof.knowledge_manifest_digest().clone(),
+            configuration_digest: project.config_digest.clone(),
+            policy_digest: crate::human_runtime::ticket_status_adoption_policy_digest(
+                &payload.project_id,
+                &payload.ticket_id,
+                &project.config_digest,
+            )?,
+            expires_at_unix: expires_at,
+        };
+        let human_request = crate::human_runtime::ticket_status_adoption_request(
+            human_request_id.clone(),
+            authority.clone(),
+        )?;
+        let logical_key = format!("ticket-status-adoption:{}", human_request_id.as_str());
+        if let Some(existing) = context.store.current_human_request(&human_request_id)? {
+            // Expiry is assigned once; every replay must still prove the full exact snapshot.
+            let replay_authority = crate::human_runtime::TicketStatusAdoptionAuthority {
+                expires_at_unix: existing.request.expires_at_unix,
+                ..authority.clone()
+            };
+            let replay_request = crate::human_runtime::ticket_status_adoption_request(
+                human_request_id.clone(),
+                replay_authority,
+            )?;
+            if replay_request != existing.request {
+                return Err("stable ticket status adoption request changed content".into());
+            }
+            if let Some(approval) = context.store.accepted_ticket_status_adoption_approval(
+                &human_request_id,
+                u64::try_from(context.now_unix).unwrap_or(0),
+            )? {
+                let fresh = self
+                    .adapter
+                    .get(
+                        request_id("status-adoption-recheck")?,
+                        None,
+                        TicketGetRequest {
+                            scope: self.scope(payload)?,
+                            ticket_id: payload.ticket_id.as_str().into(),
+                            timeline_limit: Some(1),
+                        },
+                    )
+                    .map_err(adapter_error)?;
+                let fresh_json =
+                    serde_json::to_string(&fresh).map_err(|error| error.to_string())?;
+                if fresh_json != approval.authority().current_ticket_json {
+                    return Err(
+                        "external ticket changed after human status-adoption approval".into(),
+                    );
+                }
+                let replacement = context.store.adopt_done_ticket_status_revision(
+                    context.owner_generation,
+                    &request.intent,
+                    payload,
+                    &approval,
+                    &proof,
+                    context.now_unix,
+                )?;
+                return Ok(EffectObservation::Rejected { receipt: serde_json::json!({"outcome":"superseded_after_approved_revision_adoption","replacement_operation_id":replacement.operation_id,"approval_request_id":human_request_id.as_str()}).to_string() });
+            }
+            return Ok(EffectObservation::Pending {
+                receipt: format!(
+                    "awaiting explicit human approval for changed ticket revision: {}",
+                    human_request_id.as_str()
+                ),
+            });
+        }
+        let view_id = context
+            .store
+            .active_ticket_run_view_id(&payload.ticket_run_id)?
+            .ok_or("completed ticket has no active Rex view for status-adoption review")?;
+        let request = crate::human_runtime::HumanPresentationEffect {
+            request: human_request,
+            rex_view_id: view_id,
+            authority: Some(
+                crate::human_runtime::HumanAuthorityMaterial::TicketStatusAdoption {
+                    material: authority,
+                },
+            ),
+        };
+        let request_json = crate::store::canonical_json(&request)?;
+        let intent = EffectIntent {
+            project_id: payload.project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: payload.ticket_run_id.as_str().into(),
+            operation_id: format!("present-{}", human_request_id.as_str()),
+            logical_key,
+            kind: "request_human_review".into(),
+            request_digest: format!("{:x}", Sha256::digest(request_json.as_bytes())),
+            request_json,
+            expected_revision: Some(payload.ticket_run_revision),
+        };
+        context
+            .store
+            .enqueue_effect(context.owner_generation, &intent)?;
+        Ok(EffectObservation::Pending {
+            receipt: format!(
+                "awaiting explicit human approval for changed ticket revision: {}",
+                human_request_id.as_str()
+            ),
+        })
+    }
 }
 
 impl EffectHandler for PublishTicketStatusHandler {
@@ -120,6 +340,15 @@ impl EffectHandler for PublishTicketStatusHandler {
             || request.intent.project_id != payload.project_id
         {
             return Err("ticket status effect identity does not match its durable intent".into());
+        }
+        if mode == EffectMode::Reconcile
+            && payload.desired_status == TicketStatus::Done
+            && let Some(replacement) =
+                self.replacement_for_adopted_done(context, request, &payload)?
+        {
+            return Ok(EffectObservation::Rejected {
+                receipt: serde_json::json!({"outcome":"superseded_after_approved_revision_adoption","replacement_operation_id":replacement.operation_id}).to_string(),
+            });
         }
         context
             .store
@@ -145,6 +374,9 @@ impl EffectHandler for PublishTicketStatusHandler {
                     &payload.namespace,
                     &payload.ticket_id,
                 )?;
+                if current.ticket.scope != scope {
+                    return Err("ticket status publication observation is outside the configured Project scope".into());
+                }
                 if payload
                     .expected_external_revision
                     .as_deref()
@@ -198,6 +430,9 @@ impl EffectHandler for PublishTicketStatusHandler {
                     observation_applied(&result)
                 }
                 Lookup::Absent(proof) => Ok(EffectObservation::AuthoritativelyAbsent { proof }),
+                Lookup::Unknown(_receipt) if payload.desired_status == TicketStatus::Done => {
+                    self.reconcile_done_external_revision(request, &payload, scope, context)
+                }
                 Lookup::Unknown(receipt) => Ok(EffectObservation::Pending { receipt }),
             },
         }
@@ -963,7 +1198,48 @@ mod tests {
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{Digest, Revision};
     use crate::engine::reducer::Input;
+    use crate::human_runtime::{HumanSubjectObservation, HumanSubjectObserver};
     use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
+
+    struct FixedTicketSubjectObserver;
+
+    impl HumanSubjectObserver for FixedTicketSubjectObserver {
+        fn observe_current_subject(
+            &self,
+            _store: &crate::store::ConfigStore,
+            request: &crate::human_runtime::HumanRuntimeRequest,
+        ) -> Result<HumanSubjectObservation, String> {
+            Ok(HumanSubjectObservation::Current(request.subject.clone()))
+        }
+    }
+
+    struct FakeTicketStatusAdoptionSource {
+        adapter: Arc<FakeAdapter>,
+        scope: TicketScope,
+    }
+
+    impl crate::human_runtime::TicketStatusAdoptionSource for FakeTicketStatusAdoptionSource {
+        fn observe_ticket_status_adoption(
+            &self,
+            authority: &crate::human_runtime::TicketStatusAdoptionAuthority,
+        ) -> Result<Option<String>, String> {
+            let observed = self
+                .adapter
+                .get(
+                    request_id("test-status-adoption-observe")?,
+                    None,
+                    TicketGetRequest {
+                        scope: self.scope.clone(),
+                        ticket_id: authority.ticket_id.as_str().into(),
+                        timeline_limit: Some(1),
+                    },
+                )
+                .map_err(adapter_error)?;
+            serde_json::to_string(&observed)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+    }
 
     struct FakeAdapter {
         namespace: String,
@@ -971,6 +1247,7 @@ mod tests {
         operations: Mutex<Vec<OperationMatch>>,
         ticket: Mutex<NormalizedTicket>,
         fail_next_update: Mutex<bool>,
+        unknown_lookups: Mutex<bool>,
     }
 
     impl FakeAdapter {
@@ -985,6 +1262,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 operations: Mutex::new(Vec::new()),
                 fail_next_update: Mutex::new(false),
+                unknown_lookups: Mutex::new(false),
                 ticket: Mutex::new(NormalizedTicket {
                     ticket_namespace: namespace.into(),
                     scope,
@@ -1219,6 +1497,16 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>();
             if found.is_empty() {
+                if *self.unknown_lookups.lock().unwrap() {
+                    return Ok(OperationLookup {
+                        ticket_namespace: self.namespace.clone(),
+                        outcome: ReconciliationOutcome::Unknown,
+                        match_basis: None,
+                        reason: Some("fixture cannot establish remote operation visibility".into()),
+                        matches: vec![],
+                        proof: None,
+                    });
+                }
                 Ok(OperationLookup {
                     ticket_namespace: self.namespace.clone(),
                     outcome: ReconciliationOutcome::Absent,
@@ -1856,6 +2144,23 @@ mod tests {
     }
     #[test]
     fn manual_knowledge_intent_completes_and_publishes_external_done() {
+        manual_knowledge_intent_completion_status_flow(false, false);
+    }
+
+    #[test]
+    fn uncertain_done_status_adopts_exact_external_revision_and_replays_child() {
+        manual_knowledge_intent_completion_status_flow(true, false);
+    }
+
+    #[test]
+    fn ticket_status_adoption_rejects_project_config_changed_after_approval() {
+        manual_knowledge_intent_completion_status_flow(true, true);
+    }
+
+    fn manual_knowledge_intent_completion_status_flow(
+        adopt_external_revision: bool,
+        change_config_after_approval: bool,
+    ) {
         use crate::knowledge::PostmortemInput;
         use crate::knowledge_effect::KnowledgeEffectHandler;
         use crate::store::EffectOutcome;
@@ -1876,6 +2181,15 @@ mod tests {
                 "In Progress",
             )
             .unwrap();
+        if adopt_external_revision {
+            rusqlite::Connection::open(temp.path().join("state.sqlite3"))
+                .unwrap()
+                .execute(
+                    "UPDATE ticket_runs SET external_revision='revision-73' WHERE project_id=?1 AND ticket_run_id=?2",
+                    rusqlite::params![project.as_str(), run.as_str()],
+                )
+                .unwrap();
+        }
 
         let applied_snapshot = store.load_snapshot("factory").unwrap().unwrap();
         let applied = applied_snapshot.config;
@@ -2056,23 +2370,227 @@ mod tests {
             adapter.clone(),
             BTreeMap::from([(project.clone(), scope())]),
         );
+        if !adopt_external_revision {
+            let status = status_handler
+                .handle(EffectMode::Submit, &status_request, &mut context)
+                .unwrap();
+            assert!(matches!(status, EffectObservation::Applied { .. }));
+            assert_eq!(
+                adapter.ticket.lock().unwrap().status.value,
+                NormalizedTicketStatus::Done
+            );
+            return;
+        }
+        // The external ticket was changed after its initial Ready revision, while the old Done
+        // status intent still carries that original revision. Operation lookup is inconclusive.
+        adapter.ticket.lock().unwrap().revision = Some("revision-74".into());
+        *adapter.unknown_lookups.lock().unwrap() = true;
+        let view = crate::launch::RexView {
+            view_id: crate::launch::RexView::derive_id(
+                &project,
+                crate::launch::RexViewKind::Ticket,
+                Some(namespace.as_str()),
+                Some(ticket.as_str()),
+                1,
+            )
+            .unwrap(),
+            project_id: project.clone(),
+            kind: crate::launch::RexViewKind::Ticket,
+            ticket_namespace: Some(namespace.as_str().into()),
+            ticket_id: Some(ticket.as_str().into()),
+            view_epoch: 1,
+            rex_server_identity: "test-server".into(),
+            rex_session_id: "test-session".into(),
+            rex_window_id: "ticket-window".into(),
+        };
+        context.store.register_rex_view(owner, &view).unwrap();
+        let waiting = status_handler
+            .handle(EffectMode::Reconcile, &status_request, &mut context)
+            .unwrap();
+        assert!(matches!(waiting, EffectObservation::Pending { .. }));
+        let presentation = context
+            .store
+            .claim_next_due_effect(owner, i64::MAX, &["request_human_review".into()])
+            .unwrap()
+            .unwrap();
+        let presentation_request = EffectRequest {
+            intent: presentation.intent.clone(),
+            attempt_count: presentation.attempt_count,
+            created_at_unix: presentation.created_at_unix,
+        };
+        let human_effect: crate::human_runtime::HumanPresentationEffect =
+            crate::protocol::parse_unique(presentation.intent.request_json.as_bytes()).unwrap();
+        let human_request = human_effect.request.clone();
+        let presenter = crate::human_runtime::HumanPresenterEffectHandler::new(
+            "local_html",
+            vec!["/usr/bin/true".into()],
+            [(
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from("/usr/bin"),
+            )]
+            .into_iter()
+            .collect(),
+            temp.path().join("review-artifacts"),
+            Arc::new(FixedTicketSubjectObserver),
+        )
+        .unwrap();
+        assert!(matches!(
+            presenter
+                .handle(EffectMode::Submit, &presentation_request, &mut context)
+                .unwrap(),
+            EffectObservation::Pending { .. }
+        ));
+        let response = crate::human_runtime::HumanDecisionIntent {
+            request_id: human_request.request_id.clone(),
+            response_id: "ticket-status-adoption-approve".into(),
+            expected_subject_digest: human_request.subject.digest().unwrap(),
+            choice: crate::human_runtime::HumanDecisionChoice::Approve,
+            explanation: Some("Reviewed the exact current ticket and completion evidence.".into()),
+        };
+        crate::store::ConfigStore::enqueue_human_decision(temp.path(), &response, 12).unwrap();
+        let adoption_observer =
+            crate::human_runtime::DurableHumanSubjectObserver::new(temp.path().join("profiles"))
+                .unwrap()
+                .with_ticket_status_adoption_source(Arc::new(FakeTicketStatusAdoptionSource {
+                    adapter: adapter.clone(),
+                    scope: scope(),
+                }));
+        crate::human_runtime::process_queued_human_responses(
+            context.store,
+            owner,
+            8,
+            13,
+            |store, request| {
+                crate::human_runtime::HumanSubjectObserver::observe_current_subject(
+                    &adoption_observer,
+                    store,
+                    request,
+                )
+            },
+        )
+        .unwrap();
+        let accepted = context
+            .store
+            .accepted_ticket_status_adoption_approval(&human_request.request_id, 14)
+            .unwrap()
+            .expect("public queued approval is accepted after fresh ticket re-observation");
+        assert_eq!(
+            accepted.authority().current_ticket_json,
+            serde_json::to_string(&crate::adapters::tickets::TicketGetResult {
+                ticket_namespace: namespace.as_str().into(),
+                ticket: adapter.ticket.lock().unwrap().clone(),
+                timeline: vec![],
+            })
+            .unwrap()
+        );
+        let child_key = format!("{}:adopted_done", status_request.intent.logical_key);
+        if change_config_after_approval {
+            let mut changed_snapshot = context.store.load_snapshot("factory").unwrap().unwrap();
+            changed_snapshot.config.digest = Digest::parse("c".repeat(64)).unwrap();
+            changed_snapshot.config.source_files[0].contents = "changed config".into();
+            changed_snapshot.config.source_files[0].bytes = "changed config".len() as u64;
+            changed_snapshot.config.source_files[0].sha256 = Digest::parse("d".repeat(64)).unwrap();
+            let changed = context
+                .store
+                .apply_snapshot(
+                    "factory",
+                    &changed_snapshot.config,
+                    crate::store::ExpectedRevision::Current(changed_snapshot.revision),
+                )
+                .unwrap();
+            rusqlite::Connection::open(temp.path().join("state.sqlite3"))
+                .unwrap()
+                .execute(
+                    "UPDATE projects SET config_revision=?1,config_digest=?2 WHERE project_id=?3",
+                    rusqlite::params![
+                        changed.revision.0,
+                        changed.digest.as_str(),
+                        project.as_str()
+                    ],
+                )
+                .unwrap();
+            let payload: crate::engine::ticket_effects::PublishTicketStatus =
+                crate::protocol::parse_unique(status_request.intent.request_json.as_bytes())
+                    .unwrap();
+            let proof = context
+                .store
+                .ticket_completion_proof(owner, &project, &run, payload.ticket_run_revision - 1)
+                .unwrap()
+                .unwrap();
+            assert!(
+                context
+                    .store
+                    .adopt_done_ticket_status_revision(
+                        owner,
+                        &status_request.intent,
+                        &payload,
+                        &accepted,
+                        &proof,
+                        15,
+                    )
+                    .unwrap_err()
+                    .contains("Project configuration changed during ticket status adoption")
+            );
+            let saved_revision: String = rusqlite::Connection::open(temp.path().join("state.sqlite3"))
+                .unwrap().query_row(
+                    "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                    rusqlite::params![project.as_str(), run.as_str()], |row| row.get(0),
+                ).unwrap();
+            assert_eq!(saved_revision, "revision-73");
+            assert!(
+                context
+                    .store
+                    .effect_by_logical_key(&child_key)
+                    .unwrap()
+                    .is_none()
+            );
+            return;
+        }
+        let adopted = status_handler
+            .handle(EffectMode::Reconcile, &status_request, &mut context)
+            .unwrap();
+        assert!(matches!(adopted, EffectObservation::Rejected { .. }));
+        let child = context
+            .store
+            .effect_by_logical_key(&child_key)
+            .unwrap()
+            .expect("approved adoption creates a replacement");
+        let replay = status_handler
+            .handle(EffectMode::Reconcile, &status_request, &mut context)
+            .unwrap();
+        assert!(matches!(replay, EffectObservation::Rejected { .. }));
+        assert_eq!(
+            context.store.effect_by_logical_key(&child_key).unwrap(),
+            Some(child.clone())
+        );
+        let replacement = context
+            .store
+            .claim_next_due_effect(owner, i64::MAX, &["publish_ticket_status".into()])
+            .unwrap()
+            .expect("replacement status intent is durable");
+        let replacement_request = EffectRequest {
+            intent: replacement.intent.clone(),
+            attempt_count: replacement.attempt_count,
+            created_at_unix: replacement.created_at_unix,
+        };
         let status = status_handler
-            .handle(EffectMode::Submit, &status_request, &mut context)
+            .handle(EffectMode::Submit, &replacement_request, &mut context)
             .unwrap();
         assert!(matches!(status, EffectObservation::Applied { .. }));
         assert_eq!(
             adapter.ticket.lock().unwrap().status.value,
             NormalizedTicketStatus::Done
         );
-        context
-            .store
-            .finish_effect(
-                &status_effect.intent.operation_id,
-                owner,
-                EffectOutcome::Succeeded,
-                Some("external ticket status is Done"),
-            )
-            .unwrap();
+        assert_eq!(
+            adapter
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| **call == "update")
+                .count(),
+            1
+        );
     }
     #[test]
     fn knowledge_publication_then_completion_effect_publishes_external_done() {

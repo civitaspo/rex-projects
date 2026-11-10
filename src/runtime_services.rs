@@ -30,6 +30,45 @@ use crate::store::scheduler::{ObservedTicket, TicketScanKey};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+struct RuntimeTicketStatusAdoptionSource {
+    adapter: Arc<dyn TicketAdapter>,
+    scopes: BTreeMap<crate::domain::ids::ProjectId, TicketScope>,
+}
+
+impl crate::human_runtime::TicketStatusAdoptionSource for RuntimeTicketStatusAdoptionSource {
+    fn observe_ticket_status_adoption(
+        &self,
+        authority: &crate::human_runtime::TicketStatusAdoptionAuthority,
+    ) -> Result<Option<String>, String> {
+        let Some(scope) = self.scopes.get(&authority.project_id).cloned() else {
+            return Ok(None);
+        };
+        let observed = self
+            .adapter
+            .get(
+                RequestId::new(format!(
+                    "rex-projects-status-adoption-{}",
+                    REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ))?,
+                None,
+                TicketGetRequest {
+                    scope,
+                    ticket_id: authority.ticket_id.as_str().to_owned(),
+                    timeline_limit: Some(1),
+                },
+            )
+            .map_err(|error| format!("ticket status adoption re-observation failed: {error}"))?;
+        if observed.ticket.scope != self.scopes[&authority.project_id] {
+            return Err(
+                "ticket adapter returned a ticket outside the configured Project scope".into(),
+            );
+        }
+        serde_json::to_string(&observed)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
 pub(crate) mod merge;
 
 struct PreparedWorkerContext {
@@ -524,7 +563,7 @@ impl RuntimeServices {
         handlers.extend(
             crate::engine::ticket_effect_handlers::TicketEffectHandlers::new(
                 tickets.clone(),
-                scopes,
+                scopes.clone(),
             )
             .into_handlers(),
         );
@@ -552,7 +591,10 @@ impl RuntimeServices {
                     delivery.shared_effects(),
                     merge_source.clone(),
                     delivery.publication_adoption_source(),
-                )?;
+                )?.with_ticket_status_adoption_source(Arc::new(RuntimeTicketStatusAdoptionSource {
+                    adapter: tickets.clone(),
+                    scopes: scopes.clone(),
+                }));
             handlers.push(Box::new(
                 crate::human_runtime::HumanPresenterEffectHandler::new(
                     &human.kind,
@@ -654,6 +696,36 @@ impl RuntimeServices {
     fn request_id(&self, purpose: &str) -> Result<RequestId, String> {
         let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         RequestId::new(format!("rex-projects-{purpose}-{sequence}"))
+    }
+
+    fn ticket_status_adoption_source(
+        &self,
+    ) -> Result<Arc<dyn crate::human_runtime::TicketStatusAdoptionSource>, String> {
+        let scopes = self
+            .config
+            .projects
+            .iter()
+            .map(|(project_id, project)| {
+                let values = project
+                    .ticket_scope
+                    .iter()
+                    .map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), value.to_owned()))
+                            .ok_or_else(|| format!("ticket scope `{key}` must be a string"))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                Ok((
+                    project_id.clone(),
+                    TicketScope::new(values).map_err(|error| error.to_string())?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        Ok(Arc::new(RuntimeTicketStatusAdoptionSource {
+            adapter: self.tickets.clone(),
+            scopes,
+        }))
     }
 
     pub fn configuration_digest(&self) -> &Digest {
@@ -2116,7 +2188,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             self.delivery.shared_effects(),
             source,
             self.delivery.publication_adoption_source(),
-        )?;
+        )?.with_ticket_status_adoption_source(self.ticket_status_adoption_source()?);
         let now =
             u64::try_from(now_unix).map_err(|_| "controller clock is before the Unix epoch")?;
         for queued in store.pending_human_decisions(owner_generation, 64)? {

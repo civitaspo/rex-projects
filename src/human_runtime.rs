@@ -647,6 +647,13 @@ pub trait PublicationAdoptionSource: Send + Sync {
     ) -> Result<Option<crate::delivery_runtime::RepositoryPublicationObservation>, String>;
 }
 
+pub trait TicketStatusAdoptionSource: Send + Sync {
+    fn observe_ticket_status_adoption(
+        &self,
+        authority: &TicketStatusAdoptionAuthority,
+    ) -> Result<Option<String>, String>;
+}
+
 /// Re-observes the complete current merge subject and its host-derived gates before a queued
 /// human merge decision is accepted. Returning an error leaves the response pending for retry.
 pub trait MergeWorkReviewSource: Send + Sync {
@@ -676,6 +683,7 @@ pub struct DurableHumanSubjectObserver {
     owner_generation: Option<u64>,
     publication_source: Option<std::sync::Arc<dyn PublicationAdoptionSource>>,
     merge_work_source: Option<std::sync::Arc<dyn MergeWorkReviewSource>>,
+    ticket_status_adoption_source: Option<std::sync::Arc<dyn TicketStatusAdoptionSource>>,
 }
 
 impl DurableHumanSubjectObserver {
@@ -689,6 +697,7 @@ impl DurableHumanSubjectObserver {
             owner_generation: None,
             publication_source: None,
             merge_work_source: None,
+            ticket_status_adoption_source: None,
         })
     }
 
@@ -706,6 +715,7 @@ impl DurableHumanSubjectObserver {
             owner_generation: Some(owner_generation),
             publication_source: None,
             merge_work_source: None,
+            ticket_status_adoption_source: None,
         })
     }
 
@@ -723,6 +733,7 @@ impl DurableHumanSubjectObserver {
             owner_generation: Some(owner_generation),
             publication_source: Some(publication_source),
             merge_work_source: None,
+            ticket_status_adoption_source: None,
         })
     }
 
@@ -741,6 +752,7 @@ impl DurableHumanSubjectObserver {
             owner_generation: Some(owner_generation),
             publication_source: None,
             merge_work_source: Some(merge_work_source),
+            ticket_status_adoption_source: None,
         })
     }
 
@@ -760,7 +772,16 @@ impl DurableHumanSubjectObserver {
             owner_generation: Some(owner_generation),
             publication_source: Some(publication_source),
             merge_work_source: Some(merge_work_source),
+            ticket_status_adoption_source: None,
         })
+    }
+
+    pub fn with_ticket_status_adoption_source(
+        mut self,
+        source: std::sync::Arc<dyn TicketStatusAdoptionSource>,
+    ) -> Self {
+        self.ticket_status_adoption_source = Some(source);
+        self
     }
 }
 
@@ -780,6 +801,20 @@ impl HumanSubjectObserver for DurableHumanSubjectObserver {
             | HumanPurpose::CoordinatorClarification
             | HumanPurpose::GoalCompletion => observe_typed_role_authority(store, request),
             HumanPurpose::PublicationAdoption => {
+                if matches!(
+                    store.human_request_authority(&request.request_id)?,
+                    Some(HumanAuthorityMaterial::TicketStatusAdoption { .. })
+                ) {
+                    return match &self.ticket_status_adoption_source {
+                        Some(source) => {
+                            observe_ticket_status_adoption_subject(store, request, source.as_ref())
+                        }
+                        None => Err(
+                            "ticket status adoption requires the configured fresh ticket observer"
+                                .into(),
+                        ),
+                    };
+                }
                 match (&self.publication_source, self.owner_generation) {
                     (Some(source), Some(generation)) => observe_publication_adoption_subject(
                         store,
@@ -815,6 +850,76 @@ impl HumanSubjectObserver for DurableHumanSubjectObserver {
             )),
         }
     }
+}
+
+fn observe_ticket_status_adoption_subject(
+    store: &crate::store::ConfigStore,
+    request: &HumanRuntimeRequest,
+    source: &dyn TicketStatusAdoptionSource,
+) -> Result<HumanSubjectObservation, String> {
+    let Some(HumanAuthorityMaterial::TicketStatusAdoption { material }) =
+        store.human_request_authority(&request.request_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "ticket status adoption authority is no longer available".into(),
+        ));
+    };
+    let Some(project) = store.project(&material.project_id)? else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project for this ticket status adoption no longer exists".into(),
+        ));
+    };
+    let Some(snapshot) = store.load_snapshot(&project.config_source)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if snapshot.revision != project.config_revision
+        || snapshot.config.digest != project.config_digest
+        || snapshot.config.digest != material.configuration_digest
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the Project configuration changed after ticket status adoption was prepared".into(),
+        ));
+    }
+    if ticket_status_adoption_policy_digest(
+        &material.project_id,
+        &material.ticket_id,
+        &snapshot.config.digest,
+    )? != material.policy_digest
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "ticket status adoption policy changed".into(),
+        ));
+    }
+    let Some((project_id, run_revision, phase, _)) =
+        store.current_ticket_human_scope(&material.ticket_run_id)?
+    else {
+        return Ok(HumanSubjectObservation::Gone(
+            "the completed TicketRun no longer exists".into(),
+        ));
+    };
+    if project_id != material.project_id
+        || run_revision != material.ticket_run_revision
+        || phase != "done"
+    {
+        return Ok(HumanSubjectObservation::Gone(
+            "the TicketRun is no longer the exact completed revision".into(),
+        ));
+    }
+    let Some(current_json) = source.observe_ticket_status_adoption(&material)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
+    if current_json != material.current_ticket_json {
+        return Ok(HumanSubjectObservation::Gone(
+            "the external ticket snapshot changed after ticket status adoption was prepared".into(),
+        ));
+    }
+    let expected = ticket_status_adoption_request(request.request_id.clone(), material)?;
+    if expected != *request {
+        return Ok(HumanSubjectObservation::Gone(
+            "ticket status adoption scope, completion evidence, or policy changed".into(),
+        ));
+    }
+    Ok(HumanSubjectObservation::Current(expected.subject))
 }
 
 fn observe_merge_work_review_subject(
@@ -1142,7 +1247,8 @@ fn observe_typed_role_authority(
         HumanAuthorityMaterial::PlannerClarification { source, .. }
         | HumanAuthorityMaterial::CoordinatorClarification { source, .. }
         | HumanAuthorityMaterial::GoalCompletion { source, .. } => source,
-        HumanAuthorityMaterial::PublicationAdoption { .. } => {
+        HumanAuthorityMaterial::PublicationAdoption { .. }
+        | HumanAuthorityMaterial::TicketStatusAdoption { .. } => {
             return Ok(HumanSubjectObservation::Gone(
                 "publication adoption is not a Planner or goal decision".into(),
             ));
@@ -1254,6 +1360,7 @@ fn observe_typed_role_authority(
             }
         }
         HumanAuthorityMaterial::PublicationAdoption { .. }
+        | HumanAuthorityMaterial::TicketStatusAdoption { .. }
         | HumanAuthorityMaterial::MergeWorkReview { .. } => unreachable!("handled above"),
     }
     Ok(HumanSubjectObservation::Current(request.subject.clone()))
@@ -1300,9 +1407,164 @@ pub enum HumanAuthorityMaterial {
     PublicationAdoption {
         material: PublicationAdoptionAuthority,
     },
+    TicketStatusAdoption {
+        material: TicketStatusAdoptionAuthority,
+    },
     MergeWorkReview {
         work_item: Box<crate::store::merge_work::MergeWorkItem>,
     },
+}
+
+/// Exact ticket snapshot proposed for adopting a newer external revision before publishing Done.
+/// It is only authority to present a request; the configured ticket adapter must re-read the
+/// issue before a response is accepted and before the replacement status intent is queued.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketStatusAdoptionAuthority {
+    pub project_id: ProjectId,
+    pub ticket_run_id: TicketRunId,
+    pub ticket_run_revision: u64,
+    pub namespace: crate::domain::ids::TicketNamespace,
+    pub ticket_id: crate::domain::ids::TicketId,
+    pub original_effect_id: String,
+    pub previous_external_revision: Option<String>,
+    pub current_ticket_json: String,
+    pub completion_plan_digest: Digest,
+    pub postmortem_receipt_digest: Digest,
+    pub knowledge_operation_id: String,
+    pub knowledge_manifest_digest: Digest,
+    pub configuration_digest: Digest,
+    pub policy_digest: Digest,
+    pub expires_at_unix: u64,
+}
+
+impl TicketStatusAdoptionAuthority {
+    pub fn snapshot_digest(&self) -> Result<Digest, String> {
+        let snapshot: crate::adapters::tickets::TicketGetResult =
+            crate::protocol::parse_unique(self.current_ticket_json.as_bytes())?;
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+        if bytes != self.current_ticket_json.as_bytes() {
+            return Err("ticket status adoption snapshot is not canonical".into());
+        }
+        let mut material = b"rex-projects-ticket-status-adoption-v1\0".to_vec();
+        material.extend(bytes);
+        Digest::parse(hex(&Sha256::digest(material)))
+    }
+
+    pub fn material_digest(&self) -> Result<Digest, String> {
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_HUMAN_REQUEST_BYTES {
+            return Err(
+                "ticket status adoption evidence exceeds the human request size limit".into(),
+            );
+        }
+        Digest::parse(hex(&Sha256::digest(bytes)))
+    }
+
+    pub fn review_bundle(&self) -> Result<ReviewBundle, String> {
+        validate_ticket_status_adoption_authority(self)?;
+        let snapshot: crate::adapters::tickets::TicketGetResult =
+            crate::protocol::parse_unique(self.current_ticket_json.as_bytes())?;
+        let snapshot =
+            serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())?;
+        let bundle = ReviewBundle {
+            title: "Approve external ticket revision adoption".into(),
+            summary: format!("Ticket {} has changed externally while its completed TicketRun is ready to publish Done. Review the exact current ticket snapshot before allowing a conditional status update.", self.ticket_id),
+            risk: Some(crate::human::ReviewRisk {
+                rating: 3,
+                confidence: crate::human::RiskConfidence::High,
+                rationale: "Approval adopts one freshly re-observed external ticket revision for a Done update. The update remains conditional on that exact revision.".into(),
+                unresolved_gates: vec!["Confirm the ticket identity, current status, and revision are the intended target.".into()],
+            }),
+            repositories: Vec::new(),
+            evidence: vec![
+                ReviewEvidence { title: "Current external ticket snapshot".into(), body: snapshot, truncated: false },
+                ReviewEvidence { title: "Completion receipts".into(), body: format!("plan={}\npostmortem={}\nknowledge_operation={}\nknowledge_manifest={}", self.completion_plan_digest, self.postmortem_receipt_digest, self.knowledge_operation_id, self.knowledge_manifest_digest), truncated: false },
+            ],
+            unknowns: vec![format!("Original status effect: {}", self.original_effect_id), format!("Previously stored external revision: {}", self.previous_external_revision.as_deref().unwrap_or("<none>"))],
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
+}
+
+fn validate_ticket_status_adoption_authority(
+    authority: &TicketStatusAdoptionAuthority,
+) -> Result<(), String> {
+    let snapshot: crate::adapters::tickets::TicketGetResult =
+        crate::protocol::parse_unique(authority.current_ticket_json.as_bytes())?;
+    let ticket = &snapshot.ticket;
+    if authority.ticket_run_revision == 0
+        || authority.expires_at_unix == 0
+        || authority.original_effect_id.is_empty()
+        || authority.original_effect_id.len() > 255
+        || snapshot.ticket_namespace != authority.namespace.as_str()
+        || ticket.ticket_namespace != authority.namespace.as_str()
+        || ticket.id != authority.ticket_id.as_str()
+        || ticket.status.value != crate::adapters::tickets::NormalizedTicketStatus::InProgress
+        || ticket.revision.as_deref().is_none_or(str::is_empty)
+        || ticket.revision == authority.previous_external_revision
+        || authority.knowledge_operation_id.is_empty()
+    {
+        return Err(
+            "ticket status adoption authority is not a current in-progress ticket snapshot".into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn ticket_status_adoption_policy_digest(
+    project_id: &ProjectId,
+    ticket_id: &crate::domain::ids::TicketId,
+    configuration_digest: &Digest,
+) -> Result<Digest, String> {
+    let bytes = serde_json::to_vec(&(
+        "rex-projects-ticket-status-adoption-policy-v1",
+        project_id,
+        ticket_id,
+        configuration_digest,
+        crate::domain::types::TicketStatus::Done,
+        crate::domain::types::TicketStatus::InProgress,
+    ))
+    .map_err(|error| error.to_string())?;
+    Digest::parse(hex(&Sha256::digest(bytes)))
+}
+
+pub fn ticket_status_adoption_request(
+    request_id: HumanRequestId,
+    material: TicketStatusAdoptionAuthority,
+) -> Result<HumanRuntimeRequest, String> {
+    validate_ticket_status_adoption_authority(&material)?;
+    let review_bundle = material.review_bundle()?;
+    let subject = HumanSubjectBinding {
+        project_id: material.project_id.clone(),
+        kind: HumanSubjectKind::Publication,
+        subject_id: material.original_effect_id.clone(),
+        ticket_run_id: Some(material.ticket_run_id.clone()),
+        revision: Revision(material.ticket_run_revision),
+        material_digest: material.material_digest()?,
+        configuration_digest: material.configuration_digest.clone(),
+        policy_digest: material.policy_digest.clone(),
+        bundle_digest: review_bundle_digest(&review_bundle)?,
+    };
+    let request = HumanRuntimeRequest {
+        request_id,
+        purpose: HumanPurpose::PublicationAdoption,
+        subject,
+        question: format!(
+            "Adopt the current external revision of ticket {} for its Done status publication?",
+            material.ticket_id
+        ),
+        choices: vec![
+            HumanDecisionChoice::Approve,
+            HumanDecisionChoice::Refuse,
+            HumanDecisionChoice::Defer,
+        ],
+        expires_at_unix: material.expires_at_unix,
+        review_bundle,
+    };
+    request.validate(material.expires_at_unix.saturating_sub(1))?;
+    Ok(request)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1721,6 +1983,16 @@ impl HumanAuthorityMaterial {
             }
             return Ok(());
         }
+        if let Self::TicketStatusAdoption { material } = self {
+            if ticket_status_adoption_request(request.request_id.clone(), material.clone())?
+                != *request
+            {
+                return Err(
+                    "ticket status adoption authority does not match its human request".into(),
+                );
+            }
+            return Ok(());
+        }
         if let Self::MergeWorkReview { work_item } = self {
             if Self::build_merge_work_review_request(
                 request.request_id.clone(),
@@ -1848,7 +2120,9 @@ impl HumanAuthorityMaterial {
                     crate::domain::types::Role::Supervisor,
                 )
             }
-            Self::PublicationAdoption { .. } | Self::MergeWorkReview { .. } => {
+            Self::PublicationAdoption { .. }
+            | Self::TicketStatusAdoption { .. }
+            | Self::MergeWorkReview { .. } => {
                 unreachable!("handled above")
             }
         };
@@ -1918,6 +2192,7 @@ impl HumanAuthorityMaterial {
             | Self::CoordinatorClarification { source, .. }
             | Self::GoalCompletion { source, .. } => &source.binding,
             Self::PublicationAdoption { material } => return Ok(material.policy_digest.clone()),
+            Self::TicketStatusAdoption { material } => return Ok(material.policy_digest.clone()),
             Self::MergeWorkReview { work_item } => {
                 return Ok(work_item.document.authority.policy_digest.clone());
             }
@@ -1998,6 +2273,7 @@ impl HumanAuthorityMaterial {
                 ],
             },
             Self::PublicationAdoption { material } => material.review_bundle()?,
+            Self::TicketStatusAdoption { material } => material.review_bundle()?,
             Self::MergeWorkReview { work_item } => merge_work_review_bundle(work_item)?,
         };
         bundle.validate()?;
@@ -3197,5 +3473,75 @@ mod presenter_tests {
         ] {
             assert_eq!(review_risk_rating(risk_index), expected);
         }
+    }
+
+    #[test]
+    fn ticket_status_adoption_requires_exact_changed_in_progress_revision() {
+        let project_id = ProjectId::parse("payments").unwrap();
+        let namespace = crate::domain::ids::TicketNamespace::parse("fixture:workspace").unwrap();
+        let ticket_id = crate::domain::ids::TicketId::parse("PAY-50").unwrap();
+        let current = crate::adapters::tickets::TicketGetResult {
+            ticket_namespace: namespace.as_str().into(),
+            ticket: crate::adapters::tickets::NormalizedTicket {
+                ticket_namespace: namespace.as_str().into(),
+                scope: crate::adapters::tickets::TicketScope::new(
+                    std::collections::BTreeMap::from([("workspace".into(), "fixture".into())]),
+                )
+                .unwrap(),
+                id: ticket_id.as_str().into(),
+                key: None,
+                url: None,
+                revision: Some("revision-74".into()),
+                title: "Ticket 50".into(),
+                body: "Complete work".into(),
+                status: crate::adapters::tickets::TicketStatusValue {
+                    value: crate::adapters::tickets::NormalizedTicketStatus::InProgress,
+                    native_value: None,
+                    provider_id: None,
+                    label: None,
+                },
+                priority: None,
+                labels: vec![],
+                dependencies: vec![],
+                created_at: None,
+                updated_at: None,
+                extensions: Default::default(),
+            },
+            timeline: vec![],
+        };
+        let mut authority = TicketStatusAdoptionAuthority {
+            project_id: project_id.clone(),
+            ticket_run_id: TicketRunId::parse("run-50").unwrap(),
+            ticket_run_revision: 26,
+            namespace,
+            ticket_id,
+            original_effect_id: "done-status-op".into(),
+            previous_external_revision: Some("revision-73".into()),
+            current_ticket_json: serde_json::to_string(&current).unwrap(),
+            completion_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            postmortem_receipt_digest: Digest::parse("b".repeat(64)).unwrap(),
+            knowledge_operation_id: "knowledge-50".into(),
+            knowledge_manifest_digest: Digest::parse("c".repeat(64)).unwrap(),
+            configuration_digest: Digest::parse("d".repeat(64)).unwrap(),
+            policy_digest: ticket_status_adoption_policy_digest(
+                &project_id,
+                &crate::domain::ids::TicketId::parse("PAY-50").unwrap(),
+                &Digest::parse("d".repeat(64)).unwrap(),
+            )
+            .unwrap(),
+            expires_at_unix: 100,
+        };
+        let request = ticket_status_adoption_request(
+            HumanRequestId::parse("adopt-50").unwrap(),
+            authority.clone(),
+        )
+        .unwrap();
+        assert_eq!(request.purpose, HumanPurpose::PublicationAdoption);
+        assert!(request.review_bundle.summary.contains("PAY-50"));
+        authority.previous_external_revision = Some("revision-74".into());
+        assert!(
+            ticket_status_adoption_request(HumanRequestId::parse("adopt-50").unwrap(), authority)
+                .is_err()
+        );
     }
 }

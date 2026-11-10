@@ -1165,6 +1165,192 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Refresh the persisted ticket revision and enqueue one conditional Done status intent after
+    /// an exact, accepted human adoption of the current external ticket snapshot.
+    pub fn adopt_done_ticket_status_revision(
+        &mut self,
+        owner_generation: u64,
+        old_intent: &EffectIntent,
+        payload: &crate::engine::ticket_effects::PublishTicketStatus,
+        approval: &super::human::AcceptedTicketStatusAdoptionApproval,
+        proof: &crate::engine::ticket_effects::TicketCompletionProof,
+        now_unix: i64,
+    ) -> Result<EffectIntent, String> {
+        if payload.desired_status != TicketStatus::Done
+            || approval.receipt().request_id().as_str().is_empty()
+            || proof.project_id() != &payload.project_id
+            || proof.ticket_run_id() != &payload.ticket_run_id
+            || proof.expected_revision().checked_add(1) != Some(payload.ticket_run_revision)
+        {
+            return Err("ticket status adoption does not match a validated Done completion".into());
+        }
+        let authority = approval.authority();
+        if authority.project_id != payload.project_id
+            || authority.ticket_run_id != payload.ticket_run_id
+            || authority.ticket_run_revision != payload.ticket_run_revision
+            || authority.namespace != payload.namespace
+            || authority.ticket_id != payload.ticket_id
+            || authority.original_effect_id != old_intent.operation_id
+            || authority.previous_external_revision != payload.expected_external_revision
+            || authority.completion_plan_digest != *proof.plan_digest()
+            || authority.postmortem_receipt_digest != *proof.postmortem_receipt_digest()
+            || authority.knowledge_operation_id != proof.knowledge_operation_id()
+            || authority.knowledge_manifest_digest != *proof.knowledge_manifest_digest()
+            || authority.current_ticket_json.len() > crate::human_runtime::MAX_HUMAN_REQUEST_BYTES
+        {
+            return Err(
+                "accepted ticket status adoption does not match the original Done intent".into(),
+            );
+        }
+        let status_snapshot: crate::adapters::tickets::TicketGetResult =
+            crate::protocol::parse_unique(authority.current_ticket_json.as_bytes())?;
+        let current_external_revision = status_snapshot
+            .ticket
+            .revision
+            .as_deref()
+            .filter(|revision| !revision.is_empty() && revision.len() <= 512)
+            .ok_or("approved ticket snapshot requires a bounded external revision")?;
+        if status_snapshot.ticket.status.value
+            != crate::adapters::tickets::NormalizedTicketStatus::InProgress
+        {
+            return Err(
+                "approved ticket snapshot no longer identifies the observed in-progress revision"
+                    .into(),
+            );
+        }
+
+        let replacement_operation =
+            OperationId::parse(format!("{}-adopted-done", old_intent.operation_id))?;
+        let replacement_key = format!("{}:adopted_done", old_intent.logical_key);
+        let replacement_payload = crate::engine::ticket_effects::PublishTicketStatus {
+            schema_version: 1,
+            project_id: payload.project_id.clone(),
+            namespace: payload.namespace.clone(),
+            ticket_id: payload.ticket_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            ticket_run_revision: payload.ticket_run_revision,
+            expected_external_revision: Some(current_external_revision.to_owned()),
+            desired_status: TicketStatus::Done,
+            reason: "TicketRun completion status revision adopted by explicit human approval"
+                .into(),
+        };
+        replacement_payload.validate()?;
+        let request_json = serde_json::to_string(
+            &serde_json::to_value(&replacement_payload).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let replacement = EffectIntent {
+            project_id: payload.project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: payload.ticket_run_id.as_str().into(),
+            operation_id: replacement_operation.as_str().into(),
+            logical_key: replacement_key,
+            kind: "publish_ticket_status".into(),
+            request_digest: format!("{:x}", sha2::Sha256::digest(request_json.as_bytes())),
+            request_json,
+            expected_revision: Some(payload.ticket_run_revision),
+        };
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let old: Option<(EffectIntent, String)> = tx.query_row(
+            "SELECT request_json,status,kind,logical_key,expected_revision,subject_type,subject_id,request_digest FROM effects WHERE operation_id=?1 AND project_id=?2",
+            params![old_intent.operation_id, payload.project_id.as_str()],
+            |row| Ok((EffectIntent {
+                project_id: payload.project_id.clone(),
+                operation_id: old_intent.operation_id.clone(),
+                request_json: row.get(0)?,
+                kind: row.get(2)?,
+                logical_key: row.get(3)?,
+                expected_revision: row.get(4)?,
+                subject_type: row.get(5)?,
+                subject_id: row.get(6)?,
+                request_digest: row.get(7)?,
+            }, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((stored_old, old_state)) = old else {
+            return Err("original Done status effect is missing".into());
+        };
+        if &stored_old != old_intent
+            || !matches!(old_state.as_str(), "claimed" | "uncertain" | "pending")
+        {
+            return Err(
+                "original Done status effect changed while adoption was being applied".into(),
+            );
+        }
+        let run: Option<(String, u64, Option<String>, String)> = tx.query_row(
+            "SELECT internal_phase,revision,external_revision,config_digest FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+            params![payload.project_id.as_str(), payload.ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if !matches!(run, Some((ref phase, revision, ref ext, ref digest)) if phase == "done" && revision == payload.ticket_run_revision && ext == &payload.expected_external_revision && digest == authority.configuration_digest.as_str())
+        {
+            return Err(
+                "completed TicketRun or saved external revision changed during adoption".into(),
+            );
+        }
+        let project_configuration: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [payload.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(project_configuration, Some((revision, ref digest)) if digest == authority.configuration_digest.as_str() && revision > 0)
+        {
+            return Err("Project configuration changed during ticket status adoption".into());
+        }
+        if crate::human_runtime::ticket_status_adoption_policy_digest(
+            &payload.project_id,
+            &payload.ticket_id,
+            &authority.configuration_digest,
+        )? != authority.policy_digest
+        {
+            return Err(
+                "ticket status adoption policy changed before its replacement intent was queued"
+                    .into(),
+            );
+        }
+        let human_request: Option<(String, String, String, String)> = tx.query_row(
+            "SELECT lifecycle,subject_digest,configuration_digest,policy_digest FROM human_requests WHERE request_id=?1",
+            [approval.receipt().request_id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if !matches!(human_request, Some((ref lifecycle, ref digest, ref configuration, ref policy)) if lifecycle == "decided" && digest == approval.receipt().subject_digest().as_str() && configuration == approval.receipt().configuration_digest().as_str() && policy == approval.receipt().policy_digest().as_str())
+        {
+            return Err(
+                "ticket status adoption approval is no longer the accepted durable decision".into(),
+            );
+        }
+        let decision: Option<(String, i64, String, String, String)> = tx.query_row(
+            "SELECT choice,approved,subject_digest,configuration_digest,policy_digest FROM human_decisions WHERE response_id=?1 AND request_id=?2",
+            params![approval.receipt().response_id(), approval.receipt().request_id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if !matches!(decision, Some((ref choice, approved, ref subject, ref configuration, ref policy)) if choice == "approve" && approved == 1 && subject == approval.receipt().subject_digest().as_str() && configuration == approval.receipt().configuration_digest().as_str() && policy == approval.receipt().policy_digest().as_str())
+        {
+            return Err(
+                "ticket status adoption approval receipt changed before replacement enqueue".into(),
+            );
+        }
+        let changed = tx.execute(
+            "UPDATE ticket_runs SET external_revision=?1 WHERE project_id=?2 AND ticket_run_id=?3 AND revision=?4 AND internal_phase='done' AND external_revision IS ?5",
+            params![current_external_revision, payload.project_id.as_str(), payload.ticket_run_id.as_str(), payload.ticket_run_revision, payload.expected_external_revision],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(
+                "saved external ticket revision changed before adoption could commit".into(),
+            );
+        }
+        insert_effect(&tx, &replacement, now_unix)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(replacement)
+    }
+
     /// Produce the opaque final-completion proof only after the persisted operations gate and
     /// Postmortem publication receipts both validate for this exact TicketRun revision.
     pub fn ticket_completion_proof(
