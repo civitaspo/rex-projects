@@ -1,6 +1,6 @@
 //! GitHub REST adapter over the host's bounded `gh` process runner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -273,6 +273,84 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         })
     }
 
+    fn resolve_check_run_workflows(
+        &self,
+        repository: &RepositoryRef,
+        head_sha: &str,
+        check_runs: &mut [CheckRun],
+    ) -> Result<(), ForgeError> {
+        let mut counts = BTreeMap::<(Option<u64>, String, String), usize>::new();
+        for check in check_runs.iter() {
+            *counts
+                .entry((check.app_id, check.name.clone(), check.head_sha.clone()))
+                .or_default() += 1;
+        }
+        let colliding_actions_suites = check_runs
+            .iter()
+            .filter(|check| {
+                check.app_slug.as_deref() == Some("github-actions")
+                    && counts
+                        .get(&(check.app_id, check.name.clone(), check.head_sha.clone()))
+                        .is_some_and(|count| *count > 1)
+            })
+            .map(|check| {
+                check.check_suite_id.ok_or_else(|| {
+                    ForgeError("duplicate GitHub Actions check has no suite identity".into())
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+
+        let mut suite_workflows = BTreeMap::new();
+        for suite_id in colliding_actions_suites {
+            let (runs, _) = self.read_records(
+                repository,
+                &format!("actions/runs?head_sha={head_sha}&check_suite_id={suite_id}"),
+                Some("workflow_runs"),
+            )?;
+            let mut workflow_ids = BTreeSet::new();
+            for run in runs {
+                if string(&run, "head_sha")? != head_sha
+                    || number(&run, "check_suite_id")? != suite_id
+                {
+                    return Err(ForgeError(
+                        "GitHub Actions run did not match the requested check suite and head"
+                            .into(),
+                    ));
+                }
+                let workflow_id = number(&run, "workflow_id")?;
+                if workflow_id == 0 {
+                    return Err(ForgeError(
+                        "GitHub Actions run has an invalid workflow identity".into(),
+                    ));
+                }
+                workflow_ids.insert(workflow_id);
+            }
+            if workflow_ids.len() != 1 {
+                return Err(ForgeError(
+                    "GitHub Actions check suite has missing or ambiguous workflow lineage".into(),
+                ));
+            }
+            suite_workflows.insert(suite_id, *workflow_ids.first().unwrap());
+        }
+        for check in check_runs.iter_mut() {
+            if check.app_slug.as_deref() == Some("github-actions")
+                && counts
+                    .get(&(check.app_id, check.name.clone(), check.head_sha.clone()))
+                    .is_some_and(|count| *count > 1)
+            {
+                check.workflow_id = check
+                    .check_suite_id
+                    .and_then(|suite| suite_workflows.get(&suite).copied());
+                if check.workflow_id.is_none() {
+                    return Err(ForgeError(
+                        "GitHub Actions check run has unknown workflow lineage".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn unknown<T>(error: ForgeError) -> Observed<T> {
         Observed::Unknown { reason: error.0 }
     }
@@ -358,24 +436,36 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         repository: &RepositoryRef,
         base_ref: &str,
     ) -> Observed<BranchProtection> {
-        let result = path_component(base_ref)
-            .and_then(|branch| {
-                // An effective-rules response is required before using classic protection as
-                // an execution-time base guard. Rulesets can add force-push/deletion or bypass
-                // behavior that the classic endpoint does not report.
-                let rules = self.read_value(repository, &format!("rules/branches/{branch}"))?;
-                let rules = rules.as_array().ok_or_else(|| {
-                    ForgeError("effective repository rules are not a complete array".into())
-                })?;
-                if !rules.is_empty() {
-                    return Err(ForgeError(
-                        "active repository rules need a registered executor or human handling"
-                            .into(),
-                    ));
-                }
-                self.read_value(repository, &format!("branches/{branch}/protection"))
-            })
-            .and_then(parse_branch_protection);
+        let result = path_component(base_ref).and_then(|branch| {
+            // An effective-rules response is required before using classic protection as
+            // an execution-time base guard. Rulesets can add force-push/deletion or bypass
+            // behavior that the classic endpoint does not report.
+            let rules = self.read_value(repository, &format!("rules/branches/{branch}"))?;
+            let rules = rules.as_array().ok_or_else(|| {
+                ForgeError("effective repository rules are not a complete array".into())
+            })?;
+            if !rules.is_empty() {
+                return Err(ForgeError(
+                    "active repository rules need a registered executor or human handling".into(),
+                ));
+            }
+            let branch_identity = self.read_value(repository, &format!("branches/{branch}"))?;
+            let observed_name = string(&branch_identity, "name")?;
+            let protected = branch_identity
+                .get("protected")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ForgeError("branch protection state is unknown".into()))?;
+            if observed_name != base_ref {
+                return Err(ForgeError(
+                    "GitHub returned a different base branch identity".into(),
+                ));
+            }
+            if !protected {
+                return unprotected_branch_protection();
+            }
+            self.read_value(repository, &format!("branches/{branch}/protection"))
+                .and_then(parse_branch_protection)
+        });
         match result {
             Ok(value) => Self::observed(value.clone(), 1)
                 .expect("typed response serialization is infallible"),
@@ -585,12 +675,32 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             other => other,
         };
         let check_runs = match pr {
-            Some(pr) => self.observe_list(
+            Some(pr) => match self.read_records(
                 &pull.repository,
                 &format!("commits/{}/check-runs", pr.head_sha),
                 Some("check_runs"),
-                parse_check_run,
-            ),
+            ) {
+                Ok((values, pages)) => {
+                    let parsed = values
+                        .into_iter()
+                        .map(parse_check_run)
+                        .collect::<Result<Vec<_>, _>>()
+                        .and_then(|mut runs| {
+                            self.resolve_check_run_workflows(
+                                &pull.repository,
+                                &pr.head_sha,
+                                &mut runs,
+                            )?;
+                            Ok(runs)
+                        });
+                    match parsed {
+                        Ok(runs) => Self::observed(runs, pages)
+                            .expect("typed response serialization is infallible"),
+                        Err(error) => Self::unknown(error),
+                    }
+                }
+                Err(error) => Self::unknown(error),
+            },
             None => Self::unknown(ForgeError("pull request head is unknown".into())),
         };
         let statuses = match pr {
@@ -1107,6 +1217,16 @@ fn parse_check_run(value: Value) -> Result<CheckRun, ForgeError> {
             .get("app")
             .and_then(|v| v.get("id"))
             .and_then(Value::as_u64),
+        app_slug: value
+            .get("app")
+            .and_then(|v| v.get("slug"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        check_suite_id: value
+            .get("check_suite")
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_u64),
+        workflow_id: None,
     })
 }
 
@@ -1226,6 +1346,28 @@ fn parse_branch_protection(value: Value) -> Result<BranchProtection, ForgeError>
         allow_force_pushes,
         allow_deletions,
         digest,
+    })
+}
+
+fn unprotected_branch_protection() -> Result<BranchProtection, ForgeError> {
+    let mut normalized = BTreeMap::new();
+    normalized.insert("branch_protected".to_owned(), Value::Bool(false));
+    normalized.insert("strict".to_owned(), Value::Bool(false));
+    normalized.insert("required_check_contexts".to_owned(), serde_json::json!([]));
+    normalized.insert("required_approving_review_count".to_owned(), Value::Null);
+    normalized.insert("dismiss_stale_reviews".to_owned(), Value::Null);
+    normalized.insert("enforce_admins".to_owned(), Value::Bool(false));
+    normalized.insert("allow_force_pushes".to_owned(), Value::Bool(true));
+    normalized.insert("allow_deletions".to_owned(), Value::Bool(true));
+    Ok(BranchProtection {
+        strict_required_status_checks: false,
+        required_check_contexts: Vec::new(),
+        required_approving_review_count: None,
+        dismiss_stale_reviews: None,
+        enforce_admins: false,
+        allow_force_pushes: true,
+        allow_deletions: true,
+        digest: canonical_digest(&normalized)?,
     })
 }
 
@@ -1771,6 +1913,32 @@ mod tests {
     fn missing_protection_fields_are_unknown_not_disabled() {
         let error = parse_branch_protection(serde_json::json!({"required_status_checks": null}));
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn unprotected_branch_requires_exact_branch_identity_and_empty_effective_rules() {
+        let make_forge = |replies: Vec<Value>| fixture_forge_responses(replies);
+        let repository = &test_pull().repository;
+        let observed = make_forge(vec![
+            serde_json::json!([]),
+            serde_json::json!({"name":"prototype/first-ticket","protected":false}),
+        ])
+        .observe_protection(repository, "prototype/first-ticket");
+        let Observed::Complete { value, .. } = observed else {
+            panic!("confirmed unprotected branch should be complete");
+        };
+        assert!(!value.supports_execution_base_guard(&["ci".into()], None));
+
+        let wrong_branch = make_forge(vec![
+            serde_json::json!([]),
+            serde_json::json!({"name":"another-branch","protected":false}),
+        ])
+        .observe_protection(repository, "prototype/first-ticket");
+        assert!(matches!(wrong_branch, Observed::Unknown { .. }));
+
+        let active_rules = make_forge(vec![serde_json::json!([{"name":"ruleset"}])])
+            .observe_protection(repository, "prototype/first-ticket");
+        assert!(matches!(active_rules, Observed::Unknown { .. }));
     }
 
     #[test]

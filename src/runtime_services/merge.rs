@@ -1075,19 +1075,28 @@ fn host_gates(
             .iter()
             .filter(|row| row.context == *required && row.sha == pr.head_sha)
             .collect::<Vec<_>>();
+        let latest_checks = latest_check_runs(&check_rows);
+        let status_failed = status_rows.iter().any(|row| row.state != "success");
         let state = if check_rows.is_empty() && status_rows.is_empty() {
             EvidenceState::Unknown
-        } else if check_rows.iter().any(|row| {
-            row.status != "completed"
-                || !row
-                    .conclusion
-                    .as_deref()
-                    .is_some_and(|conclusion| allowed.contains(&conclusion))
-        }) || status_rows.iter().any(|row| row.state != "success")
-        {
+        } else if status_failed {
             EvidenceState::Fail
         } else {
-            EvidenceState::Pass
+            match latest_checks {
+                None => EvidenceState::Unknown,
+                Some(latest)
+                    if latest.iter().any(|row| {
+                        row.status != "completed"
+                            || !row
+                                .conclusion
+                                .as_deref()
+                                .is_some_and(|conclusion| allowed.contains(&conclusion))
+                    }) =>
+                {
+                    EvidenceState::Fail
+                }
+                Some(_) => EvidenceState::Pass,
+            }
         };
         gates.push(GateEvidence {
             key: format!("check:{required}"),
@@ -1140,6 +1149,57 @@ fn host_gates(
     });
     let _ = protection;
     Ok(gates)
+}
+
+/// Keep the latest run per GitHub Actions workflow for a required check. Check-run IDs are
+/// monotonically assigned by GitHub; older runs within one workflow are history. Distinct
+/// workflows remain separate evidence, and repeated non-Actions checks lack a safe lineage key.
+fn latest_check_runs<'a>(
+    rows: &[&'a crate::forge::CheckRun],
+) -> Option<Vec<&'a crate::forge::CheckRun>> {
+    let mut by_app = std::collections::BTreeMap::<u64, Vec<&'a crate::forge::CheckRun>>::new();
+    let mut missing_app = Vec::new();
+    for row in rows {
+        let Some(app_id) = row.app_id else {
+            missing_app.push(*row);
+            continue;
+        };
+        by_app.entry(app_id).or_default().push(*row);
+    }
+    if missing_app.len() > 1 || (!missing_app.is_empty() && !by_app.is_empty()) {
+        return None;
+    }
+    if missing_app.len() == 1 {
+        return Some(missing_app);
+    }
+    let mut latest = Vec::new();
+    for app_rows in by_app.into_values() {
+        if app_rows.len() == 1 {
+            latest.push(app_rows[0]);
+            continue;
+        }
+        if app_rows.iter().any(|row| {
+            row.app_slug.as_deref() != Some("github-actions") || row.workflow_id.is_none()
+        }) {
+            return None;
+        }
+        let mut by_workflow = std::collections::BTreeMap::<u64, &'a crate::forge::CheckRun>::new();
+        for row in app_rows {
+            let workflow_id = row.workflow_id?;
+            match by_workflow.get(&workflow_id) {
+                Some(current) if current.id == row.id && *current != row => return None,
+                Some(current) if current.id >= row.id => {}
+                _ => {
+                    by_workflow.insert(workflow_id, row);
+                }
+            }
+        }
+        if by_workflow.is_empty() || by_workflow.keys().any(|workflow_id| *workflow_id == 0) {
+            return None;
+        }
+        latest.extend(by_workflow.into_values());
+    }
+    Some(latest)
 }
 
 fn current_head_approval_gate(
@@ -1646,6 +1706,124 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn required_check_uses_latest_run_per_name_head_and_app_identity() {
+        let mut config: crate::config::Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let repo_id = crate::domain::ids::RepositoryId::parse("example").unwrap();
+        config
+            .repositories
+            .get_mut(&repo_id)
+            .unwrap()
+            .merge
+            .required_checks = vec!["ci".into()];
+
+        let gate = |check_runs: Vec<crate::forge::CheckRun>| {
+            let mut observed = host_observation_with_reviews(Vec::new());
+            observed.check_runs = complete(check_runs);
+            host_gates(
+                config.repositories.get(&repo_id).unwrap(),
+                &observed,
+                &test_pull_reference(),
+            )
+            .unwrap()
+            .into_iter()
+            .find(|gate| gate.key == "check:ci")
+            .unwrap()
+        };
+        let check = |id, status: &str, conclusion: Option<&str>, app_id, workflow_id| {
+            crate::forge::CheckRun {
+                id,
+                name: "ci".into(),
+                head_sha: "head".into(),
+                status: status.into(),
+                conclusion: conclusion.map(str::to_owned),
+                app_id,
+                app_slug: app_id.map(|_| "github-actions".to_owned()),
+                check_suite_id: Some(id),
+                workflow_id,
+            }
+        };
+
+        let historical_failure_then_success = gate(vec![
+            check(
+                10,
+                "completed",
+                Some("failure"),
+                Some(15368),
+                Some(405468936),
+            ),
+            check(
+                20,
+                "completed",
+                Some("success"),
+                Some(15368),
+                Some(405468936),
+            ),
+        ]);
+        assert_eq!(historical_failure_then_success.state, EvidenceState::Pass);
+
+        let latest_pending = gate(vec![
+            check(
+                10,
+                "completed",
+                Some("success"),
+                Some(15368),
+                Some(405468936),
+            ),
+            check(20, "in_progress", None, Some(15368), Some(405468936)),
+        ]);
+        assert_eq!(latest_pending.state, EvidenceState::Fail);
+
+        let ambiguous_missing_app = gate(vec![
+            check(10, "completed", Some("failure"), None, None),
+            check(20, "completed", Some("success"), None, None),
+        ]);
+        assert_eq!(ambiguous_missing_app.state, EvidenceState::Unknown);
+
+        let distinct_app_failure = gate(vec![
+            check(
+                10,
+                "completed",
+                Some("success"),
+                Some(15368),
+                Some(405468936),
+            ),
+            check(
+                20,
+                "completed",
+                Some("failure"),
+                Some(99999),
+                Some(405468936),
+            ),
+        ]);
+        assert_eq!(distinct_app_failure.state, EvidenceState::Fail);
+
+        let distinct_workflow_failure = gate(vec![
+            check(
+                10,
+                "completed",
+                Some("success"),
+                Some(15368),
+                Some(405468936),
+            ),
+            check(
+                20,
+                "completed",
+                Some("failure"),
+                Some(15368),
+                Some(405468937),
+            ),
+        ]);
+        assert_eq!(distinct_workflow_failure.state, EvidenceState::Fail);
+
+        let missing_workflow_lineage = gate(vec![
+            check(10, "completed", Some("failure"), Some(15368), None),
+            check(20, "completed", Some("success"), Some(15368), None),
+        ]);
+        assert_eq!(missing_workflow_lineage.state, EvidenceState::Unknown);
+    }
+
+    #[test]
     fn approval_gate_counts_only_distinct_latest_decisive_reviews_for_exact_head() {
         use crate::forge::Review;
 
@@ -1915,6 +2093,12 @@ pub(crate) mod tests {
             .unwrap()
             .merge
             .required_approvals = 2;
+        config
+            .repositories
+            .get_mut(&RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .merge
+            .required_checks = vec!["ci".into()];
         let worker_profile = crate::domain::ids::ProfileId::parse("worker_codex").unwrap();
         let applied = crate::config::AppliedConfig {
             config,
@@ -1956,7 +2140,12 @@ pub(crate) mod tests {
             json!({"id":7,"full_name":"team/example","default_branch":"main","allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}),
             json!({"node_id":"PR_42","number":42,"state":"open","draft":false,"merged":false,"head":{"sha":head_sha,"ref":"feature","repo":{"id":7}},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"body":body}),
             json!([]),
-            json!({"check_runs":[]}),
+            json!({"check_runs":[
+                {"id":129583564755_u64,"name":"ci","head_sha":head_sha,"status":"completed","conclusion":"failure","app":{"id":15368,"slug":"github-actions"},"check_suite":{"id":301}},
+                {"id":129584803208_u64,"name":"ci","head_sha":head_sha,"status":"completed","conclusion":"success","app":{"id":15368,"slug":"github-actions"},"check_suite":{"id":302}}
+            ]}),
+            json!({"total_count":1,"workflow_runs":[{"head_sha":head_sha,"check_suite_id":301,"workflow_id":405468936}]}),
+            json!({"total_count":1,"workflow_runs":[{"head_sha":head_sha,"check_suite_id":302,"workflow_id":405468936}]}),
             json!([]),
             json!([
                 {"id":1,"user":{"login":"alice"},"state":"APPROVED","commit_id":head_sha,"submitted_at":"2026-01-01T10:00:00Z"},
@@ -1966,6 +2155,7 @@ pub(crate) mod tests {
             json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
             json!([]),
             json!([]),
+            json!({"name":"main","protected":true}),
             json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
         ];
         let mut absent_body_responses = responses.clone();
@@ -1973,6 +2163,7 @@ pub(crate) mod tests {
         let runner = std::sync::Arc::new(FixtureRunner {
             replies: Mutex::new(
                 responses
+                    .clone()
                     .into_iter()
                     .map(|response| serde_json::to_vec(&response).unwrap())
                     .collect(),
@@ -2019,8 +2210,82 @@ pub(crate) mod tests {
                 .state,
             EvidenceState::Pass
         );
+        assert_eq!(
+            observation
+                .evidence
+                .gates
+                .iter()
+                .find(|gate| gate.key == "check:ci")
+                .unwrap()
+                .state,
+            EvidenceState::Pass
+        );
+        let mut missing_lineage_responses = responses.clone();
+        missing_lineage_responses[5] = json!({"total_count":0,"workflow_runs":[]});
+        let missing_lineage_runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(
+                missing_lineage_responses
+                    .into_iter()
+                    .map(|response| serde_json::to_vec(&response).unwrap())
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let missing_lineage_source = RuntimeMergeEvidenceSource::with_github_runner(
+            applied.clone(),
+            vec![binary_dir.clone()],
+            BTreeMap::new(),
+            missing_lineage_runner,
+        );
+        assert!(
+            missing_lineage_source
+                .observe_publication_subject(&publication_subject, &result.ingested)
+                .is_err()
+        );
+        let mut unprotected_responses = responses.clone();
+        unprotected_responses[12] = json!({"name":"main","protected":false});
+        let unprotected_runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(
+                unprotected_responses
+                    .into_iter()
+                    .map(|response| serde_json::to_vec(&response).unwrap())
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let unprotected_source = RuntimeMergeEvidenceSource::with_github_runner(
+            applied.clone(),
+            vec![binary_dir.clone()],
+            BTreeMap::new(),
+            unprotected_runner.clone(),
+        );
+        let unprotected_observation = unprotected_source
+            .observe_publication_subject(&publication_subject, &result.ingested)
+            .unwrap();
+        assert_eq!(
+            unprotected_observation.evidence.execution_time_base_guard,
+            EvidenceState::Unknown
+        );
+        let conservative = crate::merge_policy::evaluate_merge_policy(
+            &unprotected_observation.policy,
+            &unprotected_observation.evidence,
+        )
+        .unwrap();
+        assert_eq!(
+            conservative.disposition,
+            crate::merge_policy::MergeDisposition::HumanRequired
+        );
+        let unprotected_requests = unprotected_runner.requests.lock().unwrap();
+        assert_eq!(unprotected_requests.len(), 13);
+        assert!(unprotected_requests.iter().any(|request| {
+            request
+                .args
+                .iter()
+                .any(|argument| argument == "repos/team/example/branches/main")
+        }));
+        drop(unprotected_requests);
         let requests = runner.requests.lock().unwrap();
-        assert_eq!(requests.len(), 11);
+        assert_eq!(requests.len(), 14);
         let endpoint = |request: &crate::process::ProcessRequest| {
             let args = request
                 .args
@@ -2036,12 +2301,21 @@ pub(crate) mod tests {
             "repos/team/example/pulls/42",
             "repos/team/example/pulls/42/files",
             &format!("repos/team/example/commits/{}/check-runs", "a".repeat(40)),
+            &format!(
+                "repos/team/example/actions/runs?head_sha={}&check_suite_id=301",
+                "a".repeat(40)
+            ),
+            &format!(
+                "repos/team/example/actions/runs?head_sha={}&check_suite_id=302",
+                "a".repeat(40)
+            ),
             &format!("repos/team/example/commits/{}/statuses", "a".repeat(40)),
             "repos/team/example/pulls/42/reviews",
             "repos/team/example/pulls/42/comments",
             "graphql",
             "repos/team/example/issues/42/comments",
             "repos/team/example/rules/branches/main",
+            "repos/team/example/branches/main",
             "repos/team/example/branches/main/protection",
         ] {
             assert!(
