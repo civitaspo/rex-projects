@@ -2416,14 +2416,20 @@ impl FixtureMessageExt for Value {
     }
 }
 
-fn config_text(request: &Request<'_>, executable: &Path, _native_stage: bool) -> String {
+fn config_text(request: &Request<'_>, executable: &Path, native_stage: bool) -> String {
     let db = request.fixture_root.join("tickets.sqlite");
+    let native_runtime_limits = if native_stage {
+        "max_blocks_per_tab = 2\ncompleted_blocks_to_keep = 0\n"
+    } else {
+        ""
+    };
     format!(
         r#"schema_version = 1
 state_root = {:?}
 
 [runtime]
 rex_binary = {:?}
+{}
 external_poll_seconds = 1
 [runtime.environment]
 source = "inherit"
@@ -2487,6 +2493,7 @@ command = [{:?}, "fixture", "operations", "--state-dir", {:?}, "--observe-status
 "#,
         request.fixture_root.join("state").display().to_string(),
         request.rex.display().to_string(),
+        native_runtime_limits,
         executable.display().to_string(),
         db.display().to_string(),
         executable.display().to_string(),
