@@ -1205,10 +1205,18 @@ impl ConfigStore {
                     .into(),
             );
         }
+        let mut prepared_nodes = prepared_nodes.into_values().collect::<Vec<_>>();
+        let mut base_refreshes = prepared_nodes
+            .iter()
+            .filter_map(|node| node.base_refresh.clone())
+            .collect::<Vec<_>>();
+        prepared_nodes.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
+        base_refreshes.sort_by(|left, right| left.branch.cmp(&right.branch));
         let prepared_receipt = PreparedWorktreesEffectReceipt {
             schema_version: 1,
             ticket_run_id: ticket_run_id.clone(),
-            work_nodes: prepared_nodes.into_values().collect(),
+            work_nodes: prepared_nodes,
+            base_refreshes,
         };
         let bindings = evidence["publication_receipts"]
             .as_array()
@@ -1480,6 +1488,17 @@ impl ConfigStore {
             PreparedWorkerContextPurpose::Launch => current_phase == "implementing",
             PreparedWorkerContextPurpose::PublicationObservation => {
                 matches!(current_phase.as_str(), "implementing" | "publishing")
+                    || (matches!(current_phase.as_str(), "planning" | "preparing")
+                        && self
+                            .ticket_run_transition_evidence(
+                                owner_generation,
+                                project_id,
+                                &ticket_run_id,
+                                0,
+                                256,
+                            )?
+                            .iter()
+                            .any(|(_, evidence)| evidence["kind"] == "merge_reassessment_required"))
             }
         };
         if !phase_is_allowed {

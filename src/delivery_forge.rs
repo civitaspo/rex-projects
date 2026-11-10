@@ -79,6 +79,16 @@ pub struct ObservedPullRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ObservedBranchSecurity {
+    pub repository_id: RepositoryId,
+    pub branch: String,
+    pub head_sha: String,
+    pub protected: bool,
+    pub digest: crate::domain::ids::Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedTimelineEntry {
     pub event: String,
     pub reference: String,
@@ -423,6 +433,54 @@ impl GitHubPullRequestPublisher {
             pull_requests: ObservationCapability::Known(pull_requests),
         })
     }
+
+    /// Read one exact GitHub branch identity and protection flag. The digest binds
+    /// a force-with-lease refresh to the provider response observed immediately
+    /// before the host rebase.
+    pub fn observe_branch_security(
+        &self,
+        repository_id: &RepositoryId,
+        clone_url: &str,
+        branch: &str,
+    ) -> Result<ObservedBranchSecurity, PublicationError> {
+        validate_branch(branch)?;
+        let (owner, repo) = github_repository(clone_url)?;
+        let encoded_branch = branch.replace('%', "%25").replace('/', "%2F");
+        let response: serde_json::Value = self.api_json(
+            "GET",
+            &format!("repos/{owner}/{repo}/branches/{encoded_branch}"),
+            None,
+        )?;
+        let observed_name = response
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| PublicationError::Unknown("branch response has no name".into()))?;
+        let head_sha = response
+            .get("commit")
+            .and_then(|commit| commit.get("sha"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| PublicationError::Unknown("branch response has no commit SHA".into()))?;
+        let protected = response
+            .get("protected")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                PublicationError::Unknown("branch response has no protection state".into())
+            })?;
+        if observed_name != branch || validate_sha(head_sha).is_err() {
+            return Err(PublicationError::Unknown(
+                "GitHub returned a different branch identity or invalid commit".into(),
+            ));
+        }
+        let digest = crate::forge::canonical_digest(&response)
+            .map_err(|error| PublicationError::Invalid(error.to_string()))?;
+        Ok(ObservedBranchSecurity {
+            repository_id: repository_id.clone(),
+            branch: branch.to_owned(),
+            head_sha: head_sha.to_owned(),
+            protected,
+            digest,
+        })
+    }
 }
 
 impl PullRequestPublisher for GitHubPullRequestPublisher {
@@ -703,12 +761,33 @@ impl GitHubPullRequestPublisher {
     }
 }
 
-fn marked_body(intent: &PullRequestPublicationIntent) -> String {
-    format!(
-        "{}\n\n{}",
-        intent.body.trim_end(),
-        operation_marker(&intent.operation_id)
-    )
+pub(crate) fn marked_body(intent: &PullRequestPublicationIntent) -> String {
+    let body = intent
+        .body
+        .lines()
+        .filter(|line| {
+            !(line.starts_with("<!-- rex-projects-operation:") && line.ends_with(" -->"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim_end();
+    let lines = body.lines().collect::<Vec<_>>();
+    let trailer_start = lines
+        .iter()
+        .rposition(|line| !line.starts_with("Co-authored-by:"))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let marker = operation_marker(&intent.operation_id);
+    if trailer_start == lines.len() {
+        return format!("{body}\n\n{marker}");
+    }
+    let prefix = lines[..trailer_start].join("\n").trim_end().to_owned();
+    let trailers = lines[trailer_start..].join("\n");
+    if prefix.is_empty() {
+        format!("{marker}\n\n{trailers}")
+    } else {
+        format!("{prefix}\n\n{marker}\n\n{trailers}")
+    }
 }
 
 fn operation_marker(operation_id: &OperationId) -> String {
@@ -779,6 +858,23 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn publication_marker_precedes_final_coauthor_trailers() {
+        let (_, _, mut intent) = fixture_publisher();
+        intent.body = "Feature details\n\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: Claude <noreply@anthropic.com>\n".into();
+        let body = marked_body(&intent);
+        let marker = operation_marker(&intent.operation_id);
+        assert!(body.ends_with("Co-authored-by: Codex <noreply@openai.com>\nCo-authored-by: Claude <noreply@anthropic.com>"));
+        assert!(body.find(&marker).unwrap() < body.find("Co-authored-by:").unwrap());
+        assert_eq!(
+            marked_body(&PullRequestPublicationIntent {
+                body: body.clone(),
+                ..intent
+            }),
+            body
+        );
+    }
 
     fn fixture_publisher() -> (
         tempfile::TempDir,

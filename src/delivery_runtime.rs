@@ -133,6 +133,7 @@ pub enum WorkerCommitSubmission {
 pub enum VerifiedCommit {
     Native { receipt: NativeCommitReceipt },
     Host { receipt: HostCommitReceipt },
+    BaseRefresh { receipt: StackRepairReceipt },
 }
 
 impl VerifiedCommit {
@@ -140,6 +141,7 @@ impl VerifiedCommit {
         match self {
             Self::Native { receipt } => &receipt.head,
             Self::Host { receipt } => &receipt.observed_head,
+            Self::BaseRefresh { receipt } => &receipt.new_child_head,
         }
     }
 }
@@ -308,6 +310,55 @@ impl RepositoryDelivery {
                     .into(),
             ));
         }
+        Ok(PreparedRepositoryWork {
+            identity,
+            repository,
+            worktree,
+            expected_base_sha: expected_base_sha.to_owned(),
+            commit_mode,
+        })
+    }
+
+    /// Reopen the exact stable worktree for a host-authorized base refresh. The
+    /// recorded old base must match; the caller separately proves the new base,
+    /// PR identity, source branch protection, and remote child lease.
+    pub fn prepare_worktree_for_base_refresh(
+        &self,
+        identity: WorkNodeIdentity,
+        repository_config: &RepositoryConfig,
+        expected_base_sha: &str,
+        recorded_base_sha: &str,
+        commit_mode: CommitMode,
+    ) -> Result<PreparedRepositoryWork, DeliveryError> {
+        if commit_mode == CommitMode::Auto {
+            return Err(DeliveryError::Invalid(
+                "resolve automatic commit mode before refreshing a worktree".into(),
+            ));
+        }
+        validate_git_sha(expected_base_sha)?;
+        validate_git_sha(recorded_base_sha)?;
+        let repository = self
+            .worktrees
+            .ensure_repository(&identity.repository_id, &repository_config.clone_url)
+            .map_err(DeliveryError::Worktree)?;
+        let worktree = self
+            .worktrees
+            .prepare_worktree(
+                &repository,
+                &repository_config.base_branch,
+                &identity.ticket_key()?,
+            )
+            .map_err(DeliveryError::Worktree)?;
+        if worktree.base_sha != recorded_base_sha && worktree.base_sha != expected_base_sha {
+            return Err(DeliveryError::Conflict(
+                "stable worktree base differs from its prior succeeded preparation receipt".into(),
+            ));
+        }
+        // Preserve the recorded old parent in the request passed to the
+        // idempotent repair operation. If a prior attempt already rebased the
+        // branch, the helper recognizes the exact resulting patch and lease.
+        let mut worktree = worktree;
+        worktree.base_sha = recorded_base_sha.to_owned();
         Ok(PreparedRepositoryWork {
             identity,
             repository,
@@ -1120,6 +1171,7 @@ impl RepositoryDelivery {
                 &worktree.path,
                 [
                     "rebase",
+                    "--gpg-sign",
                     "--onto",
                     request.new_parent_sha.as_str(),
                     request.old_parent_sha.as_str(),
@@ -1435,6 +1487,13 @@ pub enum WorkerDeliveryCommit {
         worker_reported_head: String,
         receipt: Box<CommitWorkerManifestEffectReceipt>,
     },
+    HostBaseRefresh {
+        prepare_operation_id: OperationId,
+        prepare_receipt_digest: Digest,
+        prior_publication_operation_id: OperationId,
+        prior_publication_receipt_digest: Digest,
+        receipt: Box<StackRepairReceipt>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1478,6 +1537,8 @@ pub struct PreparedWorktreesEffectReceipt {
     pub schema_version: u32,
     pub ticket_run_id: TicketRunId,
     pub work_nodes: Vec<PreparedWorktreeReceiptNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_refreshes: Vec<StackRepairReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1489,6 +1550,26 @@ pub struct PreparedWorktreeReceiptNode {
     pub branch: String,
     pub base_sha: String,
     pub commit_mode: CommitMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_refresh: Option<StackRepairReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_refresh_source: Option<BaseRefreshSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaseRefreshSource {
+    pub merge_work_id: Digest,
+    pub merge_receipt_digest: Digest,
+    pub prior_prepare_operation_id: OperationId,
+    pub prior_prepare_receipt_digest: Digest,
+    pub prior_publication_operation_id: OperationId,
+    pub prior_publication_receipt_digest: Digest,
+    pub pull_request_number: u64,
+    pub pull_request_node_id: String,
+    pub pull_request_url: String,
+    pub pull_request_title: String,
+    pub exact_body: String,
 }
 
 /// Validate that a persisted worktree receipt covers exactly its request.
@@ -1510,6 +1591,7 @@ pub fn validate_prepared_receipt(
     let mut actual = receipt.work_nodes.iter().collect::<Vec<_>>();
     actual.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
     let mut previous: Option<&str> = None;
+    let mut witnessed_refreshes = Vec::new();
     for (wanted, got) in expected.iter().zip(actual) {
         if previous == Some(wanted.work_node_id.as_str())
             || wanted.work_node_id != got.work_node_id
@@ -1521,7 +1603,45 @@ pub fn validate_prepared_receipt(
         {
             return Err("prepared worktree node does not match its effect request".into());
         }
+        if let Some(refresh) = &got.base_refresh {
+            validate_git_sha(&refresh.old_parent_sha).map_err(|error| error.to_string())?;
+            validate_git_sha(&refresh.new_parent_sha).map_err(|error| error.to_string())?;
+            validate_git_sha(&refresh.old_child_head).map_err(|error| error.to_string())?;
+            validate_git_sha(&refresh.new_child_head).map_err(|error| error.to_string())?;
+            if refresh.repository_id != got.repository_id
+                || refresh.branch != got.branch
+                || refresh.new_parent_sha != wanted.expected_base_sha
+                || refresh.new_parent_sha != got.base_sha
+                || refresh.old_parent_sha == refresh.new_parent_sha
+                || refresh.verified_commits.is_empty()
+                || refresh.verified_commits.last() != Some(&refresh.new_child_head)
+                || refresh.hook_gate.repository_id != got.repository_id
+                || refresh.hook_gate.head != refresh.new_child_head
+                || refresh.protection_observation_digest.as_str().len() != 64
+                || got.base_refresh_source.as_ref().is_none_or(|source| {
+                    source.merge_receipt_digest.as_str().len() != 64
+                        || source.prior_prepare_receipt_digest.as_str().len() != 64
+                        || source.prior_publication_receipt_digest.as_str().len() != 64
+                        || source.merge_work_id.as_str().is_empty()
+                })
+            {
+                return Err(
+                    "base refresh receipt does not match the exact prepared branch and base".into(),
+                );
+            }
+            witnessed_refreshes.push(refresh.clone());
+        } else if got.base_refresh_source.is_some() {
+            return Err(
+                "base refresh source exists without a signed branch refresh receipt".into(),
+            );
+        }
         previous = Some(wanted.work_node_id.as_str());
+    }
+    witnessed_refreshes.sort_by(|left, right| left.branch.cmp(&right.branch));
+    let mut receipt_refreshes = receipt.base_refreshes.clone();
+    receipt_refreshes.sort_by(|left, right| left.branch.cmp(&right.branch));
+    if witnessed_refreshes != receipt_refreshes {
+        return Err("prepared base refresh list differs from its per-node signed receipts".into());
     }
     Ok(())
 }
@@ -1757,6 +1877,17 @@ impl RepositoryDeliveryEffects {
             .map_err(|error| error.to_string())
     }
 
+    pub fn observe_branch_security(
+        &self,
+        repository_id: &RepositoryId,
+        branch: &str,
+    ) -> Result<crate::delivery_forge::ObservedBranchSecurity, String> {
+        let repository = self.repository(repository_id)?;
+        self.publisher
+            .observe_branch_security(repository_id, &repository.clone_url, branch)
+            .map_err(|error| error.to_string())
+    }
+
     fn ensure_initial_publication_baseline(
         &self,
         store: &mut crate::store::ConfigStore,
@@ -1820,10 +1951,30 @@ impl RepositoryDeliveryEffects {
     fn prepare_worktrees(
         &self,
         request: &EffectRequest,
+        context: &mut EffectContext<'_>,
     ) -> Result<PreparedWorktreesEffectReceipt, String> {
         let payload: PrepareWorktreesEffectPayload = decode_effect_payload(request)?;
         self.validate_prepare_payload(request, &payload)?;
+        let succeeded = context.store.list_succeeded_effect_receipts(
+            context.owner_generation,
+            &request.intent.project_id,
+            "ticket_run",
+            payload.ticket_run_id.as_str(),
+            256,
+        )?;
+        let transitions = context.store.ticket_run_transition_evidence(
+            context.owner_generation,
+            &request.intent.project_id,
+            &payload.ticket_run_id,
+            0,
+            256,
+        )?;
+        let reassessment = transitions
+            .iter()
+            .find(|(_, evidence)| evidence["kind"] == "merge_reassessment_required")
+            .map(|(_, evidence)| evidence.clone());
         let mut receipts = Vec::with_capacity(payload.work_nodes.len());
+        let mut base_refreshes = Vec::new();
         for node in payload.work_nodes {
             let identity = WorkNodeIdentity {
                 project_id: request.intent.project_id.clone(),
@@ -1834,28 +1985,344 @@ impl RepositoryDeliveryEffects {
                 work_node_id: node.work_node_id.to_string(),
             };
             let repository_config = self.repository(&node.repository_id)?;
-            let prepared = self
-                .delivery
-                .prepare_worktree(
-                    identity,
-                    repository_config,
-                    &node.expected_base_sha,
-                    node.commit_mode,
-                )
-                .map_err(|error| error.to_string())?;
+            let prior_prepare = succeeded
+                .iter()
+                .filter(|entry| entry.intent().kind == "prepare_worktrees")
+                .filter_map(|entry| {
+                    let old_request: PrepareWorktreesEffectPayload =
+                        decode_effect_payload(&effect_request_from_persisted(entry)).ok()?;
+                    if old_request.source_revision >= payload.source_revision
+                        || old_request.ticket_run_id != payload.ticket_run_id
+                    {
+                        return None;
+                    }
+                    let old_receipt: PreparedWorktreesEffectReceipt =
+                        serde_json::from_str(entry.receipt_json()).ok()?;
+                    let old_node = old_receipt
+                        .work_nodes
+                        .into_iter()
+                        .find(|candidate| candidate.work_node_id == node.work_node_id)?;
+                    Some((
+                        old_request.source_revision,
+                        old_node,
+                        entry.intent().operation_id.clone(),
+                        sha256_hex(entry.receipt_json().as_bytes()),
+                    ))
+                })
+                .max_by_key(|(revision, _, _, _)| *revision)
+                .map(|(_, node, operation_id, receipt_digest)| {
+                    (node, operation_id, receipt_digest)
+                });
+            let prior_publication = succeeded
+                .iter()
+                .filter(|entry| entry.intent().kind == "publish_implementation")
+                .filter_map(|entry| {
+                    let old_request: PublishImplementationEffectPayload =
+                        decode_effect_payload(&effect_request_from_persisted(entry)).ok()?;
+                    if old_request.source_revision >= payload.source_revision
+                        || old_request.ticket_run_id != payload.ticket_run_id
+                        || old_request.work_node_id != node.work_node_id
+                        || old_request.repository_id != node.repository_id
+                    {
+                        return None;
+                    }
+                    let old_receipt: ImplementationPublicationReceipt =
+                        serde_json::from_str(entry.receipt_json()).ok()?;
+                    Some((
+                        old_request.source_revision,
+                        old_receipt,
+                        entry.intent().operation_id.clone(),
+                        sha256_hex(entry.receipt_json().as_bytes()),
+                    ))
+                })
+                .max_by_key(|(revision, _, _, _)| *revision)
+                .map(|(_, receipt, operation_id, receipt_digest)| {
+                    (receipt, operation_id, receipt_digest)
+                });
+            let should_refresh = reassessment.is_some()
+                && prior_prepare
+                    .as_ref()
+                    .is_some_and(|prior| prior.0.base_sha != node.expected_base_sha);
+            let mut refresh_source = None;
+            let prepared = if should_refresh {
+                let reassessment = reassessment.as_ref().expect("checked above");
+                let source_revision = reassessment["source_revision"]
+                    .as_u64()
+                    .ok_or("merge reassessment lacks source revision")?;
+                let old_work = context
+                    .store
+                    .merge_work_item(
+                        &request.intent.project_id,
+                        &payload.ticket_run_id,
+                        crate::domain::ids::Revision(source_revision),
+                    )?
+                    .ok_or("merge reassessment has no immutable prior MergeWorkItem")?;
+                if reassessment["work_id"].as_str() != Some(old_work.work_id.as_str())
+                    || reassessment["prior_accepted_plan_digest"].as_str()
+                        != Some(old_work.accepted_plan_digest.as_str())
+                {
+                    return Err(
+                        "merge reassessment does not match its immutable work and plan".into(),
+                    );
+                }
+                let prior_publication = prior_publication
+                    .as_ref()
+                    .ok_or("base refresh has no prior succeeded publication receipt")?;
+                let prior_prepare = prior_prepare
+                    .as_ref()
+                    .ok_or("base refresh has no prior succeeded preparation receipt")?;
+                let prior = &prior_publication.0;
+                let prior_node = &prior_prepare.0;
+                let body_effect = succeeded
+                    .iter()
+                    .filter(|entry| entry.intent().kind == "merge")
+                    .filter_map(|entry| {
+                        let step: crate::merge_executor::MergeStepEffectRequest =
+                            serde_json::from_str(&entry.intent().request_json).ok()?;
+                        if step.awaiting_merge_revision.0 != source_revision
+                            || step.work_id != old_work.work_id
+                            || !step.prior_receipts.is_empty()
+                        {
+                            return None;
+                        }
+                        let receipt: crate::merge_executor::MergeStepReceipt =
+                            serde_json::from_str(entry.receipt_json()).ok()?;
+                        if sha256_hex(crate::store::canonical_json(&receipt).ok()?.as_bytes())
+                            != reassessment["receipt_digest"].as_str().unwrap_or_default()
+                        {
+                            return None;
+                        }
+                        let body = match &receipt.effect_intent.operation {
+                            crate::forge::MergeEffectOperation::UpdateBody(body) => body.clone(),
+                            _ => return None,
+                        };
+                        (body.expected_head_sha == prior.pull_request.source_head
+                            && old_work.document.prepared_body.as_deref()
+                                == Some(body.exact_body.as_str()))
+                        .then_some((entry, receipt, body))
+                    })
+                    .next()
+                    .ok_or("base refresh lacks the exact provider-reconciled first body step")?;
+                let pull_observation =
+                    self.observe_current_pull_requests(&node.repository_id, &prior.push.branch)?;
+                let remote_head = self
+                    .delivery
+                    .observe_configured_remote_branch(repository_config, &prior.push.branch)
+                    .map_err(|error| error.to_string())?;
+                let observed = RepositoryPublicationObservation {
+                    remote_head,
+                    pull_requests: pull_observation.pull_requests,
+                };
+                let crate::delivery_forge::ObservationCapability::Known(pulls) =
+                    &observed.pull_requests
+                else {
+                    return Err(
+                        "base refresh requires a complete GitHub pull request observation".into(),
+                    );
+                };
+                let matching_pulls = pulls
+                    .iter()
+                    .filter(|pull| pull.number == prior.pull_request.number)
+                    .collect::<Vec<_>>();
+                let [pull] = matching_pulls.as_slice() else {
+                    return Err("base refresh PR is absent or ambiguous".into());
+                };
+                let resource = crate::store::publication_monitor::PublicationResource {
+                    project_id: request.intent.project_id.clone(),
+                    ticket_run_id: payload.ticket_run_id.clone(),
+                    repository_id: node.repository_id.clone(),
+                    branch: prior.push.branch.clone(),
+                };
+                let baseline = context
+                    .store
+                    .load_publication_baseline(&resource)?
+                    .ok_or("base refresh has no current publication observation baseline")?;
+                if baseline.configuration_digest != self.configuration_digest
+                    || baseline.observation != observed
+                    || pull.node_id != prior.pull_request.node_id
+                    || pull.source_head != prior.pull_request.source_head
+                    || pull.source_branch != prior.pull_request.source_branch
+                    || pull.base_branch != repository_config.base_branch
+                    || pull.base_sha != old_work.document.assessment.subject.base_sha
+                    || pull.body.as_deref() != Some(body_effect.2.exact_body.as_str())
+                    || pull.state != "open"
+                    || pull.merged
+                {
+                    return Err(
+                        "base refresh PR differs from the exact reconciled body baseline".into(),
+                    );
+                }
+                let current_base = self
+                    .delivery
+                    .observe_configured_remote_branch(
+                        repository_config,
+                        &repository_config.base_branch,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or("configured base branch is absent during refresh")?;
+                if current_base != node.expected_base_sha {
+                    return Err(
+                        "base refresh target differs from the currently observed configured base"
+                            .into(),
+                    );
+                }
+                let security =
+                    self.observe_branch_security(&node.repository_id, &prior.push.branch)?;
+                let remote_child = self
+                    .delivery
+                    .observe_configured_remote_branch(repository_config, &prior.push.branch)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("owned source branch is absent during base refresh")?;
+                if security.protected
+                    || security.head_sha != prior.pull_request.source_head
+                    || remote_child != prior.pull_request.source_head
+                {
+                    return Err(
+                        "owned branch protection or remote head changed before base refresh".into(),
+                    );
+                }
+                let old_base = &prior_node.base_sha;
+                let prepared = self
+                    .delivery
+                    .prepare_worktree_for_base_refresh(
+                        identity,
+                        repository_config,
+                        &node.expected_base_sha,
+                        old_base,
+                        node.commit_mode,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let required_trailer = match &prior.commit {
+                    VerifiedCommit::Native { .. } => {
+                        let old_publish_request = succeeded
+                            .iter()
+                            .filter(|entry| {
+                                entry.intent().operation_id == prior.effect_operation_id
+                            })
+                            .find_map(|entry| {
+                                serde_json::from_str::<PublishImplementationEffectPayload>(
+                                    &entry.intent().request_json,
+                                )
+                                .ok()
+                            })
+                            .ok_or("prior publication request is missing")?;
+                        match old_publish_request.commit {
+                            WorkerDeliveryCommit::Native {
+                                required_trailer, ..
+                            } => required_trailer,
+                            _ => {
+                                return Err(
+                                    "prior native publication has a different commit mode".into()
+                                );
+                            }
+                        }
+                    }
+                    VerifiedCommit::Host { receipt } => {
+                        let commit_request = succeeded
+                            .iter()
+                            .filter(|entry| {
+                                entry.intent().operation_id == receipt.operation_id.as_str()
+                            })
+                            .find_map(|entry| {
+                                serde_json::from_str::<CommitWorkerManifestEffectPayload>(
+                                    &entry.intent().request_json,
+                                )
+                                .ok()
+                            })
+                            .ok_or("prior host commit request is missing")?;
+                        commit_request.required_trailer
+                    }
+                    VerifiedCommit::BaseRefresh { .. } => {
+                        return Err(
+                            "stacked base refresh requires original Worker publication provenance"
+                                .into(),
+                        );
+                    }
+                };
+                let repair = StackRepairRequest {
+                    repository_id: node.repository_id.clone(),
+                    worktree_path: prepared.worktree.path.clone(),
+                    branch: prepared.worktree.branch.clone(),
+                    recorded_base_sha: old_base.clone(),
+                    old_parent_sha: old_base.clone(),
+                    new_parent_sha: current_base,
+                    expected_child_head: prior.pull_request.source_head.clone(),
+                    expected_remote_child_head: remote_child,
+                    default_branch: repository_config.base_branch.clone(),
+                    observed_protected_branches: Vec::new(),
+                    protection_observation_complete: true,
+                    protection_observed_at_unix: u64::try_from(context.now_unix)
+                        .map_err(|_| "controller clock is before Unix epoch")?,
+                    protection_observation_digest: security.digest,
+                    required_trailer,
+                };
+                let repaired = self
+                    .delivery
+                    .repair_stacked_branch(
+                        &prepared,
+                        repository_config,
+                        &self.configuration_digest,
+                        &repair,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let merge_receipt_digest = crate::domain::ids::Digest::parse(
+                    reassessment["receipt_digest"]
+                        .as_str()
+                        .ok_or("reassessment lacks the reconciled receipt digest")?
+                        .to_owned(),
+                )?;
+                refresh_source = Some(BaseRefreshSource {
+                    merge_work_id: old_work.work_id.clone(),
+                    merge_receipt_digest,
+                    prior_prepare_operation_id: OperationId::parse(prior_prepare.1.clone())?,
+                    prior_prepare_receipt_digest: crate::domain::ids::Digest::parse(
+                        prior_prepare.2.clone(),
+                    )?,
+                    prior_publication_operation_id: OperationId::parse(
+                        prior_publication.1.clone(),
+                    )?,
+                    prior_publication_receipt_digest: crate::domain::ids::Digest::parse(
+                        prior_publication.2.clone(),
+                    )?,
+                    pull_request_number: pull.number,
+                    pull_request_node_id: pull.node_id.clone(),
+                    pull_request_url: pull.url.clone(),
+                    pull_request_title: pull.title.clone(),
+                    exact_body: body_effect.2.exact_body.clone(),
+                });
+                (prepared, Some(repaired))
+            } else {
+                let prepared = self
+                    .delivery
+                    .prepare_worktree(
+                        identity,
+                        repository_config,
+                        &node.expected_base_sha,
+                        node.commit_mode,
+                    )
+                    .map_err(|error| error.to_string())?;
+                (prepared, None)
+            };
+            let (prepared, repair) = prepared;
+            if let Some(repair) = &repair {
+                base_refreshes.push(repair.clone());
+            }
             receipts.push(PreparedWorktreeReceiptNode {
                 work_node_id: node.work_node_id,
                 repository_id: node.repository_id,
                 worktree_path: prepared.worktree.path,
                 branch: prepared.worktree.branch,
-                base_sha: prepared.worktree.base_sha,
+                base_sha: prepared.expected_base_sha,
                 commit_mode: prepared.commit_mode,
+                base_refresh: repair,
+                base_refresh_source: refresh_source,
             });
         }
         Ok(PreparedWorktreesEffectReceipt {
             schema_version: 1,
             ticket_run_id: payload.ticket_run_id,
             work_nodes: receipts,
+            base_refreshes,
         })
     }
 
@@ -2393,6 +2860,23 @@ impl RepositoryDeliveryEffects {
                     return Err("host receipt does not identify one verified host commit".into());
                 }
             }
+            (
+                WorkerDeliveryCommit::HostBaseRefresh { receipt, .. },
+                CommitMode::Native | CommitMode::Host,
+            ) => {
+                validate_git_sha(&receipt.old_child_head).map_err(|error| error.to_string())?;
+                validate_git_sha(&receipt.new_child_head).map_err(|error| error.to_string())?;
+                validate_git_sha(&receipt.new_parent_sha).map_err(|error| error.to_string())?;
+                if receipt.verified_commits.last() != Some(&receipt.new_child_head)
+                    || receipt.hook_gate.head != receipt.new_child_head
+                    || receipt.hook_gate.repository_id != payload.repository_id
+                    || receipt.new_parent_sha != payload.expected_base_sha
+                {
+                    return Err(
+                        "base refresh does not prove the configured, signed source head".into(),
+                    );
+                }
+            }
             _ => return Err("commit payload does not match the configured commit mode".into()),
         }
         Ok(())
@@ -2453,6 +2937,8 @@ impl RepositoryDeliveryEffects {
                 branch: work.worktree.branch.clone(),
                 base_sha: prior_payload.expected_base_sha.clone(),
                 commit_mode: prior_payload.commit_mode,
+                base_refresh: None,
+                base_refresh_source: None,
             };
             let receipt = validate_one_implementation_publication_receipt(
                 &prior_request,
@@ -2511,15 +2997,36 @@ impl RepositoryDeliveryEffects {
             ticket_run_id: payload.ticket_run_id.clone(),
             work_node_id: payload.work_node_id.to_string(),
         };
-        let work = self
-            .delivery
-            .prepare_worktree(
+        let work = if let WorkerDeliveryCommit::HostBaseRefresh { receipt, .. } = &payload.commit {
+            self.delivery.prepare_worktree_for_base_refresh(
+                identity,
+                repository_config,
+                &payload.expected_base_sha,
+                &receipt.old_parent_sha,
+                payload.commit_mode,
+            )
+        } else {
+            self.delivery.prepare_worktree(
                 identity,
                 repository_config,
                 &payload.expected_base_sha,
                 payload.commit_mode,
             )
-            .map_err(|error| error.to_string())?;
+        }
+        .map_err(|error| error.to_string())?;
+        if matches!(
+            &payload.commit,
+            WorkerDeliveryCommit::HostBaseRefresh { .. }
+        ) {
+            return self.publish_base_refresh(
+                request,
+                store,
+                owner_generation,
+                &payload,
+                &work,
+                repository_config,
+            );
+        }
         let prior_publication = self.prior_publication_anchor(
             store,
             owner_generation,
@@ -2568,6 +3075,7 @@ impl RepositoryDeliveryEffects {
                     worker_reported_head,
                     ..
                 } => worker_reported_head,
+                WorkerDeliveryCommit::HostBaseRefresh { receipt, .. } => &receipt.new_child_head,
             };
             if baseline.configuration_digest != payload.configuration_digest
                 || baseline.base_branch != repository_config.base_branch
@@ -2962,6 +3470,261 @@ impl RepositoryDeliveryEffects {
         })
     }
 
+    fn publish_base_refresh(
+        &self,
+        request: &EffectRequest,
+        store: &crate::store::ConfigStore,
+        owner_generation: u64,
+        payload: &PublishImplementationEffectPayload,
+        work: &PreparedRepositoryWork,
+        repository: &RepositoryConfig,
+    ) -> Result<EffectObservation, String> {
+        let WorkerDeliveryCommit::HostBaseRefresh {
+            prepare_operation_id,
+            prepare_receipt_digest,
+            prior_publication_operation_id,
+            prior_publication_receipt_digest,
+            receipt: supplied_refresh,
+        } = &payload.commit
+        else {
+            unreachable!()
+        };
+        let prepare = store
+            .succeeded_effect_receipt(prepare_operation_id.as_str())?
+            .ok_or("base refresh prepare receipt is not durably succeeded")?;
+        if sha256_hex(prepare.receipt_json().as_bytes()) != prepare_receipt_digest.as_str()
+            || prepare.intent().kind != "prepare_worktrees"
+            || prepare.intent().project_id != request.intent.project_id
+            || prepare.intent().subject_id != payload.ticket_run_id.as_str()
+        {
+            return Err(
+                "base refresh publication is detached from its succeeded preparation".into(),
+            );
+        }
+        let prepare_request: PrepareWorktreesEffectPayload =
+            decode_effect_payload(&effect_request_from_persisted(&prepare))?;
+        let prepared: PreparedWorktreesEffectReceipt =
+            serde_json::from_str(prepare.receipt_json()).map_err(|e| e.to_string())?;
+        validate_prepared_receipt(&prepare_request, &prepared)?;
+        let prepared_node = prepared
+            .work_nodes
+            .iter()
+            .find(|node| node.work_node_id == payload.work_node_id)
+            .ok_or("base refresh preparation does not contain the publication node")?;
+        let source = prepared_node
+            .base_refresh_source
+            .as_ref()
+            .ok_or("prepared node lacks base refresh source authority")?;
+        let refresh = prepared_node
+            .base_refresh
+            .as_ref()
+            .ok_or("prepared node lacks signed base refresh receipt")?;
+        let prior = store
+            .succeeded_effect_receipt(prior_publication_operation_id.as_str())?
+            .ok_or("prior implementation publication is not durably succeeded")?;
+        if sha256_hex(prior.receipt_json().as_bytes()) != prior_publication_receipt_digest.as_str()
+            || source.prior_publication_operation_id != *prior_publication_operation_id
+            || source.prior_publication_receipt_digest != *prior_publication_receipt_digest
+            || source.prior_prepare_receipt_digest.as_str().is_empty()
+            || supplied_refresh.as_ref() != refresh
+            || refresh.repository_id != payload.repository_id
+            || refresh.branch != work.worktree.branch
+            || refresh.new_parent_sha != payload.expected_base_sha
+            || payload.expected_remote_head.as_deref() != Some(refresh.old_child_head.as_str())
+            || payload
+                .pull_request
+                .update_target
+                .as_ref()
+                .is_none_or(|target| target.expected_head != refresh.old_child_head)
+        {
+            return Err(
+                "host base refresh publication does not match its immutable prior receipts".into(),
+            );
+        }
+        let old_prepare = store
+            .succeeded_effect_receipt(source.prior_prepare_operation_id.as_str())?
+            .ok_or("prior prepared-worktree receipt is not durably succeeded")?;
+        if sha256_hex(old_prepare.receipt_json().as_bytes())
+            != source.prior_prepare_receipt_digest.as_str()
+            || old_prepare.intent().kind != "prepare_worktrees"
+            || old_prepare.intent().project_id != request.intent.project_id
+            || old_prepare.intent().subject_id != payload.ticket_run_id.as_str()
+        {
+            return Err("base refresh prior preparation is not the exact succeeded receipt".into());
+        }
+        let old_prepared: PreparedWorktreesEffectReceipt =
+            serde_json::from_str(old_prepare.receipt_json()).map_err(|e| e.to_string())?;
+        let old_node = old_prepared
+            .work_nodes
+            .iter()
+            .find(|node| node.work_node_id == payload.work_node_id)
+            .ok_or("prior preparation does not contain the refreshed work node")?;
+        if old_node.repository_id != payload.repository_id
+            || old_node.branch != work.worktree.branch
+            || old_node.base_sha != refresh.old_parent_sha
+        {
+            return Err("base refresh does not continue the exact prior prepared branch".into());
+        }
+        let run_effects = store.list_succeeded_effect_receipts(
+            owner_generation,
+            &request.intent.project_id,
+            "ticket_run",
+            payload.ticket_run_id.as_str(),
+            256,
+        )?;
+        let merge_receipt = run_effects
+            .iter()
+            .find(|entry| {
+                entry.intent().kind == "merge"
+                    && sha256_hex(entry.receipt_json().as_bytes())
+                        == source.merge_receipt_digest.as_str()
+                    && serde_json::from_str::<crate::merge_executor::MergeStepEffectRequest>(
+                        &entry.intent().request_json,
+                    )
+                    .is_ok_and(|merge| merge.work_id == source.merge_work_id)
+            })
+            .ok_or("base refresh is detached from its exact succeeded first merge-step receipt")?;
+        let merge_request: crate::merge_executor::MergeStepEffectRequest =
+            serde_json::from_str(&merge_receipt.intent().request_json)
+                .map_err(|e| e.to_string())?;
+        let merge_step: crate::merge_executor::MergeStepReceipt =
+            serde_json::from_str(merge_receipt.receipt_json()).map_err(|e| e.to_string())?;
+        let exact_prepared_body = match &merge_step.effect_intent.operation {
+            crate::forge::MergeEffectOperation::UpdateBody(body) => Some(body.exact_body.as_str()),
+            _ => None,
+        };
+        if merge_receipt.intent().subject_id != payload.ticket_run_id.as_str()
+            || merge_request.step_key != merge_step.step_key
+            || !matches!(
+                merge_step.certainty,
+                crate::forge::EffectCertainty::Applied | crate::forge::EffectCertainty::Recovered
+            )
+            || exact_prepared_body != Some(source.exact_body.as_str())
+        {
+            return Err("base refresh merge-step receipt belongs to another TicketRun".into());
+        }
+        let prior_receipt: ImplementationPublicationReceipt =
+            serde_json::from_str(prior.receipt_json()).map_err(|e| e.to_string())?;
+        if prior.intent().kind != "publish_implementation"
+            || prior.intent().project_id != request.intent.project_id
+            || prior.intent().subject_id != payload.ticket_run_id.as_str()
+            || prior_receipt.effect_operation_id != prior.intent().operation_id
+        {
+            return Err(
+                "prior publication receipt has a mismatched durable effect identity".into(),
+            );
+        }
+        let prior_request = effect_request_from_persisted(&prior);
+        validate_one_implementation_publication_receipt(
+            &prior_request,
+            old_node,
+            &request.intent.project_id,
+            repository,
+            prior.receipt_json(),
+        )?;
+        if prior_receipt.repository_id != payload.repository_id
+            || prior_receipt.work_node_id != payload.work_node_id
+            || prior_receipt.pull_request.number != source.pull_request_number
+            || prior_receipt.pull_request.node_id != source.pull_request_node_id
+            || prior_receipt.pull_request.url != source.pull_request_url
+            || prior_receipt.pull_request.source_head != refresh.old_child_head
+            || prior_receipt.pull_request.source_branch != work.worktree.branch
+            || payload
+                .pull_request
+                .update_target
+                .as_ref()
+                .is_none_or(|target| {
+                    target.number != source.pull_request_number
+                        || target.expected_head != refresh.old_child_head
+                })
+            || payload.pull_request.title != source.pull_request_title
+            || payload.pull_request.body != source.exact_body
+        {
+            return Err("refreshed publication changed the existing PR identity or body".into());
+        }
+        let remote_head =
+            self.observe_remote_branch(&payload.repository_id, &work.worktree.branch)?;
+        let target_head =
+            self.observe_remote_branch(&payload.repository_id, &repository.base_branch)?;
+        if remote_head.as_deref() != Some(refresh.new_child_head.as_str())
+            || target_head.as_deref() != Some(refresh.new_parent_sha.as_str())
+        {
+            return Err("signed refreshed branch or configured target moved before publication verification".into());
+        }
+        let observed =
+            self.observe_current_pull_requests(&payload.repository_id, &work.worktree.branch)?;
+        let crate::delivery_forge::ObservationCapability::Known(pulls) = observed.pull_requests
+        else {
+            return Err("refreshed publication requires a complete current PR observation".into());
+        };
+        let matching_pulls = pulls
+            .iter()
+            .filter(|pull| pull.number == source.pull_request_number)
+            .collect::<Vec<_>>();
+        let [pull] = matching_pulls.as_slice() else {
+            return Err("refreshed publication PR is absent or ambiguous".into());
+        };
+        if pull.node_id != source.pull_request_node_id
+            || pull.url != source.pull_request_url
+            || pull.state != "open"
+            || pull.merged
+            || pull.merged_at.is_some()
+            || pull.source_branch != work.worktree.branch
+            || pull.source_head != refresh.new_child_head
+            || pull.base_branch != repository.base_branch
+            || pull.base_sha != refresh.new_parent_sha
+            || pull.title != source.pull_request_title
+            || pull.body.as_deref() != Some(source.exact_body.as_str())
+        {
+            return Err(
+                "current PR differs from the exact refreshed head, target, or preserved body"
+                    .into(),
+            );
+        }
+        let operation_id = derived_operation_id(
+            &request.intent.operation_id,
+            &payload.repository_id,
+            payload.work_node_id.as_str(),
+            "pull-request",
+        )?;
+        let receipt = ImplementationPublicationReceipt {
+            schema_version: 1,
+            effect_operation_id: request.intent.operation_id.clone(),
+            source_revision: payload.source_revision,
+            configuration_digest: payload.configuration_digest.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            repository_id: payload.repository_id.clone(),
+            work_node_id: payload.work_node_id.clone(),
+            commit: VerifiedCommit::BaseRefresh {
+                receipt: refresh.clone(),
+            },
+            hook_gate: refresh.hook_gate.clone(),
+            push: PushReceipt {
+                repository_id: payload.repository_id.clone(),
+                branch: work.worktree.branch.clone(),
+                expected_remote_head: Some(refresh.old_child_head.clone()),
+                observed_remote_head: refresh.new_child_head.clone(),
+                pushed_head: refresh.new_child_head.clone(),
+                force_with_lease: true,
+            },
+            pull_request: PublishedPullRequest {
+                repository_id: payload.repository_id.clone(),
+                number: pull.number,
+                node_id: pull.node_id.clone(),
+                url: pull.url.clone(),
+                state: pull.state.clone(),
+                source_branch: pull.source_branch.clone(),
+                source_head: pull.source_head.clone(),
+                base_branch: pull.base_branch.clone(),
+                title: pull.title.clone(),
+                body_digest: sha256_hex(source.exact_body.as_bytes()),
+                operation_id,
+            },
+        };
+        let receipt = crate::store::canonical_json(&receipt)?;
+        Ok(EffectObservation::Applied { receipt })
+    }
+
     fn validate_scope(
         &self,
         request: &EffectRequest,
@@ -3339,6 +4102,7 @@ pub struct ValidatedPreparedWorktrees {
     configuration_digest: Digest,
     work_node_ids: Vec<WorkNodeId>,
     receipt_digest: String,
+    has_base_refresh: bool,
 }
 
 impl ValidatedPreparedWorktrees {
@@ -3356,6 +4120,10 @@ impl ValidatedPreparedWorktrees {
 
     pub(crate) fn configuration_digest(&self) -> &Digest {
         &self.configuration_digest
+    }
+
+    pub(crate) fn has_base_refresh(&self) -> bool {
+        self.has_base_refresh
     }
 }
 
@@ -3386,6 +4154,10 @@ pub fn validate_prepared_worktree_stage(
                 .map(|node| node.work_node_id)
                 .collect(),
             receipt_digest: sha256_hex(stored.receipt_json().as_bytes()),
+            has_base_refresh: receipt
+                .work_nodes
+                .iter()
+                .any(|node| node.base_refresh.is_some()),
         },
         receipt,
     ))
@@ -3772,6 +4544,18 @@ fn validate_one_implementation_publication_receipt(
             && commit.hooks_completed
             && commit.index_synchronized
             && !commit.index_sync_conflict => {}
+        (
+            VerifiedCommit::BaseRefresh { receipt: refresh },
+            WorkerDeliveryCommit::HostBaseRefresh {
+                receipt: requested, ..
+            },
+        ) if refresh == requested.as_ref()
+            && prepared_worktree.base_refresh.as_ref() == Some(refresh)
+            && prepared_worktree.base_refresh_source.is_some()
+            && refresh.repository_id == payload.repository_id
+            && refresh.branch == prepared_worktree.branch
+            && refresh.new_parent_sha == payload.expected_base_sha
+            && refresh.new_child_head == head => {}
         _ => {
             return Err("implementation receipt commit does not match the requested commit".into());
         }
@@ -3807,7 +4591,11 @@ fn validate_one_implementation_publication_receipt(
         || receipt.push.pushed_head != head
         || receipt.push.observed_remote_head != head
         || receipt.push.expected_remote_head != payload.expected_remote_head
-        || receipt.push.force_with_lease
+        || (receipt.push.force_with_lease
+            != matches!(
+                &payload.commit,
+                WorkerDeliveryCommit::HostBaseRefresh { .. }
+            ))
     {
         return Err("implementation receipt does not prove the exact expected remote head".into());
     }
@@ -3817,11 +4605,24 @@ fn validate_one_implementation_publication_receipt(
         payload.work_node_id.as_str(),
         "pull-request",
     )?;
-    let expected_body = format!(
-        "{}\n\n<!-- rex-projects-operation:{} -->",
-        payload.pull_request.body.trim_end(),
-        expected_pr_operation.as_str()
-    );
+    let expected_body = if matches!(
+        &payload.commit,
+        WorkerDeliveryCommit::HostBaseRefresh { .. }
+    ) {
+        payload.pull_request.body.clone()
+    } else {
+        crate::delivery_forge::marked_body(&PullRequestPublicationIntent {
+            operation_id: expected_pr_operation.clone(),
+            repository_id: payload.repository_id.clone(),
+            clone_url: repository_config.clone_url.clone(),
+            source_branch: prepared_worktree.branch.clone(),
+            source_head: head.to_owned(),
+            base_branch: payload.base_branch.clone(),
+            title: payload.pull_request.title.clone(),
+            body: payload.pull_request.body.clone(),
+            update_target: payload.pull_request.update_target.clone(),
+        })
+    };
     if receipt.pull_request.repository_id != payload.repository_id
         || receipt.pull_request.operation_id != expected_pr_operation
         || receipt.pull_request.source_branch != prepared_worktree.branch
@@ -3846,11 +4647,7 @@ fn digest_json<T: Serialize>(value: &T) -> Result<String, String> {
 }
 
 fn marked_body_for_monitor(intent: &PullRequestPublicationIntent) -> String {
-    format!(
-        "{}\n\n<!-- rex-projects-operation:{} -->",
-        intent.body.trim_end(),
-        intent.operation_id.as_str()
-    )
+    crate::delivery_forge::marked_body(intent)
 }
 
 fn publication_intent_after_push(
@@ -3898,7 +4695,7 @@ impl EffectHandler for PrepareWorktreesEffectHandler {
                 return Ok(rejected_delivery_effect(error));
             }
         }
-        let receipt = self.effects.prepare_worktrees(request)?;
+        let receipt = self.effects.prepare_worktrees(request, context)?;
         Ok(EffectObservation::Applied {
             receipt: crate::store::canonical_json(&receipt)?,
         })
@@ -5772,6 +6569,36 @@ esac
     }
 
     #[test]
+    fn legacy_prepared_receipt_keeps_its_original_canonical_digest() {
+        let receipt = PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: TicketRunId::parse("run-legacy-prepared").unwrap(),
+            work_nodes: vec![PreparedWorktreeReceiptNode {
+                work_node_id: WorkNodeId::parse("implementation").unwrap(),
+                repository_id: RepositoryId::parse("demo").unwrap(),
+                worktree_path: PathBuf::from("/managed/worktree"),
+                branch: "rex-projects/legacy".into(),
+                base_sha: "a".repeat(40),
+                commit_mode: CommitMode::Native,
+                base_refresh: None,
+                base_refresh_source: None,
+            }],
+            base_refreshes: Vec::new(),
+        };
+        let current = serde_json::to_value(&receipt).unwrap();
+        assert!(current.get("base_refreshes").is_none());
+        assert!(current["work_nodes"][0].get("base_refresh").is_none());
+        let legacy_json = crate::store::canonical_json(&receipt).unwrap();
+        let parsed: PreparedWorktreesEffectReceipt = serde_json::from_str(&legacy_json).unwrap();
+        let roundtrip = crate::store::canonical_json(&parsed).unwrap();
+        assert_eq!(roundtrip, legacy_json);
+        assert_eq!(
+            sha256_hex(roundtrip.as_bytes()),
+            sha256_hex(legacy_json.as_bytes())
+        );
+    }
+
+    #[test]
     fn publish_effect_rejects_invalid_forge_configuration_before_git_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let executable = git_path();
@@ -5940,11 +6767,14 @@ esac
             branch: branch.clone(),
             base_sha: base.clone(),
             commit_mode: CommitMode::Native,
+            base_refresh: None,
+            base_refresh_source: None,
         };
         let prepared_receipt = PreparedWorktreesEffectReceipt {
             schema_version: 1,
             ticket_run_id: ticket_run_id.clone(),
             work_nodes: vec![prepared.clone()],
+            base_refreshes: Vec::new(),
         };
         let pr_operation = derived_operation_id(
             &request.intent.operation_id,
@@ -6037,6 +6867,8 @@ esac
                 branch: "rex-projects/abcdef0123456789abcdef0123456789".into(),
                 base_sha: "a".repeat(40),
                 commit_mode: CommitMode::Native,
+                base_refresh: None,
+                base_refresh_source: None,
             });
         let two_repository_configs = BTreeMap::from([
             (

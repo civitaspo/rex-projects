@@ -188,6 +188,92 @@ pub fn consume_one_host_transition(
                     continue;
                 }
 
+                let mut publish_effects = Vec::new();
+                if proof.has_base_refresh() {
+                    if receipt.work_nodes.len() != 1 {
+                        return Err(
+                            "base refresh publication currently requires one work node".into()
+                        );
+                    }
+                    let node = &receipt.work_nodes[0];
+                    let refresh = node
+                        .base_refresh
+                        .as_ref()
+                        .ok_or("refresh proof has no branch refresh receipt")?;
+                    let source = node
+                        .base_refresh_source
+                        .as_ref()
+                        .ok_or("refresh proof has no prior publication authority")?;
+                    let repository = config
+                        .repositories
+                        .get(&node.repository_id)
+                        .ok_or("refreshed repository is no longer configured")?;
+                    let next_revision = run
+                        .revision
+                        .checked_add(1)
+                        .ok_or("TicketRun revision overflow")?;
+                    let publication = crate::delivery_runtime::PublishImplementationEffectPayload {
+                        schema_version: 1,
+                        source_revision: next_revision,
+                        configuration_digest: configuration_digest.clone(),
+                        ticket_namespace: run.namespace.clone(),
+                        ticket_id: run.ticket_id.clone(),
+                        ticket_run_id: run.ticket_run_id.clone(),
+                        work_node_id: node.work_node_id.clone(),
+                        repository_id: node.repository_id.clone(),
+                        expected_base_sha: refresh.new_parent_sha.clone(),
+                        base_branch: repository.base_branch.clone(),
+                        commit_mode: node.commit_mode,
+                        commit: crate::delivery_runtime::WorkerDeliveryCommit::HostBaseRefresh {
+                            prepare_operation_id: OperationId::parse(intent.operation_id.clone())?,
+                            prepare_receipt_digest: crate::domain::ids::Digest::parse(sha256_hex(
+                                stored.receipt_json().as_bytes(),
+                            ))?,
+                            prior_publication_operation_id: source
+                                .prior_publication_operation_id
+                                .clone(),
+                            prior_publication_receipt_digest: source
+                                .prior_publication_receipt_digest
+                                .clone(),
+                            receipt: Box::new(refresh.clone()),
+                        },
+                        expected_remote_head: Some(refresh.old_child_head.clone()),
+                        pull_request: crate::delivery_runtime::PullRequestContent {
+                            title: source.pull_request_title.clone(),
+                            body: source.exact_body.clone(),
+                            update_target: Some(crate::delivery_forge::PullRequestTarget {
+                                number: source.pull_request_number,
+                                expected_head: refresh.old_child_head.clone(),
+                            }),
+                        },
+                    };
+                    let (request_json, request_digest) =
+                        crate::delivery_runtime::canonical_delivery_payload(&publication)?;
+                    let operation_id = OperationId::parse(format!(
+                        "refresh-publish-{}",
+                        sha256_hex(
+                            format!(
+                                "{}:{}",
+                                intent.operation_id, source.prior_publication_operation_id
+                            )
+                            .as_bytes()
+                        )
+                    ))?;
+                    publish_effects.push(EffectIntent {
+                        project_id: run.project_id.clone(),
+                        subject_type: "ticket_run".into(),
+                        subject_id: run.ticket_run_id.as_str().into(),
+                        operation_id: operation_id.as_str().into(),
+                        logical_key: format!(
+                            "{}:{}:host-base-refresh-publication",
+                            run.ticket_run_id, next_revision
+                        ),
+                        kind: effect_name(EffectKind::PublishImplementation).into(),
+                        request_digest,
+                        request_json,
+                        expected_revision: Some(next_revision),
+                    });
+                }
                 let payload_json = serde_json::json!({
                     "schema_version": 1,
                     "kind": "worktrees_prepared",
@@ -214,7 +300,7 @@ pub fn consume_one_host_transition(
                     Input::WorktreesPrepared(proof),
                     "host-validated worktree preparation receipt",
                     &payload_json,
-                    &[],
+                    &publish_effects,
                 )?;
                 return Ok(true);
             }
@@ -623,7 +709,7 @@ fn advance_work_plan_stage(
             let Some(expected_revision) = intent.expected_revision else {
                 continue;
             };
-            if expected_revision > run.revision {
+            if expected_revision < accepted.accepted_revision || expected_revision > run.revision {
                 continue;
             }
             let payload: PrepareWorktreesEffectPayload =
@@ -661,6 +747,9 @@ fn advance_work_plan_stage(
             let Some(expected_revision) = intent.expected_revision else {
                 continue;
             };
+            if expected_revision < accepted.accepted_revision {
+                continue;
+            }
             if expected_revision > run.revision {
                 continue;
             }
@@ -701,10 +790,18 @@ fn advance_work_plan_stage(
     let Some((_, current_receipt, current_proof)) = current_publication else {
         return Ok(false);
     };
+    let mut prepared_nodes = prepared.values().cloned().collect::<Vec<_>>();
+    let mut base_refreshes = prepared_nodes
+        .iter()
+        .filter_map(|node| node.base_refresh.clone())
+        .collect::<Vec<_>>();
+    prepared_nodes.sort_by(|left, right| left.work_node_id.cmp(&right.work_node_id));
+    base_refreshes.sort_by(|left, right| left.branch.cmp(&right.branch));
     let mut prepared_receipt = PreparedWorktreesEffectReceipt {
         schema_version: 1,
         ticket_run_id: run.ticket_run_id.clone(),
-        work_nodes: prepared.values().cloned().collect(),
+        work_nodes: prepared_nodes,
+        base_refreshes,
     };
     prepared_receipt
         .work_nodes
@@ -998,6 +1095,87 @@ fn advance_approved_merge_procedure(
         )?;
         return Ok(true);
     }
+
+    // A provider-reconciled prepared-body step proves the old effect's exact
+    // target is already present, but it does not authorize continuing into a
+    // merge when the immutable work item has no execution-time base guard.
+    // Start a fresh assessment now; this preserves the body receipt while
+    // ensuring no later step is emitted under the stale approval.
+    if item.document.authority.execution_time_base_guard != crate::merge_policy::EvidenceState::Pass
+        && completed.len() == 1
+        && item.document.procedure.steps.first().is_some_and(|first| {
+            first.key == completed[0].step_key
+                && matches!(
+                    first.operation,
+                    MergeProcedureOperation::UpdatePullRequestBody { .. }
+                )
+        })
+        && item.document.procedure.steps.len() > 1
+    {
+        let receipt = &completed[0];
+        let subject = &item.document.assessment.subject;
+        let body_matches_work = match &receipt.effect_intent.operation {
+            crate::forge::MergeEffectOperation::UpdateBody(body) => {
+                let expected_body_digest = item
+                    .document
+                    .prepared_body
+                    .as_deref()
+                    .map(|body| sha256_hex(body.as_bytes()));
+                body.pull.number.to_string() == subject.pull_request_id
+                    && body.pull.expected_node_id.as_deref()
+                        == Some(subject.pull_request_node_id.as_str())
+                    && body.pull.repository.expected_id == Some(subject.forge_repository_id)
+                    && body.pull.repository.host == subject.forge_host
+                    && body.expected_head_sha == subject.head_sha
+                    && item.document.prepared_body.as_deref() == Some(body.exact_body.as_str())
+                    && expected_body_digest.as_deref() == Some(body.approved_body_digest.as_str())
+            }
+            _ => false,
+        };
+        if !body_matches_work {
+            return Ok(false);
+        }
+        let receipt_digest = crate::domain::ids::Digest::parse(sha256_hex(
+            crate::store::canonical_json(receipt)?.as_bytes(),
+        ))?;
+        let proof = crate::engine::reducer::MergeReassessmentProof::from_reconciled_first_step(
+            item.work_id.as_str().to_owned(),
+            receipt_digest.clone(),
+        )?;
+        let prior_plan = store
+            .latest_accepted_work_plan(&run.project_id, &run.ticket_run_id)?
+            .ok_or("reassessment has no previously accepted work plan")?;
+        if prior_plan.plan_digest != item.accepted_plan_digest {
+            return Err("reassessment MergeWork does not bind the current accepted plan".into());
+        }
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "merge_reassessment_required",
+            "ticket_run_id": run.ticket_run_id,
+            "source_revision": run.revision,
+            "work_id": item.work_id,
+            "receipt_digest": receipt_digest,
+            "required_next_action": "reassess only the existing work against the current protected base; preserve the same work-node IDs, repositories, tasks, dependencies, and accepted scope; the controller will refresh the owned branch and require a fresh Reviewer result, Merge Decision, and human approval",
+            "prior_accepted_plan_digest": prior_plan.plan_digest,
+            "prior_accepted_plan": prior_plan.proposal,
+        })
+        .to_string();
+        let input = durable_host_input(
+            &format!("merge-reassessment:{}:{}", item.work_id, run.revision),
+            &payload,
+        );
+        store.commit_ticket_transition(
+            owner_generation,
+            &run.ticket_run_id,
+            revision,
+            &input,
+            Input::MergeReassessmentRequired(proof),
+            "host reconciled the prepared body but the saved merge work has no execution-time base guard; a fresh assessment and approval are required",
+            &payload,
+            &[],
+        )?;
+        return Ok(true);
+    }
     let Some(next_index) = item
         .document
         .procedure
@@ -1275,6 +1453,13 @@ fn validate_prepared_stage_against_plan(
         let Some(prepared_node) = prepared.get(&publication.work_node_id) else {
             continue;
         };
+        if prepared_node.base_refresh.is_some()
+            && publication.expected_base_sha != prepared_node.base_sha
+        {
+            // The old publication remains historical evidence, but cannot be
+            // rebound to the host-refreshed worktree as current authority.
+            continue;
+        }
         let Some(revision) = stored.intent().expected_revision else {
             continue;
         };
@@ -1451,7 +1636,10 @@ mod tests {
                 branch: "rex/run-12/implementation".into(),
                 base_sha: "b".repeat(40),
                 commit_mode: CommitMode::Native,
+                base_refresh: None,
+                base_refresh_source: None,
             }],
+            base_refreshes: Vec::new(),
         }
     }
 
@@ -1474,15 +1662,20 @@ mod tests {
 
     #[test]
     fn merge_work_receipt_consumer_enforces_approval_and_builds_postmortem_inbox() {
-        merge_review_approval_fixture(false);
+        merge_review_approval_fixture(false, false);
     }
 
     #[test]
     fn verified_merge_persists_required_operator_plan_and_launch_readiness() {
-        merge_review_approval_fixture(true);
+        merge_review_approval_fixture(true, false);
     }
 
-    fn merge_review_approval_fixture(required_operations: bool) {
+    #[test]
+    fn reconciled_prepared_body_reassesses_before_old_merge_step_is_queued() {
+        merge_review_approval_fixture(false, true);
+    }
+
+    fn merge_review_approval_fixture(required_operations: bool, reassessment_case: bool) {
         use crate::domain::ids::{
             Digest, HumanRequestId, OperationId, ProjectId, Revision, TicketRunId,
         };
@@ -1595,6 +1788,8 @@ mod tests {
             project_id: ProjectId,
             ticket_run_id: TicketRunId,
             config_digest: Digest,
+            accepted_plan_digest: Digest,
+            reassessment_case: bool,
         ) -> MergeWorkItem {
             let comments = Vec::<crate::forge::IssueComment>::new();
             let comments_digest = crate::forge::canonical_digest(&comments).unwrap();
@@ -1616,7 +1811,11 @@ mod tests {
                 merge_comments_digest: comments_digest,
                 base_guard_digest: Some(digest('6')),
                 review_digest: digest('7'),
-                prepared_body_digest: Some(digest('8')),
+                prepared_body_digest: Some(if reassessment_case {
+                    Digest::parse(super::sha256_hex(b"Prior body\n")).unwrap()
+                } else {
+                    digest('8')
+                }),
             };
             let policy = MergePolicy {
                 auto_merge_enabled: false,
@@ -1634,33 +1833,55 @@ mod tests {
                 risk: Vec::new(),
                 confidence: Confidence::High,
                 human_review_required: true,
-                execution_time_base_guard: EvidenceState::Pass,
+                execution_time_base_guard: if reassessment_case {
+                    EvidenceState::Unknown
+                } else {
+                    EvidenceState::Pass
+                },
             };
             let assessment = evaluate_merge_policy(&policy, &evidence).unwrap();
+            let mut procedure_steps = Vec::new();
+            if reassessment_case {
+                procedure_steps.push(MergeProcedureStep {
+                    key: "body".into(),
+                    prerequisites: Vec::new(),
+                    operation: MergeProcedureOperation::UpdatePullRequestBody {
+                        expected_prior_body_digest: subject.prepared_body_digest.clone().unwrap(),
+                        approved_body_digest: Digest::parse(super::sha256_hex(b"Reviewed body\n"))
+                            .unwrap(),
+                    },
+                    instruction_digest: subject.instruction_digest.clone(),
+                });
+            }
+            procedure_steps.extend([
+                MergeProcedureStep {
+                    key: "merge".into(),
+                    prerequisites: if reassessment_case {
+                        vec!["body".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    operation: MergeProcedureOperation::ExecuteMerge {
+                        expected_head_sha: subject.head_sha.clone(),
+                        base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
+                    },
+                    instruction_digest: subject.instruction_digest.clone(),
+                },
+                MergeProcedureStep {
+                    key: "verify".into(),
+                    prerequisites: vec!["merge".into()],
+                    operation: MergeProcedureOperation::VerifyMergeCommit {
+                        expected_trailers: vec![
+                            "Co-authored-by: Agent <agent@example.test>".into(),
+                        ],
+                    },
+                    instruction_digest: subject.instruction_digest.clone(),
+                },
+            ]);
             let procedure = crate::merge_policy::build_merge_procedure(
                 policy.method,
                 policy.executor,
-                vec![
-                    MergeProcedureStep {
-                        key: "merge".into(),
-                        prerequisites: Vec::new(),
-                        operation: MergeProcedureOperation::ExecuteMerge {
-                            expected_head_sha: subject.head_sha.clone(),
-                            base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
-                        },
-                        instruction_digest: subject.instruction_digest.clone(),
-                    },
-                    MergeProcedureStep {
-                        key: "verify".into(),
-                        prerequisites: vec!["merge".into()],
-                        operation: MergeProcedureOperation::VerifyMergeCommit {
-                            expected_trailers: vec![
-                                "Co-authored-by: Agent <agent@example.test>".into(),
-                            ],
-                        },
-                        instruction_digest: subject.instruction_digest.clone(),
-                    },
-                ],
+                procedure_steps,
                 &subject,
             )
             .unwrap();
@@ -1669,19 +1890,43 @@ mod tests {
                 assessment_id: "assessment-1".into(),
                 pr_identities: vec!["example#9".into()],
                 policy_digest: policy_digest.clone(),
-                prepared_body_digest: subject.prepared_body_digest.clone().unwrap(),
-                steps: vec![
-                    crate::engine::orchestration::MergeProcedureStep {
-                        kind: MergeProcedureStepKind::DirectMerge,
-                        instruction_reference: "merge.instructions#merge".into(),
-                        rationale: "execute the approved merge".into(),
-                    },
-                    crate::engine::orchestration::MergeProcedureStep {
-                        kind: MergeProcedureStepKind::VerifyMergeCommit,
-                        instruction_reference: "merge.instructions#verify".into(),
-                        rationale: "verify the resulting commit".into(),
-                    },
-                ],
+                prepared_body_digest: if reassessment_case {
+                    Digest::parse(super::sha256_hex(b"Reviewed body\n")).unwrap()
+                } else {
+                    subject.prepared_body_digest.clone().unwrap()
+                },
+                steps: if reassessment_case {
+                    vec![
+                        crate::engine::orchestration::MergeProcedureStep {
+                            kind: MergeProcedureStepKind::UpdatePullRequestBody,
+                            instruction_reference: "merge.instructions#body".into(),
+                            rationale: "ensure the prepared body is present".into(),
+                        },
+                        crate::engine::orchestration::MergeProcedureStep {
+                            kind: MergeProcedureStepKind::DirectMerge,
+                            instruction_reference: "merge.instructions#merge".into(),
+                            rationale: "execute the approved merge".into(),
+                        },
+                        crate::engine::orchestration::MergeProcedureStep {
+                            kind: MergeProcedureStepKind::VerifyMergeCommit,
+                            instruction_reference: "merge.instructions#verify".into(),
+                            rationale: "verify the resulting commit".into(),
+                        },
+                    ]
+                } else {
+                    vec![
+                        crate::engine::orchestration::MergeProcedureStep {
+                            kind: MergeProcedureStepKind::DirectMerge,
+                            instruction_reference: "merge.instructions#merge".into(),
+                            rationale: "execute the approved merge".into(),
+                        },
+                        crate::engine::orchestration::MergeProcedureStep {
+                            kind: MergeProcedureStepKind::VerifyMergeCommit,
+                            instruction_reference: "merge.instructions#verify".into(),
+                            rationale: "verify the resulting commit".into(),
+                        },
+                    ]
+                },
                 post_merge_verification: vec![PostMergeVerification {
                     kind: PostMergeVerificationKind::MergeCommitRecorded,
                     instruction_reference: "merge.instructions#verify".into(),
@@ -1705,11 +1950,15 @@ mod tests {
                     instruction_digest: subject.instruction_digest.clone(),
                     sources: Default::default(),
                     request_comment_proofs: Vec::new(),
-                    execution_time_base_guard: EvidenceState::Pass,
+                    execution_time_base_guard: if reassessment_case {
+                        EvidenceState::Unknown
+                    } else {
+                        EvidenceState::Pass
+                    },
                     base_guard_digest: subject.base_guard_digest.clone(),
                 },
                 procedure,
-                prepared_body: None,
+                prepared_body: reassessment_case.then(|| "Reviewed body\n".into()),
             };
             MergeWorkItem::new(
                 project_id,
@@ -1717,7 +1966,7 @@ mod tests {
                 Revision(4),
                 Revision(6),
                 config_digest,
-                digest('c'),
+                accepted_plan_digest,
                 digest('d'),
                 digest('e'),
                 document,
@@ -1844,10 +2093,37 @@ mod tests {
         };
         store.register_rex_view(generation, &view).unwrap();
 
+        let accepted_proposal = crate::engine::orchestration::WorkPlan {
+            nodes: vec![crate::engine::orchestration::PlannedWorkNode {
+                id: crate::engine::orchestration::WorkNodeId::parse("worker").unwrap(),
+                repository: crate::domain::ids::RepositoryId::parse("example").unwrap(),
+                task: "Implement the accepted ticket scope".into(),
+                depends_on: Vec::new(),
+                required_evidence: vec!["tests".into()],
+                investigation: false,
+            }],
+            requested_investigation_children: 0,
+        };
+        let persisted_plan = crate::store::accepted_plans::PersistedWorkPlan {
+            schema_version: 1,
+            proposal: accepted_proposal,
+            observed_base_shas: std::collections::BTreeMap::from([(
+                crate::domain::ids::RepositoryId::parse("example").unwrap(),
+                "b".repeat(40),
+            )]),
+        };
+        let plan_json = crate::store::canonical_json(&persisted_plan).unwrap();
+        let plan_digest = Digest::parse(super::sha256_hex(plan_json.as_bytes())).unwrap();
+        store.test_connection().execute(
+            "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,2,?3,?4,?5,'source-evidence','coordinator-run','source-message',?6,'coordinator-run','coordinator-session',?7,1)",
+            params![project_id.as_str(), ticket_run_id.as_str(), loaded.digest.as_str(), plan_digest.as_str(), plan_json, "a".repeat(64), "b".repeat(64)],
+        ).unwrap();
         let work_item = item(
             project_id.clone(),
             ticket_run_id.clone(),
             loaded.digest.clone(),
+            plan_digest,
+            reassessment_case,
         );
         let work_json = crate::store::canonical_json(&serde_json::json!({
             "schema_version": 1,
@@ -1940,14 +2216,19 @@ mod tests {
         assert_eq!(awaiting.revision, 6);
         let first = store
             .effect_by_logical_key(&format!(
-                "{}:6:{}:000:merge",
-                ticket_run_id, work_item.work_id
+                "{}:6:{}:000:{}",
+                ticket_run_id,
+                work_item.work_id,
+                if reassessment_case { "body" } else { "merge" }
             ))
             .unwrap()
             .unwrap();
         let first_request: MergeStepEffectRequest =
             serde_json::from_str(&first.request_json).unwrap();
-        assert_eq!(first_request.step_key, "merge");
+        assert_eq!(
+            first_request.step_key,
+            if reassessment_case { "body" } else { "merge" }
+        );
         assert_eq!(first.expected_revision, Some(6));
 
         let merge_kind = super::effect_name(EffectKind::Merge).to_owned();
@@ -1968,6 +2249,115 @@ mod tests {
             number: 9,
             expected_node_id: Some("PR_node".into()),
         };
+        if reassessment_case {
+            let operation_key = format!("{}:body", first.operation_id);
+            let body = BodyUpdateIntent {
+                pull: pull.clone(),
+                operation_key: operation_key.clone(),
+                expected_head_sha: "a".repeat(40),
+                expected_prior_body_digest: Digest::parse(super::sha256_hex(b"Prior body\n"))
+                    .unwrap(),
+                exact_body: "Reviewed body\n".into(),
+                approved_body_digest: Digest::parse(super::sha256_hex(b"Reviewed body\n")).unwrap(),
+            };
+            let request_digest = crate::forge::canonical_digest(&body).unwrap();
+            let effect_intent = MergeEffectIntent {
+                pull: pull.clone(),
+                operation_key: operation_key.clone(),
+                request_digest: request_digest.clone(),
+                operation: MergeEffectOperation::UpdateBody(body),
+                attempt_started_unix: 16,
+            };
+            let receipt = MergeStepReceipt {
+                step_key: "body".into(),
+                operation_key: operation_key.clone(),
+                certainty: EffectCertainty::Recovered,
+                request_digest: request_digest.clone(),
+                effect_intent,
+                acknowledgement: EffectAcknowledgement {
+                    operation_key,
+                    request_digest,
+                    certainty: EffectCertainty::Recovered,
+                    external_id: None,
+                    external_url: None,
+                    resulting_head_sha: Some("a".repeat(40)),
+                    resulting_merge_sha: None,
+                    reason: Some(
+                        "exact prepared body observed during provider reconciliation".into(),
+                    ),
+                },
+            };
+            let receipt_json = crate::store::canonical_json(&receipt).unwrap();
+            store
+                .finish_effect(
+                    &first.operation_id,
+                    generation,
+                    EffectOutcome::Succeeded,
+                    Some(&receipt_json),
+                )
+                .unwrap();
+            assert!(
+                super::consume_one_host_transition(
+                    &mut store,
+                    generation,
+                    14,
+                    &config,
+                    &loaded.digest,
+                )
+                .unwrap()
+            );
+            let reassessed = store
+                .active_ticket_runs(generation, 10)
+                .unwrap()
+                .into_iter()
+                .find(|run| run.ticket_run_id == ticket_run_id)
+                .unwrap();
+            assert_eq!(reassessed.phase, super::Phase::Planning);
+            assert_eq!(reassessed.revision, 7);
+            assert!(
+                store
+                    .effect_by_logical_key(&format!(
+                        "{}:6:{}:001:merge",
+                        ticket_run_id, work_item.work_id
+                    ))
+                    .unwrap()
+                    .is_none()
+            );
+            let coordinator_wakes = store
+                .pending_role_wake_inputs(
+                    &project_id,
+                    &format!("ticket_run:{ticket_run_id}:coordinator"),
+                    8,
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == 7
+                        && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(coordinator_wakes.len(), 1);
+            let transition_evidence = store
+                .ticket_run_transition_evidence(generation, &project_id, &ticket_run_id, 6, 1)
+                .unwrap();
+            assert_eq!(
+                transition_evidence[0].1["kind"],
+                "merge_reassessment_required"
+            );
+            assert_eq!(
+                transition_evidence[0].1["work_id"],
+                work_item.work_id.as_str()
+            );
+            assert!(transition_evidence[0].1["receipt_digest"].is_string());
+            assert!(
+                store
+                    .accepted_merge_work_review_approval(&request_id, &work_item, 15)
+                    .unwrap()
+                    .is_some()
+            );
+            return;
+        }
         let direct_merge = DirectMergeIntent {
             pull: pull.clone(),
             operation_key: operation_key.clone(),

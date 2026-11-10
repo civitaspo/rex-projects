@@ -61,6 +61,7 @@ pub enum Input {
     ReviewEscalationRequired,
     RequireHumanReview,
     MergeAssessmentCorrectionExhausted,
+    MergeReassessmentRequired(MergeReassessmentProof),
     HumanReviewApproved,
     HumanReviewRevisionRequested,
     MergeVerified,
@@ -72,6 +73,30 @@ pub enum Input {
     ExternalCanceled,
     Pause,
     Resume,
+}
+
+/// Evidence created by the host transition consumer after reconciling the first
+/// approved merge-procedure step and finding that the saved work has no
+/// execution-time base guard. Agents and protocol callers cannot construct it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeReassessmentProof {
+    work_id: String,
+    receipt_digest: crate::domain::ids::Digest,
+}
+
+impl MergeReassessmentProof {
+    pub(crate) fn from_reconciled_first_step(
+        work_id: String,
+        receipt_digest: crate::domain::ids::Digest,
+    ) -> Result<Self, String> {
+        if work_id.is_empty() || work_id.len() > 256 {
+            return Err("merge reassessment work identity is invalid".into());
+        }
+        Ok(Self {
+            work_id,
+            receipt_digest,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -158,9 +183,15 @@ pub fn reduce(
         Input::WorktreesPrepared(proof)
             if current.phase == Phase::Preparing && proof.matches(current) =>
         {
-            next.phase = Phase::Implementing;
-            next.activity = Activity::Running;
-            wakes.push(WakeTarget::TicketRole(Role::Worker));
+            if proof.has_base_refresh() {
+                next.phase = Phase::Publishing;
+                next.activity = Activity::Running;
+                effects.push(EffectKind::PublishImplementation);
+            } else {
+                next.phase = Phase::Implementing;
+                next.activity = Activity::Running;
+                wakes.push(WakeTarget::TicketRole(Role::Worker));
+            }
         }
         Input::EvidenceSubmitted if current.phase == Phase::Implementing => {
             next.phase = Phase::Publishing;
@@ -219,6 +250,17 @@ pub fn reduce(
             // Supervisor must surface the blocked decision for human direction.
             next.activity = Activity::Blocked;
             wakes.push(WakeTarget::Supervisor);
+        }
+        Input::MergeReassessmentRequired(proof) if current.phase == Phase::AwaitingMerge => {
+            // The host transition consumer has reconciled the first procedure
+            // step and binds this correction to its immutable work and receipt.
+            // Re-plan through the normal delivery path so any protected-base
+            // refresh creates a new publication and review subject. The old
+            // review and merge approvals are not carried across this revision.
+            let _reconciled_identity = (proof.work_id, proof.receipt_digest);
+            next.phase = Phase::Planning;
+            next.activity = Activity::Running;
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         Input::HumanReviewApproved
             if current.phase == Phase::WaitingHuman
