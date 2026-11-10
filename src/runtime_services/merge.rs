@@ -880,7 +880,7 @@ fn instruction_sources(
     files.dedup();
     let mut sources = BTreeMap::new();
     if let Some(instructions) = &repository.merge.instructions {
-        let key = "inline:merge.instructions".to_owned();
+        let key = format!("repository:{repository_id}:merge");
         sources.insert(
             key.clone(),
             crate::merge_executor::TrustedInstructionSource {
