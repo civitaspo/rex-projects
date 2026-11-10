@@ -227,6 +227,21 @@ pub struct AcceptedPublicationAdoptionApproval {
     authority: crate::human_runtime::PublicationAdoptionAuthority,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedTicketStatusAdoptionApproval {
+    receipt: HumanApprovalReceipt,
+    authority: crate::human_runtime::TicketStatusAdoptionAuthority,
+}
+
+impl AcceptedTicketStatusAdoptionApproval {
+    pub fn receipt(&self) -> &HumanApprovalReceipt {
+        &self.receipt
+    }
+    pub fn authority(&self) -> &crate::human_runtime::TicketStatusAdoptionAuthority {
+        &self.authority
+    }
+}
+
 /// Exact human approval of one immutable MergeWorkItem. The work item is reloaded and checked
 /// against the request before this capability is minted.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -604,6 +619,7 @@ impl ConfigStore {
                     Some(source)
                 }
                 crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption { .. }
+                | crate::human_runtime::HumanAuthorityMaterial::TicketStatusAdoption { .. }
                 | crate::human_runtime::HumanAuthorityMaterial::MergeWorkReview { .. } => None,
             };
             if let Some(source) = source
@@ -1385,6 +1401,57 @@ impl ConfigStore {
             receipt,
             authority: material,
         }))
+    }
+
+    pub fn accepted_ticket_status_adoption_approval(
+        &self,
+        request_id: &HumanRequestId,
+        now: u64,
+    ) -> Result<Option<AcceptedTicketStatusAdoptionApproval>, String> {
+        let Some(summary) = load_request(&self.connection, request_id)? else {
+            return Ok(None);
+        };
+        if summary.request.purpose != crate::human_runtime::HumanPurpose::PublicationAdoption {
+            return Ok(None);
+        }
+        let Some(crate::human_runtime::HumanAuthorityMaterial::TicketStatusAdoption { material }) =
+            self.human_request_authority(request_id)?
+        else {
+            return Ok(None);
+        };
+        if crate::human_runtime::ticket_status_adoption_request(
+            request_id.clone(),
+            material.clone(),
+        )? != summary.request
+        {
+            return Ok(None);
+        }
+        let subject_digest = summary.request.subject.digest()?;
+        let Some(receipt) = self.accepted_human_approval(
+            request_id,
+            &subject_digest,
+            &summary.request.subject.configuration_digest,
+            &summary.request.subject.policy_digest,
+            now,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AcceptedTicketStatusAdoptionApproval {
+            receipt,
+            authority: material,
+        }))
+    }
+
+    pub fn active_ticket_run_view_id(
+        &self,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<Option<Digest>, String> {
+        let view: Option<String> = self.connection.query_row(
+            "SELECT v.view_id FROM rex_views v JOIN ticket_runs t ON t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id WHERE t.ticket_run_id=?1 AND v.view_kind='ticket' AND v.lifecycle='active' ORDER BY v.view_epoch DESC LIMIT 1",
+            [ticket_run_id.as_str()], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        view.map(Digest::parse).transpose()
     }
 
     pub fn accepted_merge_work_review_approval(
