@@ -14,7 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{AgentRunId, Digest, ProjectId, Revision, TicketRunId};
+use crate::domain::ids::{
+    AgentRunId, Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRevision, TicketRunId,
+};
 use crate::domain::types::Role;
 use crate::engine::orchestration::{
     RoleResultBinding, RoleResultSubmission, ValidatedRoleResult, WakeSessionKey,
@@ -3489,8 +3491,10 @@ pub(crate) mod tests {
             .execute_batch(
                 "CREATE TABLE role_wake_inputs(wake_input_id INTEGER, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, payload_json TEXT);
                  INSERT INTO role_wake_inputs VALUES (1,'project-a','ticket_run:ticket-run:coordinator','ticket_run_dispatch','ticket-run','{\"supervisor_evidence_id\":\"dispatch-evidence\"}');
-                 CREATE TABLE ticket_runs(ticket_run_id TEXT, project_id TEXT, ticket_id TEXT, external_revision TEXT);
-                 INSERT INTO ticket_runs VALUES ('ticket-run','project-a','ticket-42','rev-8');
+                 CREATE TABLE ticket_runs(ticket_run_id TEXT, project_id TEXT, ticket_id TEXT, namespace TEXT, generation INTEGER, external_revision TEXT);
+                 INSERT INTO ticket_runs VALUES ('ticket-run','project-a','ticket-42','fixture',1,'rev-9');
+                 CREATE TABLE transitions(project_id TEXT, entity_type TEXT, entity_id TEXT, old_revision INTEGER, new_revision INTEGER, input_id TEXT, evidence_json TEXT);
+                 INSERT INTO transitions VALUES ('project-a','ticket_run','ticket-run',0,1,'dispatch:fixture:ticket-42','{\"namespace\":\"fixture\",\"ticket_id\":\"ticket-42\",\"generation\":1,\"recipe_id\":null,\"observed_revision\":\"rev-8\"}');
                  CREATE TABLE agent_result_evidence(evidence_id TEXT, agent_run_id TEXT, project_id TEXT, role TEXT, ticket_run_id TEXT, outcome TEXT, result_json TEXT);
                  CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT, descriptor_digest TEXT, authority_digest TEXT);",
             )
@@ -3523,6 +3527,57 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(parent.agent_run_id.as_str(), "supervisor-run");
         assert_eq!(parent.role, Role::Supervisor);
+
+        for (input_id, evidence_json) in [
+            ("dispatch:fixture:ticket-42", "{"),
+            (
+                "dispatch:fixture:ticket-42",
+                r#"{"namespace":"fixture","ticket_id":"ticket-42","generation":1,"recipe_id":null,"observed_revision":"rev-7"}"#,
+            ),
+            (
+                "dispatch:fixture:ticket-42",
+                r#"{"namespace":"fixture","ticket_id":"ticket-42","generation":1,"recipe_id":null}"#,
+            ),
+            (
+                "dispatch:other:ticket-42",
+                r#"{"namespace":"other","ticket_id":"ticket-42","generation":1,"recipe_id":null,"observed_revision":"rev-8"}"#,
+            ),
+            (
+                "dispatch:fixture:ticket-43",
+                r#"{"namespace":"fixture","ticket_id":"ticket-43","generation":1,"recipe_id":null,"observed_revision":"rev-8"}"#,
+            ),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE transitions SET input_id=?1,evidence_json=?2 WHERE project_id='project-a' AND entity_type='ticket_run' AND entity_id='ticket-run' AND new_revision=1",
+                    rusqlite::params![input_id, evidence_json],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .supervisor_parent_for_ticket_run(
+                        &ProjectId::parse("project-a").unwrap(),
+                        &TicketRunId::parse("ticket-run").unwrap(),
+                    )
+                    .is_err()
+            );
+        }
+        store
+            .connection
+            .execute(
+                "DELETE FROM transitions WHERE project_id='project-a' AND entity_type='ticket_run' AND entity_id='ticket-run' AND new_revision=1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .supervisor_parent_for_ticket_run(
+                    &ProjectId::parse("project-a").unwrap(),
+                    &TicketRunId::parse("ticket-run").unwrap(),
+                )
+                .is_err()
+        );
     }
 
     pub(super) fn test_authority() -> AgentLaunchAuthority {
@@ -9954,12 +10009,12 @@ impl ConfigStore {
             .get("supervisor_evidence_id")
             .and_then(serde_json::Value::as_str)
             .ok_or("TicketRun dispatch has no Supervisor source evidence")?;
-        let ticket: (String, Option<String>) = self
+        let ticket: (String, String, u64) = self
             .connection
             .query_row(
-                "SELECT ticket_id,external_revision FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+                "SELECT ticket_id,namespace,generation FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
                 rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|error| error.to_string())?;
         let (run_id, result_json): (String, String) = self
@@ -9995,9 +10050,42 @@ impl ConfigStore {
         else {
             return Err("Supervisor dispatch evidence has a different typed payload".into());
         };
+        #[derive(serde::Deserialize)]
+        struct InitialDispatchEvidence {
+            namespace: TicketNamespace,
+            ticket_id: TicketId,
+            generation: u64,
+            observed_revision: Option<TicketRevision>,
+        }
+
+        let (old_revision, new_revision, input_id, evidence_json): (i64, i64, String, String) = self
+            .connection
+            .query_row(
+                "SELECT old_revision,new_revision,input_id,evidence_json FROM transitions WHERE project_id=?1 AND entity_type='ticket_run' AND entity_id=?2 AND new_revision=1",
+                rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| format!("TicketRun has no immutable initial dispatch provenance: {error}"))?;
+        if old_revision != 0 || new_revision != 1 {
+            return Err(
+                "TicketRun initial dispatch provenance has an invalid transition revision".into(),
+            );
+        }
+        let provenance: InitialDispatchEvidence =
+            crate::protocol::parse_unique(evidence_json.as_bytes())?;
+        let expected_input_id =
+            format!("dispatch:{}:{}", provenance.namespace, provenance.ticket_id);
         let expected_revision = request.expected_ticket_revision.as_str();
-        if request.ticket_reference.as_str() != ticket.0
-            || ticket.1.as_deref() != Some(expected_revision)
+        let observed_revision = provenance
+            .observed_revision
+            .as_ref()
+            .ok_or("TicketRun initial dispatch provenance has no observed external revision")?;
+        if input_id != expected_input_id
+            || provenance.ticket_id.as_str() != ticket.0
+            || provenance.namespace.as_str() != ticket.1
+            || provenance.generation != ticket.2
+            || request.ticket_reference.as_str() != ticket.0
+            || observed_revision.as_str() != expected_revision
         {
             return Err(
                 "TicketRun dispatch does not match its Supervisor's exact ticket observation"
