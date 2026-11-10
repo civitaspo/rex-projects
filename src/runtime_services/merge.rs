@@ -641,12 +641,26 @@ impl RuntimeMergeEvidenceSource {
         {
             return Err("merge step does not match its immutable MergeWorkItem".into());
         }
-        let current = context
-            .store
-            .active_ticket_runs(context.owner_generation, 512)?
-            .into_iter()
-            .find(|run| run.ticket_run_id == ticket_run_id)
-            .ok_or("TicketRun for merge effect is no longer active")?;
+        let mut offset = 0;
+        let current = loop {
+            let page = context.store.active_ticket_runs_page_for_project(
+                context.owner_generation,
+                &request.intent.project_id,
+                offset,
+                256,
+            )?;
+            let page_len = page.len();
+            if let Some(run) = page
+                .into_iter()
+                .find(|run| run.ticket_run_id == ticket_run_id)
+            {
+                break run;
+            }
+            if page_len < 256 {
+                return Err("TicketRun for merge effect is no longer active".into());
+            }
+            offset += page_len as u64;
+        };
         if current.phase != crate::engine::reducer::Phase::AwaitingMerge
             || current.revision != step_request.awaiting_merge_revision.0
             || current.project_id != request.intent.project_id
@@ -1457,6 +1471,18 @@ pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    pub(crate) fn reconcile_merge_for_store_test(
+        applied: AppliedConfig,
+        request: &crate::effects::EffectRequest,
+        context: &mut crate::effects::EffectContext<'_>,
+    ) -> Result<crate::effects::EffectObservation, String> {
+        RuntimeMergeEvidenceSource::new(applied, Vec::new(), BTreeMap::new()).run_merge_step(
+            crate::effects::EffectMode::Reconcile,
+            request,
+            context,
+        )
+    }
 
     struct FixtureRunner {
         replies: Mutex<VecDeque<Vec<u8>>>,
