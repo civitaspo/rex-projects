@@ -184,8 +184,11 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     trace.push(json!({"step":"local_bare_repository_and_profiles","status":"passed","provider":"EMULATED"}));
 
     let config_path = request.fixture_root.join("config.toml");
-    fs::write(&config_path, config_text(&request, &executable))
-        .map_err(|error| format!("write fixture config: {error}"))?;
+    fs::write(
+        &config_path,
+        config_text(&request, &executable, native_worker_block_loss_stage),
+    )
+    .map_err(|error| format!("write fixture config: {error}"))?;
     let seeded_ticket = seed_operations_ticket(&request, &executable)?;
     trace.push(json!({"step":"external_ticket_seeded_through_adapter_protocol","status":"observed","evidence":seeded_ticket}));
     if native_worker_block_loss_stage {
@@ -2413,14 +2416,20 @@ impl FixtureMessageExt for Value {
     }
 }
 
-fn config_text(request: &Request<'_>, executable: &Path) -> String {
+fn config_text(request: &Request<'_>, executable: &Path, native_stage: bool) -> String {
     let db = request.fixture_root.join("tickets.sqlite");
+    let native_runtime_limits = if native_stage {
+        "max_blocks_per_tab = 2\ncompleted_blocks_to_keep = 0\n"
+    } else {
+        ""
+    };
     format!(
         r#"schema_version = 1
 state_root = {:?}
 
 [runtime]
 rex_binary = {:?}
+{}
 external_poll_seconds = 1
 [runtime.environment]
 source = "inherit"
@@ -2484,6 +2493,7 @@ command = [{:?}, "fixture", "operations", "--state-dir", {:?}, "--observe-status
 "#,
         request.fixture_root.join("state").display().to_string(),
         request.rex.display().to_string(),
+        native_runtime_limits,
         executable.display().to_string(),
         db.display().to_string(),
         executable.display().to_string(),
@@ -4853,7 +4863,11 @@ mod tests {
             },
         )
         .unwrap();
-        fs::write(root.join("config.toml"), config_text(&request, &executable)).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            config_text(&request, &executable, false),
+        )
+        .unwrap();
 
         let applied = rex_projects::config::load(&root.join("config.toml")).unwrap();
         let profile = applied
@@ -4909,7 +4923,11 @@ mod tests {
                 },
             )
             .unwrap();
-            fs::write(root.join("config.toml"), config_text(&request, &executable)).unwrap();
+            fs::write(
+                root.join("config.toml"),
+                config_text(&request, &executable, false),
+            )
+            .unwrap();
             let applied = rex_projects::config::load(&root.join("config.toml")).unwrap();
             let worker = applied
                 .profiles
@@ -5362,8 +5380,51 @@ mod tests {
         )
         .unwrap();
         let config = root.join("config.toml");
-        fs::write(&config, config_text(&request, &executable)).unwrap();
+        fs::write(&config, config_text(&request, &executable, false)).unwrap();
         rex_projects::config::load(&config).unwrap();
+    }
+
+    #[test]
+    fn generated_native_config_selects_low_retention_without_changing_defaults() {
+        for (native_stage, expected_max_blocks, expected_completed_keep) in
+            [(false, 8, 1), (true, 2, 0)]
+        {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("acceptance");
+            fs::create_dir(&root).unwrap();
+            let request = Request {
+                cli: Path::new("/usr/bin/true"),
+                rex: Path::new("/usr/bin/true"),
+                rex_server: "unix:///fixture.sock",
+                rex_session: "acceptance-session",
+                expected_instance: "fixture-instance",
+                fixture_root: &root,
+            };
+            let executable = std::env::current_exe().unwrap();
+            prepare_profiles(
+                &request,
+                &executable,
+                request.cli,
+                ProfilePreparation::default(),
+            )
+            .unwrap();
+            let config_path = root.join("config.toml");
+            fs::write(
+                &config_path,
+                config_text(&request, &executable, native_stage),
+            )
+            .unwrap();
+
+            let loaded = rex_projects::config::load(&config_path).unwrap();
+            assert_eq!(
+                loaded.config.runtime.max_blocks_per_tab, expected_max_blocks,
+                "native_stage={native_stage}"
+            );
+            assert_eq!(
+                loaded.config.runtime.completed_blocks_to_keep, expected_completed_keep,
+                "native_stage={native_stage}"
+            );
+        }
     }
 
     fn resolve_test_references(value: Value) -> Value {
