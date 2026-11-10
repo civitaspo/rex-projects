@@ -2231,6 +2231,59 @@ mod tests {
         );
         assert_eq!(first.expected_revision, Some(6));
 
+        if reassessment_case {
+            store
+                .test_connection()
+                .execute(
+                    "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                    [project_id.as_str()],
+                )
+                .unwrap();
+            for index in 0..256 {
+                let earlier_id = format!("run-earlier-{index:03}");
+                store.test_connection().execute(
+                    "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision,required_review_revision) SELECT ?1,project_id,config_source,config_revision,config_digest,namespace,?1,generation,internal_phase,activity,external_status,observed_status,revision,required_review_revision FROM ticket_runs WHERE ticket_run_id=?2",
+                    params![earlier_id, ticket_run_id.as_str()],
+                ).unwrap();
+                store.test_connection().execute(
+                    "INSERT INTO ticket_run_context SELECT ?1,project_id,project_epoch,recipe_id,goal_revision,created_at_unix FROM ticket_run_context WHERE ticket_run_id=?2",
+                    params![earlier_id, ticket_run_id.as_str()],
+                ).unwrap();
+            }
+            let error = crate::runtime_services::merge::tests::reconcile_merge_for_store_test(
+                loaded.clone(),
+                &crate::effects::EffectRequest {
+                    intent: first.clone(),
+                    attempt_count: 1,
+                    created_at_unix: 13,
+                },
+                &mut crate::effects::EffectContext {
+                    store: &mut store,
+                    owner_generation: generation,
+                    now_unix: 13,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "merge observation requires a github.com repository URL"
+            );
+            store
+                .test_connection()
+                .execute(
+                    "DELETE FROM ticket_run_context WHERE ticket_run_id LIKE 'run-earlier-%'",
+                    [],
+                )
+                .unwrap();
+            store
+                .test_connection()
+                .execute(
+                    "DELETE FROM ticket_runs WHERE ticket_run_id LIKE 'run-earlier-%'",
+                    [],
+                )
+                .unwrap();
+        }
+
         let merge_kind = super::effect_name(EffectKind::Merge).to_owned();
         let initial_claim = store
             .claim_next_due_effect(generation, i64::MAX, std::slice::from_ref(&merge_kind))

@@ -3597,16 +3597,10 @@ impl RuntimeServices {
         if candidate.role != Role::Worker && candidate.work_node_id.is_some() {
             return Err("ticket role wake scope does not match its TicketRun".into());
         }
-        let active_run = store
-            .active_ticket_runs(self.owner_generation, 256)?
-            .into_iter()
-            .find(|run| run.ticket_run_id == *ticket_run_id)
-            .ok_or("ticket role refers to a missing or terminal TicketRun")?;
-        if active_run.project_id != candidate.project_id
-            || !role_allowed_for_run(candidate.role, active_run.phase, active_run.activity)
-        {
-            return Err("ticket role does not match the active TicketRun phase".into());
-        }
+        let Some(active_run) = active_ticket_run_for_wake(store, self.owner_generation, candidate)?
+        else {
+            return Ok(false);
+        };
         let project = self
             .applied_config
             .config
@@ -4695,6 +4689,47 @@ fn role_allowed_for_run(
             || activity == crate::engine::reducer::Activity::Running)
 }
 
+fn active_ticket_run_for_wake(
+    store: &ConfigStore,
+    owner_generation: u64,
+    candidate: &crate::store::scheduler::PendingRoleWakeSession,
+) -> Result<Option<crate::store::scheduler::ActiveTicketRun>, String> {
+    let ticket_run_id = candidate
+        .ticket_run_id
+        .as_ref()
+        .ok_or("ticket role wake lacks TicketRun identity")?;
+    let active_run = store
+        .active_ticket_runs(owner_generation, 256)?
+        .into_iter()
+        .find(|run| run.ticket_run_id == *ticket_run_id);
+    let Some(active_run) = active_run else {
+        let Some((stored_project_id, phase)) =
+            store.ticket_run_phase_for_wake(owner_generation, ticket_run_id)?
+        else {
+            return Err("ticket role refers to a missing TicketRun".into());
+        };
+        if stored_project_id != candidate.project_id {
+            return Err("ticket role does not match the stored TicketRun Project".into());
+        }
+        if matches!(
+            phase,
+            crate::engine::reducer::Phase::Done | crate::engine::reducer::Phase::Canceled
+        ) {
+            return Ok(None);
+        }
+        return Err(
+            "ticket role refers to a nonterminal TicketRun outside the bounded active page".into(),
+        );
+    };
+    if active_run.project_id != candidate.project_id {
+        return Err("ticket role does not match the active TicketRun phase".into());
+    }
+    Ok(
+        role_allowed_for_run(candidate.role, active_run.phase, active_run.activity)
+            .then_some(active_run),
+    )
+}
+
 fn resolve_prepared_worker_context(
     store: &ConfigStore,
     owner_generation: u64,
@@ -5645,7 +5680,8 @@ mod coordinator_worker_recovery_prompt_tests {
 
 #[cfg(test)]
 mod reviewer_activity_gate_tests {
-    use super::role_allowed_for_run;
+    use super::{active_ticket_run_for_wake, role_allowed_for_run};
+    use crate::domain::ids::{ProjectId, TicketId, TicketNamespace, TicketRunId};
     use crate::domain::types::Role;
     use crate::engine::reducer::{Activity, Phase};
 
@@ -5666,6 +5702,151 @@ mod reviewer_activity_gate_tests {
             Phase::Assessing,
             Activity::Running
         ));
+    }
+
+    #[test]
+    fn publishing_and_terminal_ticket_wakes_do_not_authorize_launch() {
+        use crate::store::{ExpectedRevision, OwnerMetadata, ProjectRecord};
+        use std::path::Path;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
+        let applied = crate::config::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
+        )
+        .unwrap();
+        let revision = store
+            .apply_snapshot("fixture", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let ticket_run_id = TicketRunId::parse("ticket-run-a").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "fixture".into(),
+                config_revision: revision.revision,
+                config_digest: applied.digest,
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: crate::domain::ids::Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "fixture-owner".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: "fixture-process".into(),
+                executable_path: "/fixture/rex-projects".into(),
+                executable_digest: "a".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?1 WHERE project_id=?2",
+                rusqlite::params![generation, project_id.as_str()],
+            )
+            .unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &TicketNamespace::parse("tickets").unwrap(),
+                &TicketId::parse("TICKET-50").unwrap(),
+                &ticket_run_id,
+                18,
+                "publishing",
+                "in_progress",
+            )
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,NULL,0,1)",
+                rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+            )
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'work_node_ready','node-a',18,0,'{}','pending',1)",
+                rusqlite::params![project_id.as_str(), "ticket:ticket-run-a:worker:node-a"],
+            )
+            .unwrap();
+        let candidate = store
+            .pending_role_wake_sessions(generation, 16)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("scheduler must return the pending Worker wake");
+        assert_eq!(candidate.role, Role::Worker);
+        assert_eq!(candidate.ticket_run_id.as_ref(), Some(&ticket_run_id));
+        assert!(
+            active_ticket_run_for_wake(&store, generation, &candidate)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(candidate.pending_count, 1);
+        assert_eq!(
+            store
+                .pending_role_wake_inputs(&project_id, &candidate.role_session_id, 16)
+                .unwrap()
+                .len(),
+            1,
+            "phase mismatch must leave the wake pending"
+        );
+
+        for terminal_phase in ["done", "canceled"] {
+            store
+                .test_connection()
+                .execute(
+                    "UPDATE ticket_runs SET internal_phase=?1,revision=26 WHERE ticket_run_id=?2",
+                    rusqlite::params![terminal_phase, ticket_run_id.as_str()],
+                )
+                .unwrap();
+            assert!(
+                active_ticket_run_for_wake(&store, generation, &candidate)
+                    .unwrap()
+                    .is_none(),
+                "a wake for terminal phase {terminal_phase} must not authorize a launch"
+            );
+            if terminal_phase == "done" {
+                let status_target = store
+                    .ticket_run_status_target(generation, &project_id, &ticket_run_id, 25)
+                    .unwrap();
+                assert_eq!(status_target.ticket_id.as_str(), "TICKET-50");
+            }
+        }
+        assert_eq!(
+            store
+                .pending_role_wake_inputs(&project_id, &candidate.role_session_id, 16)
+                .unwrap()
+                .len(),
+            1,
+            "terminal wake handling must not consume durable input implicitly"
+        );
+
+        let mut wrong_project = candidate.clone();
+        wrong_project.project_id = ProjectId::parse("project-b").unwrap();
+        assert!(
+            active_ticket_run_for_wake(&store, generation, &wrong_project)
+                .unwrap_err()
+                .contains("stored TicketRun Project")
+        );
+
+        let mut missing = candidate;
+        missing.ticket_run_id = Some(TicketRunId::parse("missing-run").unwrap());
+        assert!(
+            active_ticket_run_for_wake(&store, generation, &missing)
+                .unwrap_err()
+                .contains("missing TicketRun")
+        );
     }
 }
 

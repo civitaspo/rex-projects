@@ -888,6 +888,41 @@ impl ConfigStore {
         .collect()
     }
 
+    /// Read the stored phase for one TicketRun that was absent from a bounded
+    /// active-run page. This lets callers distinguish a terminal run from a
+    /// missing subject without changing the page's nonterminal semantics.
+    pub(crate) fn ticket_run_phase_for_wake(
+        &self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+    ) -> Result<Option<(ProjectId, Phase)>, String> {
+        let active_owner: Option<u64> = self.connection.query_row(
+            "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let row: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT project_id,internal_phase FROM ticket_runs WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map(|(project_id, phase)| {
+            Ok((
+                ProjectId::parse(project_id)?,
+                serde_json::from_str(&format!("\"{phase}\""))
+                    .map_err(|error| format!("stored TicketRun phase is invalid: {error}"))?,
+            ))
+        })
+        .transpose()
+    }
+
     /// Return one stable page of active TicketRuns for a runnable Project. The
     /// per-Project query avoids starvation when another Project owns many old
     /// nonterminal runs; callers must continue with the returned page length.

@@ -2084,7 +2084,7 @@ impl ConfigStore {
             return Err("effect error diagnostic exceeds 512 bytes".into());
         }
         let changed = self.connection.execute(
-            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json),last_error=COALESCE(last_error,?5) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
+            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json),last_error=COALESCE(?5,last_error) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
             params![operation_id, owner_generation, receipt, next_reconciliation_at_unix, last_error],
         ).map_err(|error| error.to_string())?;
         if changed != 1 {
@@ -5596,6 +5596,22 @@ pub(crate) mod tests {
 
     #[test]
     fn start_agent_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
+        handler_error_stays_uncertain_and_keeps_diagnostic(crate::effects::EffectKind::StartAgent);
+    }
+
+    #[test]
+    fn merge_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
+        handler_error_stays_uncertain_and_keeps_diagnostic(crate::effects::EffectKind::Merge);
+    }
+
+    #[test]
+    fn prepare_worktrees_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
+        handler_error_stays_uncertain_and_keeps_diagnostic(
+            crate::effects::EffectKind::PrepareWorktrees,
+        );
+    }
+
+    fn handler_error_stays_uncertain_and_keeps_diagnostic(kind: crate::effects::EffectKind) {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
@@ -5640,10 +5656,7 @@ pub(crate) mod tests {
             subject_id: project_id.as_str().into(),
             operation_id: "start-error-operation".into(),
             logical_key: "start-error-intent".into(),
-            kind: crate::engine::reducer::effect_name(
-                &crate::engine::reducer::EffectKind::StartAgent,
-            )
-            .into(),
+            kind: crate::engine::reducer::effect_name(&kind).into(),
             request_json: request_json.into(),
             request_digest: content_digest(request_json),
             expected_revision: Some(0),
@@ -5657,10 +5670,10 @@ pub(crate) mod tests {
                 rusqlite::params![&intent.operation_id, prior_receipt],
             )
             .unwrap();
-        struct ErrorHandler;
+        struct ErrorHandler(crate::effects::EffectKind);
         impl crate::effects::EffectHandler for ErrorHandler {
             fn kind(&self) -> crate::effects::EffectKind {
-                crate::effects::EffectKind::StartAgent
+                self.0
             }
 
             fn handle(
@@ -5679,7 +5692,7 @@ pub(crate) mod tests {
                 })
             }
         }
-        let handler = ErrorHandler;
+        let handler = ErrorHandler(kind);
         let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
         let result = crate::effects::EffectDispatcher::tick(
             &mut store,
@@ -5732,7 +5745,7 @@ pub(crate) mod tests {
             (
                 "uncertain".into(),
                 Some(prior_receipt.into()),
-                Some("Rex wrapper request was not observed".into()),
+                Some("later Rex process observation failed".into()),
             )
         );
     }
@@ -7225,6 +7238,22 @@ pub(crate) mod tests {
                 assert_eq!(
                     publication_snapshot.prepared_receipt().base_refreshes.len(),
                     1
+                );
+                let artifacts = crate::artifacts::ArtifactStore::open(
+                    &temp.path().join("publication-source-artifacts"),
+                )
+                .unwrap();
+                let source = store.validated_worker_publication_source_for_node(
+                    &artifacts,
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    &publication_snapshot.publication_receipts()[0],
+                );
+                assert_eq!(
+                    source.unwrap_err(),
+                    "Query returned no rows",
+                    "this synthetic fixture has no Worker terminal; the source consumer must follow the prior publication to the original Worker transition, rather than misreading the host implementation_published transition"
                 );
                 let mut detached = publication_snapshot.prepared_receipt().clone();
                 detached.work_nodes[0].base_refresh_source = None;

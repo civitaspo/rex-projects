@@ -1286,9 +1286,14 @@ fn validate_current_step_evidence(
         .len()
         .checked_add(expected_extra_comments.len())
         .ok_or_else(|| MergeExecutionError::Invalid("merge comment count overflow".into()))?;
-    if sorted_comments.len() != expected_count {
+    if !terminal_merged_verification && sorted_comments.len() != expected_count {
         return Err(MergeExecutionError::Stale(
             "unexpected PR comments appeared after the approved merge procedure began".into(),
+        ));
+    }
+    if terminal_merged_verification && sorted_comments.len() < expected_count {
+        return Err(MergeExecutionError::Stale(
+            "a recorded merge procedure comment is absent after the pull request was merged".into(),
         ));
     }
     for (receipt, comment_intent) in expected_extra_comments {
@@ -1334,6 +1339,7 @@ fn validate_current_step_evidence(
     let mut expected_subject = evidence_now.subject.clone();
     if terminal_merged_verification {
         expected_subject.base_sha = approved.subject.base_sha.clone();
+        expected_subject.remote_checks_digest = approved.subject.remote_checks_digest.clone();
     }
     expected_subject.prepared_body_digest = approved.subject.prepared_body_digest.clone();
     expected_subject.merge_comments_digest = approved.subject.merge_comments_digest.clone();
@@ -1942,6 +1948,8 @@ mod tests {
     struct ProcedureForge {
         observation: std::sync::Arc<std::sync::Mutex<ForgeObservation>>,
         commit: crate::forge::CommitObservation,
+        add_service_comment_after_merge: bool,
+        add_post_merge_check: bool,
     }
 
     impl Forge for ProcedureForge {
@@ -2044,6 +2052,36 @@ mod tests {
             intent: &DirectMergeIntent,
         ) -> Result<EffectAcknowledgement, ForgeError> {
             let mut observation = self.observation.lock().unwrap();
+            if self.add_service_comment_after_merge {
+                let Observed::Complete {
+                    value: comments, ..
+                } = &mut observation.issue_comments
+                else {
+                    return Err(ForgeError("issue comments are unknown".into()));
+                };
+                comments.push(crate::forge::IssueComment {
+                    id: 43,
+                    user: Some("csm-ci-server[bot]".into()),
+                    body: "csm-ci: Merge accepted".into(),
+                    created_at: "2026-11-10T15:16:11Z".into(),
+                });
+            }
+            if self.add_post_merge_check {
+                let Observed::Complete { value: checks, .. } = &mut observation.check_runs else {
+                    return Err(ForgeError("check-run observation is unknown".into()));
+                };
+                checks.push(crate::forge::CheckRun {
+                    id: 2,
+                    name: "release / request".into(),
+                    head_sha: intent.expected_head_sha.clone(),
+                    status: "completed".into(),
+                    conclusion: Some("skipped".into()),
+                    app_id: Some(1),
+                    app_slug: Some("github-actions".into()),
+                    check_suite_id: None,
+                    workflow_id: Some(2),
+                });
+            }
             let Observed::Complete { value: pull, .. } = &mut observation.pull_request else {
                 return Err(ForgeError("PR observation is unknown".into()));
             };
@@ -2310,8 +2348,10 @@ mod tests {
             message: commit_message,
         };
         let forge = ProcedureForge {
-            observation: std::sync::Arc::new(std::sync::Mutex::new(observation)),
+            observation: std::sync::Arc::new(std::sync::Mutex::new(observation.clone())),
             commit,
+            add_service_comment_after_merge: true,
+            add_post_merge_check: true,
         };
         let executor = MergeProcedureExecutor::new(forge.clone());
         let pull = PullRequestRef {
@@ -2324,6 +2364,100 @@ mod tests {
             number: 1,
             expected_node_id: Some("PR_1".into()),
         };
+        let mut unexpected_before_merge = forge.observe(&pull).unwrap();
+        let Observed::Complete {
+            value: comments, ..
+        } = &mut unexpected_before_merge.issue_comments
+        else {
+            panic!("fixture issue comments are complete");
+        };
+        comments.push(crate::forge::IssueComment {
+            id: 41,
+            user: Some("unexpected-user".into()),
+            body: "unreviewed comment".into(),
+            created_at: "2026-11-10T15:00:00Z".into(),
+        });
+        let unexpected_forge = ProcedureForge {
+            observation: std::sync::Arc::new(std::sync::Mutex::new(
+                unexpected_before_merge.clone(),
+            )),
+            commit: forge.commit.clone(),
+            add_service_comment_after_merge: false,
+            add_post_merge_check: false,
+        };
+        let unexpected_executor = MergeProcedureExecutor::new(unexpected_forge);
+        let unexpected_evidence = procedure_evidence(&unexpected_before_merge, &subject);
+        let unexpected_result = unexpected_executor.execute_one(
+            &pull,
+            &policy,
+            &assessment,
+            &evidence,
+            &unexpected_evidence,
+            Some(&approval),
+            &authority,
+            &procedure,
+            &[],
+            "body",
+            &StepIntent {
+                operation_key: "outbox:unexpected:body".into(),
+                authenticated_actor: String::new(),
+                attempt_started_unix: 199,
+                exact_prepared_body: Some(prepared_body.into()),
+            },
+            &[],
+        );
+        assert!(matches!(
+            unexpected_result,
+            Err(MergeExecutionError::Stale(_))
+        ));
+
+        let mut unexpected_check = observation.clone();
+        let Observed::Complete { value: checks, .. } = &mut unexpected_check.check_runs else {
+            panic!("fixture check-run observation is complete");
+        };
+        checks.push(crate::forge::CheckRun {
+            id: 2,
+            name: "release / request".into(),
+            head_sha: subject.head_sha.clone(),
+            status: "completed".into(),
+            conclusion: Some("skipped".into()),
+            app_id: Some(1),
+            app_slug: Some("github-actions".into()),
+            check_suite_id: None,
+            workflow_id: Some(2),
+        });
+        let unexpected_check_evidence = procedure_evidence(&unexpected_check, &subject);
+        let check_only_forge = ProcedureForge {
+            observation: std::sync::Arc::new(std::sync::Mutex::new(unexpected_check.clone())),
+            commit: forge.commit.clone(),
+            add_service_comment_after_merge: false,
+            add_post_merge_check: false,
+        };
+        let check_only_result = MergeProcedureExecutor::new(check_only_forge).execute_one(
+            &pull,
+            &policy,
+            &assessment,
+            &evidence,
+            &unexpected_check_evidence,
+            Some(&approval),
+            &authority,
+            &procedure,
+            &[],
+            "body",
+            &StepIntent {
+                operation_key: "outbox:unexpected:check".into(),
+                authenticated_actor: String::new(),
+                attempt_started_unix: 199,
+                exact_prepared_body: Some(prepared_body.into()),
+            },
+            &[],
+        );
+        assert!(matches!(
+            check_only_result,
+            Err(MergeExecutionError::Stale(reason))
+                if reason == "a merge subject field outside the recorded body/comment procedure changed"
+        ));
+
         let mut receipts = Vec::new();
         for (index, key) in ["body", "merge", "verify"].into_iter().enumerate() {
             let observation_now = forge.observe(&pull).unwrap();
@@ -2375,6 +2509,52 @@ mod tests {
                 StepOutcome::Pending(reason) => panic!("fixture merge should verify: {reason}"),
             }
         }
+        let mut forge_observation = forge.observation.lock().unwrap();
+        let Observed::Complete { value: checks, .. } = &mut forge_observation.check_runs else {
+            panic!("fixture check-run observation is complete");
+        };
+        checks.push(crate::forge::CheckRun {
+            id: 3,
+            name: "ci".into(),
+            head_sha: subject.head_sha.clone(),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            app_id: Some(1),
+            app_slug: Some("github-actions".into()),
+            check_suite_id: None,
+            workflow_id: Some(1),
+        });
+        let merged_observation = forge_observation.clone();
+        drop(forge_observation);
+        let mut failed_required_gate = procedure_evidence(&merged_observation, &subject);
+        failed_required_gate
+            .gates
+            .iter_mut()
+            .find(|gate| gate.key == "check:ci")
+            .unwrap()
+            .state = crate::merge_policy::EvidenceState::Fail;
+        assert!(matches!(
+            executor.execute_one(
+                &pull,
+                &policy,
+                &assessment,
+                &evidence,
+                &failed_required_gate,
+                Some(&approval),
+                &authority,
+                &procedure,
+                &[],
+                "verify",
+                &StepIntent {
+                    operation_key: "outbox:failed-required-check".into(),
+                    authenticated_actor: String::new(),
+                    attempt_started_unix: 203,
+                    exact_prepared_body: Some(prepared_body.into()),
+                },
+                &receipts,
+            ),
+            Err(MergeExecutionError::Stale(_))
+        ));
         assert_eq!(receipts.len(), 2);
         assert!(matches!(
             receipts[0].effect_intent.operation,
