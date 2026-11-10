@@ -339,6 +339,94 @@ pub struct PreparedWorkerLaunch {
     coordinator_authority_digest: Digest,
 }
 
+/// Verified prepared worktree metadata used only to observe publication state.
+/// It deliberately has no reservation binding or Worker launch authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedWorktreeObservation {
+    pub(crate) resource: super::publication_monitor::PublicationResource,
+}
+
+struct ValidatedPreparedWorkerNode {
+    project_id: ProjectId,
+    ticket_run_id: TicketRunId,
+    accepted_revision: u64,
+    ticket_revision: u64,
+    configuration_digest: Digest,
+    plan_digest: Digest,
+    node_id: WorkNodeId,
+    repository_id: RepositoryId,
+    commit_mode: CommitMode,
+    worktree_path: std::path::PathBuf,
+    branch: String,
+    base_sha: String,
+    expected_head: Option<String>,
+    prepare_operation_id: String,
+    prepare_receipt_digest: Digest,
+    source_evidence_id: String,
+    source_agent_run_id: AgentRunId,
+    source_message_id: String,
+    source_result_digest: Digest,
+    coordinator_agent_run_id: AgentRunId,
+    coordinator_role_session_id: String,
+    coordinator_authority_digest: Digest,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedWorkerContextPurpose {
+    Launch,
+    PublicationObservation,
+}
+
+struct PreparedWorkerValidationContext<'a> {
+    purpose: PreparedWorkerContextPurpose,
+    owner_generation: u64,
+    accepted_revision: u64,
+    node_id: &'a WorkNodeId,
+    succeeded: &'a SucceededEffectReceipt,
+    project_config: &'a ProjectConfig,
+    configuration_digest: &'a Digest,
+}
+
+impl ValidatedPreparedWorkerNode {
+    fn into_worker_launch(self) -> PreparedWorkerLaunch {
+        PreparedWorkerLaunch {
+            project_id: self.project_id,
+            ticket_run_id: self.ticket_run_id,
+            accepted_revision: self.accepted_revision,
+            ticket_revision: self.ticket_revision,
+            configuration_digest: self.configuration_digest,
+            plan_digest: self.plan_digest,
+            node_id: self.node_id,
+            repository_id: self.repository_id,
+            commit_mode: self.commit_mode,
+            worktree_path: self.worktree_path,
+            branch: self.branch,
+            base_sha: self.base_sha,
+            expected_head: self.expected_head,
+            prepare_operation_id: self.prepare_operation_id,
+            prepare_receipt_digest: self.prepare_receipt_digest,
+            source_evidence_id: self.source_evidence_id,
+            source_agent_run_id: self.source_agent_run_id,
+            source_message_id: self.source_message_id,
+            source_result_digest: self.source_result_digest,
+            coordinator_agent_run_id: self.coordinator_agent_run_id,
+            coordinator_role_session_id: self.coordinator_role_session_id,
+            coordinator_authority_digest: self.coordinator_authority_digest,
+        }
+    }
+
+    fn into_publication_observation(self) -> PreparedWorktreeObservation {
+        PreparedWorktreeObservation {
+            resource: super::publication_monitor::PublicationResource {
+                project_id: self.project_id,
+                ticket_run_id: self.ticket_run_id,
+                repository_id: self.repository_id,
+                branch: self.branch,
+            },
+        }
+    }
+}
+
 impl PreparedWorkerLaunch {
     pub fn reservation_binding(&self) -> crate::launch::WorkerLaunchBinding {
         crate::launch::WorkerLaunchBinding {
@@ -1297,13 +1385,72 @@ impl ConfigStore {
         project_config: &ProjectConfig,
         configuration_digest: &Digest,
     ) -> Result<Option<PreparedWorkerLaunch>, String> {
+        let Some(validated) =
+            self.validated_prepared_worker_node(PreparedWorkerValidationContext {
+                purpose: PreparedWorkerContextPurpose::Launch,
+                owner_generation,
+                accepted_revision,
+                node_id,
+                succeeded,
+                project_config,
+                configuration_digest,
+            })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(validated.into_worker_launch()))
+    }
+
+    /// Revalidate a prepared Worker node for publication monitoring without minting
+    /// Worker launch authority. It observes implementation delivery while implementing
+    /// and publication correction/adoption while publishing.
+    pub(crate) fn prepared_worktree_observation(
+        &self,
+        owner_generation: u64,
+        accepted_revision: u64,
+        node_id: &WorkNodeId,
+        succeeded: &SucceededEffectReceipt,
+        project_config: &ProjectConfig,
+        configuration_digest: &Digest,
+    ) -> Result<Option<PreparedWorktreeObservation>, String> {
+        let Some(validated) =
+            self.validated_prepared_worker_node(PreparedWorkerValidationContext {
+                purpose: PreparedWorkerContextPurpose::PublicationObservation,
+                owner_generation,
+                accepted_revision,
+                node_id,
+                succeeded,
+                project_config,
+                configuration_digest,
+            })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(validated.into_publication_observation()))
+    }
+
+    fn validated_prepared_worker_node(
+        &self,
+        context: PreparedWorkerValidationContext<'_>,
+    ) -> Result<Option<ValidatedPreparedWorkerNode>, String> {
+        let PreparedWorkerValidationContext {
+            purpose,
+            owner_generation,
+            accepted_revision,
+            node_id,
+            succeeded,
+            project_config,
+            configuration_digest,
+        } = context;
         let active_generation: Option<u64> = self.connection.query_row(
             "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
             [],
             |row| row.get(0),
         ).optional().map_err(|error| error.to_string())?;
         if active_generation != Some(owner_generation) {
-            return Err("Worker launch context is fenced to a stale controller generation".into());
+            return Err(
+                "prepared worktree context is fenced to a stale controller generation".into(),
+            );
         }
         let intent = succeeded.intent();
         if intent.kind != "prepare_worktrees"
@@ -1326,7 +1473,16 @@ impl ConfigStore {
         let Some((current_project, current_revision, current_phase)) = current else {
             return Ok(None);
         };
-        if current_project != project_id.as_str() || current_phase != "implementing" {
+        if current_project != project_id.as_str() {
+            return Ok(None);
+        }
+        let phase_is_allowed = match purpose {
+            PreparedWorkerContextPurpose::Launch => current_phase == "implementing",
+            PreparedWorkerContextPurpose::PublicationObservation => {
+                matches!(current_phase.as_str(), "implementing" | "publishing")
+            }
+        };
+        if !phase_is_allowed {
             return Ok(None);
         }
         if intent
@@ -1470,7 +1626,7 @@ impl ConfigStore {
             }
             _ => None,
         };
-        Ok(Some(PreparedWorkerLaunch {
+        Ok(Some(ValidatedPreparedWorkerNode {
             project_id: project_id.clone(),
             ticket_run_id,
             accepted_revision,
