@@ -32,6 +32,85 @@ pub fn anchor_command_digest(spec: &AgentBlockSpec) -> Result<crate::domain::ids
     crate::domain::ids::Digest::parse(format!("{:x}", Sha256::digest(&bytes)))
 }
 
+pub(crate) fn record_created_view_anchor(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    view: &crate::launch::RexView,
+    window: &RexWindow,
+    spec: &AgentBlockSpec,
+    transport: &RexCliTransport,
+) -> Result<(), String> {
+    if window.disposition != CreateDisposition::Created {
+        return Ok(());
+    }
+    let Some(block_id) = window.initial_block_id.as_deref() else {
+        return Ok(());
+    };
+    let label = owned_agent_block_label(&spec.run_id).map_err(|error| error.to_string())?;
+    let (expected_run_id, expected_window_label) = match view.kind {
+        RexViewKind::Ticket => {
+            let ticket_id = view
+                .ticket_id
+                .as_deref()
+                .ok_or("ticket view is missing its ticket ID")?;
+            (
+                format!("ticket-{ticket_id}-view-{}", view.view_epoch),
+                owned_ticket_window_label(
+                    view.ticket_namespace
+                        .as_deref()
+                        .ok_or("ticket view is missing its namespace")?,
+                    ticket_id,
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        }
+        RexViewKind::Supervisor => (
+            format!("project-{}-view-{}", view.project_id, view.view_epoch),
+            owned_supervisor_window_label(view.project_id.as_str()),
+        ),
+    };
+    if spec.run_id != expected_run_id
+        || view.rex_server_identity != window.server_instance_id
+        || view.rex_session_id != window.session_id
+        || view.rex_window_id != window.window_id
+        || view.rex_server_identity != transport.capabilities().server_instance_id
+        || view.rex_session_id != transport.session_id()
+        || window.label != expected_window_label
+    {
+        return Ok(());
+    }
+    let blocks = transport
+        .list_window_blocks(window, &expected_window_label)
+        .map_err(|error| error.to_string())?;
+    let matching_block_count = blocks
+        .iter()
+        .filter(|block| {
+            block.block_id == block_id
+                && block.label == label
+                && block.flavor == "com.superlogical.terminal.shell"
+        })
+        .count();
+    let matching_label_count = blocks.iter().filter(|block| block.label == label).count();
+    if matching_block_count != 1
+        || matching_label_count != 1
+        || !transport
+            .agent_block_is_present(window, &spec.run_id, block_id)
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    let command_digest = anchor_command_digest(spec)?;
+    store.register_rex_view_anchor(
+        owner_generation,
+        &view.view_id,
+        block_id,
+        &spec.run_id,
+        &label,
+        &command_digest,
+    )?;
+    Ok(())
+}
+
 impl RexViewLifecyclePolicy {
     pub fn validate(self) -> Result<Self, String> {
         if self.max_blocks_per_tab < 2
@@ -345,8 +424,17 @@ fn maintain_anchor(
         || !rex_blocks
             .iter()
             .any(|block| block.block_id == anchor.block_id && block.label == anchor.owned_label)
+        || rex_blocks
+            .iter()
+            .filter(|block| block.label == anchor.owned_label)
+            .count()
+            != 1
+        || rex_blocks
+            .iter()
+            .find(|block| block.block_id == anchor.block_id)
+            .is_none_or(|block| block.flavor != "com.superlogical.terminal.shell")
         || !transport
-            .agent_block_matches_spec(window, spec, &anchor.block_id)
+            .agent_block_is_present(window, &anchor.run_id, &anchor.block_id)
             .map_err(|error| error.to_string())?
     {
         store.observe_rex_view_anchor(
@@ -683,7 +771,9 @@ pub fn project_views(
 mod tests {
     use super::*;
     use crate::domain::ids::AgentRunId;
-    use crate::launch::RexViewBlock;
+    use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+    use crate::launch::{RexView, RexViewBlock, RexViewKind};
+    use std::os::unix::fs::PermissionsExt;
 
     fn record(block_id: &str, lifecycle: RexBlockLifecycle) -> crate::launch::RexViewBlockRecord {
         crate::launch::RexViewBlockRecord {
@@ -732,6 +822,409 @@ mod tests {
         };
         assert!(is_tracked_view_block(&[], Some(&anchor), "status-anchor"));
         assert!(!is_tracked_view_block(&[], Some(&anchor), "user-pane"));
+    }
+
+    #[cfg(unix)]
+    struct StatusAnchorFixture {
+        terminal: crate::store::agent_results::host_validation_fixture::TestTerminalResultFixture,
+        view: RexViewRecord,
+        spec: AgentBlockSpec,
+        window: RexWindow,
+        transport: RexCliTransport,
+        root: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl StatusAnchorFixture {
+        fn new(process: serde_json::Value, preexisting: bool) -> Self {
+            let mut terminal = crate::store::agent_results::host_validation_fixture::host_validated_terminal_result(
+                crate::domain::types::Role::Coordinator,
+                crate::roles::RoleResultMessage {
+                    schema_version: 1,
+                    message_id: "status-anchor-provenance".into(),
+                    kind: RoleOutputKind::PlanReady,
+                    assertion: AgentAssertion::Succeeded,
+                    result_digest: None,
+                    structured_result: serde_json::json!({
+                        "plan": {"nodes": [], "requested_investigation_children": 0},
+                        "unresolved_questions": []
+                    }),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+            let authority = terminal
+                .store
+                .agent_launch_authority(terminal.terminal.agent_run_id())
+                .unwrap()
+                .unwrap();
+            let root = terminal._temp.path().join("status-anchor-fixture");
+            std::fs::create_dir(&root).unwrap();
+            let project_id = authority.project_id.clone();
+            let run_id = "ticket-STATUS-1-view-1".to_owned();
+            let spec = AgentBlockSpec {
+                run_id,
+                command: "/usr/bin/env".into(),
+                args: vec![
+                    "/opt/rex-projects".into(),
+                    "--config".into(),
+                    root.join("config.toml").display().to_string(),
+                    "--state-root".into(),
+                    root.join("state").display().to_string(),
+                    "status".into(),
+                    "--json".into(),
+                ],
+                cwd: root.clone(),
+                path_prepend: Vec::new(),
+            };
+            let block_id = "status-block";
+            let window_id = "status-window";
+            let window_label = owned_ticket_window_label("fixture", "STATUS-1").unwrap();
+            let block_label = owned_agent_block_label(&spec.run_id).unwrap();
+            let inventory = serde_json::json!({
+                "session_id": "fixture-session",
+                "windows": [{
+                    "window_id": window_id,
+                    "label": window_label,
+                    "layers": [{"blocks": [{
+                        "block_id": block_id,
+                        "label": block_label,
+                        "creator_name": "com.superlogical.terminal",
+                        "flavor": "com.superlogical.terminal.shell",
+                        "host_id": "fixture-host"
+                    }]}]
+                }]
+            });
+            let empty_inventory = serde_json::json!({
+                "session_id": "fixture-session",
+                "windows": []
+            });
+            std::fs::write(
+                root.join("inventory.json"),
+                serde_json::to_vec(&inventory).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("empty-inventory.json"),
+                serde_json::to_vec(&empty_inventory).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("process.json"),
+                serde_json::to_vec(&process).unwrap(),
+            )
+            .unwrap();
+            if preexisting {
+                std::fs::write(root.join("preexisting"), "").unwrap();
+            }
+            let script = root.join("rex");
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+fixture_dir=${0%/*}
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/status-anchor.sock","instance_id":"fixture-instance","host_id":"fixture-host","rex_version":"fixture"}' ;;
+  *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*)
+    if [ -f "$fixture_dir/preexisting" ] || [ -f "$fixture_dir/created" ]; then /bin/cat "$fixture_dir/inventory.json"; else /bin/cat "$fixture_dir/empty-inventory.json"; fi ;;
+  *"api call session.new_window"*) : > "$fixture_dir/created"; printf '%s\n' '{"window_id":"status-window","block_ids":["status-block"]}' ;;
+  *"terminal.process"*) : > "$fixture_dir/process-observed"; /bin/cat "$fixture_dir/process.json" ;;
+  *"capture"*) printf 'rex-projects status output\n' ;;
+  *) exit 3 ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let transport = RexCliTransport::connect(
+                &script,
+                &[],
+                "unix:///tmp/status-anchor.sock".into(),
+                "fixture-instance".into(),
+                "fixture-session".into(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            let window = transport
+                .find_or_create_ticket_window("fixture", "STATUS-1", &spec)
+                .unwrap();
+            let view = RexView {
+                view_id: RexView::derive_id(
+                    &project_id,
+                    RexViewKind::Ticket,
+                    Some("fixture"),
+                    Some("STATUS-1"),
+                    1,
+                )
+                .unwrap(),
+                project_id: project_id.clone(),
+                kind: RexViewKind::Ticket,
+                ticket_namespace: Some("fixture".into()),
+                ticket_id: Some("STATUS-1".into()),
+                view_epoch: 1,
+                rex_server_identity: window.server_instance_id.clone(),
+                rex_session_id: window.session_id.clone(),
+                rex_window_id: window.window_id.clone(),
+            };
+            terminal
+                .store
+                .register_rex_view(terminal.owner_generation, &view)
+                .unwrap();
+            let view = terminal
+                .store
+                .rex_view_history(&project_id)
+                .unwrap()
+                .into_iter()
+                .find(|record| record.view.view_id == view.view_id)
+                .unwrap();
+            Self {
+                terminal,
+                view,
+                spec,
+                window,
+                transport,
+                root,
+            }
+        }
+
+        fn record_created(&mut self) {
+            record_created_view_anchor(
+                &mut self.terminal.store,
+                self.terminal.owner_generation,
+                &self.view.view,
+                &self.window,
+                &self.spec,
+                &self.transport,
+            )
+            .unwrap();
+        }
+
+        fn maintain(&mut self) {
+            maintain_view(
+                &mut self.terminal.store,
+                self.terminal.owner_generation,
+                100,
+                &self.view,
+                &self.transport,
+                RexViewLifecyclePolicy {
+                    max_blocks_per_tab: 2,
+                    completed_blocks_to_keep: 1,
+                    completed_ticket_tab_retention_seconds: 3600,
+                },
+                Some(&self.spec),
+            )
+            .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_status_anchor_uses_creation_response_and_archives_only_with_complete_process_evidence()
+     {
+        let mut fixture = StatusAnchorFixture::new(
+            serde_json::json!({"last_exit":{"exit_code":0},"home":"/fixture/home","ancestors":[]}),
+            false,
+        );
+        assert_eq!(fixture.window.disposition, CreateDisposition::Created);
+        fixture.record_created();
+        let anchor = fixture
+            .terminal
+            .store
+            .rex_view_anchor(&fixture.view.view.view_id)
+            .unwrap()
+            .expect("successful Created response records the status anchor");
+        assert_eq!(anchor.block_id, "status-block");
+        assert_eq!(anchor.run_id, fixture.spec.run_id);
+        assert_eq!(
+            anchor.owned_label,
+            owned_agent_block_label(&fixture.spec.run_id).unwrap()
+        );
+        assert_eq!(
+            anchor.command_digest,
+            anchor_command_digest(&fixture.spec).unwrap()
+        );
+        assert!(
+            fixture
+                .terminal
+                .store
+                .register_rex_view_anchor(
+                    fixture.terminal.owner_generation,
+                    &fixture.view.view.view_id,
+                    "different-status-block",
+                    &fixture.spec.run_id,
+                    &anchor.owned_label,
+                    &anchor.command_digest,
+                )
+                .is_err()
+        );
+
+        fixture.maintain();
+
+        let anchor = fixture
+            .terminal
+            .store
+            .rex_view_anchor(&fixture.view.view.view_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.lifecycle, RexBlockLifecycle::Completed);
+        assert!(anchor.process_absent_confirmed);
+        assert!(anchor.archive_digest.is_some());
+        assert!(
+            fixture
+                .terminal
+                .store
+                .rex_view_blocks(&fixture.view.view.view_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_matching_label_without_creation_provenance_stays_unadopted() {
+        let mut fixture = StatusAnchorFixture::new(
+            serde_json::json!({"last_exit":{"exit_code":0},"ancestors":[]}),
+            true,
+        );
+        assert_eq!(fixture.window.disposition, CreateDisposition::Existing);
+        fixture.record_created();
+
+        fixture.maintain();
+
+        assert!(
+            fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .is_none()
+        );
+        let records = fixture
+            .terminal
+            .store
+            .rex_view_blocks(&fixture.view.view.view_id)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].block.ownership, RexBlockOwnership::User);
+        assert_eq!(records[0].block.lifecycle, RexBlockLifecycle::Unknown);
+        assert!(!records[0].block.process_absent_confirmed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_anchor_rejects_wrong_server_window_block_and_label() {
+        let mut fixture = StatusAnchorFixture::new(
+            serde_json::json!({"last_exit":{"exit_code":0},"home":"/fixture/home","ancestors":[]}),
+            false,
+        );
+        let server_instance_id = fixture.window.server_instance_id.clone();
+        fixture.window.server_instance_id = "wrong-instance".into();
+        fixture.record_created();
+        assert!(
+            fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fixture.window.server_instance_id = server_instance_id;
+        let window_id = fixture.window.window_id.clone();
+        fixture.window.window_id = "wrong-window".into();
+        fixture.record_created();
+        assert!(
+            fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fixture.window.window_id = window_id;
+        let initial_block_id = fixture.window.initial_block_id.clone();
+        fixture.window.initial_block_id = Some("wrong-block".into());
+        fixture.record_created();
+        assert!(
+            fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fixture.window.initial_block_id = initial_block_id;
+        let inventory_path = fixture.root.join("inventory.json");
+        let mut inventory: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&inventory_path).unwrap()).unwrap();
+        inventory["windows"][0]["layers"][0]["blocks"][0]["label"] =
+            serde_json::Value::String("unrelated-label".into());
+        std::fs::write(&inventory_path, serde_json::to_vec(&inventory).unwrap()).unwrap();
+        fixture.record_created();
+        assert!(
+            fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omitted_process_ancestry_keeps_a_proven_status_anchor_unknown() {
+        let mut fixture = StatusAnchorFixture::new(
+            serde_json::json!({"last_exit":{"exit_code":0},"home":"/fixture/home"}),
+            false,
+        );
+        fixture.record_created();
+        assert!(
+            fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .is_some()
+        );
+
+        fixture.maintain();
+        assert!(fixture.root.join("process-observed").exists());
+
+        let anchor = fixture
+            .terminal
+            .store
+            .rex_view_anchor(&fixture.view.view.view_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.lifecycle, RexBlockLifecycle::Unknown);
+        assert!(!anchor.process_absent_confirmed);
+        assert!(anchor.archive_digest.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_status_anchor_command_digest_stays_unknown_without_archive() {
+        let mut fixture = StatusAnchorFixture::new(
+            serde_json::json!({"last_exit":{"exit_code":0},"home":"/fixture/home","ancestors":[]}),
+            false,
+        );
+        fixture.record_created();
+        fixture.spec.args.push("different-command".into());
+
+        fixture.maintain();
+
+        let anchor = fixture
+            .terminal
+            .store
+            .rex_view_anchor(&fixture.view.view.view_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.lifecycle, RexBlockLifecycle::Unknown);
+        assert!(!anchor.process_absent_confirmed);
+        assert!(anchor.archive_digest.is_none());
     }
 
     #[cfg(unix)]
