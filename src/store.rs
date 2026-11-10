@@ -424,6 +424,14 @@ impl MachineLock {
     }
 }
 
+impl Drop for MachineLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self._file {
+            let _ = FileExt::unlock(file);
+        }
+    }
+}
+
 impl ConfigStore {
     /// Open an existing controller database for read-only inspection.
     ///
@@ -5392,6 +5400,24 @@ pub(crate) mod tests {
     use sha2::{Digest as _, Sha256};
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn machine_lock_owner_releases_flock_while_cloned_file_remains_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let lock_root = state_root.join("machine-registry");
+        let owner = super::MachineLock::acquire_in_registry(&state_root, &lock_root).unwrap();
+        let inherited_file = owner._file.as_ref().unwrap().try_clone().unwrap();
+
+        assert!(super::MachineLock::acquire_in_registry(&state_root, &lock_root).is_err());
+
+        drop(owner);
+        let replacement = super::MachineLock::acquire_in_registry(&state_root, &lock_root).unwrap();
+        drop(inherited_file);
+
+        assert!(super::MachineLock::acquire_in_registry(&state_root, &lock_root).is_err());
+        drop(replacement);
+    }
 
     #[test]
     fn agent_profile_digest_matches_canonical_profile_representation() {
