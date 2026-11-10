@@ -6388,6 +6388,14 @@ pub(crate) mod tests {
             "ticket_run:{ticket_run_id}:{}",
             super::role_name(child_role)
         );
+        let current_ticket_revision = fixture
+            .store
+            .active_ticket_runs(fixture.owner_generation, 16)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.ticket_run_id == ticket_run_id)
+            .unwrap()
+            .revision;
         let child_wakes = fixture
             .store
             .pending_role_wake_inputs(&project_id, &child_session, 16)
@@ -6395,6 +6403,7 @@ pub(crate) mod tests {
         assert_eq!(child_wakes.len(), 1);
         assert_eq!(child_wakes[0].source_type, "coordinator_child");
         assert_eq!(child_wakes[0].source_id, ingested.receipt.evidence_id());
+        assert_eq!(child_wakes[0].source_revision, current_ticket_revision);
 
         fixture
             .store
@@ -6414,7 +6423,6 @@ pub(crate) mod tests {
             .expect("persisted Coordinator child wake is offered as a judgment launch candidate");
         assert_eq!(child_candidate.role, child_role);
         assert_eq!(child_candidate.ticket_run_id.as_ref(), Some(&ticket_run_id));
-
         let parent = fixture
             .store
             .coordinator_child_parent(&project_id, &child_session)
@@ -6423,6 +6431,11 @@ pub(crate) mod tests {
         assert_eq!(parent.agent_run_id, run_id);
         assert_eq!(parent.role, Role::Coordinator);
         assert_eq!(parent.ticket_run_id.as_ref(), Some(&ticket_run_id));
+        assert_eq!(
+            parent.ticket_revision.map(|revision| revision.0),
+            Some(current_ticket_revision),
+            "Coordinator child authority must bind to the current TicketRun revision"
+        );
         assert_eq!(
             parent.role_session_id,
             format!("ticket_run:{ticket_run_id}:coordinator")

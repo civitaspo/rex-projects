@@ -210,7 +210,7 @@ pub fn reduce(
         {
             next.phase = Phase::Reviewing;
             next.activity = Activity::Running;
-            wakes.push(WakeTarget::TicketRole(Role::Reviewer));
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         Input::CorrectionsRemain if current.phase == Phase::Reviewing => {
             next.phase = Phase::Implementing;
