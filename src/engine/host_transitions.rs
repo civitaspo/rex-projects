@@ -1797,7 +1797,7 @@ pub(crate) mod tests {
         let policy_digest = crate::forge::canonical_digest(&policy).unwrap();
         let intent = crate::engine::orchestration::MergeIntentPayload {
             assessment_id: "assessment-1".into(),
-            pr_identities: vec!["example#9".into()],
+            pr_identities: vec!["https://github.com/acme/widgets/pull/9".into()],
             policy_digest: policy_digest.clone(),
             prepared_body_digest: if reassessment_case {
                 Digest::parse(super::sha256_hex(b"Reviewed body\n")).unwrap()
@@ -2181,6 +2181,11 @@ pub(crate) mod tests {
         .unwrap();
         let artifact_path =
             crate::human_runtime::write_runtime_review_artifact(&artifact_root, &request).unwrap();
+        let html = fs::read_to_string(&artifact_path).unwrap();
+        assert!(html.contains(
+            "<h3>example · <a rel=\"noopener noreferrer\" href=\"https://github.com/acme/widgets/pull/9\">#9</a>"
+        ));
+        assert!(!html.contains("https://github.com/example/pull/9"));
         assert_eq!(request.purpose, HumanPurpose::TicketReview);
         store
             .register_human_request_with_authority(

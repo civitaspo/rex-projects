@@ -2285,6 +2285,9 @@ fn merge_work_review_bundle(
     work_item: &crate::store::merge_work::MergeWorkItem,
 ) -> Result<ReviewBundle, String> {
     let document = &work_item.document;
+    let [pull_request_reference] = document.intent.pr_identities.as_slice() else {
+        return Err("merge review requires exactly one accepted pull request reference".into());
+    };
     let subject = &document.evidence.subject;
     let confidence = match document.evidence.confidence {
         crate::merge_policy::Confidence::Low => RiskConfidence::Low,
@@ -2369,10 +2372,7 @@ fn merge_work_review_bundle(
         repositories: vec![RepositoryReview {
             repository: subject.repository_id.clone(),
             pull_request: format!("#{}", subject.pull_request_id),
-            url: Some(format!(
-                "https://{}/{}/pull/{}",
-                subject.forge_host, subject.repository_id, subject.pull_request_id
-            )),
+            url: Some(pull_request_reference.clone()),
             base_ref: subject.base_ref.clone(),
             base_sha: subject.base_sha.clone(),
             head_ref: String::new(),
@@ -3057,6 +3057,36 @@ fn hex(bytes: &[u8]) -> String {
 mod presenter_tests {
     use super::*;
     use crate::human::ReviewBundle;
+
+    #[test]
+    fn merge_review_rejects_missing_ambiguous_or_unsafe_pr_reference() {
+        let mut work = crate::engine::host_transitions::tests::merge_work_fixture_item(
+            ProjectId::parse("review-project").unwrap(),
+            TicketRunId::parse("review-ticket").unwrap(),
+            Digest::parse("a".repeat(64)).unwrap(),
+            Digest::parse("b".repeat(64)).unwrap(),
+            false,
+            &"c".repeat(40),
+        );
+        for references in [
+            Vec::new(),
+            vec![
+                "https://github.com/acme/widgets/pull/9".into(),
+                "https://github.com/another/repository/pull/9".into(),
+            ],
+        ] {
+            work.document.intent.pr_identities = references;
+            assert_eq!(
+                merge_work_review_bundle(&work).unwrap_err(),
+                "merge review requires exactly one accepted pull request reference"
+            );
+        }
+        work.document.intent.pr_identities = vec!["javascript:alert(1)".into()];
+        assert_eq!(
+            merge_work_review_bundle(&work).unwrap_err(),
+            "review links must use https"
+        );
+    }
 
     fn sample_request() -> HumanRuntimeRequest {
         let bundle = ReviewBundle {
