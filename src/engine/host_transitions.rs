@@ -3002,6 +3002,68 @@ mod tests {
                 .included_head_sha,
             verified.included_head_sha
         );
+        let completion_json = serde_json::to_value(&completion_context).unwrap();
+        let human_decision = &completion_json["human_decision"];
+        assert_eq!(human_decision["request_id"], request_id.as_str());
+        assert_eq!(human_decision["work_id"], work_item.work_id.as_str());
+        assert_eq!(
+            human_decision["receipt"]["response_id"],
+            decision.response_id
+        );
+        assert_eq!(human_decision["receipt"]["choice"], "approve");
+        assert_eq!(human_decision["receipt"]["approved"], true);
+        assert_eq!(
+            human_decision["request_digest"],
+            crate::forge::canonical_digest(&serde_json::to_value(&request).unwrap())
+                .unwrap()
+                .as_str()
+        );
+        assert_eq!(
+            human_decision["receipt_digest"],
+            crate::forge::canonical_digest(&human_decision["receipt"])
+                .unwrap()
+                .as_str()
+        );
+        assert!(
+            store
+                .accepted_merge_work_review_approval(&request_id, &work_item, 1001)
+                .unwrap()
+                .is_none(),
+            "historical evidence must not extend the live approval lifetime"
+        );
+        assert_eq!(
+            store
+                .historical_merge_work_review_evidence(&request_id, &work_item)
+                .unwrap(),
+            completion_context.human_decision,
+            "Postmortem must retain the exact approval after its live expiry"
+        );
+        let mut unrelated_work = work_item.clone();
+        unrelated_work.work_id = digest('f');
+        assert!(
+            store
+                .historical_merge_work_review_evidence(&request_id, &unrelated_work)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .historical_merge_work_review_evidence(
+                    &HumanRequestId::parse("missing-merge-request").unwrap(),
+                    &work_item,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let mut legacy_context = completion_json.clone();
+        legacy_context
+            .as_object_mut()
+            .unwrap()
+            .remove("human_decision");
+        let legacy: crate::agent_api::HostCompletionContext =
+            serde_json::from_value(legacy_context.clone()).unwrap();
+        assert!(legacy.human_decision.is_none());
+        assert_eq!(serde_json::to_value(legacy).unwrap(), legacy_context);
         let session = format!("ticket_run:{}:postmortem", ticket_run_id);
         let inputs = store
             .pending_role_wake_inputs(&project_id, &session, 256)
@@ -3043,6 +3105,52 @@ mod tests {
         assert_eq!(
             consumed[0].host_completion_context,
             Some(completion_context)
+        );
+
+        let original_receipt = human_decision["receipt"].clone();
+        for (field, value) in [
+            ("request_id", serde_json::json!("another-request")),
+            ("response_id", serde_json::json!("another-response")),
+            ("subject_digest", serde_json::json!(digest('f'))),
+            ("decided_at_unix", serde_json::json!(1000)),
+            ("request_expires_at_unix", serde_json::json!(2000)),
+            ("approved", serde_json::json!(false)),
+        ] {
+            let mut altered = original_receipt.clone();
+            altered[field] = value;
+            store
+                .test_connection()
+                .execute(
+                    "UPDATE human_decisions SET receipt_json=?1 WHERE request_id=?2",
+                    params![altered.to_string(), request_id.as_str()],
+                )
+                .unwrap();
+            let context = crate::runtime_services::postmortem_completion_context_for_test(
+                &mut store,
+                generation,
+                &postmortem,
+                &loaded.digest,
+            )
+            .unwrap();
+            assert!(context.human_decision.is_none(), "accepted altered {field}");
+        }
+        store
+            .test_connection()
+            .execute(
+                "UPDATE human_decisions SET receipt_json=?1,subject_digest=?2 WHERE request_id=?3",
+                params![
+                    original_receipt.to_string(),
+                    digest('f').as_str(),
+                    request_id.as_str()
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .historical_merge_work_review_evidence(&request_id, &work_item)
+                .unwrap()
+                .is_none(),
+            "receipt JSON must not override conflicting stored decision columns"
         );
     }
 }

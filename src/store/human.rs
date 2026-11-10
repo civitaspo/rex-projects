@@ -1454,6 +1454,81 @@ impl ConfigStore {
         view.map(Digest::parse).transpose()
     }
 
+    pub(crate) fn historical_merge_work_review_evidence(
+        &self,
+        request_id: &HumanRequestId,
+        expected_work_item: &crate::store::merge_work::MergeWorkItem,
+    ) -> Result<Option<crate::agent_api::HostHumanDecisionEvidence>, String> {
+        let Some(summary) = load_request(&self.connection, request_id)? else {
+            return Ok(None);
+        };
+        if summary.request.purpose != HumanPurpose::TicketReview
+            || summary.lifecycle != HumanRequestLifecycle::Decided
+        {
+            return Ok(None);
+        }
+        let Some(crate::human_runtime::HumanAuthorityMaterial::MergeWorkReview { work_item }) =
+            self.human_request_authority(request_id)?
+        else {
+            return Ok(None);
+        };
+        if work_item.as_ref() != expected_work_item
+            || crate::human_runtime::HumanAuthorityMaterial::merge_work_review_request(
+                request_id.clone(),
+                expected_work_item.clone(),
+                summary.request.expires_at_unix,
+            )? != summary.request
+            || self.merge_work_item(
+                &expected_work_item.project_id,
+                &expected_work_item.ticket_run_id,
+                expected_work_item.awaiting_merge_revision,
+            )? != Some(expected_work_item.clone())
+        {
+            return Ok(None);
+        }
+        let subject_digest = summary.request.subject.digest()?;
+        let row: Option<(String, String, u64, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT receipt_json,response_id,decided_at_unix,explanation FROM human_decisions WHERE request_id=?1 AND subject_digest=?2 AND configuration_digest=?3 AND policy_digest=?4 AND choice='approve' AND approved=1",
+                params![request_id.as_str(), subject_digest.as_str(), summary.request.subject.configuration_digest.as_str(), summary.request.subject.policy_digest.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((receipt_json, response_id, decided_at_unix, explanation)) = row else {
+            return Ok(None);
+        };
+        let receipt: PersistedApprovalReceipt =
+            crate::protocol::parse_unique(receipt_json.as_bytes())?;
+        if receipt.request_id != *request_id
+            || receipt.response_id != response_id
+            || receipt.response_id.trim().is_empty()
+            || receipt.subject_digest != subject_digest
+            || receipt.configuration_digest != summary.request.subject.configuration_digest
+            || receipt.policy_digest != summary.request.subject.policy_digest
+            || receipt.choice != HumanDecisionChoice::Approve
+            || !receipt.approved
+            || receipt.decided_at_unix != decided_at_unix
+            || receipt.explanation != explanation
+            || receipt.request_expires_at_unix != summary.request.expires_at_unix
+            || receipt.decided_at_unix >= receipt.request_expires_at_unix
+        {
+            return Ok(None);
+        }
+        let receipt: serde_json::Value = crate::protocol::parse_unique(receipt_json.as_bytes())?;
+        let request = serde_json::to_value(&summary.request).map_err(|error| error.to_string())?;
+        Ok(Some(crate::agent_api::HostHumanDecisionEvidence {
+            request_id: request_id.clone(),
+            work_id: expected_work_item.work_id.clone(),
+            request_digest: crate::forge::canonical_digest(&request)
+                .map_err(|error| error.to_string())?,
+            receipt_digest: crate::forge::canonical_digest(&receipt)
+                .map_err(|error| error.to_string())?,
+            receipt,
+        }))
+    }
+
     pub fn accepted_merge_work_review_approval(
         &self,
         request_id: &HumanRequestId,
