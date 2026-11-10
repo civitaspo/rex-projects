@@ -6641,22 +6641,27 @@ pub(crate) mod tests {
 
     #[test]
     fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
-        published_publication_fixture(false, false, false);
+        published_publication_fixture(false, false, false, false);
     }
 
     #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
-        published_publication_fixture(true, false, false);
+        published_publication_fixture(true, false, false, false);
+    }
+
+    #[test]
+    fn publication_and_review_results_wake_current_coordinator_child_requests() {
+        published_publication_fixture(true, false, false, true);
     }
 
     #[test]
     fn repeated_merge_reference_mismatch_blocks_and_notifies_supervisor_once() {
-        published_publication_fixture(true, true, false);
+        published_publication_fixture(true, true, false, false);
     }
 
     #[test]
     fn host_base_refresh_publication_drives_fresh_reviewer_subject() {
-        published_publication_fixture(true, false, true);
+        published_publication_fixture(true, false, true, false);
     }
 
     fn assert_registered_staging_survives_verification(
@@ -6764,6 +6769,7 @@ pub(crate) mod tests {
         single_publication: bool,
         reject_twice: bool,
         base_refresh: bool,
+        verify_coordinator_handoff: bool,
     ) {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
@@ -7318,6 +7324,57 @@ pub(crate) mod tests {
         if single_publication {
             let reviewing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
             assert_eq!(reviewing.phase, Phase::Reviewing);
+            let coordinator_session = format!("ticket_run:{ticket_run_id}:coordinator");
+            let coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap();
+            let current_coordinator_wakes = coordinator_wakes
+                .iter()
+                .filter(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                current_coordinator_wakes.len(),
+                1,
+                "a completed publication must durably wake its Coordinator at Reviewing revision"
+            );
+            let reviewer_session = format!("ticket_run:{ticket_run_id}:reviewer");
+            let reviewer_wakes = store
+                .pending_role_wake_inputs(&project_id, &reviewer_session, 16)
+                .unwrap();
+            assert!(
+                !reviewer_wakes.iter().any(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "reviewer"
+                }),
+                "Reviewer must be woken only after Coordinator persists its authorized child request"
+            );
+            assert!(
+                !crate::engine::host_transitions::consume_one_host_transition(
+                    &mut store,
+                    owner_generation,
+                    13,
+                    &config,
+                    &config_digest,
+                )
+                .unwrap(),
+                "replaying the publication consumer must not apply a duplicate transition"
+            );
+            let replayed_coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap()
+                .into_iter()
+                .filter(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                })
+                .count();
+            assert_eq!(replayed_coordinator_wakes, 1);
             let publication_snapshot = store
                 .accepted_implementation_publication_snapshot(
                     owner_generation,
@@ -7429,6 +7486,160 @@ pub(crate) mod tests {
             );
             let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
             assert_eq!(assessing.phase, Phase::Assessing);
+            assert_eq!(
+                assessing.revision,
+                reviewer
+                    .ingested
+                    .validated
+                    .binding
+                    .ticket_revision
+                    .unwrap()
+                    .0
+                    + 1,
+                "ReviewConverged must advance the exact revision reviewed by the child"
+            );
+            let post_review_coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap();
+            assert!(
+                post_review_coordinator_wakes.iter().any(|wake| {
+                    wake.source_type == "agent_result"
+                        && wake.source_id == reviewer.ingested.receipt.evidence_id()
+                }),
+                "the validated Reviewer result must retain its Coordinator parent wake after ReviewConverged"
+            );
+            assert!(
+                !post_review_coordinator_wakes.iter().any(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == assessing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                }),
+                "ReviewConverged must not add a duplicate Coordinator reducer wake"
+            );
+            if verify_coordinator_handoff {
+                use crate::engine::orchestration::SpawnRequestPayload;
+                use crate::store::agent_results::host_validation_fixture;
+
+                let wake_inputs = post_review_coordinator_wakes
+                    .iter()
+                    .map(|wake| crate::agent_api::AgentWakeItem {
+                        wake_input_id: wake.wake_input_id,
+                        source_type: wake.source_type.clone(),
+                        source_id: wake.source_id.clone(),
+                        source_revision: wake.source_revision,
+                        priority: wake.priority,
+                        payload_json: wake.payload_json.clone(),
+                        host_artifact_source_evidence_ids: Vec::new(),
+                        host_artifacts: Vec::new(),
+                        host_completion_context: None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(wake_inputs.iter().any(|wake| {
+                    wake.source_type == "agent_result"
+                        && wake.source_id == reviewer.ingested.receipt.evidence_id()
+                }));
+                let request = SpawnRequestPayload {
+                    work_node: root_id.clone(),
+                    role: crate::domain::types::Role::MergeDecision,
+                    profile_id: crate::domain::ids::ProfileId::parse("worker_codex").unwrap(),
+                    plan_digest: Some(accepted.plan_digest.clone()),
+                    worker_recovery: None,
+                    allowed_repositories: vec![repository_id.clone()],
+                    artifact_inputs: Vec::new(),
+                    parent_run_id: None,
+                };
+                let structured_result = serde_json::to_value(&request).unwrap();
+                let result_digest = Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+                ))
+                .unwrap();
+                let coordinator_run_id =
+                    crate::domain::ids::AgentRunId::parse("post-review-coordinator-run").unwrap();
+                let coordinator =
+                    host_validation_fixture::host_validated_result_in_with_wake_inputs(
+                        &mut store,
+                        &std::fs::canonicalize(temp.path()).unwrap(),
+                        owner_generation,
+                        project_id.clone(),
+                        ticket_run_id.clone(),
+                        crate::domain::types::Role::Coordinator,
+                        crate::roles::RoleResultMessage {
+                            schema_version:
+                                crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                            message_id: "coordinator-request-merge-decision-after-review".into(),
+                            kind: crate::engine::orchestration::RoleOutputKind::SpawnRequest,
+                            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                            structured_result,
+                            result_digest: Some(result_digest),
+                            artifact_refs: Vec::new(),
+                        },
+                        coordinator_run_id.clone(),
+                        wake_inputs,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    coordinator.ingested.validated.binding.ticket_revision,
+                    Some(Revision(assessing.revision)),
+                    "Coordinator SpawnRequest must carry the current post-review revision"
+                );
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                        &mut store,
+                        owner_generation,
+                        14,
+                        &config,
+                        config_digest.clone(),
+                        &coordinator.ingested,
+                    )
+                    .unwrap()
+                );
+                let merge_decision_session = format!("ticket_run:{ticket_run_id}:merge_decision");
+                let child_wakes = store
+                    .pending_role_wake_inputs(&project_id, &merge_decision_session, 16)
+                    .unwrap();
+                assert!(child_wakes.iter().any(|wake| {
+                    wake.source_type == "coordinator_child"
+                        && wake.source_id == coordinator.ingested.receipt.evidence_id()
+                        && wake.source_revision == assessing.revision
+                }));
+                let child_parent = store
+                    .coordinator_child_parent(&project_id, &merge_decision_session)
+                    .unwrap()
+                    .expect("Merge Decision child candidate must retain its Coordinator parent");
+                assert_eq!(child_parent.agent_run_id, coordinator_run_id);
+                assert_eq!(child_parent.role, crate::domain::types::Role::Coordinator);
+                assert_eq!(
+                    child_parent.ticket_revision.map(|revision| revision.0),
+                    Some(assessing.revision)
+                );
+                store
+                    .connection
+                    .execute(
+                        "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                        [project_id.as_str()],
+                    )
+                    .unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+                        rusqlite::params![project_id.as_str(), owner_generation],
+                    )
+                    .unwrap();
+                let candidates = store
+                    .pending_role_wake_sessions(owner_generation, 32)
+                    .unwrap();
+                assert!(
+                    candidates.iter().any(|candidate| {
+                        candidate.role_session_id == merge_decision_session
+                            && candidate.role == crate::domain::types::Role::MergeDecision
+                            && candidate.ticket_run_id.as_ref() == Some(&ticket_run_id)
+                    }),
+                    "Coordinator SpawnRequest must reach the Merge Decision launch candidate: {candidates:#?}"
+                );
+                return;
+            }
             if base_refresh {
                 assert_eq!(subject.publications[0].published_head, "f".repeat(40));
                 assert_eq!(
