@@ -644,7 +644,7 @@ pub trait PublicationAdoptionSource: Send + Sync {
     fn observe_publication(
         &self,
         resource: &crate::store::publication_monitor::PublicationResource,
-    ) -> Result<crate::delivery_runtime::RepositoryPublicationObservation, String>;
+    ) -> Result<Option<crate::delivery_runtime::RepositoryPublicationObservation>, String>;
 }
 
 /// Re-observes the complete current merge subject and its host-derived gates before a queued
@@ -740,6 +740,25 @@ impl DurableHumanSubjectObserver {
             delivery_effects: Some(delivery_effects),
             owner_generation: Some(owner_generation),
             publication_source: None,
+            merge_work_source: Some(merge_work_source),
+        })
+    }
+
+    pub fn with_merge_work_review_and_publication_adoption(
+        declarative_root: PathBuf,
+        owner_generation: u64,
+        delivery_effects: std::sync::Arc<crate::delivery_runtime::RepositoryDeliveryEffects>,
+        merge_work_source: std::sync::Arc<dyn MergeWorkReviewSource>,
+        publication_source: std::sync::Arc<dyn PublicationAdoptionSource>,
+    ) -> Result<Self, String> {
+        if !declarative_root.is_absolute() || owner_generation == 0 {
+            return Err("human observer requires an absolute config root and active owner".into());
+        }
+        Ok(Self {
+            declarative_root,
+            delivery_effects: Some(delivery_effects),
+            owner_generation: Some(owner_generation),
+            publication_source: Some(publication_source),
             merge_work_source: Some(merge_work_source),
         })
     }
@@ -984,7 +1003,9 @@ fn observe_publication_adoption_subject(
             "the repository publication adoption policy changed".into(),
         ));
     }
-    let current_observation = source.observe_publication(&material.resource)?;
+    let Some(current_observation) = source.observe_publication(&material.resource)? else {
+        return Ok(HumanSubjectObservation::TemporarilyUnavailable);
+    };
     let mut current_material = material.clone();
     current_material.current_observation_digest =
         publication_observation_digest(&current_observation)?;
@@ -2163,9 +2184,15 @@ impl HumanPresenterEffectHandler {
             &request.intent.subject_id,
             review,
         );
+        let subject_revision_matches = match review.purpose {
+            HumanPurpose::PublicationAdoption => {
+                request.intent.expected_revision.is_some() && review.subject.ticket_run_id.is_some()
+            }
+            _ => request.intent.expected_revision == Some(review.subject.revision.0),
+        };
         if request.intent.project_id != review.subject.project_id
             || !subject_scope_matches
-            || request.intent.expected_revision != Some(review.subject.revision.0)
+            || !subject_revision_matches
         {
             return Err(
                 "human presentation effect identity does not match its typed subject".into(),
@@ -2327,6 +2354,14 @@ fn effect_subject_matches(
 ) -> bool {
     match request.purpose {
         HumanPurpose::OperationApproval => {
+            effect_subject_type == "ticket_run"
+                && request
+                    .subject
+                    .ticket_run_id
+                    .as_ref()
+                    .is_some_and(|ticket_run_id| effect_subject_id == ticket_run_id.as_str())
+        }
+        HumanPurpose::PublicationAdoption => {
             effect_subject_type == "ticket_run"
                 && request
                     .subject

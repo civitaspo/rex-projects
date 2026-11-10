@@ -19,6 +19,9 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const GH_TIMEOUT: Duration = Duration::from_secs(120);
 const TOOL_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+mod adoption_tests;
+
 /// Repository effect handlers and the observer used to detect out-of-band publication.
 pub struct RuntimeDelivery {
     applied_config: AppliedConfig,
@@ -40,6 +43,45 @@ pub enum PublicationMonitorTick {
     Unchanged,
     BaselineAdvanced { revision: u64 },
     IrregularityRecorded { revision: u64 },
+    HumanReviewPending { request_id: String },
+    HumanReviewApplied { revision: u64 },
+}
+
+struct RuntimePublicationAdoptionSource {
+    effects: Arc<RepositoryDeliveryEffects>,
+    repositories: BTreeMap<RepositoryId, RepositoryConfig>,
+}
+
+impl crate::human_runtime::PublicationAdoptionSource for RuntimePublicationAdoptionSource {
+    fn observe_publication(
+        &self,
+        resource: &crate::store::publication_monitor::PublicationResource,
+    ) -> Result<Option<crate::delivery_runtime::RepositoryPublicationObservation>, String> {
+        if !self.repositories.contains_key(&resource.repository_id) {
+            return Err(format!("unknown repository `{}`", resource.repository_id));
+        }
+        let observation = (|| {
+            let remote_head = self
+                .effects
+                .observe_remote_branch(&resource.repository_id, &resource.branch)?;
+            let pulls = self
+                .effects
+                .observe_current_pull_requests(&resource.repository_id, &resource.branch)?;
+            Ok::<_, String>(crate::delivery_runtime::RepositoryPublicationObservation {
+                remote_head,
+                pull_requests: pulls.pull_requests,
+            })
+        })();
+        let Ok(mut observation) = observation else {
+            return Ok(None);
+        };
+        if let crate::delivery_forge::ObservationCapability::Known(entries) =
+            &mut observation.pull_requests
+        {
+            entries.sort_by_key(|pull| pull.number);
+        }
+        Ok(Some(observation))
+    }
 }
 
 impl RuntimeDelivery {
@@ -53,6 +95,15 @@ impl RuntimeDelivery {
 
     pub fn shared_effects(&self) -> std::sync::Arc<RepositoryDeliveryEffects> {
         std::sync::Arc::clone(&self.effects)
+    }
+
+    pub fn publication_adoption_source(
+        &self,
+    ) -> Arc<dyn crate::human_runtime::PublicationAdoptionSource> {
+        Arc::new(RuntimePublicationAdoptionSource {
+            effects: Arc::clone(&self.effects),
+            repositories: self.repositories.clone(),
+        })
     }
 
     pub fn host_jobs(&self) -> Arc<Mutex<HostJobPool>> {
@@ -107,6 +158,32 @@ impl RuntimeDelivery {
         ),
         String,
     > {
+        let observation = self.observe_snapshot(&resource.repository_id, &resource.branch)?;
+        self.publication_adoption_request_for_observation(
+            store,
+            resource,
+            selected_resource,
+            request_id,
+            expires_at_unix,
+            observation,
+        )
+    }
+
+    fn publication_adoption_request_for_observation(
+        &self,
+        store: &crate::store::ConfigStore,
+        resource: &crate::store::publication_monitor::PublicationResource,
+        selected_resource: crate::human_runtime::SelectedPublicationResource,
+        request_id: crate::domain::ids::HumanRequestId,
+        expires_at_unix: u64,
+        current_observation: crate::delivery_runtime::RepositoryPublicationObservation,
+    ) -> Result<
+        (
+            crate::human_runtime::HumanRuntimeRequest,
+            crate::human_runtime::HumanAuthorityMaterial,
+        ),
+        String,
+    > {
         let unresolved = store
             .latest_unresolved_publication(resource)?
             .ok_or("publication resource has no unresolved irregularity")?;
@@ -114,8 +191,6 @@ impl RuntimeDelivery {
             .repositories
             .get(&resource.repository_id)
             .ok_or_else(|| format!("unknown repository `{}`", resource.repository_id))?;
-        let current_observation =
-            self.observe_snapshot(&resource.repository_id, &resource.branch)?;
         let current_observation_digest =
             crate::human_runtime::publication_observation_digest(&current_observation)?;
         let authority = crate::human_runtime::PublicationAdoptionAuthority {
@@ -217,6 +292,27 @@ impl RuntimeDelivery {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % candidates.len();
         let (resource, receipts) = candidates.swap_remove(index);
+        if let Some(unresolved) = store.latest_unresolved_publication(&resource)? {
+            if let Some(revision) = self.apply_accepted_publication_adoption(
+                store,
+                owner_generation,
+                &resource,
+                &unresolved,
+                now_unix,
+            )? {
+                return Ok(PublicationMonitorTick::HumanReviewApplied { revision });
+            }
+            if let Some(request_id) = self.enqueue_publication_adoption_review(
+                store,
+                owner_generation,
+                &resource,
+                &unresolved,
+                now_unix,
+            )? {
+                return Ok(PublicationMonitorTick::HumanReviewPending { request_id });
+            }
+            return Ok(PublicationMonitorTick::Unknown);
+        }
         if store.publication_effect_in_flight(
             &resource.project_id,
             &resource.ticket_run_id,
@@ -326,6 +422,224 @@ impl RuntimeDelivery {
         }
     }
 
+    fn enqueue_publication_adoption_review(
+        &self,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        resource: &crate::store::publication_monitor::PublicationResource,
+        unresolved: &crate::store::publication_monitor::UnresolvedPublicationIrregularity,
+        now_unix: i64,
+    ) -> Result<Option<String>, String> {
+        if self.applied_config.config.human.is_none() {
+            return Ok(None);
+        }
+        let now =
+            u64::try_from(now_unix).map_err(|_| "controller clock is before the Unix epoch")?;
+        let Some(observation) =
+            self.observe_monitor_snapshot(&resource.repository_id, &resource.branch)
+        else {
+            return Ok(None);
+        };
+        let Ok(selected) = selected_publication_resource(&observation) else {
+            // Unknown capability or multiple candidate PRs requires a later fresh observation
+            // and must leave the publication hold intact without failing the controller tick.
+            return Ok(None);
+        };
+        let observation_digest =
+            crate::human_runtime::publication_observation_digest(&observation)?;
+        let identity = serde_json::to_vec(&(
+            resource,
+            &unresolved.event_id,
+            unresolved.revision,
+            &observation_digest,
+        ))
+        .map_err(|error| error.to_string())?;
+        let stable = sha256(&identity);
+        let mut selected_request = None;
+        for attempt in 0..32u8 {
+            let request_id = crate::domain::ids::HumanRequestId::parse(format!(
+                "publication-adoption-{}-{attempt}",
+                &stable[..32]
+            ))?;
+            if let Some(existing) = store.current_human_request(&request_id)? {
+                match existing.lifecycle {
+                    crate::human_runtime::HumanRequestLifecycle::Stale
+                    | crate::human_runtime::HumanRequestLifecycle::Expired
+                    | crate::human_runtime::HumanRequestLifecycle::Cancelled => continue,
+                    crate::human_runtime::HumanRequestLifecycle::Decided
+                        if existing.request.expires_at_unix <= now
+                            && store.human_decision_choice(&request_id)?
+                                == Some(crate::human_runtime::HumanDecisionChoice::Approve) =>
+                    {
+                        // A prior approval that expired during downtime cannot authorize
+                        // adoption. Give this exact observation a fresh, bounded approval ID.
+                        continue;
+                    }
+                    crate::human_runtime::HumanRequestLifecycle::Decided
+                        if matches!(
+                            store.human_decision_choice(&request_id)?,
+                            Some(
+                                crate::human_runtime::HumanDecisionChoice::Refuse
+                                    | crate::human_runtime::HumanDecisionChoice::Defer
+                            )
+                        ) =>
+                    {
+                        // A refusal or explicit deferral remains a hold. Do not create a new
+                        // prompt for the same unresolved observation on every controller tick.
+                        return Ok(None);
+                    }
+                    _ => return Ok(Some(request_id.as_str().to_owned())),
+                }
+            }
+            let logical_key = format!("publication-adoption:{}", request_id.as_str());
+            if let Some(existing) = store.effect_by_logical_key(&logical_key)? {
+                let effect: crate::human_runtime::HumanPresentationEffect =
+                    crate::protocol::parse_unique(existing.request_json.as_bytes())?;
+                if effect.request.request_id != request_id {
+                    return Err(
+                        "publication adoption presentation key is bound to another request".into(),
+                    );
+                }
+                return Ok(Some(request_id.as_str().to_owned()));
+            }
+            selected_request = Some((request_id, logical_key));
+            break;
+        }
+        let Some((request_id, logical_key)) = selected_request else {
+            return Err("publication adoption request retry limit was exhausted".into());
+        };
+        let expires_at = now
+            .checked_add(7 * 24 * 60 * 60)
+            .ok_or("publication review expiry overflow")?;
+        let (request, authority) = self.publication_adoption_request_for_observation(
+            store,
+            resource,
+            selected,
+            request_id.clone(),
+            expires_at,
+            observation,
+        )?;
+        if request.subject.revision.0 != unresolved.revision
+            || request.subject.subject_id != unresolved.event_id
+        {
+            return Err("publication review request differs from the unresolved event".into());
+        }
+        let mut offset = 0u64;
+        let run = loop {
+            let page = store.active_ticket_runs_page_for_project(
+                owner_generation,
+                &resource.project_id,
+                offset,
+                256,
+            )?;
+            if let Some(run) = page
+                .iter()
+                .find(|run| run.ticket_run_id == resource.ticket_run_id)
+                .cloned()
+            {
+                break Some(run);
+            }
+            if page.len() < 256 {
+                break None;
+            }
+            offset = offset
+                .checked_add(page.len() as u64)
+                .ok_or("active TicketRun page offset overflow")?;
+        };
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let view = store
+            .rex_view_history(&resource.project_id)?
+            .into_iter()
+            .find(|record| {
+                record.lifecycle == "active"
+                    && record.view.kind == crate::launch::RexViewKind::Ticket
+                    && record.view.ticket_namespace.as_deref() == Some(run.namespace.as_str())
+                    && record.view.ticket_id.as_deref() == Some(run.ticket_id.as_str())
+            });
+        let Some(view) = view else {
+            return Ok(None);
+        };
+        let authority = crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption {
+            material: match authority {
+                crate::human_runtime::HumanAuthorityMaterial::PublicationAdoption { material } => {
+                    material
+                }
+                _ => return Err("publication request builder returned the wrong authority".into()),
+            },
+        };
+        let effect = crate::human_runtime::HumanPresentationEffect {
+            request: request.clone(),
+            rex_view_id: view.view.view_id,
+            authority: Some(authority),
+        };
+        let request_json = crate::store::canonical_json(&effect)?;
+        let request_digest = crate::domain::ids::Digest::parse(sha256(request_json.as_bytes()))?;
+        let intent = crate::store::EffectIntent {
+            project_id: resource.project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: resource.ticket_run_id.as_str().to_owned(),
+            operation_id: format!("present-{}", request_id.as_str()),
+            logical_key,
+            kind: crate::engine::reducer::effect_name(
+                &crate::engine::reducer::EffectKind::RequestHumanReview,
+            )
+            .into(),
+            request_json,
+            request_digest: request_digest.as_str().to_owned(),
+            expected_revision: Some(run.revision),
+        };
+        store.enqueue_effect(owner_generation, &intent)?;
+        Ok(Some(request_id.as_str().to_owned()))
+    }
+
+    fn apply_accepted_publication_adoption(
+        &self,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        resource: &crate::store::publication_monitor::PublicationResource,
+        unresolved: &crate::store::publication_monitor::UnresolvedPublicationIrregularity,
+        now_unix: i64,
+    ) -> Result<Option<u64>, String> {
+        let now =
+            u64::try_from(now_unix).map_err(|_| "controller clock is before the Unix epoch")?;
+        let Some(summary) =
+            store.current_human_request_for_publication_event(&unresolved.event_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(approval) =
+            store.accepted_publication_adoption_approval(&summary.request.request_id, now)?
+        else {
+            return Ok(None);
+        };
+        let repository = self
+            .repositories
+            .get(&resource.repository_id)
+            .ok_or_else(|| format!("unknown repository `{}`", resource.repository_id))?;
+        let Some(observation) =
+            self.observe_monitor_snapshot(&resource.repository_id, &resource.branch)
+        else {
+            return Ok(None);
+        };
+        let material = approval.authority();
+        if crate::human_runtime::publication_observation_digest(&observation)?
+            != material.current_observation_digest
+        {
+            return Ok(None);
+        }
+        let baseline = store.adopt_publication_snapshot(
+            owner_generation,
+            &approval,
+            &observation,
+            &self.configuration_digest,
+            &repository.base_branch,
+            now_unix,
+        )?;
+        Ok(Some(baseline.revision))
+    }
+
     /// Resolve each configured base branch to its current remote commit without cloning or
     /// mutating a managed repository. The returned map is a single bounded read pass.
     pub fn observe_base_heads(&self) -> Result<BTreeMap<RepositoryId, String>, String> {
@@ -388,8 +702,11 @@ impl crate::human_runtime::PublicationAdoptionSource for RuntimeDelivery {
     fn observe_publication(
         &self,
         resource: &crate::store::publication_monitor::PublicationResource,
-    ) -> Result<crate::delivery_runtime::RepositoryPublicationObservation, String> {
-        self.observe_snapshot(&resource.repository_id, &resource.branch)
+    ) -> Result<Option<crate::delivery_runtime::RepositoryPublicationObservation>, String> {
+        match self.observe_snapshot(&resource.repository_id, &resource.branch) {
+            Ok(observation) => Ok(Some(observation)),
+            Err(_) => Ok(None),
+        }
     }
 }
 
@@ -496,6 +813,35 @@ fn valid_git_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn selected_publication_resource(
+    observation: &crate::delivery_runtime::RepositoryPublicationObservation,
+) -> Result<crate::human_runtime::SelectedPublicationResource, String> {
+    let crate::delivery_forge::ObservationCapability::Known(pulls) = &observation.pull_requests
+    else {
+        return Err("publication adoption requires a complete pull-request observation".into());
+    };
+    if pulls.len() > 1 {
+        return Err(
+            "publication adoption cannot select among multiple pull requests automatically".into(),
+        );
+    }
+    if let Some(pull) = pulls.first() {
+        return Ok(
+            crate::human_runtime::SelectedPublicationResource::PullRequest {
+                number: pull.number,
+                node_id: pull.node_id.clone(),
+                head_sha: pull.source_head.clone(),
+                base_sha: pull.base_sha.clone(),
+            },
+        );
+    }
+    let head = observation
+        .remote_head
+        .clone()
+        .ok_or("publication adoption has no current branch or pull request to review")?;
+    Ok(crate::human_runtime::SelectedPublicationResource::Branch { head })
+}
+
 fn canonical_observation_digest(
     observation: &crate::delivery_runtime::RepositoryPublicationObservation,
 ) -> Result<String, String> {
@@ -591,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_remote_observation_is_unknown_to_monitor_but_blocks_adoption() {
+    fn failed_remote_observation_is_unknown_to_monitor_and_unavailable_to_adoption() {
         let temp = tempfile::tempdir().unwrap();
         let bin = tool_path(&temp.path().join("bin"));
         fs::write(bin.join("git"), "#!/bin/sh\nexit 17\n").unwrap();
@@ -619,7 +965,8 @@ mod tests {
             crate::human_runtime::PublicationAdoptionSource::observe_publication(
                 &delivery, &resource,
             )
-            .is_err()
+            .unwrap()
+            .is_none()
         );
     }
 

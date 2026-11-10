@@ -545,11 +545,12 @@ impl RuntimeServices {
                 .ok_or("captured environment has neither XDG_CONFIG_HOME nor HOME")?
                 .join("rex-projects");
             let observer =
-                crate::human_runtime::DurableHumanSubjectObserver::with_merge_work_review(
+                crate::human_runtime::DurableHumanSubjectObserver::with_merge_work_review_and_publication_adoption(
                     declarative_root,
                     owner_generation,
                     delivery.shared_effects(),
                     merge_source.clone(),
+                    delivery.publication_adoption_source(),
                 )?;
             handlers.push(Box::new(
                 crate::human_runtime::HumanPresenterEffectHandler::new(
@@ -2108,16 +2109,21 @@ impl FactoryRuntimeServices for RuntimeServices {
             self.rex_search_path.clone(),
             self.host_environment.clone(),
         ));
-        let observer = crate::human_runtime::DurableHumanSubjectObserver::with_merge_work_review(
+        let observer = crate::human_runtime::DurableHumanSubjectObserver::with_merge_work_review_and_publication_adoption(
             declarative_root,
             owner_generation,
             self.delivery.shared_effects(),
             source,
+            self.delivery.publication_adoption_source(),
         )?;
         let now =
             u64::try_from(now_unix).map_err(|_| "controller clock is before the Unix epoch")?;
         for queued in store.pending_human_decisions(owner_generation, 64)? {
-            if queued.request.purpose != crate::human_runtime::HumanPurpose::TicketReview {
+            if !matches!(
+                queued.request.purpose,
+                crate::human_runtime::HumanPurpose::TicketReview
+                    | crate::human_runtime::HumanPurpose::PublicationAdoption
+            ) {
                 continue;
             }
             match crate::human_runtime::HumanSubjectObserver::observe_current_subject(
@@ -2609,6 +2615,72 @@ impl FactoryRuntimeServices for RuntimeServices {
             run.ticket_run_id,
             node_id,
         );
+        let mut prior_publications = succeeded
+            .iter()
+            .filter_map(|prior| {
+                let intent = prior.intent();
+                if intent.kind != "publish_implementation"
+                    || intent.project_id != run.project_id
+                    || intent.subject_type != "ticket_run"
+                    || intent.subject_id != run.ticket_run_id.as_str()
+                    || intent
+                        .expected_revision
+                        .is_none_or(|revision| revision >= effect_revision)
+                {
+                    return None;
+                }
+                let previous: PublishImplementationEffectPayload =
+                    crate::protocol::parse_unique(intent.request_json.as_bytes()).ok()?;
+                let receipt: crate::delivery_runtime::ImplementationPublicationReceipt =
+                    crate::protocol::parse_unique(prior.receipt_json().as_bytes()).ok()?;
+                if previous.ticket_run_id != run.ticket_run_id
+                    || previous.work_node_id != node_id
+                    || previous.repository_id != node.repository
+                    || previous.configuration_digest != self.configuration_digest
+                    || previous.source_revision >= effect_revision
+                    || previous.base_branch != repository.base_branch
+                    || receipt.effect_operation_id != intent.operation_id
+                    || receipt.source_revision != previous.source_revision
+                    || receipt.configuration_digest != previous.configuration_digest
+                    || receipt.ticket_run_id != previous.ticket_run_id
+                    || receipt.repository_id != previous.repository_id
+                    || receipt.work_node_id != previous.work_node_id
+                    || receipt.commit.head() != receipt.pull_request.source_head
+                    || receipt.push.pushed_head != receipt.pull_request.source_head
+                    || receipt.push.branch != prepared.branch()
+                    || receipt.pull_request.source_branch != prepared.branch()
+                    || receipt.pull_request.base_branch != repository.base_branch
+                    || receipt.pull_request.state != "open"
+                {
+                    return None;
+                }
+                Some((previous.source_revision, receipt))
+            })
+            .collect::<Vec<_>>();
+        prior_publications.sort_by_key(|(revision, _)| *revision);
+        if prior_publications.iter().any(|(_, receipt)| {
+            receipt.pull_request.number != prior_publications[0].1.pull_request.number
+                || receipt.pull_request.node_id != prior_publications[0].1.pull_request.node_id
+        }) {
+            return Err(
+                "prior succeeded publications for this work node identify different pull requests"
+                    .into(),
+            );
+        }
+        let update_target = prior_publications.last().map(|(_, receipt)| {
+            crate::delivery_forge::PullRequestTarget {
+                number: receipt.pull_request.number,
+                expected_head: receipt.pull_request.source_head.clone(),
+            }
+        });
+        if update_target.as_ref().is_some_and(|target| {
+            expected_remote_head.as_deref() != Some(target.expected_head.as_str())
+        }) {
+            return Err(
+                "current remote branch head differs from the prior succeeded pull request head"
+                    .into(),
+            );
+        }
         let payload = PublishImplementationEffectPayload {
             schema_version: 1,
             source_revision: effect_revision,
@@ -2626,7 +2698,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             pull_request: PullRequestContent {
                 title,
                 body,
-                update_target: None,
+                update_target,
             },
         };
         let (request_json, request_digest) = canonical_delivery_payload(&payload)?;

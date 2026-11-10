@@ -380,6 +380,41 @@ impl ConfigStore {
         load_request(&self.connection, request_id)
     }
 
+    pub(crate) fn current_human_request_for_publication_event(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<HumanRequestSummary>, String> {
+        let request_id: Option<String> = self.connection.query_row(
+            "SELECT request_id FROM human_requests WHERE purpose='publication_adoption' AND subject_id=?1 ORDER BY created_at_unix DESC,request_id DESC LIMIT 1",
+            [event_id],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        request_id
+            .map(HumanRequestId::parse)
+            .transpose()?
+            .map(|request_id| load_request(&self.connection, &request_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn human_decision_choice(
+        &self,
+        request_id: &HumanRequestId,
+    ) -> Result<Option<crate::human_runtime::HumanDecisionChoice>, String> {
+        let receipt: Option<String> = self.connection
+            .query_row(
+                "SELECT receipt_json FROM human_decisions WHERE request_id=?1 ORDER BY decided_at_unix DESC,response_id DESC LIMIT 1",
+                [request_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        receipt
+            .map(|json| crate::protocol::parse_unique::<PersistedApprovalReceipt>(json.as_bytes()))
+            .transpose()
+            .map(|receipt| receipt.map(|receipt| receipt.choice))
+    }
+
     /// Apply v8 after v7. Tests build a v6 fixture, promote only its user_version to 7, and invoke
     /// this function directly so this branch can be reviewed before PR3d is merged.
     pub fn migrate_human_v8(connection: &mut Connection) -> Result<(), String> {
@@ -2942,6 +2977,16 @@ mod tests {
             .accepted_publication_adoption_approval(&request_id, 63)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            store.human_decision_choice(&request_id).unwrap(),
+            Some(HumanDecisionChoice::Approve)
+        );
+        assert!(
+            store
+                .accepted_publication_adoption_approval(&request_id, 200)
+                .unwrap()
+                .is_none()
+        );
         let baseline = store
             .adopt_publication_snapshot(
                 generation,

@@ -517,6 +517,12 @@ impl PullRequestPublisher for GitHubPullRequestPublisher {
                 && rows.len() == 1
                 && rows[0].number == target.number
                 && rows[0].head.sha == target.expected_head
+                && rows[0].head.sha == intent.source_head
+                && rows[0].head.ref_name == intent.source_branch
+                && rows[0].base.ref_name == intent.base_branch
+                && rows[0].state == "open"
+                && !rows[0].merged
+                && rows[0].merged_at.is_none()
             {
                 return Ok(None);
             }
@@ -655,6 +661,9 @@ fn validate_update_target(
         || current.head.sha != intent.source_head
         || current.head.ref_name != intent.source_branch
         || current.base.ref_name != intent.base_branch
+        || current.state != "open"
+        || current.merged
+        || current.merged_at.is_some()
     {
         return Err(PublicationError::Conflict(
             "PR changed since the update target was observed".into(),
@@ -670,6 +679,9 @@ fn validate_api_pr(
     if row.head.ref_name != intent.source_branch
         || row.head.sha != intent.source_head
         || row.base.ref_name != intent.base_branch
+        || row.state != "open"
+        || row.merged
+        || row.merged_at.is_some()
         || row.title != intent.title
         || row.body.as_deref() != Some(marked_body(intent).as_str())
     {
@@ -805,6 +817,100 @@ mod tests {
             update_target: None,
         };
         (temp, publisher, intent)
+    }
+
+    fn fixture_update_publisher() -> (
+        tempfile::TempDir,
+        GitHubPullRequestPublisher,
+        PullRequestPublicationIntent,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("gh-fixture");
+        let state = temp.path().join("pull-request.json");
+        let payload = temp.path().join("payload.json");
+        let new_head = "cccccccccccccccccccccccccccccccccccccccc";
+        let old_row = format!(
+            r#"[{{"number":7,"node_id":"PR_fixture","html_url":"https://github.com/acme/demo/pull/7","state":"open","title":"Old title","body":"Old body\n\n<!-- rex-projects-operation:old-op -->","head":{{"ref":"rex-projects/work","sha":"{new_head}"}},"base":{{"ref":"main","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}]"#
+        );
+        std::fs::write(&state, old_row).unwrap();
+        let updated_row = format!(
+            r#"{{"number":7,"node_id":"PR_fixture","html_url":"https://github.com/acme/demo/pull/7","state":"open","title":"New title","body":"New body\n\n<!-- rex-projects-operation:publish-2 -->","head":{{"ref":"rex-projects/work","sha":"{new_head}"}},"base":{{"ref":"main","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}"#
+        );
+        let updated_list = format!("[{updated_row}]");
+        let script = format!(
+            "#!/bin/sh\nmethod=GET; endpoint=; previous=\nfor arg in \"$@\"; do if [ \"$previous\" = -X ]; then method=$arg; fi; if [ \"$arg\" = -X ]; then previous=-X; else previous=; fi; case $arg in repos/*) endpoint=$arg;; esac; done\ncase \"$method:$endpoint\" in\nGET:repos/acme/demo/pulls\\?*) cat \"$FIXTURE_STATE\" ;;\nGET:repos/acme/demo/pulls/7) sed 's/^\\[//;s/\\]$//' \"$FIXTURE_STATE\" ;;\nPATCH:repos/acme/demo/pulls/7) cat > \"$FIXTURE_PAYLOAD\"; if grep -q '\"head\"' \"$FIXTURE_PAYLOAD\"; then exit 91; fi; printf '%s' '{updated_list}' > \"$FIXTURE_STATE\"; printf '%s' '{updated_row}' ;;\n*) exit 90 ;;\nesac\n",
+            updated_row = updated_row,
+            updated_list = updated_list
+        );
+        std::fs::write(&executable, script).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let publisher = GitHubPullRequestPublisher::new(
+            executable,
+            BTreeMap::from([
+                (OsString::from("FIXTURE_STATE"), state.into_os_string()),
+                (OsString::from("FIXTURE_PAYLOAD"), payload.into_os_string()),
+            ]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let intent = PullRequestPublicationIntent {
+            operation_id: OperationId::parse("publish-2").unwrap(),
+            repository_id: RepositoryId::parse("demo").unwrap(),
+            clone_url: "git@github.com:acme/demo.git".into(),
+            source_branch: "rex-projects/work".into(),
+            source_head: new_head.into(),
+            base_branch: "main".into(),
+            title: "New title".into(),
+            body: "New body".into(),
+            update_target: Some(PullRequestTarget {
+                number: 7,
+                expected_head: new_head.into(),
+            }),
+        };
+        (temp, publisher, intent)
+    }
+
+    #[test]
+    fn post_push_update_patches_existing_pr_metadata_and_reconciles_idempotently() {
+        let (_temp, publisher, intent) = fixture_update_publisher();
+        let first = publisher.publish(&intent).unwrap();
+        let second = publisher.publish(&intent).unwrap();
+
+        assert_eq!(first.number, 7);
+        assert_eq!(first.source_head, intent.source_head);
+        assert_eq!(first.title, intent.title);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn post_push_update_rejects_stale_or_non_open_pr_without_patching() {
+        for replacement in [
+            ("\"state\":\"open\"", "\"state\":\"closed\""),
+            ("\"state\":\"open\"", "\"state\":\"open\",\"merged\":true"),
+            (
+                "\"state\":\"open\"",
+                "\"state\":\"open\",\"merged_at\":\"2026-11-09T00:00:00Z\"",
+            ),
+            (
+                "cccccccccccccccccccccccccccccccccccccccc",
+                "dddddddddddddddddddddddddddddddddddddddd",
+            ),
+            ("rex-projects/work", "other-branch"),
+            ("\"ref\":\"main\"", "\"ref\":\"release\""),
+            ("\"number\":7", "\"number\":8"),
+        ] {
+            let (temp, publisher, intent) = fixture_update_publisher();
+            let state_path = temp.path().join("pull-request.json");
+            let original = std::fs::read_to_string(&state_path).unwrap();
+            let changed = original.replacen(replacement.0, replacement.1, 1);
+            assert_ne!(changed, original);
+            std::fs::write(&state_path, changed).unwrap();
+
+            assert!(publisher.publish(&intent).is_err());
+            assert!(!temp.path().join("payload.json").exists());
+        }
     }
 
     #[test]

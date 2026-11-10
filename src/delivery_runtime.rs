@@ -2398,6 +2398,100 @@ impl RepositoryDeliveryEffects {
         Ok(())
     }
 
+    fn prior_publication_anchor(
+        &self,
+        store: &crate::store::ConfigStore,
+        owner_generation: u64,
+        request: &EffectRequest,
+        payload: &PublishImplementationEffectPayload,
+        work: &PreparedRepositoryWork,
+        repository: &RepositoryConfig,
+    ) -> Result<Option<PriorPublicationAnchor>, String> {
+        let succeeded = store.list_succeeded_effect_receipts(
+            owner_generation,
+            &request.intent.project_id,
+            "ticket_run",
+            payload.ticket_run_id.as_str(),
+            256,
+        )?;
+        let mut anchors = Vec::new();
+        for prior in succeeded
+            .iter()
+            .filter(|prior| prior.intent().kind == "publish_implementation")
+        {
+            let intent = prior.intent();
+            if intent
+                .expected_revision
+                .is_none_or(|revision| revision >= payload.source_revision)
+            {
+                continue;
+            }
+            let prior_request = effect_request_from_persisted(prior);
+            let prior_payload: PublishImplementationEffectPayload =
+                match decode_effect_payload(&prior_request) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+            if intent.project_id != request.intent.project_id
+                || intent.subject_type != "ticket_run"
+                || intent.subject_id != payload.ticket_run_id.as_str()
+                || prior_payload.ticket_run_id != payload.ticket_run_id
+                || prior_payload.work_node_id != payload.work_node_id
+                || prior_payload.repository_id != payload.repository_id
+                || prior_payload.configuration_digest != payload.configuration_digest
+                || prior_payload.source_revision >= payload.source_revision
+                || prior_payload.expected_base_sha != payload.expected_base_sha
+                || prior_payload.base_branch != payload.base_branch
+                || repository.base_branch != prior_payload.base_branch
+            {
+                continue;
+            }
+            let prepared = PreparedWorktreeReceiptNode {
+                work_node_id: prior_payload.work_node_id.clone(),
+                repository_id: prior_payload.repository_id.clone(),
+                worktree_path: work.worktree.path.clone(),
+                branch: work.worktree.branch.clone(),
+                base_sha: prior_payload.expected_base_sha.clone(),
+                commit_mode: prior_payload.commit_mode,
+            };
+            let receipt = validate_one_implementation_publication_receipt(
+                &prior_request,
+                &prepared,
+                &request.intent.project_id,
+                repository,
+                prior.receipt_json(),
+            )?;
+            if receipt.pull_request.source_branch != work.worktree.branch
+                || receipt.pull_request.base_branch != repository.base_branch
+                || receipt.pull_request.source_head != receipt.commit.head()
+                || receipt.pull_request.state != "open"
+            {
+                return Err("prior succeeded publication does not identify the current open work-node pull request".into());
+            }
+            anchors.push(PriorPublicationAnchor {
+                target: crate::delivery_forge::PullRequestTarget {
+                    number: receipt.pull_request.number,
+                    expected_head: receipt.pull_request.source_head.clone(),
+                },
+                receipt,
+                source_revision: prior_payload.source_revision,
+            });
+        }
+        if anchors.is_empty() {
+            return Ok(None);
+        }
+        if anchors.iter().any(|anchor| {
+            anchor.receipt.pull_request.number != anchors[0].receipt.pull_request.number
+                || anchor.receipt.pull_request.node_id != anchors[0].receipt.pull_request.node_id
+        }) {
+            return Err(
+                "prior same-node publication receipts refer to different pull requests".into(),
+            );
+        }
+        anchors.sort_by_key(|anchor| anchor.source_revision);
+        Ok(anchors.pop())
+    }
+
     fn publish_implementation(
         &self,
         mode: EffectMode,
@@ -2426,14 +2520,70 @@ impl RepositoryDeliveryEffects {
                 payload.commit_mode,
             )
             .map_err(|error| error.to_string())?;
-        store.assert_publication_unblocked(
-            &crate::store::publication_monitor::PublicationResource {
-                project_id: request.intent.project_id.clone(),
-                ticket_run_id: payload.ticket_run_id.clone(),
-                repository_id: payload.repository_id.clone(),
-                branch: work.worktree.branch.clone(),
-            },
+        let prior_publication = self.prior_publication_anchor(
+            store,
+            owner_generation,
+            request,
+            &payload,
+            &work,
+            repository_config,
         )?;
+        if payload
+            .pull_request
+            .update_target
+            .as_ref()
+            .is_some_and(|explicit| {
+                prior_publication
+                    .as_ref()
+                    .is_none_or(|prior| explicit != &prior.target)
+            })
+        {
+            return Err("explicit pull-request update target does not match the prior succeeded publication receipt".into());
+        }
+        let update_target = prior_publication.as_ref().map(|prior| prior.target.clone());
+        if prior_publication.as_ref().is_some_and(|prior| {
+            payload.expected_remote_head.as_deref() != Some(prior.target.expected_head.as_str())
+        }) {
+            return Err(
+                "correction publication remote compare-and-swap head differs from the prior succeeded pull request head".into(),
+            );
+        }
+        let publication_resource = crate::store::publication_monitor::PublicationResource {
+            project_id: request.intent.project_id.clone(),
+            ticket_run_id: payload.ticket_run_id.clone(),
+            repository_id: payload.repository_id.clone(),
+            branch: work.worktree.branch.clone(),
+        };
+        let prior_baseline = store.load_publication_baseline(&publication_resource)?;
+        if let Some(prior) = &prior_publication {
+            let baseline = prior_baseline.as_ref().ok_or(
+                "prior publication has no trusted current baseline for correction publication",
+            )?;
+            let declared_head = match &payload.commit {
+                WorkerDeliveryCommit::Native {
+                    worker_reported_head,
+                    ..
+                }
+                | WorkerDeliveryCommit::HostReceipt {
+                    worker_reported_head,
+                    ..
+                } => worker_reported_head,
+            };
+            if baseline.configuration_digest != payload.configuration_digest
+                || baseline.base_branch != repository_config.base_branch
+                || !(baseline_has_prior_pull_request_at(
+                    baseline,
+                    prior,
+                    &prior.target.expected_head,
+                ) || baseline_has_prior_pull_request_at(baseline, prior, declared_head))
+            {
+                return Err(
+                    "trusted publication baseline does not match the prior correction target"
+                        .into(),
+                );
+            }
+        }
+        store.assert_publication_unblocked(&publication_resource)?;
         let commit = match (&payload.commit, payload.commit_mode, mode) {
             (
                 WorkerDeliveryCommit::Native {
@@ -2584,7 +2734,7 @@ impl RepositoryDeliveryEffects {
             base_branch: repository_config.base_branch.clone(),
             title: payload.pull_request.title.clone(),
             body: payload.pull_request.body.clone(),
-            update_target: payload.pull_request.update_target.clone(),
+            update_target: update_target.clone(),
         };
         let before_publication = self
             .delivery
@@ -2604,7 +2754,7 @@ impl RepositoryDeliveryEffects {
                 return Err("GitHub PR and timeline observation capability is unknown".into());
             }
             crate::delivery_forge::ObservationCapability::Known(pull_requests) => {
-                if mode == EffectMode::Reconcile {
+                if mode == EffectMode::Reconcile && update_target.is_none() {
                     pull_requests.len() <= 1
                         && pull_requests.first().is_none_or(|pull| {
                             !pull.merged
@@ -2629,12 +2779,50 @@ impl RepositoryDeliveryEffects {
                         })
                 } else if let Some(target) = &publication_intent.update_target {
                     pull_requests.len() == 1
-                        && pull_requests[0].number == target.number
-                        && !pull_requests[0].merged
-                        && pull_requests[0].state == "open"
-                        && pull_requests[0].source_head == target.expected_head
-                        && pull_requests[0].source_branch == publication_intent.source_branch
-                        && pull_requests[0].base_branch == publication_intent.base_branch
+                        && pull_requests.first().is_some_and(|pull| {
+                            let identity_matches = pull.number == target.number
+                                && !pull.merged
+                                && pull.state == "open"
+                                && pull.source_branch == publication_intent.source_branch
+                                && pull.base_branch == publication_intent.base_branch
+                                && prior_publication.as_ref().is_some_and(|prior| {
+                                    pull.node_id == prior.receipt.pull_request.node_id
+                                });
+                            let old_state = identity_matches
+                                && pull.source_head == target.expected_head
+                                && before_publication.remote_head.as_deref()
+                                    == payload.expected_remote_head.as_deref()
+                                && prior_publication.as_ref().is_some_and(|prior| {
+                                    prior_baseline.as_ref().is_some_and(|baseline| {
+                                        baseline_matches_observed_pull_request(
+                                            baseline, prior, pull,
+                                        )
+                                    })
+                                });
+                            let advanced_state = mode == EffectMode::Reconcile
+                                && identity_matches
+                                && pull.source_head == commit.head()
+                                && before_publication.remote_head.as_deref() == Some(commit.head())
+                                && correction_baseline_matches_post_push(
+                                    prior_publication.as_ref(),
+                                    prior_baseline.as_ref(),
+                                    pull,
+                                    &publication_intent,
+                                    CorrectionPublicationStage::BeforePatch,
+                                );
+                            let completed_state = mode == EffectMode::Reconcile
+                                && identity_matches
+                                && pull.source_head == commit.head()
+                                && before_publication.remote_head.as_deref() == Some(commit.head())
+                                && correction_baseline_matches_post_push(
+                                    prior_publication.as_ref(),
+                                    prior_baseline.as_ref(),
+                                    pull,
+                                    &publication_intent,
+                                    CorrectionPublicationStage::Completed,
+                                );
+                            old_state || advanced_state || completed_state
+                        })
                 } else {
                     pull_requests.is_empty()
                 }
@@ -2691,10 +2879,23 @@ impl RepositoryDeliveryEffects {
                     ),
                 );
             };
-            if let Some(pull_request) = self
+            let post_push_intent =
+                publication_intent_after_push(&publication_intent, commit.head());
+            let pull_request = if let Some(pull_request) = self
                 .publisher
-                .reconcile(&publication_intent)
+                .reconcile(&post_push_intent)
                 .map_err(|error| error.to_string())?
+            {
+                pull_request
+            } else {
+                self.publisher
+                    .publish(&post_push_intent)
+                    .map_err(|error| error.to_string())?
+            };
+            if pull_request.source_head == commit.head()
+                && update_target
+                    .as_ref()
+                    .is_none_or(|target| target.number == pull_request.number)
             {
                 return Ok(EffectObservation::Applied {
                     receipt: serde_json::to_string(&ImplementationPublicationReceipt {
@@ -2713,16 +2914,8 @@ impl RepositoryDeliveryEffects {
                     .map_err(|error| error.to_string())?,
                 });
             }
-            return absent_effect(
-                EffectKind::PublishImplementation,
-                request,
-                "github_pull_request_search",
-                format!(
-                    "no PR with operation marker {} for {}/{}",
-                    publication_intent.operation_id,
-                    publication_intent.source_branch,
-                    publication_intent.base_branch
-                ),
+            return Err(
+                "publisher returned a pull request outside the owned correction target".into(),
             );
         }
         let push = self
@@ -2736,6 +2929,7 @@ impl RepositoryDeliveryEffects {
                 &hook_gate,
             )
             .map_err(|error| error.to_string())?;
+        let post_push_intent = publication_intent_after_push(&publication_intent, commit.head());
         let pull_request = self
             .delivery
             .publish_pull_request(
@@ -2746,7 +2940,7 @@ impl RepositoryDeliveryEffects {
                     configuration_digest: &self.configuration_digest,
                     expected_head: commit.head(),
                     hook_gate: &hook_gate,
-                    intent: &publication_intent,
+                    intent: &post_push_intent,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -2821,6 +3015,202 @@ pub struct ImplementationPublicationReceipt {
     pub hook_gate: HookGateReceipt,
     pub push: PushReceipt,
     pub pull_request: PublishedPullRequest,
+}
+
+#[derive(Clone)]
+struct PriorPublicationAnchor {
+    target: crate::delivery_forge::PullRequestTarget,
+    receipt: ImplementationPublicationReceipt,
+    source_revision: u64,
+}
+
+fn baseline_has_prior_pull_request(
+    baseline: &crate::store::publication_monitor::PublicationBaseline,
+    prior: &PriorPublicationAnchor,
+) -> bool {
+    baseline_has_prior_pull_request_at(baseline, prior, &prior.target.expected_head)
+}
+
+fn baseline_has_prior_pull_request_at(
+    baseline: &crate::store::publication_monitor::PublicationBaseline,
+    prior: &PriorPublicationAnchor,
+    expected_head: &str,
+) -> bool {
+    if baseline.observation.remote_head.as_deref() != Some(expected_head) {
+        return false;
+    }
+    let crate::delivery_forge::ObservationCapability::Known(pulls) =
+        &baseline.observation.pull_requests
+    else {
+        return false;
+    };
+    pulls.len() == 1
+        && pulls.first().is_some_and(|pull| {
+            pull.number == prior.target.number
+                && pull.node_id == prior.receipt.pull_request.node_id
+                && pull.state == "open"
+                && !pull.merged
+                && pull.merged_at.is_none()
+                && pull.source_branch == prior.receipt.pull_request.source_branch
+                && pull.source_head == expected_head
+                && pull.base_branch == prior.receipt.pull_request.base_branch
+        })
+}
+
+fn baseline_matches_observed_pull_request(
+    baseline: &crate::store::publication_monitor::PublicationBaseline,
+    prior: &PriorPublicationAnchor,
+    observed: &crate::delivery_forge::ObservedPullRequest,
+) -> bool {
+    if baseline.observation.remote_head.as_deref() != Some(prior.target.expected_head.as_str())
+        || !baseline_has_prior_pull_request(baseline, prior)
+    {
+        return false;
+    }
+    let crate::delivery_forge::ObservationCapability::Known(pulls) =
+        &baseline.observation.pull_requests
+    else {
+        return false;
+    };
+    pulls.first().is_some_and(|baseline_pull| {
+        baseline_pull.number == observed.number
+            && baseline_pull.node_id == observed.node_id
+            && baseline_pull.url == observed.url
+            && baseline_pull.state == observed.state
+            && baseline_pull.merged == observed.merged
+            && baseline_pull.merged_at == observed.merged_at
+            && baseline_pull.source_branch == observed.source_branch
+            && baseline_pull.source_head == observed.source_head
+            && baseline_pull.base_branch == observed.base_branch
+            && baseline_pull.base_sha == observed.base_sha
+            && baseline_pull.title == observed.title
+            && baseline_pull.body == observed.body
+            && baseline_pull.timeline == observed.timeline
+    })
+}
+
+#[derive(Clone, Copy)]
+enum CorrectionPublicationStage {
+    BeforePatch,
+    Completed,
+}
+
+fn correction_baseline_matches_post_push(
+    prior: Option<&PriorPublicationAnchor>,
+    baseline: Option<&crate::store::publication_monitor::PublicationBaseline>,
+    observed: &crate::delivery_forge::ObservedPullRequest,
+    intent: &PullRequestPublicationIntent,
+    stage: CorrectionPublicationStage,
+) -> bool {
+    let (Some(prior), Some(baseline)) = (prior, baseline) else {
+        return false;
+    };
+    let pushed_head = intent.source_head.as_str();
+    let baseline_head =
+        if baseline_has_prior_pull_request_at(baseline, prior, &prior.target.expected_head) {
+            prior.target.expected_head.as_str()
+        } else if baseline_has_prior_pull_request_at(baseline, prior, pushed_head) {
+            pushed_head
+        } else {
+            return false;
+        };
+    let crate::delivery_forge::ObservationCapability::Known(baseline_pulls) =
+        &baseline.observation.pull_requests
+    else {
+        return false;
+    };
+    if baseline_pulls.len() != 1 || observed.source_head != pushed_head {
+        return false;
+    }
+    let accepted = &baseline_pulls[0];
+    let immutable_identity_matches = accepted.number == observed.number
+        && accepted.node_id == observed.node_id
+        && accepted.url == observed.url
+        && accepted.state == observed.state
+        && accepted.merged == observed.merged
+        && accepted.merged_at == observed.merged_at
+        && accepted.source_branch == observed.source_branch
+        && accepted.base_branch == observed.base_branch
+        && accepted.base_sha == observed.base_sha;
+    let metadata_matches = match stage {
+        CorrectionPublicationStage::BeforePatch => {
+            accepted.title == observed.title && accepted.body == observed.body
+        }
+        CorrectionPublicationStage::Completed => {
+            observed.title == intent.title
+                && observed.body.as_deref() == Some(marked_body_for_monitor(intent).as_str())
+        }
+    };
+    let timeline_matches = if baseline_head == prior.target.expected_head {
+        baseline_timeline_matches_post_push(baseline, observed, &intent.clone_url, pushed_head)
+    } else {
+        accepted.timeline == observed.timeline
+    };
+    immutable_identity_matches && metadata_matches && timeline_matches
+}
+
+fn baseline_timeline_matches_post_push(
+    baseline: &crate::store::publication_monitor::PublicationBaseline,
+    observed: &crate::delivery_forge::ObservedPullRequest,
+    clone_url: &str,
+    pushed_head: &str,
+) -> bool {
+    let (
+        crate::delivery_forge::ObservationCapability::Known(before),
+        crate::delivery_forge::ObservationCapability::Known(after),
+    ) = (&baseline.observation.pull_requests, &observed.timeline)
+    else {
+        return false;
+    };
+    let Some(repository) = github_repository_path(clone_url) else {
+        return false;
+    };
+    let expected_commit =
+        format!("https://api.github.com/repos/{repository}/git/commits/{pushed_head}");
+    if before.len() != 1 || before[0].number != observed.number {
+        return false;
+    }
+    let Some(baseline_pull) = before.first() else {
+        return false;
+    };
+    let crate::delivery_forge::ObservationCapability::Known(baseline_entries) =
+        &baseline_pull.timeline
+    else {
+        return false;
+    };
+    let additions = after
+        .iter()
+        .filter(|entry| !baseline_entries.contains(entry))
+        .collect::<Vec<_>>();
+    baseline_entries.iter().all(|entry| after.contains(entry))
+        && additions.len() <= 1
+        && additions
+            .first()
+            .is_none_or(|entry| entry.event == "committed" && entry.reference == expected_commit)
+}
+
+fn github_repository_path(clone_url: &str) -> Option<String> {
+    let path = clone_url
+        .strip_prefix("git@github.com:")
+        .or_else(|| clone_url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| clone_url.strip_prefix("https://github.com/"))?;
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    if parts.next().is_some()
+        || owner.is_empty()
+        || repository.is_empty()
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || !repository
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+    {
+        return None;
+    }
+    Some(format!("{owner}/{repository}"))
 }
 
 /// Host-derived identity and coverage for the exact implementation publications under review.
@@ -3461,6 +3851,17 @@ fn marked_body_for_monitor(intent: &PullRequestPublicationIntent) -> String {
         intent.body.trim_end(),
         intent.operation_id.as_str()
     )
+}
+
+fn publication_intent_after_push(
+    intent: &PullRequestPublicationIntent,
+    pushed_head: &str,
+) -> PullRequestPublicationIntent {
+    let mut updated = intent.clone();
+    if let Some(target) = &mut updated.update_target {
+        target.expected_head = pushed_head.to_owned();
+    }
+    updated
 }
 
 pub struct PrepareWorktreesEffectHandler {
@@ -4127,6 +4528,766 @@ mod tests {
             rex_projects_hooks: Vec::new(),
             merge: MergeConfig::default(),
             operations: None,
+        }
+    }
+
+    fn correction_publication_fixture(
+        reconcile_after_push: bool,
+        inject_post_patch_comment: bool,
+        inject_post_patch_base_drift: bool,
+    ) -> (tempfile::TempDir, EffectObservation, String, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = git_path();
+        let (bare, base_sha) = seed_local_remote(temp.path(), &executable);
+        let remote = "https://github.com/acme/demo.git";
+        let signing_key = temp.path().join("fixture-signing-key");
+        let generated_key = std::process::Command::new("ssh-keygen")
+            .args([
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "fixture@example.invalid",
+                "-f",
+            ])
+            .arg(&signing_key)
+            .status()
+            .unwrap();
+        assert!(generated_key.success(), "create isolated SSH signing key");
+        let public_key = std::fs::read_to_string(signing_key.with_extension("pub")).unwrap();
+        let public_fields = public_key.split_whitespace().collect::<Vec<_>>();
+        assert!(public_fields.len() >= 2, "fixture public key is valid");
+        let allowed_signers = temp.path().join("allowed-signers");
+        std::fs::write(
+            &allowed_signers,
+            format!(
+                "fixture@example.invalid {} {}\n",
+                public_fields[0], public_fields[1]
+            ),
+        )
+        .unwrap();
+        let signing_key_config = format!("user.signingkey={}", signing_key.display());
+        let configuration_digest = Digest::parse("c".repeat(64)).unwrap();
+        let repository_id = RepositoryId::parse("demo").unwrap();
+        let project_id = ProjectId::parse("project").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-1").unwrap();
+        let work_node_id = WorkNodeId::parse("api").unwrap();
+        let mut git_environment = BTreeMap::new();
+        git_environment.insert(OsString::from("GIT_CONFIG_COUNT"), OsString::from("4"));
+        git_environment.insert(
+            OsString::from("GIT_CONFIG_KEY_0"),
+            OsString::from(format!("url.{}.insteadOf", bare.to_string_lossy())),
+        );
+        git_environment.insert(OsString::from("GIT_CONFIG_VALUE_0"), OsString::from(remote));
+        git_environment.insert(
+            OsString::from("GIT_CONFIG_KEY_1"),
+            OsString::from("gpg.format"),
+        );
+        git_environment.insert(OsString::from("GIT_CONFIG_VALUE_1"), OsString::from("ssh"));
+        git_environment.insert(
+            OsString::from("GIT_CONFIG_KEY_2"),
+            OsString::from("gpg.ssh.allowedSignersFile"),
+        );
+        git_environment.insert(
+            OsString::from("GIT_CONFIG_VALUE_2"),
+            allowed_signers.clone().into_os_string(),
+        );
+        git_environment.insert(
+            OsString::from("GIT_CONFIG_KEY_3"),
+            OsString::from("user.signingkey"),
+        );
+        git_environment.insert(
+            OsString::from("GIT_CONFIG_VALUE_3"),
+            signing_key.clone().into_os_string(),
+        );
+
+        let gh_executable = temp.path().join("gh-fixture");
+        let branch_env = temp.path().join("branch");
+        let script = r##"#!/bin/sh
+endpoint="$2"
+method=GET
+if [ "$3" = "-X" ]; then method="$4"; fi
+BRANCH=$(cat "$BRANCH_FILE")
+BASE_HEAD=$(cat "$BASE_HEAD_FILE")
+PR_BASE_SHA=$(cat "$PR_BASE_SHA_FILE")
+OLD_HEAD=$(cat "$OLD_HEAD_FILE")
+NEW_HEAD=$(cat "$NEW_HEAD_FILE")
+OLD_TITLE_JSON=$(cat "$OLD_TITLE_JSON_FILE")
+FINAL_TITLE_JSON=$(cat "$FINAL_TITLE_JSON_FILE")
+OLD_BODY_JSON=$(cat "$OLD_BODY_JSON_FILE")
+FINAL_BODY_JSON=$(cat "$FINAL_BODY_JSON_FILE")
+BASE_TIMELINE_JSON=$(cat "$BASE_TIMELINE_JSON_FILE")
+COMMIT_TIMELINE_JSON=$(cat "$COMMIT_TIMELINE_JSON_FILE")
+head=$(git --git-dir "$BARE" rev-parse "refs/heads/$BRANCH" 2>/dev/null || printf '%s' "$OLD_HEAD")
+if [ "$method" = PATCH ]; then
+  cat > "$PATCH_CAPTURE"
+  : > "$PATCHED"
+  cat "$FINAL_PR"
+  exit 0
+fi
+if [ -f "$PATCHED" ]; then title="$FINAL_TITLE_JSON"; body="$FINAL_BODY_JSON"; else title="$OLD_TITLE_JSON"; body="$OLD_BODY_JSON"; fi
+row() {
+  printf '{"number":42,"node_id":"PR_node_42","html_url":"https://github.com/acme/demo/pull/42","state":"open","merged":false,"merged_at":null,"title":%s,"body":%s,"head":{"ref":"%s","sha":"%s"},"base":{"ref":"main","sha":"%s"}}' "$title" "$body" "$BRANCH" "$head" "$PR_BASE_SHA"
+}
+case "$endpoint" in
+  */pulls\?state=all\&*) printf '['; row; printf ']';;
+  */pulls/42) row;;
+  */issues/42/timeline\?*)
+    printf '[%s' "$BASE_TIMELINE_JSON"
+    if [ "$head" = "$NEW_HEAD" ]; then printf ',%s' "$COMMIT_TIMELINE_JSON"; fi
+    if [ -f "$EXTRA_TIMELINE_FILE" ]; then printf ',%s' "$(cat "$EXTRA_TIMELINE_FILE")"; fi
+    printf ']';;
+  *) printf 'unexpected gh endpoint: %s\n' "$endpoint" >&2; exit 3;;
+esac
+"##;
+        std::fs::write(&gh_executable, script).unwrap();
+        std::fs::set_permissions(&gh_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let repository_config = fixture_repository_config(remote.into());
+        let effects = RepositoryDeliveryEffects::new(
+            RepositoryDeliveryEffectConfig {
+                state_root: temp.path().join("state"),
+                git: GitOptions {
+                    executable: executable.clone(),
+                    environment: git_environment,
+                    timeout: Duration::from_secs(20),
+                },
+                inherited_environment: BTreeMap::new(),
+                environment_binding: HostJobEnvironmentBinding {
+                    snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                    policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+                },
+                gh_executable,
+                gh_environment: BTreeMap::from([
+                    (OsString::from("PATH"), std::env::var_os("PATH").unwrap()),
+                    (OsString::from("BARE"), bare.as_os_str().to_owned()),
+                    (
+                        OsString::from("BRANCH_FILE"),
+                        branch_env.clone().into_os_string(),
+                    ),
+                    (
+                        OsString::from("BASE_HEAD_FILE"),
+                        temp.path().join("base-head").into_os_string(),
+                    ),
+                    (
+                        OsString::from("PR_BASE_SHA_FILE"),
+                        temp.path().join("pr-base-sha").into_os_string(),
+                    ),
+                    (
+                        OsString::from("OLD_HEAD_FILE"),
+                        temp.path().join("old-head").into_os_string(),
+                    ),
+                    (
+                        OsString::from("NEW_HEAD_FILE"),
+                        temp.path().join("new-head").into_os_string(),
+                    ),
+                    (
+                        OsString::from("OLD_TITLE_JSON_FILE"),
+                        temp.path().join("old-title.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("FINAL_TITLE_JSON_FILE"),
+                        temp.path().join("final-title.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("OLD_BODY_JSON_FILE"),
+                        temp.path().join("old-body.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("FINAL_BODY_JSON_FILE"),
+                        temp.path().join("final-body.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("BASE_TIMELINE_JSON_FILE"),
+                        temp.path().join("base-timeline.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("COMMIT_TIMELINE_JSON_FILE"),
+                        temp.path().join("commit-timeline.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("EXTRA_TIMELINE_FILE"),
+                        temp.path().join("extra-timeline.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("PATCH_CAPTURE"),
+                        temp.path().join("patch.json").into_os_string(),
+                    ),
+                    (
+                        OsString::from("PATCHED"),
+                        temp.path().join("patched").into_os_string(),
+                    ),
+                    (
+                        OsString::from("FINAL_PR"),
+                        temp.path().join("final-pr.json").into_os_string(),
+                    ),
+                ]),
+                timeout: Duration::from_secs(5),
+                configuration_digest: configuration_digest.clone(),
+                repositories: BTreeMap::from([(repository_id.clone(), repository_config)]),
+                project_repositories: BTreeMap::from([(
+                    project_id.clone(),
+                    BTreeSet::from([repository_id.clone()]),
+                )]),
+                max_hook_attempts: 3,
+            },
+            Arc::new(Mutex::new(HostJobPool::new(2, 2).unwrap())),
+        )
+        .unwrap();
+
+        let state_dir = temp.path().join("controller");
+        let mut store = crate::store::ConfigStore::open_test(&state_dir).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &crate::config::AppliedConfig {
+                    config: serde_json::from_value(serde_json::json!({
+                        "schema_version": 1,
+                        "adapters": {"tickets": {"kind":"command","command":["test"]}},
+                        "projects": {}
+                    }))
+                    .unwrap(),
+                    profiles: BTreeMap::new(),
+                    source_root: temp.path().display().to_string(),
+                    source_files: Vec::new(),
+                    digest: configuration_digest.clone(),
+                },
+                crate::store::ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        store
+            .insert_project(&crate::store::ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: applied.digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: crate::domain::ids::Revision(0),
+            })
+            .unwrap();
+        let owner_generation = store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "correction-test-owner".into(),
+                state_root: state_dir.display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "correction-test-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "a".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store
+            .create_ticket_run(
+                owner_generation,
+                &project_id,
+                &TicketNamespace::parse("fixture").unwrap(),
+                &TicketId::parse("T-1").unwrap(),
+                &ticket_run_id,
+                2,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET revision=1 WHERE ticket_run_id=?1",
+                rusqlite::params![ticket_run_id.as_str()],
+            )
+            .unwrap();
+        let identity = WorkNodeIdentity {
+            project_id: project_id.clone(),
+            repository_id: repository_id.clone(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket_run_id.clone(),
+            work_node_id: work_node_id.to_string(),
+        };
+        let work = effects
+            .delivery
+            .prepare_worktree(
+                identity,
+                &fixture_repository_config(remote.into()),
+                &base_sha,
+                CommitMode::Native,
+            )
+            .unwrap();
+        git(
+            &executable,
+            &work.worktree.path,
+            &["remote", "set-url", "origin", bare.to_str().unwrap()],
+        );
+        std::fs::write(work.worktree.path.join("feature.txt"), "initial\n").unwrap();
+        git(&executable, &work.worktree.path, &["add", "feature.txt"]);
+        git(
+            &executable,
+            &work.worktree.path,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                signing_key_config.as_str(),
+                "commit",
+                "-S",
+                "-m",
+                "Initial implementation\n\nCo-authored-by: Codex <noreply@openai.com>",
+            ],
+        );
+        let old_head = String::from_utf8(
+            std::process::Command::new(&executable)
+                .current_dir(&work.worktree.path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let branch = work.worktree.branch.clone();
+        std::fs::write(&branch_env, &branch).unwrap();
+        std::fs::write(temp.path().join("base-head"), &base_sha).unwrap();
+        std::fs::write(temp.path().join("pr-base-sha"), &base_sha).unwrap();
+        std::fs::write(temp.path().join("old-head"), &old_head).unwrap();
+        git(
+            &executable,
+            &work.worktree.path,
+            &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        );
+        git(
+            &executable,
+            &work.worktree.path,
+            &["remote", "set-url", "origin", remote],
+        );
+        std::fs::write(work.worktree.path.join("feature.txt"), "corrected\n").unwrap();
+        git(&executable, &work.worktree.path, &["add", "feature.txt"]);
+        git(
+            &executable,
+            &work.worktree.path,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                signing_key_config.as_str(),
+                "commit",
+                "-S",
+                "-m",
+                "Correct implementation\n\nCo-authored-by: Codex <noreply@openai.com>",
+            ],
+        );
+        let new_head = String::from_utf8(
+            std::process::Command::new(&executable)
+                .current_dir(&work.worktree.path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        std::fs::write(temp.path().join("new-head"), &new_head).unwrap();
+        if reconcile_after_push {
+            git(
+                &executable,
+                &work.worktree.path,
+                &["remote", "set-url", "origin", bare.to_str().unwrap()],
+            );
+            git(
+                &executable,
+                &work.worktree.path,
+                &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+            );
+            git(
+                &executable,
+                &work.worktree.path,
+                &["remote", "set-url", "origin", remote],
+            );
+        }
+
+        let prior_operation = OperationId::parse("publish-prior").unwrap();
+        let prior_pr_operation = derived_operation_id(
+            prior_operation.as_str(),
+            &repository_id,
+            work_node_id.as_str(),
+            "pull-request",
+        )
+        .unwrap();
+        let prior_body = format!(
+            "Previous implementation\n\n<!-- rex-projects-operation:{} -->",
+            prior_pr_operation.as_str()
+        );
+        std::fs::write(
+            temp.path().join("old-title.json"),
+            serde_json::to_string("Human-approved title").unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("final-title.json"),
+            serde_json::to_string("Corrected title").unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("old-body.json"),
+            serde_json::to_string(&prior_body).unwrap(),
+        )
+        .unwrap();
+        let prior_payload = PublishImplementationEffectPayload {
+            schema_version: 1,
+            source_revision: 1,
+            configuration_digest: configuration_digest.clone(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket_run_id.clone(),
+            work_node_id: work_node_id.clone(),
+            repository_id: repository_id.clone(),
+            expected_base_sha: base_sha.clone(),
+            base_branch: "main".into(),
+            commit_mode: CommitMode::Native,
+            commit: WorkerDeliveryCommit::Native {
+                previous_accepted_head: base_sha.clone(),
+                worker_reported_head: old_head.clone(),
+                required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+            },
+            expected_remote_head: None,
+            pull_request: PullRequestContent {
+                title: "Human-approved title".into(),
+                body: "Previous implementation".into(),
+                update_target: None,
+            },
+        };
+        let (prior_json, prior_digest) = canonical_delivery_payload(&prior_payload).unwrap();
+        let prior_intent = crate::store::EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.to_string(),
+            operation_id: prior_operation.to_string(),
+            logical_key: "prior-publication".into(),
+            kind: "publish_implementation".into(),
+            request_json: prior_json,
+            request_digest: prior_digest,
+            expected_revision: Some(1),
+        };
+        let prior_receipt = ImplementationPublicationReceipt {
+            schema_version: 1,
+            effect_operation_id: prior_operation.to_string(),
+            source_revision: 1,
+            configuration_digest: configuration_digest.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            repository_id: repository_id.clone(),
+            work_node_id: work_node_id.clone(),
+            commit: VerifiedCommit::Native {
+                receipt: NativeCommitReceipt {
+                    head: old_head.clone(),
+                    base_sha: base_sha.clone(),
+                    commits: vec![old_head.clone()],
+                },
+            },
+            hook_gate: HookGateReceipt {
+                repository_id: repository_id.clone(),
+                head: old_head.clone(),
+                configuration_digest: configuration_digest.clone(),
+                hook_receipts: Vec::new(),
+            },
+            push: PushReceipt {
+                repository_id: repository_id.clone(),
+                branch: branch.clone(),
+                expected_remote_head: None,
+                observed_remote_head: old_head.clone(),
+                pushed_head: old_head.clone(),
+                force_with_lease: false,
+            },
+            pull_request: PublishedPullRequest {
+                repository_id: repository_id.clone(),
+                number: 42,
+                node_id: "PR_node_42".into(),
+                url: "https://github.com/acme/demo/pull/42".into(),
+                state: "open".into(),
+                source_branch: branch.clone(),
+                source_head: old_head.clone(),
+                base_branch: "main".into(),
+                title: "Human-approved title".into(),
+                body_digest: sha256_hex(prior_body.as_bytes()),
+                operation_id: prior_pr_operation,
+            },
+        };
+        store
+            .enqueue_effect(owner_generation, &prior_intent)
+            .unwrap();
+        let claimed = store
+            .next_due_effect(owner_generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.operation_id, prior_operation.as_str());
+        store
+            .finish_effect(
+                prior_operation.as_str(),
+                owner_generation,
+                crate::store::EffectOutcome::Succeeded,
+                Some(&serde_json::to_string(&prior_receipt).unwrap()),
+            )
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "UPDATE ticket_runs SET revision=2 WHERE ticket_run_id=?1",
+                rusqlite::params![ticket_run_id.as_str()],
+            )
+            .unwrap();
+
+        let base_timeline = crate::delivery_forge::ObservedTimelineEntry {
+            event: "reviewed".into(),
+            reference: "https://api.github.com/repos/acme/demo/pulls/42/reviews/1".into(),
+            actor: Some("reviewer".into()),
+            created_at: Some("2026-11-01T00:00:00Z".into()),
+            body: Some("Looks good".into()),
+        };
+        let old_pull = crate::delivery_forge::ObservedPullRequest {
+            number: 42,
+            node_id: "PR_node_42".into(),
+            url: "https://github.com/acme/demo/pull/42".into(),
+            state: "open".into(),
+            merged: false,
+            merged_at: None,
+            source_branch: branch.clone(),
+            source_head: old_head.clone(),
+            base_branch: "main".into(),
+            base_sha: base_sha.clone(),
+            title: "Human-approved title".into(),
+            body: Some(prior_body.clone()),
+            timeline: crate::delivery_forge::ObservationCapability::Known(vec![
+                base_timeline.clone(),
+            ]),
+        };
+        let publication_resource = crate::store::publication_monitor::PublicationResource {
+            project_id: project_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            repository_id: repository_id.clone(),
+            branch: branch.clone(),
+        };
+        store
+            .insert_initial_publication_baseline(
+                owner_generation,
+                &publication_resource,
+                "main",
+                &configuration_digest,
+                &RepositoryPublicationObservation {
+                    remote_head: None,
+                    pull_requests: crate::delivery_forge::ObservationCapability::Known(Vec::new()),
+                },
+                1,
+            )
+            .unwrap();
+        let prior_observation = RepositoryPublicationObservation {
+            remote_head: Some(old_head.clone()),
+            pull_requests: crate::delivery_forge::ObservationCapability::Known(vec![old_pull]),
+        };
+        let prior_observation_json = crate::store::canonical_json(&prior_observation).unwrap();
+        let prior_observation_digest = sha256_hex(prior_observation_json.as_bytes());
+        store
+            .test_connection()
+            .execute(
+                "UPDATE publication_baselines SET current_snapshot_json=?5,current_digest=?6,revision=2 WHERE project_id=?1 AND ticket_run_id=?2 AND repository_id=?3 AND branch=?4",
+                rusqlite::params![
+                    publication_resource.project_id.as_str(),
+                    publication_resource.ticket_run_id.as_str(),
+                    publication_resource.repository_id.as_str(),
+                    publication_resource.branch,
+                    prior_observation_json,
+                    prior_observation_digest,
+                ],
+            )
+            .unwrap();
+
+        let final_operation = OperationId::parse("publish-correction").unwrap();
+        let final_pr_operation = derived_operation_id(
+            final_operation.as_str(),
+            &repository_id,
+            work_node_id.as_str(),
+            "pull-request",
+        )
+        .unwrap();
+        let final_body = format!(
+            "Corrected body\n\n<!-- rex-projects-operation:{} -->",
+            final_pr_operation.as_str()
+        );
+        std::fs::write(
+            temp.path().join("final-body.json"),
+            serde_json::to_string(&final_body).unwrap(),
+        )
+        .unwrap();
+        let final_pull = serde_json::json!({
+            "number":42,"node_id":"PR_node_42","html_url":"https://github.com/acme/demo/pull/42",
+            "state":"open","merged":false,"merged_at":null,"title":"Corrected title","body":final_body,
+            "head":{"ref":branch,"sha":new_head},"base":{"ref":"main","sha":base_sha}
+        });
+        std::fs::write(
+            temp.path().join("final-pr.json"),
+            serde_json::to_vec(&final_pull).unwrap(),
+        )
+        .unwrap();
+        let base_timeline_json = serde_json::to_string(&serde_json::json!({
+            "event":"reviewed","url":base_timeline.reference,"created_at":base_timeline.created_at,
+            "body":base_timeline.body,"actor":{"login":"reviewer"}
+        }))
+        .unwrap();
+        let committed_timeline_json = serde_json::to_string(&serde_json::json!({
+            "event":"committed","url":format!("https://api.github.com/repos/acme/demo/git/commits/{new_head}"),
+            "created_at":"2026-11-10T00:00:00Z","actor":{"login":"automation"}
+        })).unwrap();
+        std::fs::write(temp.path().join("base-timeline.json"), &base_timeline_json).unwrap();
+        std::fs::write(
+            temp.path().join("commit-timeline.json"),
+            &committed_timeline_json,
+        )
+        .unwrap();
+        let intent_payload = PublishImplementationEffectPayload {
+            schema_version: 1,
+            source_revision: 2,
+            configuration_digest: configuration_digest.clone(),
+            ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+            ticket_id: TicketId::parse("T-1").unwrap(),
+            ticket_run_id: ticket_run_id.clone(),
+            work_node_id: work_node_id.clone(),
+            repository_id: repository_id.clone(),
+            expected_base_sha: base_sha,
+            base_branch: "main".into(),
+            commit_mode: CommitMode::Native,
+            commit: WorkerDeliveryCommit::Native {
+                previous_accepted_head: old_head.clone(),
+                worker_reported_head: new_head.clone(),
+                required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+            },
+            expected_remote_head: Some(old_head.clone()),
+            pull_request: PullRequestContent {
+                title: "Corrected title".into(),
+                body: "Corrected body".into(),
+                update_target: None,
+            },
+        };
+        let (request_json, request_digest) = canonical_delivery_payload(&intent_payload).unwrap();
+        let request = EffectRequest {
+            intent: crate::store::EffectIntent {
+                project_id,
+                subject_type: "ticket_run".into(),
+                subject_id: ticket_run_id.to_string(),
+                operation_id: final_operation.to_string(),
+                logical_key: "correction-publication".into(),
+                kind: "publish_implementation".into(),
+                request_json,
+                request_digest,
+                expected_revision: Some(2),
+            },
+            attempt_count: 1,
+            created_at_unix: 2,
+        };
+
+        let mut context = EffectContext {
+            store: &mut store,
+            owner_generation,
+            now_unix: 2,
+        };
+        let observation = effects
+            .publish_implementation_handler()
+            .handle(
+                if reconcile_after_push {
+                    EffectMode::Reconcile
+                } else {
+                    EffectMode::Submit
+                },
+                &request,
+                &mut context,
+            )
+            .unwrap();
+        if inject_post_patch_comment {
+            std::fs::write(
+                temp.path().join("extra-timeline.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "event":"commented",
+                    "url":"https://api.github.com/repos/acme/demo/issues/comments/99",
+                    "created_at":"2026-11-10T00:01:00Z",
+                    "body":"unexpected review-time edit",
+                    "actor":{"login":"reviewer"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        if inject_post_patch_base_drift {
+            std::fs::write(temp.path().join("pr-base-sha"), "f".repeat(40)).unwrap();
+        }
+        let replay = effects.publish_implementation_handler().handle(
+            EffectMode::Reconcile,
+            &request,
+            &mut EffectContext {
+                store: &mut store,
+                owner_generation,
+                now_unix: 3,
+            },
+        );
+        if inject_post_patch_comment || inject_post_patch_base_drift {
+            assert!(
+                replay.is_err(),
+                "post-patch unapproved timeline or immutable PR change must hold"
+            );
+        } else {
+            assert!(
+                matches!(replay, Ok(EffectObservation::Applied { .. })),
+                "an exact post-patch replay should reconcile"
+            );
+        }
+        (temp, observation, old_head, new_head)
+    }
+
+    #[test]
+    fn correction_publication_updates_same_pr_after_compare_and_swap_and_replays_after_push() {
+        for (reconcile_after_push, inject_post_patch_comment, inject_post_patch_base_drift) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let (temp, observation, old_head, new_head) = correction_publication_fixture(
+                reconcile_after_push,
+                inject_post_patch_comment,
+                inject_post_patch_base_drift,
+            );
+            let EffectObservation::Applied { receipt } = observation else {
+                panic!("correction publication should apply: {observation:?}");
+            };
+            let receipt: ImplementationPublicationReceipt = serde_json::from_str(&receipt).unwrap();
+            assert_eq!(receipt.pull_request.number, 42);
+            assert_eq!(receipt.pull_request.source_head, new_head);
+            assert_eq!(
+                receipt.push.expected_remote_head.as_deref(),
+                Some(old_head.as_str())
+            );
+            assert!(!receipt.push.force_with_lease);
+            let patch: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(temp.path().join("patch.json")).unwrap())
+                    .unwrap();
+            assert_eq!(patch["title"], "Corrected title");
+            assert!(
+                patch["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&receipt.pull_request.operation_id.to_string())
+            );
         }
     }
 
@@ -4845,5 +6006,107 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn correction_reconcile_accepts_only_the_exact_post_push_commit_timeline_entry() {
+        let old_entry = crate::delivery_forge::ObservedTimelineEntry {
+            event: "reviewed".into(),
+            reference: "https://api.github.com/repos/acme/demo/pulls/42/reviews/1".into(),
+            actor: Some("reviewer".into()),
+            created_at: Some("2026-11-01T00:00:00Z".into()),
+            body: Some("Looks good".into()),
+        };
+        let baseline_pull = crate::delivery_forge::ObservedPullRequest {
+            number: 42,
+            node_id: "PR_node_42".into(),
+            url: "https://github.com/acme/demo/pull/42".into(),
+            state: "open".into(),
+            merged: false,
+            merged_at: None,
+            source_branch: "rex-projects/branch".into(),
+            source_head: "a".repeat(40),
+            base_branch: "main".into(),
+            base_sha: "b".repeat(40),
+            title: "Human-approved title".into(),
+            body: Some("Human-approved body".into()),
+            timeline: crate::delivery_forge::ObservationCapability::Known(vec![old_entry.clone()]),
+        };
+        let baseline = crate::store::publication_monitor::PublicationBaseline {
+            resource: crate::store::publication_monitor::PublicationResource {
+                project_id: ProjectId::parse("project").unwrap(),
+                ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+                repository_id: RepositoryId::parse("demo").unwrap(),
+                branch: "rex-projects/branch".into(),
+            },
+            base_branch: "main".into(),
+            configuration_digest: Digest::parse("c".repeat(64)).unwrap(),
+            observation: RepositoryPublicationObservation {
+                remote_head: Some("a".repeat(40)),
+                pull_requests: crate::delivery_forge::ObservationCapability::Known(vec![
+                    baseline_pull.clone(),
+                ]),
+            },
+            revision: 2,
+            digest: "d".repeat(64),
+            last_effect_operation_id: None,
+        };
+        let mut pushed = baseline_pull.clone();
+        pushed.source_head = "e".repeat(40);
+        let committed = crate::delivery_forge::ObservedTimelineEntry {
+            event: "committed".into(),
+            reference: format!(
+                "https://api.github.com/repos/acme/demo/git/commits/{}",
+                "e".repeat(40)
+            ),
+            actor: Some("automation".into()),
+            created_at: Some("2026-11-10T00:00:00Z".into()),
+            body: None,
+        };
+        pushed.timeline =
+            crate::delivery_forge::ObservationCapability::Known(vec![old_entry.clone(), committed]);
+        assert!(baseline_timeline_matches_post_push(
+            &baseline,
+            &pushed,
+            "git@github.com:acme/demo.git",
+            &"e".repeat(40),
+        ));
+
+        let mut with_comment = pushed.clone();
+        let crate::delivery_forge::ObservationCapability::Known(entries) =
+            &mut with_comment.timeline
+        else {
+            unreachable!()
+        };
+        entries.push(crate::delivery_forge::ObservedTimelineEntry {
+            event: "commented".into(),
+            reference: "https://api.github.com/repos/acme/demo/issues/comments/9".into(),
+            actor: Some("unknown".into()),
+            created_at: Some("2026-11-10T00:01:00Z".into()),
+            body: Some("Unreviewed change".into()),
+        });
+        assert!(!baseline_timeline_matches_post_push(
+            &baseline,
+            &with_comment,
+            "git@github.com:acme/demo.git",
+            &"e".repeat(40),
+        ));
+
+        let mut wrong_commit = pushed;
+        let crate::delivery_forge::ObservationCapability::Known(entries) =
+            &mut wrong_commit.timeline
+        else {
+            unreachable!()
+        };
+        entries[1].reference = format!(
+            "https://api.github.com/repos/acme/demo/git/commits/{}",
+            "f".repeat(40)
+        );
+        assert!(!baseline_timeline_matches_post_push(
+            &baseline,
+            &wrong_commit,
+            "git@github.com:acme/demo.git",
+            &"e".repeat(40),
+        ));
     }
 }
