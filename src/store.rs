@@ -7239,6 +7239,22 @@ pub(crate) mod tests {
                     publication_snapshot.prepared_receipt().base_refreshes.len(),
                     1
                 );
+                let artifacts = crate::artifacts::ArtifactStore::open(
+                    &temp.path().join("publication-source-artifacts"),
+                )
+                .unwrap();
+                let source = store.validated_worker_publication_source_for_node(
+                    &artifacts,
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    &publication_snapshot.publication_receipts()[0],
+                );
+                assert_eq!(
+                    source.unwrap_err(),
+                    "Query returned no rows",
+                    "this synthetic fixture has no Worker terminal; the source consumer must follow the prior publication to the original Worker transition, rather than misreading the host implementation_published transition"
+                );
                 let mut detached = publication_snapshot.prepared_receipt().clone();
                 detached.work_nodes[0].base_refresh_source = None;
                 assert!(

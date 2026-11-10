@@ -7058,6 +7058,43 @@ impl ConfigStore {
         {
             return Err("Worker source publication differs from its exact scoped receipt".into());
         }
+        if let crate::delivery_runtime::WorkerDeliveryCommit::HostBaseRefresh {
+            prior_publication_operation_id,
+            prior_publication_receipt_digest,
+            ..
+        } = &request.commit
+        {
+            let prior = self
+                .succeeded_effect_receipt(prior_publication_operation_id.as_str())?
+                .ok_or("base refresh source has no succeeded prior Worker publication")?;
+            if digest(prior.receipt_json().as_bytes())? != *prior_publication_receipt_digest {
+                return Err("base refresh source prior publication receipt digest differs".into());
+            }
+            let prior_request: crate::delivery_runtime::PublishImplementationEffectPayload =
+                crate::protocol::parse_unique(prior.intent().request_json.as_bytes())?;
+            if prior.intent().kind != "publish_implementation"
+                || prior.intent().project_id != *project_id
+                || prior.intent().subject_type != "ticket_run"
+                || prior.intent().subject_id != ticket_run_id.as_str()
+                || prior_request.ticket_run_id != request.ticket_run_id
+                || prior_request.work_node_id != request.work_node_id
+                || prior_request.repository_id != request.repository_id
+                || prior_request.configuration_digest != request.configuration_digest
+                || prior_request.source_revision >= request.source_revision
+            {
+                return Err(
+                    "base refresh source prior publication differs from its Worker assignment"
+                        .into(),
+                );
+            }
+            return self.validated_worker_publication_source_for_node(
+                artifact_store,
+                owner_generation,
+                project_id,
+                ticket_run_id,
+                &prior,
+            );
+        }
         let node_id = &request.work_node_id;
         let repository_id = &request.repository_id;
         let publication_revision = request.source_revision;
