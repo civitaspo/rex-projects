@@ -17,6 +17,7 @@ use rex_projects::process::{ProcessRequest, resolve_executable, run};
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const STDERR_LIMIT: usize = 16 * 1024;
 const FIXTURE_ACTOR: &str = "fixture-operator";
+const REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved comments(first:100){nodes{id} pageInfo{hasNextPage}}} pageInfo{hasNextPage}}}}}";
 
 pub fn run_cli(root: &Path, args: &[OsString]) -> Result<(), String> {
     validate_root(root)?;
@@ -168,6 +169,9 @@ fn dispatch(
             json!({"login":FIXTURE_ACTOR,"id":1,"node_id":"fixture-user"}),
         ));
     }
+    if request.endpoint == "graphql" && request.method == "POST" {
+        return observe_review_threads(connection, root, body);
+    }
     let (path, query) = request
         .endpoint
         .split_once('?')
@@ -241,6 +245,49 @@ fn dispatch(
         }
         _ => not_found("unsupported local pull request endpoint"),
     }
+}
+
+fn observe_review_threads(
+    connection: &Connection,
+    root: &Path,
+    body: Value,
+) -> Result<(u16, Value), String> {
+    if body.get("query").and_then(Value::as_str) != Some(REVIEW_THREADS_QUERY) {
+        return not_found("unsupported local GitHub GraphQL query");
+    }
+    let Some(variables) = body.get("variables").and_then(Value::as_object) else {
+        return not_found("review thread query variables are missing");
+    };
+    if variables.len() != 3 {
+        return not_found("review thread query variables are unsupported");
+    }
+    let (Some(owner), Some(repo), Some(number)) = (
+        variables.get("owner").and_then(Value::as_str),
+        variables.get("name").and_then(Value::as_str),
+        variables.get("number").and_then(Value::as_u64),
+    ) else {
+        return not_found("review thread query identity is malformed");
+    };
+    let owner = safe_component(owner)?;
+    let repo = safe_component(repo)?;
+    let remote = root.join("git").join(&owner).join(format!("{repo}.git"));
+    if !remote.is_dir() || load_pull(connection, &owner, &repo, number)?.is_none() {
+        return not_found("local pull request identity is unknown");
+    }
+    let review_comments: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM comments WHERE pull_number=?1 AND kind='review'",
+            [number],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if review_comments != 0 {
+        return not_found("fixture cannot model review comment threads or resolution state");
+    }
+    Ok((
+        200,
+        json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
+    ))
 }
 
 fn dispatch_repository_route(
@@ -809,7 +856,7 @@ mod tests {
     use super::*;
     use rex_projects::forge::github::{GitHubCliForge, GitHubCommandRunner};
     use rex_projects::forge::{
-        CommentIntent, EffectCertainty, Forge, MergeEffectIntent, MergeEffectOperation,
+        CommentIntent, EffectCertainty, Forge, MergeEffectIntent, MergeEffectOperation, Observed,
         PullRequestRef, Reconciliation, RepositoryRef,
     };
     use rex_projects::process::{ProcessError, ProcessOutput};
@@ -1104,6 +1151,101 @@ mod tests {
         assert_eq!(pull_state["state"], "open");
         assert_eq!(pull_state["merged"], false);
         assert!(pull_state["merge_commit_sha"].is_null());
+    }
+
+    #[test]
+    fn actual_github_observe_gets_complete_empty_threads_only_for_known_threadless_pull() {
+        let (temporary, connection, _remote, number, _, _) = fixture_pull();
+        let root = temporary.path().to_path_buf();
+        let runner = Arc::new(AdapterFixtureRunner {
+            root,
+            connection: Mutex::new(connection),
+            requests: Mutex::new(Vec::new()),
+        });
+        let forge = GitHubCliForge::new(
+            runner.clone(),
+            "/fixture/bin/gh".into(),
+            "github.test",
+            BTreeMap::new(),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            OUTPUT_LIMIT,
+            STDERR_LIMIT,
+            2,
+        )
+        .unwrap();
+        let pull = PullRequestRef {
+            repository: RepositoryRef {
+                host: "github.test".into(),
+                owner: "fixture".into(),
+                name: "repository".into(),
+                expected_id: None,
+            },
+            number,
+            expected_node_id: None,
+        };
+
+        let observation = forge.observe(&pull).unwrap();
+        assert!(matches!(
+            observation.review_threads,
+            Observed::Complete { ref value, .. } if value.is_empty()
+        ));
+        assert!(
+            runner
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, endpoint, body, _)| method == "POST"
+                    && endpoint == "graphql"
+                    && body["query"] == REVIEW_THREADS_QUERY
+                    && body["variables"]["owner"] == "fixture"
+                    && body["variables"]["name"] == "repository"
+                    && body["variables"]["number"] == number)
+        );
+
+        let unknown = PullRequestRef {
+            number: number + 100,
+            ..pull.clone()
+        };
+        let unknown_observation = forge.observe(&unknown).unwrap();
+        assert!(matches!(
+            unknown_observation.review_threads,
+            Observed::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn review_thread_fixture_refuses_to_invent_empty_threads_when_review_comments_exist() {
+        let (temporary, connection, _remote, number, _, _) = fixture_pull();
+        connection
+            .execute(
+                "INSERT INTO comments(pull_number,kind,user,body,created_at) VALUES(?1,'review',?2,'unmodeled review comment','2026-11-11T00:00:00Z')",
+                params![number, FIXTURE_ACTOR],
+            )
+            .unwrap();
+        let request = Request {
+            method: "POST".into(),
+            endpoint: "graphql".into(),
+            input: true,
+        };
+        let (status, response) = dispatch(
+            temporary.path(),
+            &connection,
+            &request,
+            json!({
+                "query":REVIEW_THREADS_QUERY,
+                "variables":{"owner":"fixture","name":"repository","number":number}
+            }),
+        )
+        .unwrap();
+        assert_eq!(status, 404);
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot model")
+        );
     }
 
     #[test]

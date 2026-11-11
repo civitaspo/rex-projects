@@ -672,6 +672,67 @@ fn agent_marker_cannot_submit_human_claim_release() {
 }
 
 #[test]
+fn public_human_commands_parse_the_acceptance_request_arguments() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let initialized = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let listed = command(&config, &state, &home)
+        .args(["human", "list", "--project", "operations", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert!(listed["requests"].is_array());
+
+    let shown = command(&config, &state, &home)
+        .args(["human", "show", "missing-request", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(shown.status.code(), Some(3));
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["error"]["code"], "not_found");
+    assert_eq!(shown["error"]["message"], "human request was not found");
+
+    let responded = command(&config, &state, &home)
+        .args([
+            "human",
+            "respond",
+            "missing-request",
+            "--subject-digest",
+            &"a".repeat(64),
+            "--choice",
+            "approve",
+            "--explanation",
+            "acceptance parser fixture",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(responded.status.code(), Some(4));
+    let responded: serde_json::Value = serde_json::from_slice(&responded.stdout).unwrap();
+    assert_eq!(responded["error"]["code"], "conflict");
+    assert!(
+        responded["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())
+    );
+}
+
+#[test]
 fn version_json_is_enabled_when_global_flag_precedes_subcommand() {
     let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
         .args(["--json", "version"])
