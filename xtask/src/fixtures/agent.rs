@@ -1589,6 +1589,32 @@ fn next_message(
                 artifact_refs: Vec::new(),
             });
         }
+        if let Some(ticket_run_id) = inbox.coordinator_plan_ready(&invocation.scope.project_id)? {
+            let progress = json!({
+                "summary":format!("Acknowledged the validated Coordinator plan for TicketRun {ticket_run_id}; the host owns plan acceptance and work-node admission."),
+                "completed_node_keys":[],
+                "pending_node_keys":[],
+                "evidence":[],
+                "next_observation_at":null
+            });
+            validate_payload(RoleOutputKind::Progress, &progress)?;
+            ledger_tx.commit().map_err(|error| error.to_string())?;
+            let bytes = serde_json::to_vec(&progress).map_err(|error| {
+                format!("serialize Supervisor Coordinator plan-ready progress: {error}")
+            })?;
+            return Ok(AgentMessage {
+                schema_version: 1,
+                message_id: format!(
+                    "fixture-supervisor-coordinator-plan-ready-{:x}",
+                    Sha256::digest(invocation.run_id.as_bytes())
+                ),
+                kind: RoleOutputKind::Progress,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: progress,
+                result_digest: format!("{:x}", Sha256::digest(bytes)),
+                artifact_refs: Vec::new(),
+            });
+        }
         if !inbox.is_periodic_review_only() {
             return Err("Supervisor fixture has no eligible normalized ticket observation in its public inbox".into());
         }
@@ -2058,10 +2084,8 @@ impl FixtureInbox {
             .filter_map(|item| {
                 let payload = item.get("payload_json")?;
                 (payload.get("kind").and_then(Value::as_str) == Some("validated_agent_result")
-                    && (payload.pointer("/source/role").and_then(Value::as_str)
-                        == Some("coordinator")
-                        || payload.pointer("/result/kind").and_then(Value::as_str)
-                            == Some("spawn_request")))
+                    && payload.pointer("/result/kind").and_then(Value::as_str)
+                        == Some("spawn_request"))
                 .then_some((item, payload))
             })
             .collect::<Vec<_>>();
@@ -2193,6 +2217,143 @@ impl FixtureInbox {
                 .is_none_or(|bytes| format!("{:x}", Sha256::digest(bytes)) != result_digest)
         {
             return Err("Supervisor Coordinator spawn result failed its project, TicketRun, source, or Planner binding".into());
+        }
+        Ok(Some(ticket_run_id.to_owned()))
+    }
+
+    fn coordinator_plan_ready(&self, project_id: &str) -> Result<Option<String>, String> {
+        let plans = self
+            .inputs
+            .iter()
+            .filter(|item| item.get("source_type").and_then(Value::as_str) == Some("agent_result"))
+            .filter_map(|item| {
+                let payload = item.get("payload_json")?;
+                (payload.get("kind").and_then(Value::as_str) == Some("validated_agent_result")
+                    && payload.pointer("/source/role").and_then(Value::as_str)
+                        == Some("coordinator")
+                    && payload.pointer("/result/kind").and_then(Value::as_str)
+                        == Some("plan_ready"))
+                .then_some((item, payload))
+            })
+            .collect::<Vec<_>>();
+        let [(item, payload)] = plans.as_slice() else {
+            return if plans.is_empty() {
+                Ok(None)
+            } else {
+                Err(
+                    "Supervisor inbox has multiple or ambiguous Coordinator plan-ready results"
+                        .into(),
+                )
+            };
+        };
+        let source = payload
+            .get("source")
+            .ok_or("validated Coordinator plan-ready result omitted its source binding")?;
+        let ticket_run_id = source
+            .get("ticket_run_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or("validated Coordinator plan-ready result omitted its TicketRun binding")?;
+        let host_result = payload
+            .get("result")
+            .ok_or("validated Coordinator plan-ready result omitted its role result")?;
+        let host_observation = payload
+            .get("host_observation")
+            .ok_or("validated Coordinator plan-ready result omitted its host observation")?;
+        let structured = payload
+            .pointer("/result/structured_result")
+            .ok_or("validated Coordinator plan-ready result omitted its structured result")?;
+        let role_session_id = format!("ticket_run:{ticket_run_id}:coordinator");
+        let result_digest = payload
+            .get("result_digest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let structured_digest = serde_json::to_vec(structured)
+            .ok()
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+        if payload.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || source.get("role").and_then(Value::as_str) != Some("coordinator")
+            || source.get("project_id").and_then(Value::as_str) != Some(project_id)
+            || source
+                .get("parent_run_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || source.get("role_session_id").and_then(Value::as_str)
+                != Some(role_session_id.as_str())
+            || source
+                .get("agent_run_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || source
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .is_none_or(|attempt| attempt == 0)
+            || source
+                .get("run_epoch")
+                .and_then(Value::as_u64)
+                .is_none_or(|epoch| epoch == 0)
+            || source
+                .get("profile_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || !is_sha256_digest(
+                source
+                    .get("config_digest")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            || !is_sha256_digest(
+                source
+                    .get("profile_digest")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            || ![
+                "authority_digest",
+                "terminal_digest",
+                "process_absence_digest",
+            ]
+            .iter()
+            .all(|field| {
+                host_observation
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256_digest)
+            })
+            || host_result
+                .get("message_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || host_result
+                .pointer("/assertion/assertion")
+                .and_then(Value::as_str)
+                != Some("succeeded")
+            || !host_result
+                .get("artifact_refs")
+                .is_some_and(Value::is_array)
+            || structured.get("plan").is_none_or(|plan| !plan.is_object())
+            || !structured
+                .get("unresolved_questions")
+                .is_some_and(Value::is_array)
+            || source
+                .get("ticket_revision")
+                .and_then(Value::as_u64)
+                .is_none_or(|revision| {
+                    revision == 0
+                        || item.get("source_revision").and_then(Value::as_u64) != Some(revision)
+                })
+            || item.get("source_id").and_then(Value::as_str)
+                != payload.get("evidence_id").and_then(Value::as_str)
+            || !is_sha256_digest(
+                payload
+                    .get("evidence_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            || !is_sha256_digest(result_digest)
+            || structured_digest.as_deref() != Some(result_digest)
+        {
+            return Err("Supervisor Coordinator plan-ready result failed its project, TicketRun, source, or plan binding".into());
         }
         Ok(Some(ticket_run_id.to_owned()))
     }
@@ -3013,6 +3174,7 @@ mod tests {
         source_schema, validate_action, validate_coordinator_dispatch, validate_recipe_references,
         validate_source_prompt, worker_assignment, worker_node_id, worker_node_id_for_lane,
     };
+    use rusqlite::Connection;
     use std::path::Path;
 
     #[test]
@@ -3510,6 +3672,54 @@ mod tests {
         inbox
     }
 
+    fn coordinator_plan_ready_inbox(run_id: &str) -> FixtureInbox {
+        use sha2::{Digest as _, Sha256};
+
+        let structured = serde_json::json!({
+            "plan":{"nodes":[],"requested_investigation_children":0},
+            "unresolved_questions":[]
+        });
+        let result_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&structured).unwrap())
+        );
+        let evidence_id = "b".repeat(64);
+        FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":run_id,"after":7,"next_after":8,
+                "inputs":[{
+                    "wake_input_id":8,"source_type":"agent_result","source_id":evidence_id,
+                    "source_revision":1,"priority":0,
+                    "payload_json":{
+                        "schema_version":1,"kind":"validated_agent_result",
+                        "evidence_id":evidence_id,"result_digest":result_digest,
+                        "host_observation":{
+                            "authority_digest":"c".repeat(64),
+                            "terminal_digest":"d".repeat(64),
+                            "process_absence_digest":"e".repeat(64)
+                        },
+                        "source":{
+                            "role":"coordinator","project_id":"operations_project",
+                            "ticket_run_id":"ticket-run-a","ticket_revision":1,
+                            "role_session_id":"ticket_run:ticket-run-a:coordinator",
+                            "agent_run_id":"coordinator-run-a","parent_run_id":"supervisor-run-a",
+                            "attempt":1,"run_epoch":1,"profile_id":"fixture_coordinator",
+                            "config_digest":"f".repeat(64),"profile_digest":"a".repeat(64)
+                        },
+                        "result":{
+                            "message_id":"coordinator-plan-ready-a",
+                            "assertion":{"assertion":"succeeded"},"artifact_refs":[],
+                            "kind":"plan_ready","structured_result":structured
+                        }
+                    },
+                    "host_artifacts":[]
+                }]
+            }),
+            run_id,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn operations_ticket_with_zero_goal_revision_produces_dispatch_request() {
         let run_id = "operations-zero-goal-ticket";
@@ -3619,6 +3829,87 @@ mod tests {
             ticket_first.path(),
         );
         assert_eq!(progress.kind, super::RoleOutputKind::Progress);
+    }
+
+    #[test]
+    fn validated_coordinator_plan_ready_is_acknowledged_without_dispatch_or_cursor_consumption() {
+        let run_id = "supervisor-plan-ready";
+        let inbox = coordinator_plan_ready_inbox(run_id);
+        let temp = tempfile::tempdir().unwrap();
+        let message = run_supervisor_message(
+            &supervisor_context(),
+            &supervisor_invocation(run_id),
+            &inbox,
+            temp.path(),
+        );
+
+        assert_eq!(message.kind, super::RoleOutputKind::Progress);
+        assert_eq!(message.assertion, super::AgentAssertion::Succeeded);
+        assert!(
+            message.structured_result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Acknowledged the validated Coordinator plan")
+        );
+        assert_eq!(
+            message.structured_result["completed_node_keys"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            message.structured_result["pending_node_keys"],
+            serde_json::json!([])
+        );
+        assert!(message.structured_result.get("ticket_reference").is_none());
+        let invocations = Connection::open(temp.path().join("invocations.sqlite")).unwrap();
+        let recorded: i64 = invocations
+            .query_row(
+                "SELECT COUNT(*) FROM invocations WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "plan acknowledgement must not consume a recipe"
+        );
+    }
+
+    #[test]
+    fn malformed_coordinator_plan_ready_is_not_acknowledged() {
+        let run_id = "supervisor-invalid-plan-ready";
+        let mut inbox = coordinator_plan_ready_inbox(run_id);
+        inbox.inputs[0]["payload_json"]["result_digest"] = serde_json::json!("0".repeat(64));
+        let temp = tempfile::tempdir().unwrap();
+
+        assert!(
+            next_message(
+                &supervisor_context(),
+                &supervisor_invocation(run_id),
+                temp.path(),
+                None,
+                "host prompt",
+                Some(&inbox),
+            )
+            .is_err()
+        );
+
+        let malformed_run_id = "supervisor-invalid-plan-ready-host";
+        let mut malformed = coordinator_plan_ready_inbox(malformed_run_id);
+        malformed.inputs[0]["payload_json"]["host_observation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authority_digest");
+        assert!(
+            next_message(
+                &supervisor_context(),
+                &supervisor_invocation(malformed_run_id),
+                temp.path(),
+                None,
+                "host prompt",
+                Some(&malformed),
+            )
+            .is_err()
+        );
     }
 
     #[test]
