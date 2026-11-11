@@ -59,6 +59,7 @@ fn complete_role_messages_validate_for_every_allowed_role_and_kind() {
                 "result_digest": digest,
                 "artifact_refs": match kind {
                     RoleOutputKind::MergeAssessment => json!([merge_assessment_reference()]),
+                    RoleOutputKind::VerificationReady => json!([test_receipt_reference()]),
                     RoleOutputKind::PostmortemReady
                     | RoleOutputKind::ProfileTrialResult
                     | RoleOutputKind::ProfilePromotionProposal => json!([general_reference()]),
@@ -133,7 +134,7 @@ fn valid_payloads() -> Vec<(RoleOutputKind, Value)> {
         ),
         (
             RoleOutputKind::DispatchRequest,
-            json!({"ticket_reference":"TICKET-1","expected_ticket_revision":1,"coordinator_profile":"default","priority":1,"rationale":"unblocks work"}),
+            json!({"ticket_reference":"TICKET-1","expected_ticket_revision":"rev-1","coordinator_profile":"default","priority":1,"rationale":"unblocks work"}),
         ),
         (
             RoleOutputKind::Intervention,
@@ -156,6 +157,10 @@ fn valid_payloads() -> Vec<(RoleOutputKind, Value)> {
             json!({"plan":{"nodes":[{"id":"node-a","repository":"repo-a","task":"implement acceptance","depends_on":[],"required_evidence":[],"investigation":false}],"requested_investigation_children":0},"unresolved_questions":[]}),
         ),
         (RoleOutputKind::ImplementationReady, change),
+        (
+            RoleOutputKind::VerificationReady,
+            json!({"work_node_id":"node-a","repository":"repo-a","publication_operation_id":"publication-1","published_head":"2222222222222222222222222222222222222222","test_receipt_artifact_ids":[digest]}),
+        ),
         (
             RoleOutputKind::ReviewReady,
             json!({"subject_kind":"patch","subject_digest":digest,"findings":[],"evidence_coverage":["all acceptance items"],"disposition":"approved","unknowns":[]}),
@@ -204,6 +209,13 @@ fn general_reference() -> Value {
     json!({
         "kind":"general", "artifact_id":"a".repeat(64), "schema_version":1,
         "path":"evidence/result.json", "digest":"a".repeat(64), "bytes":10
+    })
+}
+
+fn test_receipt_reference() -> Value {
+    json!({
+        "kind":"test_receipt", "artifact_id":"a".repeat(64), "schema_version":1,
+        "path":"evidence/checks.json", "digest":"a".repeat(64), "bytes":10
     })
 }
 

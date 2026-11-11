@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,7 @@ use sha2::{Digest as _, Sha256};
 use crate::config::{Config, OperationRecipe, ProjectConfig, SuccessPredicate};
 use crate::domain::ids::{
     AgentRunId, ArtifactId, Digest, OperationId, ProfileId, ProjectId, RepositoryId, Revision,
-    TicketId, TicketNamespace, TicketRunId,
+    TicketId, TicketNamespace, TicketRevision, TicketRunId,
 };
 use crate::domain::types::CommitMode;
 use crate::domain::types::{ProjectMode, RecipeStage, Role, TicketStatus};
@@ -303,9 +304,10 @@ impl RoleSessionId {
         let value = value.into();
         if value.is_empty()
             || value.len() > 255
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || value.split(':').any(str::is_empty)
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+            })
         {
             return Err("invalid role session ID".into());
         }
@@ -331,6 +333,7 @@ pub enum RoleOutputKind {
     PrepareWorktrees,
     PlanReady,
     ImplementationReady,
+    VerificationReady,
     ReviewReady,
     MergeAssessment,
     MergeIntent,
@@ -523,11 +526,11 @@ impl<'de> Deserialize<'de> for GitCommitId {
 }
 
 macro_rules! role_payload {
-    ($name:ident { $($field:ident : $type:ty),* $(,)? }) => {
+    ($name:ident { $($(#[$attribute:meta])* $field:ident : $type:ty),* $(,)? }) => {
         #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
         #[serde(deny_unknown_fields)]
         pub struct $name {
-            $(pub $field: $type,)*
+            $($(#[$attribute])* pub $field: $type,)*
         }
     };
 }
@@ -566,8 +569,12 @@ role_payload!(TicketProposalPayload {
     dependencies: Vec<TicketId>,
 });
 role_payload!(DispatchRequestPayload {
+    /// Copy `payload_json.ticket_id` byte-for-byte from the selected current ticket observation.
+    /// Do not add a namespace, adapter name, URL, or source identifier unless it is part of that
+    /// ticket ID itself.
     ticket_reference: TicketId,
-    expected_ticket_revision: Revision,
+    /// Copy `payload_json.external_revision` byte-for-byte from the same ticket observation.
+    expected_ticket_revision: TicketRevision,
     coordinator_profile: ProfileId,
     priority: i32,
     rationale: String,
@@ -583,11 +590,124 @@ role_payload!(SpawnRequestPayload {
     work_node: WorkNodeId,
     role: Role,
     profile_id: ProfileId,
-    plan_digest: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_digest: Option<Digest>,
+    /// Requests host-authorized recovery of a terminal Worker on this accepted node.
+    /// This value is a request only; the controller derives the durable wake authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_recovery: Option<WorkerRecoveryRequest>,
     allowed_repositories: Vec<RepositoryId>,
     artifact_inputs: Vec<RoleArtifactReference>,
     parent_run_id: Option<AgentRunId>,
 });
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRecoveryRequest {
+    pub prior_worker_agent_run_id: AgentRunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_host_commit_operation_id: Option<crate::domain::ids::OperationId>,
+}
+
+/// Durable authorization minted by the host after validating a Worker recovery request.
+/// This host-issued value binds the retry to the current TicketRun revision; `expected_head`
+/// is derived only from the prepared base or the exact verified host commit receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRecoveryAuthorization {
+    pub schema_version: u32,
+    pub ticket_run_id: TicketRunId,
+    pub ticket_revision: u64,
+    pub work_node_id: WorkNodeId,
+    pub accepted_plan_digest: Digest,
+    pub prior_worker_agent_run_id: AgentRunId,
+    pub prior_terminal_digest: Digest,
+    pub prior_absence_digest: Digest,
+    pub prior_host_commit_operation_id: Option<crate::domain::ids::OperationId>,
+    pub prior_host_commit_receipt_digest: Option<Digest>,
+    pub expected_head: String,
+    pub source_coordinator_evidence_id: String,
+    pub prior_worker_result_evidence_id: String,
+    pub prior_artifact_refs: Vec<RoleArtifactReference>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRecoveryCandidate {
+    pub work_node_id: WorkNodeId,
+    pub ticket_revision: u64,
+    #[serde(skip)]
+    pub worktree_path: std::path::PathBuf,
+    pub accepted_plan_digest: Digest,
+    pub prior_worker_agent_run_id: AgentRunId,
+    pub prior_host_commit_operation_id: Option<crate::domain::ids::OperationId>,
+    pub expected_head: String,
+    pub prior_terminal_digest: Digest,
+    pub prior_absence_digest: Digest,
+    pub prior_host_commit_receipt_digest: Option<Digest>,
+    pub prior_worker_result_evidence_id: String,
+    pub prior_artifact_refs: Vec<RoleArtifactReference>,
+}
+
+impl WorkerRecoveryAuthorization {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.ticket_revision == 0
+            || self.expected_head.len() != 40 && self.expected_head.len() != 64
+            || !self
+                .expected_head
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.source_coordinator_evidence_id.trim().is_empty()
+            || self.prior_worker_result_evidence_id.trim().is_empty()
+            || self.prior_worker_agent_run_id.as_str().trim().is_empty()
+            || self.work_node_id.as_str().trim().is_empty()
+            || self.prior_host_commit_operation_id.is_some()
+                != self.prior_host_commit_receipt_digest.is_some()
+        {
+            return Err("Worker recovery authorization is malformed".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod worker_recovery_authorization_tests {
+    use super::*;
+
+    fn authorization() -> WorkerRecoveryAuthorization {
+        WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: TicketRunId::parse("ticket-run-1").unwrap(),
+            ticket_revision: 3,
+            work_node_id: WorkNodeId::parse("worker-1").unwrap(),
+            accepted_plan_digest: Digest::parse("a".repeat(64)).unwrap(),
+            prior_worker_agent_run_id: AgentRunId::parse("worker-run-1").unwrap(),
+            prior_terminal_digest: Digest::parse("b".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("c".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: None,
+            prior_host_commit_receipt_digest: None,
+            expected_head: "d".repeat(40),
+            source_coordinator_evidence_id: "coordinator-evidence".into(),
+            prior_worker_result_evidence_id: "worker-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_recovery_authorization_requires_a_lowercase_git_object_id_and_paired_receipt() {
+        authorization().validate().unwrap();
+
+        let mut uppercase_head = authorization();
+        uppercase_head.expected_head = "D".repeat(40);
+        assert!(uppercase_head.validate().is_err());
+
+        let mut unpaired_receipt = authorization();
+        unpaired_receipt.prior_host_commit_operation_id =
+            Some(crate::domain::ids::OperationId::parse("operation-1").unwrap());
+        assert!(unpaired_receipt.validate().is_err());
+    }
+}
 role_payload!(InvestigationRequestPayload {
     question: String,
     allowed_repositories: Vec<RepositoryId>,
@@ -607,12 +727,47 @@ role_payload!(PlanReadyPayload {
 #[serde(deny_unknown_fields)]
 pub struct ChangeReference {
     pub repository: RepositoryId,
+    /// New Worker results use the logical `assigned_node.node_id` in schema v1.
+    /// Host validation also accepts the exact managed worktree directory ID
+    /// derived from the same immutable assignment for existing schema-v1 results.
     pub worktree_id: WorkNodeId,
     pub commit_mode: CommitMode,
     pub base_commit: GitCommitId,
     pub previous_head: GitCommitId,
     pub branch_head: GitCommitId,
     pub commit_shas: Vec<GitCommitId>,
+    /// Host-mode commits must name the durable `repository.commit` receipt whose SHA is reported above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_commit_operation_id: Option<String>,
+}
+
+/// Resolve a Worker claim to its exact host-prepared repository assignment.
+/// The managed directory ID is accepted only as a compatibility spelling for
+/// the same immutable assignment; arbitrary aliases and duplicate matches fail.
+pub(crate) fn change_reference_for_assignment<'a>(
+    references: &'a [ChangeReference],
+    repository_id: &RepositoryId,
+    work_node_id: &WorkNodeId,
+    worktree_path: &Path,
+) -> Result<&'a ChangeReference, String> {
+    let worktree_directory_id = worktree_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or("prepared Worker worktree has no canonical directory ID")?;
+    let matches = references
+        .iter()
+        .filter(|reference| {
+            reference.repository == *repository_id
+                && (reference.worktree_id == *work_node_id
+                    || reference.worktree_id.as_str() == worktree_directory_id)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [reference] => Ok(reference),
+        [] => Err("Worker result does not identify its exact prepared repository node".into()),
+        _ => Err("Worker result ambiguously identifies its prepared repository node".into()),
+    }
 }
 
 role_payload!(ImplementationReadyPayload {
@@ -620,6 +775,13 @@ role_payload!(ImplementationReadyPayload {
     completed_acceptance_items: Vec<String>,
     unresolved_items: Vec<String>,
     irregularity_references: Vec<RoleArtifactReference>,
+});
+role_payload!(VerificationReadyPayload {
+    work_node_id: WorkNodeId,
+    repository: RepositoryId,
+    publication_operation_id: OperationId,
+    published_head: GitCommitId,
+    test_receipt_artifact_ids: Vec<ArtifactId>,
 });
 role_payload!(ReviewReadyPayload {
     subject_kind: String,
@@ -792,6 +954,7 @@ pub enum RoleResultPayload {
     PrepareWorktrees(PrepareWorktreesPayload),
     PlanReady(PlanReadyPayload),
     ImplementationReady(ImplementationReadyPayload),
+    VerificationReady(VerificationReadyPayload),
     ReviewReady(ReviewReadyPayload),
     MergeAssessment(MergeAssessmentPayload),
     MergeIntent(MergeIntentPayload),
@@ -804,7 +967,7 @@ pub enum RoleResultPayload {
 }
 
 impl RoleResultPayload {
-    fn parse(kind: RoleOutputKind, value: Value) -> Result<Self, String> {
+    pub(crate) fn parse(kind: RoleOutputKind, value: Value) -> Result<Self, String> {
         macro_rules! parse_variant {
             ($type:ty, $variant:ident) => {
                 serde_json::from_value::<$type>(value)
@@ -831,6 +994,9 @@ impl RoleResultPayload {
             RoleOutputKind::PlanReady => parse_variant!(PlanReadyPayload, PlanReady),
             RoleOutputKind::ImplementationReady => {
                 parse_variant!(ImplementationReadyPayload, ImplementationReady)
+            }
+            RoleOutputKind::VerificationReady => {
+                parse_variant!(VerificationReadyPayload, VerificationReady)
             }
             RoleOutputKind::ReviewReady => parse_variant!(ReviewReadyPayload, ReviewReady),
             RoleOutputKind::MergeAssessment => {
@@ -871,6 +1037,7 @@ impl RoleResultPayload {
             Self::PrepareWorktrees(_) => RoleOutputKind::PrepareWorktrees,
             Self::PlanReady(_) => RoleOutputKind::PlanReady,
             Self::ImplementationReady(_) => RoleOutputKind::ImplementationReady,
+            Self::VerificationReady(_) => RoleOutputKind::VerificationReady,
             Self::ReviewReady(_) => RoleOutputKind::ReviewReady,
             Self::MergeAssessment(_) => RoleOutputKind::MergeAssessment,
             Self::MergeIntent(_) => RoleOutputKind::MergeIntent,
@@ -895,12 +1062,35 @@ fn validate_role_payload(payload: &RoleResultPayload) -> Result<(), String> {
                 if change.commit_shas.is_empty()
                     || change.commit_shas.last() != Some(&change.branch_head)
                     || change.previous_head == change.branch_head
+                    || match change.commit_mode {
+                        CommitMode::Native => change.host_commit_operation_id.is_some(),
+                        CommitMode::Host => change
+                            .host_commit_operation_id
+                            .as_ref()
+                            .is_none_or(|operation| operation.trim().is_empty()),
+                        CommitMode::Auto => true,
+                    }
                     || !work_nodes.insert((&change.repository, &change.worktree_id))
                 {
                     return Err(
                         "implementation change must identify a unique work node and exact resulting commit chain".into(),
                     );
                 }
+            }
+        }
+        RoleResultPayload::VerificationReady(result) => {
+            if result.test_receipt_artifact_ids.is_empty() {
+                return Err(
+                    "verification-ready result requires at least one TestReceipt artifact".into(),
+                );
+            }
+            let mut artifact_ids = BTreeSet::new();
+            if result
+                .test_receipt_artifact_ids
+                .iter()
+                .any(|artifact_id| !artifact_ids.insert(artifact_id))
+            {
+                return Err("verification-ready result repeats a TestReceipt artifact ID".into());
             }
         }
         RoleResultPayload::MergeAssessment(result)
@@ -1002,6 +1192,28 @@ fn validate_payload_artifacts(
         RoleResultPayload::ImplementationReady(value) => {
             references.extend(&value.irregularity_references)
         }
+        RoleResultPayload::VerificationReady(value) => {
+            if declared_claims.len()
+                != declared_claims
+                    .iter()
+                    .filter(|reference| reference.kind == RoleArtifactKind::TestReceipt)
+                    .count()
+            {
+                return Err("verification-ready may claim only TestReceipt artifacts".into());
+            }
+            let declared_ids = declared_claims
+                .iter()
+                .filter(|reference| reference.kind == RoleArtifactKind::TestReceipt)
+                .map(|reference| &reference.artifact_id)
+                .collect::<BTreeSet<_>>();
+            let expected_ids = value
+                .test_receipt_artifact_ids
+                .iter()
+                .collect::<BTreeSet<_>>();
+            if declared_ids != expected_ids {
+                return Err("verification-ready TestReceipt IDs must exactly match its declared TestReceipt artifacts".into());
+            }
+        }
         RoleResultPayload::MergeAssessment(value) => {
             for gate in &value.deterministic_gate_evidence {
                 references.extend(&gate.evidence_references);
@@ -1018,9 +1230,9 @@ fn validate_payload_artifacts(
         RoleResultPayload::ProfilePromotionProposal(value) => {
             references.extend(&value.evidence_references)
         }
+        RoleResultPayload::Intervention(value) => references.extend(&value.evidence),
         RoleResultPayload::TicketProposal(_)
         | RoleResultPayload::DispatchRequest(_)
-        | RoleResultPayload::Intervention(_)
         | RoleResultPayload::InvestigationRequest(_)
         | RoleResultPayload::PrepareWorktrees(_)
         | RoleResultPayload::PlanReady(_)
@@ -1066,6 +1278,7 @@ pub fn role_result_payload_schema(kind: RoleOutputKind) -> Value {
         RoleOutputKind::PrepareWorktrees => schema_for_kind!(PrepareWorktreesPayload),
         RoleOutputKind::PlanReady => schema_for_kind!(PlanReadyPayload),
         RoleOutputKind::ImplementationReady => schema_for_kind!(ImplementationReadyPayload),
+        RoleOutputKind::VerificationReady => schema_for_kind!(VerificationReadyPayload),
         RoleOutputKind::ReviewReady => schema_for_kind!(ReviewReadyPayload),
         RoleOutputKind::MergeAssessment => schema_for_kind!(MergeAssessmentPayload),
         RoleOutputKind::MergeIntent => schema_for_kind!(MergeIntentPayload),
@@ -1119,7 +1332,12 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                             "GitCommitId" => {
                                 constrain(definition, 40, 64, r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
                             }
-                            "RoleSessionId" => constrain(definition, 1, 255, r"^[A-Za-z0-9._-]+$"),
+                            "RoleSessionId" => constrain(
+                                definition,
+                                1,
+                                255,
+                                r"^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$",
+                            ),
                             "RoleArtifactReference" => {
                                 if let Some(properties) = definition
                                     .get_mut("properties")
@@ -1311,7 +1529,7 @@ fn constrain_payload_string_schemas(schema: &mut Value) {
                                 constrain(property, 1, 255, r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
                             }
                             "coordinator_role_session_id" => {
-                                constrain(property, 1, 255, r"^[A-Za-z0-9._-]+$")
+                                constrain(property, 1, 255, r"^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$")
                             }
                             "parent" | "ticket_reference" | "ticket_id" | "ticket_namespace"
                             | "ticket_run_id" | "agent_run_id" | "parent_run_id"
@@ -1541,7 +1759,7 @@ pub fn allowed_role_output_kinds(role: Role) -> Vec<RoleOutputKind> {
         ],
         Role::Coordinator => vec![K::SpawnRequest, K::PrepareWorktrees, K::PlanReady],
         Role::Planner => vec![K::PlanReady, K::InvestigationRequest],
-        Role::Worker => vec![K::ImplementationReady],
+        Role::Worker => vec![K::ImplementationReady, K::VerificationReady],
         Role::Reviewer => vec![K::ReviewReady, K::InvestigationRequest],
         Role::MergeDecision => vec![K::MergeAssessment, K::MergeIntent],
         Role::Operator => vec![K::OperationAction, K::OperationResult],
@@ -2332,9 +2550,6 @@ pub fn authorize_role_request(
     let authorized = match (role, request.clone()) {
         (Role::Coordinator, R::CoordinatorPlanAccepted) => A::Transition(Input::PlanAccepted),
         (Role::Coordinator, R::CoordinatorAskPlanner) => A::SpawnRole(Role::Planner),
-        (Role::Coordinator, R::CoordinatorPrepareWorktrees) => {
-            A::Transition(Input::WorktreesPrepared)
-        }
         (Role::Coordinator, R::CoordinatorStartWorker) => A::SpawnRole(Role::Worker),
         (Role::Coordinator, R::CoordinatorStartReviewer) => A::SpawnRole(Role::Reviewer),
         (Role::Coordinator, R::CoordinatorStartMergeDecision) => A::SpawnRole(Role::MergeDecision),
@@ -2432,6 +2647,62 @@ mod tests {
     use crate::domain::ids::{AdapterId, TicketId};
     use crate::domain::types::RecipeStage;
 
+    #[test]
+    fn change_reference_matches_only_its_exact_prepared_assignment() {
+        let repository = RepositoryId::parse("repo-a").unwrap();
+        let foreign_repository = RepositoryId::parse("repo-b").unwrap();
+        let node = WorkNodeId::parse("adapter-troubleshooting").unwrap();
+        let path = Path::new("/state/worktrees/repo-a/c22417d2fa7923308a4ae3f3c912ab58");
+        let reference = |repository: &RepositoryId, worktree_id: &str| {
+            serde_json::from_value::<ChangeReference>(json!({
+                "repository":repository,
+                "worktree_id":worktree_id,
+                "commit_mode":"host",
+                "base_commit":"d855022bcd52d3156e2c130f0952da50bfca606b",
+                "previous_head":"d855022bcd52d3156e2c130f0952da50bfca606b",
+                "branch_head":"06d67158f0f0d65449418bf505c9d723daccd244",
+                "commit_shas":["06d67158f0f0d65449418bf505c9d723daccd244"],
+                "host_commit_operation_id":"repo-commit-caba9518fbe184eefb25b2b5d3be5e6b6d096e3ca0463297f64b86ca55ce9698"
+            })).unwrap()
+        };
+
+        for identifier in [node.as_str(), "c22417d2fa7923308a4ae3f3c912ab58"] {
+            let claim = reference(&repository, identifier);
+            assert_eq!(
+                change_reference_for_assignment(
+                    std::slice::from_ref(&claim),
+                    &repository,
+                    &node,
+                    path
+                )
+                .unwrap(),
+                &claim
+            );
+        }
+
+        for claim in [
+            reference(&repository, "another-worktree-id"),
+            reference(&foreign_repository, "c22417d2fa7923308a4ae3f3c912ab58"),
+        ] {
+            assert!(
+                change_reference_for_assignment(
+                    std::slice::from_ref(&claim),
+                    &repository,
+                    &node,
+                    path
+                )
+                .is_err()
+            );
+        }
+
+        let logical = reference(&repository, node.as_str());
+        let physical = reference(&repository, "c22417d2fa7923308a4ae3f3c912ab58");
+        assert!(
+            change_reference_for_assignment(&[logical, physical], &repository, &node, path)
+                .is_err()
+        );
+    }
+
     fn test_digest(value: char) -> Digest {
         Digest::parse(value.to_string().repeat(64)).unwrap()
     }
@@ -2488,6 +2759,37 @@ mod tests {
             "unresolved_items": [],
             "irregularity_references": []
         })
+    }
+
+    #[test]
+    fn verification_ready_requires_exact_registered_test_receipt_claims() {
+        let artifact_id = ArtifactId::parse("f".repeat(64)).unwrap();
+        let artifact = RoleArtifactReference {
+            artifact_id: artifact_id.clone(),
+            kind: RoleArtifactKind::TestReceipt,
+            schema_version: 1,
+            path: "checks/test-receipt.md".into(),
+            digest: test_digest('e'),
+            bytes: 17,
+        };
+        let payload = json!({
+            "work_node_id":"node-a",
+            "repository":"repo-a",
+            "publication_operation_id":"publish-worker-1",
+            "published_head":"2222222222222222222222222222222222222222",
+            "test_receipt_artifact_ids":[artifact_id]
+        });
+        let mut submission = worker_result_submission(RoleOutputKind::VerificationReady, payload);
+        submission.artifact_refs = vec![artifact.clone()];
+        validate_role_result(&worker_result_binding(), submission.clone()).unwrap();
+
+        submission.structured_result["test_receipt_artifact_ids"] = json!(["a".repeat(64)]);
+        submission.result_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&submission.structured_result).unwrap())
+        ))
+        .unwrap();
+        assert!(validate_role_result(&worker_result_binding(), submission).is_err());
     }
 
     fn worker_irregularity_payload() -> Value {
@@ -2554,7 +2856,7 @@ mod tests {
             ),
             (
                 RoleOutputKind::DispatchRequest,
-                json!({"ticket_reference":"TICKET-1", "expected_ticket_revision":1, "coordinator_profile":"default", "priority":1, "rationale":"unblocks work"}),
+                json!({"ticket_reference":"TICKET-1", "expected_ticket_revision":"rev-1", "coordinator_profile":"default", "priority":1, "rationale":"unblocks work"}),
             ),
             (
                 RoleOutputKind::Intervention,
@@ -2579,6 +2881,16 @@ mod tests {
             (
                 RoleOutputKind::ImplementationReady,
                 worker_implementation_ready_payload(),
+            ),
+            (
+                RoleOutputKind::VerificationReady,
+                json!({
+                    "work_node_id":"node-a",
+                    "repository":"repo-a",
+                    "publication_operation_id":"publish-worker-1",
+                    "published_head":"2222222222222222222222222222222222222222",
+                    "test_receipt_artifact_ids":["f".repeat(64)]
+                }),
             ),
             (
                 RoleOutputKind::ReviewReady,
@@ -3260,6 +3572,56 @@ mod tests {
     }
 
     #[test]
+    fn agent_wire_digest_is_optional_and_host_canonicalized_before_strict_validation() {
+        let binding = worker_result_binding();
+        let payload = worker_implementation_ready_payload();
+        let actual_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        ))
+        .unwrap();
+        let message = crate::roles::RoleResultMessage {
+            schema_version: ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "result-1".into(),
+            kind: RoleOutputKind::ImplementationReady,
+            assertion: AgentAssertion::Succeeded,
+            structured_result: payload.clone(),
+            result_digest: Some(test_digest('0')),
+            artifact_refs: vec![],
+        };
+        let validated = message.clone().bind(binding.clone()).unwrap();
+        assert_eq!(validated.result_digest, actual_digest);
+        let canonical_terminal = message.clone().canonicalized().unwrap();
+        let persisted_message = crate::roles::RoleResultMessage {
+            result_digest: Some(validated.result_digest.clone()),
+            ..message.clone()
+        };
+        assert_eq!(
+            canonical_terminal,
+            persisted_message.canonicalized().unwrap()
+        );
+        let omitted_digest = crate::roles::RoleResultMessage {
+            result_digest: None,
+            ..message
+        };
+        assert!(
+            serde_json::to_value(&omitted_digest)
+                .unwrap()
+                .get("result_digest")
+                .is_none()
+        );
+
+        let mut forged_host_submission =
+            worker_result_submission(RoleOutputKind::ImplementationReady, payload);
+        forged_host_submission.result_digest = test_digest('0');
+        assert!(validate_role_result(&binding, forged_host_submission).is_err());
+
+        let schema = crate::roles::result_schema(Role::Worker);
+        let required = schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|field| field == "result_digest"));
+    }
+
+    #[test]
     fn implementation_ready_rejects_empty_and_inconsistent_change_payloads() {
         let binding = worker_result_binding();
         assert!(
@@ -3431,6 +3793,46 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_intervention_evidence_must_be_declared() {
+        let artifact = RoleArtifactReference {
+            artifact_id: ArtifactId::parse("f".repeat(64)).unwrap(),
+            kind: RoleArtifactKind::General,
+            schema_version: 1,
+            path: "evidence/intervention.json".into(),
+            digest: test_digest('f'),
+            bytes: 10,
+        };
+        let mut binding = worker_result_binding();
+        binding.role = Role::Supervisor;
+        binding.role_session_id = RoleSessionId::parse("project:project-a:supervisor").unwrap();
+        binding.ticket_run_id = None;
+        binding.ticket_revision = None;
+        binding.parent_role = None;
+        binding.parent_run_id = None;
+        let payload = json!({
+            "coordinator_role_session_id": "ticket_run:ticket-run-1:coordinator",
+            "ticket_run_revision": 4,
+            "reason": "The implementation is taking longer than expected.",
+            "evidence": [artifact],
+            "proposed_plan_change": "Ask the Coordinator to narrow the remaining work."
+        });
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let mut submission = RoleResultSubmission {
+            schema_version: ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "intervention-1".into(),
+            binding: binding.clone(),
+            kind: RoleOutputKind::Intervention,
+            assertion: AgentAssertion::Succeeded,
+            result_digest: Digest::parse(format!("{:x}", Sha256::digest(encoded))).unwrap(),
+            structured_result: payload,
+            artifact_refs: vec![],
+        };
+        assert!(validate_role_result(&binding, submission.clone()).is_err());
+        submission.artifact_refs.push(artifact);
+        assert!(validate_role_result(&binding, submission).is_ok());
+    }
+
+    #[test]
     fn every_role_output_has_a_bounded_closed_generated_schema() {
         let kinds = [
             RoleOutputKind::Progress,
@@ -3444,6 +3846,7 @@ mod tests {
             RoleOutputKind::PrepareWorktrees,
             RoleOutputKind::PlanReady,
             RoleOutputKind::ImplementationReady,
+            RoleOutputKind::VerificationReady,
             RoleOutputKind::ReviewReady,
             RoleOutputKind::MergeAssessment,
             RoleOutputKind::MergeIntent,
@@ -3511,6 +3914,41 @@ mod tests {
         assert!(encoded.contains(r"^[A-Za-z0-9._-]+$"));
         assert!(encoded.contains(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$"));
         assert!(encoded.contains(r"^[a-f0-9]{64}$"));
+    }
+
+    #[test]
+    fn dispatch_schema_documents_opaque_ticket_identity_mapping() {
+        let schema = role_result_payload_schema(RoleOutputKind::DispatchRequest);
+        let reference = schema["properties"]["ticket_reference"]["description"]
+            .as_str()
+            .unwrap();
+        let revision = schema["properties"]["expected_ticket_revision"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(reference.contains("payload_json.ticket_id"));
+        assert!(reference.contains("byte-for-byte"));
+        assert!(revision.contains("payload_json.external_revision"));
+    }
+
+    #[test]
+    fn preplan_planner_spawn_request_omits_the_plan_digest() {
+        let request: SpawnRequestPayload = serde_json::from_value(json!({
+            "work_node": "initial-plan",
+            "role": "planner",
+            "profile_id": "planner-default",
+            "allowed_repositories": [],
+            "artifact_inputs": [],
+            "parent_run_id": null
+        }))
+        .unwrap();
+        assert_eq!(request.plan_digest, None);
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("plan_digest").is_none());
+        let validator = jsonschema::options()
+            .build(&role_result_payload_schema(RoleOutputKind::SpawnRequest))
+            .unwrap();
+        assert!(validator.is_valid(&value));
     }
 
     #[test]
@@ -3897,8 +4335,53 @@ mod tests {
 
     #[test]
     fn role_session_id_deserialization_uses_constructor_validation() {
-        for invalid in ["../outside", "folder/session", "bad id"] {
+        assert!(RoleSessionId::parse("ticket_run:run-a:coordinator").is_ok());
+        assert!(RoleSessionId::parse("project:project-a:supervisor").is_ok());
+        for invalid in [
+            "../outside",
+            "folder/session",
+            "bad id",
+            "ticket_run::coordinator",
+        ] {
             assert!(serde_json::from_str::<RoleSessionId>(&format!("{invalid:?}")).is_err());
         }
+        assert!(RoleSessionId::parse("ticket_run:ticket-1:planner").is_ok());
+        assert!(RoleSessionId::parse("ticket_run::planner").is_err());
+    }
+
+    #[test]
+    fn intervention_schema_accepts_canonical_coordinator_session() {
+        let payload = json!({
+            "coordinator_role_session_id": "ticket_run:run-a:coordinator",
+            "ticket_run_revision": 1,
+            "reason": "Coordinator requests a plan adjustment.",
+            "evidence": [],
+            "proposed_plan_change": "Split the implementation into smaller nodes."
+        });
+        let schema = role_result_payload_schema(RoleOutputKind::Intervention);
+        let validator = jsonschema::options()
+            .offline()
+            .build(&schema)
+            .expect("Intervention schema is valid");
+        assert!(
+            validator.is_valid(&payload),
+            "{}",
+            validator
+                .iter_errors(&payload)
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        assert!(RoleResultPayload::parse(RoleOutputKind::Intervention, payload).is_ok());
+
+        let invalid = json!({
+            "coordinator_role_session_id": "ticket_run::coordinator",
+            "ticket_run_revision": 1,
+            "reason": "Coordinator requests a plan adjustment.",
+            "evidence": [],
+            "proposed_plan_change": "Split the implementation into smaller nodes."
+        });
+        assert!(!validator.is_valid(&invalid));
+        assert!(RoleResultPayload::parse(RoleOutputKind::Intervention, invalid).is_err());
     }
 }

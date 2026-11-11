@@ -707,7 +707,7 @@ fn validate_text(text: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_safe_url(url: &str) -> Result<(), String> {
+pub(crate) fn validate_safe_url(url: &str) -> Result<(), String> {
     validate_text(url, "URL")?;
     if url.chars().any(char::is_whitespace) || url.contains('\\') {
         return Err("review link contains whitespace or a backslash".into());

@@ -31,6 +31,8 @@ pub struct MergeSubject {
     /// Digest of repository rules or adapter capability that guards the assessed base.
     pub base_guard_digest: Option<Digest>,
     pub review_digest: Digest,
+    /// Digest of the body bytes observed at assessment time. An absent body is represented by the
+    /// digest of empty bytes; presence is separately retained by the prepared proposal.
     pub prepared_body_digest: Option<Digest>,
 }
 
@@ -413,14 +415,16 @@ pub fn build_merge_procedure(
         }
         match &step.operation {
             MergeProcedureOperation::UpdatePullRequestBody {
-                approved_body_digest,
-                ..
+                expected_prior_body_digest,
+                approved_body_digest: _,
             } => {
                 if index != 0 || merge_seen || verify_seen {
                     return Err("body update must be the first procedure step".into());
                 }
-                if subject.prepared_body_digest.as_ref() != Some(approved_body_digest) {
-                    return Err("body update digest is outside the approved body scope".into());
+                if subject.prepared_body_digest.as_ref() != Some(expected_prior_body_digest) {
+                    return Err(
+                        "body update prior digest is outside the assessed body scope".into(),
+                    );
                 }
                 body_key = Some(step.key.as_str());
             }
@@ -665,8 +669,8 @@ mod tests {
                 "body",
                 vec![],
                 MergeProcedureOperation::UpdatePullRequestBody {
-                    expected_prior_body_digest: digest('4'),
-                    approved_body_digest: digest('f'),
+                    expected_prior_body_digest: digest('f'),
+                    approved_body_digest: digest('4'),
                 },
             ),
             step(
@@ -690,7 +694,7 @@ mod tests {
         );
     }
     #[test]
-    fn procedure_supports_repository_request_comment_and_rejects_wrong_body_scope() {
+    fn procedure_supports_repository_request_comment_and_rejects_wrong_prior_body_scope() {
         let s = subject();
         let steps = vec![
             step(
@@ -716,7 +720,7 @@ mod tests {
                 "body",
                 vec![],
                 MergeProcedureOperation::UpdatePullRequestBody {
-                    expected_prior_body_digest: digest('4'),
+                    expected_prior_body_digest: digest('f'),
                     approved_body_digest: digest('0'),
                 },
             ),
@@ -736,7 +740,20 @@ mod tests {
             ),
         ];
         assert!(
-            build_merge_procedure(MergeMethod::Merge, MergeExecutor::Request, bad, &s).is_err()
+            build_merge_procedure(MergeMethod::Merge, MergeExecutor::Request, bad.clone(), &s)
+                .is_ok()
+        );
+        let mut wrong_prior = bad;
+        if let MergeProcedureOperation::UpdatePullRequestBody {
+            expected_prior_body_digest,
+            ..
+        } = &mut wrong_prior[0].operation
+        {
+            *expected_prior_body_digest = digest('4');
+        }
+        assert!(
+            build_merge_procedure(MergeMethod::Merge, MergeExecutor::Request, wrong_prior, &s)
+                .is_err()
         );
     }
 

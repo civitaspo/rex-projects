@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+use crate::delivery_runtime::{
+    ValidatedImplementationPublication, ValidatedPreparedWorktrees, ValidatedWorkNodePublication,
+};
 use crate::domain::ids::{OperationId, ProjectId, Revision, TicketRunId};
-use crate::domain::types::TicketStatus;
+use crate::domain::types::{Role, TicketStatus};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +13,7 @@ pub enum Phase {
     Planning,
     Preparing,
     Implementing,
+    Publishing,
     Reviewing,
     Assessing,
     WaitingHuman,
@@ -43,16 +47,21 @@ pub struct TicketRun {
     pub required_review_revision: Option<Revision>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Input {
     Dispatch,
     PlanAccepted,
-    WorktreesPrepared,
+    WorktreesPrepared(ValidatedPreparedWorktrees),
     EvidenceSubmitted,
+    WorkNodePublished(ValidatedWorkNodePublication),
+    ImplementationPublished(ValidatedImplementationPublication),
     CorrectionsRemain,
+    WorkerVerificationCompleted,
     ReviewConverged,
+    ReviewEscalationRequired,
     RequireHumanReview,
+    MergeAssessmentCorrectionExhausted,
+    MergeReassessmentRequired(MergeReassessmentProof),
     HumanReviewApproved,
     HumanReviewRevisionRequested,
     MergeVerified,
@@ -64,6 +73,30 @@ pub enum Input {
     ExternalCanceled,
     Pause,
     Resume,
+}
+
+/// Evidence created by the host transition consumer after reconciling the first
+/// approved merge-procedure step and finding that the saved work has no
+/// execution-time base guard. Agents and protocol callers cannot construct it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeReassessmentProof {
+    work_id: String,
+    receipt_digest: crate::domain::ids::Digest,
+}
+
+impl MergeReassessmentProof {
+    pub(crate) fn from_reconciled_first_step(
+        work_id: String,
+        receipt_digest: crate::domain::ids::Digest,
+    ) -> Result<Self, String> {
+        if work_id.is_empty() || work_id.len() > 256 {
+            return Err("merge reassessment work identity is invalid".into());
+        }
+        Ok(Self {
+            work_id,
+            receipt_digest,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -81,18 +114,18 @@ pub enum EffectKind {
     TicketDuplicateComment,
     TicketCancelDuplicate,
     TicketResolveDuplicate,
-    StartSupervisor,
-    StartCoordinator,
     PrepareWorktrees,
-    StartWorker,
-    StartReviewer,
-    StartMergeDecision,
+    CommitWorkerManifest,
+    PublishImplementation,
     RequestHumanReview,
     Merge,
-    StartOperator,
     Operation,
     StartPostmortem,
+    PublishKnowledge,
+    PublishProfile,
     CompleteTicket,
+    StartAgent,
+    StartProfileTrial,
     StopOwnedRuns,
 }
 
@@ -106,7 +139,7 @@ pub struct WakeInput {
 #[serde(rename_all = "snake_case")]
 pub enum WakeTarget {
     Supervisor,
-    Coordinator,
+    TicketRole(Role),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,11 +165,12 @@ pub fn reduce(
     let mut next = current.clone();
     let mut effects = Vec::new();
     let mut wakes = Vec::new();
+    let review_escalation = matches!(&input, Input::ReviewEscalationRequired);
     match input {
         Input::Dispatch if current.phase == Phase::Queued => {
             next.phase = Phase::Planning;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartCoordinator);
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
             if current.external_status != TicketStatus::InProgress {
                 effects.push(EffectKind::PublishTicketStatus);
             }
@@ -146,25 +180,62 @@ pub fn reduce(
             next.activity = Activity::Running;
             effects.push(EffectKind::PrepareWorktrees);
         }
-        Input::WorktreesPrepared if current.phase == Phase::Preparing => {
-            next.phase = Phase::Implementing;
-            next.activity = Activity::Running;
-            effects.push(EffectKind::StartWorker);
+        Input::WorktreesPrepared(proof)
+            if current.phase == Phase::Preparing && proof.matches(current) =>
+        {
+            if proof.has_base_refresh() {
+                next.phase = Phase::Publishing;
+                next.activity = Activity::Running;
+                effects.push(EffectKind::PublishImplementation);
+            } else {
+                next.phase = Phase::Implementing;
+                next.activity = Activity::Running;
+                wakes.push(WakeTarget::TicketRole(Role::Worker));
+            }
         }
         Input::EvidenceSubmitted if current.phase == Phase::Implementing => {
+            next.phase = Phase::Publishing;
+            next.activity = Activity::Running;
+            effects.push(EffectKind::PublishImplementation);
+        }
+        Input::WorkNodePublished(proof)
+            if current.phase == Phase::Publishing && proof.matches(current) =>
+        {
+            next.phase = Phase::Preparing;
+            next.activity = Activity::Running;
+            effects.push(EffectKind::PrepareWorktrees);
+        }
+        Input::ImplementationPublished(receipt)
+            if current.phase == Phase::Publishing && receipt.matches(current) =>
+        {
             next.phase = Phase::Reviewing;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartReviewer);
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         Input::CorrectionsRemain if current.phase == Phase::Reviewing => {
             next.phase = Phase::Implementing;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartWorker);
+            wakes.push(WakeTarget::TicketRole(Role::Worker));
+        }
+        Input::WorkerVerificationCompleted
+            if current.phase == Phase::Implementing && current.activity == Activity::Running =>
+        {
+            next.phase = Phase::Reviewing;
+            next.activity = Activity::Running;
+            wakes.push(WakeTarget::TicketRole(Role::Reviewer));
         }
         Input::ReviewConverged if current.phase == Phase::Reviewing => {
             next.phase = Phase::Assessing;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartMergeDecision);
+            wakes.push(WakeTarget::TicketRole(Role::MergeDecision));
+        }
+        Input::ReviewEscalationRequired if current.phase == Phase::Reviewing => {
+            // Keep the TicketRun in Reviewing and surface it as In Review. This is an
+            // escalation, not evidence that the review converged or merge was authorized.
+            next.activity = Activity::Blocked;
+            next.external_status = TicketStatus::InReview;
+            wakes.push(WakeTarget::Supervisor);
+            effects.push(EffectKind::PublishTicketStatus);
         }
         Input::RequireHumanReview if current.phase == Phase::Assessing => {
             next.phase = Phase::WaitingHuman;
@@ -173,6 +244,23 @@ pub fn reduce(
             next.required_review_revision = Some(current.revision);
             effects.push(EffectKind::RequestHumanReview);
             effects.push(EffectKind::PublishTicketStatus);
+        }
+        Input::MergeAssessmentCorrectionExhausted if current.phase == Phase::Assessing => {
+            // No Agent assessment is trusted. Keep external status In Progress; the
+            // Supervisor must surface the blocked decision for human direction.
+            next.activity = Activity::Blocked;
+            wakes.push(WakeTarget::Supervisor);
+        }
+        Input::MergeReassessmentRequired(proof) if current.phase == Phase::AwaitingMerge => {
+            // The host transition consumer has reconciled the first procedure
+            // step and binds this correction to its immutable work and receipt.
+            // Re-plan through the normal delivery path so any protected-base
+            // refresh creates a new publication and review subject. The old
+            // review and merge approvals are not carried across this revision.
+            let _reconciled_identity = (proof.work_id, proof.receipt_digest);
+            next.phase = Phase::Planning;
+            next.activity = Activity::Running;
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         Input::HumanReviewApproved
             if current.phase == Phase::WaitingHuman
@@ -193,15 +281,16 @@ pub fn reduce(
             next.activity = Activity::Running;
             next.required_review_revision = None;
             next.external_status = TicketStatus::InProgress;
-            effects.push(EffectKind::StartCoordinator);
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
             effects.push(EffectKind::PublishTicketStatus);
         }
         Input::MergeVerified if current.phase == Phase::AwaitingMerge => {
             next.phase = Phase::Operating;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartOperator);
+            wakes.push(WakeTarget::TicketRole(Role::Operator));
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
-        Input::OperationFailed if current.phase == Phase::Operating => {
+        Input::OperationFailed if matches!(current.phase, Phase::Operating | Phase::Postmortem) => {
             next.activity = Activity::Blocked;
             wakes.push(WakeTarget::Supervisor);
         }
@@ -210,7 +299,8 @@ pub fn reduce(
         {
             next.phase = Phase::Postmortem;
             next.activity = Activity::Running;
-            effects.push(EffectKind::StartPostmortem);
+            wakes.push(WakeTarget::TicketRole(Role::Postmortem));
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         Input::KnowledgePublished if current.phase == Phase::Postmortem => {
             next.phase = Phase::Completing;
@@ -237,7 +327,7 @@ pub fn reduce(
         }
         Input::Resume if current.activity == Activity::Paused => {
             next.activity = Activity::Ready;
-            wakes.push(WakeTarget::Coordinator);
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
         }
         _ => return Err("input is not valid in the current ticket run state".into()),
     }
@@ -255,6 +345,7 @@ pub fn reduce(
     if next.phase != Phase::WaitingHuman {
         next.external_status = match next.phase {
             Phase::Queued | Phase::Done => next.external_status,
+            Phase::Reviewing if review_escalation => TicketStatus::InReview,
             Phase::Canceled => TicketStatus::Canceled,
             _ => TicketStatus::InProgress,
         };
@@ -295,18 +386,18 @@ pub const fn effect_name(kind: &EffectKind) -> &'static str {
         EffectKind::TicketDuplicateComment => "ticket_duplicate_comment",
         EffectKind::TicketCancelDuplicate => "ticket_cancel_duplicate",
         EffectKind::TicketResolveDuplicate => "ticket_resolve_duplicate",
-        EffectKind::StartSupervisor => "start_supervisor",
-        EffectKind::StartCoordinator => "start_coordinator",
         EffectKind::PrepareWorktrees => "prepare_worktrees",
-        EffectKind::StartWorker => "start_worker",
-        EffectKind::StartReviewer => "start_reviewer",
-        EffectKind::StartMergeDecision => "start_merge_decision",
+        EffectKind::CommitWorkerManifest => "commit_worker_manifest",
+        EffectKind::PublishImplementation => "publish_implementation",
         EffectKind::RequestHumanReview => "request_human_review",
         EffectKind::Merge => "merge",
-        EffectKind::StartOperator => "start_operator",
         EffectKind::Operation => "operation",
         EffectKind::StartPostmortem => "start_postmortem",
+        EffectKind::PublishKnowledge => "publish_knowledge",
+        EffectKind::PublishProfile => "publish_profile",
         EffectKind::CompleteTicket => "complete_ticket",
+        EffectKind::StartAgent => "start_agent",
+        EffectKind::StartProfileTrial => "start_profile_trial",
         EffectKind::StopOwnedRuns => "stop_owned_runs",
     }
 }
@@ -324,9 +415,9 @@ pub fn wake_inputs(decision: &Decision) -> Vec<WakeInput> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Activity, EffectKind, Input, Phase, TicketRun, reduce};
+    use super::{Activity, EffectKind, Input, Phase, TicketRun, WakeTarget, reduce};
     use crate::domain::ids::{ProjectId, Revision, TicketRunId};
-    use crate::domain::types::TicketStatus;
+    use crate::domain::types::{Role, TicketStatus};
 
     fn run() -> TicketRun {
         TicketRun {
@@ -338,6 +429,21 @@ mod tests {
             external_status: TicketStatus::Ready,
             required_review_revision: None,
         }
+    }
+
+    #[test]
+    fn implementation_review_cannot_start_before_host_delivery_receipt() {
+        let mut implementing = run();
+        implementing.phase = Phase::Implementing;
+        implementing.activity = Activity::Running;
+        let publish = reduce(
+            &implementing,
+            implementing.revision,
+            Input::EvidenceSubmitted,
+        )
+        .unwrap();
+        assert_eq!(publish.ticket_run.phase, Phase::Publishing);
+        assert_eq!(publish.effects, vec![EffectKind::PublishImplementation]);
     }
 
     #[test]
@@ -354,12 +460,121 @@ mod tests {
         let decision = reduce(&run(), Revision(1), Input::Dispatch).unwrap();
         assert_eq!(decision.ticket_run.phase, Phase::Planning);
         assert_eq!(decision.ticket_run.revision, Revision(2));
+        assert_eq!(decision.effects, [EffectKind::PublishTicketStatus]);
         assert_eq!(
-            decision.effects,
-            [
-                EffectKind::StartCoordinator,
-                EffectKind::PublishTicketStatus
-            ]
+            decision.wakes,
+            [WakeTarget::TicketRole(
+                crate::domain::types::Role::Coordinator
+            )]
+        );
+    }
+
+    #[test]
+    fn role_work_is_always_durably_routed_as_a_wake() {
+        let cases = [
+            (Phase::Queued, Input::Dispatch, vec![Role::Coordinator]),
+            (
+                Phase::Reviewing,
+                Input::CorrectionsRemain,
+                vec![Role::Worker],
+            ),
+            (
+                Phase::Reviewing,
+                Input::ReviewConverged,
+                vec![Role::MergeDecision],
+            ),
+            (
+                Phase::AwaitingMerge,
+                Input::MergeVerified,
+                vec![Role::Operator, Role::Coordinator],
+            ),
+            (
+                Phase::Operating,
+                Input::OperationsSucceeded,
+                vec![Role::Postmortem, Role::Coordinator],
+            ),
+            (
+                Phase::Operating,
+                Input::OperationsNotRequired,
+                vec![Role::Postmortem, Role::Coordinator],
+            ),
+        ];
+        for (phase, input, targets) in cases {
+            let mut current = run();
+            current.phase = phase;
+            current.activity = Activity::Running;
+            let decision = reduce(&current, current.revision, input).unwrap();
+            assert_eq!(
+                decision.wakes,
+                targets
+                    .into_iter()
+                    .map(WakeTarget::TicketRole)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                decision
+                    .effects
+                    .iter()
+                    .all(|effect| *effect == EffectKind::PublishTicketStatus)
+            );
+        }
+        let mut implementing = run();
+        implementing.phase = Phase::Implementing;
+        implementing.activity = Activity::Running;
+        let publication = reduce(
+            &implementing,
+            implementing.revision,
+            Input::EvidenceSubmitted,
+        )
+        .unwrap();
+        assert_eq!(publication.ticket_run.phase, Phase::Publishing);
+        assert!(publication.wakes.is_empty());
+    }
+
+    #[test]
+    fn reviewer_escalation_marks_in_review_without_claiming_convergence() {
+        let mut current = run();
+        current.phase = Phase::Reviewing;
+        current.activity = Activity::Running;
+        current.external_status = TicketStatus::InProgress;
+
+        let decision = reduce(&current, current.revision, Input::ReviewEscalationRequired).unwrap();
+
+        assert_eq!(decision.ticket_run.phase, Phase::Reviewing);
+        assert_eq!(decision.ticket_run.activity, Activity::Blocked);
+        assert_eq!(decision.ticket_run.external_status, TicketStatus::InReview);
+        assert_eq!(decision.ticket_run.required_review_revision, None);
+        assert_eq!(decision.wakes, [WakeTarget::Supervisor]);
+        assert_eq!(decision.effects, [EffectKind::PublishTicketStatus]);
+    }
+
+    #[test]
+    fn worker_verification_completion_routes_to_reviewer_without_publication_effects() {
+        let mut current = run();
+        current.phase = Phase::Implementing;
+        current.activity = Activity::Running;
+
+        let decision = reduce(
+            &current,
+            current.revision,
+            Input::WorkerVerificationCompleted,
+        )
+        .unwrap();
+
+        assert_eq!(decision.ticket_run.phase, Phase::Reviewing);
+        assert_eq!(decision.ticket_run.activity, Activity::Running);
+        assert_eq!(decision.wakes, [WakeTarget::TicketRole(Role::Reviewer)]);
+        assert!(decision.effects.is_empty());
+
+        let mut blocked = current;
+        blocked.activity = Activity::Blocked;
+        assert!(
+            reduce(
+                &blocked,
+                blocked.revision,
+                Input::WorkerVerificationCompleted
+            )
+            .is_err()
         );
     }
 

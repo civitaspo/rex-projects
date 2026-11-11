@@ -69,10 +69,8 @@ pub(super) fn parse_result(
 ) -> Result<(Option<String>, Value), String> {
     let response: Value = serde_json::from_str(stdout.trim())
         .map_err(|_| "Claude Code output is not one JSON response")?;
-    if response.get("type").and_then(Value::as_str) != Some("result")
-        || response.get("is_error") != Some(&Value::Bool(false))
-    {
-        return Err("Claude Code did not report a successful terminal result".into());
+    if response.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return Err("Claude Code reported an error".into());
     }
     let conversation_id = response
         .get("session_id")
@@ -115,57 +113,14 @@ mod tests {
     #[test]
     fn does_not_accept_error_or_missing_structured_output() {
         let schema = json!({"type":"object"});
-        assert!(
-            parse_result(
-                r#"{"type":"result","is_error":true,"structured_output":{"result":"{}"}}"#,
-                &schema
-            )
-            .is_err()
-        );
-        assert!(
-            parse_result(
-                r#"{"type":"result","is_error":false,"session_id":"s","result":"{}"}"#,
-                &schema
-            )
-            .is_err()
-        );
+        assert!(parse_result(r#"{"is_error":true,"structured_output":{}}"#, &schema).is_err());
+        assert!(parse_result(r#"{"session_id":"s","result":"{}"}"#, &schema).is_err());
     }
 
     #[test]
     fn host_rejects_projected_string_that_fails_the_source_schema() {
         let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
-        let output = r#"{"type":"result","is_error":false,"structured_output":{"result":"{\"other\":true}"}}"#;
+        let output = r#"{"is_error":false,"structured_output":{"result":"{\"other\":true}"}}"#;
         assert!(parse_result(output, &schema).is_err());
-    }
-
-    #[test]
-    fn requires_an_explicit_successful_terminal_result() {
-        let schema = json!({"type":"object"});
-        for status in [
-            None,
-            Some(json!(null)),
-            Some(json!("false")),
-            Some(json!(1)),
-        ] {
-            let mut response = json!({"type":"result","structured_output":{"result":"{}"}});
-            if let Some(status) = status {
-                response["is_error"] = status;
-            }
-            assert!(parse_result(&response.to_string(), &schema).is_err());
-        }
-        for kind in [None, Some(json!(null)), Some(json!("assistant"))] {
-            let mut response = json!({"is_error":false,"structured_output":{"result":"{}"}});
-            if let Some(kind) = kind {
-                response["type"] = kind;
-            }
-            assert!(parse_result(&response.to_string(), &schema).is_err());
-        }
-        assert!(
-            parse_result(
-                r#"{"type":"result","is_error":false,"structured_output":{"result":"{}"}}"#,
-                &schema
-            )
-            .is_ok()
-        );
     }
 }

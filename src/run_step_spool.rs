@@ -7,19 +7,26 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::launch::{AgentLaunchReceipt, AgentStartRequest};
+use crate::domain::ids::{AgentRunId, Digest};
+use crate::launch::{AgentLaunchReceipt, AgentStartRequest, LaunchAnchorIdentity};
+use crate::process::{ProcessIdentity, ProcessIdentityQuality};
 use crate::run_step::{RunReceipt, TurnResult};
 
 const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const BLOCK_LOSS_SNAPSHOT_VERSION: u32 = 2;
+const RUN_FAMILY_VERSION: u32 = 1;
+const RUN_FAMILY_RECORD_VERSION: u32 = 2;
 const MAX_START_BYTES: usize = 32 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_BLOCK_LOSS_SNAPSHOT_BYTES: usize = 33 * 1024 * 1024;
+const MAX_RUN_FAMILY_BYTES: usize = crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES;
+const MAX_AGENT_TURN_RESULT_BYTES: usize = crate::process::MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -48,16 +55,172 @@ pub struct AgentTurnResult {
     pub result_digest: String,
 }
 
+/// Host-owned cumulative process evidence used only after a managed Rex block disappears.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockLossCleanupSnapshot {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub reservation_epoch: u64,
+    pub authority_digest: Digest,
+    pub launch_tree_digest: Digest,
+    pub observed_at_unix: i64,
+    pub cleanup_covered: bool,
+    pub process_tree: Vec<ProcessIdentity>,
+    pub process_tree_digest: Digest,
+}
+
+/// Immutable host-issued binding that lets the run-step producer checkpoint without SQLite.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFamilyBinding {
+    pub schema_version: u32,
+    pub agent_run_id: AgentRunId,
+    pub reservation_epoch: u64,
+    pub authority_digest: Digest,
+    pub descriptor_digest: Digest,
+    pub wrapper_pid: u32,
+    pub wrapper_start_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<LaunchAnchorIdentity>,
+}
+
+impl RunFamilyBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != RUN_FAMILY_VERSION
+            || self.reservation_epoch == 0
+            || self.wrapper_pid == 0
+            || self.wrapper_start_identity.trim().is_empty()
+            || self.rex_launch_anchor.as_ref().is_some_and(|anchor| {
+                anchor.pid == 0
+                    || anchor.pid == self.wrapper_pid
+                    || anchor.start_identity.trim().is_empty()
+                    || anchor.start_identity.chars().any(char::is_control)
+            })
+        {
+            return Err("run-family binding is outside its bounds".into());
+        }
+        Ok(())
+    }
+}
+
+/// Durable cumulative identities observed by the provider-owning run-step process.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFamilyRecord {
+    pub schema_version: u32,
+    pub binding: RunFamilyBinding,
+    pub observed_at_unix: i64,
+    pub coverage: RunFamilyCoverage,
+    pub wrapper_process: ProcessIdentity,
+    pub provider_root: ProcessIdentity,
+    pub provider_executable_path: PathBuf,
+    pub provider_executable_digest: Digest,
+    pub process_tree: Vec<ProcessIdentity>,
+    pub process_tree_digest: Digest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFamilyCoverage {
+    Observing,
+    Complete,
+    Interrupted,
+}
+
+impl RunFamilyRecord {
+    pub fn validate(&self) -> Result<(), String> {
+        self.binding.validate()?;
+        if self.schema_version != RUN_FAMILY_RECORD_VERSION
+            || self.observed_at_unix < 0
+            || self.process_tree.is_empty()
+            || !self.provider_executable_path.is_absolute()
+        {
+            return Err("run-family record is outside its bounds".into());
+        }
+        if self.wrapper_process.pid != self.binding.wrapper_pid
+            || self.wrapper_process.start_identity != self.binding.wrapper_start_identity
+            || self.wrapper_process.quality != ProcessIdentityQuality::KernelBirthToken
+            || self.wrapper_process.process_group_id == 0
+            || self.wrapper_process.start_identity.trim().is_empty()
+            || self.provider_root.parent_pid != self.wrapper_process.pid
+        {
+            return Err("run-family record does not identify the exact live wrapper parent".into());
+        }
+        if self.provider_root.pid == 0
+            || self.provider_root.process_group_id == 0
+            || self.provider_root.quality != ProcessIdentityQuality::KernelBirthToken
+            || self.provider_root.start_identity.trim().is_empty()
+            || !self.process_tree.iter().any(|process| {
+                process.pid == self.provider_root.pid
+                    && process.start_identity == self.provider_root.start_identity
+                    && process.quality == self.provider_root.quality
+            })
+        {
+            return Err("run-family record has no exact provider root anchor".into());
+        }
+        crate::process::validate_process_evidence_tree(&self.process_tree)?;
+        let mut identities = std::collections::BTreeSet::new();
+        for process in &self.process_tree {
+            if process.pid == 0
+                || process.process_group_id == 0
+                || process.quality != ProcessIdentityQuality::KernelBirthToken
+                || process.start_identity.trim().is_empty()
+                || !identities.insert((process.pid, process.start_identity.as_str()))
+            {
+                return Err("run-family record has invalid process identities".into());
+            }
+        }
+        let bytes = crate::protocol::serialize_bounded(&self.process_tree, MAX_RUN_FAMILY_BYTES)
+            .map_err(|error| error.to_string())?;
+        if self.process_tree_digest != Digest::parse(sha256(&bytes))? {
+            return Err("run-family record digest does not match its process tree".into());
+        }
+        Ok(())
+    }
+}
+
+impl BlockLossCleanupSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != BLOCK_LOSS_SNAPSHOT_VERSION
+            || self.reservation_epoch == 0
+            || self.observed_at_unix < 0
+            || self.process_tree.is_empty()
+        {
+            return Err("block-loss cleanup snapshot is outside its bounds".into());
+        }
+        crate::process::validate_process_evidence_tree(&self.process_tree)?;
+        let mut identities = std::collections::BTreeSet::new();
+        for process in &self.process_tree {
+            if process.pid == 0
+                || process.process_group_id == 0
+                || process.quality != ProcessIdentityQuality::KernelBirthToken
+                || process.start_identity.trim().is_empty()
+                || !identities.insert((process.pid, process.start_identity.as_str()))
+            {
+                return Err("block-loss cleanup snapshot has invalid process identities".into());
+            }
+        }
+        let bytes =
+            crate::protocol::serialize_bounded(&self.process_tree, MAX_BLOCK_LOSS_SNAPSHOT_BYTES)
+                .map_err(|error| error.to_string())?;
+        if self.process_tree_digest != Digest::parse(sha256(&bytes))? {
+            return Err(
+                "block-loss cleanup snapshot digest does not match its process tree".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Files scoped to one immutable launch authority's control directory.
 #[derive(Clone, Debug)]
 pub struct RunStepSpool {
     directory: PathBuf,
-    #[cfg(unix)]
-    directory_handle: Arc<File>,
 }
 
 impl RunStepSpool {
-    /// Opens or creates the `run-step` child of an already registered control directory.
+    /// Opens or creates the private `run-step` child of an already registered control directory.
     pub fn open(control_dir: &Path) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(control_dir)
             .map_err(|error| format!("control directory: {error}"))?;
@@ -82,21 +245,7 @@ impl RunStepSpool {
         if canonical != directory {
             return Err("run-step spool path changed during canonicalization".into());
         }
-        #[cfg(unix)]
-        let directory_handle = Arc::new(
-            open_dir(&directory)
-                .map_err(|error| format!("open run-step spool directory: {error}"))?,
-        );
-        sync_directory(&canonical_parent)?;
-        #[cfg(unix)]
-        directory_handle
-            .sync_all()
-            .map_err(|error| format!("sync run-step spool directory: {error}"))?;
-        Ok(Self {
-            directory,
-            #[cfg(unix)]
-            directory_handle,
-        })
+        Ok(Self { directory })
     }
 
     pub fn directory(&self) -> &Path {
@@ -118,13 +267,98 @@ impl RunStepSpool {
         };
         let bytes = crate::protocol::serialize_bounded(&envelope, MAX_START_BYTES)
             .map_err(|error| error.to_string())?;
-        self.publish_file("start.request.json", &bytes, MAX_START_BYTES)?;
+        publish_once(
+            &self.directory,
+            "start.request.json",
+            &bytes,
+            MAX_START_BYTES,
+        )?;
         Ok(envelope)
+    }
+
+    pub fn publish_run_family_binding_once(
+        &self,
+        binding: &RunFamilyBinding,
+    ) -> Result<(), String> {
+        binding.validate()?;
+        let bytes = crate::protocol::serialize_bounded(binding, MAX_START_BYTES)
+            .map_err(|error| error.to_string())?;
+        publish_once(
+            &self.directory,
+            "run-family-binding.json",
+            &bytes,
+            MAX_START_BYTES,
+        )
+    }
+
+    pub fn read_run_family_binding(&self) -> Result<RunFamilyBinding, String> {
+        let bytes = read_bounded(
+            &self.directory.join("run-family-binding.json"),
+            MAX_START_BYTES,
+        )?;
+        let binding: RunFamilyBinding = parse_unique(&bytes)?;
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub fn read_run_family_record(&self) -> Result<Option<RunFamilyRecord>, String> {
+        match read_bounded(
+            &self.directory.join("run-family.json"),
+            MAX_RUN_FAMILY_BYTES,
+        ) {
+            Ok(bytes) => {
+                let record: RunFamilyRecord = parse_unique(&bytes)?;
+                record.validate()?;
+                Ok(Some(record))
+            }
+            Err(error) if error == "run-step spool file is not present" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Atomically replaces cumulative producer evidence without allowing rebinding or promotion
+    /// from an interrupted producer to a clean terminal.
+    pub fn write_run_family_record(&self, record: &RunFamilyRecord) -> Result<(), String> {
+        record.validate()?;
+        if self.read_run_family_binding()? != record.binding {
+            return Err("run-family record does not match its immutable binding".into());
+        }
+        if let Some(previous) = self.read_run_family_record()? {
+            if previous == *record {
+                return Ok(());
+            }
+            if previous.binding != record.binding
+                || previous.provider_root.pid != record.provider_root.pid
+                || previous.provider_root.start_identity != record.provider_root.start_identity
+                || previous.provider_root.process_group_id != record.provider_root.process_group_id
+                || previous.provider_root.quality != record.provider_root.quality
+                || previous.wrapper_process != record.wrapper_process
+                || previous.provider_executable_path != record.provider_executable_path
+                || previous.provider_executable_digest != record.provider_executable_digest
+                || record.observed_at_unix < previous.observed_at_unix
+                || !process_tree_contains(&record.process_tree, &previous.process_tree)
+                || previous.coverage != RunFamilyCoverage::Observing
+            {
+                return Err(
+                    "run-family record changed its binding, root, identities, or phase".into(),
+                );
+            }
+        } else if record.coverage != RunFamilyCoverage::Observing {
+            return Err("run-family terminal phase has no preceding observation".into());
+        }
+        let bytes = crate::protocol::serialize_bounded(record, MAX_RUN_FAMILY_BYTES)
+            .map_err(|error| error.to_string())?;
+        replace_bounded(
+            &self.directory,
+            "run-family.json",
+            &bytes,
+            MAX_RUN_FAMILY_BYTES,
+        )
     }
 
     /// Host-side read. The caller must authorize this request against durable store state.
     pub fn read_start_request(&self) -> Result<StartRequestEnvelope, String> {
-        let bytes = self.read_file("start.request.json", MAX_START_BYTES)?;
+        let bytes = read_bounded(&self.directory.join("start.request.json"), MAX_START_BYTES)?;
         let envelope: StartRequestEnvelope = parse_unique(&bytes)?;
         envelope.validate()?;
         Ok(envelope)
@@ -145,7 +379,12 @@ impl RunStepSpool {
         };
         let bytes = crate::protocol::serialize_bounded(&envelope, MAX_START_BYTES)
             .map_err(|error| error.to_string())?;
-        self.publish_file("start.receipt.json", &bytes, MAX_START_BYTES)
+        publish_once(
+            &self.directory,
+            "start.receipt.json",
+            &bytes,
+            MAX_START_BYTES,
+        )
     }
 
     /// Host-side read of an already published start receipt. Existing receipts remain
@@ -155,7 +394,7 @@ impl RunStepSpool {
         request: &StartRequestEnvelope,
     ) -> Result<Option<AgentLaunchReceipt>, String> {
         request.validate()?;
-        match self.read_file("start.receipt.json", MAX_START_BYTES) {
+        match read_bounded(&self.directory.join("start.receipt.json"), MAX_START_BYTES) {
             Ok(bytes) => {
                 let envelope: StartReceiptEnvelope = parse_unique(&bytes)?;
                 envelope.validate_for(request)?;
@@ -195,7 +434,7 @@ impl RunStepSpool {
         }
         let _: serde_json::Value = parse_unique(bytes)?;
         let digest = sha256(bytes);
-        self.publish_file("turn.result.json", bytes, MAX_RESULT_BYTES)?;
+        publish_once(&self.directory, "turn.result.json", bytes, MAX_RESULT_BYTES)?;
         Ok(digest)
     }
 
@@ -205,6 +444,38 @@ impl RunStepSpool {
         result: TurnResult,
     ) -> Result<AgentTurnResult, String> {
         request.validate()?;
+        let family = match self.read_run_family_record()? {
+            Some(family) => family,
+            None => {
+                let message = result
+                    .receipt
+                    .cleanup_detail
+                    .as_deref()
+                    .filter(|detail| {
+                        detail.starts_with("provider process-family checkpoint failed: ")
+                    })
+                    .map(|detail| {
+                        format!(
+                            "run-step producer has no durable process-family evidence: {detail}"
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "run-step producer has no durable process-family evidence".into()
+                    });
+                return Err(message);
+            }
+        };
+        if family.binding.agent_run_id != request.request.agent_run_id
+            || family.binding.descriptor_digest != request.request.descriptor_digest
+            || family.binding.wrapper_pid != request.request.wrapper_pid
+            || family.binding.wrapper_start_identity != request.request.wrapper_start_identity
+            || family.binding.rex_launch_anchor != request.request.rex_launch_anchor
+            || family.coverage != RunFamilyCoverage::Complete
+        {
+            return Err(
+                "run-step producer did not durably complete this exact process family".into(),
+            );
+        }
         let mut envelope = AgentTurnResult {
             schema_version: PROTOCOL_VERSION,
             start_request_digest: request.request_digest.clone(),
@@ -215,17 +486,77 @@ impl RunStepSpool {
         if envelope.receipt.run_id != request.request.agent_run_id {
             return Err("provider result belongs to a different AgentRun".into());
         }
+        envelope.result_digest = "0".repeat(64);
+        envelope.validate_payload_bounds()?;
         envelope.result_digest = envelope.payload_digest()?;
-        let bytes = crate::protocol::serialize_bounded(&envelope, MAX_RESULT_BYTES)
+        let bytes = crate::protocol::serialize_bounded(&envelope, MAX_AGENT_TURN_RESULT_BYTES)
             .map_err(|error| error.to_string())?;
-        let _: AgentTurnResult = parse_unique(&bytes)?;
-        self.publish_file("turn.result.json", &bytes, MAX_RESULT_BYTES)?;
+        publish_once(
+            &self.directory,
+            "turn.result.json",
+            &bytes,
+            MAX_AGENT_TURN_RESULT_BYTES,
+        )?;
         Ok(envelope)
     }
 
     /// Host-side bounded read; callers must validate the envelope and treat its claims as evidence.
     pub fn read_result(&self) -> Result<Vec<u8>, String> {
-        self.read_file("turn.result.json", MAX_RESULT_BYTES)
+        read_bounded(&self.directory.join("turn.result.json"), MAX_RESULT_BYTES)
+    }
+
+    pub fn read_block_loss_cleanup_snapshot(
+        &self,
+    ) -> Result<Option<BlockLossCleanupSnapshot>, String> {
+        match read_bounded(
+            &self.directory.join("block-loss-cleanup.json"),
+            MAX_BLOCK_LOSS_SNAPSHOT_BYTES,
+        ) {
+            Ok(bytes) => {
+                let snapshot: BlockLossCleanupSnapshot = parse_unique(&bytes)?;
+                snapshot.validate()?;
+                Ok(Some(snapshot))
+            }
+            Err(error) if error == "run-step spool file is not present" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Atomically replaces the private cumulative cleanup snapshot after validating its binding.
+    pub fn write_block_loss_cleanup_snapshot(
+        &self,
+        snapshot: &BlockLossCleanupSnapshot,
+    ) -> Result<(), String> {
+        snapshot.validate()?;
+        if let Some(previous) = self.read_block_loss_cleanup_snapshot()? {
+            if previous.agent_run_id != snapshot.agent_run_id
+                || previous.reservation_epoch != snapshot.reservation_epoch
+                || previous.authority_digest != snapshot.authority_digest
+                || previous.launch_tree_digest != snapshot.launch_tree_digest
+                || snapshot.observed_at_unix < previous.observed_at_unix
+                || !process_tree_contains(&snapshot.process_tree, &previous.process_tree)
+            {
+                return Err(
+                    "block-loss cleanup snapshot changed its binding or lost identities".into(),
+                );
+            }
+            if snapshot.cleanup_covered && !previous.cleanup_covered {
+                let same_identities = snapshot.process_tree.len() == previous.process_tree.len();
+                if !same_identities {
+                    return Err(
+                        "block-loss cleanup coverage cannot include unobserved identities".into(),
+                    );
+                }
+            }
+        }
+        let bytes = crate::protocol::serialize_bounded(snapshot, MAX_BLOCK_LOSS_SNAPSHOT_BYTES)
+            .map_err(|error| error.to_string())?;
+        replace_bounded(
+            &self.directory,
+            "block-loss-cleanup.json",
+            &bytes,
+            MAX_BLOCK_LOSS_SNAPSHOT_BYTES,
+        )
     }
 
     pub fn read_turn_result(
@@ -233,38 +564,38 @@ impl RunStepSpool {
         request: &StartRequestEnvelope,
     ) -> Result<AgentTurnResult, String> {
         request.validate()?;
-        let bytes = self.read_result()?;
+        let bytes = read_bounded(
+            &self.directory.join("turn.result.json"),
+            MAX_AGENT_TURN_RESULT_BYTES,
+        )?;
+        let family = self
+            .read_run_family_record()?
+            .ok_or("run-step producer has no durable process-family evidence")?;
+        if family.binding.agent_run_id != request.request.agent_run_id
+            || family.binding.descriptor_digest != request.request.descriptor_digest
+            || family.binding.wrapper_pid != request.request.wrapper_pid
+            || family.binding.wrapper_start_identity != request.request.wrapper_start_identity
+            || family.binding.rex_launch_anchor != request.request.rex_launch_anchor
+            || family.coverage != RunFamilyCoverage::Complete
+        {
+            return Err(
+                "run-step producer did not durably complete this exact process family".into(),
+            );
+        }
         let envelope: AgentTurnResult = parse_unique(&bytes)?;
         envelope.validate_for(request)?;
         Ok(envelope)
     }
+}
 
-    fn publish_file(&self, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
-        #[cfg(unix)]
-        {
-            publish_once_at(&self.directory_handle, name, bytes, limit)
-        }
-        #[cfg(not(unix))]
-        {
-            publish_once(&self.directory, name, bytes, limit)
-        }
-    }
-
-    fn read_file(&self, name: &str, limit: usize) -> Result<Vec<u8>, String> {
-        #[cfg(unix)]
-        {
-            read_bounded_at(&self.directory_handle, name, limit).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::NotFound => "run-step spool file is not present".into(),
-                    _ => format!("read run-step spool file: {error}"),
-                }
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            read_bounded(&self.directory.join(name), limit)
-        }
-    }
+fn process_tree_contains(tree: &[ProcessIdentity], required: &[ProcessIdentity]) -> bool {
+    required.iter().all(|process| {
+        tree.iter().any(|candidate| {
+            candidate.pid == process.pid
+                && candidate.start_identity == process.start_identity
+                && candidate.quality == process.quality
+        })
+    })
 }
 
 impl StartRequestEnvelope {
@@ -284,7 +615,6 @@ impl StartRequestEnvelope {
 
 impl StartReceiptEnvelope {
     pub fn validate_for(&self, request: &StartRequestEnvelope) -> Result<(), String> {
-        request.validate()?;
         if self.schema_version != PROTOCOL_VERSION || self.request_digest != request.request_digest
         {
             return Err("host start receipt is not bound to this start request".into());
@@ -295,16 +625,28 @@ impl StartReceiptEnvelope {
 
 impl AgentTurnResult {
     pub fn validate_for(&self, request: &StartRequestEnvelope) -> Result<(), String> {
-        request.validate()?;
         if self.schema_version != PROTOCOL_VERSION
             || self.start_request_digest != request.request_digest
             || self.receipt.run_id != request.request.agent_run_id
         {
             return Err("Agent result is not bound to this acknowledged launch".into());
         }
+        self.validate_payload_bounds()?;
         if self.result_digest != self.payload_digest()? {
             return Err("Agent result digest does not match its payload".into());
         }
+        Ok(())
+    }
+
+    fn validate_payload_bounds(&self) -> Result<(), String> {
+        crate::process::validate_process_evidence_tree(&self.receipt.processes)?;
+        if let Some(result) = &self.structured_result
+            && crate::process::serialized_json_size_at_most(result, MAX_RESULT_BYTES).is_err()
+        {
+            return Err("Agent structured result exceeds the 1 MiB limit".into());
+        }
+        crate::process::serialized_json_size_at_most(self, MAX_AGENT_TURN_RESULT_BYTES)
+            .map_err(|_| "Agent turn result envelope exceeds the 34 MiB limit".to_owned())?;
         Ok(())
     }
 
@@ -323,14 +665,13 @@ impl AgentTurnResult {
                 receipt: &self.receipt,
                 structured_result: &self.structured_result,
             },
-            MAX_RESULT_BYTES,
+            MAX_AGENT_TURN_RESULT_BYTES,
         )
         .map_err(|error| error.to_string())?;
         Ok(sha256(&bytes))
     }
 }
 
-#[cfg(not(unix))]
 fn publish_once(directory: &Path, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
     if bytes.len() > limit {
         return Err("run-step spool payload exceeds its byte limit".into());
@@ -372,14 +713,41 @@ fn publish_once(directory: &Path, name: &str, bytes: &[u8], limit: usize) -> Res
     }
 }
 
-#[cfg(not(unix))]
+fn replace_bounded(directory: &Path, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
+    if bytes.len() > limit {
+        return Err("run-step spool payload exceeds its byte limit".into());
+    }
+    let temporary = directory.join(format!(".{name}.{}.tmp", nonce()));
+    let destination = directory.join(name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    set_private_file_options(&mut options);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create run-step temporary file: {error}"))?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write run-step spool file: {error}"));
+    drop(file);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("replace run-step spool file: {error}"));
+    }
+    sync_directory(directory)
+}
+
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let file = match options.open(path) {
         Ok(file) => file,
@@ -405,8 +773,13 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
 }
 
 fn parse_unique<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
-    crate::protocol::parse_unique(bytes)
-        .map_err(|error| format!("invalid run-step spool JSON: {error}"))
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = serde_path_to_error::deserialize(&mut deserializer)
+        .map_err(|error| format!("invalid run-step spool JSON at {}", error.path()))?;
+    deserializer
+        .end()
+        .map_err(|_| "trailing data in run-step spool JSON".to_owned())?;
+    Ok(value)
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -430,117 +803,6 @@ fn nonce() -> String {
 }
 
 #[cfg(unix)]
-fn open_dir(path: &Path) -> Result<File, std::io::Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-}
-
-#[cfg(unix)]
-fn read_bounded_at(directory: &File, name: &str, limit: usize) -> Result<Vec<u8>, std::io::Error> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let name = std::ffi::CString::new(name).expect("internal spool filename has no nul");
-    // SAFETY: directory is a retained directory descriptor and name is a fixed basename.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: openat returned a new owned descriptor.
-    let file = unsafe { File::from_raw_fd(fd) };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > limit as u64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "run-step spool entry is not a bounded regular file",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "run-step spool entry exceeds its byte limit",
-        ));
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-fn publish_once_at(directory: &File, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    if bytes.len() > limit {
-        return Err("run-step spool payload exceeds its byte limit".into());
-    }
-    let temporary = std::ffi::CString::new(format!(".{name}.{}.tmp", nonce()))
-        .expect("internal spool filename has no nul");
-    let destination = std::ffi::CString::new(name).expect("internal spool destination has no nul");
-    // SAFETY: directory is an open directory and temporary is a unique internal basename.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            temporary.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "create run-step temporary file: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: openat returned a new owned descriptor.
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let result = (|| {
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("write run-step spool file: {error}"))?;
-        drop(file);
-        // SAFETY: both names are internal basenames under the retained directory descriptor.
-        let linked = unsafe {
-            libc::linkat(
-                directory.as_raw_fd(),
-                temporary.as_ptr(),
-                directory.as_raw_fd(),
-                destination.as_ptr(),
-                0,
-            )
-        };
-        if linked < 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("run-step spool file `{name}` was already published")
-            } else {
-                format!("publish run-step spool file: {error}")
-            });
-        }
-        // SAFETY: temporary is the private file created by this call.
-        if unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } < 0 {
-            return Err(format!(
-                "remove run-step temporary file: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        directory
-            .sync_all()
-            .map_err(|error| format!("sync run-step spool directory: {error}"))
-    })();
-    if result.is_err() {
-        // SAFETY: temporary is owned by this call and removed beneath its pinned directory.
-        unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
-    }
-    result
-}
-
-#[cfg(unix)]
 fn set_private_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -550,6 +812,12 @@ fn set_private_dir(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_private_dir(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_options(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
 }
 
 #[cfg(not(unix))]
@@ -569,11 +837,17 @@ fn sync_directory(_path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentTurnResult, RunStepSpool, StartReceiptEnvelope, StartRequestEnvelope};
+    use super::{
+        AgentTurnResult, BLOCK_LOSS_SNAPSHOT_VERSION, BlockLossCleanupSnapshot, RunFamilyBinding,
+        RunFamilyCoverage, RunFamilyRecord, RunStepSpool, StartReceiptEnvelope,
+        StartRequestEnvelope,
+    };
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId};
     use crate::launch::{AgentLaunchReceipt, AgentStartRequest, LaunchDecision};
-    use crate::run_step::{CleanupState, RunReceipt, TurnOutcome, TurnResult};
+    use crate::process::{ProcessIdentity, ProcessIdentityQuality};
+    use crate::run_step::{CleanupState, ObservedProcess, RunReceipt, TurnOutcome, TurnResult};
     use sha2::Digest as _;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -590,6 +864,7 @@ mod tests {
             qualification_receipt_digest: digest('d'),
             wrapper_pid: 100,
             wrapper_start_identity: "birth-100".into(),
+            rex_launch_anchor: None,
             rex_session_id: "session-1".into(),
             rex_block_id: "block-1".into(),
         }
@@ -597,6 +872,78 @@ mod tests {
 
     fn digest(c: char) -> Digest {
         Digest::parse(c.to_string().repeat(64)).unwrap()
+    }
+
+    fn process(pid: u32, start_identity: &str, group_id: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            parent_pid: 1,
+            process_group_id: group_id,
+            start_identity: start_identity.into(),
+            command: "/bin/sleep".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        }
+    }
+
+    fn cleanup_snapshot(process_tree: Vec<ProcessIdentity>) -> BlockLossCleanupSnapshot {
+        let bytes = serde_json::to_vec(&process_tree).unwrap();
+        BlockLossCleanupSnapshot {
+            schema_version: BLOCK_LOSS_SNAPSHOT_VERSION,
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            reservation_epoch: 2,
+            authority_digest: digest('a'),
+            launch_tree_digest: digest('b'),
+            observed_at_unix: 10,
+            cleanup_covered: false,
+            process_tree,
+            process_tree_digest: Digest::parse(format!("{:x}", sha2::Sha256::digest(bytes)))
+                .unwrap(),
+        }
+    }
+
+    fn family_binding(request: &AgentStartRequest) -> RunFamilyBinding {
+        RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: request.agent_run_id.clone(),
+            reservation_epoch: 2,
+            authority_digest: digest('f'),
+            descriptor_digest: request.descriptor_digest.clone(),
+            wrapper_pid: request.wrapper_pid,
+            wrapper_start_identity: request.wrapper_start_identity.clone(),
+            rex_launch_anchor: request.rex_launch_anchor.clone(),
+        }
+    }
+
+    fn family_record(
+        binding: RunFamilyBinding,
+        mut process_tree: Vec<ProcessIdentity>,
+    ) -> RunFamilyRecord {
+        let mut provider_root = process_tree[0].clone();
+        provider_root.parent_pid = binding.wrapper_pid;
+        process_tree[0] = provider_root.clone();
+        RunFamilyRecord {
+            schema_version: 2,
+            wrapper_process: ProcessIdentity {
+                pid: binding.wrapper_pid,
+                parent_pid: 1,
+                process_group_id: binding.wrapper_pid,
+                start_identity: binding.wrapper_start_identity.clone(),
+                command: String::new(),
+                quality: ProcessIdentityQuality::KernelBirthToken,
+            },
+            binding,
+            observed_at_unix: 10,
+            coverage: RunFamilyCoverage::Observing,
+            provider_root,
+            provider_executable_path: PathBuf::from("/bin/sleep"),
+            provider_executable_digest: digest('e'),
+            process_tree_digest: Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+            ))
+            .unwrap(),
+            process_tree,
+        }
     }
 
     fn receipt(request: &AgentStartRequest) -> AgentLaunchReceipt {
@@ -632,6 +979,7 @@ mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancellation_signal: None,
+                cancellation_cause: None,
                 cleanup: CleanupState::Confirmed,
                 cleanup_detail: None,
                 processes: vec![],
@@ -698,66 +1046,138 @@ mod tests {
         assert!(spool.wait_start_receipt(&envelope, Duration::ZERO).is_err());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn readers_reject_fifo_spool_files_without_blocking() {
-        use std::os::unix::ffi::OsStrExt;
-        use std::sync::mpsc;
-
-        fn fifo(path: &std::path::Path) {
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-            // SAFETY: `path` is a valid NUL-terminated path and mode is an ordinary permission mask.
-            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        }
-
-        fn completes_without_blocking<T: Send + 'static>(
-            read: impl FnOnce() -> T + Send + 'static,
-        ) -> T {
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || sender.send(read()).unwrap());
-            receiver
-                .recv_timeout(Duration::from_secs(1))
-                .expect("FIFO read blocked instead of rejecting the non-regular file")
-        }
-
-        let temp = tempdir().unwrap();
-        let spool = RunStepSpool::open(temp.path()).unwrap();
-        let request = spool.publish_start_once(request()).unwrap();
-
-        let request_path = spool.directory().join("start.request.json");
-        std::fs::remove_file(&request_path).unwrap();
-        fifo(&request_path);
-        let request_spool = spool.clone();
-        assert!(completes_without_blocking(move || request_spool.read_start_request()).is_err());
-
-        let receipt_path = spool.directory().join("start.receipt.json");
-        fifo(&receipt_path);
-        let receipt_spool = spool.clone();
-        assert!(
-            completes_without_blocking(move || receipt_spool.read_start_receipt(&request)).is_err()
-        );
-
-        let result_path = spool.directory().join("turn.result.json");
-        fifo(&result_path);
-        let result_spool = spool.clone();
-        assert!(completes_without_blocking(move || result_spool.read_result()).is_err());
-    }
-
     #[test]
     fn bounded_turn_result_is_bound_to_start_and_detects_tampering() {
         let temp = tempdir().unwrap();
         let spool = RunStepSpool::open(temp.path()).unwrap();
         let request = spool.publish_start_once(request()).unwrap();
-        let mut original = turn_result(&request.request);
-        original.structured_result = Some(serde_json::json!({"answer":"ok"}));
-        spool.publish_turn_result_once(&request, original).unwrap();
+        assert_eq!(
+            spool.read_turn_result(&request).unwrap_err(),
+            "run-step spool file is not present"
+        );
+        let mut failed_turn = turn_result(&request.request);
+        failed_turn.receipt.cleanup_detail = Some(
+            "provider process-family checkpoint failed: provider root exited during image inspection"
+                .into(),
+        );
+        assert_eq!(
+            spool
+                .publish_turn_result_once(&request, failed_turn)
+                .unwrap_err(),
+            "run-step producer has no durable process-family evidence: provider process-family checkpoint failed: provider root exited during image inspection"
+        );
+        assert!(
+            spool
+                .publish_turn_result_once(&request, turn_result(&request.request))
+                .is_err()
+        );
+        let binding = family_binding(&request.request);
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let mut family = family_record(binding, vec![process(200, "birth-200", 200)]);
+        spool.write_run_family_record(&family).unwrap();
+        assert!(
+            spool
+                .publish_turn_result_once(&request, turn_result(&request.request))
+                .is_err()
+        );
+        family.coverage = RunFamilyCoverage::Complete;
+        spool.write_run_family_record(&family).unwrap();
+        spool
+            .publish_turn_result_once(&request, turn_result(&request.request))
+            .unwrap();
         let read = spool.read_turn_result(&request).unwrap();
         read.validate_for(&request).unwrap();
 
         let mut forged: AgentTurnResult =
             serde_json::from_slice(&spool.read_result().unwrap()).unwrap();
-        forged.structured_result = Some(serde_json::json!({"answer":"changed"}));
+        forged.receipt.exit_code = Some(99);
         assert!(forged.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn producer_family_retains_late_child_and_rejects_rebinding_or_lost_history() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let binding = family_binding(&request());
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let initial = family_record(binding.clone(), vec![process(200, "birth-200", 200)]);
+        spool.write_run_family_record(&initial).unwrap();
+        let mut cumulative = family_record(
+            binding,
+            vec![
+                process(200, "birth-200", 200),
+                process(201, "late-birth-201", 201),
+            ],
+        );
+        cumulative.observed_at_unix = 11;
+        spool.write_run_family_record(&cumulative).unwrap();
+        assert_eq!(
+            spool.read_run_family_record().unwrap(),
+            Some(cumulative.clone())
+        );
+
+        let mut lost_child = initial;
+        lost_child.observed_at_unix = 12;
+        assert!(spool.write_run_family_record(&lost_child).is_err());
+        let mut rebound = cumulative.clone();
+        rebound.binding.reservation_epoch += 1;
+        assert!(spool.write_run_family_record(&rebound).is_err());
+        let mut moved_root = cumulative.clone();
+        moved_root.provider_root.process_group_id += 1;
+        assert!(spool.write_run_family_record(&moved_root).is_err());
+        let mut reused_wrapper_pid = cumulative.clone();
+        reused_wrapper_pid.wrapper_process.start_identity = "different-wrapper-birth".into();
+        assert!(spool.write_run_family_record(&reused_wrapper_pid).is_err());
+        let mut wrong_executable = cumulative.clone();
+        wrong_executable.provider_executable_path = PathBuf::from("/tmp/unqualified-provider");
+        assert!(spool.write_run_family_record(&wrong_executable).is_err());
+        let mut wrong_root_parent = cumulative.clone();
+        wrong_root_parent.provider_root.parent_pid = 999;
+        assert!(spool.write_run_family_record(&wrong_root_parent).is_err());
+
+        cumulative.coverage = RunFamilyCoverage::Interrupted;
+        spool.write_run_family_record(&cumulative).unwrap();
+        spool.write_run_family_record(&cumulative).unwrap();
+        let mut false_completion = cumulative.clone();
+        false_completion.coverage = RunFamilyCoverage::Complete;
+        assert!(spool.write_run_family_record(&false_completion).is_err());
+        assert_eq!(spool.read_run_family_record().unwrap(), Some(cumulative));
+    }
+
+    #[test]
+    fn producer_family_crosses_1024_and_interrupted_history_cannot_publish_result() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let request = spool.publish_start_once(request()).unwrap();
+        let binding = family_binding(&request.request);
+        spool.publish_run_family_binding_once(&binding).unwrap();
+
+        let initial = (200..1224)
+            .map(|pid| process(pid, &format!("birth-{pid}"), pid))
+            .collect::<Vec<_>>();
+        let mut family = family_record(binding, initial);
+        spool.write_run_family_record(&family).unwrap();
+        family.process_tree.push(process(1224, "birth-1224", 1224));
+        family.provider_root = family.process_tree[0].clone();
+        family.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&family.process_tree).unwrap())
+        ))
+        .unwrap();
+        family.observed_at_unix += 1;
+        spool.write_run_family_record(&family).unwrap();
+
+        let snapshot = cleanup_snapshot(family.process_tree.clone());
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            spool.read_block_loss_cleanup_snapshot().unwrap(),
+            Some(snapshot)
+        );
+
+        family.coverage = RunFamilyCoverage::Interrupted;
+        family.observed_at_unix += 1;
+        spool.write_run_family_record(&family).unwrap();
+        assert_eq!(spool.read_run_family_record().unwrap(), Some(family));
         assert!(
             spool
                 .publish_turn_result_once(&request, turn_result(&request.request))
@@ -766,148 +1186,179 @@ mod tests {
     }
 
     #[test]
-    fn typed_result_rejects_oversize_and_unreadable_payloads_before_publication() {
+    fn turn_result_envelope_allows_large_process_evidence_but_keeps_structured_result_bound() {
         let temp = tempdir().unwrap();
         let spool = RunStepSpool::open(temp.path()).unwrap();
         let request = spool.publish_start_once(request()).unwrap();
+        let binding = family_binding(&request.request);
+        spool.publish_run_family_binding_once(&binding).unwrap();
 
-        let mut oversized = turn_result(&request.request);
-        oversized.structured_result = Some(serde_json::json!({
-            "payload": "x".repeat(1024 * 1024)
-        }));
-        assert!(spool.publish_turn_result_once(&request, oversized).is_err());
-        assert!(!spool.directory().join("turn.result.json").exists());
+        let mut process_tree = (200..8_392)
+            .map(|pid| {
+                let mut process = process(pid, &format!("birth-{pid}"), pid);
+                process.command = format!("/provider/{}", "x".repeat(128));
+                process
+            })
+            .collect::<Vec<_>>();
+        let mut family = family_record(binding, std::mem::take(&mut process_tree));
+        spool.write_run_family_record(&family).unwrap();
+        family.coverage = RunFamilyCoverage::Complete;
+        family.observed_at_unix += 1;
+        spool.write_run_family_record(&family).unwrap();
 
-        let mut deeply_nested = serde_json::Value::String("leaf".into());
-        for _ in 0..160 {
-            deeply_nested = serde_json::Value::Array(vec![deeply_nested]);
-        }
-        let mut unreadable = turn_result(&request.request);
-        unreadable.structured_result = Some(deeply_nested);
+        let mut result = turn_result(&request.request);
+        result.receipt.processes = family
+            .process_tree
+            .iter()
+            .map(|process| ObservedProcess {
+                pid: process.pid,
+                parent_pid: process.parent_pid,
+                process_group_id: process.process_group_id,
+                start_identity: process.start_identity.clone(),
+                command: process.command.clone(),
+                identity_quality: "kernel_birth_token".into(),
+            })
+            .collect();
+        spool.publish_turn_result_once(&request, result).unwrap();
         assert!(
-            spool
-                .publish_turn_result_once(&request, unreadable)
-                .is_err()
+            std::fs::metadata(spool.directory().join("turn.result.json"))
+                .unwrap()
+                .len()
+                > 1024 * 1024
         );
-        assert!(!spool.directory().join("turn.result.json").exists());
-    }
+        assert!(spool.read_result().is_err());
+        let read = spool.read_turn_result(&request).unwrap();
+        assert_eq!(read.receipt.processes.len(), 8_192);
 
-    #[test]
-    fn response_validators_reject_an_invalid_start_request_even_with_matching_digest() {
-        let mut request_envelope = StartRequestEnvelope {
-            schema_version: 1,
-            request_digest: String::new(),
-            request: request(),
-        };
-        request_envelope.request.schema_version = 2;
-        request_envelope.request_digest =
-            super::sha256(&serde_json::to_vec(&request_envelope.request).unwrap());
-
-        let receipt = StartReceiptEnvelope {
-            schema_version: 1,
-            request_digest: request_envelope.request_digest.clone(),
-            receipt: receipt(&request_envelope.request),
-        };
-        assert!(receipt.validate_for(&request_envelope).is_err());
-
-        let result = turn_result(&request_envelope.request);
-        let mut result = AgentTurnResult {
-            schema_version: 1,
-            start_request_digest: request_envelope.request_digest.clone(),
-            receipt: result.receipt,
-            structured_result: result.structured_result,
-            result_digest: String::new(),
-        };
-        result.result_digest = result.payload_digest().unwrap();
-        assert!(result.validate_for(&request_envelope).is_err());
-    }
-
-    #[test]
-    fn result_cannot_be_replayed_for_a_different_valid_wrapper_binding() {
-        let original_request = request();
-        let mut result = turn_result(&original_request);
-        result.structured_result = Some(serde_json::json!({"answer":"ok"}));
+        let mut too_large_result = turn_result(&request.request);
+        too_large_result.structured_result =
+            Some(serde_json::Value::String("x".repeat(1024 * 1024 + 1)));
         let mut envelope = AgentTurnResult {
             schema_version: 1,
-            start_request_digest: "0".repeat(64),
-            receipt: result.receipt,
-            structured_result: result.structured_result,
+            start_request_digest: request.request_digest.clone(),
+            receipt: too_large_result.receipt,
+            structured_result: too_large_result.structured_result,
             result_digest: String::new(),
         };
-        let original = StartRequestEnvelope {
-            schema_version: 1,
-            request_digest: super::sha256(&serde_json::to_vec(&original_request).unwrap()),
-            request: original_request,
-        };
-        envelope.start_request_digest = original.request_digest.clone();
         envelope.result_digest = envelope.payload_digest().unwrap();
-        envelope.validate_for(&original).unwrap();
-
-        let mut changed_request = original.request.clone();
-        changed_request.wrapper_start_identity = "different-kernel-birth".into();
-        let changed = StartRequestEnvelope {
-            schema_version: 1,
-            request_digest: super::sha256(&serde_json::to_vec(&changed_request).unwrap()),
-            request: changed_request,
-        };
-
-        assert!(envelope.validate_for(&changed).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn spool_reads_and_writes_remain_bound_to_opened_directory() {
-        let temp = tempdir().unwrap();
-        let spool = RunStepSpool::open(temp.path()).unwrap();
-        let pinned = temp.path().join("pinned-run-step");
-        std::fs::rename(spool.directory(), &pinned).unwrap();
-        std::fs::create_dir(spool.directory()).unwrap();
-
-        spool.publish_result_once(br#"{"result":1}"#).unwrap();
-
-        assert_eq!(spool.read_result().unwrap(), br#"{"result":1}"#);
-        assert!(!spool.directory().join("turn.result.json").exists());
         assert_eq!(
-            std::fs::read(pinned.join("turn.result.json")).unwrap(),
-            br#"{"result":1}"#
+            envelope.validate_for(&request).unwrap_err(),
+            "Agent structured result exceeds the 1 MiB limit"
         );
     }
 
     #[test]
-    fn raw_result_rejects_duplicate_keys_in_nested_objects() {
+    fn legacy_run_family_record_without_image_proof_is_not_promoted() {
         let temp = tempdir().unwrap();
         let spool = RunStepSpool::open(temp.path()).unwrap();
-        let bytes = br#"{"outer":{"result":1,"result":2}}"#;
-
-        assert!(spool.publish_result_once(bytes).is_err());
-        assert!(spool.read_result().is_err());
+        let binding = family_binding(&request());
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let current = family_record(binding, vec![process(200, "birth-200", 200)]);
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy.as_object_mut().unwrap().remove("wrapper_process");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_executable_path");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_executable_digest");
+        std::fs::write(
+            spool.directory().join("run-family.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert!(spool.read_run_family_record().is_err());
     }
 
     #[test]
-    fn raw_result_rejects_oversize_payload_and_conflicting_replay() {
+    fn producer_completion_cannot_reopen_observation_or_accept_corrupt_history() {
         let temp = tempdir().unwrap();
         let spool = RunStepSpool::open(temp.path()).unwrap();
-        let bytes = br#"{"result":1}"#;
-        spool.publish_result_once(bytes).unwrap();
-        assert_eq!(spool.read_result().unwrap(), bytes);
-        assert!(spool.publish_result_once(bytes).is_err());
+        let binding = family_binding(&request());
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        let mut family = family_record(binding, vec![process(200, "birth-200", 200)]);
+        family.coverage = RunFamilyCoverage::Complete;
+        assert!(spool.write_run_family_record(&family).is_err());
+        family.coverage = RunFamilyCoverage::Observing;
+        spool.write_run_family_record(&family).unwrap();
+        family.coverage = RunFamilyCoverage::Complete;
+        spool.write_run_family_record(&family).unwrap();
+        spool.write_run_family_record(&family).unwrap();
+        family.coverage = RunFamilyCoverage::Observing;
+        assert!(spool.write_run_family_record(&family).is_err());
+        std::fs::write(spool.directory().join("run-family.json"), b"{bad}").unwrap();
+        assert!(spool.read_run_family_record().is_err());
+        assert!(spool.write_run_family_record(&family).is_err());
+    }
+
+    #[test]
+    fn block_loss_snapshot_is_atomic_bound_and_cumulative() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let first = process(20, "birth-20", 20);
+        let mut snapshot = cleanup_snapshot(vec![first]);
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            spool.read_block_loss_cleanup_snapshot().unwrap(),
+            Some(snapshot.clone())
+        );
+
+        let second = process(21, "birth-21", 21);
+        snapshot.process_tree.push(second);
+        snapshot.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&snapshot.process_tree).unwrap())
+        ))
+        .unwrap();
+        snapshot.observed_at_unix = 11;
+        spool.write_block_loss_cleanup_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            spool.read_block_loss_cleanup_snapshot().unwrap(),
+            Some(snapshot.clone())
+        );
+
+        let mut truncated = snapshot.clone();
+        truncated.process_tree.pop();
+        truncated.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&truncated.process_tree).unwrap())
+        ))
+        .unwrap();
+        assert!(spool.write_block_loss_cleanup_snapshot(&truncated).is_err());
+
+        let mut rebound = snapshot;
+        rebound.authority_digest = digest('c');
+        assert!(spool.write_block_loss_cleanup_snapshot(&rebound).is_err());
+    }
+
+    #[test]
+    fn block_loss_snapshot_corruption_stays_an_error() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let path = spool.directory().join("block-loss-cleanup.json");
+        std::fs::write(path, b"{\"schema_version\":1}").unwrap();
+        assert!(spool.read_block_loss_cleanup_snapshot().is_err());
+    }
+
+    #[test]
+    fn legacy_signal_only_snapshot_cannot_prove_cleanup() {
+        let temp = tempdir().unwrap();
+        let spool = RunStepSpool::open(temp.path()).unwrap();
+        let mut legacy = cleanup_snapshot(vec![process(20, "birth-20", 20)]);
+        legacy.schema_version = 1;
+        legacy.cleanup_covered = true;
+        let path = spool.directory().join("block-loss-cleanup.json");
+        std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(spool.read_block_loss_cleanup_snapshot().is_err());
+        let mut replacement = legacy;
+        replacement.schema_version = BLOCK_LOSS_SNAPSHOT_VERSION;
         assert!(
             spool
-                .publish_result_once(&vec![b' '; 1024 * 1024 + 1])
+                .write_block_loss_cleanup_snapshot(&replacement)
                 .is_err()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn open_rejects_symlinked_control_directory() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempdir().unwrap();
-        let actual = temp.path().join("actual");
-        std::fs::create_dir(&actual).unwrap();
-        let alias = temp.path().join("alias");
-        symlink(&actual, &alias).unwrap();
-        assert!(RunStepSpool::open(&alias).is_err());
     }
 }

@@ -4,7 +4,23 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-pub fn run(state_dir: &Path) -> Result<(), String> {
+pub fn run(state_dir: &Path, observe_status: &str) -> Result<(), String> {
+    if !matches!(
+        observe_status,
+        "legacy"
+            | "queued"
+            | "running"
+            | "awaiting_approval"
+            | "succeeded"
+            | "failed"
+            | "cancelled"
+            | "skipped"
+            | "missing"
+            | "timed_out"
+            | "unknown"
+    ) {
+        return Err("unsupported fixture operation observation status".into());
+    }
     fs::create_dir_all(state_dir)
         .map_err(|error| format!("create operations fixture state directory: {error}"))?;
 
@@ -43,6 +59,15 @@ pub fn run(state_dir: &Path) -> Result<(), String> {
             let action_id = string(params, "action_id")?;
             let operation_id = string(&request, "operation_id")?;
             let path = state_path(state_dir, operation_id)?;
+            let metrics_path = state_dir.join("metrics.json");
+            let mut metrics = read_json_if_present(&metrics_path)?
+                .unwrap_or_else(|| json!({"invoke_calls": 0, "duplicate_invoke_calls": 0}));
+            metrics["invoke_calls"] = json!(metrics["invoke_calls"].as_u64().unwrap_or(0) + 1);
+            if path.exists() {
+                metrics["duplicate_invoke_calls"] =
+                    json!(metrics["duplicate_invoke_calls"].as_u64().unwrap_or(0) + 1);
+            }
+            write_json(&metrics_path, &metrics)?;
             let stored = json!({
                 "operation_id": operation_id,
                 "correlation_key": params["correlation_key"],
@@ -121,7 +146,9 @@ pub fn run(state_dir: &Path) -> Result<(), String> {
             "environment": params["environment"],
             "source_sha": params["source_sha"],
             "observed_at": "2026-01-01T00:00:00Z",
-            "status": "unknown",
+            "status": if observe_status == "legacy" {
+                if params["action_id"] == "fixture_lost_reply" { "succeeded" } else { "unknown" }
+            } else { observe_status },
             "evidence": [],
             "jobs": {}
         }),

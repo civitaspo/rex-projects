@@ -142,6 +142,58 @@ fn list(scope: TicketScope, size: u32, cursor: Option<String>) -> TicketListRequ
 }
 
 #[test]
+fn status_filter_is_applied_before_pagination_through_the_external_command() {
+    for shape in ["record", "edges"] {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter(&dir, shape, None, 0, None);
+        let ticket_scope = scope("status-filter");
+        let mut tickets = Vec::new();
+        for (index, status) in [
+            NormalizedTicketStatus::InProgress,
+            NormalizedTicketStatus::Ready,
+            NormalizedTicketStatus::Ready,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("filtered-{index}");
+            let mut input = create(ticket_scope.clone(), &id, &id);
+            input.status = Some(status);
+            tickets.push(
+                adapter
+                    .create(req(&id), op(&id), project(), input)
+                    .unwrap()
+                    .ticket,
+            );
+        }
+        let mut input = list(ticket_scope.clone(), 1, None);
+        input.status = Some(NormalizedTicketStatus::Ready);
+        let first = adapter
+            .list(req("ready-first"), project(), input.clone())
+            .unwrap();
+        assert_eq!(first.tickets.len(), 1);
+        assert_eq!(first.tickets[0].id, tickets[1].id);
+        assert_eq!(first.tickets[0].status.value, NormalizedTicketStatus::Ready);
+        input.cursor = Some(
+            first
+                .next_cursor
+                .expect("second matching ticket has a page"),
+        );
+        let second = adapter
+            .list(req("ready-second"), project(), input.clone())
+            .unwrap();
+        assert_eq!(second.tickets.len(), 1);
+        assert_eq!(second.tickets[0].id, tickets[2].id);
+        assert!(second.next_cursor.is_none());
+        input.cursor = None;
+        input.status = Some(NormalizedTicketStatus::InProgress);
+        let running = adapter.list(req("running"), project(), input).unwrap();
+        assert_eq!(running.tickets.len(), 1);
+        assert_eq!(running.tickets[0].id, tickets[0].id);
+    }
+}
+
+#[test]
 fn unrelated_native_shapes_normalize_through_the_external_command() {
     for shape in ["record", "edges"] {
         let dir = tempfile::tempdir().unwrap();

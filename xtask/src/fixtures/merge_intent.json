@@ -1,0 +1,30 @@
+{
+  "assessment_id": {"$fixture_ref": "prompt.assessment_id"},
+  "pr_identities": [{"$fixture_ref": "prompt.pr_reference"}],
+  "policy_digest": {"$fixture_ref": "prompt.policy_digest"},
+  "prepared_body_digest": {"$fixture_ref": "prompt.prepared_body_digest"},
+  "steps": [
+    {
+      "kind": "update_pull_request_body",
+      "instruction_reference": "repository:{repository_id}:merge#prepare-body",
+      "rationale": "Add the host-prepared authorship trailer."
+    },
+    {
+      "kind": "direct_merge",
+      "instruction_reference": "repository:{repository_id}:merge#procedure",
+      "rationale": "Use the fixture repository's declared direct-merge procedure."
+    },
+    {
+      "kind": "verify_merge_commit",
+      "instruction_reference": "repository:{repository_id}:merge#verification",
+      "rationale": "Verify the host-observed merge commit."
+    }
+  ],
+  "post_merge_verification": [
+    {
+      "kind": "merge_commit_recorded",
+      "instruction_reference": "repository:{repository_id}:merge#verification",
+      "rationale": "Confirm the forge records the merge commit."
+    }
+  ]
+}

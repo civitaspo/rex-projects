@@ -196,6 +196,7 @@
         "prepare_worktrees",
         "plan_ready",
         "implementation_ready",
+        "verification_ready",
         "review_ready",
         "merge_assessment",
         "merge_intent",
@@ -212,7 +213,7 @@
       "description": "Local logical identity for a durable role session. It is not an Agent\nsupplied destination; validation matches it against the host descriptor.",
       "maxLength": 255,
       "minLength": 1,
-      "pattern": "^[A-Za-z0-9._-]+$",
+      "pattern": "^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$",
       "type": "string"
     },
     "WorkNodeId": {
@@ -474,9 +475,8 @@
                   "type": "string"
                 },
                 "expected_ticket_revision": {
-                  "format": "uint64",
-                  "minimum": 0,
-                  "type": "integer"
+                  "description": "Copy `payload_json.external_revision` byte-for-byte from the same ticket observation.",
+                  "type": "string"
                 },
                 "priority": {
                   "format": "int32",
@@ -486,6 +486,7 @@
                   "type": "string"
                 },
                 "ticket_reference": {
+                  "description": "Copy `payload_json.ticket_id` byte-for-byte from the selected current ticket observation.\nDo not add a namespace, adapter name, URL, or source identifier unless it is part of that\nticket ID itself.",
                   "maxLength": 512,
                   "minLength": 1,
                   "pattern": "^[^\\p{Cc}]*$",
@@ -520,7 +521,7 @@
                   "$ref": "#/$defs/RoleSessionId",
                   "maxLength": 255,
                   "minLength": 1,
-                  "pattern": "^[A-Za-z0-9._-]+$"
+                  "pattern": "^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$"
                 },
                 "evidence": {
                   "items": {
@@ -810,7 +811,6 @@
     "kind",
     "assertion",
     "structured_result",
-    "result_digest",
     "artifact_refs"
   ],
   "title": "rex-projects supervisor result message",

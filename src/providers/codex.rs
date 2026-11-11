@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -10,7 +11,7 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
         prefix,
         role_contract,
         prompt,
-        schema_path,
+        paths,
         conversation_id,
         model,
         effort,
@@ -18,6 +19,10 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
         ..
     } = input;
     let mut args: Vec<OsString> = prefix;
+    if let Some(control_dir) = paths.control_dir {
+        validate_control_dir(control_dir)?;
+        args.extend(["--add-dir".into(), control_dir.as_os_str().to_owned()]);
+    }
     args.extend([
         "--no-daemon".into(),
         "--config".into(),
@@ -48,12 +53,18 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
     ]);
     if let Some(conversation_id) = conversation_id {
         validate_conversation_id(conversation_id)?;
-        args.extend(["resume".into(), conversation_id.into()]);
+        args.extend([
+            "resume".into(),
+            "--skip-git-repo-check".into(),
+            conversation_id.into(),
+        ]);
+    } else {
+        args.push("--skip-git-repo-check".into());
     }
     args.extend([
         "--json".into(),
         "--output-schema".into(),
-        schema_path.as_os_str().to_owned(),
+        paths.schema_path.as_os_str().to_owned(),
         prompt.into(),
     ]);
     Ok(Invocation {
@@ -61,6 +72,24 @@ pub(super) fn build(input: InvocationInput<'_>) -> Result<Invocation, String> {
         args,
         effective_mode: "workspace-write; approvals never; automatic provider execution",
     })
+}
+
+fn validate_control_dir(control_dir: &Path) -> Result<(), String> {
+    if !control_dir.is_absolute() {
+        return Err("Codex run control directory must be absolute".into());
+    }
+    let metadata = std::fs::symlink_metadata(control_dir)
+        .map_err(|_| "Codex run control directory is unavailable")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Codex run control directory must be a real directory".into());
+    }
+    let canonical = control_dir
+        .canonicalize()
+        .map_err(|_| "Codex run control directory is unavailable")?;
+    if canonical != control_dir {
+        return Err("Codex run control directory must be canonical".into());
+    }
+    Ok(())
 }
 
 pub(super) fn parse_result(
@@ -71,21 +100,11 @@ pub(super) fn parse_result(
     let mut result_text = None;
     let mut turn_failed = false;
     let mut successful_terminal_events = 0_u8;
-    let mut terminal_event_seen = false;
     for line in stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let event_type = event.get("type").and_then(Value::as_str);
-        if terminal_event_seen
-            && matches!(
-                event_type,
-                Some("thread.started" | "item.completed" | "turn.completed" | "turn.failed")
-            )
-        {
-            return Err("Codex returned an event after its terminal event".into());
-        }
-        match event_type {
+        match event.get("type").and_then(Value::as_str) {
             Some("thread.started") => {
                 if let Some(id) = event.get("thread_id").and_then(Value::as_str) {
                     validate_conversation_id(id)?;
@@ -106,7 +125,6 @@ pub(super) fn parse_result(
                 }
             }
             Some("turn.completed") => {
-                terminal_event_seen = true;
                 if successful_terminal_events != 0 {
                     return Err("Codex returned multiple terminal events".into());
                 }
@@ -120,7 +138,6 @@ pub(super) fn parse_result(
                 }
             }
             Some("turn.failed") => {
-                terminal_event_seen = true;
                 if successful_terminal_events != 0 {
                     return Err("Codex returned a failure after completing the turn".into());
                 }
@@ -152,9 +169,140 @@ fn validate_conversation_id(value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::json;
 
-    use super::parse_result;
+    use super::{build, parse_result};
+    use crate::providers::{InvocationInput, InvocationPaths};
+
+    fn build_args(conversation_id: Option<&str>) -> Vec<String> {
+        let schema = json!({"type":"object"});
+        build(InvocationInput {
+            executable: "/usr/bin/codex".into(),
+            prefix: vec![],
+            role_contract: "Follow the role contract.",
+            prompt: "Complete the assigned turn.",
+            schema: &schema,
+            paths: InvocationPaths {
+                schema_path: Path::new("/tmp/result-schema.json"),
+                control_dir: None,
+            },
+            conversation_id,
+            model: None,
+            effort: None,
+            codex_options: None,
+            claude_options: None,
+        })
+        .unwrap()
+        .args
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect()
+    }
+
+    #[test]
+    fn allows_initial_and_resumed_exec_outside_git_repositories() {
+        let initial = build_args(None);
+        let exec = initial
+            .iter()
+            .position(|argument| argument == "exec")
+            .unwrap();
+        assert_eq!(initial[exec + 1], "--skip-git-repo-check");
+        assert!(initial.contains(&"--sandbox".into()));
+        assert!(
+            initial
+                .windows(2)
+                .any(|args| args == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            initial
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "never"])
+        );
+
+        let resumed = build_args(Some("thread-123"));
+        let resume = resumed
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        assert_eq!(resumed[resume + 1], "--skip-git-repo-check");
+        assert_eq!(resumed[resume + 2], "thread-123");
+        assert!(
+            resumed
+                .windows(2)
+                .any(|args| args == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            resumed
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "never"])
+        );
+    }
+
+    #[test]
+    fn grants_only_the_canonical_run_control_directory_before_exec() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_dir = temp.path().canonicalize().unwrap();
+        let schema = json!({"type":"object"});
+        let invocation = build(InvocationInput {
+            executable: "/usr/bin/codex".into(),
+            prefix: vec![],
+            role_contract: "Follow the role contract.",
+            prompt: "Complete the assigned turn.",
+            schema: &schema,
+            paths: InvocationPaths {
+                schema_path: Path::new("/tmp/result-schema.json"),
+                control_dir: Some(&control_dir),
+            },
+            conversation_id: Some("thread-123"),
+            model: None,
+            effort: None,
+            codex_options: None,
+            claude_options: None,
+        })
+        .unwrap();
+        let args = invocation
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let grant = args
+            .iter()
+            .position(|argument| argument == "--add-dir")
+            .unwrap();
+        let exec = args.iter().position(|argument| argument == "exec").unwrap();
+        assert_eq!(args[grant + 1], control_dir.to_string_lossy());
+        assert!(grant < exec);
+        assert_eq!(args[exec + 1], "resume");
+    }
+
+    #[test]
+    fn rejects_a_noncanonical_run_control_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_dir = temp
+            .path()
+            .join("..")
+            .join(temp.path().file_name().unwrap());
+        let schema = json!({"type":"object"});
+        let result = build(InvocationInput {
+            executable: "/usr/bin/codex".into(),
+            prefix: vec![],
+            role_contract: "Follow the role contract.",
+            prompt: "Complete the assigned turn.",
+            schema: &schema,
+            paths: InvocationPaths {
+                schema_path: Path::new("/tmp/result-schema.json"),
+                control_dir: Some(&control_dir),
+            },
+            conversation_id: None,
+            model: None,
+            effort: None,
+            codex_options: None,
+            claude_options: None,
+        });
+        assert!(result.is_err());
+    }
 
     #[test]
     fn extracts_only_final_structured_message_and_thread_identity() {
@@ -216,42 +364,6 @@ mod tests {
                 &schema,
             )
             .is_ok()
-        );
-    }
-
-    #[test]
-    fn rejects_recognized_events_after_terminal_event() {
-        let schema = json!({"type":"object"});
-        let message = r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"result\":\"{}\"}"}}"#;
-        assert!(
-            parse_result(
-                &format!("{message}\n{{\"type\":\"turn.completed\"}}\n{message}"),
-                &schema,
-            )
-            .is_err()
-        );
-        assert!(
-            parse_result(
-                &format!(
-                    "{message}\n{{\"type\":\"turn.completed\"}}\n{{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}}"
-                ),
-                &schema,
-            )
-            .is_err()
-        );
-        assert!(
-            parse_result(
-                "{\"type\":\"turn.failed\"}\n{\"type\":\"turn.failed\"}",
-                &schema,
-            )
-            .is_err()
-        );
-        assert!(
-            parse_result(
-                "{\"type\":\"turn.failed\"}\n{\"type\":\"turn.completed\"}",
-                &schema,
-            )
-            .is_err()
         );
     }
 

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
 use crate::config::{AppliedConfig, Config, Profile, SourceFile};
@@ -13,17 +13,48 @@ use crate::domain::ids::{
     AgentRunId, Digest, ProfileId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
 };
 use crate::domain::types::Role;
-use crate::engine::reducer::{Input, TicketRun, WakeTarget, reduce};
+use crate::engine::reducer::{Input, Phase, TicketRun, WakeTarget, reduce};
 use crate::launch::{
     AgentLaunchAuthority, AgentLaunchReceipt, AgentLaunchReservation, AgentStartRequest,
     ObservedProviderStart, ObservedWrapperIdentity, ProviderQualification, RexBlockLifecycle,
-    RexFocusTarget, RexView, RexViewBlock, RexViewCleanupCandidate, RexViewKind, RexViewRecord,
-    authorize_start,
+    RexFocusTarget, RexView, RexViewAnchorRecord, RexViewBlock, RexViewBlockRecord,
+    RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
-pub const SCHEMA_VERSION: i64 = 8;
-mod agent_runtime;
-pub use agent_runtime::{LaunchPreparationOutcome, PendingRoleWakeInput};
+pub mod agent_recovery;
+#[path = "store/dashboard_projection.rs"]
+pub mod dashboard_projection;
+
+#[path = "store/agent_mailbox.rs"]
+pub mod agent_mailbox;
+#[path = "store/agent_results.rs"]
+pub mod agent_results;
+#[path = "store/artifact_registry.rs"]
+pub mod artifact_registry;
+#[path = "store/provider_qualification.rs"]
+pub(crate) mod provider_qualification;
+#[path = "store/rex_view_tables.rs"]
+pub(crate) mod rex_view_tables;
+
+pub const SCHEMA_VERSION: i64 = 15;
+#[path = "store/accepted_plans.rs"]
+pub mod accepted_plans;
+pub mod agent_runtime;
+pub mod host_jobs;
+pub mod human;
+#[path = "store/learning.rs"]
+mod learning_store;
+pub mod merge_work;
+pub use learning_store::{
+    CandidateRegistration, KnowledgePublicationIntent, KnowledgePublicationReceipt,
+    LearningCandidatePackage, LearningCandidateRecord, ProfilePromotionIntent,
+    ProjectSupervisorMaintenance, PublishedKnowledgeRecord, StoredApprovedProfilePackage,
+    StoredTrial, SupervisorCandidateEntry, SupervisorKnowledgeEntry, TrialProgress,
+};
+pub mod operations;
+pub mod provider_qualification_runtime;
+pub mod publication_monitor;
+pub mod scheduler;
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 const MAX_INPUT_BYTES: usize = 1_048_576;
 type DueEffectRow = (
@@ -37,17 +68,6 @@ type DueEffectRow = (
     String,
     Option<u64>,
 );
-type AgentLaunchRunRow = (
-    String,
-    String,
-    u64,
-    String,
-    String,
-    u64,
-    String,
-    Option<String>,
-    Option<String>,
-);
 type ClaimableEffectRow = (
     String,
     String,
@@ -59,6 +79,17 @@ type ClaimableEffectRow = (
     String,
     String,
     Option<u64>,
+);
+type LaunchAgentRunRow = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
 );
 type PendingControlRow = (
     String,
@@ -88,6 +119,43 @@ type LaunchRexViewRow = (
     Option<String>,
 );
 
+type SucceededEffectRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+    u32,
+    i64,
+    Option<String>,
+);
+type RuntimeSnapshotRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    bool,
+    Option<u64>,
+    Option<String>,
+);
+type AcceptedWorkPlanSourceRow = (String, String, String, String, String, u64, Option<u64>);
+type ArtifactSourceAuthorityRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<u64>,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectRecord {
     pub id: ProjectId,
@@ -139,6 +207,44 @@ pub struct ClaimedEffect {
     pub created_at_unix: i64,
 }
 
+/// An immutable effect record re-read from SQLite after it reached `succeeded`.
+/// Its private fields prevent a caller from turning a transient handler observation into proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SucceededEffectReceipt {
+    intent: EffectIntent,
+    attempt_count: u32,
+    created_at_unix: i64,
+    receipt_json: String,
+}
+
+impl SucceededEffectReceipt {
+    pub fn intent(&self) -> &EffectIntent {
+        &self.intent
+    }
+
+    pub fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+
+    pub fn created_at_unix(&self) -> i64 {
+        self.created_at_unix
+    }
+
+    pub fn receipt_json(&self) -> &str {
+        &self.receipt_json
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(request: &crate::effects::EffectRequest, receipt_json: String) -> Self {
+        Self {
+            intent: request.intent.clone(),
+            attempt_count: request.attempt_count,
+            created_at_unix: request.created_at_unix,
+            receipt_json,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectClaimState {
     Pending,
@@ -160,6 +266,7 @@ pub struct OwnerMetadata {
     pub process_start_identity: String,
     pub executable_path: String,
     pub executable_digest: String,
+    pub rex_endpoint: Option<String>,
     pub rex_server_identity: Option<String>,
     pub rex_session_id: Option<String>,
     pub rex_block_id: Option<String>,
@@ -211,6 +318,10 @@ pub struct RuntimeStatus {
     pub owner_pid: Option<u32>,
     pub owner_process_start_identity: Option<String>,
     pub owner_started_at_unix: Option<i64>,
+    pub owner_rex_endpoint: Option<String>,
+    pub owner_rex_server_identity: Option<String>,
+    pub owner_rex_session_id: Option<String>,
+    pub owner_rex_block_id: Option<String>,
     pub projects: Vec<ProjectStatus>,
     pub pending_commands: u64,
     pub rejected_commands: u64,
@@ -273,7 +384,7 @@ pub struct ConfigStore {
 }
 
 pub struct MachineLock {
-    _file: File,
+    _file: Option<File>,
 }
 
 impl MachineLock {
@@ -308,21 +419,102 @@ impl MachineLock {
         }
         restrict_directory_permissions(lock_root)?;
         Ok(Self {
-            _file: acquire_machine_lock(lock_root)?,
+            _file: Some(acquire_machine_lock(lock_root)?),
         })
     }
 }
 
+impl Drop for MachineLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self._file {
+            let _ = FileExt::unlock(file);
+        }
+    }
+}
+
 impl ConfigStore {
+    /// Open an existing controller database for read-only inspection.
+    ///
+    /// This path never creates the state root or database and never runs migrations.
+    pub fn open_readonly(state_root: &Path) -> Result<Self, String> {
+        let root_metadata = fs::symlink_metadata(state_root)
+            .map_err(|error| format!("{}: {error}", state_root.display()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err("state root must be an existing non-symlink directory".into());
+        }
+        let state_root = fs::canonicalize(state_root)
+            .map_err(|error| format!("{}: {error}", state_root.display()))?;
+        let database = state_root.join("state.sqlite3");
+        let metadata = fs::symlink_metadata(&database)
+            .map_err(|error| format!("{}: {error}", database.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("state database must be an existing regular non-symlink file".into());
+        }
+        let connection = Connection::open_with_flags(
+            &database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| format!("{}: {error}", database.display()))?;
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "read-only inspection requires schema {SCHEMA_VERSION}, found {schema_version}; run the foreground controller to initialize or migrate the database"
+            ));
+        }
+        Ok(Self {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        })
+    }
+
     pub fn open(state_root: &Path) -> Result<Self, String> {
         Self::open_with_lock(state_root, MachineLock::acquire(state_root)?)
     }
 
+    /// Open the state database for a bounded external control request while the foreground
+    /// controller owns the machine lock. Mutations remain available only through typed APIs
+    /// which fence on the active owner generation.
+    pub fn open_control(state_root: &Path) -> Result<Self, String> {
+        let database = state_root.join("state.sqlite3");
+        let metadata = fs::symlink_metadata(&database)
+            .map_err(|error| format!("{}: {error}", database.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("control database must be an existing regular file".into());
+        }
+        let connection = Connection::open(&database)
+            .map_err(|error| format!("{}: {error}", database.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| error.to_string())?;
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "control request requires current schema {SCHEMA_VERSION}, found {schema_version}; run the foreground controller first"
+            ));
+        }
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            connection,
+            _machine_lock: MachineLock { _file: None },
+        })
+    }
+
     #[cfg(test)]
-    fn open_test(state_root: &Path) -> Result<Self, String> {
+    pub(crate) fn open_test(state_root: &Path) -> Result<Self, String> {
         let lock_root = state_root.join("machine-registry");
         let machine_lock = MachineLock::acquire_in_registry(state_root, &lock_root)?;
         Self::open_with_lock(state_root, machine_lock)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_connection(&self) -> &Connection {
+        &self.connection
     }
 
     fn open_with_lock(state_root: &Path, machine_lock: MachineLock) -> Result<Self, String> {
@@ -341,6 +533,41 @@ impl ConfigStore {
             return Err(format!(
                 "database schema {existing_version} is newer than supported schema {SCHEMA_VERSION}; refusing to write"
             ));
+        }
+        if existing_version == 7 {
+            let supported_launch_layout: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_launch_authority') WHERE name='operation_recipe_id')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_launch_reservations')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if !supported_launch_layout {
+                return Err(
+                    "database schema 7 uses an unsupported legacy launch layout; preserve this state and use a separate state root".into(),
+                );
+            }
+        }
+        if existing_version == 8 {
+            // Validate the hold layout before WAL/journal PRAGMAs can modify an incompatible
+            // development database that already claims this schema version.
+            Self::validate_human_v8_schema(&connection)?;
+        }
+        if existing_version == 10 {
+            learning_store::validate_v10_schema(&connection)?;
+        }
+        if existing_version == 12 {
+            artifact_registry::validate_v12_schema(&connection)?;
+        }
+        if existing_version == 13 {
+            artifact_registry::validate_v12_schema(&connection)?;
+            artifact_registry::validate_v13_schema(&connection)?;
+        }
+        if matches!(existing_version, 14 | 15) {
+            artifact_registry::validate_v12_schema(&connection)?;
+            artifact_registry::validate_v13_schema(&connection)?;
+            artifact_registry::validate_v14_schema(&connection)?;
         }
         connection
             .execute_batch(
@@ -381,7 +608,54 @@ impl ConfigStore {
             if existing_version > 0 {
                 backup_before_migration(&connection, state_root)?;
             }
-            crate::launch::migrate_v8(&mut connection)?;
+            Self::migrate_human_v8(&mut connection)?;
+        }
+        Self::validate_human_v8_schema(&connection)?;
+        if existing_version < 9 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            scheduler::migrate_v9(&connection)?;
+        }
+        if existing_version < 10 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            learning_store::migrate_v10(&connection)?;
+        }
+        learning_store::validate_v10_schema(&connection)?;
+        if existing_version < 11 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            operations::migrate_v11(&connection)?;
+        }
+        if existing_version < 12 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            artifact_registry::migrate_v12(&connection)?;
+        }
+        artifact_registry::validate_v12_schema(&connection)?;
+        if existing_version < 13 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            artifact_registry::migrate_v13(&connection)?;
+        }
+        artifact_registry::validate_v13_schema(&connection)?;
+        if existing_version < 14 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            artifact_registry::migrate_v14(&connection)?;
+        }
+        artifact_registry::validate_v14_schema(&connection)?;
+        if existing_version < 15 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            agent_results::migrate_v15_merge_observation_deferrals(&mut connection)?;
         }
         Ok(Self {
             connection,
@@ -547,7 +821,7 @@ impl ConfigStore {
         let status = serde_json::to_value(lifecycle).map_err(|error| error.to_string())?;
         let status = status.as_str().ok_or("Rex block lifecycle is invalid")?;
         let changed = tx.execute(
-            "UPDATE rex_view_blocks SET lifecycle=?3,process_absent_confirmed=?4,last_observed_at_unix=?5,retained_until_unix=COALESCE(?6,retained_until_unix) WHERE view_id=?1 AND block_id=?2 AND lifecycle!='closed' AND (lifecycle='unknown' OR ?3='unknown' OR (?3='closed' AND process_absent_confirmed=1) OR lifecycle='active')",
+            "UPDATE rex_view_blocks SET lifecycle=?3,process_absent_confirmed=?4,last_observed_at_unix=?5,terminal_at_unix=CASE WHEN ?3 IN ('completed','failed') THEN COALESCE(terminal_at_unix,?5) WHEN ?3='active' THEN NULL ELSE terminal_at_unix END,retained_until_unix=COALESCE(?6,retained_until_unix) WHERE view_id=?1 AND block_id=?2 AND lifecycle!='closed' AND (lifecycle='unknown' OR ?3='unknown' OR (?3='closed' AND process_absent_confirmed=1) OR lifecycle='active')",
             params![view_id.as_str(),block_id,status,process_absent_confirmed,now_unix()?,retained_until_unix],
         ).map_err(|error|error.to_string())?;
         if changed != 1 {
@@ -676,14 +950,40 @@ impl ConfigStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    pub fn mark_rex_view_terminal(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        now_unix: u64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        tx.execute(
+            "UPDATE rex_views SET terminal_at_unix=NULL WHERE view_id=?1 AND lifecycle='active' AND view_kind='ticket' AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase NOT IN ('done','canceled'))",
+            [view_id.as_str()],
+        ).map_err(|error| error.to_string())?;
+        let changed = tx.execute(
+            "UPDATE rex_views SET terminal_at_unix=?2,updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND view_kind='ticket' AND terminal_at_unix IS NULL AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase IN ('done','canceled')) AND NOT EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase NOT IN ('done','canceled')) AND (EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) OR EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id)) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.ownership='factory' AND NOT EXISTS (SELECT 1 FROM rex_block_archives a WHERE a.view_id=b.view_id AND a.block_id=b.block_id)))) AND NOT EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id AND (a.lifecycle NOT IN ('completed','failed','closed') OR a.process_absent_confirmed=0 OR NOT EXISTS (SELECT 1 FROM rex_view_anchor_archives ar WHERE ar.view_id=a.view_id AND ar.block_id=a.block_id))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=rex_views.view_id AND h.lifecycle IN ('pending','presented','response_queued'))",
+            params![view_id.as_str(), now_unix],
+        ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
     pub fn rex_view_cleanup_candidates(
         &self,
         now_unix: u64,
         retention_seconds: u64,
     ) -> Result<Vec<RexViewCleanupCandidate>, String> {
+        if !self.rex_view_cleanup_schema_ready()? {
+            return Ok(Vec::new());
+        }
         let cutoff = now_unix.saturating_sub(retention_seconds);
         let mut statement=self.connection.prepare(
-            "SELECT v.view_id,v.project_id,v.view_kind,v.ticket_namespace,v.ticket_id,v.view_epoch,v.rex_server_identity,v.rex_session_id,v.rex_window_id,v.updated_at_unix FROM rex_views v WHERE v.lifecycle='active' AND v.pinned=0 AND v.updated_at_unix<=?1 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2))) ORDER BY v.updated_at_unix",
+            "SELECT v.view_id,v.project_id,v.view_kind,v.ticket_namespace,v.ticket_id,v.view_epoch,v.rex_server_identity,v.rex_session_id,v.rex_window_id,CASE WHEN v.view_kind='ticket' THEN v.terminal_at_unix ELSE v.updated_at_unix END FROM rex_views v WHERE v.lifecycle='active' AND v.pinned=0 AND ((v.view_kind='ticket' AND v.terminal_at_unix IS NOT NULL AND v.terminal_at_unix<=?1 AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id AND t.internal_phase IN ('done','canceled')) AND NOT EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=v.project_id AND t.namespace=v.ticket_namespace AND t.ticket_id=v.ticket_id AND t.internal_phase NOT IN ('done','canceled'))) OR (v.view_kind='supervisor' AND v.updated_at_unix<=?1)) AND (EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id) OR EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=v.view_id)) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=v.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2) OR (b.ownership='factory' AND NOT EXISTS (SELECT 1 FROM rex_block_archives a WHERE a.view_id=b.view_id AND a.block_id=b.block_id)))) AND NOT EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=v.view_id AND (a.lifecycle NOT IN ('completed','failed','closed') OR a.process_absent_confirmed=0 OR NOT EXISTS (SELECT 1 FROM rex_view_anchor_archives ar WHERE ar.view_id=a.view_id AND ar.block_id=a.block_id))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=v.view_id AND h.lifecycle IN ('pending','presented','response_queued')) ORDER BY 10",
         ).map_err(|error|error.to_string())?;
         let rows = statement
             .query_map(params![cutoff, now_unix], |row| {
@@ -740,57 +1040,40 @@ impl ConfigStore {
         if candidate.close_after_unix > now_unix {
             return Err("Rex view retention period has not elapsed".into());
         }
+        if !self.rex_view_cleanup_schema_ready()? {
+            return Err("human review hold state is unavailable; Rex view cannot be closed".into());
+        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let persisted: Option<RexViewIdentityRow> = tx
-            .query_row(
-                "SELECT project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id FROM rex_views WHERE view_id=?1",
-                [candidate.view.view_id.as_str()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let expected_kind = serde_json::to_value(candidate.view.kind)
-            .map_err(|error| error.to_string())?
-            .as_str()
-            .ok_or("Rex view kind did not serialize as a string")?
-            .to_owned();
-        let expected = (
-            candidate.view.project_id.as_str().to_owned(),
-            expected_kind,
-            candidate.view.ticket_namespace.clone(),
-            candidate.view.ticket_id.clone(),
-            candidate.view.view_epoch,
-            candidate.view.rex_server_identity.clone(),
-            candidate.view.rex_session_id.clone(),
-            candidate.view.rex_window_id.clone(),
-        );
-        if persisted.as_ref() != Some(&expected) {
-            return Err("cleanup candidate does not match persisted Rex view identity".into());
-        }
         let cutoff = now_unix.saturating_sub(retention_seconds);
         let changed=tx.execute(
-            "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND updated_at_unix<=?3 AND EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2)))",
+            "UPDATE rex_views SET lifecycle='close_pending',updated_at_unix=?2 WHERE view_id=?1 AND lifecycle='active' AND pinned=0 AND ((view_kind='ticket' AND terminal_at_unix IS NOT NULL AND terminal_at_unix<=?3 AND EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase IN ('done','canceled')) AND NOT EXISTS (SELECT 1 FROM ticket_runs t WHERE t.project_id=rex_views.project_id AND t.namespace=rex_views.ticket_namespace AND t.ticket_id=rex_views.ticket_id AND t.internal_phase NOT IN ('done','canceled'))) OR (view_kind='supervisor' AND updated_at_unix<=?3)) AND (EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id) OR EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id)) AND NOT EXISTS (SELECT 1 FROM rex_view_blocks b WHERE b.view_id=rex_views.view_id AND (b.ownership='user' OR b.lifecycle NOT IN ('completed','failed','closed') OR b.process_absent_confirmed=0 OR (b.retained_until_unix IS NOT NULL AND b.retained_until_unix>?2) OR (b.ownership='factory' AND NOT EXISTS (SELECT 1 FROM rex_block_archives a WHERE a.view_id=b.view_id AND a.block_id=b.block_id)))) AND NOT EXISTS (SELECT 1 FROM rex_view_anchors a WHERE a.view_id=rex_views.view_id AND (a.lifecycle NOT IN ('completed','failed','closed') OR a.process_absent_confirmed=0 OR NOT EXISTS (SELECT 1 FROM rex_view_anchor_archives ar WHERE ar.view_id=a.view_id AND ar.block_id=a.block_id))) AND NOT EXISTS (SELECT 1 FROM human_requests h WHERE h.rex_view_id=rex_views.view_id AND h.lifecycle IN ('pending','presented','response_queued'))",
             params![candidate.view.view_id.as_str(),now_unix,cutoff],
         ).map_err(|error|error.to_string())?;
         if changed != 1 {
             return Err("Rex view is no longer safe to close".into());
         }
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    fn rex_view_cleanup_schema_ready(&self) -> Result<bool, String> {
+        let table_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='human_requests')",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !table_exists {
+            return Ok(false);
+        }
+        let has_view_binding: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('human_requests') WHERE name='rex_view_id')",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        Ok(has_view_binding)
     }
 
     pub fn finish_rex_view_close(
@@ -812,8 +1095,10 @@ impl ConfigStore {
         }
         if observed_closed {
             tx.execute("UPDATE rex_view_blocks SET lifecycle='closed',process_absent_confirmed=1,last_observed_at_unix=?2 WHERE view_id=?1",params![view_id.as_str(),now]).map_err(|error|error.to_string())?;
+            tx.execute("UPDATE rex_view_anchors SET lifecycle='closed',process_absent_confirmed=1 WHERE view_id=?1",[view_id.as_str()]).map_err(|error|error.to_string())?;
         } else {
             tx.execute("UPDATE rex_view_blocks SET lifecycle='unknown',process_absent_confirmed=0,last_observed_at_unix=?2 WHERE view_id=?1 AND lifecycle!='closed'",params![view_id.as_str(),now]).map_err(|error|error.to_string())?;
+            tx.execute("UPDATE rex_view_anchors SET lifecycle='unknown',process_absent_confirmed=0 WHERE view_id=?1 AND lifecycle!='closed'",[view_id.as_str()]).map_err(|error|error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())
     }
@@ -845,11 +1130,11 @@ impl ConfigStore {
                 .agent_run_id
                 .as_ref()
                 .ok_or("factory block requires AgentRun")?;
-            let (view, role): (String, String) = tx
+            let (view, role, block_id): (String, String, String) = tx
                 .query_row(
-                    "SELECT rex_view_id,role FROM agent_launch_authority WHERE agent_run_id=?1",
+                    "SELECT rex_view_id,role,rex_block_id FROM agent_launch_authority WHERE agent_run_id=?1",
                     [run_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(|error| error.to_string())?
@@ -859,7 +1144,7 @@ impl ConfigStore {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
-            if view != block.view_id.as_str() || role != role_raw {
+            if view != block.view_id.as_str() || role != role_raw || block_id != block.block_id {
                 return Err("Rex block identity does not match launch authority".into());
             }
         }
@@ -871,6 +1156,13 @@ impl ConfigStore {
                 .and_then(|value| value.as_str().map(str::to_owned))
         });
         let inserted=tx.execute("INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix,retained_until_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9) ON CONFLICT(view_id,block_id) DO NOTHING",params![block.view_id.as_str(),block.block_id,block.agent_run_id.as_ref().map(AgentRunId::as_str),role.flatten(),ownership.as_str().unwrap_or_default(),lifecycle.as_str().unwrap_or_default(),block.process_absent_confirmed,now_unix()?,block.retained_until_unix]).map_err(|error|error.to_string())?==1;
+        if inserted && block.ownership == crate::launch::RexBlockOwnership::Factory {
+            tx.execute(
+                "UPDATE rex_views SET updated_at_unix=?2,terminal_at_unix=NULL WHERE view_id=?1 AND lifecycle='active'",
+                params![block.view_id.as_str(), now_unix()?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
         let requested_role = block.role.map(|role| {
             serde_json::to_value(role)
                 .ok()
@@ -889,6 +1181,304 @@ impl ConfigStore {
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(inserted)
+    }
+
+    pub fn rex_view_blocks(&self, view_id: &Digest) -> Result<Vec<RexViewBlockRecord>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT b.block_id,b.agent_run_id,b.role,b.ownership,b.lifecycle,b.process_absent_confirmed,b.retained_until_unix,b.terminal_at_unix,a.content_digest FROM rex_view_blocks b LEFT JOIN rex_block_archives a USING(view_id,block_id) WHERE b.view_id=?1 ORDER BY b.terminal_at_unix DESC,b.created_at_unix DESC",
+        ).map_err(|error| error.to_string())?;
+        statement
+            .query_map([view_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<u64>>(6)?,
+                    row.get::<_, Option<u64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let (
+                    block_id,
+                    run_id,
+                    role,
+                    ownership,
+                    lifecycle,
+                    absent,
+                    retained,
+                    terminal,
+                    digest,
+                ) = row.map_err(|error| error.to_string())?;
+                let block = RexViewBlock {
+                    view_id: view_id.clone(),
+                    block_id,
+                    agent_run_id: run_id.map(AgentRunId::parse).transpose()?,
+                    role: role
+                        .map(|value| {
+                            serde_json::from_value(serde_json::Value::String(value))
+                                .map_err(|_| "stored Rex block role is invalid".to_owned())
+                        })
+                        .transpose()?,
+                    ownership: serde_json::from_value(serde_json::Value::String(ownership))
+                        .map_err(|_| "stored Rex block ownership is invalid".to_owned())?,
+                    lifecycle: serde_json::from_value(serde_json::Value::String(lifecycle))
+                        .map_err(|_| "stored Rex block lifecycle is invalid".to_owned())?,
+                    process_absent_confirmed: absent,
+                    retained_until_unix: retained,
+                };
+                block.validate()?;
+                Ok(RexViewBlockRecord {
+                    block,
+                    terminal_at_unix: terminal,
+                    archive_digest: digest.map(Digest::parse).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn archive_rex_view_block(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+        output: &str,
+    ) -> Result<Digest, String> {
+        if output.len() > 1_048_576 {
+            return Err("Rex block archive exceeds the 1 MiB limit".into());
+        }
+        let digest = Digest::parse(format!("{:x}", Sha256::digest(output.as_bytes())))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let block: Option<(String, String, bool)> = tx.query_row(
+            "SELECT ownership,lifecycle,process_absent_confirmed FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(), block_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if block.as_ref().is_none_or(|(ownership, lifecycle, absent)| {
+            ownership != "factory"
+                || !matches!(lifecycle.as_str(), "completed" | "failed")
+                || !absent
+        }) {
+            return Err("only a confirmed terminal factory block can be archived".into());
+        }
+        tx.execute(
+            "INSERT INTO rex_block_archives(view_id,block_id,content_digest,output,created_at_unix) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(view_id,block_id) DO NOTHING",
+            params![view_id.as_str(),block_id,digest.as_str(),output,now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        let stored: (String,String) = tx.query_row(
+            "SELECT content_digest,output FROM rex_block_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored != (digest.as_str().to_owned(), output.to_owned()) {
+            return Err("Rex block archive already exists with different content".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(digest)
+    }
+
+    pub fn read_rex_view_block_archive(
+        &self,
+        view_id: &Digest,
+        block_id: &str,
+    ) -> Result<Option<String>, String> {
+        let stored: Option<(String,String)> = self.connection.query_row(
+            "SELECT content_digest,output FROM rex_block_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((digest, output)) = stored else {
+            return Ok(None);
+        };
+        if format!("{:x}", Sha256::digest(output.as_bytes())) != digest {
+            return Err("stored Rex block archive digest does not match its output".into());
+        }
+        Ok(Some(output))
+    }
+
+    pub fn register_rex_view_anchor(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+        run_id: &str,
+        owned_label: &str,
+        command_digest: &Digest,
+    ) -> Result<bool, String> {
+        if block_id.trim().is_empty()
+            || run_id.trim().is_empty()
+            || owned_label.trim().is_empty()
+            || [block_id, run_id, owned_label]
+                .iter()
+                .any(|value| value.chars().any(char::is_control))
+        {
+            return Err("Rex view anchor identity is malformed".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let active: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rex_views WHERE view_id=?1 AND lifecycle='active')",
+                [view_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !active {
+            return Err("Rex view anchor requires an active view".into());
+        }
+        let inserted = tx.execute(
+            "INSERT INTO rex_view_anchors(view_id,block_id,run_id,owned_label,command_digest,lifecycle,process_absent_confirmed,created_at_unix) VALUES (?1,?2,?3,?4,?5,'unknown',0,?6) ON CONFLICT(view_id) DO NOTHING",
+            params![view_id.as_str(),block_id,run_id,owned_label,command_digest.as_str(),now_unix()?],
+        ).map_err(|error| error.to_string())? == 1;
+        let stored: (String,String,String,String) = tx.query_row(
+            "SELECT block_id,run_id,owned_label,command_digest FROM rex_view_anchors WHERE view_id=?1",
+            [view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored
+            != (
+                block_id.to_owned(),
+                run_id.to_owned(),
+                owned_label.to_owned(),
+                command_digest.as_str().to_owned(),
+            )
+        {
+            return Err("Rex view already has a different recorded anchor".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
+    }
+
+    pub fn rex_view_anchor(&self, view_id: &Digest) -> Result<Option<RexViewAnchorRecord>, String> {
+        let row: Option<RuntimeSnapshotRow> = self.connection.query_row(
+            "SELECT a.block_id,a.run_id,a.owned_label,a.command_digest,a.lifecycle,a.process_absent_confirmed,a.terminal_at_unix,r.content_digest FROM rex_view_anchors a LEFT JOIN rex_view_anchor_archives r USING(view_id,block_id) WHERE a.view_id=?1",
+            [view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        row.map(
+            |(
+                block_id,
+                run_id,
+                owned_label,
+                command_digest,
+                lifecycle,
+                absent,
+                terminal,
+                archive_digest,
+            )| {
+                Ok(RexViewAnchorRecord {
+                    view_id: view_id.clone(),
+                    block_id,
+                    run_id,
+                    owned_label,
+                    command_digest: Digest::parse(command_digest)?,
+                    lifecycle: serde_json::from_value(serde_json::Value::String(lifecycle))
+                        .map_err(|_| "stored Rex anchor lifecycle is invalid".to_owned())?,
+                    process_absent_confirmed: absent,
+                    terminal_at_unix: terminal,
+                    archive_digest: archive_digest.map(Digest::parse).transpose()?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn observe_rex_view_anchor(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        lifecycle: RexBlockLifecycle,
+        process_absent_confirmed: bool,
+    ) -> Result<(), String> {
+        if lifecycle == RexBlockLifecycle::Unknown && process_absent_confirmed
+            || lifecycle == RexBlockLifecycle::Active && process_absent_confirmed
+        {
+            return Err("Rex anchor process absence claim is invalid".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let lifecycle = serde_json::to_value(lifecycle).map_err(|error| error.to_string())?;
+        let lifecycle = lifecycle
+            .as_str()
+            .ok_or("Rex anchor lifecycle is invalid")?;
+        let now = now_unix()?;
+        let changed = tx.execute(
+            "UPDATE rex_view_anchors SET lifecycle=?2,process_absent_confirmed=?3,terminal_at_unix=CASE WHEN ?2 IN ('completed','failed') THEN COALESCE(terminal_at_unix,?4) WHEN ?2='active' THEN NULL ELSE terminal_at_unix END WHERE view_id=?1 AND lifecycle!='closed' AND (lifecycle IN ('active','unknown') OR ?2='unknown' OR (?2='closed' AND process_absent_confirmed=1))",
+            params![view_id.as_str(),lifecycle,process_absent_confirmed,now],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(
+                "Rex anchor not found or observation would regress a terminal state".into(),
+            );
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn archive_rex_view_anchor(
+        &mut self,
+        owner_generation: u64,
+        view_id: &Digest,
+        block_id: &str,
+        output: &str,
+    ) -> Result<Digest, String> {
+        if output.len() > 1_048_576 {
+            return Err("Rex block archive exceeds the 1 MiB limit".into());
+        }
+        let digest = Digest::parse(format!("{:x}", Sha256::digest(output.as_bytes())))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let state: Option<(String,bool)> = tx.query_row(
+            "SELECT lifecycle,process_absent_confirmed FROM rex_view_anchors WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if state.as_ref().is_none_or(|(lifecycle, absent)| {
+            !matches!(lifecycle.as_str(), "completed" | "failed") || !absent
+        }) {
+            return Err("only a confirmed terminal Rex anchor can be archived".into());
+        }
+        tx.execute(
+            "INSERT INTO rex_view_anchor_archives(view_id,block_id,content_digest,output,created_at_unix) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(view_id,block_id) DO NOTHING",
+            params![view_id.as_str(),block_id,digest.as_str(),output,now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        let stored: (String,String) = tx.query_row(
+            "SELECT content_digest,output FROM rex_view_anchor_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).map_err(|error| error.to_string())?;
+        if stored != (digest.as_str().to_owned(), output.to_owned()) {
+            return Err("Rex anchor archive already exists with different content".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(digest)
+    }
+
+    pub fn read_rex_view_anchor_archive(
+        &self,
+        view_id: &Digest,
+        block_id: &str,
+    ) -> Result<Option<String>, String> {
+        let stored: Option<(String,String)> = self.connection.query_row(
+            "SELECT content_digest,output FROM rex_view_anchor_archives WHERE view_id=?1 AND block_id=?2",
+            params![view_id.as_str(),block_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((digest, output)) = stored else {
+            return Ok(None);
+        };
+        if format!("{:x}", Sha256::digest(output.as_bytes())) != digest {
+            return Err("stored Rex anchor archive digest does not match its output".into());
+        }
+        Ok(Some(output))
     }
 
     /// Persist immutable provider qualification evidence. A caller-supplied digest is never
@@ -960,69 +1550,24 @@ impl ConfigStore {
         authority: &AgentLaunchAuthority,
     ) -> Result<bool, String> {
         authority.validate()?;
-        let authority_json = authority.storage_json()?;
+        let authority_json = serde_json::to_string(authority).map_err(|error| error.to_string())?;
         let authority_digest = authority.digest()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let prior_authority: Option<(String, String)> = tx
-            .query_row(
-                "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1",
-                [authority.agent_run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let exact_replay = match prior_authority {
-            Some((stored_json, stored_digest)) => {
-                if stored_json != authority_json || stored_digest != authority_digest.as_str() {
-                    return Err(
-                        "AgentRun already has a different immutable launch authority".into(),
-                    );
-                }
-                true
-            }
-            None => false,
-        };
-        if !exact_replay {
-            authority.validate_new_launch_topology()?;
-        }
-        let reservation_row: Option<(String, String)> = tx
-            .query_row(
-                "SELECT reservation_json,reservation_digest FROM agent_launch_reservations WHERE agent_run_id=?1",
-                [authority.agent_run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some((reservation_json, reservation_digest)) = reservation_row {
-            let reservation: AgentLaunchReservation =
-                crate::protocol::parse_unique(reservation_json.as_bytes())
-                    .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
-            reservation.validate()?;
-            if reservation.digest()?.as_str() != reservation_digest
-                || !agent_runtime::authority_matches_reservation(authority, &reservation)
-            {
-                return Err("launch authority does not match its immutable reservation".into());
-            }
-        }
         if authority.controller_generation != owner_generation {
             return Err(
                 "new launch authority must belong to the active controller generation".into(),
             );
-        }
-        if exact_replay {
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok(false);
         }
         let expected_role = serde_json::to_value(authority.role)
             .map_err(|error| error.to_string())?
             .as_str()
             .ok_or("Agent role did not serialize as a string")?
             .to_owned();
-        let run: Option<AgentLaunchRunRow> = tx.query_row(
+        let run: Option<LaunchAgentRunRow> = tx.query_row(
             "SELECT project_id,state,controller_generation,launch_operation_id,config_digest,config_revision,config_source,role_session_id,role FROM agent_runs WHERE agent_run_id=?1",
             [authority.agent_run_id.as_str()],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
@@ -1050,34 +1595,11 @@ impl ConfigStore {
             || role_session_id.as_deref() != Some(authority.role_session_id.as_str())
             || role.as_deref() != Some(expected_role.as_str())
         {
-            return Err("AgentRun does not match the proposed launch authority".into());
+            return Err(
+                "AgentRun identity or reserved role does not match the proposed launch authority"
+                    .into(),
+            );
         }
-        let ticket_scope = if authority.role == Role::Supervisor {
-            None
-        } else {
-            let ticket_run_id = authority
-                .ticket_run_id
-                .as_ref()
-                .ok_or("ticket AgentRun is missing TicketRun ID")?;
-            let ticket: Option<(String, String, String, u64)> = tx
-                .query_row(
-                    "SELECT project_id,namespace,ticket_id,revision FROM ticket_runs WHERE ticket_run_id=?1",
-                    [ticket_run_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            let Some((ticket_project, namespace, ticket_id, revision)) = ticket else {
-                return Err("launch TicketRun does not exist".into());
-            };
-            if ticket_project != authority.project_id.as_str() {
-                return Err("launch TicketRun belongs to another Project".into());
-            }
-            if authority.ticket_revision != Some(Revision(revision)) {
-                return Err("TicketRun revision does not match launch authority".into());
-            }
-            Some((namespace, ticket_id))
-        };
         let snapshot: Option<(String, String)> = tx.query_row(
             "SELECT snapshots.digest,snapshots.effective_config_json FROM config_current current JOIN config_snapshots snapshots USING(source_identity,revision) WHERE current.source_identity=?1 AND current.revision=?2",
             params![config_source,authority.config_revision.0],
@@ -1096,46 +1618,32 @@ impl ConfigStore {
         let effective: EffectiveConfig =
             crate::protocol::parse_unique(effective_json.as_bytes())
                 .map_err(|error| format!("applied config snapshot is invalid: {error}"))?;
-        if let Some(project_config) = effective.config.projects.get(&authority.project_id) {
-            let project_roles = crate::config::effective_project_roles(
-                &authority.project_id,
-                &effective.config.projects,
-            )?;
-            let expected_profile = if let Some(recipe_id) = &authority.operation_recipe_id {
-                if !project_config
-                    .operation_matches
-                    .iter()
-                    .any(|operation| &operation.recipe == recipe_id)
-                {
-                    return Err("operation recipe is not selected by this Project".into());
-                }
-                effective
-                    .config
-                    .operation_recipes
-                    .get(recipe_id)
-                    .ok_or("launch operation recipe is missing from applied configuration")?
-                    .roles
-                    .get(&authority.role)
-                    .or_else(|| project_roles.get(&authority.role))
-            } else {
-                project_roles.get(&authority.role)
-            }
-            .ok_or("launch role has no effective profile")?;
-            if expected_profile != &authority.profile_id {
-                return Err(
-                    "launch profile does not match the Project's effective role profile".into(),
-                );
-            }
-        } else if authority.operation_recipe_id.is_some() {
-            return Err("launch Project is missing from the applied config snapshot".into());
-        }
         let profile = effective
             .profiles
             .get(&authority.profile_id)
             .ok_or("launch profile is missing from the applied config snapshot")?;
-        let profile_json = canonical_json(profile)?;
-        let profile_digest =
-            Digest::parse(format!("{:x}", Sha256::digest(profile_json.as_bytes())))?;
+        let project_roles = crate::config::effective_project_roles(
+            &authority.project_id,
+            &effective.config.projects,
+        )?;
+        let expected_profile = if let Some(recipe_id) = &authority.operation_recipe_id {
+            let recipe = effective
+                .config
+                .operation_recipes
+                .get(recipe_id)
+                .ok_or("launch operation recipe is missing from the applied config snapshot")?;
+            recipe
+                .roles
+                .get(&authority.role)
+                .or_else(|| project_roles.get(&authority.role))
+        } else {
+            project_roles.get(&authority.role)
+        }
+        .ok_or("launch role has no effective profile in project or operation recipe")?;
+        if expected_profile != &authority.profile_id {
+            return Err("launch profile does not match the effective project role profile".into());
+        }
+        let profile_digest = agent_profile_digest(profile)?;
         if profile_digest != authority.profile_digest {
             return Err("launch profile digest does not match the applied config snapshot".into());
         }
@@ -1154,6 +1662,24 @@ impl ConfigStore {
             "SELECT project_id,rex_server_identity,rex_session_id,rex_window_id,view_kind,ticket_namespace,ticket_id FROM rex_views WHERE view_id=?1 AND lifecycle='active'",
             [authority.rex_view_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
         ).optional().map_err(|error| error.to_string())?;
+        let ticket_scope = if authority.role == Role::Supervisor {
+            None
+        } else {
+            Some(
+                tx.query_row(
+                    "SELECT project_id,namespace,ticket_id,revision FROM ticket_runs WHERE ticket_run_id=?1",
+                    [authority
+                        .ticket_run_id
+                        .as_ref()
+                        .ok_or("ticket AgentRun is missing TicketRun ID")?
+                        .as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u64>(3)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or("launch TicketRun does not exist")?,
+            )
+        };
         let view_ticket_scope_matches =
             view.as_ref()
                 .is_some_and(|(_, _, _, _, kind, namespace, ticket)| {
@@ -1162,8 +1688,19 @@ impl ConfigStore {
                     } else {
                         kind == "ticket"
                             && ticket_scope.as_ref().is_some_and(
-                                |(expected_namespace, expected_ticket)| {
-                                    namespace.as_deref() == Some(expected_namespace.as_str())
+                                |(
+                                    ticket_project,
+                                    expected_namespace,
+                                    expected_ticket,
+                                    ticket_revision,
+                                )| {
+                                    ticket_project == authority.project_id.as_str()
+                                        && *ticket_revision
+                                            == authority
+                                                .ticket_revision
+                                                .map(|revision| revision.0)
+                                                .unwrap_or_default()
+                                        && namespace.as_deref() == Some(expected_namespace.as_str())
                                         && ticket.as_deref() == Some(expected_ticket.as_str())
                                 },
                             )
@@ -1201,10 +1738,9 @@ impl ConfigStore {
             return Err("qualification receipt does not match the immutable launch profile".into());
         }
         qualification.validate_for_unattended_launch()?;
-        agent_runtime::validate_qualification_profile(&qualification, profile)?;
         let authority_inserted = tx.execute(
-            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,operation_recipe_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,wake_snapshot_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36) ON CONFLICT(agent_run_id) DO NOTHING",
-            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.operation_recipe_id,authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.wake_snapshot_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,operation_recipe_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35) ON CONFLICT(agent_run_id) DO NOTHING",
+            params![authority.agent_run_id.as_str(),authority.project_id.as_str(),serde_json::to_value(authority.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(),authority.role_session_id,authority.parent_run_id.as_ref().map(AgentRunId::as_str),authority.parent_role.map(|role| serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_default()),authority.ticket_run_id.as_ref().map(TicketRunId::as_str),authority.ticket_revision.map(|revision| revision.0),authority.config_revision.0,authority.config_digest.as_str(),authority.attempt,authority.run_epoch,authority.controller_generation,authority.operation_id.as_str(),authority.operation_recipe_id,authority.rex_view_id.as_str(),authority.descriptor_digest.as_str(),authority.runtime_binary_digest.as_str(),authority.descriptor_path.display().to_string(),authority.environment_snapshot_id.as_str(),authority.profile_id.as_str(),authority.profile_digest.as_str(),authority.instruction_digest.as_str(),authority.result_schema_digest.as_str(),authority.qualification_receipt_digest.as_str(),authority.rex_server_identity,authority.rex_session_id,authority.rex_window_id,authority.rex_block_id,authority.workspace_path.display().to_string(),authority.control_dir.display().to_string(),authority.mailbox_capability_digest.as_str(),authority_json,authority_digest.as_str(),now_unix()?],
         ).map_err(|error| error.to_string())?;
         let existing: Option<(String,String)> = tx
             .query_row(
@@ -1265,17 +1801,11 @@ impl ConfigStore {
             limits,
         )?;
         let canonical_directory = capability.directory().display().to_string();
-        let descriptor = crate::mailbox::MailboxDescriptor {
-            schema_version: 1,
-            run_id: agent_run_id.to_owned(),
+        let capability_digest = crate::mailbox::MailboxDescriptor::capability_digest(
+            agent_run_id,
             expires_at_unix,
-            max_request_bytes: limits.max_request_bytes,
-            max_pending_requests: limits.max_pending_requests,
-        };
-        let capability_digest = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?)
-        );
+            limits,
+        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1345,11 +1875,19 @@ impl ConfigStore {
             .map_err(|error| error.to_string())
     }
 
-    pub fn registered_agent_mailboxes(&self) -> Result<Vec<AgentMailboxRegistration>, String> {
-        let mut statement = self.connection.prepare(
+    pub fn registered_agent_mailboxes(
+        &mut self,
+        owner_generation: u64,
+    ) -> Result<Vec<AgentMailboxRegistration>, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let mut statement = tx.prepare(
             "SELECT agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests FROM agent_mailboxes ORDER BY agent_run_id",
         ).map_err(|error| error.to_string())?;
-        statement
+        let registrations = statement
             .query_map([], |row| {
                 Ok(AgentMailboxRegistration {
                     agent_run_id: row.get(0)?,
@@ -1362,7 +1900,10 @@ impl ConfigStore {
             })
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(registrations)
     }
 
     pub fn record_input(
@@ -1419,6 +1960,26 @@ impl ConfigStore {
         let inserted = insert_effect(&tx, effect, now_unix()?)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted)
+    }
+
+    pub fn effect_by_logical_key(&self, logical_key: &str) -> Result<Option<EffectIntent>, String> {
+        self.connection.query_row(
+            "SELECT project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision FROM effects WHERE logical_key=?1",
+            [logical_key],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,Option<u64>>(8)?)),
+        ).optional().map_err(|error| error.to_string())?.map(|(project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision)| {
+            Ok(EffectIntent {
+                project_id: ProjectId::parse(project_id)?,
+                subject_type,
+                subject_id,
+                operation_id,
+                logical_key,
+                kind,
+                request_json,
+                request_digest,
+                expected_revision,
+            })
+        }).transpose()
     }
 
     pub fn claim_next_due_effect(
@@ -1545,11 +2106,15 @@ impl ConfigStore {
         operation_id: &str,
         owner_generation: u64,
         receipt: Option<&str>,
+        last_error: Option<&str>,
         next_reconciliation_at_unix: i64,
     ) -> Result<(), String> {
+        if last_error.is_some_and(|diagnostic| diagnostic.len() > 512) {
+            return Err("effect error diagnostic exceeds 512 bytes".into());
+        }
         let changed = self.connection.execute(
-            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
-            params![operation_id, owner_generation, receipt, next_reconciliation_at_unix],
+            "UPDATE effects SET status='uncertain',owner_generation=NULL,next_attempt_at_unix=?4,receipt_json=COALESCE(?3,receipt_json),last_error=COALESCE(?5,last_error) WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)",
+            params![operation_id, owner_generation, receipt, next_reconciliation_at_unix, last_error],
         ).map_err(|error| error.to_string())?;
         if changed != 1 {
             return Err("effect reconciliation claim is stale or no longer active".into());
@@ -1623,11 +2188,335 @@ impl ConfigStore {
             EffectOutcome::Failed => "failed",
             EffectOutcome::Unknown => "uncertain",
         };
-        let changed = self.connection.execute("UPDATE effects SET status=?3, receipt_json=?4, owner_generation=NULL WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed' AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?2 AND stopped_at_unix IS NULL)", params![operation_id, owner_generation, status, receipt]).map_err(|e| e.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let effect = tx
+            .query_row(
+                "SELECT project_id,subject_type,subject_id,operation_id,logical_key,kind,request_json,request_digest,expected_revision FROM effects WHERE operation_id=?1 AND status='claimed' AND owner_generation=?2",
+                params![operation_id, owner_generation],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<u64>>(8)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(
+                |(
+                    project_id,
+                    subject_type,
+                    subject_id,
+                    operation_id,
+                    logical_key,
+                    kind,
+                    request_json,
+                    request_digest,
+                    expected_revision,
+                )| -> Result<EffectIntent, String> {
+                    Ok(EffectIntent {
+                        project_id: ProjectId::parse(project_id)?,
+                        subject_type,
+                        subject_id,
+                        operation_id,
+                        logical_key,
+                        kind,
+                        request_json,
+                        request_digest,
+                        expected_revision,
+                    })
+                },
+            )
+            .transpose()?;
+        let Some(effect) = effect else {
+            return Err("effect claim is stale or no longer active".into());
+        };
+
+        if matches!(outcome, EffectOutcome::Succeeded) && effect.kind == "publish_ticket_status" {
+            let request: crate::engine::ticket_effects::PublishTicketStatus =
+                crate::protocol::parse_unique(effect.request_json.as_bytes())?;
+            if canonical_json(&request)? != effect.request_json
+                || content_digest(&effect.request_json) != effect.request_digest
+                || effect.project_id != request.project_id
+                || effect.subject_type != "ticket_run"
+                || effect.subject_id != request.ticket_run_id.as_str()
+                || effect.expected_revision != Some(request.ticket_run_revision)
+            {
+                return Err(
+                    "ticket status effect request does not match its durable identity".into(),
+                );
+            }
+            let receipt = receipt.ok_or_else(|| {
+                "successful ticket status effect requires its adapter receipt".to_owned()
+            })?;
+            let result: crate::adapters::tickets::ScopedTicketResult =
+                crate::protocol::parse_unique(receipt.as_bytes())?;
+            crate::engine::ticket_effect_handlers::validate_ticket_status_receipt(
+                &request, &result,
+            )?;
+            Self::validate_ticket_status_publication_on_connection(
+                &tx,
+                owner_generation,
+                &request,
+            )?;
+            let external_revision = result
+                .ticket
+                .revision
+                .as_deref()
+                .ok_or("ticket status adapter receipt has no external revision")?;
+            let changed = tx
+                .execute(
+                    "UPDATE ticket_runs SET external_revision=?1 WHERE project_id=?2 AND ticket_run_id=?3 AND revision=?4 AND external_revision IS ?5",
+                    params![external_revision, request.project_id.as_str(), request.ticket_run_id.as_str(), request.ticket_run_revision, request.expected_external_revision],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "TicketRun external revision changed before status receipt could be recorded"
+                        .into(),
+                );
+            }
+        }
+
+        let changed = tx.execute(
+            "UPDATE effects SET status=?3, receipt_json=?4, owner_generation=NULL WHERE operation_id=?1 AND owner_generation=?2 AND status='claimed'",
+            params![operation_id, owner_generation, status, receipt],
+        ).map_err(|error| error.to_string())?;
         if changed != 1 {
             return Err("effect claim is stale or no longer active".into());
         }
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// Read handler-owned progress only while this controller still owns the
+    /// exact claimed effect request. Progress survives retries and restarts.
+    pub fn load_effect_progress(
+        &self,
+        operation_id: &str,
+        owner_generation: u64,
+        request_digest: &str,
+    ) -> Result<Option<String>, String> {
+        Digest::parse(request_digest.to_owned())?;
+        self.connection
+            .query_row(
+                "SELECT p.progress_json FROM effect_progress p JOIN effects e ON e.operation_id=p.operation_id WHERE p.operation_id=?1 AND p.request_digest=?2 AND e.request_digest=?2 AND e.status='claimed' AND e.owner_generation=?3 AND EXISTS (SELECT 1 FROM controller_owners WHERE singleton=1 AND generation=?3 AND stopped_at_unix IS NULL)",
+                params![operation_id, request_digest, owner_generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persist a bounded canonical JSON checkpoint for the currently claimed
+    /// effect. The external operation must be performed outside this transaction.
+    pub fn save_effect_progress(
+        &mut self,
+        operation_id: &str,
+        owner_generation: u64,
+        request_digest: &str,
+        progress_json: &str,
+        now_unix: i64,
+    ) -> Result<(), String> {
+        const MAX_PROGRESS_BYTES: usize = 262_144;
+        Digest::parse(request_digest.to_owned())?;
+        if progress_json.len() > MAX_PROGRESS_BYTES {
+            return Err("effect progress exceeds 262144 bytes".into());
+        }
+        let value: serde_json::Value = serde_json::from_str(progress_json)
+            .map_err(|_| "effect progress must be valid JSON".to_owned())?;
+        if serde_json::to_string(&value).map_err(|error| error.to_string())? != progress_json {
+            return Err("effect progress JSON must use canonical serialization".into());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let claimed: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM effects WHERE operation_id=?1 AND request_digest=?2 AND status='claimed' AND owner_generation=?3)",
+                params![operation_id, request_digest, owner_generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !claimed {
+            return Err("effect progress claim is stale or request digest mismatched".into());
+        }
+        tx.execute(
+            "INSERT INTO effect_progress(operation_id,request_digest,progress_json,updated_at_unix) VALUES (?1,?2,?3,?4) ON CONFLICT(operation_id) DO UPDATE SET progress_json=excluded.progress_json,updated_at_unix=excluded.updated_at_unix WHERE effect_progress.request_digest=excluded.request_digest",
+            params![operation_id, request_digest, progress_json, now_unix],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Return a receipt only after SQLite has recorded this effect as succeeded.
+    /// Pending, claimed, uncertain, failed, cancelled, or missing effects return `None`.
+    pub fn succeeded_effect_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<SucceededEffectReceipt>, String> {
+        let row: Option<SucceededEffectRow> = self
+            .connection
+            .query_row(
+                "SELECT project_id, subject_type, subject_id, operation_id, logical_key, kind, request_json, request_digest, expected_revision, attempt_count, created_at_unix, receipt_json FROM effects WHERE operation_id=?1 AND status='succeeded'",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((
+            project_id,
+            subject_type,
+            subject_id,
+            operation_id,
+            logical_key,
+            kind,
+            request_json,
+            request_digest,
+            expected_revision,
+            attempt_count,
+            created_at_unix,
+            receipt_json,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let receipt_json =
+            receipt_json.ok_or_else(|| "succeeded effect has no persisted receipt".to_owned())?;
+        Ok(Some(SucceededEffectReceipt {
+            intent: EffectIntent {
+                project_id: ProjectId::parse(project_id)?,
+                subject_type,
+                subject_id,
+                operation_id,
+                logical_key,
+                kind,
+                request_json,
+                request_digest,
+                expected_revision,
+            },
+            attempt_count,
+            created_at_unix,
+            receipt_json,
+        }))
+    }
+
+    /// List a bounded page of durable, succeeded effects for one exact subject.
+    /// Callers must still validate each typed receipt against its original request
+    /// and the current domain state before producing a transition.
+    pub fn list_succeeded_effect_receipts(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        subject_type: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SucceededEffectReceipt>, String> {
+        if subject_type.is_empty()
+            || subject_type.len() > 128
+            || subject_id.is_empty()
+            || subject_id.len() > 512
+        {
+            return Err("effect subject identity is invalid".into());
+        }
+        if limit == 0 || limit > 256 {
+            return Err("succeeded effect query limit must be between 1 and 256".into());
+        }
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id FROM effects WHERE project_id=?1 AND subject_type=?2 AND subject_id=?3 AND status='succeeded' ORDER BY created_at_unix,operation_id LIMIT ?4",
+        ).map_err(|error| error.to_string())?;
+        let operation_ids = statement
+            .query_map(
+                params![project_id.as_str(), subject_type, subject_id, limit as u64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        operation_ids
+            .iter()
+            .map(|operation_id| {
+                self.succeeded_effect_receipt(operation_id)?
+                    .ok_or_else(|| "succeeded effect disappeared during read".to_owned())
+            })
+            .collect()
+    }
+
+    /// Read bounded immutable TicketRun transition evidence for host consumers that need to cite
+    /// an earlier verified phase transition. Returned evidence is scoped to this Project and run.
+    pub fn ticket_run_transition_evidence(
+        &self,
+        owner_generation: u64,
+        project_id: &ProjectId,
+        ticket_run_id: &TicketRunId,
+        after_revision: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, serde_json::Value)>, String> {
+        if limit == 0 || limit > 256 {
+            return Err("TicketRun transition evidence limit must be between 1 and 256".into());
+        }
+        let active_owner: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active_owner != Some(owner_generation) {
+            return Err("controller owner generation is stale".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT new_revision,evidence_json FROM transitions WHERE project_id=?1 AND entity_type='ticket_run' AND entity_id=?2 AND new_revision>?3 ORDER BY new_revision DESC LIMIT ?4",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id.as_str(),
+                    ticket_run_id.as_str(),
+                    after_revision,
+                    limit as u64
+                ],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(|(revision, evidence)| {
+                let value: serde_json::Value = crate::protocol::parse_unique(evidence.as_bytes())?;
+                Ok((revision, value))
+            })
+            .collect()
     }
 
     pub fn claim_ticket(
@@ -1653,6 +2542,17 @@ impl ConfigStore {
         {
             return Err("ticket was relinquished by a human and must be repolled as open before a new local claim".into());
         }
+        if reconcile_state.is_some()
+            && crate::store::scheduler::ticket_claim_reconciliation_origin_project(
+                &tx, namespace, ticket,
+            )?
+            .as_ref()
+                != Some(project)
+        {
+            return Err(
+                "ticket claim reconciliation belongs to a different or unknown Project".into(),
+            );
+        }
         let matching: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2 AND namespace=?3 AND ticket_id=?4 AND generation=?5)", params![ticket_run.as_str(), project.as_str(), namespace.as_str(), ticket.as_str(), generation], |row| row.get(0)).map_err(|e| e.to_string())?;
         if !matching {
             return Err("ticket run does not match claim identity".into());
@@ -1663,36 +2563,6 @@ impl ConfigStore {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted)
-    }
-
-    pub fn confirm_ticket_claim_repolled(
-        &mut self,
-        owner_generation: u64,
-        namespace: &TicketNamespace,
-        ticket: &TicketId,
-        eligible_for_claim: bool,
-        observed_status: &str,
-        external_revision: Option<&str>,
-    ) -> Result<bool, String> {
-        if observed_status.is_empty() || observed_status.len() > 255 {
-            return Err("repolled external status is required".into());
-        }
-        let state = if eligible_for_claim {
-            "repolled_open"
-        } else {
-            "repolled_closed"
-        };
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        validate_active_generation(&tx, owner_generation)?;
-        let changed = tx.execute(
-            "UPDATE ticket_claim_reconciliations SET state=?3,observed_status=?4,external_revision=?5,repolled_by_generation=?6,repolled_at_unix=?7 WHERE namespace=?1 AND ticket_id=?2",
-            params![namespace.as_str(),ticket.as_str(),state,observed_status,external_revision,owner_generation,now_unix()?],
-        ).map_err(|error| error.to_string())? == 1;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(changed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1870,6 +2740,22 @@ impl ConfigStore {
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(epoch)
+    }
+
+    pub fn activate_starting_projects(&mut self, owner_generation: u64) -> Result<usize, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let activated = tx
+            .execute(
+                "UPDATE project_runtimes SET observed_lifecycle='running' WHERE desired_lifecycle='running' AND observed_lifecycle='starting' AND controller_generation=?1",
+                [owner_generation],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(activated)
     }
 
     pub fn reserve_next_ready(
@@ -2071,7 +2957,102 @@ impl ConfigStore {
         evidence_json: &str,
         effects: &[EffectIntent],
     ) -> Result<InputReceipt, String> {
+        self.commit_ticket_transition_impl(
+            owner_generation,
+            ticket_run_id,
+            expected_revision,
+            input,
+            transition,
+            reason,
+            evidence_json,
+            effects,
+            None,
+            None,
+        )
+    }
+
+    /// Persist a validated plan and its PlanAccepted transition/effect in one
+    /// owner-fenced SQLite transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_validated_work_plan(
+        &mut self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+        expected_revision: Revision,
+        configuration_digest: &Digest,
+        plan: &crate::engine::orchestration::ValidatedPlan,
+        source: &crate::store::agent_results::IngestedAgentResult,
+        input: &DurableInput,
+        reason: &str,
+        evidence_json: &str,
+        effects: &[EffectIntent],
+    ) -> Result<InputReceipt, String> {
+        let write = crate::store::accepted_plans::prepare_accepted_plan_write(
+            ticket_run_id,
+            plan,
+            configuration_digest,
+            source,
+        )?;
+        self.commit_ticket_transition_impl(
+            owner_generation,
+            ticket_run_id,
+            expected_revision,
+            input,
+            Input::PlanAccepted,
+            reason,
+            evidence_json,
+            effects,
+            None,
+            Some(write),
+        )
+    }
+
+    /// Commit the final Done transition only with a host proof derived from operation and
+    /// Postmortem receipts. The general transition API deliberately cannot accept this event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_ticket_completion(
+        &mut self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+        expected_revision: Revision,
+        input: &DurableInput,
+        reason: &str,
+        evidence_json: &str,
+        effects: &[EffectIntent],
+        proof: &crate::engine::ticket_effects::TicketCompletionProof,
+    ) -> Result<InputReceipt, String> {
+        self.commit_ticket_transition_impl(
+            owner_generation,
+            ticket_run_id,
+            expected_revision,
+            input,
+            Input::CompletionObserved,
+            reason,
+            evidence_json,
+            effects,
+            Some(proof),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_ticket_transition_impl(
+        &mut self,
+        owner_generation: u64,
+        ticket_run_id: &TicketRunId,
+        expected_revision: Revision,
+        input: &DurableInput,
+        transition: Input,
+        reason: &str,
+        evidence_json: &str,
+        effects: &[EffectIntent],
+        completion_proof: Option<&crate::engine::ticket_effects::TicketCompletionProof>,
+        accepted_plan: Option<crate::store::accepted_plans::AcceptedPlanWrite>,
+    ) -> Result<InputReceipt, String> {
         validate_input(input)?;
+        if matches!(transition, Input::KnowledgePublished) {
+            self.ensure_postmortem_published(ticket_run_id)?;
+        }
         if reason.is_empty()
             || reason.len() > 1024
             || evidence_json.len() > MAX_INPUT_BYTES
@@ -2111,16 +3092,23 @@ impl ConfigStore {
             });
         }
 
-        let stored: Option<(String, String, String, String, u64, Option<u64>)> = tx
+        let stored: Option<AcceptedWorkPlanSourceRow> = tx
             .query_row(
-                "SELECT project_id, internal_phase, activity, external_status, revision, required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
+                "SELECT project_id, config_digest, internal_phase, activity, external_status, revision, required_review_revision FROM ticket_runs WHERE ticket_run_id=?1",
                 [ticket_run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((project_raw, phase_raw, activity_raw, status_raw, revision, review_revision)) =
-            stored
+        let Some((
+            project_raw,
+            config_digest,
+            phase_raw,
+            activity_raw,
+            status_raw,
+            revision,
+            review_revision,
+        )) = stored
         else {
             return Err("ticket run not found".into());
         };
@@ -2141,6 +3129,105 @@ impl ConfigStore {
             external_status: parse_ticket_status(&status_raw)?,
             required_review_revision: review_revision.map(Revision),
         };
+        match (&transition, completion_proof) {
+            (Input::CompletionObserved, Some(proof)) => {
+                if proof.project_id() != &project_id
+                    || proof.ticket_run_id() != ticket_run_id
+                    || proof.expected_revision() != revision
+                {
+                    return Err(
+                        "completion proof is bound to a different TicketRun revision".into(),
+                    );
+                }
+                let receipt: Option<(String, String, String, String, String, String)> = tx
+                    .query_row(
+                        "SELECT p.plan_digest,p.state,p.postmortem_receipt_digest,m.receipt_digest,k.operation_id,k.manifest_digest FROM operation_plans p JOIN operation_postmortems m USING(project_id,ticket_run_id) JOIN knowledge_publications k USING(project_id,ticket_run_id) WHERE p.project_id=?1 AND p.ticket_run_id=?2 AND k.state='published'",
+                        params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let Some((
+                    plan_digest,
+                    plan_state,
+                    plan_postmortem,
+                    operation_postmortem,
+                    knowledge_operation,
+                    knowledge_digest,
+                )) = receipt
+                else {
+                    return Err("completion receipts are incomplete".into());
+                };
+                if !matches!(plan_state.as_str(), "not_required" | "succeeded")
+                    || plan_postmortem != operation_postmortem
+                    || Digest::parse(plan_digest)? != *proof.plan_digest()
+                    || Digest::parse(operation_postmortem)? != *proof.postmortem_receipt_digest()
+                    || knowledge_operation != proof.knowledge_operation_id()
+                    || Digest::parse(knowledge_digest)? != *proof.knowledge_manifest_digest()
+                {
+                    return Err("completion proof no longer matches persisted operation and Postmortem receipts".into());
+                }
+                let manifest_json: String = tx
+                    .query_row(
+                        "SELECT manifest_json FROM knowledge_publications WHERE operation_id=?1 AND ticket_run_id=?2 AND state='published'",
+                        params![proof.knowledge_operation_id(), ticket_run_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let manifest: crate::knowledge::PublicationManifest =
+                    crate::protocol::parse_unique(manifest_json.as_bytes()).map_err(|error| {
+                        format!("stored Postmortem manifest is invalid: {error}")
+                    })?;
+                if manifest.operation_id.as_str() != proof.knowledge_operation_id()
+                    || manifest.project_id.as_str() != project_id.as_str()
+                    || manifest.ticket_run_id.as_str() != ticket_run_id.as_str()
+                    || serde_json::to_string(&manifest).map_err(|error| error.to_string())?
+                        != manifest_json
+                    || content_digest(&manifest_json) != proof.knowledge_manifest_digest().as_str()
+                {
+                    return Err(
+                        "completion Postmortem publication receipt failed verification".into(),
+                    );
+                }
+            }
+            (Input::CompletionObserved, None) => {
+                return Err(
+                    "completion requires host-validated operation and Postmortem receipts".into(),
+                );
+            }
+            (_, Some(_)) => {
+                return Err("completion proof cannot authorize a different transition".into());
+            }
+            (_, None) => {}
+        }
+        let worker_wake = matches!(
+            &transition,
+            Input::WorktreesPrepared(_) | Input::CorrectionsRemain
+        );
+        let prepared_node_ids = match &transition {
+            Input::WorktreesPrepared(proof) => {
+                if proof.configuration_digest().as_str() != config_digest {
+                    return Err("prepared worktree proof belongs to a stale configuration".into());
+                }
+                Some(
+                    proof
+                        .work_node_ids()
+                        .iter()
+                        .map(|node| node.as_str().to_owned())
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+            }
+            _ => None,
+        };
+        if let Input::WorkNodePublished(proof) = &transition
+            && proof.configuration_digest().as_str() != config_digest
+        {
+            return Err("published work node proof belongs to a stale configuration".into());
+        }
+        let is_plan_accepted = matches!(&transition, Input::PlanAccepted);
+        if is_plan_accepted != accepted_plan.is_some() {
+            return Err("PlanAccepted requires an atomic validated plan payload".into());
+        }
         let decision = reduce(&current, expected_revision, transition)?;
         let expected_kinds = decision
             .effects
@@ -2174,6 +3261,99 @@ impl ConfigStore {
         }
 
         let decision_run = &decision.ticket_run;
+        if let Some(plan) = accepted_plan {
+            if decision_run.phase != Phase::Preparing
+                || plan.plan_digest.as_str() != content_digest(&plan.plan_json)
+            {
+                return Err(
+                    "validated work plan is not bound to the PlanAccepted transition".into(),
+                );
+            }
+            let source_claim: crate::engine::orchestration::WorkPlan =
+                crate::protocol::parse_unique(plan.source_claim_plan_json.as_bytes()).map_err(
+                    |error| format!("stored Coordinator plan claim is invalid: {error}"),
+                )?;
+            let accepted: crate::store::accepted_plans::PersistedWorkPlan =
+                crate::protocol::parse_unique(plan.plan_json.as_bytes())
+                    .map_err(|error| format!("persisted work plan is invalid: {error}"))?;
+            if accepted.schema_version != 1
+                || accepted.proposal != source_claim
+                || plan.validated_plan.ticket_run_id != *ticket_run_id
+                || !crate::store::accepted_plans::validated_plan_matches_claim(
+                    &plan.validated_plan,
+                    &accepted.proposal,
+                )
+            {
+                return Err("validated work plan differs from Coordinator result evidence".into());
+            }
+            let source_row: Option<ArtifactSourceAuthorityRow> = tx.query_row(
+                "SELECT e.agent_run_id,e.project_id,e.role,e.ticket_run_id,a.ticket_revision,a.role_session_id,a.config_digest,a.authority_digest,a.role,a.parent_role FROM agent_result_evidence e JOIN agent_launch_authority a USING(agent_run_id) WHERE e.evidence_id=?1 AND e.message_id=?2 AND e.result_digest=?3",
+                params![plan.source_evidence_id,plan.source_message_id,plan.source_result_digest.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let Some((
+                source_run,
+                source_project,
+                source_role,
+                source_ticket,
+                source_ticket_revision,
+                source_session,
+                source_config,
+                authority_digest,
+                authority_role,
+                parent_role,
+            )) = source_row
+            else {
+                return Err(
+                    "accepted plan has no matching persisted Coordinator result evidence".into(),
+                );
+            };
+            if source_run != plan.source_agent_run_id.as_str()
+                || source_run != plan.coordinator_agent_run_id.as_str()
+                || source_project != project_id.as_str()
+                || source_role != "coordinator"
+                || authority_role != "coordinator"
+                || parent_role != "supervisor"
+                || source_ticket.as_deref() != Some(ticket_run_id.as_str())
+                || source_ticket_revision != Some(current.revision.0)
+                || source_session != plan.coordinator_role_session_id
+                || source_config != plan.configuration_digest.as_str()
+                || source_session
+                    != crate::store::accepted_plans::coordinator_role_session_id(ticket_run_id)?
+                        .as_str()
+            {
+                return Err("accepted plan Coordinator provenance is stale or out of scope".into());
+            }
+            let source_submission: crate::engine::orchestration::RoleResultSubmission = tx
+                .query_row(
+                    "SELECT result_json FROM agent_result_evidence WHERE evidence_id=?1",
+                    [&plan.source_evidence_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|raw| {
+                    crate::protocol::parse_unique(raw.as_bytes()).map_err(|error| error.to_string())
+                })?;
+            let source_binding = source_submission.binding.clone();
+            let source_validated = crate::engine::orchestration::validate_role_result(
+                &source_binding,
+                source_submission,
+            )?;
+            let source_claim_matches = matches!(
+                source_validated.typed_payload,
+                crate::engine::orchestration::RoleResultPayload::PlanReady(ref payload)
+                    if serde_json::to_string(&payload.plan).is_ok_and(|json| json == plan.source_claim_plan_json)
+            );
+            if !source_claim_matches {
+                return Err(
+                    "persisted Coordinator result differs from accepted plan source".into(),
+                );
+            }
+            tx.execute(
+                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![project_id.as_str(),ticket_run_id.as_str(),decision_run.revision.0,plan.configuration_digest.as_str(),plan.plan_digest.as_str(),plan.plan_json,plan.source_evidence_id,plan.source_agent_run_id.as_str(),plan.source_message_id,plan.source_result_digest.as_str(),plan.coordinator_agent_run_id.as_str(),plan.coordinator_role_session_id,authority_digest,now_unix()?],
+            ).map_err(|error| error.to_string())?;
+        }
         tx.execute(
             "UPDATE ticket_runs SET internal_phase=?2, activity=?3, external_status=?4, required_review_revision=?5, revision=?6 WHERE ticket_run_id=?1 AND revision=?7",
             params![
@@ -2205,26 +3385,101 @@ impl ConfigStore {
         for effect in effects {
             insert_effect(&tx, effect, now)?;
         }
-        let wake_records = decision
-            .wakes
-            .iter()
-            .map(|target| {
+        let wake_records = if worker_wake {
+            let accepted: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT plan_digest,plan_json FROM accepted_work_plans WHERE project_id=?1 AND ticket_run_id=?2 ORDER BY accepted_revision DESC LIMIT 1",
+                    params![project_id.as_str(), ticket_run_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((plan_digest, plan_json)) = accepted else {
+                return Err("Worker wake requires a persisted accepted work plan".into());
+            };
+            if content_digest(&plan_json) != plan_digest {
+                return Err("accepted work plan digest is invalid".into());
+            }
+            let persisted: crate::store::accepted_plans::PersistedWorkPlan =
+                crate::protocol::parse_unique(plan_json.as_bytes())
+                    .map_err(|error| format!("accepted work plan is invalid: {error}"))?;
+            if persisted.schema_version != 1 {
+                return Err("accepted work plan is bound to another TicketRun".into());
+            }
+            if let Some(ids) = &prepared_node_ids
+                && ids.iter().any(|id| {
+                    !persisted
+                        .proposal
+                        .nodes
+                        .iter()
+                        .any(|node| !node.investigation && node.id.as_str() == id)
+                })
+            {
+                return Err(
+                    "prepared worktree proof names a node outside the accepted plan".into(),
+                );
+            }
+            persisted.proposal.nodes
+                .iter()
+                .filter(|node| {
+                    !node.investigation
+                        && prepared_node_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(node.id.as_str()))
+                })
+                .map(|node| {
+                    let role_session_id = format!(
+                        "ticket:{}:worker:{}",
+                        ticket_run_id.as_str(),
+                        node.id.as_str()
+                    );
+                    let payload = serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "work_node_ready",
+                        "ticket_run_id": ticket_run_id.as_str(),
+                        "work_node_id": node.id.as_str(),
+                        "accepted_plan_digest": plan_digest,
+                        "source_message_id": input.message_id,
+                        "revision": decision_run.revision.0
+                    });
+                    let inserted = tx.execute(
+                        "INSERT INTO role_wake_inputs(project_id, role_session_id, source_type, source_id, source_revision, priority, payload_json, lifecycle, created_at_unix) VALUES (?1, ?2, 'work_node_ready', ?3, ?4, 0, ?5, 'pending', ?6)",
+                        params![project_id.as_str(), role_session_id, input.message_id, decision_run.revision.0, payload.to_string(), now],
+                    ).map_err(|error| error.to_string())?;
+                    if inserted != 1 { return Err("Worker wake input was not persisted".into()); }
+                    Ok(serde_json::json!({"role_session_id":role_session_id,"work_node_id":node.id.as_str(),"revision":decision_run.revision.0}))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        } else {
+            decision
+                .wakes
+                .iter()
+                .map(|target| {
                 let (role_session_id, target_name) = match target {
                     WakeTarget::Supervisor => (
                         format!("project:{}:supervisor", project_id.as_str()),
                         "supervisor",
                     ),
-                    WakeTarget::Coordinator => (
-                        format!("ticket_run:{}:coordinator", ticket_run_id.as_str()),
-                        "coordinator",
+                    WakeTarget::TicketRole(role) => (
+                        format!(
+                            "ticket_run:{}:{}",
+                            ticket_run_id.as_str(),
+                            crate::engine::factory_runtime::role_name(*role)
+                        ),
+                        crate::engine::factory_runtime::role_name(*role),
                     ),
                 };
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "ticket_run_id": ticket_run_id.as_str(),
                     "target": target_name,
                     "message_id": input.message_id,
                     "revision": decision_run.revision.0
                 });
+                if let Ok(transition) = serde_json::from_str::<serde_json::Value>(&input.payload)
+                    && transition["kind"] == "merge_reassessment_required"
+                {
+                    payload["transition_evidence"] = transition;
+                }
                 let inserted = tx.execute(
                     "INSERT INTO role_wake_inputs(project_id, role_session_id, source_type, source_id, source_revision, priority, payload_json, lifecycle, created_at_unix) VALUES (?1, ?2, 'ticket_run_transition', ?3, ?4, 0, ?5, 'pending', ?6)",
                     params![project_id.as_str(), role_session_id, input.message_id, decision_run.revision.0, payload.to_string(), now],
@@ -2234,7 +3489,8 @@ impl ConfigStore {
                 }
                 Ok(serde_json::json!({"role_session_id":role_session_id,"revision":decision_run.revision.0}))
             })
-            .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, String>>()?
+        };
         let receipt = serde_json::json!({
             "accepted": true,
             "message_id": input.message_id,
@@ -2277,8 +3533,16 @@ impl ConfigStore {
         let now = now_unix()?;
         tx.execute("UPDATE effects SET status='uncertain', owner_generation=NULL, last_error='previous controller stopped before recording an outcome' WHERE status='claimed'", []).map_err(|e| e.to_string())?;
         tx.execute("UPDATE execution_slots SET disposition='unknown' WHERE disposition IN ('launch_pending','live')", []).map_err(|e| e.to_string())?;
-        tx.execute("UPDATE agent_runs SET state='unknown', controller_generation=?1 WHERE state IN ('launch_pending','running')", [generation]).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO controller_owners(singleton, owner_nonce, generation, state_root, config_source, pid, process_start_identity, executable_path, executable_digest, rex_server_identity, rex_session_id, rex_block_id, started_at_unix, heartbeat_at_unix, stopped_at_unix) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL) ON CONFLICT(singleton) DO UPDATE SET owner_nonce=excluded.owner_nonce, generation=excluded.generation, state_root=excluded.state_root, config_source=excluded.config_source, pid=excluded.pid, process_start_identity=excluded.process_start_identity, executable_path=excluded.executable_path, executable_digest=excluded.executable_digest, rex_server_identity=excluded.rex_server_identity, rex_session_id=excluded.rex_session_id, rex_block_id=excluded.rex_block_id, started_at_unix=excluded.started_at_unix, heartbeat_at_unix=excluded.heartbeat_at_unix, stopped_at_unix=NULL", params![owner.owner_nonce, generation, owner.state_root, owner.config_source, std::process::id(), owner.process_start_identity, owner.executable_path, owner.executable_digest, owner.rex_server_identity, owner.rex_session_id, owner.rex_block_id, now]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE agent_runs SET state='unknown', controller_generation=?1 WHERE state IN ('launch_pending','running','unknown')", [generation]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO controller_owners(singleton, owner_nonce, generation, state_root, config_source, pid, process_start_identity, executable_path, executable_digest, rex_endpoint, rex_server_identity, rex_session_id, rex_block_id, started_at_unix, heartbeat_at_unix, stopped_at_unix) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, NULL) ON CONFLICT(singleton) DO UPDATE SET owner_nonce=excluded.owner_nonce, generation=excluded.generation, state_root=excluded.state_root, config_source=excluded.config_source, pid=excluded.pid, process_start_identity=excluded.process_start_identity, executable_path=excluded.executable_path, executable_digest=excluded.executable_digest, rex_endpoint=excluded.rex_endpoint, rex_server_identity=excluded.rex_server_identity, rex_session_id=excluded.rex_session_id, rex_block_id=excluded.rex_block_id, started_at_unix=excluded.started_at_unix, heartbeat_at_unix=excluded.heartbeat_at_unix, stopped_at_unix=NULL", params![owner.owner_nonce, generation, owner.state_root, owner.config_source, std::process::id(), owner.process_start_identity, owner.executable_path, owner.executable_digest, owner.rex_endpoint, owner.rex_server_identity, owner.rex_session_id, owner.rex_block_id, now]).map_err(|e| e.to_string())?;
+        // A new machine owner must reclaim Projects whose durable desired state is still
+        // running. Keep their epoch and all execution-slot evidence intact: only lifecycle
+        // ownership moves to this controller, which activates them on its first tick.
+        tx.execute(
+            "UPDATE project_runtimes SET desired_lifecycle='running',observed_lifecycle='starting',controller_generation=?1 WHERE project_id IN (SELECT project_id FROM projects WHERE desired_lifecycle='running')",
+            [generation],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(generation)
     }
@@ -2312,6 +3576,17 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
+        tx.execute(
+            "UPDATE controller_commands \
+             SET state='rejected',result_json=?1,applied_by_generation=?2,applied_at_unix=?3 \
+             WHERE kind='machine_stop' AND state='pending' AND expected_generation!=?2",
+            params![
+                serde_json::json!({"error":"owner generation changed"}).to_string(),
+                owner_generation,
+                now_unix()?,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         let row: Option<PendingControlRow> = tx.query_row(
             "SELECT request_id, kind, project_id, lifecycle, payload_json, created_at_unix FROM controller_commands WHERE state='pending' ORDER BY sequence LIMIT 1",
             [],
@@ -2447,6 +3722,14 @@ impl ConfigStore {
                     "stopped"
                 };
                 tx.execute("UPDATE project_runtimes SET desired_lifecycle=?2, observed_lifecycle=?3, controller_generation=?4, project_epoch=?5 WHERE project_id=?1", params![project, lifecycle, observed, owner_generation, next_epoch]).map_err(|e| e.to_string())?;
+                if lifecycle == "running" {
+                    ConfigStore::enqueue_pending_supervisor_ticket_observations(
+                        &tx,
+                        &ProjectId::parse(project)?,
+                        next_epoch,
+                        now_unix()?,
+                    )?;
+                }
             }
             _ => return Err("stored controller command has an unsupported kind".into()),
         }
@@ -2464,6 +3747,11 @@ impl ConfigStore {
 
     pub fn should_stop(&self, owner_generation: u64) -> Result<bool, String> {
         let count: u64 = self.connection.query_row("SELECT COUNT(*) FROM controller_commands WHERE kind='machine_stop' AND state='applied' AND applied_by_generation=?1", [owner_generation], |row| row.get(0)).map_err(|e| e.to_string())?;
+        Ok(count > 0)
+    }
+
+    pub fn pending_machine_stop_requested(&self, owner_generation: u64) -> Result<bool, String> {
+        let count: u64 = self.connection.query_row("SELECT COUNT(*) FROM controller_commands WHERE kind='machine_stop' AND state='pending' AND expected_generation=?1", [owner_generation], |row| row.get(0)).map_err(|e| e.to_string())?;
         Ok(count > 0)
     }
 
@@ -2530,7 +3818,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
         let tx = connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let project_id = command.project_id.as_ref().map(ProjectId::as_str);
@@ -2584,7 +3872,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         let tx = connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         tx.execute(
@@ -2636,7 +3924,7 @@ impl ConfigStore {
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         let tx = connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         tx.execute("INSERT INTO human_claim_release_commands(request_id,payload_json,state,created_at_unix,expected_generation) VALUES (?1,?2,'pending',?3,?4) ON CONFLICT(request_id) DO NOTHING", params![request_id,payload,now_unix()?,owner_generation]).map_err(|error| error.to_string())?;
@@ -2671,6 +3959,19 @@ impl ConfigStore {
             );
         }
         let owner: Option<(u64,u32,String,i64)> = connection.query_row("SELECT generation,pid,process_start_identity,started_at_unix FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(|e| e.to_string())?;
+        let owner_rex = if schema_version >= 10 {
+            connection
+                .query_row(
+                    "SELECT rex_endpoint,rex_server_identity,rex_session_id,rex_block_id FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or((None, None, None, None))
+        } else {
+            (None, None, None, None)
+        };
         let mut statement = connection.prepare("SELECT p.project_id,p.mode,p.desired_lifecycle,r.observed_lifecycle,r.project_epoch,r.next_due_at_unix,r.last_error FROM projects p JOIN project_runtimes r USING(project_id) ORDER BY p.project_id").map_err(|e| e.to_string())?;
         let projects = statement
             .query_map([], |row| {
@@ -2717,6 +4018,10 @@ impl ConfigStore {
             owner_pid: owner.as_ref().map(|v| v.1),
             owner_process_start_identity: owner.as_ref().map(|v| v.2.clone()),
             owner_started_at_unix: owner.map(|v| v.3),
+            owner_rex_endpoint: owner_rex.0,
+            owner_rex_server_identity: owner_rex.1,
+            owner_rex_session_id: owner_rex.2,
+            owner_rex_block_id: owner_rex.3,
             projects,
             pending_commands: count(
                 "SELECT COUNT(*) FROM controller_commands WHERE state='pending'",
@@ -3411,41 +4716,34 @@ impl ConfigStore {
         let authority: AgentLaunchAuthority =
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
-        authority.validate()?;
-        let reservation_state: Option<(String, String)> = tx
-            .query_row(
-                "SELECT lifecycle,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
-                [request.agent_run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if reservation_state
-            .as_ref()
-            .is_some_and(|(state, _)| state != "authorized")
-        {
-            return Err("Agent launch reservation has not been finalized".into());
-        }
-        if let Some((_, reservation_json)) = &reservation_state {
+        let reservation: Option<(String, String)> = tx.query_row(
+            "SELECT reservation_json,lifecycle FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [request.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some((reservation_json, lifecycle)) = reservation {
+            if lifecycle != "authorized" {
+                return Err("Agent launch reservation has not been finalized".into());
+            }
             let reservation: AgentLaunchReservation =
                 crate::protocol::parse_unique(reservation_json.as_bytes())
                     .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
-            agent_runtime::validate_project_launch_epoch(
+            if reservation.agent_run_id != request.agent_run_id
+                || reservation.operation_id != request.operation_id
+                || reservation.controller_generation != current_generation
+            {
+                return Err("launch reservation does not match the start request".into());
+            }
+            agent_runtime::validate_project_launch_identity(
                 &tx,
-                &authority.project_id,
+                &reservation.project_id,
                 reservation.project_epoch,
-            )?;
-            agent_runtime::validate_project_launch_config(
-                &tx,
-                &authority.project_id,
                 reservation.config_revision.0,
                 &reservation.config_digest,
             )?;
-        }
-        if reservation_state.is_some() {
-            let block_is_active: bool = tx.query_row(
+            let active_block: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM rex_view_blocks WHERE view_id=?1 AND block_id=?2 AND agent_run_id=?3 AND ownership='factory' AND lifecycle='active')",
-                params![authority.rex_view_id.as_str(),authority.rex_block_id,request.agent_run_id.as_str()],
+                params![authority.rex_view_id.as_str(), authority.rex_block_id, request.agent_run_id.as_str()],
                 |row| row.get(0),
             ).map_err(|error| error.to_string())?;
             let wake_digest: Option<String> = tx
@@ -3456,12 +4754,21 @@ impl ConfigStore {
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
-            if !block_is_active
+            if !active_block
                 || wake_digest.as_deref() != Some(authority.wake_snapshot_digest.as_str())
             {
                 return Err("Agent launch reservation lacks its finalized active Rex block and wake context".into());
             }
+        } else {
+            let existing_ack: Option<(Option<String>, Option<String>)> = tx.query_row(
+                "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
+                [request.agent_run_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            if persisted_start_ack(existing_ack)?.is_none() {
+                return Err("new Agent starts require a finalized launch reservation".into());
+            }
         }
+        authority.validate()?;
         let qualification_json: String = tx
             .query_row(
                 "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
@@ -3494,7 +4801,7 @@ impl ConfigStore {
             .query_row(
                 "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
                 [request.agent_run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?,row.get(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
@@ -3547,48 +4854,67 @@ impl ConfigStore {
         let authority: AgentLaunchAuthority =
             crate::protocol::parse_unique(authority_json.as_bytes())
                 .map_err(|error| format!("stored launch authority is invalid: {error}"))?;
-        if authority.controller_generation != current_generation
-            || authority.operation_id != observation.operation_id
+        let reservation_row: Option<(String, String, String, String, u64, u64, String)> = tx.query_row(
+            "SELECT reservation_json,lifecycle,project_id,operation_id,controller_generation,project_epoch,reservation_digest FROM agent_launch_reservations WHERE agent_run_id=?1",
+            [observation.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let launch_reservation = if let Some((
+            reservation_json,
+            lifecycle,
+            project_id,
+            operation_id,
+            controller_generation,
+            project_epoch,
+            reservation_digest,
+        )) = reservation_row
         {
-            return Err(
-                "provider start observation does not match the active launch authority".into(),
-            );
-        }
-        let reservation: Option<(String, String)> = tx
-            .query_row(
-                "SELECT lifecycle,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
-                [observation.agent_run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let reserved_wake_count = if let Some((lifecycle, reservation_json)) = reservation {
             if lifecycle != "authorized" {
                 return Err("Agent launch reservation has not been finalized".into());
             }
             let reservation: AgentLaunchReservation =
                 crate::protocol::parse_unique(reservation_json.as_bytes())
                     .map_err(|error| format!("stored launch reservation is invalid: {error}"))?;
+            if reservation.agent_run_id != observation.agent_run_id
+                || reservation.project_id.as_str() != project_id
+                || reservation.operation_id.as_str() != operation_id
+                || reservation.controller_generation != controller_generation
+                || reservation.project_epoch != project_epoch
+                || reservation.digest()?.as_str() != reservation_digest
+                || reservation.project_id != authority.project_id
+                || reservation.operation_id != authority.operation_id
+                || reservation.controller_generation != authority.controller_generation
+            {
+                return Err("stored launch reservation binding is inconsistent".into());
+            }
+            Some(reservation)
+        } else {
+            None
+        };
+        let reserved_wake_count = if let Some(reservation) = launch_reservation.as_ref() {
+            reservation.wake_snapshot.validate()?;
             if reservation.wake_snapshot.digest != authority.wake_snapshot_digest {
                 return Err("launch authority wake manifest does not match its reservation".into());
             }
-            agent_runtime::validate_project_launch_epoch(
-                &tx,
-                &authority.project_id,
-                reservation.project_epoch,
-            )?;
-            agent_runtime::validate_project_launch_config(
-                &tx,
-                &authority.project_id,
-                reservation.config_revision.0,
-                &reservation.config_digest,
-            )?;
-
-            let mut statement = tx
-                .prepare(
-                    "SELECT wake_input_id,project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle FROM role_wake_inputs WHERE consuming_agent_run_id=?1 ORDER BY wake_input_id",
-                )
-                .map_err(|error| error.to_string())?;
+            let current: Option<(u64, String, u64, String, String)> = tx.query_row(
+                "SELECT r.project_epoch,p.config_digest,p.config_revision,p.desired_lifecycle,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",
+                [authority.project_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let Some((epoch, config_digest, config_revision, desired, observed)) = current else {
+                return Err("launch Project no longer exists".into());
+            };
+            if desired != "running"
+                || !matches!(observed.as_str(), "running" | "starting")
+                || epoch != reservation.project_epoch
+            {
+                return Err("Project lifecycle or epoch changed".into());
+            }
+            if config_revision != reservation.config_revision.0
+                || config_digest != reservation.config_digest.as_str()
+            {
+                return Err("Project config changed".into());
+            }
+            let mut statement = tx.prepare("SELECT wake_input_id,project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle FROM role_wake_inputs WHERE consuming_agent_run_id=?1 ORDER BY wake_input_id").map_err(|error| error.to_string())?;
             let owned_wakes = statement
                 .query_map([observation.agent_run_id.as_str()], |row| {
                     Ok((
@@ -3631,14 +4957,13 @@ impl ConfigStore {
                         let stored_payload =
                             crate::protocol::parse_unique(payload_json.as_bytes()).ok();
                         project_id != authority.project_id.as_str()
-                            || role_session_id != reservation.role_session_id.as_str()
-                            || source_type != expected.source_type.as_str()
-                            || source_id != expected.source_id.as_str()
+                            || role_session_id != &reservation.role_session_id
+                            || source_type != &expected.source_type
+                            || source_id != &expected.source_id
                             || *source_revision != expected.source_revision
                             || *priority != expected.priority
                             || stored_payload.as_ref() != Some(&expected.payload_json)
                             || lifecycle != "assigned"
-                            || !expected.host_artifacts.is_empty()
                     },
                 )
             {
@@ -3650,6 +4975,40 @@ impl ConfigStore {
         } else {
             0
         };
+        if authority.operation_id != observation.operation_id {
+            return Err(
+                "provider start observation does not match the active launch authority".into(),
+            );
+        }
+        let receipt_json: Option<String> = tx
+            .query_row(
+                "SELECT launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1 AND state='awaiting_provider' AND start_request_id=?2",
+                params![authority.agent_run_id.as_str(), authority.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        let Some(receipt_json) = receipt_json else {
+            return Err("provider start observation has no durable launch receipt".into());
+        };
+        let receipt: crate::launch::AgentLaunchReceipt =
+            crate::protocol::parse_unique(receipt_json.as_bytes())
+                .map_err(|error| format!("stored Agent launch receipt is invalid: {error}"))?;
+        if receipt.schema_version != crate::launch::LAUNCH_SCHEMA_VERSION
+            || receipt.decision != crate::launch::LaunchDecision::Accepted
+            || receipt.reason.is_some()
+            || receipt.agent_run_id != authority.agent_run_id
+            || receipt.operation_id != authority.operation_id
+            || receipt.controller_generation != authority.controller_generation
+            || receipt.descriptor_digest != authority.descriptor_digest
+            || receipt.runtime_binary_digest != authority.runtime_binary_digest
+            || receipt.qualification_receipt_digest != authority.qualification_receipt_digest
+        {
+            return Err(
+                "stored accepted launch receipt does not match immutable launch authority".into(),
+            );
+        }
         let qualification_json: String = tx
             .query_row(
                 "SELECT receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
@@ -3662,7 +5021,7 @@ impl ConfigStore {
         let qualification: ProviderQualification =
             crate::protocol::parse_unique(qualification_json.as_bytes())
                 .map_err(|error| format!("stored provider qualification is invalid: {error}"))?;
-        observation.validate(&qualification)?;
+        observation.validate_complete_process_tree(&qualification)?;
         let process_tree_json =
             serde_json::to_string(observation).map_err(|error| error.to_string())?;
         let now = now_unix()?;
@@ -3678,22 +5037,43 @@ impl ConfigStore {
             "provider_start_identity": observation.provider_start_identity,
             "executable_digest": observation.executable_digest,
             "process_tree_digest": observation.process_tree_digest,
+            "process_tree": &observation.process_tree,
         });
+        let process_identity_json =
+            serde_json::to_string(&process_identity).map_err(|error| error.to_string())?;
         let run_changed = tx.execute(
-            "UPDATE agent_runs SET state='running',process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state='launch_pending' AND controller_generation=?4",
-            params![observation.agent_run_id.as_str(),serde_json::to_string(&process_identity).map_err(|error| error.to_string())?,now,current_generation],
+            "UPDATE agent_runs SET state=CASE WHEN controller_generation=?5 THEN 'running' ELSE 'unknown' END,process_identity_json=?2,started_at_unix=COALESCE(started_at_unix,?3) WHERE agent_run_id=?1 AND state IN ('launch_pending','unknown') AND controller_generation=?4",
+            params![observation.agent_run_id.as_str(),process_identity_json,now,current_generation,authority.controller_generation],
         ).map_err(|error| error.to_string())?;
         if run_changed != 1 {
             return Err(
                 "AgentRun state changed before provider start observation was committed".into(),
             );
         }
-        let consumed_wakes = tx
-            .execute(
-                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE consuming_agent_run_id=?1 AND lifecycle='assigned'",
+        if let Some(reservation) = launch_reservation.as_ref() {
+            let slot_changed = tx.execute(
+                "UPDATE execution_slots SET disposition='live',process_identity_json=?1 WHERE pool=?2 AND slot_index=?3 AND project_id=?4 AND ticket_run_id IS ?5 AND owner_kind='agent_run' AND owner_id=?6 AND reservation_epoch=?7 AND controller_generation=?8 AND disposition IN ('launch_pending','unknown')",
+                params![process_identity_json,reservation.pool,reservation.slot_index,reservation.project_id.as_str(),reservation.ticket_run_id.as_ref().map(|id| id.as_str()),reservation.agent_run_id.as_str(),reservation.project_epoch,reservation.controller_generation],
+            ).map_err(|error| error.to_string())?;
+            if slot_changed != 1 {
+                return Err(
+                    "execution slot no longer matches the immutable Agent launch reservation"
+                        .into(),
+                );
+            }
+        } else {
+            let owns_active_slot: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND disposition!='released')",
                 [observation.agent_run_id.as_str()],
-            )
-            .map_err(|error| error.to_string())?;
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if owns_active_slot {
+                return Err(
+                    "active execution slot has no immutable Agent launch reservation".into(),
+                );
+            }
+        }
+        let consumed_wakes = tx.execute("UPDATE role_wake_inputs SET lifecycle='consumed' WHERE consuming_agent_run_id=?1 AND lifecycle='assigned'", [observation.agent_run_id.as_str()]).map_err(|error| error.to_string())?;
         if consumed_wakes != reserved_wake_count {
             return Err("assigned wake inputs changed before provider start was committed".into());
         }
@@ -3824,16 +5204,6 @@ fn insert_effect(
     Err("effect operation ID or scoped logical intent was reused with different ownership or content".into())
 }
 
-fn persisted_start_ack(
-    stored: Option<(Option<String>, Option<String>)>,
-) -> Result<Option<(String, String)>, String> {
-    match stored {
-        None | Some((None, None)) => Ok(None),
-        Some((Some(digest), Some(receipt))) => Ok(Some((digest, receipt))),
-        Some(_) => Err("Agent launch state has a partial persisted start acknowledgement".into()),
-    }
-}
-
 fn validate_effect_subject(
     tx: &rusqlite::Transaction<'_>,
     effect: &EffectIntent,
@@ -3880,6 +5250,16 @@ fn validate_effect_subject(
         return Err("effect expected subject revision is stale".into());
     }
     Ok(())
+}
+
+pub(crate) fn persisted_start_ack(
+    stored: Option<(Option<String>, Option<String>)>,
+) -> Result<Option<(String, String)>, String> {
+    match stored {
+        None | Some((None, None)) => Ok(None),
+        Some((Some(digest), Some(receipt))) => Ok(Some((digest, receipt))),
+        Some(_) => Err("Agent launch state has a partial persisted start acknowledgement".into()),
+    }
 }
 
 fn validate_effect(effect: &EffectIntent) -> Result<(), String> {
@@ -4002,9 +5382,14 @@ fn restrict_file_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn canonical_json<T: serde::Serialize>(value: &T) -> Result<String, String> {
+pub(crate) fn canonical_json<T: serde::Serialize>(value: &T) -> Result<String, String> {
     let value = serde_json::to_value(value).map_err(|e| e.to_string())?;
     serde_json::to_string(&value).map_err(|e| e.to_string())
+}
+
+pub(crate) fn agent_profile_digest(profile: &Profile) -> Result<Digest, String> {
+    let profile_json = canonical_json(profile)?;
+    Digest::parse(format!("{:x}", Sha256::digest(profile_json.as_bytes())))
 }
 
 fn now_unix() -> Result<i64, String> {
@@ -4015,35 +5400,5683 @@ fn now_unix() -> Result<i64, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
+pub(crate) mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     use super::{
-        ConfigStore, DurableInput, EffectIntent, EffectOutcome, ExpectedRevision,
-        HumanClaimRelease, OwnerMetadata, ProjectRecord, content_digest, durable_input_digest,
+        AgentLaunchAuthority, ConfigStore, ControlCommand, DurableInput, EffectIntent,
+        EffectOutcome, ExpectedRevision, HumanClaimRelease, OwnerMetadata, ProjectRecord,
+        agent_profile_digest, canonical_json, content_digest, durable_input_digest,
+        persisted_start_ack,
     };
-    use crate::config::{AppliedConfig, SourceFile, SourceKind};
+    use crate::config::{AppliedConfig, Profile, SourceFile, SourceKind};
     use crate::domain::ids::{
-        AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketId, TicketNamespace,
-        TicketRunId,
+        AdapterId, Digest, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
     };
-    use crate::domain::types::Role;
+    use crate::domain::types::TicketStatus;
     use crate::engine::reducer::Input;
-    use crate::launch::{
-        AgentLaunchAuthority, AgentStartRequest, ObservedWrapperIdentity, ProviderQualification,
-        QualificationProof, QualificationStatus, RexBlockLifecycle, RexBlockOwnership, RexView,
-        RexViewBlock, RexViewKind,
-    };
-    use sha2::Digest as _;
+    use crate::launch::{RexBlockLifecycle, RexBlockOwnership, RexView, RexViewBlock, RexViewKind};
+    use crate::store::scheduler::{PendingTicketObservation, TicketScanKey};
+    use sha2::{Digest as _, Sha256};
 
     static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn machine_lock_owner_releases_flock_while_cloned_file_remains_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let lock_root = state_root.join("machine-registry");
+        let owner = super::MachineLock::acquire_in_registry(&state_root, &lock_root).unwrap();
+        let inherited_file = owner._file.as_ref().unwrap().try_clone().unwrap();
+
+        assert!(super::MachineLock::acquire_in_registry(&state_root, &lock_root).is_err());
+
+        drop(owner);
+        let replacement = super::MachineLock::acquire_in_registry(&state_root, &lock_root).unwrap();
+        drop(inherited_file);
+
+        assert!(super::MachineLock::acquire_in_registry(&state_root, &lock_root).is_err());
+        drop(replacement);
+    }
+
+    #[test]
+    fn agent_profile_digest_matches_canonical_profile_representation() {
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "turn_timeout_seconds": 60,
+            "command": ["/bin/codex"],
+            "adapter": "codex",
+            "model": "fixture",
+            "commit_mode": "native"
+        }))
+        .unwrap();
+
+        let canonical = canonical_json(&profile).unwrap();
+        let expected =
+            Digest::parse(format!("{:x}", Sha256::digest(canonical.as_bytes()))).unwrap();
+        let raw = serde_json::to_vec(&profile).unwrap();
+
+        assert_eq!(agent_profile_digest(&profile).unwrap(), expected);
+        let raw_digest = Digest::parse(format!("{:x}", Sha256::digest(raw))).unwrap();
+        assert_ne!(agent_profile_digest(&profile).unwrap(), raw_digest);
+
+        let mut changed_profile = profile.clone();
+        changed_profile.model = Some("changed".into());
+        assert_ne!(
+            agent_profile_digest(&profile).unwrap(),
+            agent_profile_digest(&changed_profile).unwrap()
+        );
+    }
+
+    #[test]
+    fn start_ack_decoder_treats_empty_pair_as_pending_and_rejects_partial_receipts() {
+        assert_eq!(persisted_start_ack(None).unwrap(), None);
+        assert_eq!(persisted_start_ack(Some((None, None))).unwrap(), None);
+        assert_eq!(
+            persisted_start_ack(Some((Some("digest".into()), Some("receipt".into())))).unwrap(),
+            Some(("digest".into(), "receipt".into()))
+        );
+        assert!(persisted_start_ack(Some((Some("digest".into()), None))).is_err());
+        assert!(persisted_start_ack(Some((None, Some("receipt".into())))).is_err());
+    }
+
+    #[test]
+    fn pending_machine_stop_is_scoped_to_its_expected_owner_generation() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: nonce.into(),
+            executable_path: "/tmp/rex-projects-test".into(),
+            executable_digest: "f".repeat(64),
+            rex_endpoint: None,
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let first_generation = store.start_owner(&owner("first")).unwrap();
+        let stop = |request_id: &str| ControlCommand {
+            request_id: request_id.into(),
+            kind: "machine_stop".into(),
+            project_id: None,
+            lifecycle: None,
+            created_at_unix: 1,
+            applied_config: None,
+        };
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-first-owner",
+            &stop("stop-first-owner"),
+            first_generation,
+        )
+        .unwrap();
+        assert!(
+            store
+                .pending_machine_stop_requested(first_generation)
+                .unwrap()
+        );
+
+        store.stop_owner(first_generation).unwrap();
+        let second_generation = store.start_owner(&owner("second")).unwrap();
+        assert!(
+            !store
+                .pending_machine_stop_requested(second_generation)
+                .unwrap()
+        );
+        assert!(!store.should_stop(second_generation).unwrap());
+
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-second-owner",
+            &stop("stop-second-owner"),
+            second_generation,
+        )
+        .unwrap();
+        assert!(
+            store
+                .pending_machine_stop_requested(second_generation)
+                .unwrap()
+        );
+        assert!(!store.should_stop(second_generation).unwrap());
+    }
+
+    #[test]
+    fn stale_machine_stop_is_rejected_without_stopping_the_new_owner() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let owner = |nonce: &str| OwnerMetadata {
+            owner_nonce: nonce.into(),
+            state_root: temp.path().to_string_lossy().into_owned(),
+            config_source: "factory".into(),
+            process_start_identity: nonce.into(),
+            executable_path: "/tmp/rex-projects-test".into(),
+            executable_digest: "f".repeat(64),
+            rex_endpoint: None,
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        };
+        let first_generation = store.start_owner(&owner("first")).unwrap();
+        let stop = |request_id: &str| ControlCommand {
+            request_id: request_id.into(),
+            kind: "machine_stop".into(),
+            project_id: None,
+            lifecycle: None,
+            created_at_unix: 1,
+            applied_config: None,
+        };
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-first-owner",
+            &stop("stop-first-owner"),
+            first_generation,
+        )
+        .unwrap();
+
+        store.stop_owner(first_generation).unwrap();
+        let second_generation = store.start_owner(&owner("second")).unwrap();
+        assert!(
+            store
+                .process_next_control(second_generation)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.should_stop(second_generation).unwrap());
+        assert!(
+            store
+                .process_next_control(second_generation)
+                .unwrap()
+                .is_none()
+        );
+
+        let stale: (String, u64, String) = store
+            .connection
+            .query_row(
+                "SELECT state,applied_by_generation,result_json FROM controller_commands WHERE request_id='stop-first-owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stale.0, "rejected");
+        assert_eq!(stale.1, second_generation);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stale.2).unwrap()["error"],
+            "owner generation changed"
+        );
+
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-second-owner",
+            &stop("stop-second-owner"),
+            second_generation,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .process_next_control(second_generation)
+                .unwrap()
+                .unwrap()
+                .kind,
+            "machine_stop"
+        );
+        assert!(store.should_stop(second_generation).unwrap());
+    }
+
+    #[test]
+    fn append_control_waits_for_concurrent_writer_before_validating_owner() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "concurrent-writer-test".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let state_root = temp.path().to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let append = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = ConfigStore::append_control(
+                &state_root,
+                "concurrent-start",
+                &ControlCommand {
+                    request_id: "concurrent-start".into(),
+                    kind: "machine_stop".into(),
+                    project_id: None,
+                    lifecycle: None,
+                    created_at_unix: 1,
+                    applied_config: None,
+                },
+                generation,
+            );
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        writer.execute_batch("COMMIT").unwrap();
+
+        result_rx.recv().unwrap().unwrap();
+        append.join().unwrap();
+        let pending: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT request_id,kind FROM controller_commands WHERE request_id='concurrent-start'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, ("concurrent-start".into(), "machine_stop".into()));
+
+        let writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let state_root = temp.path().to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = ConfigStore::append_human_claim_release(
+                &state_root,
+                "concurrent-release",
+                &super::HumanClaimRelease {
+                    namespace: "fixture/repo".into(),
+                    ticket: "T-1".into(),
+                    ticket_run_id: "run-1".into(),
+                    generation: 1,
+                    expected_revision: 1,
+                    reason: "release test".into(),
+                    disposition: "cancel".into(),
+                },
+                generation,
+            );
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        writer.execute_batch("COMMIT").unwrap();
+        result_rx.recv().unwrap().unwrap();
+        release.join().unwrap();
+        let release_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM human_claim_release_commands WHERE request_id='concurrent-release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(release_count, 1);
+    }
+
+    #[test]
+    fn every_effect_handler_error_stays_uncertain_with_safe_diagnostic() {
+        use crate::effects::EffectKind;
+
+        for kind in [
+            EffectKind::PublishTicketStatus,
+            EffectKind::TicketCreate,
+            EffectKind::TicketDuplicateComment,
+            EffectKind::TicketCancelDuplicate,
+            EffectKind::TicketResolveDuplicate,
+            EffectKind::PrepareWorktrees,
+            EffectKind::CommitWorkerManifest,
+            EffectKind::PublishImplementation,
+            EffectKind::RequestHumanReview,
+            EffectKind::Merge,
+            EffectKind::Operation,
+            EffectKind::StartPostmortem,
+            EffectKind::PublishKnowledge,
+            EffectKind::PublishProfile,
+            EffectKind::CompleteTicket,
+            EffectKind::StartAgent,
+            EffectKind::StartProfileTrial,
+            EffectKind::StopOwnedRuns,
+        ] {
+            handler_error_stays_uncertain_and_keeps_diagnostic(kind);
+        }
+    }
+
+    fn handler_error_stays_uncertain_and_keeps_diagnostic(kind: crate::effects::EffectKind) {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("start-error-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "start-error-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "start-error-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let request_json = r#"{"agent_run_id":"agent-1"}"#;
+        let intent = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "project".into(),
+            subject_id: project_id.as_str().into(),
+            operation_id: "start-error-operation".into(),
+            logical_key: "start-error-intent".into(),
+            kind: crate::engine::reducer::effect_name(&kind).into(),
+            request_json: request_json.into(),
+            request_digest: content_digest(request_json),
+            expected_revision: Some(0),
+        };
+        store.enqueue_effect(generation, &intent).unwrap();
+        let prior_receipt = r#"{"kind":"start_request","request_id":"request-1"}"#;
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![&intent.operation_id, prior_receipt],
+            )
+            .unwrap();
+        struct ErrorHandler(crate::effects::EffectKind);
+        impl crate::effects::EffectHandler for ErrorHandler {
+            fn kind(&self) -> crate::effects::EffectKind {
+                self.0
+            }
+
+            fn handle(
+                &self,
+                _mode: crate::effects::EffectMode,
+                _request: &crate::effects::EffectRequest,
+                _context: &mut crate::effects::EffectContext<'_>,
+            ) -> Result<crate::effects::EffectObservation, String> {
+                Err(match _mode {
+                    crate::effects::EffectMode::Submit => {
+                        "token=secret-submit; command=gh pr merge 123; path=/Users/private/repo"
+                            .into()
+                    }
+                    crate::effects::EffectMode::Reconcile => {
+                        "authorization=secret-reconcile; args=--token abc; path=/private/state"
+                            .into()
+                    }
+                })
+            }
+        }
+        let handler = ErrorHandler(kind);
+        let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
+        let submit_now = super::now_unix().unwrap();
+        let result = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            generation,
+            submit_now,
+            &handlers,
+            crate::effects::EffectLimits {
+                max_attempts: 3,
+                max_age: std::time::Duration::from_secs(300),
+                retry_base: std::time::Duration::from_secs(20),
+                retry_max: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            crate::effects::DispatchTick::WaitingForReconciliation {
+                operation_id: intent.operation_id.clone(),
+            }
+        );
+        let submit_diagnostic: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT last_error FROM effects WHERE operation_id=?1",
+                [&intent.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let effect_name = crate::engine::reducer::effect_name(&kind);
+        let expected_submit_diagnostic = format!(
+            "uncertain handler_error kind={effect_name} stage=submit; reconciliation scheduled; inspect this operation before deciding next action"
+        );
+        assert_eq!(
+            submit_diagnostic.as_deref(),
+            Some(expected_submit_diagnostic.as_str())
+        );
+        assert!(!submit_diagnostic.unwrap().contains("secret-submit"));
+        let reconcile_now = submit_now.saturating_add(21);
+        let reconciliation_result = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            generation,
+            reconcile_now,
+            &handlers,
+            crate::effects::EffectLimits {
+                max_attempts: 3,
+                max_age: std::time::Duration::from_secs(300),
+                retry_base: std::time::Duration::from_secs(20),
+                retry_max: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reconciliation_result,
+            crate::effects::DispatchTick::WaitingForReconciliation {
+                operation_id: intent.operation_id.clone(),
+            }
+        );
+        let persisted: (String, Option<String>, Option<String>, String, String, u32, i64) = store
+            .connection
+            .query_row(
+                "SELECT status,receipt_json,last_error,operation_id,request_digest,attempt_count,next_attempt_at_unix FROM effects WHERE operation_id=?1",
+                [&intent.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let expected_diagnostic = format!(
+            "uncertain handler_error kind={effect_name} stage=reconcile; reconciliation scheduled; inspect this operation before deciding next action"
+        );
+        assert_eq!(persisted.0, "uncertain");
+        assert_eq!(persisted.1.as_deref(), Some(prior_receipt));
+        assert_eq!(persisted.2.as_deref(), Some(expected_diagnostic.as_str()));
+        assert_eq!(persisted.3, intent.operation_id);
+        assert_eq!(persisted.4, intent.request_digest);
+        assert_eq!(persisted.5, 1);
+        assert_eq!(persisted.6, reconcile_now.saturating_add(20));
+        assert!(!persisted.2.unwrap().contains("secret-reconcile"));
+
+        let projection = crate::store::dashboard_projection::read_projection(temp.path()).unwrap();
+        let wait = projection
+            .waits
+            .iter()
+            .find(|wait| wait.kind == effect_name)
+            .unwrap();
+        assert_eq!(wait.detail, format!("uncertain {expected_diagnostic}"));
+        assert!(!wait.detail.contains("secret"));
+    }
+
+    #[test]
+    fn confirmed_prelaunch_failure_releases_only_its_unbound_launch_slot() {
+        use crate::config::ProjectConfig;
+        use crate::domain::ids::{ProfileId, RepositoryId};
+        use crate::domain::types::Role;
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationJobStatus, ProviderQualificationRequest,
+        };
+
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut applied = snapshot(&"a".repeat(64));
+        let project_id = ProjectId::parse("preflight-project").unwrap();
+        let repository_id = RepositoryId::parse("preflight-repo").unwrap();
+        applied.config.repositories.insert(
+            repository_id,
+            serde_json::from_value(serde_json::json!({
+                "clone_url": "https://example.com/acme/repo.git",
+                "base_branch": "main",
+                "forge": "github"
+            }))
+            .unwrap(),
+        );
+        applied.config.projects.insert(
+            project_id.clone(),
+            serde_json::from_value::<ProjectConfig>(serde_json::json!({
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "repositories": ["preflight-repo"]
+            }))
+            .unwrap(),
+        );
+        let config_digest = applied.digest.clone();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied_record = store
+            .apply_snapshot("factory", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied_record.revision,
+                config_digest: config_digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "preflight-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "preflight-test".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let request = ProviderQualificationRequest {
+            request_id: "preflight-deadline".into(),
+            project_id,
+            role: Role::Worker,
+            profile_id: ProfileId::parse("codex-worker").unwrap(),
+            profile_digest: Digest::parse("b".repeat(64)).unwrap(),
+            config_revision: applied_record.revision.0,
+            config_digest,
+        };
+        store
+            .enqueue_provider_qualification(generation, &request)
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_provider_qualification(generation, 1, 1)
+                .unwrap(),
+            super::provider_qualification_runtime::QualificationClaim::Claimed { .. }
+        ));
+
+        store
+            .fail_provider_qualification_before_launch(
+                generation,
+                &request.request_id,
+                "local_preflight_failed",
+            )
+            .unwrap();
+        let job = store
+            .provider_qualification_job(&request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, ProviderQualificationJobStatus::Failed);
+        assert!(job.rex_session_id.is_none());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT disposition FROM execution_slots WHERE owner_kind='provider_qualification' AND owner_id=?1",
+                    [request.request_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "released"
+        );
+    }
+
+    #[test]
+    fn readonly_open_rejects_absent_state_and_prevents_logical_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("absent-state");
+        assert!(ConfigStore::open_readonly(&absent).is_err());
+        assert!(!absent.exists());
+
+        let state_root = temp.path().join("state");
+        drop(ConfigStore::open_test(&state_root).unwrap());
+        let database = state_root.join("state.sqlite3");
+        let database_before = std::fs::read(&database).unwrap();
+        let table_count_before = {
+            let store = ConfigStore::open_readonly(&state_root).unwrap();
+            store
+                .test_connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='table'",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+        };
+
+        let store = ConfigStore::open_readonly(&state_root).unwrap();
+        assert!(
+            store
+                .test_connection()
+                .execute("CREATE TABLE forbidden_write(id)", [])
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .test_connection()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            super::SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .test_connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='table'",
+                    [],
+                    |row| { row.get::<_, usize>(0) }
+                )
+                .unwrap(),
+            table_count_before
+        );
+        drop(store);
+        assert_eq!(std::fs::read(database).unwrap(), database_before);
+    }
+
+    #[test]
+    fn readonly_connection_observes_new_committed_wal_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let writer = ConfigStore::open_test(&state_root).unwrap();
+        writer
+            .test_connection()
+            .execute("CREATE TABLE read_only_probe(value INTEGER NOT NULL)", [])
+            .unwrap();
+
+        let reader = ConfigStore::open_readonly(&state_root).unwrap();
+        let count = |connection: &rusqlite::Connection| {
+            connection
+                .query_row("SELECT count(*) FROM read_only_probe", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(reader.test_connection()), 0);
+        writer
+            .test_connection()
+            .execute("INSERT INTO read_only_probe(value) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(count(reader.test_connection()), 1);
+    }
+
+    #[test]
+    fn effect_lookup_reuses_the_exact_request_after_a_result_ack_crash() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("goal-replay-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "goal".into(),
+                goal_revision: 2,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "goal-replay-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "goal-replay-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let request_json = r#"{"authority":"same","expires_at_unix":123}"#;
+        let original = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "project".into(),
+            subject_id: project_id.as_str().into(),
+            operation_id: "goal-human-original".into(),
+            logical_key: "goal-completion:goal-replay-project:evidence-1".into(),
+            kind: "request_human_review".into(),
+            request_json: request_json.into(),
+            request_digest: content_digest(request_json),
+            expected_revision: Some(0),
+        };
+        store.enqueue_effect(generation, &original).unwrap();
+
+        assert!(!store.enqueue_effect(generation, &original).unwrap());
+        let replayed = store
+            .effect_by_logical_key(&original.logical_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed, original);
+    }
+
+    #[test]
+    fn corrected_worker_publication_can_create_a_new_operation_and_replay_each_round() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("worker-correction-project").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            mode: "goal".into(),
+            goal_revision: 1,
+            desired_lifecycle: "running".into(),
+            state_revision: Revision(0),
+        };
+        assert!(store.insert_project(&project).unwrap());
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "worker-correction-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "worker-correction-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let ticket_run = TicketRunId::parse("worker-correction-run").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project.id,
+                &TicketNamespace::parse("github:org/repo").unwrap(),
+                &TicketId::parse("#12").unwrap(),
+                &ticket_run,
+                1,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+
+        let publication = |round: &str| {
+            let request_json = canonical_json(&serde_json::json!({"commit": round})).unwrap();
+            let evidence_id = format!("evidence-{round}");
+            let (operation_id, logical_key) = crate::runtime_services::worker_publication_identity(
+                &ticket_run,
+                &crate::engine::orchestration::WorkNodeId::parse("worker-a").unwrap(),
+                &evidence_id,
+            )
+            .unwrap();
+            EffectIntent {
+                project_id: project.id.clone(),
+                subject_type: "ticket_run".into(),
+                subject_id: ticket_run.as_str().into(),
+                operation_id,
+                logical_key,
+                kind: "publish_implementation".into(),
+                request_digest: content_digest(&request_json),
+                request_json,
+                expected_revision: Some(0),
+            }
+        };
+        let first_round = publication("first");
+        assert!(store.enqueue_effect(generation, &first_round).unwrap());
+        assert!(!store.enqueue_effect(generation, &first_round).unwrap());
+
+        let corrected_round = publication("corrected");
+        assert_ne!(first_round.logical_key, corrected_round.logical_key);
+        assert!(store.enqueue_effect(generation, &corrected_round).is_ok());
+        assert!(!store.enqueue_effect(generation, &corrected_round).unwrap());
+        assert_eq!(
+            store
+                .effect_by_logical_key(&first_round.logical_key)
+                .unwrap()
+                .unwrap(),
+            first_round
+        );
+    }
+
+    #[test]
+    fn validated_plan_transition_persists_provenance_and_replays_atomically() {
+        use crate::domain::ids::{AgentRunId, OperationId, RepositoryId};
+        use crate::domain::types::Role;
+        use crate::engine::orchestration::{
+            AgentAssertion, PlannedWorkNode, RoleOutputKind, RoleResultBinding,
+            RoleResultSubmission, RoleSessionId, ValidatedPlan, ValidatedWorkNode, WorkBaseSource,
+            WorkPlan,
+        };
+        use sha2::Digest as _;
+
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("plan-persistence").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: applied.digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "plan-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "plan-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store
+            .set_project_lifecycle(generation, &project_id, "running")
+            .unwrap();
+        let namespace = TicketNamespace::parse("github:org/repo").unwrap();
+        let ticket_id = TicketId::parse("#14").unwrap();
+        let ticket_run_id = TicketRunId::parse("plan-persistence-14-g1").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &namespace,
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "queued",
+                "ToDo",
+            )
+            .unwrap();
+        let dispatch_payload = r#"{"input":"dispatch"}"#;
+        let dispatch_effect = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.as_str().into(),
+            operation_id: "publish-plan-in-progress".into(),
+            logical_key: "publish-plan-in-progress".into(),
+            kind: "publish_ticket_status".into(),
+            request_json: "{}".into(),
+            request_digest: content_digest("{}"),
+            expected_revision: Some(1),
+        };
+        store
+            .commit_ticket_transition(
+                generation,
+                &ticket_run_id,
+                Revision(0),
+                &DurableInput {
+                    producer_id: "test".into(),
+                    message_id: "dispatch-plan".into(),
+                    content_digest: durable_input_digest("ticket_run", dispatch_payload),
+                    recipient: "ticket_run".into(),
+                    payload: dispatch_payload.into(),
+                },
+                Input::Dispatch,
+                "Dispatch for plan test.",
+                "{}",
+                &[dispatch_effect],
+            )
+            .unwrap();
+
+        let coordinator_run_id = AgentRunId::parse("plan-coordinator-run").unwrap();
+        let role_session_id =
+            crate::store::accepted_plans::coordinator_role_session_id(&ticket_run_id).unwrap();
+        let structured_result = serde_json::json!({
+            "plan": {
+                "nodes": [{
+                    "id": "implement",
+                    "repository": "repo-a",
+                    "task": "Implement the requested change",
+                    "depends_on": [],
+                    "required_evidence": ["tests pass"],
+                    "investigation": false
+                }],
+                "requested_investigation_children": 0
+            },
+            "unresolved_questions": []
+        });
+        let structured_bytes = serde_json::to_vec(&structured_result).unwrap();
+        let result_digest =
+            Digest::parse(format!("{:x}", sha2::Sha256::digest(&structured_bytes))).unwrap();
+        let binding = RoleResultBinding {
+            agent_run_id: coordinator_run_id.clone(),
+            operation_id: OperationId::parse("plan-operation").unwrap(),
+            project_id: project_id.clone(),
+            role_session_id: RoleSessionId::parse(role_session_id.as_str()).unwrap(),
+            role: Role::Coordinator,
+            parent_run_id: Some(AgentRunId::parse("plan-supervisor-run").unwrap()),
+            parent_role: Some(Role::Supervisor),
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(1)),
+            config_revision: applied.revision,
+            config_digest: applied.digest.clone(),
+            profile_digest: Digest::parse("1".repeat(64)).unwrap(),
+            instruction_digest: Digest::parse("2".repeat(64)).unwrap(),
+            provider_capability_receipt_digest: Digest::parse("3".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("4".repeat(64)).unwrap(),
+            controller_generation: generation,
+            run_epoch: 1,
+            attempt: 1,
+        };
+        let source_authority = AgentLaunchAuthority {
+            agent_run_id: coordinator_run_id.clone(),
+            project_id: project_id.clone(),
+            role: Role::Coordinator,
+            role_session_id: role_session_id.as_str().into(),
+            parent_run_id: binding.parent_run_id.clone(),
+            parent_role: binding.parent_role,
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(1)),
+            config_revision: applied.revision,
+            config_digest: applied.digest.clone(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: generation,
+            operation_id: binding.operation_id.clone(),
+            operation_recipe_id: None,
+            rex_view_id: Digest::parse("5".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("5".repeat(64)).unwrap(),
+            runtime_binary_digest: Digest::parse("5".repeat(64)).unwrap(),
+            descriptor_path: "/tmp/descriptor".into(),
+            environment_snapshot_id: Digest::parse("5".repeat(64)).unwrap(),
+            profile_id: crate::domain::ids::ProfileId::parse("test-profile").unwrap(),
+            profile_digest: binding.profile_digest.clone(),
+            instruction_digest: binding.instruction_digest.clone(),
+            result_schema_digest: binding.result_schema_digest.clone(),
+            wake_snapshot_digest: Digest::parse("5".repeat(64)).unwrap(),
+            qualification_receipt_digest: binding.provider_capability_receipt_digest.clone(),
+            rex_server_identity: "test".into(),
+            rex_session_id: "session".into(),
+            rex_window_id: "window".into(),
+            rex_block_id: "block".into(),
+            workspace_path: "/tmp/workspace".into(),
+            control_dir: "/tmp/control".into(),
+            mailbox_capability_digest: Digest::parse("5".repeat(64)).unwrap(),
+        };
+        source_authority.validate().unwrap();
+        let authority_digest = source_authority.digest().unwrap();
+        let authority_json = serde_json::to_string(&source_authority).unwrap();
+        let submission = RoleResultSubmission {
+            schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "coordinator-plan-result".into(),
+            binding: binding.clone(),
+            kind: RoleOutputKind::PlanReady,
+            assertion: AgentAssertion::Succeeded,
+            structured_result,
+            result_digest: result_digest.clone(),
+            artifact_refs: Vec::new(),
+        };
+        let persisted_submission = serde_json::to_string(&submission).unwrap();
+        let evidence_id = "plan-source-evidence";
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,'coordinator',?3,'plan-supervisor-run','supervisor',?4,1,?5,?6,1,1,?7,'plan-operation',?8,?8,?8,'/tmp/descriptor',?8,'test-profile',?9,?10,?11,?12,'test','session','window','block','/tmp/workspace','/tmp/control',?8,?13,?14,1)",
+            rusqlite::params![coordinator_run_id.as_str(),project_id.as_str(),role_session_id.as_str(),ticket_run_id.as_str(),applied.revision.0,applied.digest.as_str(),generation,"5".repeat(64),binding.profile_digest.as_str(),binding.instruction_digest.as_str(),binding.result_schema_digest.as_str(),binding.provider_capability_receipt_digest.as_str(),authority_json,authority_digest.as_str()],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_result_evidence(evidence_id,agent_run_id,project_id,role,ticket_run_id,attempt,run_epoch,message_id,content_digest,outcome,result_digest,result_json,artifact_refs_json,received_at_unix) VALUES (?1,?2,?3,'coordinator',?4,1,1,?5,?6,'completed',?7,?8,'[]',1)",
+            rusqlite::params![evidence_id,coordinator_run_id.as_str(),project_id.as_str(),ticket_run_id.as_str(),submission.message_id,"6".repeat(64),result_digest.as_str(),persisted_submission],
+        ).unwrap();
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .unwrap();
+
+        let source = crate::store::agent_results::test_ingested_agent_result(
+            submission.clone(),
+            evidence_id.into(),
+        );
+        let repository = RepositoryId::parse("repo-a").unwrap();
+        let node_id = crate::engine::orchestration::WorkNodeId::parse("implement").unwrap();
+        let claim = WorkPlan {
+            nodes: vec![PlannedWorkNode {
+                id: node_id.clone(),
+                repository: repository.clone(),
+                task: "Implement the requested change".into(),
+                depends_on: Vec::new(),
+                required_evidence: vec!["tests pass".into()],
+                investigation: false,
+            }],
+            requested_investigation_children: 0,
+        };
+        let plan = ValidatedPlan {
+            ticket_run_id: ticket_run_id.clone(),
+            nodes_in_execution_order: vec![ValidatedWorkNode {
+                id: node_id,
+                repository,
+                base: WorkBaseSource::ControllerObservedCommit {
+                    commit: "a".repeat(40),
+                },
+                task: "Implement the requested change".into(),
+                depends_on: Vec::new(),
+                required_evidence: vec!["tests pass".into()],
+                role: Role::Worker,
+            }],
+            spawned_investigation_children: 0,
+        };
+        let transition_payload = r#"{"input":"plan_accepted"}"#;
+        let input = DurableInput {
+            producer_id: "test".into(),
+            message_id: "accept-plan".into(),
+            content_digest: durable_input_digest("ticket_run", transition_payload),
+            recipient: "ticket_run".into(),
+            payload: transition_payload.into(),
+        };
+        let effect_request = "{}";
+        let effect = EffectIntent {
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.as_str().into(),
+            operation_id: "prepare-plan-worktrees".into(),
+            logical_key: "prepare-plan-worktrees".into(),
+            kind: "prepare_worktrees".into(),
+            request_json: effect_request.into(),
+            request_digest: content_digest(effect_request),
+            expected_revision: Some(2),
+        };
+        let mut wrong_session_source = source.clone();
+        wrong_session_source.validated.binding.role_session_id =
+            RoleSessionId::parse("ticket_run:another-ticket:coordinator").unwrap();
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(1),
+                    &applied.digest,
+                    &plan,
+                    &wrong_session_source,
+                    &input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(1),
+                    &Digest::parse("f".repeat(64)).unwrap(),
+                    &plan,
+                    &source,
+                    &input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        let missing_evidence = crate::store::agent_results::test_ingested_agent_result(
+            submission.clone(),
+            "missing-plan-evidence".into(),
+        );
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(1),
+                    &applied.digest,
+                    &plan,
+                    &missing_evidence,
+                    &input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        let stale_input = DurableInput {
+            producer_id: "test".into(),
+            message_id: "stale-plan-attempt".into(),
+            content_digest: durable_input_digest("ticket_run", transition_payload),
+            recipient: "ticket_run".into(),
+            payload: transition_payload.into(),
+        };
+        assert!(
+            store
+                .commit_validated_work_plan(
+                    generation,
+                    &ticket_run_id,
+                    Revision(0),
+                    &applied.digest,
+                    &plan,
+                    &source,
+                    &stale_input,
+                    "Coordinator plan accepted.",
+                    transition_payload,
+                    std::slice::from_ref(&effect),
+                )
+                .is_err()
+        );
+        let committed = store
+            .commit_validated_work_plan(
+                generation,
+                &ticket_run_id,
+                Revision(1),
+                &applied.digest,
+                &plan,
+                &source,
+                &input,
+                "Coordinator plan accepted.",
+                transition_payload,
+                std::slice::from_ref(&effect),
+            )
+            .unwrap();
+        assert!(!committed.duplicate);
+        let loaded = store
+            .latest_accepted_work_plan(&project_id, &ticket_run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.accepted_revision, 2);
+        assert_eq!(loaded.proposal, claim);
+        assert_eq!(loaded.source_evidence_id, evidence_id);
+        assert_eq!(loaded.source_agent_run_id, coordinator_run_id);
+        assert_eq!(loaded.source_message_id, "coordinator-plan-result");
+        assert_eq!(loaded.source_result_digest, result_digest);
+        assert_eq!(loaded.coordinator_role_session_id, role_session_id.as_str());
+        assert_eq!(
+            loaded.coordinator_authority_digest.as_str(),
+            authority_digest.as_str()
+        );
+        assert_eq!(
+            store.effect_by_logical_key(&effect.logical_key).unwrap(),
+            Some(effect)
+        );
+        let replay = store
+            .commit_validated_work_plan(
+                generation,
+                &ticket_run_id,
+                Revision(1),
+                &applied.digest,
+                &plan,
+                &source,
+                &input,
+                "Coordinator plan accepted.",
+                transition_payload,
+                &[EffectIntent {
+                    project_id: project_id.clone(),
+                    subject_type: "ticket_run".into(),
+                    subject_id: ticket_run_id.as_str().into(),
+                    operation_id: "prepare-plan-worktrees".into(),
+                    logical_key: "prepare-plan-worktrees".into(),
+                    kind: "prepare_worktrees".into(),
+                    request_json: effect_request.into(),
+                    request_digest: content_digest(effect_request),
+                    expected_revision: Some(2),
+                }],
+            )
+            .unwrap();
+        assert!(replay.duplicate);
+        let (revision, phase, transition_count): (u64, String, u64) = store.connection.query_row(
+            "SELECT t.revision,t.internal_phase,(SELECT COUNT(*) FROM transitions WHERE entity_id=t.ticket_run_id) FROM ticket_runs t WHERE ticket_run_id=?1",
+            [ticket_run_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            (revision, phase.as_str(), transition_count),
+            (2, "preparing", 2)
+        );
+    }
 
     fn snapshot(digest: &str) -> AppliedConfig {
         AppliedConfig {
             config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"]}},"projects":{}})).unwrap(),
             profiles: BTreeMap::new(), source_root: "/tmp/config".into(), source_files: vec![SourceFile { kind: SourceKind::File, path: "/tmp/config/config.toml".into(), canonical_path: "/tmp/config/config.toml".into(), sha256: Digest::parse("a".repeat(64)).unwrap(), bytes: 1, contents: "x".into() }], digest: Digest::parse(digest).unwrap(),
         }
+    }
+
+    fn insert_succeeded_test_effect(
+        store: &mut ConfigStore,
+        intent: &EffectIntent,
+        receipt: &impl serde::Serialize,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,expected_revision,status,attempt_count,next_attempt_at_unix,owner_generation,receipt_json,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'succeeded',1,0,1,?10,?11)",
+                rusqlite::params![
+                    intent.operation_id,
+                    intent.project_id.as_str(),
+                    intent.subject_type,
+                    intent.subject_id,
+                    intent.logical_key,
+                    intent.kind,
+                    intent.request_json,
+                    intent.request_digest,
+                    intent.expected_revision,
+                    serde_json::to_string(receipt).unwrap(),
+                    1_i64,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn staged_plan_effect(
+        project: &crate::domain::ids::ProjectId,
+        run: &TicketRunId,
+        operation_id: &str,
+        kind: &str,
+        revision: u64,
+        request: &impl serde::Serialize,
+    ) -> EffectIntent {
+        let (request_json, request_digest) =
+            crate::delivery_runtime::canonical_delivery_payload(request).unwrap();
+        EffectIntent {
+            project_id: project.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: run.as_str().into(),
+            operation_id: operation_id.into(),
+            logical_key: format!("{run}:{operation_id}"),
+            kind: kind.into(),
+            request_json,
+            request_digest,
+            expected_revision: Some(revision),
+        }
+    }
+
+    #[test]
+    fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
+        published_publication_fixture(false, false, false, false, false, false, false);
+    }
+
+    #[test]
+    fn single_publication_drives_host_merge_assessment_and_public_inbox() {
+        published_publication_fixture(true, false, false, false, false, false, false);
+    }
+
+    #[test]
+    fn generated_direct_merge_intent_reaches_host_preparation() {
+        published_publication_fixture(true, false, false, false, true, false, false);
+    }
+
+    #[test]
+    fn publication_and_review_results_wake_current_coordinator_child_requests() {
+        published_publication_fixture(true, false, false, true, false, false, false);
+    }
+
+    #[test]
+    fn repeated_merge_reference_mismatch_blocks_and_notifies_supervisor_once() {
+        published_publication_fixture(true, true, false, false, false, false, false);
+    }
+
+    #[test]
+    fn host_base_refresh_publication_drives_fresh_reviewer_subject() {
+        published_publication_fixture(true, false, true, false, false, false, false);
+    }
+
+    #[test]
+    fn obsolete_deferred_merge_assessment_does_not_abort_tick() {
+        published_publication_fixture(true, false, false, false, false, true, false);
+    }
+
+    #[test]
+    fn exhausted_observation_crash_gap_replays_block_transition_after_restart() {
+        published_publication_fixture(true, false, false, false, false, false, true);
+    }
+
+    fn assert_registered_staging_survives_verification(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        source: &crate::store::agent_results::host_validation_fixture::InPlaceValidatedResultFixture,
+        target: &crate::launch::AgentLaunchReservation,
+    ) {
+        let state = root.join("staged-artifact-verification-state");
+        std::fs::create_dir(&state).unwrap();
+        let assignment = target.worker_assignment.as_ref().unwrap();
+        let workspace = &assignment.worktree_path;
+        let locators = &target.wake_snapshot.inputs[0].host_artifacts;
+        assert!(!locators.is_empty());
+        let delivery = crate::delivery_runtime::RepositoryDelivery::new(
+            &state,
+            crate::worktrees::GitOptions {
+                executable: "/usr/bin/git".into(),
+                environment: BTreeMap::new(),
+                timeout: std::time::Duration::from_secs(5),
+            },
+            BTreeMap::new(),
+            crate::host_jobs::HostJobEnvironmentBinding {
+                snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+                policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        let verify = |store: &mut ConfigStore, binding: &crate::launch::WorkerLaunchBinding| {
+            crate::parent_artifacts::verify_worker_worktree_with_host_artifacts(
+                store,
+                &source.artifacts,
+                &target.project_id,
+                target.ticket_run_id.as_ref().unwrap(),
+                binding,
+                |path, head, allowed| {
+                    delivery
+                        .verify_clean_published_worktree_at(path, head, allowed)
+                        .map_err(|error| error.to_string())
+                },
+            )
+        };
+        verify(store, assignment).unwrap();
+        let extra = workspace.join(".rex-artifacts/unregistered.txt");
+        std::fs::write(&extra, "not host-registered").unwrap();
+        assert!(verify(store, assignment).is_err());
+        std::fs::remove_file(extra).unwrap();
+        let tracked = workspace.join("tracked.txt");
+        std::fs::write(&tracked, "staged source change").unwrap();
+        for args in [
+            ["add", "--", "tracked.txt"],
+            ["rm", "--cached", "tracked.txt"],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(verify(store, assignment).is_err());
+        }
+        std::fs::remove_file(tracked).unwrap();
+        let mut foreign = assignment.clone();
+        foreign.plan_digest = Digest::parse("0".repeat(64)).unwrap();
+        assert!(verify(store, &foreign).is_err());
+        let mut bad_source = locators.clone();
+        bad_source[0].source_evidence_id = "0".repeat(64);
+        assert!(
+            crate::parent_artifacts::verify_staged_host_artifacts(
+                store,
+                &source.artifacts,
+                &target.project_id,
+                target.ticket_run_id.as_ref().unwrap(),
+                &target.config_digest,
+                workspace,
+                &bad_source,
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let copy = workspace.join(&locators[0].path);
+            let original = std::fs::read(&copy).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&copy, vec![b'x'; original.len()]).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert!(verify(store, assignment).is_err());
+            std::fs::remove_file(&copy).unwrap();
+            let outside = state.join("outside-copy");
+            std::fs::write(&outside, &original).unwrap();
+            symlink(&outside, &copy).unwrap();
+            assert!(verify(store, assignment).is_err());
+            std::fs::remove_file(&copy).unwrap();
+            std::fs::write(&copy, original).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        verify(store, assignment).unwrap();
+        for locator in locators {
+            std::fs::remove_file(workspace.join(&locator.path)).unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_postmortem_artifact_handoff(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        artifacts: &crate::artifacts::ArtifactStore,
+        generation: u64,
+        config: &crate::config::Config,
+        config_digest: &Digest,
+        run: &crate::store::scheduler::ActiveTicketRun,
+        publication_digest: &Digest,
+        published_head: &str,
+    ) {
+        let state = root.join("postmortem-evidence-state");
+        std::fs::create_dir_all(&state).unwrap();
+        store
+            .connection
+            .execute(
+                "VACUUM INTO ?1",
+                [state.join("state.sqlite3").to_str().unwrap()],
+            )
+            .unwrap();
+        let mut history = ConfigStore::open_test(&state).unwrap();
+        let snapshot = history
+            .accepted_implementation_publication_snapshot(
+                generation,
+                &run.project_id,
+                &run.ticket_run_id,
+                run.revision,
+            )
+            .unwrap();
+        let verification = snapshot.verification().unwrap().clone();
+        let template = crate::engine::host_transitions::tests::merge_work_fixture_item(
+            run.project_id.clone(),
+            run.ticket_run_id.clone(),
+            config_digest.clone(),
+            snapshot.accepted_plan().plan_digest.clone(),
+            false,
+            published_head,
+        );
+        let work = crate::store::merge_work::MergeWorkItem::new(
+            run.project_id.clone(),
+            run.ticket_run_id.clone(),
+            Revision(run.revision),
+            Revision(run.revision + 2),
+            config_digest.clone(),
+            snapshot.accepted_plan().plan_digest.clone(),
+            crate::forge::canonical_digest(snapshot.prepared_receipt()).unwrap(),
+            publication_digest.clone(),
+            template.document,
+        )
+        .unwrap();
+        history
+            .persist_merge_work_item(generation, &work, 20)
+            .unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &work)
+                .unwrap()
+                .is_none()
+        );
+        let revision = work.awaiting_merge_revision.0 + 1;
+        // This isolated history fixture tests evidence reads, not merge authorization or execution.
+        history.connection.execute(
+            "UPDATE ticket_runs SET internal_phase='postmortem',revision=?2 WHERE ticket_run_id=?1",
+            rusqlite::params![run.ticket_run_id.as_str(), revision],
+        ).unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &work)
+                .unwrap()
+                .is_none()
+        );
+        let evidence = serde_json::json!({"kind":"merge_verified", "source_revision":work.awaiting_merge_revision.0, "work_id":work.work_id});
+        history.connection.execute(
+            "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'ticket_run',?2,?3,?4,'postmortem-evidence-fixture','historical evidence fixture',?5,21)",
+            rusqlite::params![run.project_id.as_str(), run.ticket_run_id.as_str(), work.awaiting_merge_revision.0, revision, evidence.to_string()],
+        ).unwrap();
+        let historical = history
+            .historical_implementation_publication_snapshot(generation, &work)
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.verification(), Some(&verification));
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation + 1, &work)
+                .unwrap()
+                .is_none()
+        );
+        let mut foreign = work.clone();
+        foreign.project_id = ProjectId::parse("foreign-project").unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &foreign)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            history
+                .accepted_implementation_publication_snapshot(
+                    generation,
+                    &run.project_id,
+                    &run.ticket_run_id,
+                    run.revision
+                )
+                .is_err()
+        );
+        let context: crate::agent_api::HostCompletionContext = serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "scope":{"project_id":run.project_id,"ticket_run_id":run.ticket_run_id,"ticket_id":run.ticket_id,"ticket_revision":revision,"configuration_digest":config_digest},
+            "operation_completion":{"plan_digest":"c".repeat(64),"state":"not_required","not_required_reason":"evidence-only fixture","receipts":[]},
+            "implementation_publication":{
+                "accepted_plan_digest":work.accepted_plan_digest,"configuration_digest":config_digest,
+                "merge_work_id":work.work_id,"assessed_revision":work.assessed_revision.0,"awaiting_merge_revision":work.awaiting_merge_revision.0,
+                "prepared_receipt_digest":work.prepared_receipt_digest,"publication_set_digest":work.publication_set_digest,
+                "assessment_id":work.document.assessment_id,"assessment_evidence_id":work.document.assessment_evidence_id,
+                "assessment_result_digest":work.document.assessment_result_digest,"intent_evidence_id":work.document.intent_evidence_id,
+                "intent_result_digest":work.document.intent_result_digest,"assessment":work.document.assessment,"verification":null,
+                "merge_verification":{"work_id":work.work_id,"configuration_digest":config_digest,"accepted_plan_digest":work.accepted_plan_digest,
+                    "assessment_id":work.document.assessment_id,"source_revision":work.awaiting_merge_revision.0,
+                    "merge_commit_sha":"f".repeat(40),"included_head_sha":published_head,"receipt_digest":"e".repeat(64),"receipt":{}}
+            }
+        })).unwrap();
+        let wake = crate::store::agent_runtime::PendingRoleWakeInput {
+            wake_input_id: 1,
+            source_type: "ticket_run_transition".into(),
+            source_id: "postmortem-evidence-fixture".into(),
+            source_revision: revision,
+            priority: 1,
+            payload_json: serde_json::json!({"target":"postmortem","ticket_run_id":run.ticket_run_id,"revision":revision,"message_id":"postmortem-evidence-fixture"}),
+        };
+        let workspace = state.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config_revision = store
+            .project(&run.project_id)
+            .unwrap()
+            .unwrap()
+            .config_revision
+            .0;
+        let stage = |history: &mut ConfigStore,
+                     context: &crate::agent_api::HostCompletionContext| {
+            crate::runtime_services::RuntimeServices::wake_items_with_staged_artifacts(
+                artifacts,
+                config,
+                history,
+                generation,
+                &run.project_id,
+                config_revision,
+                config_digest,
+                &workspace,
+                vec![wake.clone()],
+                Some(context),
+            )
+            .unwrap()
+        };
+        let items = stage(&mut history, &context);
+        assert_eq!(items[0].host_artifacts.len(), 1);
+        let locator = &items[0].host_artifacts[0];
+        assert_eq!(
+            locator.artifact_id,
+            verification.test_receipt_artifacts[0].artifact_id
+        );
+        assert_eq!(
+            locator.kind,
+            crate::engine::orchestration::RoleArtifactKind::TestReceipt
+        );
+        assert_eq!(locator.source_evidence_id, verification.source_evidence_id);
+        assert_eq!(
+            items[0].host_artifact_source_evidence_ids,
+            vec![verification.source_evidence_id.clone()]
+        );
+        let enriched = items[0].host_completion_context.as_ref().unwrap();
+        assert_eq!(
+            enriched
+                .implementation_publication
+                .verification
+                .as_ref()
+                .unwrap()["source_evidence_id"],
+            verification.source_evidence_id
+        );
+        assert!(
+            enriched
+                .implementation_publication
+                .artifact_evidence_unavailable
+                .is_some(),
+            "synthetic publication sources must remain explicitly unavailable"
+        );
+        let mut inbox = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: run.project_id.clone(),
+            role_session_id: format!("ticket_run:{}:postmortem", run.ticket_run_id),
+            agent_run_id: "postmortem-evidence-run".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: items.clone(),
+            worker_correction_context: None,
+        };
+        inbox.digest = inbox.content_digest().unwrap();
+        crate::agent_api::publish_wake_snapshot(&workspace, inbox).unwrap();
+        let consumed =
+            crate::agent_api::read_inbox(&workspace, "postmortem-evidence-run", 0).unwrap();
+        assert_eq!(consumed, items);
+        let bytes = std::fs::read(workspace.join(&consumed[0].host_artifacts[0].path)).unwrap();
+        assert_eq!(
+            content_digest(std::str::from_utf8(&bytes).unwrap()),
+            locator.digest.as_str()
+        );
+        assert_eq!(bytes, b"# Test receipt\n\nAll configured checks passed.\n");
+        let mut stale = context.clone();
+        stale.implementation_publication.publication_set_digest =
+            Digest::parse("0".repeat(64)).unwrap();
+        let unavailable = stage(&mut history, &stale);
+        assert!(unavailable[0].host_artifacts.is_empty());
+        assert!(
+            unavailable[0]
+                .host_completion_context
+                .as_ref()
+                .unwrap()
+                .implementation_publication
+                .artifact_evidence_unavailable
+                .is_some()
+        );
+        let mut unrelated_merge = evidence.clone();
+        unrelated_merge["work_id"] = serde_json::json!("0".repeat(64));
+        history
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_id=?1 AND new_revision=?2",
+                rusqlite::params![
+                    run.ticket_run_id.as_str(),
+                    revision,
+                    unrelated_merge.to_string()
+                ],
+            )
+            .unwrap();
+        assert!(
+            history
+                .historical_implementation_publication_snapshot(generation, &work)
+                .unwrap()
+                .is_none()
+        );
+        history
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_id=?1 AND new_revision=?2",
+                rusqlite::params![run.ticket_run_id.as_str(), revision, evidence.to_string()],
+            )
+            .unwrap();
+        let object = root
+            .join("artifacts")
+            .join(&verification.test_receipt_artifacts[0].path);
+        let retained_object = state.join("retained-test-receipt");
+        std::fs::rename(&object, &retained_object).unwrap();
+        let unavailable = stage(&mut history, &context);
+        std::fs::rename(&retained_object, &object).unwrap();
+        assert!(unavailable[0].host_artifacts.is_empty());
+        assert!(
+            unavailable[0]
+                .host_completion_context
+                .as_ref()
+                .unwrap()
+                .implementation_publication
+                .artifact_evidence_unavailable
+                .is_some()
+        );
+    }
+
+    fn published_publication_fixture(
+        single_publication: bool,
+        reject_twice: bool,
+        base_refresh: bool,
+        verify_coordinator_handoff: bool,
+        direct_merge_intent: bool,
+        obsolete_deferred_assessment: bool,
+        terminal_deferral_crash_gap: bool,
+    ) {
+        use crate::config::ProjectConfig;
+        use crate::delivery_forge::PublishedPullRequest;
+        use crate::delivery_runtime::{
+            HookGateReceipt, ImplementationPublicationReceipt, PrepareWorktreesEffectPayload,
+            PreparedWorktreeNodeRequest, PreparedWorktreeReceiptNode,
+            PreparedWorktreesEffectReceipt, PublishImplementationEffectPayload, PullRequestContent,
+            PushReceipt, VerifiedCommit, WorkerDeliveryCommit,
+        };
+        use crate::domain::ids::{OperationId, RepositoryId};
+        use crate::domain::types::CommitMode;
+        use crate::engine::orchestration::{
+            PlannedWorkNode, WorkDependency, WorkDependencyKind, WorkPlan,
+        };
+        use crate::engine::reducer::Phase;
+        use sha2::Digest as _;
+
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let worker_worktree = temp.path().join("worker-worktree");
+        std::fs::create_dir_all(&worker_worktree).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&worker_worktree)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        run_git(&["init", "--quiet", "--initial-branch=main"]);
+        run_git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "published implementation",
+        ]);
+        let corrected_head = run_git(&["rev-parse", "HEAD"]);
+        let mut applied = snapshot(&"a".repeat(64));
+        applied.source_files[0].sha256 = Digest::parse(content_digest("x")).unwrap();
+        applied.source_files.push(crate::config::SourceFile {
+            kind: crate::config::SourceKind::Directory,
+            path: "/tmp/config/profiles/worker_codex".into(),
+            canonical_path: "/tmp/config/profiles/worker_codex".into(),
+            sha256: Digest::parse("0".repeat(64)).unwrap(),
+            bytes: 0,
+            contents: String::new(),
+        });
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let repository_id = RepositoryId::parse("repo-a").unwrap();
+        applied.config.repositories.insert(
+            repository_id.clone(),
+            serde_json::from_value(serde_json::json!({
+                "clone_url": "https://github.com/acme/repo-a.git",
+                "base_branch": "main",
+                "forge": "github",
+                "merge": {"executor": if direct_merge_intent {"direct"} else {"request"}, "instructions": "# Merge instructions\nPrepare the body, request the configured merge, then verify the result.\n/merge\n"}
+            }))
+            .unwrap(),
+        );
+        applied.config.projects.insert(
+            project_id.clone(),
+            serde_json::from_value::<ProjectConfig>(serde_json::json!({
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "repositories": ["repo-a"],
+                "roles": {
+                    "coordinator": "worker_codex",
+                    "worker": "worker_codex",
+                    "reviewer": "worker_codex",
+                    "merge_decision": "worker_codex"
+                }
+            }))
+            .unwrap(),
+        );
+        applied.profiles.insert(
+            crate::domain::ids::ProfileId::parse("worker_codex").unwrap(),
+            crate::config::Profile {
+                adapter: crate::domain::types::AgentAdapter::Codex,
+                command: vec!["codex".into()],
+                description: None,
+                model: None,
+                effort: None,
+                turn_timeout_seconds: 60,
+                instruction_files: Vec::new(),
+                skill_paths: Vec::new(),
+                commit_mode: CommitMode::Native,
+                learned_guidance: None,
+                options: None,
+            },
+        );
+        let config_digest = applied.digest.clone();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied_record = store
+            .apply_snapshot("factory", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied_record.revision,
+                config_digest: config_digest.clone(),
+                mode: "goal".into(),
+                goal_revision: 1,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let owner_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "staged-plan-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "staged-plan-test".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert_eq!(owner_generation, 1);
+        let ticket_namespace = TicketNamespace::parse("github:acme/repo-a").unwrap();
+        let ticket_id = TicketId::parse("PAY-12").unwrap();
+        let ticket_run_id = TicketRunId::parse("fixture-ticket-run").unwrap();
+        store
+            .create_ticket_run(
+                owner_generation,
+                &project_id,
+                &ticket_namespace,
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "publishing",
+                "in_progress",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO ticket_run_context(ticket_run_id,project_id,project_epoch,recipe_id,goal_revision,created_at_unix) VALUES (?1,?2,1,NULL,1,1)",
+                rusqlite::params![ticket_run_id.as_str(), project_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=4,external_revision='revision-1' WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            )
+            .unwrap();
+
+        let root_id = crate::engine::orchestration::WorkNodeId::parse("root").unwrap();
+        let stacked_id = crate::engine::orchestration::WorkNodeId::parse("node-a").unwrap();
+        let mut plan_nodes = vec![PlannedWorkNode {
+            id: root_id.clone(),
+            repository: repository_id.clone(),
+            task: "Implement the foundation".into(),
+            depends_on: Vec::new(),
+            required_evidence: vec!["foundation exists".into()],
+            investigation: false,
+        }];
+        if !single_publication {
+            plan_nodes.push(PlannedWorkNode {
+                id: stacked_id.clone(),
+                repository: repository_id.clone(),
+                task: "Build on the foundation".into(),
+                depends_on: vec![WorkDependency {
+                    node: root_id.clone(),
+                    kind: WorkDependencyKind::GitBase,
+                    affected_evidence: BTreeSet::from(["foundation exists".into()]),
+                }],
+                required_evidence: vec!["dependent change exists".into()],
+                investigation: false,
+            });
+        }
+        let plan = WorkPlan {
+            nodes: plan_nodes,
+            requested_investigation_children: 0,
+        };
+        let coordinator_run_id =
+            crate::domain::ids::AgentRunId::parse("verification-coordinator-run").unwrap();
+        let coordinator_payload = serde_json::json!({
+            "plan": plan.clone(),
+            "unresolved_questions": [],
+        });
+        let coordinator_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+            &mut store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Coordinator,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "coordinator-plan-result".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::PlanReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&coordinator_payload.to_string())).unwrap(),
+                ),
+                structured_result: coordinator_payload,
+                artifact_refs: Vec::new(),
+            },
+            coordinator_run_id.clone(),
+        )
+        .unwrap();
+        let observed_base = "b".repeat(40);
+        let persisted = crate::store::accepted_plans::PersistedWorkPlan {
+            schema_version: 1,
+            proposal: plan.clone(),
+            observed_base_shas: BTreeMap::from([(repository_id.clone(), observed_base.clone())]),
+        };
+        let plan_json = serde_json::to_string(&serde_json::to_value(&persisted).unwrap()).unwrap();
+        let plan_digest = content_digest(&plan_json);
+        let coordinator_authority = store
+            .agent_launch_authority(&coordinator_run_id)
+            .unwrap()
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,2,?3,?4,?5,?6,?7,?8,?9,?7,?10,?11,1)",
+                rusqlite::params![
+                    project_id.as_str(),
+                    ticket_run_id.as_str(),
+                    config_digest.as_str(),
+                    plan_digest,
+                    plan_json,
+                    coordinator_result.ingested.receipt.evidence_id(),
+                    coordinator_run_id.as_str(),
+                    coordinator_result.ingested.validated.message_id,
+                    coordinator_result.ingested.validated.result_digest.as_str(),
+                    coordinator_authority.role_session_id,
+                    coordinator_authority.digest().unwrap().as_str(),
+                ],
+            )
+            .unwrap();
+
+        let root_branch = "rex/run-staged-1/root";
+        let root_prepare = PrepareWorktreesEffectPayload {
+            schema_version: 1,
+            source_revision: 2,
+            configuration_digest: config_digest.clone(),
+            ticket_namespace: ticket_namespace.clone(),
+            ticket_id: ticket_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: vec![PreparedWorktreeNodeRequest {
+                work_node_id: root_id.clone(),
+                repository_id: repository_id.clone(),
+                expected_base_sha: observed_base.clone(),
+                commit_mode: CommitMode::Native,
+            }],
+        };
+        let root_prepared = PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: vec![PreparedWorktreeReceiptNode {
+                work_node_id: root_id.clone(),
+                repository_id: repository_id.clone(),
+                worktree_path: std::path::PathBuf::from("/tmp/run-staged-1/root"),
+                branch: root_branch.into(),
+                base_sha: observed_base.clone(),
+                commit_mode: CommitMode::Native,
+                base_refresh: None,
+                base_refresh_source: None,
+            }],
+            base_refreshes: Vec::new(),
+        };
+        let root_prepare_intent = staged_plan_effect(
+            &project_id,
+            &ticket_run_id,
+            "prepare-root",
+            "prepare_worktrees",
+            2,
+            &root_prepare,
+        );
+        insert_succeeded_test_effect(&mut store, &root_prepare_intent, &root_prepared);
+
+        let publication = |node_id: &crate::engine::orchestration::WorkNodeId,
+                           base: &str,
+                           head: &str,
+                           branch: &str,
+                           revision: u64,
+                           operation_id: &str| {
+            let operation_id = OperationId::parse(operation_id).unwrap();
+            let pr_key = format!(
+                "{}\0{}\0{}\0{}",
+                operation_id.as_str(),
+                repository_id.as_str(),
+                node_id.as_str(),
+                "pull-request"
+            );
+            let pr_operation =
+                OperationId::parse(format!("rp-{}", content_digest(&pr_key))).unwrap();
+            let marked_body = format!(
+                "Details\n\n<!-- rex-projects-operation:{} -->",
+                pr_operation
+            );
+            let payload = PublishImplementationEffectPayload {
+                schema_version: 1,
+                source_revision: revision,
+                configuration_digest: config_digest.clone(),
+                ticket_namespace: ticket_namespace.clone(),
+                ticket_id: ticket_id.clone(),
+                ticket_run_id: ticket_run_id.clone(),
+                work_node_id: node_id.clone(),
+                repository_id: repository_id.clone(),
+                expected_base_sha: base.into(),
+                base_branch: "main".into(),
+                commit_mode: CommitMode::Native,
+                commit: WorkerDeliveryCommit::Native {
+                    previous_accepted_head: base.into(),
+                    worker_reported_head: head.into(),
+                    required_trailer: "Co-authored-by: Codex <noreply@openai.com>".into(),
+                },
+                expected_remote_head: None,
+                pull_request: PullRequestContent {
+                    title: "Implement staged work".into(),
+                    body: "Details".into(),
+                    update_target: None,
+                },
+            };
+            let intent = staged_plan_effect(
+                &project_id,
+                &ticket_run_id,
+                operation_id.as_str(),
+                "publish_implementation",
+                revision,
+                &payload,
+            );
+            let receipt = ImplementationPublicationReceipt {
+                schema_version: 1,
+                effect_operation_id: operation_id.as_str().into(),
+                source_revision: revision,
+                configuration_digest: config_digest.clone(),
+                ticket_run_id: ticket_run_id.clone(),
+                repository_id: repository_id.clone(),
+                work_node_id: node_id.clone(),
+                commit: VerifiedCommit::Native {
+                    receipt: crate::worktrees::NativeCommitReceipt {
+                        head: head.into(),
+                        base_sha: base.into(),
+                        commits: vec![head.into()],
+                    },
+                },
+                hook_gate: HookGateReceipt {
+                    repository_id: repository_id.clone(),
+                    head: head.into(),
+                    configuration_digest: config_digest.clone(),
+                    hook_receipts: Vec::new(),
+                },
+                push: PushReceipt {
+                    repository_id: repository_id.clone(),
+                    branch: branch.into(),
+                    expected_remote_head: None,
+                    observed_remote_head: head.into(),
+                    pushed_head: head.into(),
+                    force_with_lease: false,
+                },
+                pull_request: PublishedPullRequest {
+                    repository_id: repository_id.clone(),
+                    number: revision,
+                    node_id: format!("PR_{operation_id}"),
+                    url: format!("https://github.com/acme/repo-a/pull/{revision}"),
+                    state: "open".into(),
+                    source_branch: branch.into(),
+                    source_head: head.into(),
+                    base_branch: "main".into(),
+                    title: "Implement staged work".into(),
+                    body_digest: content_digest(&marked_body),
+                    operation_id: pr_operation,
+                },
+            };
+            (intent, receipt)
+        };
+
+        let first_head = "d".repeat(40);
+        let (first_publish_intent, first_publish_receipt) = publication(
+            &root_id,
+            &observed_base,
+            &first_head,
+            root_branch,
+            4,
+            "publish-root",
+        );
+        insert_succeeded_test_effect(&mut store, &first_publish_intent, &first_publish_receipt);
+        let config = applied.config.clone();
+
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                10,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        if base_refresh {
+            use crate::delivery_runtime::{BaseRefreshSource, StackRepairReceipt};
+
+            let refreshed_base = "e".repeat(40);
+            let refreshed_head = "f".repeat(40);
+            let mut refreshed_plan = persisted.clone();
+            refreshed_plan
+                .observed_base_shas
+                .insert(repository_id.clone(), refreshed_base.clone());
+            let refreshed_plan_json = crate::store::canonical_json(&refreshed_plan).unwrap();
+            store.connection.execute(
+                "INSERT INTO accepted_work_plans SELECT project_id,ticket_run_id,6,configuration_digest,?1,?2,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix FROM accepted_work_plans WHERE ticket_run_id=?3 AND accepted_revision=2",
+                rusqlite::params![content_digest(&refreshed_plan_json),refreshed_plan_json,ticket_run_id.as_str()],
+            ).unwrap();
+            store.connection.execute(
+                "UPDATE ticket_runs SET revision=6,internal_phase='preparing' WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            ).unwrap();
+            let refresh = StackRepairReceipt {
+                repository_id: repository_id.clone(),
+                branch: root_branch.into(),
+                old_parent_sha: observed_base.clone(),
+                new_parent_sha: refreshed_base.clone(),
+                old_child_head: first_head.clone(),
+                new_child_head: refreshed_head.clone(),
+                verified_commits: vec![refreshed_head.clone()],
+                hook_gate: HookGateReceipt {
+                    repository_id: repository_id.clone(),
+                    head: refreshed_head.clone(),
+                    configuration_digest: config_digest.clone(),
+                    hook_receipts: Vec::new(),
+                },
+                protection_observation_digest: Digest::parse("c".repeat(64)).unwrap(),
+            };
+            let exact_body = "Details\n\n<!-- rex-projects-operation:prior-publication -->\n\nCo-authored-by: Codex <noreply@openai.com>";
+            let source = BaseRefreshSource {
+                merge_work_id: Digest::parse("1".repeat(64)).unwrap(),
+                merge_receipt_digest: Digest::parse("2".repeat(64)).unwrap(),
+                prior_prepare_operation_id: OperationId::parse(
+                    root_prepare_intent.operation_id.clone(),
+                )
+                .unwrap(),
+                prior_prepare_receipt_digest: Digest::parse(content_digest(
+                    &serde_json::to_string(&root_prepared).unwrap(),
+                ))
+                .unwrap(),
+                prior_publication_operation_id: OperationId::parse(
+                    first_publish_intent.operation_id.clone(),
+                )
+                .unwrap(),
+                prior_publication_receipt_digest: Digest::parse(content_digest(
+                    &serde_json::to_string(&first_publish_receipt).unwrap(),
+                ))
+                .unwrap(),
+                pull_request_number: first_publish_receipt.pull_request.number,
+                pull_request_node_id: first_publish_receipt.pull_request.node_id.clone(),
+                pull_request_url: first_publish_receipt.pull_request.url.clone(),
+                pull_request_title: first_publish_receipt.pull_request.title.clone(),
+                exact_body: exact_body.into(),
+            };
+            let mut refresh_prepare = root_prepare.clone();
+            refresh_prepare.source_revision = 6;
+            refresh_prepare.work_nodes[0].expected_base_sha = refreshed_base.clone();
+            let mut refresh_prepared = root_prepared.clone();
+            refresh_prepared.work_nodes[0].base_sha = refreshed_base;
+            refresh_prepared.work_nodes[0].base_refresh = Some(refresh.clone());
+            refresh_prepared.work_nodes[0].base_refresh_source = Some(source.clone());
+            refresh_prepared.base_refreshes = vec![refresh.clone()];
+            let refresh_prepare_intent = staged_plan_effect(
+                &project_id,
+                &ticket_run_id,
+                "prepare-base-refresh",
+                "prepare_worktrees",
+                6,
+                &refresh_prepare,
+            );
+            insert_succeeded_test_effect(&mut store, &refresh_prepare_intent, &refresh_prepared);
+            assert!(
+                crate::engine::host_transitions::consume_one_host_transition(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    &config_digest,
+                )
+                .unwrap()
+            );
+            let publishing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+            assert_eq!(publishing.phase, Phase::Publishing);
+            assert_eq!(publishing.revision, 7);
+            let generated = store
+                .effect_by_logical_key(&format!("{ticket_run_id}:7:host-base-refresh-publication"))
+                .unwrap()
+                .unwrap();
+            let payload: PublishImplementationEffectPayload =
+                crate::protocol::parse_unique(generated.request_json.as_bytes()).unwrap();
+            assert_eq!(payload.source_revision, publishing.revision);
+            assert_eq!(payload.pull_request.body, exact_body);
+            assert_eq!(
+                payload.pull_request.update_target.as_ref().unwrap().number,
+                source.pull_request_number
+            );
+            assert!(
+                matches!(&payload.commit, WorkerDeliveryCommit::HostBaseRefresh { prepare_operation_id, receipt, .. } if prepare_operation_id.as_str() == refresh_prepare_intent.operation_id && receipt.as_ref() == &refresh)
+            );
+            let mut refreshed_publication = first_publish_receipt.clone();
+            refreshed_publication.effect_operation_id = generated.operation_id.clone();
+            refreshed_publication.source_revision = publishing.revision;
+            refreshed_publication.commit = VerifiedCommit::BaseRefresh {
+                receipt: refresh.clone(),
+            };
+            refreshed_publication.hook_gate = refresh.hook_gate.clone();
+            refreshed_publication.push.expected_remote_head = Some(first_head.clone());
+            refreshed_publication.push.observed_remote_head = refreshed_head.clone();
+            refreshed_publication.push.pushed_head = refreshed_head.clone();
+            refreshed_publication.push.force_with_lease = true;
+            refreshed_publication.pull_request.source_head = refreshed_head;
+            refreshed_publication.pull_request.body_digest = content_digest(exact_body);
+            let pr_key = format!(
+                "{}\0{}\0{}\0pull-request",
+                generated.operation_id, repository_id, root_id
+            );
+            refreshed_publication.pull_request.operation_id =
+                OperationId::parse(format!("rp-{}", content_digest(&pr_key))).unwrap();
+            store.connection.execute(
+                "UPDATE effects SET status='succeeded',attempt_count=1,receipt_json=?2 WHERE operation_id=?1 AND status='pending'",
+                rusqlite::params![generated.operation_id,serde_json::to_string(&refreshed_publication).unwrap()],
+            ).unwrap();
+            assert!(
+                crate::engine::host_transitions::consume_one_host_transition(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    &config_digest,
+                )
+                .unwrap()
+            );
+        }
+        if single_publication {
+            let reviewing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+            assert_eq!(reviewing.phase, Phase::Reviewing);
+            let coordinator_session = format!("ticket_run:{ticket_run_id}:coordinator");
+            let coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap();
+            let current_coordinator_wakes = coordinator_wakes
+                .iter()
+                .filter(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                current_coordinator_wakes.len(),
+                1,
+                "a completed publication must durably wake its Coordinator at Reviewing revision"
+            );
+            let reviewer_session = format!("ticket_run:{ticket_run_id}:reviewer");
+            let reviewer_wakes = store
+                .pending_role_wake_inputs(&project_id, &reviewer_session, 16)
+                .unwrap();
+            assert!(
+                !reviewer_wakes.iter().any(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "reviewer"
+                }),
+                "Reviewer must be woken only after Coordinator persists its authorized child request"
+            );
+            assert!(
+                !crate::engine::host_transitions::consume_one_host_transition(
+                    &mut store,
+                    owner_generation,
+                    13,
+                    &config,
+                    &config_digest,
+                )
+                .unwrap(),
+                "replaying the publication consumer must not apply a duplicate transition"
+            );
+            let replayed_coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap()
+                .into_iter()
+                .filter(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == reviewing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                })
+                .count();
+            assert_eq!(replayed_coordinator_wakes, 1);
+            let publication_snapshot = store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision,
+                )
+                .unwrap();
+            assert_eq!(publication_snapshot.publication_receipts().len(), 1);
+            if base_refresh {
+                assert_eq!(
+                    publication_snapshot.prepared_receipt().base_refreshes.len(),
+                    1
+                );
+                let artifacts = crate::artifacts::ArtifactStore::open(
+                    &temp.path().join("publication-source-artifacts"),
+                )
+                .unwrap();
+                let source = store.validated_worker_publication_source_for_node(
+                    &artifacts,
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    &publication_snapshot.publication_receipts()[0],
+                );
+                assert_eq!(
+                    source.unwrap_err(),
+                    "Query returned no rows",
+                    "this synthetic fixture has no Worker terminal; the source consumer must follow the prior publication to the original Worker transition, rather than misreading the host implementation_published transition"
+                );
+                let mut detached = publication_snapshot.prepared_receipt().clone();
+                detached.work_nodes[0].base_refresh_source = None;
+                assert!(
+                    crate::delivery_runtime::validate_implementation_publication_receipt(
+                        &plan,
+                        &detached,
+                        &project_id,
+                        &config.repositories,
+                        publication_snapshot.publication_receipts(),
+                    )
+                    .is_err()
+                );
+            }
+            let accepted = publication_snapshot.accepted_plan();
+            let validated_publications =
+                crate::delivery_runtime::validate_implementation_publication_receipt(
+                    &accepted.proposal,
+                    publication_snapshot.prepared_receipt(),
+                    &project_id,
+                    &config.repositories,
+                    publication_snapshot.publication_receipts(),
+                )
+                .unwrap();
+            let subject = crate::delivery_runtime::implementation_publication_set_subject(
+                &accepted.plan_digest,
+                &accepted.proposal,
+                &validated_publications,
+                publication_snapshot.publication_receipts(),
+                publication_snapshot.publication_revision(),
+            )
+            .unwrap();
+            let subject_digest = subject.digest().unwrap();
+            let coverage = subject
+                .coverage
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>();
+            let review_json = serde_json::json!({
+                "subject_kind": "implementation_publication_set",
+                "subject_digest": subject_digest,
+                "findings": [],
+                "evidence_coverage": coverage,
+                "disposition": "approved",
+                "unknowns": [],
+            });
+            let review_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-reviewer-result".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::ReviewReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&review_json.to_string())).unwrap(),
+                ),
+                structured_result: review_json,
+                artifact_refs: Vec::new(),
+            };
+            let reviewer =
+                crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::Reviewer,
+                    review_message,
+                    crate::domain::ids::AgentRunId::parse("single-publication-reviewer-run").unwrap(),
+                )
+                .unwrap();
+            assert!(
+                crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                    &mut store,
+                    owner_generation,
+                    10,
+                    &config,
+                    config_digest.clone(),
+                    &reviewer.ingested,
+                )
+                .unwrap()
+            );
+            let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+            assert_eq!(assessing.phase, Phase::Assessing);
+            assert_eq!(
+                assessing.revision,
+                reviewer
+                    .ingested
+                    .validated
+                    .binding
+                    .ticket_revision
+                    .unwrap()
+                    .0
+                    + 1,
+                "ReviewConverged must advance the exact revision reviewed by the child"
+            );
+            let post_review_coordinator_wakes = store
+                .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
+                .unwrap();
+            assert!(
+                post_review_coordinator_wakes.iter().any(|wake| {
+                    wake.source_type == "agent_result"
+                        && wake.source_id == reviewer.ingested.receipt.evidence_id()
+                }),
+                "the validated Reviewer result must retain its Coordinator parent wake after ReviewConverged"
+            );
+            assert!(
+                !post_review_coordinator_wakes.iter().any(|wake| {
+                    wake.source_type == "ticket_run_transition"
+                        && wake.source_revision == assessing.revision
+                        && wake.payload_json["target"] == "coordinator"
+                }),
+                "ReviewConverged must not add a duplicate Coordinator reducer wake"
+            );
+            if verify_coordinator_handoff {
+                use crate::engine::orchestration::SpawnRequestPayload;
+                use crate::store::agent_results::host_validation_fixture;
+
+                let wake_inputs = post_review_coordinator_wakes
+                    .iter()
+                    .map(|wake| crate::agent_api::AgentWakeItem {
+                        wake_input_id: wake.wake_input_id,
+                        source_type: wake.source_type.clone(),
+                        source_id: wake.source_id.clone(),
+                        source_revision: wake.source_revision,
+                        priority: wake.priority,
+                        payload_json: wake.payload_json.clone(),
+                        host_artifact_source_evidence_ids: Vec::new(),
+                        host_artifacts: Vec::new(),
+                        host_completion_context: None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(wake_inputs.iter().any(|wake| {
+                    wake.source_type == "agent_result"
+                        && wake.source_id == reviewer.ingested.receipt.evidence_id()
+                }));
+                let request = SpawnRequestPayload {
+                    work_node: root_id.clone(),
+                    role: crate::domain::types::Role::MergeDecision,
+                    profile_id: crate::domain::ids::ProfileId::parse("worker_codex").unwrap(),
+                    plan_digest: Some(accepted.plan_digest.clone()),
+                    worker_recovery: None,
+                    allowed_repositories: vec![repository_id.clone()],
+                    artifact_inputs: Vec::new(),
+                    parent_run_id: None,
+                };
+                let structured_result = serde_json::to_value(&request).unwrap();
+                let result_digest = Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+                ))
+                .unwrap();
+                let coordinator_run_id =
+                    crate::domain::ids::AgentRunId::parse("post-review-coordinator-run").unwrap();
+                let coordinator =
+                    host_validation_fixture::host_validated_result_in_with_wake_inputs(
+                        &mut store,
+                        &std::fs::canonicalize(temp.path()).unwrap(),
+                        owner_generation,
+                        project_id.clone(),
+                        ticket_run_id.clone(),
+                        crate::domain::types::Role::Coordinator,
+                        crate::roles::RoleResultMessage {
+                            schema_version:
+                                crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                            message_id: "coordinator-request-merge-decision-after-review".into(),
+                            kind: crate::engine::orchestration::RoleOutputKind::SpawnRequest,
+                            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                            structured_result,
+                            result_digest: Some(result_digest),
+                            artifact_refs: Vec::new(),
+                        },
+                        coordinator_run_id.clone(),
+                        wake_inputs,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    coordinator.ingested.validated.binding.ticket_revision,
+                    Some(Revision(assessing.revision)),
+                    "Coordinator SpawnRequest must carry the current post-review revision"
+                );
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                        &mut store,
+                        owner_generation,
+                        14,
+                        &config,
+                        config_digest.clone(),
+                        &coordinator.ingested,
+                    )
+                    .unwrap()
+                );
+                let merge_decision_session = format!("ticket_run:{ticket_run_id}:merge_decision");
+                let child_wakes = store
+                    .pending_role_wake_inputs(&project_id, &merge_decision_session, 16)
+                    .unwrap();
+                assert!(child_wakes.iter().any(|wake| {
+                    wake.source_type == "coordinator_child"
+                        && wake.source_id == coordinator.ingested.receipt.evidence_id()
+                        && wake.source_revision == assessing.revision
+                }));
+                let child_parent = store
+                    .coordinator_child_parent(&project_id, &merge_decision_session)
+                    .unwrap()
+                    .expect("Merge Decision child candidate must retain its Coordinator parent");
+                assert_eq!(child_parent.agent_run_id, coordinator_run_id);
+                assert_eq!(child_parent.role, crate::domain::types::Role::Coordinator);
+                assert_eq!(
+                    child_parent.ticket_revision.map(|revision| revision.0),
+                    Some(assessing.revision)
+                );
+                store
+                    .connection
+                    .execute(
+                        "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                        [project_id.as_str()],
+                    )
+                    .unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+                        rusqlite::params![project_id.as_str(), owner_generation],
+                    )
+                    .unwrap();
+                let candidates = store
+                    .pending_role_wake_sessions(owner_generation, 32)
+                    .unwrap();
+                assert!(
+                    candidates.iter().any(|candidate| {
+                        candidate.role_session_id == merge_decision_session
+                            && candidate.role == crate::domain::types::Role::MergeDecision
+                            && candidate.ticket_run_id.as_ref() == Some(&ticket_run_id)
+                    }),
+                    "Coordinator SpawnRequest must reach the Merge Decision launch candidate: {candidates:#?}"
+                );
+                return;
+            }
+            if base_refresh {
+                assert_eq!(subject.publications[0].published_head, "f".repeat(40));
+                assert_eq!(
+                    subject.publications[0].pull_request_number,
+                    first_publish_receipt.pull_request.number
+                );
+                assert_eq!(assessing.revision, 9);
+                return;
+            }
+
+            let claimed_pr_reference = if single_publication && !reject_twice && !base_refresh {
+                format!(
+                    "https://github.com/acme/repo-a/pull/{}",
+                    subject.publications[0].pull_request_number
+                )
+            } else {
+                format!(
+                    "https://github.com/acme/repo-a/pull/{} (PR_{}); head {}; base main",
+                    subject.publications[0].pull_request_number,
+                    subject.publications[0].pull_request_node_id,
+                    subject.publications[0].published_head
+                )
+            };
+            let merge_result_json = serde_json::json!({
+                "pr_references": [claimed_pr_reference],
+                "subject_digest": subject.digest().unwrap().as_str(),
+                "deterministic_gate_evidence": [
+                    {"gate_id":"pull_request_open","outcome":"pass","evidence_references":[]},
+                    {"gate_id":"review_threads_resolved","outcome":"pass","evidence_references":[]}
+                ],
+                "ratings": {
+                    "change_impact":{"rating":2,"source":"diff","rationale":"moderate change","evidence_references":[]},
+                    "complexity":{"rating":2,"source":"diff","rationale":"moderate complexity","evidence_references":[]},
+                    "verification_gaps":{"rating":2,"source":"checks","rationale":"some verification gaps","evidence_references":[]},
+                    "review_uncertainty":{"rating":1,"source":"review","rationale":"reviewed","evidence_references":[]},
+                    "operational_exposure":{"rating":1,"source":"policy","rationale":"low exposure","evidence_references":[]}
+                },
+                "confidence":"high",
+                "rationale":"all current evidence is present",
+                "disposition":"eligible_for_automatic_merge"
+            });
+            let merge_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-merge-assessment".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&merge_result_json.to_string())).unwrap(),
+                ),
+                structured_result: merge_result_json.clone(),
+                artifact_refs: Vec::new(),
+            };
+            let merge_result =
+                crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    merge_message,
+                    crate::domain::ids::AgentRunId::parse("single-publication-merge-run").unwrap(),
+                )
+                .unwrap();
+            let expected_pr_reference = format!(
+                "https://github.com/acme/repo-a/pull/{}",
+                subject.publications[0].pull_request_number
+            );
+            let publication = &subject.publications[0];
+            let head = publication.published_head.clone();
+            let replies = vec![
+                serde_json::json!({"id":7,"full_name":"acme/repo-a","default_branch":"main","allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}),
+                serde_json::json!({"node_id":publication.pull_request_node_id,"number":publication.pull_request_number,"state":"open","draft":false,"merged":false,"head":{"sha":head,"ref":"feature","repo":{"id":7}},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"body":null}),
+                serde_json::json!([]),
+                serde_json::json!({"check_runs":[]}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"name":"main","protected":true}),
+                serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
+            ];
+            if single_publication && !reject_twice && !base_refresh {
+                let (prepared_observation, prepared_body_proposal) =
+                    crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
+                        applied.clone(),
+                        &subject,
+                        &merge_result.ingested,
+                        &accepted.proposal,
+                        &project_id,
+                        replies.clone(),
+                    )
+                    .unwrap();
+                let mut stale_replies = replies.clone();
+                stale_replies[1]["head"]["sha"] = serde_json::Value::String("f".repeat(40));
+                let mut stale_raw_replies = stale_replies[..2]
+                    .iter()
+                    .map(|response| serde_json::to_vec(response).unwrap())
+                    .collect::<Vec<_>>();
+                stale_raw_replies.push(b"fixture-timeout".to_vec());
+                stale_raw_replies.extend(
+                    stale_replies[3..]
+                        .iter()
+                        .map(|response| serde_json::to_vec(response).unwrap()),
+                );
+                assert!(matches!(
+                    crate::runtime_services::merge::tests::observe_publication_raw_replies_for_store_test(
+                        applied.clone(),
+                        &subject,
+                        &merge_result.ingested,
+                        stale_raw_replies,
+                    ),
+                    Err(crate::merge_runtime::MergeObservationError::Permanent(_))
+                ));
+                let timeout_artifacts =
+                    crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+                let pending_results = store
+                    .pending_validated_agent_results(&timeout_artifacts, owner_generation, 32)
+                    .unwrap();
+                for pending in pending_results {
+                    if pending.validated.message_id == "coordinator-plan-result" {
+                        store
+                            .acknowledge_validated_agent_result(
+                                owner_generation,
+                                pending.receipt.evidence_id(),
+                                pending.validated.binding.ticket_revision.unwrap().0,
+                                crate::store::agent_results::ResultDisposition::Applied,
+                            )
+                            .unwrap();
+                    }
+                }
+                let runnable_results = store
+                    .pending_validated_agent_results(&timeout_artifacts, owner_generation, 8)
+                    .unwrap();
+                assert_eq!(runnable_results.len(), 1);
+                assert_eq!(
+                    runnable_results[0].validated.message_id,
+                    "single-publication-merge-assessment"
+                );
+                let tick = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    timeout_artifacts.clone(),
+                    applied.clone(),
+                );
+                assert!(
+                    tick.as_ref()
+                        .is_ok_and(|report| report.ingested_agent_result),
+                    "transient MergeDecision observation must defer without aborting the controller tick: {tick:?}"
+                );
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    None,
+                    "a failed fresh observation must leave its exact MergeAssessment unacknowledged"
+                );
+                let deferred = store
+                    .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(deferred.attempt_count, 1);
+                assert_eq!(deferred.next_attempt_at_unix, 16);
+                assert!(matches!(
+                    deferred.state,
+                    crate::store::agent_results::MergeObservationDeferralState::Waiting { .. }
+                ));
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM merge_work_items WHERE ticket_run_id=?1",
+                            [ticket_run_id.as_str()],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .unwrap(),
+                    0,
+                    "a deferred observation must not create merge work"
+                );
+                if terminal_deferral_crash_gap {
+                    for (attempt_at, expected_attempt, expected_due) in
+                        [(16, 2, 46), (46, 3, 166), (166, 4, 766), (766, 5, 766)]
+                    {
+                        let state = store
+                            .record_merge_observation_failure(
+                                owner_generation,
+                                &merge_result.ingested,
+                                &subject.digest().unwrap(),
+                                attempt_at,
+                                crate::store::agent_results::MergeObservationFailureCode::TimedOut,
+                            )
+                            .unwrap();
+                        let row = store
+                            .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(row.attempt_count, expected_attempt);
+                        assert_eq!(row.next_attempt_at_unix, expected_due);
+                        if expected_attempt == 5 {
+                            assert_eq!(
+                                state,
+                                crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                                    attempt_count: 5
+                                }
+                            );
+                        }
+                    }
+                    let state_root = temp.path().to_path_buf();
+                    drop(store);
+                    let mut store = ConfigStore::open_test(&state_root).unwrap();
+                    let restart_artifacts =
+                        crate::artifacts::ArtifactStore::open(&state_root.join("artifacts"))
+                            .unwrap();
+                    let restarted = crate::engine::factory_runtime::tests::tick_with_merge_observation_replies_for_test(
+                        &mut store,
+                        owner_generation,
+                        766,
+                        &config,
+                        config_digest.clone(),
+                        restart_artifacts,
+                        applied.clone(),
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap();
+                    assert!(restarted.ingested_agent_result);
+                    assert_eq!(
+                        store
+                            .merge_observation_deferral(
+                                merge_result.ingested.receipt.evidence_id(),
+                            )
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                            attempt_count: 5
+                        }
+                    );
+                    assert_eq!(
+                        crate::store::agent_results::host_validation_fixture::result_ack(
+                            &store,
+                            merge_result.ingested.receipt.evidence_id(),
+                        )
+                        .unwrap(),
+                        None
+                    );
+                    assert!(
+                        store
+                            .trusted_merge_assessment(
+                                &project_id,
+                                &ticket_run_id,
+                                Revision(assessing.revision),
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    let blocked = store
+                        .active_ticket_runs(owner_generation, 8)
+                        .unwrap()
+                        .into_iter()
+                        .find(|run| run.ticket_run_id == ticket_run_id)
+                        .unwrap();
+                    assert_eq!(blocked.activity, crate::engine::reducer::Activity::Blocked);
+                    assert_eq!(
+                        blocked.external_status,
+                        crate::domain::types::TicketStatus::InProgress
+                    );
+                    assert!(
+                        store
+                            .pending_role_wake_inputs(
+                                &project_id,
+                                &format!("project:{project_id}:supervisor"),
+                                16,
+                            )
+                            .unwrap()
+                            .iter()
+                            .any(|wake| {
+                                wake.payload_json["target"] == "supervisor"
+                                    && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                            })
+                    );
+                    return;
+                }
+                if obsolete_deferred_assessment {
+                    let pause_payload = serde_json::json!({
+                        "kind": "fixture_pause_after_merge_observation_deferral",
+                        "ticket_run_id": ticket_run_id.as_str(),
+                    });
+                    let pause_payload_json = crate::store::canonical_json(&pause_payload).unwrap();
+                    store
+                        .commit_ticket_transition(
+                            owner_generation,
+                            &ticket_run_id,
+                            Revision(assessing.revision),
+                            &crate::store::DurableInput {
+                                producer_id: "fixture".into(),
+                                message_id: "pause-after-merge-observation-deferral".into(),
+                                content_digest: crate::store::durable_input_digest(
+                                    "ticket_run",
+                                    &pause_payload_json,
+                                ),
+                                recipient: "ticket_run".into(),
+                                payload: pause_payload_json.clone(),
+                            },
+                            crate::engine::reducer::Input::Pause,
+                            "fixture changed the TicketRun revision after deferral",
+                            &pause_payload_json,
+                            &[staged_plan_effect(
+                                &project_id,
+                                &ticket_run_id,
+                                "pause-after-merge-observation-deferral",
+                                "stop_owned_runs",
+                                assessing.revision + 1,
+                                &serde_json::json!({}),
+                            )],
+                        )
+                        .unwrap();
+                    let stale_tick_artifacts =
+                        crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts"))
+                            .unwrap();
+                    let stale_tick = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                        &mut store,
+                        owner_generation,
+                        16,
+                        &config,
+                        config_digest.clone(),
+                        stale_tick_artifacts,
+                        applied.clone(),
+                    )
+                    .unwrap();
+                    assert!(stale_tick.ingested_agent_result);
+                    assert_eq!(
+                        store
+                            .merge_observation_deferral(
+                                merge_result.ingested.receipt.evidence_id(),
+                            )
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        crate::store::agent_results::MergeObservationDeferralState::PermanentlyInvalid
+                    );
+                    assert_eq!(
+                        crate::store::agent_results::host_validation_fixture::result_ack(
+                            &store,
+                            merge_result.ingested.receipt.evidence_id(),
+                        )
+                        .unwrap(),
+                        None
+                    );
+                    let permanent_binding = store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        store
+                            .record_merge_observation_failure(
+                                owner_generation,
+                                &merge_result.ingested,
+                                &Digest::parse("b".repeat(64)).unwrap(),
+                                17,
+                                crate::store::agent_results::MergeObservationFailureCode::TimedOut,
+                            )
+                            .unwrap(),
+                        crate::store::agent_results::MergeObservationDeferralState::PermanentlyInvalid
+                    );
+                    let after_mismatch = store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        after_mismatch.binding_digest,
+                        permanent_binding.binding_digest
+                    );
+                    assert_eq!(
+                        after_mismatch.attempt_count,
+                        permanent_binding.attempt_count
+                    );
+                    assert!(
+                        store
+                            .trusted_merge_assessment(
+                                &project_id,
+                                &ticket_run_id,
+                                Revision(assessing.revision),
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    return;
+                }
+                let second_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "single-publication-merge-assessment-fairness".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: Some(Digest::parse(content_digest(&merge_result_json.to_string())).unwrap()),
+                        structured_result: merge_result_json.clone(),
+                        artifact_refs: Vec::new(),
+                    },
+                    crate::domain::ids::AgentRunId::parse("single-publication-merge-run-fairness").unwrap(),
+                ).unwrap();
+                let fair_tick_artifacts =
+                    crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+                let fair_tick = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    fair_tick_artifacts,
+                    applied.clone(),
+                ).unwrap();
+                assert!(fair_tick.ingested_agent_result);
+                assert_eq!(
+                    store
+                        .merge_observation_deferral(second_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap()
+                        .next_attempt_at_unix,
+                    17,
+                    "a later runnable result must proceed while the older one is deferred"
+                );
+                assert_eq!(
+                    store
+                        .pending_validated_agent_results(&timeout_artifacts, owner_generation, 8)
+                        .unwrap()
+                        .len(),
+                    2,
+                    "diagnostic pending results must retain deferred unacknowledged evidence"
+                );
+                assert!(
+                    store
+                        .runnable_validated_agent_results(
+                            &timeout_artifacts,
+                            owner_generation,
+                            15,
+                            8
+                        )
+                        .unwrap()
+                        .is_empty()
+                );
+                let state_root = temp.path().to_path_buf();
+                drop(store);
+                let mut store = ConfigStore::open_test(&state_root).unwrap();
+                let reopened_artifacts =
+                    crate::artifacts::ArtifactStore::open(&state_root.join("artifacts")).unwrap();
+                let before_due = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                    &mut store,
+                    owner_generation,
+                    15,
+                    &config,
+                    config_digest.clone(),
+                    reopened_artifacts,
+                    applied.clone(),
+                )
+                .unwrap();
+                assert!(!before_due.ingested_agent_result);
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap()
+                        .attempt_count,
+                    1,
+                    "a pre-due tick must not consume a retry attempt"
+                );
+                let due_artifacts =
+                    crate::artifacts::ArtifactStore::open(&state_root.join("artifacts")).unwrap();
+                let due = crate::engine::factory_runtime::tests::tick_with_merge_observation_replies_for_test(
+                    &mut store,
+                    owner_generation,
+                    16,
+                    &config,
+                    config_digest.clone(),
+                    due_artifacts,
+                    applied.clone(),
+                    replies.clone(),
+                    Some(prepared_body_proposal),
+                )
+                .unwrap();
+                assert!(due.ingested_agent_result);
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap()
+                    .map(|(_, disposition)| disposition),
+                    Some("applied".into()),
+                    "the due retry must use fresh evidence and acknowledge the same valid claim"
+                );
+                let trusted = store
+                    .trusted_merge_assessment(
+                        &project_id,
+                        &ticket_run_id,
+                        Revision(assessing.revision),
+                    )
+                    .unwrap()
+                    .expect("fresh due observation must persist the trusted assessment");
+                assert_eq!(
+                    trusted.evidence.current_subject.remote_checks_digest,
+                    prepared_observation
+                        .evidence
+                        .current_subject
+                        .remote_checks_digest,
+                    "the due tick's newly returned evidence must be persisted exactly"
+                );
+                assert!(
+                    store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .is_none()
+                );
+                for (attempt_at, expected_attempt, expected_due) in
+                    [(17, 2, 47), (47, 3, 167), (167, 4, 767), (767, 5, 767)]
+                {
+                    let attempt_artifacts =
+                        crate::artifacts::ArtifactStore::open(&state_root.join("artifacts"))
+                            .unwrap();
+                    let attempt = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                        &mut store,
+                        owner_generation,
+                        attempt_at,
+                        &config,
+                        config_digest.clone(),
+                        attempt_artifacts,
+                        applied.clone(),
+                    )
+                    .unwrap();
+                    assert!(attempt.ingested_agent_result);
+                    let row = store
+                        .merge_observation_deferral(second_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.attempt_count, expected_attempt);
+                    assert_eq!(row.next_attempt_at_unix, expected_due);
+                    if expected_attempt == 5 {
+                        assert!(matches!(
+                            row.state,
+                            crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                                attempt_count: 5
+                            }
+                        ));
+                    }
+                }
+                let blocked = store
+                    .active_ticket_runs(owner_generation, 10)
+                    .unwrap()
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == ticket_run_id)
+                    .unwrap();
+                assert_eq!(blocked.activity, crate::engine::reducer::Activity::Blocked);
+                assert_eq!(
+                    blocked.external_status,
+                    crate::domain::types::TicketStatus::InProgress
+                );
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        second_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    None,
+                    "exhaustion must keep source evidence unacknowledged"
+                );
+                assert!(
+                    store
+                        .trusted_merge_assessment(
+                            &project_id,
+                            &ticket_run_id,
+                            Revision(assessing.revision),
+                        )
+                        .unwrap()
+                        .is_some()
+                );
+                let supervisor_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("project:{project_id}:supervisor"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| {
+                        wake.source_type == "ticket_run_transition"
+                            && wake.payload_json["target"] == "supervisor"
+                            && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                    })
+                    .count();
+                assert_eq!(supervisor_wakes, 1);
+                assert_eq!(
+                    store
+                        .record_merge_observation_failure(
+                            owner_generation,
+                            &second_result.ingested,
+                            &subject.digest().unwrap(),
+                            800,
+                            crate::store::agent_results::MergeObservationFailureCode::TimedOut,
+                        )
+                        .unwrap(),
+                    crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                        attempt_count: 5
+                    },
+                    "a later retry call must not revive an exhausted binding"
+                );
+                return;
+            }
+            let observation =
+                crate::runtime_services::merge::tests::observe_publication_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &merge_result.ingested,
+                    replies.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                observation.publication_set_digest,
+                subject.digest().unwrap()
+            );
+            store.connection.execute(
+                "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'ticket_run:other-ticket-run:coordinator','merge_assessment_claim_rejected','other-ticket-evidence',?2,100,?3,'pending',1)",
+                rusqlite::params![project_id.as_str(),assessing.revision,serde_json::json!({"kind":"merge_assessment_claim_rejected","ticket_run_id":"other-ticket-run","publication_set_digest":subject.digest().unwrap().as_str()}).to_string()],
+            ).unwrap();
+            assert!(
+                crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    &merge_result.ingested,
+                    observation.clone(),
+                    None,
+                )
+                .unwrap()
+            );
+            let correction_wakes = store
+                .pending_role_wake_inputs(
+                    &project_id,
+                    &format!("ticket_run:{ticket_run_id}:coordinator"),
+                    8,
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|wake| {
+                    wake.source_type == "merge_assessment_claim_rejected"
+                        && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(correction_wakes.len(), 1);
+            assert_eq!(
+                correction_wakes[0].source_type,
+                "merge_assessment_claim_rejected"
+            );
+            assert_eq!(
+                correction_wakes[0].payload_json["expected_pull_request_reference"],
+                expected_pr_reference
+            );
+            let coordinator_wake = &correction_wakes[0];
+            let coordinator_wake_item = crate::agent_api::AgentWakeItem {
+                wake_input_id: coordinator_wake.wake_input_id,
+                source_type: coordinator_wake.source_type.clone(),
+                source_id: coordinator_wake.source_id.clone(),
+                source_revision: coordinator_wake.source_revision,
+                priority: coordinator_wake.priority,
+                payload_json: coordinator_wake.payload_json.clone(),
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            };
+            let merge_node = accepted.proposal.nodes.first().unwrap();
+            let coordinator_request = crate::engine::orchestration::SpawnRequestPayload {
+                work_node: merge_node.id.clone(),
+                role: crate::domain::types::Role::MergeDecision,
+                profile_id: crate::domain::ids::ProfileId::parse("worker_codex").unwrap(),
+                plan_digest: Some(accepted.plan_digest.clone()),
+                worker_recovery: None,
+                allowed_repositories: vec![repository_id.clone()],
+                artifact_inputs: Vec::new(),
+                parent_run_id: None,
+            };
+            let coordinator_payload = serde_json::to_value(&coordinator_request).unwrap();
+            let coordinator_result_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-coordinator-correct-merge-reference".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::SpawnRequest,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&coordinator_payload.to_string())).unwrap(),
+                ),
+                structured_result: coordinator_payload,
+                artifact_refs: Vec::new(),
+            };
+            let coordinator_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::Coordinator,
+                coordinator_result_message,
+                crate::domain::ids::AgentRunId::parse("single-publication-correct-merge-coordinator").unwrap(),
+                vec![coordinator_wake_item.clone()],
+            ).unwrap();
+            let coordinator_authority = store
+                .agent_launch_authority(&coordinator_result.ingested.validated.binding.agent_run_id)
+                .unwrap()
+                .unwrap();
+            let mut correction_snapshot = crate::agent_api::AgentWakeSnapshot {
+                schema_version: 1,
+                project_id: project_id.clone(),
+                role_session_id: coordinator_authority.role_session_id.clone(),
+                agent_run_id: coordinator_authority.agent_run_id.to_string(),
+                digest: Digest::parse("0".repeat(64)).unwrap(),
+                inputs: vec![coordinator_wake_item],
+                worker_correction_context: None,
+            };
+            correction_snapshot.digest = correction_snapshot.content_digest().unwrap();
+            let coordinator_mailbox = coordinator_authority.control_dir.join("mailbox");
+            crate::agent_api::publish_wake_snapshot(
+                &coordinator_mailbox,
+                correction_snapshot.clone(),
+            )
+            .unwrap();
+            let inbox_args = [
+                "rex-projects",
+                "agent",
+                "inbox",
+                "--control-dir",
+                coordinator_mailbox.to_str().unwrap(),
+                "--run",
+                coordinator_authority.agent_run_id.as_str(),
+                "--json",
+            ];
+            let inbox_bytes = crate::cli::dispatch_agent_inbox_for_test(&inbox_args).unwrap();
+            let inbox_report: serde_json::Value =
+                crate::protocol::parse_unique(&inbox_bytes).unwrap();
+            let correction_inbox: Vec<crate::agent_api::AgentWakeItem> =
+                serde_json::from_value(inbox_report["inputs"].clone()).unwrap();
+            assert_eq!(correction_inbox, correction_snapshot.inputs);
+            assert_eq!(
+                correction_inbox[0].payload_json["expected_pull_request_reference"],
+                expected_pr_reference
+            );
+            assert!(
+                crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    &coordinator_result.ingested,
+                )
+                .unwrap()
+            );
+            store
+                .connection
+                .execute(
+                    "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                    [project_id.as_str()],
+                )
+                .unwrap();
+            store.connection.execute(
+                "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+                rusqlite::params![project_id.as_str(), owner_generation],
+            ).unwrap();
+            let child_session = format!("ticket_run:{ticket_run_id}:merge_decision");
+            let correction_candidates = store
+                .pending_role_wake_sessions(owner_generation, 16)
+                .unwrap();
+            let merge_candidate = correction_candidates
+                .iter()
+                .find(|candidate| candidate.role_session_id == child_session)
+                .expect(
+                    "Coordinator correction SpawnRequest becomes a MergeDecision launch candidate",
+                );
+            assert_eq!(
+                merge_candidate.role,
+                crate::domain::types::Role::MergeDecision
+            );
+            assert_eq!(merge_candidate.ticket_run_id.as_ref(), Some(&ticket_run_id));
+            if reject_twice {
+                let second_bad_message = crate::roles::RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "single-publication-merge-assessment-still-annotated".into(),
+                    kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                    assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                    result_digest: Some(
+                        Digest::parse(content_digest(&merge_result_json.to_string())).unwrap(),
+                    ),
+                    structured_result: merge_result_json.clone(),
+                    artifact_refs: Vec::new(),
+                };
+                let second_bad_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    second_bad_message,
+                    crate::domain::ids::AgentRunId::parse("single-publication-merge-run-still-annotated").unwrap(),
+                ).unwrap();
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                        &mut store,
+                        owner_generation,
+                        12,
+                        &config,
+                        config_digest.clone(),
+                        &second_bad_result.ingested,
+                        observation.clone(),
+                        None,
+                    )
+                    .unwrap()
+                );
+                let blocked = store
+                    .active_ticket_runs(owner_generation, 10)
+                    .unwrap()
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == ticket_run_id)
+                    .unwrap();
+                assert_eq!(blocked.phase, Phase::Assessing);
+                assert_eq!(blocked.activity, crate::engine::reducer::Activity::Blocked);
+                assert_eq!(
+                    blocked.external_status,
+                    crate::domain::types::TicketStatus::InProgress
+                );
+                assert!(
+                    store
+                        .trusted_merge_assessment(
+                            &project_id,
+                            &ticket_run_id,
+                            Revision(assessing.revision)
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                let supervisor_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("project:{project_id}:supervisor"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| wake.source_type == "merge_assessment_correction_exhausted")
+                    .collect::<Vec<_>>();
+                assert_eq!(supervisor_wakes.len(), 1);
+                assert_eq!(
+                    supervisor_wakes[0].payload_json["ticket_run_id"],
+                    ticket_run_id.as_str()
+                );
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                        &mut store,
+                        owner_generation,
+                        12,
+                        &config,
+                        config_digest.clone(),
+                        &second_bad_result.ingested,
+                        observation,
+                        None,
+                    )
+                    .unwrap()
+                );
+                let replayed_supervisor_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("project:{project_id}:supervisor"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| wake.source_type == "merge_assessment_correction_exhausted")
+                    .count();
+                assert_eq!(replayed_supervisor_wakes, 1);
+                return;
+            }
+            let mut corrected_merge_json = merge_result_json.clone();
+            corrected_merge_json["pr_references"] = serde_json::json!([expected_pr_reference]);
+            let corrected_merge_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-merge-assessment-corrected".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&corrected_merge_json.to_string())).unwrap(),
+                ),
+                structured_result: corrected_merge_json,
+                artifact_refs: Vec::new(),
+            };
+            let corrected_merge_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::MergeDecision,
+                corrected_merge_message,
+                crate::domain::ids::AgentRunId::parse("single-publication-merge-run-corrected").unwrap(),
+            ).unwrap();
+            let (corrected_observation, proposal) =
+                crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &corrected_merge_result.ingested,
+                    &accepted.proposal,
+                    &project_id,
+                    replies,
+                )
+                .unwrap();
+            assert_eq!(
+                corrected_observation.publication_set_digest,
+                subject.digest().unwrap()
+            );
+            assert_eq!(proposal.publication_set_digest, subject.digest().unwrap());
+            assert_eq!(
+                crate::store::agent_results::host_validation_fixture::result_ack(
+                    &store,
+                    merge_result.ingested.receipt.evidence_id()
+                )
+                .unwrap(),
+                Some((assessing.revision, "rejected_by_host".into()))
+            );
+            assert!(
+                crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    &corrected_merge_result.ingested,
+                    corrected_observation,
+                    Some(proposal),
+                )
+                .unwrap()
+            );
+            let trusted = store
+                .trusted_merge_assessment(&project_id, &ticket_run_id, Revision(assessing.revision))
+                .unwrap()
+                .unwrap();
+            assert_eq!(trusted.publication_set_digest, subject.digest().unwrap());
+            assert_eq!(
+                trusted
+                    .prepared_body_proposal
+                    .as_ref()
+                    .unwrap()
+                    .exact_target_body,
+                "Co-authored-by: Codex <noreply@openai.com>"
+            );
+            let wakes = store
+                .pending_role_wake_inputs(
+                    &project_id,
+                    &format!("ticket_run:{ticket_run_id}:merge_decision"),
+                    8,
+                )
+                .unwrap();
+            let matching_wakes = wakes
+                .iter()
+                .filter(|wake| {
+                    wake.payload_json["assessment"]["assessment_id"]
+                        == trusted.assessment_id.as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matching_wakes.len(), 1);
+            let wake = &matching_wakes[0];
+            let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+                schema_version: 1,
+                project_id: project_id.clone(),
+                role_session_id: format!("ticket_run:{ticket_run_id}:merge_decision"),
+                agent_run_id: merge_result
+                    .ingested
+                    .validated
+                    .binding
+                    .agent_run_id
+                    .to_string(),
+                digest: Digest::parse("0".repeat(64)).unwrap(),
+                inputs: vec![crate::agent_api::AgentWakeItem {
+                    wake_input_id: wake.wake_input_id,
+                    source_type: wake.source_type.clone(),
+                    source_id: wake.source_id.clone(),
+                    source_revision: wake.source_revision,
+                    priority: wake.priority,
+                    payload_json: wake.payload_json.clone(),
+                    host_artifact_source_evidence_ids: Vec::new(),
+                    host_artifacts: Vec::new(),
+                    host_completion_context: None,
+                }],
+
+                worker_correction_context: None,
+            };
+            wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+            let control_dir = temp.path().join("merge-agent-control");
+            std::fs::create_dir(&control_dir).unwrap();
+            let merge_agent_run_id = merge_result
+                .ingested
+                .validated
+                .binding
+                .agent_run_id
+                .to_string();
+            crate::mailbox::MailboxCapability::create(
+                merge_agent_run_id.clone(),
+                &control_dir,
+                u64::MAX,
+                crate::mailbox::MailboxLimits::default(),
+            )
+            .unwrap();
+            crate::agent_api::publish_wake_snapshot(&control_dir, wake_snapshot).unwrap();
+            let public_inputs =
+                crate::agent_api::read_inbox(&control_dir, &merge_agent_run_id, 0).unwrap();
+            assert_eq!(public_inputs.len(), 1);
+            let control_dir_string = control_dir.to_string_lossy().into_owned();
+            let cli_json = crate::cli::dispatch_agent_inbox_for_test(&[
+                "rex-projects",
+                "agent",
+                "inbox",
+                "--run",
+                &merge_agent_run_id,
+                "--control-dir",
+                &control_dir_string,
+                "--json",
+            ])
+            .unwrap();
+            let cli_report: serde_json::Value = serde_json::from_slice(&cli_json).unwrap();
+            assert_eq!(cli_report["run_id"], merge_agent_run_id);
+            assert_eq!(cli_report["inputs"].as_array().unwrap().len(), 1);
+            let cli_input = &cli_report["inputs"][0];
+            assert_eq!(cli_input["source_type"], "host_merge_assessment");
+            assert_eq!(cli_input, &serde_json::to_value(&public_inputs[0]).unwrap());
+            let public_assessment = &cli_input["payload_json"]["assessment"];
+            assert_eq!(
+                public_assessment["assessment_id"],
+                trusted.assessment_id.as_str()
+            );
+            assert_eq!(
+                public_assessment["policy_digest"],
+                trusted.policy_digest.as_str()
+            );
+            assert_eq!(
+                public_assessment["prepared_body_proposal"]["target_body_digest"],
+                trusted
+                    .prepared_body_proposal
+                    .as_ref()
+                    .unwrap()
+                    .target_body_digest
+                    .as_str()
+            );
+            let rendered_merge_prompt = crate::roles::render_role_prompt(
+                &applied,
+                &crate::roles::PromptContext {
+                    project_id: project_id.clone(),
+                    profile_id: None,
+                    role: crate::domain::types::Role::MergeDecision,
+                    operation_recipe: None,
+                    repositories: vec![repository_id.clone()],
+                    ticket: Some(crate::roles::TicketBrief {
+                        ticket_id: ticket_id.clone(),
+                        ticket_revision: assessing.revision,
+                        title: "Improve safety".into(),
+                        body: "Implement the requested change".into(),
+                        acceptance: vec!["The change is verified".into()],
+                    }),
+                    recovery_summary: None,
+                    accepted_plan: Some(serde_json::to_string(&accepted.proposal).unwrap()),
+                    accepted_plan_digest: Some(accepted.plan_digest.clone()),
+                    implementation_publication_subject: Some(subject.clone()),
+                    completion_context: None,
+                    previous_decisions: Vec::new(),
+                    required_evidence: Vec::new(),
+                    stop_conditions: Vec::new(),
+                    assigned_commit_mode: None,
+                },
+                &std::env::current_exe().unwrap(),
+            )
+            .unwrap();
+            let merge_instruction_source = rendered_merge_prompt
+                .instruction_sources
+                .iter()
+                .find(|source| {
+                    source.layer == "merge-procedure"
+                        && source.source == format!("repository:{repository_id}:merge")
+                })
+                .expect("rendered MergeDecision prompt includes the repository merge source")
+                .source
+                .clone();
+            let typed_intent = if direct_merge_intent {
+                let template = include_str!("../xtask/src/fixtures/merge_intent.json")
+                    .replace("{repository_id}", repository_id.as_str());
+                let mut payload: serde_json::Value = serde_json::from_str(&template).unwrap();
+                payload["assessment_id"] = public_assessment["assessment_id"].clone();
+                payload["pr_identities"] =
+                    serde_json::json!([public_assessment["pull_request_reference"]
+                        .as_str()
+                        .unwrap()]);
+                payload["policy_digest"] = public_assessment["policy_digest"].clone();
+                payload["prepared_body_digest"] =
+                    public_assessment["prepared_body_proposal"]["target_body_digest"].clone();
+                payload
+            } else {
+                serde_json::json!({
+                    "assessment_id": public_assessment["assessment_id"],
+                    "pr_identities": [public_assessment["pull_request_reference"].as_str().unwrap()],
+                    "policy_digest": public_assessment["policy_digest"],
+                    "prepared_body_digest": public_assessment["prepared_body_proposal"]["target_body_digest"],
+                    "steps": [
+                        {"kind":"update_pull_request_body","instruction_reference":format!("{merge_instruction_source}#prepare-body"),"rationale":"add the host-prepared authorship trailer"},
+                        {"kind":"request_merge","instruction_reference":format!("{merge_instruction_source}#request-merge"),"rationale":"request the configured merge"},
+                        {"kind":"verify_merge_commit","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"verify the resulting merge commit"}
+                    ],
+                    "post_merge_verification": [
+                        {"kind":"merge_commit_recorded","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"confirm the remote merge commit"}
+                    ]
+                })
+            };
+            let intent_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "single-publication-merge-intent".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: None,
+                structured_result: typed_intent.clone(),
+                artifact_refs: Vec::new(),
+            };
+            let bound_intent = intent_message
+                .bind(merge_result.ingested.validated.binding.clone())
+                .unwrap();
+            let crate::engine::orchestration::RoleResultPayload::MergeIntent(intent_payload) =
+                bound_intent.typed_payload
+            else {
+                panic!("public inbox intent did not bind to MergeIntent");
+            };
+            let host_intent = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::MergeDecision,
+                crate::roles::RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "single-publication-merge-intent-result".into(),
+                    kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                    assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                    result_digest: None,
+                    structured_result: typed_intent.clone(),
+                    artifact_refs: Vec::new(),
+                },
+                crate::domain::ids::AgentRunId::parse("single-publication-intent-run").unwrap(),
+            )
+            .unwrap();
+            let document_replies = vec![
+                serde_json::json!({"id":7,"full_name":"acme/repo-a","default_branch":"main","allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}),
+                serde_json::json!({"node_id":publication.pull_request_node_id,"number":publication.pull_request_number,"state":"open","draft":false,"merged":false,"head":{"sha":publication.published_head,"ref":"feature","repo":{"id":7}},"base":{"sha":"b".repeat(40),"ref":"main","repo":{"id":7}},"body":null}),
+                serde_json::json!([]),
+                serde_json::json!({"check_runs":[]}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!({"name":"main","protected":true}),
+                serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
+            ];
+            let document =
+                crate::runtime_services::merge::tests::prepare_merge_work_document_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &accepted.proposal,
+                    &trusted,
+                    &intent_payload,
+                    &host_intent.ingested,
+                    document_replies.clone(),
+                )
+                .unwrap();
+            if direct_merge_intent {
+                assert!(matches!(
+                    document.procedure.steps[0].operation,
+                    crate::merge_policy::MergeProcedureOperation::UpdatePullRequestBody { .. }
+                ));
+                assert!(matches!(
+                    document.procedure.steps[1].operation,
+                    crate::merge_policy::MergeProcedureOperation::ExecuteMerge { .. }
+                ));
+                assert!(matches!(
+                    document.procedure.steps[2].operation,
+                    crate::merge_policy::MergeProcedureOperation::VerifyMergeCommit { .. }
+                ));
+                assert_eq!(document.intent.post_merge_verification.len(), 1);
+                assert_eq!(
+                    document.intent.post_merge_verification[0].kind,
+                    crate::engine::orchestration::PostMergeVerificationKind::MergeCommitRecorded
+                );
+                let mut unsupported = typed_intent.clone();
+                unsupported["post_merge_verification"][0]["kind"] =
+                    serde_json::json!("target_branch_contains_commit");
+                let unsupported: crate::engine::orchestration::MergeIntentPayload =
+                    serde_json::from_value(unsupported).unwrap();
+                let unsupported_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "unsupported-post-merge-kind".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: None,
+                        structured_result: serde_json::to_value(&unsupported).unwrap(),
+                        artifact_refs: Vec::new(),
+                    },
+                    crate::domain::ids::AgentRunId::parse("unsupported-post-merge-run").unwrap(),
+                )
+                .unwrap();
+                let error = crate::runtime_services::merge::tests::prepare_merge_work_document_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &accepted.proposal,
+                    &trusted,
+                    &unsupported,
+                    &unsupported_result.ingested,
+                    document_replies,
+                )
+                .unwrap_err();
+                assert!(error.contains("host currently supports only"), "{error}");
+                let saved_documents: u64 = store
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM merge_work_items", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(saved_documents, 0);
+                let saved_reviews: u64 = store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM effects WHERE kind='request_human_review'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(saved_reviews, 0);
+                return;
+            }
+            assert!(matches!(
+                document.procedure.steps[1].operation,
+                crate::merge_policy::MergeProcedureOperation::RequestMerge { ref exact_comment }
+                    if exact_comment == "/merge"
+            ));
+            let trusted_merge_source = document
+                .authority
+                .sources
+                .get(&merge_instruction_source)
+                .expect("the rendered merge source is carried into host authority");
+            assert_eq!(
+                trusted_merge_source.bytes,
+                applied.config.repositories[&repository_id]
+                    .merge
+                    .instructions
+                    .as_deref()
+                    .unwrap()
+                    .as_bytes()
+            );
+            for (index, invalid_identity) in
+                ["acme/repo-a#4", "https://github.com/foreign/repo/pull/4"]
+                    .into_iter()
+                    .enumerate()
+            {
+                let mut invalid_intent = typed_intent.clone();
+                invalid_intent["pr_identities"] = serde_json::json!([invalid_identity]);
+                let invalid_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: format!("invalid-merge-intent-identity-{index}"),
+                        kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: None,
+                        structured_result: invalid_intent,
+                        artifact_refs: Vec::new(),
+                    },
+                    crate::domain::ids::AgentRunId::parse(format!(
+                        "single-publication-invalid-intent-{index}"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                let error = crate::engine::factory_runtime::tests::apply_merge_intent_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    &invalid_result.ingested,
+                    document.clone(),
+                )
+                .unwrap_err();
+                assert!(error.contains("MergeIntent does not match"), "{error}");
+                assert!(
+                    store
+                        .validated_agent_result_ack(invalid_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let human_effect_count: u64 = store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM effects WHERE kind='request_human_review' AND subject_id=?1",
+                    [ticket_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(human_effect_count, 0);
+            let first_operation = &document.procedure.steps[0].operation;
+            assert!(matches!(
+                first_operation,
+                crate::merge_policy::MergeProcedureOperation::UpdatePullRequestBody {
+                    expected_prior_body_digest,
+                    ..
+                } if expected_prior_body_digest.as_str() == format!("{:x}", sha2::Sha256::digest(b""))
+            ));
+            assert!(
+                crate::engine::factory_runtime::tests::apply_merge_intent_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    &host_intent.ingested,
+                    document,
+                )
+                .unwrap()
+            );
+            let human_effect_json: String = store
+                .connection
+                .query_row(
+                    "SELECT request_json FROM effects WHERE kind='request_human_review' ORDER BY created_at_unix DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let status_effect_json: String = store
+                .connection
+                .query_row(
+                    "SELECT request_json FROM effects WHERE kind='publish_ticket_status' AND subject_id=?1 ORDER BY created_at_unix DESC LIMIT 1",
+                    [ticket_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let status_payload: crate::engine::ticket_effects::PublishTicketStatus =
+                crate::protocol::parse_unique(status_effect_json.as_bytes()).unwrap();
+            assert_eq!(status_payload.project_id, project_id);
+            assert_eq!(status_payload.namespace, ticket_namespace);
+            assert_eq!(status_payload.ticket_id, ticket_id);
+            assert_eq!(status_payload.ticket_run_id, ticket_run_id);
+            assert_eq!(
+                status_payload.expected_external_revision.as_deref(),
+                Some("revision-1")
+            );
+            assert_eq!(
+                status_payload.ticket_run_revision,
+                host_intent
+                    .ingested
+                    .validated
+                    .binding
+                    .ticket_revision
+                    .unwrap()
+                    .0
+                    + 1
+            );
+            assert_eq!(
+                status_payload.desired_status,
+                crate::domain::types::TicketStatus::InReview
+            );
+            status_payload.validate().unwrap();
+            let human_effect: crate::human_runtime::HumanPresentationEffect =
+                crate::protocol::parse_unique(human_effect_json.as_bytes()).unwrap();
+            assert_eq!(
+                human_effect.request.purpose,
+                crate::human_runtime::HumanPurpose::TicketReview
+            );
+            assert_eq!(
+                human_effect.request.subject.ticket_run_id.as_ref(),
+                Some(&ticket_run_id)
+            );
+            assert!(
+                human_effect
+                    .request
+                    .review_bundle
+                    .summary
+                    .contains("risk index: 43/100; human-facing rating: 2/4")
+            );
+            struct EchoHumanSubjectObserver;
+            impl crate::human_runtime::HumanSubjectObserver for EchoHumanSubjectObserver {
+                fn observe_current_subject(
+                    &self,
+                    _: &crate::store::ConfigStore,
+                    request: &crate::human_runtime::HumanRuntimeRequest,
+                ) -> Result<crate::human_runtime::HumanSubjectObservation, String> {
+                    Ok(crate::human_runtime::HumanSubjectObservation::Current(
+                        request.subject.clone(),
+                    ))
+                }
+            }
+            let effect_due_at: i64 = store
+                .connection
+                .query_row(
+                    "SELECT next_attempt_at_unix FROM effects WHERE kind='request_human_review' AND subject_id=?1",
+                    [ticket_run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let claimed = store
+                .claim_next_due_effect(
+                    owner_generation,
+                    effect_due_at,
+                    &["request_human_review".into()],
+                )
+                .unwrap()
+                .expect("MergeIntent creates a due human review effect");
+            let handler = crate::human_runtime::HumanPresenterEffectHandler::new(
+                "local_html",
+                vec!["/usr/bin/true".into()],
+                [(
+                    std::ffi::OsString::from("PATH"),
+                    std::ffi::OsString::from("/usr/bin"),
+                )]
+                .into_iter()
+                .collect(),
+                temp.path().join("merge-intent-review-artifacts"),
+                std::sync::Arc::new(EchoHumanSubjectObserver),
+            )
+            .unwrap();
+            let mut effect_context = crate::effects::EffectContext {
+                store: &mut store,
+                owner_generation,
+                now_unix: 12,
+            };
+            let observation = crate::effects::EffectHandler::handle(
+                &handler,
+                crate::effects::EffectMode::Submit,
+                &crate::effects::EffectRequest::from(claimed),
+                &mut effect_context,
+            )
+            .unwrap();
+            assert!(matches!(
+                observation,
+                crate::effects::EffectObservation::Pending { .. }
+            ));
+            let saved_request = effect_context
+                .store
+                .current_human_request(&human_effect.request.request_id)
+                .unwrap()
+                .expect("MergeIntent reaches the durable human request store");
+            assert_eq!(saved_request.request, human_effect.request);
+            assert_eq!(
+                saved_request.lifecycle,
+                crate::human_runtime::HumanRequestLifecycle::Presented
+            );
+            return;
+        }
+        let pending = store
+            .connection
+            .query_row(
+                "SELECT request_json,expected_revision FROM effects WHERE kind='prepare_worktrees' AND operation_id<>'prepare-root'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .unwrap();
+        let staged_request: PrepareWorktreesEffectPayload =
+            serde_json::from_str(&pending.0).unwrap();
+        assert_eq!(pending.1, 5);
+        assert_eq!(staged_request.work_nodes[0].work_node_id, stacked_id);
+        assert_eq!(staged_request.work_nodes[0].expected_base_sha, first_head);
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Preparing
+        );
+
+        let staged_branch = "rex/run-staged-1/node-a";
+        let staged_prepared = PreparedWorktreesEffectReceipt {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            work_nodes: vec![PreparedWorktreeReceiptNode {
+                work_node_id: stacked_id.clone(),
+                repository_id: repository_id.clone(),
+                worktree_path: worker_worktree.clone(),
+                branch: staged_branch.into(),
+                base_sha: first_head.clone(),
+                commit_mode: CommitMode::Native,
+                base_refresh: None,
+                base_refresh_source: None,
+            }],
+            base_refreshes: Vec::new(),
+        };
+        let staged_intent = EffectIntent {
+            request_json: pending.0.clone(),
+            request_digest: content_digest(&pending.0),
+            operation_id: store
+                .connection
+                .query_row(
+                    "SELECT operation_id FROM effects WHERE kind='prepare_worktrees' AND operation_id<>'prepare-root'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            project_id: project_id.clone(),
+            subject_type: "ticket_run".into(),
+            subject_id: ticket_run_id.as_str().into(),
+            logical_key: "staged-prepare".into(),
+            kind: "prepare_worktrees".into(),
+            expected_revision: Some(5),
+        };
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET status='succeeded',attempt_count=1,receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![
+                    staged_intent.operation_id,
+                    serde_json::to_string(&staged_prepared).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                11,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Implementing
+        );
+
+        let second_head = "e".repeat(40);
+        let (second_publish_intent, second_publish_receipt) = publication(
+            &stacked_id,
+            &first_head,
+            &second_head,
+            staged_branch,
+            7,
+            "publish-stacked",
+        );
+        insert_succeeded_test_effect(&mut store, &second_publish_intent, &second_publish_receipt);
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET internal_phase='publishing',revision=7 WHERE ticket_run_id=?1",
+                [ticket_run_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM effects WHERE operation_id='publish-root'", [])
+            .unwrap();
+        assert!(
+            !crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                12,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Publishing
+        );
+        insert_succeeded_test_effect(&mut store, &first_publish_intent, &first_publish_receipt);
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                13,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        let reviewing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(reviewing.phase, Phase::Reviewing);
+        let snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                reviewing.revision,
+            )
+            .unwrap();
+        assert_eq!(snapshot.publication_revision(), reviewing.revision);
+        assert_eq!(snapshot.publication_receipts().len(), 2);
+        crate::delivery_runtime::validate_implementation_publication_receipt(
+            &snapshot.accepted_plan().proposal,
+            snapshot.prepared_receipt(),
+            &project_id,
+            &config.repositories,
+            snapshot.publication_receipts(),
+        )
+        .unwrap();
+        let publication_revision = snapshot.publication_revision();
+        let evidence_json: String = store.connection.query_row(
+            "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision],
+            |row| row.get(0),
+        ).unwrap();
+        let mut wrong_node: serde_json::Value = serde_json::from_str(&evidence_json).unwrap();
+        wrong_node["publication_receipts"][0]["work_node_id"] = serde_json::json!("unknown-node");
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, wrong_node.to_string()],
+        ).unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision
+                )
+                .is_err()
+        );
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, evidence_json],
+        ).unwrap();
+
+        let bound = snapshot.publication_receipts()[0].clone();
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json='{}' WHERE operation_id=?1",
+                [bound.intent().operation_id.as_str()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                rusqlite::params![bound.intent().operation_id.as_str(), bound.receipt_json()],
+            )
+            .unwrap();
+
+        let mut wrong_configuration: serde_json::Value =
+            serde_json::from_str(&evidence_json).unwrap();
+        wrong_configuration["configuration_digest"] = serde_json::json!("f".repeat(64));
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, wrong_configuration.to_string()],
+        ).unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision
+                )
+                .is_err()
+        );
+        store.connection.execute(
+            "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+            rusqlite::params![ticket_run_id.as_str(), publication_revision, evidence_json],
+        ).unwrap();
+        assert!(
+            store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    reviewing.revision - 1,
+                )
+                .is_err()
+        );
+
+        let corrections_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "review_assessment",
+            "source_revision": reviewing.revision,
+            "accepted_revision": reviewing.revision + 1,
+            "transition": "corrections_remain",
+        })
+        .to_string();
+        let corrections_input = DurableInput {
+            producer_id: "reviewer-test".into(),
+            message_id: "review-corrections-for-snapshot-test".into(),
+            content_digest: durable_input_digest("ticket_run", &corrections_payload),
+            recipient: "ticket_run".into(),
+            payload: corrections_payload.clone(),
+        };
+        store
+            .commit_ticket_transition(
+                owner_generation,
+                &ticket_run_id,
+                Revision(reviewing.revision),
+                &corrections_input,
+                Input::CorrectionsRemain,
+                "test accepted correction transition",
+                &corrections_payload,
+                &[],
+            )
+            .unwrap();
+        let correcting = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        let (corrected_intent, corrected_receipt) = publication(
+            &stacked_id,
+            &first_head,
+            &corrected_head,
+            staged_branch,
+            correcting.revision + 1,
+            "publish-stacked-correction",
+        );
+        let evidence_payload = serde_json::json!({
+            "schema_version": 1,
+            "kind": "worker_evidence",
+            "source_revision": correcting.revision,
+        })
+        .to_string();
+        let evidence_input = DurableInput {
+            producer_id: "worker-test".into(),
+            message_id: "worker-correction-evidence-for-snapshot-test".into(),
+            content_digest: durable_input_digest("ticket_run", &evidence_payload),
+            recipient: "ticket_run".into(),
+            payload: evidence_payload.clone(),
+        };
+        store
+            .commit_ticket_transition(
+                owner_generation,
+                &ticket_run_id,
+                Revision(correcting.revision),
+                &evidence_input,
+                Input::EvidenceSubmitted,
+                "test submitted correction evidence",
+                &evidence_payload,
+                std::slice::from_ref(&corrected_intent),
+            )
+            .unwrap();
+        store.connection.execute(
+            "UPDATE effects SET status='succeeded',attempt_count=1,receipt_json=?2 WHERE operation_id=?1",
+            rusqlite::params![corrected_intent.operation_id, serde_json::to_string(&corrected_receipt).unwrap()],
+        ).unwrap();
+        assert!(
+            crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                15,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        let corrected_review = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(corrected_review.phase, Phase::Reviewing);
+        let corrected_snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                corrected_review.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            corrected_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        assert_ne!(
+            corrected_snapshot.publication_revision(),
+            snapshot.publication_revision()
+        );
+        assert!(
+            corrected_snapshot
+                .publication_receipts()
+                .iter()
+                .any(|receipt| receipt.intent().operation_id == corrected_intent.operation_id)
+        );
+        let accepted_plan = corrected_snapshot.accepted_plan();
+
+        let human_direction =
+            "Keep the current plan and make the requested correction before reporting completion.";
+        store
+            .enqueue_coordinator_instruction(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                &ticket_namespace,
+                &ticket_id,
+                corrected_review.revision,
+                "correction-direction",
+                human_direction,
+                20,
+            )
+            .unwrap();
+        let coordinator_wakes = store
+            .pending_role_wake_inputs(
+                &project_id,
+                &format!("ticket_run:{ticket_run_id}:coordinator"),
+                8,
+            )
+            .unwrap();
+        assert!(coordinator_wakes.iter().any(|wake| {
+            wake.source_type == "human_instruction"
+                && wake.source_id == "correction-direction"
+                && wake.payload_json["body"] == human_direction
+        }));
+
+        let review_publications =
+            crate::delivery_runtime::validate_implementation_publication_receipt(
+                &accepted_plan.proposal,
+                corrected_snapshot.prepared_receipt(),
+                &project_id,
+                &config.repositories,
+                corrected_snapshot.publication_receipts(),
+            )
+            .unwrap();
+        let review_subject = crate::delivery_runtime::implementation_publication_set_subject(
+            &accepted_plan.plan_digest,
+            &accepted_plan.proposal,
+            &review_publications,
+            corrected_snapshot.publication_receipts(),
+            corrected_snapshot.publication_revision(),
+        )
+        .unwrap();
+        let review_finding = "Add a regression for the accepted correction before handoff.";
+        let verification_correction_json = serde_json::json!({
+            "subject_kind": "implementation_publication_set",
+            "subject_digest": review_subject.digest().unwrap(),
+            "findings": [review_finding],
+            "evidence_coverage": review_subject.coverage.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            "disposition": "changes_requested",
+            "unknowns": [],
+        });
+        let reviewer_correction = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+            &mut store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Reviewer,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "reviewer-requested-correction".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::ReviewReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&verification_correction_json.to_string())).unwrap(),
+                ),
+                structured_result: verification_correction_json,
+                artifact_refs: Vec::new(),
+            },
+            crate::domain::ids::AgentRunId::parse("reviewer-requested-correction-run").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &reviewer_correction.ingested,
+            )
+            .unwrap()
+        );
+        let verification_run = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(verification_run.phase, Phase::Implementing);
+
+        let prepared_receipt = store
+            .succeeded_effect_receipt(&staged_intent.operation_id)
+            .unwrap()
+            .unwrap();
+        let project_config = config.projects.get(&project_id).unwrap();
+        let prepared_worker = store
+            .prepared_worker_launch(
+                owner_generation,
+                2,
+                &stacked_id,
+                &prepared_receipt,
+                project_config,
+                &config_digest,
+            )
+            .unwrap()
+            .expect("the correction Worker must have a host-prepared assignment");
+        let worker_assignment = prepared_worker.reservation_binding();
+        assert_eq!(worker_assignment.expected_head(), corrected_head);
+
+        let verification_plan = store
+            .latest_accepted_work_plan(&project_id, &ticket_run_id)
+            .unwrap()
+            .unwrap();
+        let validated_verification_plan = verification_plan
+            .validate_for(project_config, &config_digest)
+            .unwrap();
+        let verification_node = validated_verification_plan
+            .nodes_in_execution_order
+            .iter()
+            .find(|node| node.id == stacked_id)
+            .unwrap();
+        let rework_assignment = crate::runtime_services::prepared_worker_assignment_for_test(
+            &store,
+            owner_generation,
+            &verification_plan,
+            &validated_verification_plan,
+            &prepared_worker,
+            verification_node,
+            None,
+        )
+        .unwrap();
+        let rework_assignment_path = temp.path().join("review-rework-worker-assignment.json");
+        std::fs::write(&rework_assignment_path, &rework_assignment).unwrap();
+        let rework_assignment: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&rework_assignment_path).unwrap()).unwrap();
+        assert_eq!(
+            rework_assignment["worker_correction_context"]["coordinator_instruction"]["body"],
+            human_direction
+        );
+        assert_eq!(
+            rework_assignment["worker_correction_context"]["reviewer_correction"]["assessment"]["findings"]
+                [0],
+            review_finding
+        );
+        let recovery_authorization = crate::engine::orchestration::WorkerRecoveryAuthorization {
+            schema_version: 1,
+            ticket_run_id: ticket_run_id.clone(),
+            ticket_revision: verification_run.revision,
+            work_node_id: stacked_id.clone(),
+            accepted_plan_digest: verification_plan.plan_digest.clone(),
+            prior_worker_agent_run_id: crate::domain::ids::AgentRunId::parse(
+                "prior-verification-worker-run",
+            )
+            .unwrap(),
+            prior_terminal_digest: Digest::parse("1".repeat(64)).unwrap(),
+            prior_absence_digest: Digest::parse("2".repeat(64)).unwrap(),
+            prior_host_commit_operation_id: None,
+            prior_host_commit_receipt_digest: None,
+            expected_head: corrected_head.clone(),
+            source_coordinator_evidence_id: coordinator_result
+                .ingested
+                .receipt
+                .evidence_id()
+                .to_owned(),
+            prior_worker_result_evidence_id: "prior-worker-result-evidence".into(),
+            prior_artifact_refs: Vec::new(),
+        };
+        let recovery_assignment = crate::runtime_services::prepared_worker_assignment_for_test(
+            &store,
+            owner_generation,
+            &verification_plan,
+            &validated_verification_plan,
+            &prepared_worker,
+            verification_node,
+            Some(&recovery_authorization),
+        )
+        .unwrap();
+        let recovery_assignment: serde_json::Value =
+            serde_json::from_str(&recovery_assignment).unwrap();
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["verification_only"],
+            true
+        );
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["accepted_publication"]["publication_operation_id"],
+            corrected_intent.operation_id
+        );
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["accepted_publication"]["publication_revision"],
+            corrected_review.revision
+        );
+        assert_eq!(
+            recovery_assignment["prepared_worktree"]["accepted_publication"]["published_head"],
+            corrected_head
+        );
+        assert_eq!(
+            recovery_assignment["worker_recovery_authorization"]["expected_head"],
+            corrected_head
+        );
+
+        let worker_agent_run_id =
+            crate::domain::ids::AgentRunId::parse("verification-worker-run").unwrap();
+        let worker_payload = serde_json::json!({
+            "work_node_id": stacked_id,
+            "repository": repository_id,
+            "publication_operation_id": corrected_intent.operation_id,
+            "published_head": corrected_head,
+            "test_receipt_artifact_ids": [],
+        });
+        let worker_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+            &mut store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Worker,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "worker-verification-result".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::VerificationReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(Digest::parse("0".repeat(64)).unwrap()),
+                structured_result: worker_payload,
+                artifact_refs: Vec::new(),
+            },
+            worker_agent_run_id.clone(),
+        )
+        .unwrap();
+        let authority = store
+            .agent_launch_authority(&worker_agent_run_id)
+            .unwrap()
+            .unwrap();
+        let mut worker_wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: authority.role_session_id.clone(),
+            agent_run_id: worker_agent_run_id.to_string(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: Vec::new(),
+
+            worker_correction_context: None,
+        };
+        worker_wake_snapshot.digest = worker_wake_snapshot.content_digest().unwrap();
+        let project_epoch: u64 = store
+            .connection
+            .query_row(
+                "SELECT project_epoch FROM project_runtimes WHERE project_id=?1",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let worker_reservation = crate::launch::AgentLaunchReservation {
+            schema_version: 1,
+            agent_run_id: worker_agent_run_id.clone(),
+            project_id: project_id.clone(),
+            role: crate::domain::types::Role::Worker,
+            role_session_id: authority.role_session_id.clone(),
+            parent_run_id: authority.parent_run_id.clone(),
+            parent_role: authority.parent_role,
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(verification_run.revision)),
+            config_revision: authority.config_revision,
+            config_digest: authority.config_digest.clone(),
+            attempt: authority.attempt,
+            run_epoch: authority.run_epoch,
+            controller_generation: owner_generation,
+            project_epoch,
+            operation_id: authority.operation_id.clone(),
+            operation_recipe_id: authority.operation_recipe_id.clone(),
+            worker_assignment: Some(worker_assignment),
+            rex_view_id: authority.rex_view_id.clone(),
+            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+            profile_id: authority.profile_id.clone(),
+            profile_digest: authority.profile_digest.clone(),
+            instruction_digest: authority.instruction_digest.clone(),
+            result_schema_digest: authority.result_schema_digest.clone(),
+            wake_snapshot: worker_wake_snapshot,
+            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+            descriptor_path: authority.descriptor_path.clone(),
+            workspace_path: authority.workspace_path.clone(),
+            control_dir: authority.control_dir.clone(),
+            mailbox_directory: authority.control_dir.clone(),
+            mailbox_capability_digest: authority.mailbox_capability_digest.clone(),
+            mailbox_expires_at_unix: 9_999_999_999,
+            mailbox_max_request_bytes: 1_048_576,
+            mailbox_max_pending_requests: 32,
+            pool: "agent".into(),
+            slot_index: 3,
+            global_capacity: 4,
+            project_capacity: 4,
+        };
+        let reservation_json = crate::store::canonical_json(&worker_reservation).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'authorized',1,1)",
+                rusqlite::params![
+                    worker_agent_run_id.as_str(),
+                    project_id.as_str(),
+                    worker_reservation.operation_id.as_str(),
+                    owner_generation,
+                    project_epoch,
+                    worker_reservation.digest().unwrap().as_str(),
+                    reservation_json,
+                ],
+            )
+            .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &worker_result.ingested,
+            )
+            .unwrap()
+        );
+        let verification_review =
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        assert_eq!(verification_review.phase, Phase::Reviewing);
+        assert_eq!(verification_review.revision, corrected_review.revision + 2);
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                17,
+                &config,
+                config_digest.clone(),
+                &worker_result.ingested,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.active_ticket_runs(owner_generation, 10).unwrap()[0].revision,
+            verification_review.revision
+        );
+        let verification_snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                verification_review.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            verification_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        let accepted_verification = verification_snapshot
+            .verification()
+            .expect("host-accepted VerificationReady should be in the Reviewer subject");
+        assert_eq!(
+            accepted_verification.review_revision,
+            verification_review.revision
+        );
+        assert_eq!(
+            accepted_verification.published_head.as_str(),
+            corrected_head
+        );
+        assert_eq!(
+            accepted_verification.publication_operation_id.as_str(),
+            corrected_intent.operation_id
+        );
+        assert_eq!(accepted_verification.test_receipt_artifacts.len(), 1);
+        let worker_verification_ack: (u64, String) = store
+            .connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [worker_result.ingested.receipt.evidence_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            worker_verification_ack,
+            (verification_review.revision, "applied".into())
+        );
+
+        let second_correction_state = temp.path().join("second-correction-state");
+        std::fs::create_dir_all(&second_correction_state).unwrap();
+        let second_correction_database = second_correction_state.join("state.sqlite3");
+        store
+            .connection
+            .execute(
+                "VACUUM INTO ?1",
+                [second_correction_database.to_str().unwrap()],
+            )
+            .unwrap();
+        let mut second_correction_store = ConfigStore::open_test(&second_correction_state).unwrap();
+        let second_review_snapshot = second_correction_store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                verification_review.revision,
+            )
+            .unwrap();
+        let second_review_publications =
+            crate::delivery_runtime::validate_implementation_publication_receipt(
+                &second_review_snapshot.accepted_plan().proposal,
+                second_review_snapshot.prepared_receipt(),
+                &project_id,
+                &config.repositories,
+                second_review_snapshot.publication_receipts(),
+            )
+            .unwrap();
+        let mut second_review_subject =
+            crate::delivery_runtime::implementation_publication_set_subject(
+                &second_review_snapshot.accepted_plan().plan_digest,
+                &second_review_snapshot.accepted_plan().proposal,
+                &second_review_publications,
+                second_review_snapshot.publication_receipts(),
+                second_review_snapshot.publication_revision(),
+            )
+            .unwrap();
+        second_review_subject.verification = second_review_snapshot.verification().map(|value| {
+            crate::delivery_runtime::WorkerVerificationSubject {
+                review_revision: value.review_revision,
+                source_evidence_id: value.source_evidence_id.clone(),
+                source_agent_run_id: value.source_agent_run_id.clone(),
+                source_result_digest: value.source_result_digest.clone(),
+                publication_revision: value.publication_revision,
+                publication_operation_id: value.publication_operation_id.clone(),
+                published_head: value.published_head.as_str().to_owned(),
+                work_node_id: value.work_node_id.clone(),
+                repository_id: value.repository_id.clone(),
+                test_receipt_artifacts: value.test_receipt_artifacts.clone(),
+            }
+        });
+        let second_review_payload = serde_json::json!({
+            "subject_kind": "implementation_publication_set",
+            "subject_digest": second_review_subject.digest().unwrap(),
+            "findings": ["Verify the retained publication without creating an empty commit."],
+            "evidence_coverage": second_review_subject.coverage.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            "disposition": "changes_requested",
+            "unknowns": [],
+        });
+        let second_reviewer_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+            &mut second_correction_store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Reviewer,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "reviewer-requested-second-correction".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::ReviewReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(
+                    Digest::parse(content_digest(&second_review_payload.to_string())).unwrap(),
+                ),
+                structured_result: second_review_payload,
+                artifact_refs: Vec::new(),
+            },
+            crate::domain::ids::AgentRunId::parse("reviewer-requested-second-correction-run")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut second_correction_store,
+                owner_generation,
+                18,
+                &config,
+                config_digest.clone(),
+                &second_reviewer_result.ingested,
+            )
+            .unwrap()
+        );
+        let second_correcting = second_correction_store
+            .active_ticket_runs(owner_generation, 10)
+            .unwrap()[0]
+            .clone();
+        assert_eq!(second_correcting.phase, Phase::Implementing);
+        let second_correction_snapshot = second_correction_store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                second_correcting.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            second_correction_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        let second_correction_prepare_receipt = second_correction_store
+            .succeeded_effect_receipt(&staged_intent.operation_id)
+            .unwrap()
+            .unwrap();
+        let second_correction_prepared = second_correction_store
+            .prepared_worker_launch(
+                owner_generation,
+                2,
+                &stacked_id,
+                &second_correction_prepare_receipt,
+                project_config,
+                &config_digest,
+            )
+            .unwrap()
+            .expect("second correction must retain the host-accepted publication assignment");
+        assert_eq!(second_correction_prepared.expected_head(), corrected_head);
+
+        let second_worker_agent_run_id =
+            crate::domain::ids::AgentRunId::parse("verification-worker-run-second").unwrap();
+        let second_worker_payload = serde_json::json!({
+            "work_node_id": stacked_id,
+            "repository": repository_id,
+            "publication_operation_id": corrected_intent.operation_id,
+            "published_head": corrected_head,
+            "test_receipt_artifact_ids": [],
+        });
+        let source_authority = second_correction_store
+            .agent_launch_authority(&worker_result.ingested.validated.binding.agent_run_id)
+            .unwrap()
+            .unwrap();
+        let staged_artifacts = crate::parent_artifacts::stage_verified_parent_artifacts(
+            &mut second_correction_store,
+            &worker_result.artifacts,
+            &source_authority,
+            worker_result.ingested.receipt.evidence_id(),
+            &project_id,
+            source_authority.config_revision.0,
+            &config_digest,
+            &worker_worktree,
+            &worker_result.ingested.validated.claimed_artifact_refs,
+        )
+        .unwrap();
+        let second_worker_inputs = vec![crate::agent_api::AgentWakeItem {
+            wake_input_id: 1,
+            source_type: "agent_result".into(),
+            source_id: worker_result.ingested.receipt.evidence_id().to_owned(),
+            source_revision: source_authority.ticket_revision.unwrap().0,
+            priority: 1,
+            payload_json: serde_json::json!({}),
+            host_artifact_source_evidence_ids: Vec::new(),
+            host_artifacts: staged_artifacts,
+            host_completion_context: None,
+        }];
+        let frozen_correction_context =
+            crate::runtime_services::worker_correction_context_for_launch(
+                &second_correction_store,
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                second_correcting.revision,
+                &config_digest,
+                &verification_plan,
+            )
+            .unwrap()
+            .expect(
+                "accepted Coordinator direction and Reviewer correction freeze into Worker wake",
+            );
+        let second_worker_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs(
+            &mut second_correction_store,
+            &std::fs::canonicalize(temp.path()).unwrap(),
+            owner_generation,
+            project_id.clone(),
+            ticket_run_id.clone(),
+            crate::domain::types::Role::Worker,
+            crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "worker-verification-result-second".into(),
+                kind: crate::engine::orchestration::RoleOutputKind::VerificationReady,
+                assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                result_digest: Some(Digest::parse("0".repeat(64)).unwrap()),
+                structured_result: second_worker_payload,
+                artifact_refs: Vec::new(),
+            },
+            second_worker_agent_run_id.clone(),
+            second_worker_inputs.clone(),
+        )
+        .unwrap();
+        let second_worker_authority = second_correction_store
+            .agent_launch_authority(&second_worker_agent_run_id)
+            .unwrap()
+            .unwrap();
+        let mut second_worker_wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            role_session_id: second_worker_authority.role_session_id.clone(),
+            agent_run_id: second_worker_agent_run_id.to_string(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: second_worker_inputs,
+            worker_correction_context: None,
+        };
+        second_worker_wake_snapshot.digest = second_worker_wake_snapshot.content_digest().unwrap();
+        let second_worker_reservation = crate::launch::AgentLaunchReservation {
+            schema_version: 1,
+            agent_run_id: second_worker_agent_run_id.clone(),
+            project_id: project_id.clone(),
+            role: crate::domain::types::Role::Worker,
+            role_session_id: second_worker_authority.role_session_id.clone(),
+            parent_run_id: second_worker_authority.parent_run_id.clone(),
+            parent_role: second_worker_authority.parent_role,
+            ticket_run_id: Some(ticket_run_id.clone()),
+            ticket_revision: Some(Revision(second_correcting.revision)),
+            config_revision: second_worker_authority.config_revision,
+            config_digest: second_worker_authority.config_digest.clone(),
+            attempt: second_worker_authority.attempt,
+            run_epoch: second_worker_authority.run_epoch,
+            controller_generation: owner_generation,
+            project_epoch,
+            operation_id: second_worker_authority.operation_id.clone(),
+            operation_recipe_id: second_worker_authority.operation_recipe_id.clone(),
+            worker_assignment: Some(second_correction_prepared.reservation_binding()),
+            rex_view_id: second_worker_authority.rex_view_id.clone(),
+            runtime_binary_digest: second_worker_authority.runtime_binary_digest.clone(),
+            environment_snapshot_id: second_worker_authority.environment_snapshot_id.clone(),
+            profile_id: second_worker_authority.profile_id.clone(),
+            profile_digest: second_worker_authority.profile_digest.clone(),
+            instruction_digest: second_worker_authority.instruction_digest.clone(),
+            result_schema_digest: second_worker_authority.result_schema_digest.clone(),
+            wake_snapshot: second_worker_wake_snapshot,
+            qualification_receipt_digest: second_worker_authority
+                .qualification_receipt_digest
+                .clone(),
+            descriptor_path: second_worker_authority.descriptor_path.clone(),
+            workspace_path: second_worker_authority.workspace_path.clone(),
+            control_dir: second_worker_authority.control_dir.clone(),
+            mailbox_directory: second_worker_authority.control_dir.clone(),
+            mailbox_capability_digest: second_worker_authority.mailbox_capability_digest.clone(),
+            mailbox_expires_at_unix: 9_999_999_999,
+            mailbox_max_request_bytes: 1_048_576,
+            mailbox_max_pending_requests: 32,
+            pool: "agent".into(),
+            slot_index: 3,
+            global_capacity: 4,
+            project_capacity: 4,
+        };
+        let second_worker_reservation_json =
+            crate::store::canonical_json(&second_worker_reservation).unwrap();
+        second_correction_store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'authorized',1,1)",
+                rusqlite::params![
+                    second_worker_agent_run_id.as_str(),
+                    project_id.as_str(),
+                    second_worker_reservation.operation_id.as_str(),
+                    owner_generation,
+                    project_epoch,
+                    second_worker_reservation.digest().unwrap().as_str(),
+                    second_worker_reservation_json,
+                ],
+            )
+            .unwrap();
+        assert_registered_staging_survives_verification(
+            &mut second_correction_store,
+            temp.path(),
+            &worker_result,
+            &second_worker_reservation,
+        );
+        let mut frozen_reservation = second_worker_reservation.clone();
+        frozen_reservation.agent_run_id =
+            crate::domain::ids::AgentRunId::parse("frozen-worker-reservation").unwrap();
+        frozen_reservation.operation_id =
+            crate::domain::ids::OperationId::parse("start-frozen-worker-reservation").unwrap();
+        frozen_reservation.wake_snapshot.agent_run_id =
+            frozen_reservation.agent_run_id.as_str().to_owned();
+        frozen_reservation.wake_snapshot.worker_correction_context =
+            Some(frozen_correction_context.clone());
+        frozen_reservation.wake_snapshot.digest =
+            frozen_reservation.wake_snapshot.content_digest().unwrap();
+        frozen_reservation.digest().unwrap();
+        second_correction_store
+            .connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation,role) SELECT ?1,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,?2,'completed',controller_generation,'worker' FROM agent_runs WHERE agent_run_id=?3",
+                rusqlite::params![
+                    frozen_reservation.agent_run_id.as_str(),
+                    frozen_reservation.operation_id.as_str(),
+                    second_worker_agent_run_id.as_str(),
+                ],
+            )
+            .unwrap();
+        second_correction_store
+            .connection
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'authorized',1,1)",
+                rusqlite::params![
+                    frozen_reservation.agent_run_id.as_str(),
+                    project_id.as_str(),
+                    frozen_reservation.operation_id.as_str(),
+                    owner_generation,
+                    project_epoch,
+                    frozen_reservation.digest().unwrap().as_str(),
+                    crate::store::canonical_json(&frozen_reservation).unwrap(),
+                ],
+            )
+            .unwrap();
+        second_correction_store
+            .enqueue_coordinator_instruction(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                &ticket_namespace,
+                &ticket_id,
+                second_correcting.revision,
+                "later-correction-direction",
+                "Later direction B at the same revision.",
+                21,
+            )
+            .unwrap();
+        let later_instruction = second_correction_store
+            .latest_coordinator_instruction(&project_id, &ticket_run_id, second_correcting.revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            later_instruction.body,
+            "Later direction B at the same revision."
+        );
+        let frozen_reservation_digest = frozen_reservation.digest().unwrap();
+        let frozen_reservation = second_correction_store
+            .agent_launch_reservation(&frozen_reservation.agent_run_id, &frozen_reservation_digest)
+            .unwrap()
+            .unwrap();
+        let reserved_correction_context = frozen_reservation
+            .wake_snapshot
+            .worker_correction_context
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            reserved_correction_context
+                .coordinator_instruction
+                .as_ref()
+                .unwrap()
+                .body,
+            human_direction
+        );
+        assert_eq!(
+            reserved_correction_context
+                .reviewer_correction
+                .as_ref()
+                .unwrap()
+                .assessment
+                .findings[0],
+            "Verify the retained publication without creating an empty commit."
+        );
+        let rendered_prompt = crate::runtime_services::render_reserved_worker_prompt_for_test(
+            &applied,
+            &frozen_reservation,
+            &verification_plan,
+            &validated_verification_plan,
+            &second_correction_prepared,
+            verification_node,
+            crate::roles::TicketBrief {
+                ticket_id: ticket_id.clone(),
+                ticket_revision: second_correcting.revision,
+                title: "Fixture ticket".into(),
+                body: "Fixture ticket body".into(),
+                acceptance: Vec::new(),
+            },
+        )
+        .unwrap();
+        let rendered_prompt_path = temp.path().join("reserved-worker-prompt.md");
+        std::fs::write(&rendered_prompt_path, &rendered_prompt).unwrap();
+        let rendered_prompt = std::fs::read_to_string(&rendered_prompt_path).unwrap();
+        assert!(rendered_prompt.contains(human_direction));
+        assert!(
+            rendered_prompt
+                .contains("Verify the retained publication without creating an empty commit.")
+        );
+        assert!(!rendered_prompt.contains("Later direction B at the same revision."));
+        let publication_transition_count: u64 = second_correction_store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND json_extract(evidence_json,'$.kind')='implementation_published'",
+                [ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut second_recovery = recovery_authorization.clone();
+        second_recovery.ticket_revision = second_correcting.revision;
+        let assignment_json =
+            crate::runtime_services::prepared_worker_assignment_from_reservation_for_test(
+                &second_correction_store,
+                &frozen_reservation,
+                &verification_plan,
+                &validated_verification_plan,
+                &second_correction_prepared,
+                verification_node,
+                Some(&second_recovery),
+            )
+            .unwrap();
+        let assignment_path = temp.path().join("recovered-worker-assignment.json");
+        std::fs::write(&assignment_path, assignment_json).unwrap();
+        let assignment: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&assignment_path).unwrap()).unwrap();
+        let inherited_artifacts = &frozen_reservation.wake_snapshot.inputs[0].host_artifacts;
+        assert!(!inherited_artifacts.is_empty());
+        assert_eq!(
+            assignment["prepared_worktree"]["host_artifacts"],
+            serde_json::to_value(inherited_artifacts).unwrap(),
+            "a recovery wake with no artifact claims must still describe the persisted host copies"
+        );
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut second_correction_store,
+                owner_generation,
+                18,
+                &config,
+                config_digest.clone(),
+                &second_worker_result.ingested,
+            )
+            .unwrap()
+        );
+        let second_verification_review = second_correction_store
+            .active_ticket_runs(owner_generation, 10)
+            .unwrap()[0]
+            .clone();
+        assert_eq!(second_verification_review.phase, Phase::Reviewing);
+        assert_eq!(
+            second_verification_review.revision,
+            verification_review.revision + 2
+        );
+        let second_verification_snapshot = second_correction_store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                second_verification_review.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            second_verification_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        let second_verification = second_verification_snapshot
+            .verification()
+            .expect("second host-accepted VerificationReady should be in the Reviewer subject");
+        assert_eq!(
+            second_verification.review_revision,
+            second_verification_review.revision
+        );
+        assert_eq!(second_verification.published_head.as_str(), corrected_head);
+        assert_eq!(
+            second_verification.publication_operation_id.as_str(),
+            corrected_intent.operation_id
+        );
+        let second_verification_evidence: String = second_correction_store
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+                rusqlite::params![ticket_run_id.as_str(), second_verification_review.revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut wrong_verification_publication: serde_json::Value =
+            serde_json::from_str(&second_verification_evidence).unwrap();
+        wrong_verification_publication["publication_revision"] =
+            serde_json::json!(corrected_review.revision + 1);
+        second_correction_store
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+                rusqlite::params![
+                    ticket_run_id.as_str(),
+                    second_verification_review.revision,
+                    wrong_verification_publication.to_string(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            second_correction_store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    second_verification_review.revision,
+                )
+                .is_err()
+        );
+        second_correction_store
+            .connection
+            .execute(
+                "UPDATE transitions SET evidence_json=?3 WHERE entity_type='ticket_run' AND entity_id=?1 AND new_revision=?2",
+                rusqlite::params![
+                    ticket_run_id.as_str(),
+                    second_verification_review.revision,
+                    second_verification_evidence,
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            second_correction_store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &project_id,
+                    &ticket_run_id,
+                    verification_review.revision,
+                )
+                .unwrap_err(),
+            "publication snapshot consumer revision or Project is stale"
+        );
+        assert_eq!(
+            second_correction_store
+                .accepted_implementation_publication_snapshot(
+                    owner_generation,
+                    &ProjectId::parse("foreign-project").unwrap(),
+                    &ticket_run_id,
+                    second_verification_review.revision,
+                )
+                .unwrap_err(),
+            "publication snapshot consumer revision or Project is stale"
+        );
+        let publication_transition_count_after: u64 = second_correction_store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND json_extract(evidence_json,'$.kind')='implementation_published'",
+                [ticket_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            publication_transition_count_after,
+            publication_transition_count
+        );
+
+        let accepted = verification_snapshot.accepted_plan();
+        let validated_publications =
+            crate::delivery_runtime::validate_implementation_publication_receipt(
+                &accepted.proposal,
+                verification_snapshot.prepared_receipt(),
+                &project_id,
+                &config.repositories,
+                verification_snapshot.publication_receipts(),
+            )
+            .unwrap();
+        let mut subject = crate::delivery_runtime::implementation_publication_set_subject(
+            &accepted.plan_digest,
+            &accepted.proposal,
+            &validated_publications,
+            verification_snapshot.publication_receipts(),
+            verification_snapshot.publication_revision(),
+        )
+        .unwrap();
+        subject.verification = verification_snapshot.verification().map(|verification| {
+            crate::delivery_runtime::WorkerVerificationSubject {
+                review_revision: verification.review_revision,
+                source_evidence_id: verification.source_evidence_id.clone(),
+                source_agent_run_id: verification.source_agent_run_id.clone(),
+                source_result_digest: verification.source_result_digest.clone(),
+                publication_revision: verification.publication_revision,
+                publication_operation_id: verification.publication_operation_id.clone(),
+                published_head: verification.published_head.as_str().into(),
+                work_node_id: verification.work_node_id.clone(),
+                repository_id: verification.repository_id.clone(),
+                test_receipt_artifacts: verification.test_receipt_artifacts.clone(),
+            }
+        });
+        let subject_digest = subject.digest().unwrap().to_string();
+        let evidence_coverage = subject
+            .coverage
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>();
+        let structured_result = serde_json::json!({
+            "subject_kind": "implementation_publication_set",
+            "subject_digest": subject_digest,
+            "findings": [],
+            "evidence_coverage": evidence_coverage,
+            "disposition": "approved",
+            "unknowns": [],
+        });
+        let reviewer_message = crate::roles::RoleResultMessage {
+            schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "reviewer-published-snapshot".into(),
+            kind: crate::engine::orchestration::RoleOutputKind::ReviewReady,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            result_digest: Some(
+                Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+                ))
+                .unwrap(),
+            ),
+            structured_result,
+            artifact_refs: Vec::new(),
+        };
+        let reviewer_evidence =
+            crate::store::agent_results::host_validation_fixture::host_validated_result_in(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                crate::domain::types::Role::Reviewer,
+                reviewer_message,
+            )
+            .unwrap();
+        let mut tampered = reviewer_evidence.ingested.clone();
+        let crate::engine::orchestration::RoleResultPayload::ReviewReady(assessment) =
+            &mut tampered.validated.typed_payload
+        else {
+            panic!("validated reviewer evidence has the wrong payload type");
+        };
+        assessment.subject_digest = Digest::parse("f".repeat(64)).unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &tampered,
+            )
+            .is_err()
+        );
+        let mut wrong_coverage = reviewer_evidence.ingested.clone();
+        let crate::engine::orchestration::RoleResultPayload::ReviewReady(assessment) =
+            &mut wrong_coverage.validated.typed_payload
+        else {
+            panic!("validated reviewer evidence has the wrong payload type");
+        };
+        assessment.evidence_coverage = vec!["different-node".into()];
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                16,
+                &config,
+                config_digest.clone(),
+                &wrong_coverage,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                owner_generation,
+                17,
+                &config,
+                config_digest.clone(),
+                &reviewer_evidence.ingested,
+            )
+            .unwrap()
+        );
+        let result_ack: (u64, String) = store
+            .connection
+            .query_row(
+                "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [reviewer_evidence.ingested.receipt.evidence_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            result_ack,
+            (verification_review.revision + 1, "applied".into())
+        );
+        let assessing = store.active_ticket_runs(owner_generation, 10).unwrap()[0].clone();
+        let merge_snapshot = store
+            .accepted_implementation_publication_snapshot(
+                owner_generation,
+                &project_id,
+                &ticket_run_id,
+                assessing.revision,
+            )
+            .unwrap();
+        assert_eq!(
+            merge_snapshot.publication_revision(),
+            corrected_review.revision
+        );
+        assert_eq!(merge_snapshot.publication_receipts().len(), 2);
+        assert_postmortem_artifact_handoff(
+            &mut store,
+            temp.path(),
+            &worker_result.artifacts,
+            owner_generation,
+            &config,
+            &config_digest,
+            &assessing,
+            &Digest::parse(subject_digest).unwrap(),
+            &corrected_head,
+        );
+        assert!(
+            !crate::engine::host_transitions::consume_one_host_transition(
+                &mut store,
+                owner_generation,
+                14,
+                &config,
+                &config_digest,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM effects WHERE kind='prepare_worktrees'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let pending = store
+            .pending_validated_agent_results(&reviewer_evidence.artifacts, owner_generation, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].receipt.evidence_id(),
+            coordinator_result.ingested.receipt.evidence_id()
+        );
+        drop(reviewer_evidence);
+        drop(store);
+        let mut reopened = ConfigStore::open_test(temp.path()).unwrap();
+        assert_eq!(
+            reopened.active_ticket_runs(owner_generation, 10).unwrap()[0].phase,
+            Phase::Assessing
+        );
+        let reopened_pending = reopened
+            .pending_validated_agent_results(
+                &crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap(),
+                owner_generation,
+                10,
+            )
+            .unwrap();
+        assert_eq!(reopened_pending.len(), 1);
+        assert_eq!(
+            reopened_pending[0].receipt.evidence_id(),
+            coordinator_result.ingested.receipt.evidence_id()
+        );
+    }
+
+    #[test]
+    fn human_instruction_atomically_notifies_coordinator_and_project_supervisor() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project_id = ProjectId::parse("instruction-project").unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "instruction-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "instruction-process".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let namespace = TicketNamespace::parse("fixture").unwrap();
+        let ticket = TicketId::parse("T-1").unwrap();
+        let run = TicketRunId::parse("instruction-run").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &namespace,
+                &ticket,
+                &run,
+                1,
+                "implementing",
+                "In Progress",
+            )
+            .unwrap();
+        let first = store
+            .enqueue_coordinator_instruction(
+                generation,
+                &project_id,
+                &run,
+                &namespace,
+                &ticket,
+                0,
+                "human-request-1",
+                "Please stop and explain the failing test before changing code.",
+                10,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET revision=1 WHERE ticket_run_id=?1",
+                [run.as_str()],
+            )
+            .unwrap();
+        let replay = store
+            .enqueue_coordinator_instruction(
+                generation,
+                &project_id,
+                &run,
+                &namespace,
+                &ticket,
+                0,
+                "human-request-1",
+                "Please stop and explain the failing test before changing code.",
+                11,
+            )
+            .unwrap();
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(first.wake_input_id, replay.wake_input_id);
+        assert_eq!(
+            first.supervisor_wake_input_id,
+            replay.supervisor_wake_input_id
+        );
+        assert_ne!(first.wake_input_id, first.supervisor_wake_input_id);
+        let wakes: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM role_wake_inputs WHERE source_id='human-request-1' AND lifecycle='pending'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(wakes, 2);
+        assert!(
+            store
+                .enqueue_coordinator_instruction(
+                    generation,
+                    &project_id,
+                    &run,
+                    &namespace,
+                    &ticket,
+                    0,
+                    "human-request-stale",
+                    "stale",
+                    12
+                )
+                .unwrap_err()
+                .contains("stale")
+        );
     }
 
     #[test]
@@ -4078,6 +11111,7 @@ mod tests {
             process_start_identity: nonce.into(),
             executable_path: "/tmp/rex-projects-test".into(),
             executable_digest: "f".repeat(64),
+            rex_endpoint: None,
             rex_server_identity: None,
             rex_session_id: None,
             rex_block_id: None,
@@ -4109,8 +11143,32 @@ mod tests {
                 &self,
                 mode: crate::effects::EffectMode,
                 request: &crate::effects::EffectRequest,
+                context: &mut crate::effects::EffectContext<'_>,
             ) -> Result<crate::effects::EffectObservation, String> {
                 self.seen.lock().unwrap().push((mode, request.clone()));
+                let progress = serde_json::to_string(&serde_json::json!({
+                    "attempt": request.attempt_count,
+                }))
+                .unwrap();
+                context.store.save_effect_progress(
+                    &request.intent.operation_id,
+                    context.owner_generation,
+                    &request.intent.request_digest,
+                    &progress,
+                    context.now_unix,
+                )?;
+                assert_eq!(
+                    context
+                        .store
+                        .load_effect_progress(
+                            &request.intent.operation_id,
+                            context.owner_generation,
+                            &request.intent.request_digest,
+                        )
+                        .unwrap()
+                        .as_deref(),
+                    Some(progress.as_str())
+                );
                 match self.actions.lock().unwrap().pop_front().unwrap() {
                     "pending" => Ok(crate::effects::EffectObservation::Pending {
                         receipt: "{}".into(),
@@ -4291,62 +11349,6 @@ mod tests {
     }
 
     #[test]
-    fn config_apply_queue_survives_a_concurrent_wal_writer() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        store
-            .apply_snapshot(
-                "factory",
-                &snapshot(&"a".repeat(64)),
-                ExpectedRevision::Bootstrap,
-            )
-            .unwrap();
-        let owner = OwnerMetadata {
-            owner_nonce: "queue-writer-test".into(),
-            state_root: temp.path().to_string_lossy().into_owned(),
-            config_source: "factory".into(),
-            process_start_identity: "queue-writer-test".into(),
-            executable_path: "/tmp/rex-projects-test".into(),
-            executable_digest: "f".repeat(64),
-            rex_server_identity: None,
-            rex_session_id: None,
-            rex_block_id: None,
-        };
-        let generation = store.start_owner(&owner).unwrap();
-
-        let mut writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
-        writer
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let writer_tx = writer
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
-        let state_root = temp.path().to_owned();
-        let next_snapshot = snapshot(&"b".repeat(64));
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let append = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            ConfigStore::append_config_apply(
-                &state_root,
-                "queued-during-controller-write",
-                "factory",
-                &next_snapshot,
-                ExpectedRevision::Current(Revision(1)),
-                generation,
-            )
-        });
-        started_rx.recv().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        writer_tx.commit().unwrap();
-
-        append
-            .join()
-            .unwrap()
-            .expect("config apply should wait for and follow the active WAL writer");
-    }
-
-    #[test]
     fn rex_view_history_pin_and_user_blocks_prevent_automatic_cleanup() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -4377,6 +11379,7 @@ mod tests {
                 process_start_identity: "view-process".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -4397,7 +11400,29 @@ mod tests {
         };
         assert!(store.register_rex_view(generation, &view).unwrap());
         assert!(!store.register_rex_view(generation, &view).unwrap());
-        assert_eq!(store.rex_view_history(&project.id).unwrap().len(), 1);
+        let ticket_view = |epoch| RexView {
+            view_id: RexView::derive_id(
+                &project.id,
+                RexViewKind::Ticket,
+                Some("tracker"),
+                Some("T-1"),
+                epoch,
+            )
+            .unwrap(),
+            project_id: project.id.clone(),
+            kind: RexViewKind::Ticket,
+            ticket_namespace: Some("tracker".into()),
+            ticket_id: Some("T-1".into()),
+            view_epoch: epoch,
+            rex_server_identity: "fixture-instance".into(),
+            rex_session_id: "session-1".into(),
+            rex_window_id: format!("ticket-window-{epoch}"),
+        };
+        let ticket_view_1 = ticket_view(1);
+        assert!(store.register_rex_view(generation, &ticket_view_1).unwrap());
+        let ticket_view_2 = ticket_view(2);
+        assert!(store.register_rex_view(generation, &ticket_view_2).is_err());
+        assert_eq!(store.rex_view_history(&project.id).unwrap().len(), 2);
         store.set_rex_view_pin(generation, &view_id, true).unwrap();
         store.set_rex_view_pin(generation, &view_id, false).unwrap();
         assert!(
@@ -4433,529 +11458,184 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM rex_view_blocks WHERE view_id=?1 AND block_id='human-block'",
+                [view_id.as_str()],
+            )
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'factory-block','synthetic-run','supervisor','factory','completed',1,1,1)",
+            [view_id.as_str()],
+        ).unwrap();
+        let archive_digest = store
+            .archive_rex_view_block(generation, &view_id, "factory-block", "completed output\n")
+            .unwrap();
+        assert_eq!(
+            store
+                .read_rex_view_block_archive(&view_id, "factory-block")
+                .unwrap()
+                .as_deref(),
+            Some("completed output\n"),
+        );
+        assert_eq!(
+            store.rex_view_blocks(&view_id).unwrap()[0]
+                .archive_digest
+                .as_ref(),
+            Some(&archive_digest),
+        );
+        assert!(
+            store
+                .archive_rex_view_block(generation, &view_id, "factory-block", "different output")
+                .is_err()
+        );
+        assert!(
+            store
+                .archive_rex_view_block(
+                    generation,
+                    &view_id,
+                    "factory-block",
+                    &"x".repeat(1_048_577)
+                )
+                .is_err()
+        );
+        let anchor_run = "ticket-T-1-view-1";
+        let anchor_label = crate::adapters::rex::owned_agent_block_label(anchor_run).unwrap();
+        store
+            .register_rex_view_anchor(
+                generation,
+                &view_id,
+                "owned-anchor",
+                anchor_run,
+                &anchor_label,
+                &Digest::parse("c".repeat(64)).unwrap(),
+            )
+            .unwrap();
+        store
+            .observe_rex_view_anchor(generation, &view_id, RexBlockLifecycle::Completed, true)
+            .unwrap();
+        store
+            .archive_rex_view_anchor(generation, &view_id, "owned-anchor", "status output\n")
+            .unwrap();
+        assert_eq!(
+            store
+                .read_rex_view_anchor_archive(&view_id, "owned-anchor")
+                .unwrap()
+                .as_deref(),
+            Some("status output\n"),
+        );
+        assert!(
+            store
+                .archive_rex_view_anchor(generation, &view_id, "owned-anchor", "changed status")
+                .is_err()
+        );
+        store.connection.execute(
+            "INSERT INTO human_requests(request_id,project_id,purpose,subject_kind,subject_id,subject_revision,rex_view_id,subject_digest,material_digest,configuration_digest,policy_digest,bundle_digest,request_json,artifact_path,lifecycle,created_at_unix,expires_at_unix) VALUES ('request-1',?2,'ticket_review','ticket_run','run-1',0,?1,?3,?3,?3,?3,?3,'{}','/tmp/request.html','pending',1,9999999999)",
+            rusqlite::params![view_id.as_str(), project.id.as_str(), "a".repeat(64)],
+        ).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE rex_views SET updated_at_unix=0 WHERE view_id=?1",
+                [view_id.as_str()],
+            )
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            store
+                .rex_view_cleanup_candidates(now, 0)
+                .unwrap()
+                .is_empty()
+        );
+        let candidate = crate::launch::RexViewCleanupCandidate {
+            view: view.clone(),
+            close_after_unix: now,
+        };
+        assert!(
+            store
+                .begin_rex_view_close(generation, &candidate, now, 0)
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE human_requests SET lifecycle='decided' WHERE request_id='request-1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.rex_view_cleanup_candidates(now, 0).unwrap().len(), 1);
     }
 
-    fn launch_authority_fixture(
-        ticket_in_project_b: bool,
-        reserved_role: Option<&str>,
-    ) -> (
-        tempfile::TempDir,
-        ConfigStore,
-        u64,
-        AgentLaunchAuthority,
-        ProjectId,
-        ProjectId,
-    ) {
+    #[test]
+    fn config_apply_queue_survives_a_concurrent_wal_writer() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        let project_a = ProjectId::parse("project-a").unwrap();
-        let project_b = ProjectId::parse("project-b").unwrap();
-        let mut config_snapshot = snapshot(&"a".repeat(64));
-        let profile_id = ProfileId::parse("worker").unwrap();
-        let profile: crate::config::Profile = serde_json::from_value(serde_json::json!({
-            "adapter": "codex",
-            "command": [std::env::current_exe().unwrap().display().to_string()],
-            "commit_mode": "host"
-        }))
-        .unwrap();
-        let profile_identity = crate::run_step::profile_runtime_identity(&profile).unwrap();
-        let profile_digest = Digest::parse(format!(
-            "{:x}",
-            sha2::Sha256::digest(super::canonical_json(&profile).unwrap().as_bytes())
-        ))
-        .unwrap();
-        config_snapshot.profiles.insert(profile_id.clone(), profile);
-        let applied = store
-            .apply_snapshot("factory", &config_snapshot, ExpectedRevision::Bootstrap)
+        store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
             .unwrap();
-        for project_id in [&project_a, &project_b] {
-            store
-                .insert_project(&ProjectRecord {
-                    id: project_id.clone(),
-                    config_source: "factory".into(),
-                    config_revision: applied.revision,
-                    config_digest: applied.digest.clone(),
-                    mode: "operations".into(),
-                    goal_revision: 0,
-                    desired_lifecycle: "running".into(),
-                    state_revision: Revision(0),
-                })
-                .unwrap();
-        }
         let generation = store
             .start_owner(&OwnerMetadata {
-                owner_nonce: "cross-project-ticket-owner".into(),
+                owner_nonce: "queue-writer-test".into(),
                 state_root: temp.path().to_string_lossy().into_owned(),
                 config_source: "factory".into(),
-                process_start_identity: "owner-process".into(),
+                process_start_identity: "queue-writer-test".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
-                executable_digest: "e".repeat(64),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
             })
             .unwrap();
-        let agent_run_id = AgentRunId::parse("run-a").unwrap();
-        let operation_id = OperationId::parse("op-run-a").unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,'worker-session',?5,'test',1,?6,'launch_pending',?7)",
-                rusqlite::params![agent_run_id.as_str(), project_a.as_str(), applied.revision.0, applied.digest.as_str(), reserved_role, operation_id.as_str(), generation],
-            )
+        let mut writer = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        let ticket_run_id = TicketRunId::parse("ticket-run-b").unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status) VALUES (?1,?2,'factory',?3,?4,'shared','T-1',1,'implementing','working','In Progress','In Progress')",
-                rusqlite::params![ticket_run_id.as_str(), if ticket_in_project_b { project_b.as_str() } else { project_a.as_str() }, applied.revision.0, applied.digest.as_str()],
-            )
+        let writer_tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
-        let view_id = RexView::derive_id(
-            &project_a,
-            RexViewKind::Ticket,
-            Some("shared"),
-            Some("T-1"),
-            1,
-        )
-        .unwrap();
-        store
-            .register_rex_view(
+        let state_root = temp.path().to_owned();
+        let next_snapshot = snapshot(&"b".repeat(64));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let append = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            ConfigStore::append_config_apply(
+                &state_root,
+                "queued-during-controller-write",
+                "factory",
+                &next_snapshot,
+                ExpectedRevision::Current(Revision(1)),
                 generation,
-                &RexView {
-                    view_id: view_id.clone(),
-                    project_id: project_a.clone(),
-                    kind: RexViewKind::Ticket,
-                    ticket_namespace: Some("shared".into()),
-                    ticket_id: Some("T-1".into()),
-                    view_epoch: 1,
-                    rex_server_identity: "rex-instance".into(),
-                    rex_session_id: "session".into(),
-                    rex_window_id: "window".into(),
-                },
             )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,'/state/mailbox',?2,9999999999,1048576,32)",
-                rusqlite::params![agent_run_id.as_str(), "6".repeat(64)],
-            )
-            .unwrap();
-        let markers = [
-            "REX_PROJECTS_AGENT",
-            "REX_PROJECTS_CONTEXT",
-            "REX_PROJECTS_PROJECT_ID",
-            "REX_PROJECTS_ROLE",
-            "REX_PROJECTS_RUN_ID",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<std::collections::BTreeSet<_>>();
-        let qualification = ProviderQualification {
-            schema_version: 1,
-            project_id: project_a.clone(),
-            profile_id: profile_id.clone(),
-            profile_digest: profile_digest.clone(),
-            adapter: profile_identity.adapter,
-            executable_path: profile_identity.executable_path.display().to_string(),
-            executable_digest: profile_identity.executable_digest.clone(),
-            provider_version: "fixture".into(),
-            permission_mode: profile_identity.effective_permission_mode.into(),
-            invocation_options_digest: profile_identity.invocation_options_digest.clone(),
-            commit_mode: profile_identity.commit_mode,
-            proof: QualificationProof {
-                schema_version: 1,
-                probe_id: "probe".into(),
-                fixture_digest: Digest::parse("9".repeat(64)).unwrap(),
-                rex_instance_id: "rex-instance".into(),
-                tool_shell_marker_digest: Digest::parse("1".repeat(64)).unwrap(),
-                tool_shell_markers_present: markers.clone(),
-                descendant_marker_digest: Digest::parse("2".repeat(64)).unwrap(),
-                descendant_markers_present: markers,
-                automatic_turn_result_digest: Digest::parse("3".repeat(64)).unwrap(),
-                automatic_turn_completed: true,
-                structured_result_valid: true,
-                observed_permission_mode: profile_identity.effective_permission_mode.into(),
-                permission_prompt_count: 0,
-                cleanup_process_tree_digest: Digest::parse("4".repeat(64)).unwrap(),
-                process_tree_absent: true,
-                cleanup_confirmed: true,
-            },
-            status: QualificationStatus::Verified,
-        };
-        let qualification_digest = store
-            .store_provider_qualification(generation, &qualification)
-            .unwrap();
-
-        let authority = AgentLaunchAuthority {
-            agent_run_id,
-            project_id: project_a.clone(),
-            role: Role::Worker,
-            role_session_id: "worker-session".into(),
-            parent_run_id: None,
-            parent_role: None,
-            ticket_run_id: Some(ticket_run_id),
-            ticket_revision: Some(Revision(0)),
-            config_revision: applied.revision,
-            config_digest: applied.digest,
-            attempt: 1,
-            run_epoch: 1,
-            controller_generation: generation,
-            operation_id,
-            operation_recipe_id: None,
-            rex_view_id: view_id,
-            descriptor_digest: Digest::parse("c".repeat(64)).unwrap(),
-            runtime_binary_digest: Digest::parse("d".repeat(64)).unwrap(),
-            descriptor_path: "/state/descriptor.json".into(),
-            environment_snapshot_id: Digest::parse("1".repeat(64)).unwrap(),
-            profile_id,
-            profile_digest,
-            instruction_digest: Digest::parse("3".repeat(64)).unwrap(),
-            result_schema_digest: Digest::parse("4".repeat(64)).unwrap(),
-            wake_snapshot_digest: Digest::parse("7".repeat(64)).unwrap(),
-            qualification_receipt_digest: qualification_digest,
-            rex_server_identity: "rex-instance".into(),
-            rex_session_id: "session".into(),
-            rex_window_id: "window".into(),
-            rex_block_id: "block".into(),
-            workspace_path: "/state/worktree".into(),
-            control_dir: "/state/control".into(),
-            mailbox_capability_digest: Digest::parse("6".repeat(64)).unwrap(),
-        };
-
-        (temp, store, generation, authority, project_a, project_b)
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        writer_tx.commit().unwrap();
+        append
+            .join()
+            .unwrap()
+            .expect("config apply should wait for and follow the active WAL writer");
     }
 
     #[test]
-    fn authorize_agent_start_accepts_pending_acknowledgement_and_replay() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        store
-            .register_agent_launch_authority(generation, &authority)
-            .unwrap();
-        let request = AgentStartRequest {
-            schema_version: 1,
-            operation_id: authority.operation_id.clone(),
-            agent_run_id: authority.agent_run_id.clone(),
-            project_id: authority.project_id.clone(),
-            controller_generation: generation,
-            descriptor_digest: authority.descriptor_digest.clone(),
-            runtime_binary_digest: authority.runtime_binary_digest.clone(),
-            environment_snapshot_id: authority.environment_snapshot_id.clone(),
-            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
-            wrapper_pid: 123,
-            wrapper_start_identity: "wrapper-start".into(),
-            rex_session_id: authority.rex_session_id.clone(),
-            rex_block_id: authority.rex_block_id.clone(),
-        };
-        let observed = ObservedWrapperIdentity {
-            pid: request.wrapper_pid,
-            start_identity: request.wrapper_start_identity.clone(),
-            rex_session_id: request.rex_session_id.clone(),
-            rex_block_id: request.rex_block_id.clone(),
-            runtime_binary_digest: request.runtime_binary_digest.clone(),
-        };
-
-        let receipt = store
-            .authorize_agent_start(generation, &request, &observed)
-            .unwrap();
-        assert_eq!(receipt.decision, crate::launch::LaunchDecision::Accepted);
-        assert_eq!(
-            store
-                .authorize_agent_start(generation, &request, &observed)
-                .unwrap(),
-            receipt
-        );
-
-        let mut changed_request = request.clone();
-        changed_request.wrapper_pid += 1;
-        let changed_observed = ObservedWrapperIdentity {
-            pid: changed_request.wrapper_pid,
-            ..observed.clone()
-        };
-        assert!(
-            store
-                .authorize_agent_start(generation, &changed_request, &changed_observed)
-                .unwrap_err()
-                .contains("different persisted start acknowledgement")
-        );
-
-        let (_temp, mut partial_store, partial_generation, partial_authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        partial_store
-            .register_agent_launch_authority(partial_generation, &partial_authority)
-            .unwrap();
-        partial_store
-            .connection
-            .execute(
-                "UPDATE agent_launch_state SET start_request_digest=?2 WHERE agent_run_id=?1",
-                rusqlite::params![partial_authority.agent_run_id.as_str(), "a".repeat(64)],
-            )
-            .unwrap();
-        assert!(
-            partial_store
-                .authorize_agent_start(partial_generation, &request, &observed)
-                .unwrap_err()
-                .contains("partial persisted start acknowledgement")
-        );
-    }
-
-    #[test]
-    fn launch_authority_rejects_ticket_run_from_another_project() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, authority, _, _) =
-            launch_authority_fixture(true, Some("worker"));
-        let error = store
-            .register_agent_launch_authority(generation, &authority)
-            .unwrap_err();
-        assert!(error.contains("TicketRun belongs to another Project"));
-    }
-
-    #[test]
-    fn launch_authority_rejects_stale_ticket_revision() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, mut authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        authority.ticket_revision = Some(Revision(1));
-        let error = store
-            .register_agent_launch_authority(generation, &authority)
-            .unwrap_err();
-        assert!(error.contains("TicketRun revision does not match launch authority"));
-    }
-
-    #[test]
-    fn launch_authority_rejects_unbound_role_session() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, mut authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        authority.role_session_id = "attacker-session".into();
-        let error = store
-            .register_agent_launch_authority(generation, &authority)
-            .unwrap_err();
-        assert!(error.contains("AgentRun does not match the proposed launch authority"));
-    }
-
-    #[test]
-    fn launch_authority_rejects_role_not_reserved_by_agent_run() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, mut authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        authority.role = Role::Coordinator;
-        let error = store
-            .register_agent_launch_authority(generation, &authority)
-            .unwrap_err();
-        assert!(error.contains("AgentRun does not match the proposed launch authority"));
-    }
-
-    #[test]
-    fn new_reservationless_operator_authority_cannot_use_legacy_parent_topology() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, mut authority, _, _) =
-            launch_authority_fixture(false, Some("operator"));
-        authority.role = Role::Operator;
-        authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
-        authority.parent_role = Some(Role::Supervisor);
-        assert!(authority.validate().is_ok());
-
-        let error = store
-            .register_agent_launch_authority(generation, &authority)
-            .unwrap_err();
-        assert!(error.contains("Operator launch parent role must be Coordinator"));
-        let count: u64 = store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM agent_launch_authority WHERE agent_run_id=?1",
-                [authority.agent_run_id.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn launch_authority_rejects_legacy_agent_run_without_reserved_role() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, authority, _, _) = launch_authority_fixture(false, None);
-        let error = store
-            .register_agent_launch_authority(generation, &authority)
-            .unwrap_err();
-        assert!(error.contains("AgentRun does not match the proposed launch authority"));
-    }
-
-    #[test]
-    fn launch_authority_accepts_matching_agent_run_reservation() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        assert!(
-            store
-                .register_agent_launch_authority(generation, &authority)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn exact_launch_authority_replay_does_not_revalidate_changed_runtime_profile() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (_temp, mut store, generation, authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        assert!(
-            store
-                .register_agent_launch_authority(generation, &authority)
-                .unwrap()
-        );
-        let changed = store.connection.execute(
-            "UPDATE config_snapshots SET effective_config_json=json_set(effective_config_json,'$.profiles.worker.command[0]','/missing/provider') WHERE source_identity='factory' AND revision=?1",
-            [authority.config_revision.0],
-        ).unwrap();
-        assert_eq!(changed, 1);
-        assert!(
-            !store
-                .register_agent_launch_authority(generation, &authority)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn populated_v7_authority_and_start_receipt_survive_v8_migration() {
-        let _guard = STORE_TEST_LOCK.lock().unwrap();
-        let (temp, mut store, generation, authority, _, _) =
-            launch_authority_fixture(false, Some("worker"));
-        assert!(
-            store
-                .register_agent_launch_authority(generation, &authority)
-                .unwrap()
-        );
-        let request = AgentStartRequest {
-            schema_version: 1,
-            operation_id: authority.operation_id.clone(),
-            agent_run_id: authority.agent_run_id.clone(),
-            project_id: authority.project_id.clone(),
-            controller_generation: generation,
-            descriptor_digest: authority.descriptor_digest.clone(),
-            runtime_binary_digest: authority.runtime_binary_digest.clone(),
-            environment_snapshot_id: authority.environment_snapshot_id.clone(),
-            qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
-            wrapper_pid: 456,
-            wrapper_start_identity: "v7-wrapper".into(),
-            rex_session_id: authority.rex_session_id.clone(),
-            rex_block_id: authority.rex_block_id.clone(),
-        };
-        let observed = ObservedWrapperIdentity {
-            pid: request.wrapper_pid,
-            start_identity: request.wrapper_start_identity.clone(),
-            rex_session_id: request.rex_session_id.clone(),
-            rex_block_id: request.rex_block_id.clone(),
-            runtime_binary_digest: request.runtime_binary_digest.clone(),
-        };
-        let receipt = store
-            .authorize_agent_start(generation, &request, &observed)
-            .unwrap();
-
-        // Recreate a schema-v7 Operator authority with its historical Supervisor parent.
-        // Its exact old JSON and digest must remain readable and replayable after migration.
-        let mut historical_authority = authority.clone();
-        historical_authority.role = Role::Operator;
-        historical_authority.parent_run_id = Some(AgentRunId::parse("supervisor-run").unwrap());
-        historical_authority.parent_role = Some(Role::Supervisor);
-        historical_authority.wake_snapshot_digest = Digest::parse("0".repeat(64)).unwrap();
-        let legacy_json = historical_authority.storage_json().unwrap();
-        assert!(!legacy_json.contains("operation_recipe_id"));
-        assert!(!legacy_json.contains("wake_snapshot_digest"));
-        let legacy_digest = historical_authority.digest().unwrap().to_string();
-        store
-            .connection
-            .execute_batch(
-                "DROP TRIGGER agent_launch_authority_immutable_update;
-             DROP TRIGGER agent_launch_authority_immutable_delete;
-             DROP TRIGGER agent_runs_role_immutable;",
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES ('supervisor-run',?1,'factory',?2,?3,'supervisor-session','supervisor','legacy-test',1,'supervisor-op','running',?4)",
-                rusqlite::params![authority.project_id.as_str(), authority.config_revision.0, authority.config_digest.as_str(), generation],
-            )
-            .unwrap();
-        store.connection.execute(
-            "UPDATE agent_launch_authority SET role='operator',parent_run_id='supervisor-run',parent_role='supervisor',authority_json=?2,authority_digest=?3 WHERE agent_run_id=?1",
-            rusqlite::params![authority.agent_run_id.as_str(), legacy_json, legacy_digest],
-        ).unwrap();
-        store
-            .connection
-            .execute(
-                "UPDATE agent_runs SET role='operator' WHERE agent_run_id=?1",
-                [authority.agent_run_id.as_str()],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute_batch(
-                "DROP INDEX agent_launch_reservations_project;
-             DROP TRIGGER agent_launch_reservation_identity_guard;
-             DROP TRIGGER agent_launch_reservation_no_delete;
-             DROP TRIGGER agent_wake_context_immutable_update;
-             DROP TRIGGER agent_wake_context_immutable_delete;
-             DROP TABLE agent_launch_reservations;
-             DROP TABLE agent_wake_context;
-             ALTER TABLE agent_launch_authority DROP COLUMN operation_recipe_id;
-             ALTER TABLE agent_launch_authority DROP COLUMN wake_snapshot_digest;
-             DELETE FROM schema_migrations WHERE version=8;
-             PRAGMA user_version=7;",
-            )
-            .unwrap();
-        drop(store);
-
-        let mut store = ConfigStore::open_test(temp.path()).unwrap();
-        let expected_legacy_authority = historical_authority;
-        assert_eq!(
-            store
-                .agent_launch_authority(&authority.agent_run_id)
-                .unwrap(),
-            Some(expected_legacy_authority.clone())
-        );
-        let changed = store
-            .connection
-            .execute(
-                "UPDATE config_snapshots SET effective_config_json=json_set(effective_config_json,'$.profiles.worker.command[0]','/missing/provider') WHERE source_identity='factory' AND revision=?1",
-                [authority.config_revision.0],
-            )
-            .unwrap();
-        assert_eq!(changed, 1);
-        assert!(
-            !store
-                .register_agent_launch_authority(generation, &expected_legacy_authority)
-                .unwrap()
-        );
-        assert_eq!(
-            store
-                .authorize_agent_start(generation, &request, &observed)
-                .unwrap(),
-            receipt
-        );
-        let mut changed_request = request.clone();
-        changed_request.wrapper_pid += 1;
-        let changed_observation = ObservedWrapperIdentity {
-            pid: changed_request.wrapper_pid,
-            ..observed
-        };
-        assert!(
-            store
-                .authorize_agent_start(generation, &changed_request, &changed_observation)
-                .unwrap_err()
-                .contains("different persisted start acknowledgement")
-        );
-    }
-
-    #[test]
-    fn begin_rex_view_close_rejects_substituted_persisted_identity() {
+    fn launch_authority_block_binding_rejects_different_rex_block() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let project_id = ProjectId::parse("block-binding-project").unwrap();
         let applied = store
             .apply_snapshot(
                 "factory",
@@ -4963,80 +11643,142 @@ mod tests {
                 ExpectedRevision::Bootstrap,
             )
             .unwrap();
-        let project = ProjectRecord {
-            id: ProjectId::parse("close-project").unwrap(),
-            config_source: "factory".into(),
-            config_revision: applied.revision,
-            config_digest: applied.digest.clone(),
-            mode: "operations".into(),
-            goal_revision: 0,
-            desired_lifecycle: "running".into(),
-            state_revision: Revision(0),
-        };
-        store.insert_project(&project).unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: project_id.clone(),
+                config_source: "factory".into(),
+                config_revision: applied.revision,
+                config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                mode: "operations".into(),
+                goal_revision: 0,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
         let generation = store
             .start_owner(&OwnerMetadata {
-                owner_nonce: "close-view-owner".into(),
+                owner_nonce: "block-owner".into(),
                 state_root: temp.path().to_string_lossy().into_owned(),
                 config_source: "factory".into(),
-                process_start_identity: "owner-process".into(),
+                process_start_identity: "block-process".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
             })
             .unwrap();
         let view_id =
-            RexView::derive_id(&project.id, RexViewKind::Supervisor, None, None, 1).unwrap();
-        let view = RexView {
-            view_id: view_id.clone(),
-            project_id: project.id.clone(),
-            kind: RexViewKind::Supervisor,
-            ticket_namespace: None,
-            ticket_id: None,
-            view_epoch: 1,
-            rex_server_identity: "rex-instance".into(),
-            rex_session_id: "session".into(),
-            rex_window_id: "window".into(),
+            RexView::derive_id(&project_id, RexViewKind::Supervisor, None, None, 1).unwrap();
+        store
+            .register_rex_view(
+                generation,
+                &RexView {
+                    view_id: view_id.clone(),
+                    project_id: project_id.clone(),
+                    kind: RexViewKind::Supervisor,
+                    ticket_namespace: None,
+                    ticket_id: None,
+                    view_epoch: 1,
+                    rex_server_identity: "fixture-instance".into(),
+                    rex_session_id: "session-1".into(),
+                    rex_window_id: "window-1".into(),
+                },
+            )
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES ('run-1',?1,'factory',?2,?3,'role-session','supervisor','supervisor',1,'op-1','launch_pending',?4)",
+            rusqlite::params![project_id.as_str(), applied.revision.0, "a".repeat(64), generation],
+        ).unwrap();
+        let mismatched_session_authority = AgentLaunchAuthority {
+            agent_run_id: crate::domain::ids::AgentRunId::parse("run-1").unwrap(),
+            project_id: project_id.clone(),
+            role: crate::domain::types::Role::Supervisor,
+            role_session_id: "forged-session".into(),
+            parent_run_id: None,
+            parent_role: None,
+            ticket_run_id: None,
+            ticket_revision: None,
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            attempt: 1,
+            run_epoch: 1,
+            controller_generation: generation,
+            operation_id: crate::domain::ids::OperationId::parse("op-1").unwrap(),
+            operation_recipe_id: None,
+            rex_view_id: Digest::parse("b".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("c".repeat(64)).unwrap(),
+            runtime_binary_digest: Digest::parse("d".repeat(64)).unwrap(),
+            descriptor_path: "/tmp/descriptor.json".into(),
+            environment_snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+            profile_id: crate::domain::ids::ProfileId::parse("supervisor").unwrap(),
+            profile_digest: Digest::parse("f".repeat(64)).unwrap(),
+            instruction_digest: Digest::parse("a".repeat(64)).unwrap(),
+            result_schema_digest: Digest::parse("b".repeat(64)).unwrap(),
+            wake_snapshot_digest: Digest::parse("c".repeat(64)).unwrap(),
+            qualification_receipt_digest: Digest::parse("c".repeat(64)).unwrap(),
+            rex_server_identity: "fixture-instance".into(),
+            rex_session_id: "session-1".into(),
+            rex_window_id: "window-1".into(),
+            rex_block_id: "authorized-block".into(),
+            workspace_path: "/tmp/workspace".into(),
+            control_dir: "/tmp/control".into(),
+            mailbox_capability_digest: Digest::parse("d".repeat(64)).unwrap(),
         };
-        store.register_rex_view(generation, &view).unwrap();
-        let cleanup_run = AgentRunId::parse("cleanup-run").unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,'factory',?3,?4,'test',1,'cleanup-op','completed',?5)",
-                rusqlite::params![cleanup_run.as_str(), project.id.as_str(), applied.revision.0, applied.digest.as_str(), generation],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO rex_view_blocks(view_id,block_id,agent_run_id,role,ownership,lifecycle,process_absent_confirmed,created_at_unix,last_observed_at_unix) VALUES (?1,'completed-block',?2,'supervisor','factory','completed',1,1,1)",
-                rusqlite::params![view_id.as_str(), cleanup_run.as_str()],
-            )
-            .unwrap();
-        let now = super::now_unix().unwrap() as u64 + 10;
-        let mut candidate = store
-            .rex_view_cleanup_candidates(now, 1)
-            .unwrap()
-            .pop()
-            .expect("completed, process-absent view should be eligible for cleanup");
-        candidate.view.rex_session_id = "attacker-session".into();
-
-        let error = store
-            .begin_rex_view_close(generation, &candidate, now, 1)
+        let mismatch_error = store
+            .register_agent_launch_authority(generation, &mismatched_session_authority)
             .unwrap_err();
-        assert!(error.contains("does not match persisted Rex view identity"));
-        let lifecycle: String = store
-            .connection
-            .query_row(
-                "SELECT lifecycle FROM rex_views WHERE view_id=?1",
-                [view_id.as_str()],
-                |row| row.get(0),
+        assert!(
+            mismatch_error.contains("AgentRun identity"),
+            "{mismatch_error}"
+        );
+        let mut mismatched_role_authority = mismatched_session_authority.clone();
+        mismatched_role_authority.role_session_id = "role-session".into();
+        mismatched_role_authority.role = crate::domain::types::Role::Coordinator;
+        let ticket_namespace = TicketNamespace::parse("fixture:workspace").unwrap();
+        let ticket_id = TicketId::parse("ticket-block-binding").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-block-binding").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &project_id,
+                &ticket_namespace,
+                &ticket_id,
+                &ticket_run_id,
+                1,
+                "queued",
+                "ready",
             )
             .unwrap();
-        assert_eq!(lifecycle, "active");
+        mismatched_role_authority.ticket_run_id = Some(ticket_run_id);
+        mismatched_role_authority.ticket_revision = Some(Revision(0));
+        let role_error = store
+            .register_agent_launch_authority(generation, &mismatched_role_authority)
+            .unwrap_err();
+        assert!(role_error.contains("reserved role"), "{role_error}");
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES ('run-1',?1,'supervisor','role-session',1,?2,1,1,?3,'op-1',?4,?5,?5,'/tmp/descriptor',?5,'profile',?5,?5,?5,?5,'fixture-instance','session-1','window-1','authorized-block','/tmp/workspace','/tmp/control',?5,'{}',?5,1)",
+            rusqlite::params![project_id.as_str(), "a".repeat(64), generation, view_id.as_str(), "b".repeat(64)],
+        ).unwrap();
+        let result = store.register_rex_view_block(
+            generation,
+            &RexViewBlock {
+                view_id,
+                block_id: "attacker-selected-block".into(),
+                agent_run_id: Some(crate::domain::ids::AgentRunId::parse("run-1").unwrap()),
+                role: Some(crate::domain::types::Role::Supervisor),
+                ownership: RexBlockOwnership::Factory,
+                lifecycle: RexBlockLifecycle::Active,
+                process_absent_confirmed: false,
+                retained_until_unix: None,
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -5137,6 +11879,7 @@ mod tests {
                 process_start_identity: "test-process-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -5160,6 +11903,13 @@ mod tests {
                 "ToDo",
             )
             .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ticket_runs SET external_revision='revision-1' WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.id.as_str(), ticket_run.as_str()],
+            )
+            .unwrap();
         let transition_payload = r#"{"input":"dispatch"}"#;
         let transition_input = DurableInput {
             producer_id: "agent-run-coordinator-1".into(),
@@ -5168,29 +11918,30 @@ mod tests {
             recipient: "ticket_run".into(),
             payload: transition_payload.into(),
         };
-        let effect = |operation_id: &str, logical_key: &str, kind: &str| EffectIntent {
+        let status_payload = crate::engine::ticket_effects::PublishTicketStatus {
+            schema_version: 1,
+            project_id: project.id.clone(),
+            namespace: namespace.clone(),
+            ticket_id: ticket.clone(),
+            ticket_run_id: ticket_run.clone(),
+            ticket_run_revision: 1,
+            expected_external_revision: Some("revision-1".into()),
+            desired_status: TicketStatus::InProgress,
+            reason: "dispatch fixture".into(),
+        };
+        let request_json = canonical_json(&status_payload).unwrap();
+        let effect = EffectIntent {
             project_id: project.id.clone(),
             subject_type: "ticket_run".into(),
             subject_id: ticket_run.as_str().into(),
-            operation_id: operation_id.into(),
-            logical_key: logical_key.into(),
-            kind: kind.into(),
-            request_json: "{}".into(),
-            request_digest: content_digest("{}"),
+            operation_id: "publish-in-progress".into(),
+            logical_key: "publish-in-progress-r1".into(),
+            kind: "publish_ticket_status".into(),
+            request_digest: content_digest(&request_json),
+            request_json,
             expected_revision: Some(1),
         };
-        let effects = [
-            effect(
-                "dispatch-coordinator",
-                "dispatch-coordinator-r1",
-                "start_coordinator",
-            ),
-            effect(
-                "publish-in-progress",
-                "publish-in-progress-r1",
-                "publish_ticket_status",
-            ),
-        ];
+        let effects = [effect];
         let receipt = store
             .commit_ticket_transition(
                 generation,
@@ -5235,7 +11986,51 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(committed, 2);
+        assert_eq!(committed, 1);
+        let coordinator_wake: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND lifecycle='pending'",
+                rusqlite::params![project.id.as_str(),format!("ticket_run:{}:coordinator",ticket_run.as_str())],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(coordinator_wake, 1);
+        let claimed = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.operation_id, "publish-in-progress");
+        let status_receipt = serde_json::json!({
+            "ticket_namespace": namespace.as_str(),
+            "ticket": {
+                "ticket_namespace": namespace.as_str(),
+                "scope": {"repository": "org/repo"},
+                "id": ticket.as_str(),
+                "revision": "revision-2",
+                "title": "Ticket 12",
+                "body": "Fixture",
+                "status": {"value": "in_progress"}
+            }
+        })
+        .to_string();
+        store
+            .finish_effect(
+                "publish-in-progress",
+                generation,
+                EffectOutcome::Succeeded,
+                Some(&status_receipt),
+            )
+            .unwrap();
+        let saved_external_revision: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT external_revision FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                rusqlite::params![project.id.as_str(), ticket_run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_external_revision.as_deref(), Some("revision-2"));
         assert!(
             store
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &ticket_run, 1)
@@ -5484,32 +12279,6 @@ mod tests {
             store.project(&project.id).unwrap().unwrap().state_revision,
             Revision(1)
         );
-        let claimed = store
-            .next_due_effect(generation, i64::MAX)
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.operation_id, "dispatch-coordinator");
-        store
-            .finish_effect(
-                "dispatch-coordinator",
-                generation,
-                EffectOutcome::Succeeded,
-                Some("{}"),
-            )
-            .unwrap();
-        let publish_status = store
-            .next_due_effect(generation, i64::MAX)
-            .unwrap()
-            .unwrap();
-        assert_eq!(publish_status.operation_id, "publish-in-progress");
-        store
-            .finish_effect(
-                "publish-in-progress",
-                generation,
-                EffectOutcome::Succeeded,
-                Some("{}"),
-            )
-            .unwrap();
         let project_transition_effect = store
             .next_due_effect(generation, i64::MAX)
             .unwrap()
@@ -5531,6 +12300,20 @@ mod tests {
                 Some("{}"),
             )
             .unwrap();
+        let stored_receipt = store
+            .succeeded_effect_receipt("op-other-project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_receipt.intent().operation_id, "op-other-project");
+        assert_eq!(stored_receipt.receipt_json(), "{}");
+        let first_receipt = store.succeeded_effect_receipt("op-1").unwrap().unwrap();
+        assert_eq!(first_receipt.intent().operation_id, "op-1");
+        assert!(
+            store
+                .succeeded_effect_receipt("missing-operation")
+                .unwrap()
+                .is_none()
+        );
         let new_generation = store
             .start_owner(&OwnerMetadata {
                 owner_nonce: "restarted-owner".into(),
@@ -5539,6 +12322,7 @@ mod tests {
                 process_start_identity: "new-process-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "f".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -5631,6 +12415,415 @@ mod tests {
     }
 
     #[test]
+    fn controller_activates_only_its_starting_projects() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let project = ProjectRecord {
+            id: ProjectId::parse("payments").unwrap(),
+            config_source: "factory".into(),
+            config_revision: applied.revision,
+            config_digest: Digest::parse("a".repeat(64)).unwrap(),
+            mode: "goal".into(),
+            goal_revision: 1,
+            desired_lifecycle: "stopped".into(),
+            state_revision: Revision(0),
+        };
+        store.insert_project(&project).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "activation-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        ConfigStore::append_control(
+            temp.path(),
+            "start-payments",
+            &super::ControlCommand {
+                request_id: "start-payments".into(),
+                kind: "project_lifecycle".into(),
+                project_id: Some(project.id.clone()),
+                lifecycle: Some("running".into()),
+                created_at_unix: 1,
+                applied_config: None,
+            },
+            generation,
+        )
+        .unwrap();
+        store.process_next_control(generation).unwrap().unwrap();
+        assert_eq!(
+            ConfigStore::status(temp.path()).unwrap().projects[0].observed_lifecycle,
+            "starting"
+        );
+
+        assert_eq!(store.activate_starting_projects(generation).unwrap(), 1);
+        assert_eq!(
+            ConfigStore::status(temp.path()).unwrap().projects[0].observed_lifecycle,
+            "running"
+        );
+        assert_eq!(store.activate_starting_projects(generation).unwrap(), 0);
+    }
+
+    #[test]
+    fn controller_restart_reattaches_only_desired_running_projects_without_advancing_epoch() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let applied = store
+            .apply_snapshot(
+                "factory",
+                &snapshot(&"a".repeat(64)),
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap();
+        let ids = ["running", "paused", "stopped"].map(|id| ProjectId::parse(id).unwrap());
+        for (id, lifecycle) in ids.iter().zip(["running", "paused", "stopped"]) {
+            store
+                .insert_project(&ProjectRecord {
+                    id: id.clone(),
+                    config_source: "factory".into(),
+                    config_revision: applied.revision,
+                    config_digest: Digest::parse("a".repeat(64)).unwrap(),
+                    mode: "goal".into(),
+                    goal_revision: 1,
+                    desired_lifecycle: lifecycle.into(),
+                    state_revision: Revision(0),
+                })
+                .unwrap();
+        }
+        let first = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "first-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start-1".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        for (id, lifecycle) in ids.iter().zip(["running", "paused", "stopped"]) {
+            store.set_project_lifecycle(first, id, lifecycle).unwrap();
+        }
+        let epochs = ids
+            .iter()
+            .map(|id| {
+                store
+                    .connection
+                    .query_row(
+                        "SELECT project_epoch FROM project_runtimes WHERE project_id=?1",
+                        [id.as_str()],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.stop_owner(first).unwrap();
+
+        let second = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "second-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start-2".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT desired_lifecycle,observed_lifecycle,controller_generation,project_epoch FROM project_runtimes WHERE project_id='running'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?)),
+            ).unwrap(),
+            ("running".into(), "starting".into(), second, epochs[0])
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT desired_lifecycle,observed_lifecycle,controller_generation,project_epoch FROM project_runtimes WHERE project_id='paused'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?)),
+            ).unwrap(),
+            ("paused".into(), "paused".into(), first, epochs[1])
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT desired_lifecycle,observed_lifecycle,controller_generation,project_epoch FROM project_runtimes WHERE project_id='stopped'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?)),
+            ).unwrap(),
+            ("stopped".into(), "stopped".into(), first, epochs[2])
+        );
+        assert_eq!(store.activate_starting_projects(second).unwrap(), 1);
+    }
+
+    #[test]
+    fn public_resume_requeues_only_a_current_consumed_ticket_observation() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let project_id = ProjectId::parse("payments").unwrap();
+        let project_config: crate::config::ProjectConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "ticket_scope": {"repository": "org/repo"},
+                "dispatch_states": ["ready"]
+            }))
+            .unwrap();
+        let mut snapshot = snapshot(&"a".repeat(64));
+        snapshot
+            .config
+            .projects
+            .insert(project_id.clone(), project_config.clone());
+        let applied = store
+            .apply_snapshot("factory", &snapshot, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let namespace = TicketNamespace::parse("github:org/repo").unwrap();
+        let adapter = AdapterId::parse("tickets").unwrap();
+        let key = TicketScanKey::for_project(
+            &project_id,
+            &adapter,
+            &namespace,
+            &project_config,
+            TicketStatus::Ready,
+        )
+        .unwrap();
+        for index in 0..100 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO ticket_observations(project_id,adapter_id,namespace,ticket_id,scope_digest,filter_digest,external_revision,status,title,labels_json,last_seen_at_unix,scan_generation,dispatch_state) VALUES (?1,?2,?3,?4,?5,?6,'old-rev','ready','Stale scope','[]',?7,1,'pending')",
+                    rusqlite::params![
+                        project_id.as_str(),
+                        adapter.as_str(),
+                        namespace.as_str(),
+                        format!("stale-{index:03}"),
+                        "f".repeat(64),
+                        key.filter_digest.as_str(),
+                        index as i64
+                    ],
+                )
+                .unwrap();
+        }
+        for index in 0..100 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO ticket_observations(project_id,adapter_id,namespace,ticket_id,scope_digest,filter_digest,external_revision,status,title,labels_json,last_seen_at_unix,scan_generation,dispatch_state) VALUES (?1,?2,?3,?4,?5,?6,'rev-pending','ready','No consumed wake','[]',?7,1,'pending')",
+                    rusqlite::params![
+                        project_id.as_str(),
+                        adapter.as_str(),
+                        namespace.as_str(),
+                        format!("nonconsumed-{index:03}"),
+                        key.scope_digest.as_str(),
+                        key.filter_digest.as_str(),
+                        100 + index as i64
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO ticket_observations(project_id,adapter_id,namespace,ticket_id,scope_digest,filter_digest,external_revision,status,title,labels_json,last_seen_at_unix,scan_generation,dispatch_state) VALUES (?1,?2,?3,'#42',?4,?5,'rev-1','ready','Current ticket','[\"plan\"]',300,1,'pending')",
+                rusqlite::params![
+                    project_id.as_str(),
+                    adapter.as_str(),
+                    namespace.as_str(),
+                    key.scope_digest.as_str(),
+                    key.filter_digest.as_str()
+                ],
+            )
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "resume-owner".into(),
+                state_root: temp.path().to_string_lossy().into_owned(),
+                config_source: "factory".into(),
+                process_start_identity: "test-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+
+        let append_lifecycle = |store: &mut ConfigStore, request_id: &str, lifecycle: &str| {
+            ConfigStore::append_control(
+                temp.path(),
+                request_id,
+                &ControlCommand {
+                    request_id: request_id.into(),
+                    kind: "project_lifecycle".into(),
+                    project_id: Some(project_id.clone()),
+                    lifecycle: Some(lifecycle.into()),
+                    created_at_unix: 1,
+                    applied_config: None,
+                },
+                generation,
+            )
+            .unwrap();
+            store.process_next_control(generation).unwrap().unwrap();
+        };
+
+        // An initial start has no consumed scanner wake to retry.
+        append_lifecycle(&mut store, "start-payments", "running");
+        let wake_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(wake_count, 0);
+        store.activate_starting_projects(generation).unwrap();
+
+        // Model a regular scanner wake; start/resume must not duplicate an in-flight one.
+        let observation = PendingTicketObservation {
+            ticket_id: TicketId::parse("#42").unwrap(),
+            revision: Some("rev-1".into()),
+            status: TicketStatus::Ready,
+            title: "Current ticket".into(),
+            labels: vec!["plan".into()],
+            observed_at_unix: 300,
+        };
+        assert!(
+            store
+                .enqueue_supervisor_ticket_observation(generation, &key, &observation, 11)
+                .unwrap()
+        );
+        let regular: (u64, String, u64, String) = store
+            .connection
+            .query_row(
+                "SELECT wake_input_id,source_id,source_revision,payload_json FROM role_wake_inputs WHERE source_type='ticket_observation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(regular.1, "github:org/repo:#42:ready");
+        append_lifecycle(&mut store, "pause-with-pending", "paused");
+        append_lifecycle(&mut store, "resume-with-pending", "running");
+        let pending_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending_count, 1);
+        store
+            .connection
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='assigned' WHERE wake_input_id=?1",
+                [regular.0],
+            )
+            .unwrap();
+        append_lifecycle(&mut store, "pause-with-assigned", "paused");
+        append_lifecycle(&mut store, "resume-with-assigned", "running");
+        let assigned_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(assigned_count, 1);
+
+        // Model the completed Supervisor review, retaining the consumed history.
+        store
+            .connection
+            .execute(
+                "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE wake_input_id=?1",
+                [regular.0],
+            )
+            .unwrap();
+
+        append_lifecycle(&mut store, "pause-payments", "paused");
+        append_lifecycle(&mut store, "resume-payments", "running");
+
+        let resumed_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            resumed_count, 2,
+            "resume must enqueue the current observation"
+        );
+        let resumed: (String, u64, String, String) = store
+            .connection
+            .query_row(
+                "SELECT source_id,source_revision,payload_json,lifecycle FROM role_wake_inputs WHERE wake_input_id!=?1",
+                [regular.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(resumed.0, "github:org/repo:#42:ready:resume:8");
+        assert_eq!(resumed.1, regular.2);
+        assert_eq!(resumed.2, regular.3);
+        assert_eq!(resumed.3, "pending");
+        assert!(resumed.2.contains("\"external_revision\":\"rev-1\""));
+        assert!(resumed.2.contains("\"ticket_id\":\"#42\""));
+        let old_lifecycle: String = store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM role_wake_inputs WHERE wake_input_id=?1",
+                [regular.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_lifecycle, "consumed");
+
+        // Replaying the same public request cannot advance the epoch or add another wake.
+        ConfigStore::append_control(
+            temp.path(),
+            "resume-payments",
+            &ControlCommand {
+                request_id: "resume-payments".into(),
+                kind: "project_lifecycle".into(),
+                project_id: Some(project_id),
+                lifecycle: Some("running".into()),
+                created_at_unix: 1,
+                applied_config: None,
+            },
+            generation,
+        )
+        .unwrap();
+        assert!(store.process_next_control(generation).unwrap().is_none());
+        let final_count: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(final_count, 2);
+        assert_eq!(applied.revision.0, 1);
+    }
+
+    #[test]
     fn human_claim_release_is_audited_cancels_local_run_and_requires_remote_repoll() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -5661,6 +12854,7 @@ mod tests {
                 process_start_identity: "test-start".into(),
                 executable_path: "/tmp/rex-projects-test".into(),
                 executable_digest: "e".repeat(64),
+                rex_endpoint: None,
                 rex_server_identity: None,
                 rex_session_id: None,
                 rex_block_id: None,
@@ -5718,18 +12912,6 @@ mod tests {
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &run, 1)
                 .is_err()
         );
-        assert!(
-            store
-                .confirm_ticket_claim_repolled(
-                    generation,
-                    &namespace,
-                    &ticket,
-                    true,
-                    "In Progress",
-                    Some("remote-7")
-                )
-                .unwrap()
-        );
         let next_run = TicketRunId::parse("payments-12-g2").unwrap();
         store
             .create_ticket_run(
@@ -5746,8 +12928,14 @@ mod tests {
         assert!(
             store
                 .claim_ticket(generation, &namespace, &ticket, &project.id, &next_run, 2)
-                .unwrap()
+                .is_err()
         );
+        let reconciliation_state: String = store.connection.query_row(
+            "SELECT state FROM ticket_claim_reconciliations WHERE namespace=?1 AND ticket_id=?2",
+            rusqlite::params![namespace.as_str(), ticket.as_str()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(reconciliation_state, "pending");
         let audit: (String,String) = store.connection.query_row(
             "SELECT input_id,evidence_json FROM transitions WHERE entity_id=?1 AND new_revision=1",[run.as_str()],|row| Ok((row.get(0)?,row.get(1)?)),
         ).unwrap();

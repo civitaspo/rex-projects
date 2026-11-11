@@ -11,8 +11,14 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::HookConfig;
 use crate::domain::ids::{Digest, ProjectId, RepositoryId, TicketRunId};
+use crate::host_jobs::{
+    HostJobEnvironmentBinding, HostJobPool, HostJobProgress, process_request_digest,
+};
 use crate::process::{self, ProcessError, ProcessRequest};
+use crate::store::ConfigStore;
+use crate::store::host_jobs::{HostJobIntent, HostJobKind};
 use crate::worktrees::GitOptions;
+use crate::worktrees::WorktreeLease;
 
 const DEFAULT_STDOUT_LIMIT: usize = 1024 * 1024;
 const STDERR_TAIL_LIMIT: usize = 32 * 1024;
@@ -75,6 +81,7 @@ impl std::error::Error for HookError {}
 pub struct HookRunner {
     git: GitOptions,
     inherited_environment: BTreeMap<OsString, OsString>,
+    environment_binding: HostJobEnvironmentBinding,
     stdout_limit: usize,
 }
 
@@ -88,11 +95,25 @@ pub struct HookRunContext<'a> {
     pub state_root: &'a Path,
 }
 
+pub struct ManagedHookExecution<'a> {
+    pub store: &'a mut ConfigStore,
+    pub pool: &'a mut HostJobPool,
+    pub owner_generation: u64,
+    pub effect_operation_id: &'a str,
+    pub max_attempts: u32,
+    pub now_unix: i64,
+}
+
 impl HookRunner {
-    pub fn new(git: GitOptions, inherited_environment: BTreeMap<OsString, OsString>) -> Self {
+    pub fn new(
+        git: GitOptions,
+        inherited_environment: BTreeMap<OsString, OsString>,
+        environment_binding: HostJobEnvironmentBinding,
+    ) -> Self {
         Self {
             git,
             inherited_environment,
+            environment_binding,
             stdout_limit: DEFAULT_STDOUT_LIMIT,
         }
     }
@@ -105,6 +126,295 @@ impl HookRunner {
         }
         self.stdout_limit = limit;
         Ok(self)
+    }
+
+    pub fn run_required_managed(
+        &self,
+        hooks: &[HookConfig],
+        context: HookRunContext<'_>,
+        execution: ManagedHookExecution<'_>,
+        mut acquire_worktree_lease: impl FnMut() -> Result<WorktreeLease, String>,
+    ) -> Result<Option<Vec<HookReceipt>>, HookError> {
+        let ManagedHookExecution {
+            store,
+            pool,
+            owner_generation,
+            effect_operation_id,
+            max_attempts,
+            now_unix,
+        } = execution;
+        if hooks.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if effect_operation_id.trim().is_empty() || max_attempts == 0 {
+            return Err(HookError::Invalid(
+                "managed hook identity and attempt limit are required".into(),
+            ));
+        }
+        let HookRunContext {
+            repository_id,
+            worktree,
+            expected_head,
+            project_id,
+            ticket_run_id,
+            configuration_digest,
+            state_root,
+        } = context;
+        let root = state_root.canonicalize().map_err(io_error)?;
+        let receipts_root = root
+            .join("hook-receipts")
+            .join(project_id.as_str())
+            .join(repository_id.as_str())
+            .join(ticket_run_id.as_str());
+        create_private_directory(&root)?;
+        create_private_directory(&root.join("hook-receipts"))?;
+        create_private_directory(&root.join("hook-receipts").join(project_id.as_str()))?;
+        create_private_directory(
+            &root
+                .join("hook-receipts")
+                .join(project_id.as_str())
+                .join(repository_id.as_str()),
+        )?;
+        create_private_directory(&receipts_root)?;
+        let repo = worktree.canonicalize().map_err(io_error)?;
+        ensure_real_directory(&repo)?;
+        let managed_worktrees = root.join("worktrees").canonicalize().map_err(io_error)?;
+        if !repo.starts_with(&managed_worktrees) {
+            return Err(HookError::Invalid(
+                "repository checks may run only inside a managed worktree".into(),
+            ));
+        }
+        let actual_head = self.git_text(&repo, ["rev-parse", "--verify", "HEAD"])?;
+        if actual_head.trim() != expected_head {
+            return Err(HookError::Invalid(
+                "repository hook head differs from the expected revision".into(),
+            ));
+        }
+
+        let mut receipts = Vec::with_capacity(hooks.len());
+        for hook in hooks {
+            validate_hook(hook)?;
+            let before = self.source_fingerprint(&repo)?;
+            let executable = self.resolve_command(&hook.command[0]).ok_or_else(|| {
+                HookError::Invalid(format!(
+                    "configured repository check `{}` executable is unavailable",
+                    hook.id
+                ))
+            })?;
+            let timeout = Duration::from_secs(hook.timeout_seconds);
+            if timeout.is_zero() {
+                return Err(HookError::Invalid(format!(
+                    "repository check `{}` timeout must be positive",
+                    hook.id
+                )));
+            }
+            let mut environment = self.inherited_environment.clone();
+            environment.retain(|key, _| {
+                let key = key.to_string_lossy();
+                !matches!(
+                    key.as_ref(),
+                    "REX_PROJECTS_CONTEXT"
+                        | "REX_PROJECTS_AGENT"
+                        | "REX_PROJECTS_PROJECT_ID"
+                        | "REX_PROJECTS_ROLE"
+                        | "REX_PROJECTS_RUN_ID"
+                        | "REX_PROJECTS_TICKET_RUN_ID"
+                )
+            });
+            process::clear_git_repository_environment(&mut environment);
+            environment.insert("REX_PROJECTS_CONTEXT".into(), "rex_projects_hook".into());
+            environment.insert("REX_PROJECTS_AGENT".into(), "1".into());
+            environment.insert("REX_PROJECTS_PROJECT_ID".into(), project_id.as_str().into());
+            environment.insert("REX_PROJECTS_ROLE".into(), "rex_projects_hook".into());
+            environment.insert("REX_PROJECTS_RUN_ID".into(), hook.id.as_str().into());
+            environment.insert(
+                "REX_PROJECTS_TICKET_RUN_ID".into(),
+                ticket_run_id.as_str().into(),
+            );
+            environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+            let request = ProcessRequest {
+                executable,
+                args: hook.command[1..].iter().map(OsString::from).collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.clone()),
+                clear_environment: true,
+                environment,
+                timeout,
+                shutdown_grace: HOOK_SHUTDOWN_GRACE,
+                stdout_limit: self.stdout_limit,
+                stderr_tail_limit: STDERR_TAIL_LIMIT,
+            };
+            let command_digest = process_request_digest(&request, &self.environment_binding);
+            let job_id = digest_bytes(
+                format!(
+                    "rex-hook-v1:{effect_operation_id}:{}:{}:{}:{}",
+                    hook.id, expected_head, configuration_digest, before
+                )
+                .as_bytes(),
+            )
+            .to_string();
+            let intent = HostJobIntent {
+                job_id: job_id.clone(),
+                effect_operation_id: format!("{effect_operation_id}:{}", hook.id),
+                project_id: project_id.as_str().into(),
+                subject_id: hook.id.clone(),
+                lane_id: repo.to_string_lossy().into_owned(),
+                kind: HostJobKind::RepositoryHook,
+                operation_method: None,
+                request_digest: command_digest,
+                configuration_digest: configuration_digest.to_string(),
+                environment_snapshot_id: self.environment_binding.snapshot_id.clone(),
+                environment_policy_digest: self.environment_binding.policy_digest.clone(),
+                head: expected_head.to_owned(),
+                source_digest: before.to_string(),
+                max_attempts,
+                retry_when_absent: true,
+            };
+            let lease = if pool.holds_worktree_lease_for(&intent.lane_id) {
+                None
+            } else {
+                Some(acquire_worktree_lease().map_err(HookError::Process)?)
+            };
+            match pool
+                .submit_or_poll(store, owner_generation, &intent, request, lease, now_unix)
+                .map_err(HookError::Process)?
+            {
+                HostJobProgress::Pending
+                | HostJobProgress::Running
+                | HostJobProgress::Unknown
+                | HostJobProgress::ProcessAbsentNoRetry => {
+                    return Ok(None);
+                }
+                HostJobProgress::Succeeded(receipt_json)
+                | HostJobProgress::Failed(receipt_json) => {
+                    let receipt: HookReceipt = serde_json::from_str(&receipt_json)
+                        .map_err(|_| HookError::Invalid("stored hook receipt is invalid".into()))?;
+                    validate_hook_receipt(
+                        &receipt,
+                        hook,
+                        project_id,
+                        repository_id,
+                        ticket_run_id,
+                        expected_head,
+                        configuration_digest,
+                    )?;
+                    if !receipt.succeeded {
+                        return Err(HookError::Failed(Box::new(receipt)));
+                    }
+                    receipts.push(receipt);
+                }
+                HostJobProgress::ProcessCompleted(output) => {
+                    let after_head = self.git_text(&repo, ["rev-parse", "--verify", "HEAD"])?;
+                    let after = self.source_fingerprint(&repo)?;
+                    let source_changed = before != after;
+                    let succeeded = output.status_code == Some(0)
+                        && !output.timed_out
+                        && output.cleanup_confirmed
+                        && !output.stdout_truncated
+                        && after_head.trim() == expected_head
+                        && !source_changed;
+                    let receipt = HookReceipt {
+                        schema_version: 1,
+                        hook_id: hook.id.clone(),
+                        project_id: project_id.clone(),
+                        repository_id: repository_id.clone(),
+                        ticket_run_id: ticket_run_id.clone(),
+                        head: expected_head.to_owned(),
+                        configuration_digest: configuration_digest.clone(),
+                        source_before: before,
+                        source_after: after,
+                        exit_code: output.status_code,
+                        timed_out: output.timed_out,
+                        cleanup_confirmed: output.cleanup_confirmed,
+                        stdout_digest: digest_bytes(&output.stdout),
+                        stdout_bytes: output.stdout.len(),
+                        stdout_truncated: output.stdout_truncated,
+                        stderr_tail_digest: digest_bytes(&output.stderr_tail),
+                        stderr_bytes: output.stderr_tail.len(),
+                        stderr_truncated: output.stderr_truncated,
+                        succeeded,
+                        recorded_at_unix: now_unix.max(0) as u64,
+                    };
+                    let receipt_json = serde_json::to_string(&receipt)
+                        .map_err(|error| HookError::Invalid(error.to_string()))?;
+                    write_receipt(
+                        &receipt_path(
+                            &receipts_root,
+                            &hook.id,
+                            expected_head,
+                            configuration_digest,
+                        ),
+                        &receipt,
+                    )?;
+                    pool.finish(
+                        store,
+                        owner_generation,
+                        &job_id,
+                        succeeded,
+                        &receipt_json,
+                        now_unix,
+                    )
+                    .map_err(HookError::Process)?;
+                    if after_head.trim() != expected_head || source_changed {
+                        return Err(HookError::SourceChanged {
+                            hook_id: hook.id.clone(),
+                        });
+                    }
+                    if !succeeded {
+                        return Err(HookError::Failed(Box::new(receipt)));
+                    }
+                    receipts.push(receipt);
+                }
+                HostJobProgress::ProcessFailed(error) => {
+                    let empty = digest_bytes(&[]);
+                    let receipt = HookReceipt {
+                        schema_version: 1,
+                        hook_id: hook.id.clone(),
+                        project_id: project_id.clone(),
+                        repository_id: repository_id.clone(),
+                        ticket_run_id: ticket_run_id.clone(),
+                        head: expected_head.to_owned(),
+                        configuration_digest: configuration_digest.clone(),
+                        source_before: before.clone(),
+                        source_after: self.source_fingerprint(&repo)?,
+                        exit_code: None,
+                        timed_out: false,
+                        cleanup_confirmed: true,
+                        stdout_digest: empty.clone(),
+                        stdout_bytes: 0,
+                        stdout_truncated: false,
+                        stderr_tail_digest: empty,
+                        stderr_bytes: 0,
+                        stderr_truncated: false,
+                        succeeded: false,
+                        recorded_at_unix: now_unix.max(0) as u64,
+                    };
+                    let receipt_json = serde_json::to_string(&receipt)
+                        .map_err(|e| HookError::Invalid(e.to_string()))?;
+                    write_receipt(
+                        &receipt_path(
+                            &receipts_root,
+                            &hook.id,
+                            expected_head,
+                            configuration_digest,
+                        ),
+                        &receipt,
+                    )?;
+                    pool.finish(
+                        store,
+                        owner_generation,
+                        &job_id,
+                        false,
+                        &receipt_json,
+                        now_unix,
+                    )
+                    .map_err(HookError::Process)?;
+                    let _ = error;
+                    return Err(HookError::Failed(Box::new(receipt)));
+                }
+            }
+        }
+        Ok(Some(receipts))
     }
 
     pub fn run_required(
@@ -175,17 +485,17 @@ impl HookRunner {
             let mut environment = self.inherited_environment.clone();
             environment.retain(|key, _| {
                 let key = key.to_string_lossy();
-                !key.starts_with("GIT_")
-                    && !matches!(
-                        key.as_ref(),
-                        "REX_PROJECTS_CONTEXT"
-                            | "REX_PROJECTS_AGENT"
-                            | "REX_PROJECTS_PROJECT_ID"
-                            | "REX_PROJECTS_ROLE"
-                            | "REX_PROJECTS_RUN_ID"
-                            | "REX_PROJECTS_TICKET_RUN_ID"
-                    )
+                !matches!(
+                    key.as_ref(),
+                    "REX_PROJECTS_CONTEXT"
+                        | "REX_PROJECTS_AGENT"
+                        | "REX_PROJECTS_PROJECT_ID"
+                        | "REX_PROJECTS_ROLE"
+                        | "REX_PROJECTS_RUN_ID"
+                        | "REX_PROJECTS_TICKET_RUN_ID"
+                )
             });
+            process::clear_git_repository_environment(&mut environment);
             environment.insert("REX_PROJECTS_CONTEXT".into(), "rex_projects_hook".into());
             environment.insert("REX_PROJECTS_AGENT".into(), "1".into());
             environment.insert("REX_PROJECTS_PROJECT_ID".into(), project_id.as_str().into());
@@ -328,9 +638,7 @@ impl HookRunner {
 
     fn git_text<const N: usize>(&self, cwd: &Path, args: [&str; N]) -> Result<String, HookError> {
         let mut environment = self.git.environment.clone();
-        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
-            environment.remove(OsStr::new(key));
-        }
+        process::clear_git_repository_environment(&mut environment);
         environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
         let output = process::run(ProcessRequest {
             executable: self.git.executable.clone(),
@@ -440,6 +748,29 @@ impl HookRunner {
         }
         Ok(digest_bytes(&digest.finalize()))
     }
+}
+
+fn validate_hook_receipt(
+    receipt: &HookReceipt,
+    hook: &HookConfig,
+    project_id: &ProjectId,
+    repository_id: &RepositoryId,
+    ticket_run_id: &TicketRunId,
+    head: &str,
+    configuration_digest: &Digest,
+) -> Result<(), HookError> {
+    if receipt.hook_id != hook.id
+        || &receipt.project_id != project_id
+        || &receipt.repository_id != repository_id
+        || &receipt.ticket_run_id != ticket_run_id
+        || receipt.head != head
+        || &receipt.configuration_digest != configuration_digest
+    {
+        return Err(HookError::Invalid(
+            "stored hook receipt does not match its immutable intent".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_hook(hook: &HookConfig) -> Result<(), HookError> {
@@ -610,6 +941,13 @@ fn io_error(error: std::io::Error) -> HookError {
 mod tests {
     use super::*;
 
+    fn test_environment_binding() -> HostJobEnvironmentBinding {
+        HostJobEnvironmentBinding {
+            snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+            policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+        }
+    }
+
     fn fixture_git(cwd: &Path, args: &[&str]) {
         let output = process::run(ProcessRequest {
             executable: PathBuf::from("/usr/bin/git"),
@@ -718,6 +1056,7 @@ mod tests {
                 timeout: Duration::from_secs(10),
             },
             [(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))].into(),
+            test_environment_binding(),
         );
         let receipts = runner
             .run_required(
@@ -763,6 +1102,338 @@ mod tests {
     }
 
     #[test]
+    fn managed_hook_is_pending_while_other_worktree_progresses_and_same_worktree_waits() {
+        use crate::host_jobs::HostJobPool;
+        use crate::store::host_jobs::{HostJobState, in_memory_test_store};
+        use crate::worktrees::{ManagedWorktree, WorktreeManager};
+        use std::thread;
+        use std::time::Instant;
+
+        let (temp, first_repo, config_digest) = fixture();
+        let second_repo = temp
+            .path()
+            .join("worktrees/second-repo/00000000000000000000000000000002");
+        fs::create_dir_all(second_repo.parent().unwrap()).unwrap();
+        fixture_git(
+            temp.path(),
+            &[
+                "clone",
+                "--shared",
+                "--quiet",
+                first_repo.to_str().unwrap(),
+                second_repo.to_str().unwrap(),
+            ],
+        );
+
+        let git = PathBuf::from("/usr/bin/git");
+        let git_options = GitOptions {
+            executable: git,
+            environment: BTreeMap::new(),
+            timeout: Duration::from_secs(10),
+        };
+        let manager = WorktreeManager::new(temp.path(), git_options.clone()).unwrap();
+        let head = |repo: &Path| {
+            let output = process::run(ProcessRequest {
+                executable: PathBuf::from("/usr/bin/git"),
+                args: ["rev-parse", "HEAD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.to_owned()),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+                shutdown_grace: Duration::from_secs(2),
+                stdout_limit: 1024,
+                stderr_tail_limit: 1024,
+            })
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let first_head = head(&first_repo);
+        let second_head = head(&second_repo);
+        assert_eq!(first_head, second_head);
+
+        let blocked_ready = temp.path().join("blocked.ready");
+        let blocked_release = temp.path().join("blocked.release");
+        let quick_done = temp.path().join("quick.done");
+        let quick_config_result = temp.path().join("quick.config");
+        let quick_root_result = temp.path().join("quick.root");
+        let global_config = temp.path().join("managed-gitconfig");
+        fs::write(
+            &global_config,
+            "[user]\n\tsigningkey = managed-fixture-key\n",
+        )
+        .unwrap();
+        let foreign = temp.path().join("managed-foreign-repository");
+        fs::create_dir(&foreign).unwrap();
+        fixture_git(&foreign, &["init", "-b", "main"]);
+        let foreign_git = foreign.join(".git");
+        let mut environment =
+            BTreeMap::from([(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))]);
+        environment.insert(
+            OsString::from("BLOCKED_READY"),
+            blocked_ready.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("BLOCKED_RELEASE"),
+            blocked_release.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_DONE"),
+            quick_done.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_CONFIG_RESULT"),
+            quick_config_result.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_ROOT_RESULT"),
+            quick_root_result.clone().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("QUICK_EXPECTED_ROOT"),
+            second_repo.canonicalize().unwrap().into_os_string(),
+        );
+        environment.insert(
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            global_config.into_os_string(),
+        );
+        environment.insert(
+            OsString::from("GIT_DIR"),
+            foreign_git.clone().into_os_string(),
+        );
+        environment.insert(OsString::from("GIT_WORK_TREE"), foreign.into_os_string());
+        environment.insert(
+            OsString::from("GIT_INDEX_FILE"),
+            foreign_git.join("index").into_os_string(),
+        );
+        let runner = HookRunner::new(
+            GitOptions {
+                executable: PathBuf::from("/usr/bin/git"),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+            },
+            environment,
+            test_environment_binding(),
+        );
+        let mut store = in_memory_test_store();
+        let mut pool = HostJobPool::new(2, 2).unwrap();
+        let project = ProjectId::parse("fixture-project").unwrap();
+        let first_repository = RepositoryId::parse("fixture-repo").unwrap();
+        let second_repository = RepositoryId::parse("second-repo").unwrap();
+        let blocked = HookConfig {
+            id: "blocked".into(),
+            command: [
+                "/bin/sh",
+                "-c",
+                "printf ready > \"$BLOCKED_READY\"; while [ ! -f \"$BLOCKED_RELEASE\" ]; do sleep 0.01; done",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            timeout_seconds: 10,
+        };
+        let first_ticket = TicketRunId::parse("blocked-run").unwrap();
+        let first_lease = || {
+            manager
+                .acquire_writer_lease(ManagedWorktree {
+                    repository_id: first_repository.clone(),
+                    path: first_repo.canonicalize().unwrap(),
+                    branch: "rex-projects/0123456789abcdef0123456789abcdef".into(),
+                    base_sha: first_head.clone(),
+                })
+                .map_err(|error| error.to_string())
+        };
+        assert!(
+            runner
+                .run_required_managed(
+                    std::slice::from_ref(&blocked),
+                    HookRunContext {
+                        repository_id: &first_repository,
+                        worktree: &first_repo,
+                        expected_head: &first_head,
+                        project_id: &project,
+                        ticket_run_id: &first_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-blocked",
+                        max_attempts: 1,
+                        now_unix: 10,
+                    },
+                    first_lease,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !blocked_ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "hook never reached its barrier"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let same_worktree_ticket = TicketRunId::parse("same-worktree-run").unwrap();
+        let same_worktree_hook = hook(&["/bin/sh", "-c", "exit 0"]);
+        assert!(
+            runner
+                .run_required_managed(
+                    std::slice::from_ref(&same_worktree_hook),
+                    HookRunContext {
+                        repository_id: &first_repository,
+                        worktree: &first_repo,
+                        expected_head: &first_head,
+                        project_id: &project,
+                        ticket_run_id: &same_worktree_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-same-worktree",
+                        max_attempts: 1,
+                        now_unix: 11,
+                    },
+                    first_lease,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .host_jobs_in_states(&[HostJobState::Pending])
+                .unwrap()
+                .len(),
+            1,
+            "same-worktree work must remain queued while the blocked hook holds its lease"
+        );
+
+        let quick_ticket = TicketRunId::parse("quick-run").unwrap();
+        let quick = HookConfig {
+            id: "quick".into(),
+            command: [
+                "/bin/sh",
+                "-c",
+                "test \"$(git config --global --get user.signingkey)\" = managed-fixture-key && git rev-parse --show-toplevel > \"$QUICK_ROOT_RESULT\" && test \"$(cat \"$QUICK_ROOT_RESULT\")\" = \"$QUICK_EXPECTED_ROOT\" && git config --global --get user.signingkey > \"$QUICK_CONFIG_RESULT\" && printf done > \"$QUICK_DONE\"",
+            ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            timeout_seconds: 10,
+        };
+        let second_lease = || {
+            manager
+                .acquire_writer_lease(ManagedWorktree {
+                    repository_id: second_repository.clone(),
+                    path: second_repo.canonicalize().unwrap(),
+                    branch: "rex-projects/00000000000000000000000000000002".into(),
+                    base_sha: second_head.clone(),
+                })
+                .map_err(|error| error.to_string())
+        };
+        let quick_deadline = Instant::now() + Duration::from_secs(5);
+        let quick_receipts = loop {
+            if let Some(receipts) = runner
+                .run_required_managed(
+                    std::slice::from_ref(&quick),
+                    HookRunContext {
+                        repository_id: &second_repository,
+                        worktree: &second_repo,
+                        expected_head: &second_head,
+                        project_id: &project,
+                        ticket_run_id: &quick_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-quick",
+                        max_attempts: 1,
+                        now_unix: 12,
+                    },
+                    second_lease,
+                )
+                .unwrap()
+            {
+                break receipts;
+            }
+            assert!(
+                Instant::now() < quick_deadline,
+                "independent worktree did not complete"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(fs::read_to_string(&quick_done).unwrap(), "done");
+        assert_eq!(
+            fs::read_to_string(&quick_config_result).unwrap().trim(),
+            "managed-fixture-key"
+        );
+        assert_eq!(
+            fs::read_to_string(&quick_root_result).unwrap().trim(),
+            second_repo.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(quick_receipts.len(), 1);
+        assert!(quick_receipts[0].succeeded);
+        assert!(
+            !blocked_release.exists(),
+            "the quick hook completed before the blocked hook was released"
+        );
+
+        fs::write(&blocked_release, "release").unwrap();
+        let blocked_deadline = Instant::now() + Duration::from_secs(5);
+        let blocked_receipts = loop {
+            if let Some(receipts) = runner
+                .run_required_managed(
+                    std::slice::from_ref(&blocked),
+                    HookRunContext {
+                        repository_id: &first_repository,
+                        worktree: &first_repo,
+                        expected_head: &first_head,
+                        project_id: &project,
+                        ticket_run_id: &first_ticket,
+                        configuration_digest: &config_digest,
+                        state_root: temp.path(),
+                    },
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id: "effect-blocked",
+                        max_attempts: 1,
+                        now_unix: 13,
+                    },
+                    first_lease,
+                )
+                .unwrap()
+            {
+                break receipts;
+            }
+            assert!(
+                Instant::now() < blocked_deadline,
+                "released hook did not finish"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(blocked_receipts.len(), 1);
+        assert!(blocked_receipts[0].succeeded);
+        assert_eq!(blocked_receipts[0].head, first_head);
+        assert_eq!(blocked_receipts[0].configuration_digest, config_digest);
+    }
+
+    #[test]
     fn keeps_receipts_separate_for_repositories_with_same_project_ticket_and_hook() {
         let (temp, first_repo, config_digest) = fixture();
         let second_repo = temp.path().join("worktrees/second-repo/shared");
@@ -803,6 +1474,7 @@ mod tests {
                 timeout: Duration::from_secs(10),
             },
             [(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))].into(),
+            test_environment_binding(),
         );
         let project = ProjectId::parse("fixture-project").unwrap();
         let ticket_run = TicketRunId::parse("same-run").unwrap();
@@ -848,6 +1520,104 @@ mod tests {
     }
 
     #[test]
+    fn direct_hook_reads_git_config_without_inheriting_repository_routing() {
+        let (temp, repo, config_digest) = fixture();
+        let foreign = temp.path().join("foreign-repository");
+        fs::create_dir(&foreign).unwrap();
+        fixture_git(&foreign, &["init", "-b", "main"]);
+        let global_config = temp.path().join("gitconfig");
+        fs::write(
+            &global_config,
+            "[user]\n\tsigningkey = fixture-signing-key\n",
+        )
+        .unwrap();
+        let config_result = temp.path().join("git-config-result");
+        let root_result = temp.path().join("git-root-result");
+        let foreign_git = foreign.join(".git");
+        let mut environment = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/bin:/usr/bin")),
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                global_config.clone().into_os_string(),
+            ),
+            (
+                OsString::from("GIT_DIR"),
+                foreign_git.clone().into_os_string(),
+            ),
+            (
+                OsString::from("GIT_WORK_TREE"),
+                foreign.clone().into_os_string(),
+            ),
+            (
+                OsString::from("GIT_INDEX_FILE"),
+                foreign_git.join("index").into_os_string(),
+            ),
+            (
+                OsString::from("CONFIG_RESULT"),
+                config_result.clone().into_os_string(),
+            ),
+            (
+                OsString::from("ROOT_RESULT"),
+                root_result.clone().into_os_string(),
+            ),
+        ]);
+        let runner = HookRunner::new(
+            GitOptions {
+                executable: PathBuf::from("/usr/bin/git"),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+            },
+            std::mem::take(&mut environment),
+            test_environment_binding(),
+        );
+        let expected_head = {
+            let output = process::run(ProcessRequest {
+                executable: PathBuf::from("/usr/bin/git"),
+                args: ["rev-parse", "HEAD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.clone()),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+                shutdown_grace: Duration::from_secs(2),
+                stdout_limit: 1024,
+                stderr_tail_limit: 1024,
+            })
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        runner
+            .run_required(
+                &[hook(&[
+                    "/bin/sh",
+                    "-c",
+                    "git config --global --get user.signingkey > \"$CONFIG_RESULT\" && git rev-parse --show-toplevel > \"$ROOT_RESULT\"",
+                ])],
+                HookRunContext {
+                    repository_id: &RepositoryId::parse("fixture-repo").unwrap(),
+                    worktree: &repo,
+                    expected_head: &expected_head,
+                    project_id: &ProjectId::parse("fixture-project").unwrap(),
+                    ticket_run_id: &TicketRunId::parse("direct-git-environment").unwrap(),
+                    configuration_digest: &config_digest,
+                    state_root: temp.path(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(config_result).unwrap().trim(),
+            "fixture-signing-key"
+        );
+        assert_eq!(
+            fs::read_to_string(root_result).unwrap().trim(),
+            repo.canonicalize().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
     fn rejects_hook_that_mutates_source_and_persists_failed_receipt() {
         let (temp, repo, config_digest) = fixture();
         let output = process::run(ProcessRequest {
@@ -874,6 +1644,7 @@ mod tests {
                 timeout: Duration::from_secs(10),
             },
             [(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))].into(),
+            test_environment_binding(),
         );
         let result = runner.run_required(
             &[hook(&["sh", "-c", "printf changed > README.md"])],

@@ -12,10 +12,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::agent_api::AgentWakeSnapshot;
 use crate::domain::ids::{
-    AgentRunId, Digest as ContentDigest, OperationId, ProfileId, ProjectId, Revision, TicketId,
-    TicketNamespace, TicketRunId,
+    AgentRunId, Digest as ContentDigest, OperationId, ProfileId, ProjectId, RepositoryId, Revision,
+    TicketId, TicketNamespace, TicketRunId,
 };
 use crate::domain::types::{AgentAdapter, CommitMode, Role};
 use crate::engine::orchestration::WorkNodeId;
@@ -24,7 +23,7 @@ pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_SCHEMA_VERSION: u32 = 1;
 pub const LAUNCH_DATABASE_SCHEMA_VERSION: i64 = 7;
 
-/// Minimal durable StartAgent effect. The controller reloads its authority from SQLite.
+/// Minimal durable StartAgent intent. Handlers resolve authority from controller-owned state.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartAgentEffectPayload {
@@ -42,7 +41,7 @@ impl StartAgentEffectPayload {
     }
 }
 
-/// Host-owned phase-one launch identity. The Rex block is bound only after observation.
+/// Host-owned phase-one launch identity. Rex block identity is bound only after it is observed.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentLaunchReservation {
@@ -63,6 +62,8 @@ pub struct AgentLaunchReservation {
     pub project_epoch: u64,
     pub operation_id: OperationId,
     pub operation_recipe_id: Option<String>,
+    /// Required for Worker launches; Store validates this against a host-minted
+    /// PreparedWorkerLaunch inside the reservation transaction.
     pub worker_assignment: Option<WorkerLaunchBinding>,
     pub rex_view_id: ContentDigest,
     pub runtime_binary_digest: ContentDigest,
@@ -71,7 +72,7 @@ pub struct AgentLaunchReservation {
     pub profile_digest: ContentDigest,
     pub instruction_digest: ContentDigest,
     pub result_schema_digest: ContentDigest,
-    pub wake_snapshot: AgentWakeSnapshot,
+    pub wake_snapshot: crate::agent_api::AgentWakeSnapshot,
     pub qualification_receipt_digest: ContentDigest,
     pub descriptor_path: PathBuf,
     pub workspace_path: PathBuf,
@@ -87,6 +88,9 @@ pub struct AgentLaunchReservation {
     pub project_capacity: u32,
 }
 
+/// Immutable work-plan and prepared-worktree provenance for a Worker run.
+/// Deserialization never grants authority; Store requires an opaque host token
+/// and revalidates every field against current SQLite state before reservation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLaunchBinding {
@@ -96,11 +100,16 @@ pub struct WorkerLaunchBinding {
     pub configuration_digest: ContentDigest,
     pub plan_digest: ContentDigest,
     pub node_id: WorkNodeId,
-    pub repository_id: crate::domain::ids::RepositoryId,
+    pub repository_id: RepositoryId,
     pub commit_mode: CommitMode,
     pub worktree_path: PathBuf,
     pub branch: String,
     pub base_sha: String,
+    /// Present only for an explicitly authorized continuation after a host-validated
+    /// publication and Reviewer `corrections_remain` transition. None preserves the
+    /// original launch encoding and means the prepared base is the expected head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_head: Option<String>,
     pub prepare_operation_id: String,
     pub prepare_receipt_digest: ContentDigest,
     pub source_evidence_id: String,
@@ -113,6 +122,10 @@ pub struct WorkerLaunchBinding {
 }
 
 impl WorkerLaunchBinding {
+    pub fn expected_head(&self) -> &str {
+        self.expected_head.as_deref().unwrap_or(&self.base_sha)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1
             || self.accepted_revision == 0
@@ -120,6 +133,9 @@ impl WorkerLaunchBinding {
             || !self.worktree_path.is_absolute()
             || self.branch.trim().is_empty()
             || self.base_sha.trim().is_empty()
+            || self.expected_head.as_ref().is_some_and(|head| {
+                !matches!(head.len(), 40 | 64) || !head.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
             || self.prepare_operation_id.trim().is_empty()
             || self.source_evidence_id.trim().is_empty()
             || self.source_message_id.trim().is_empty()
@@ -143,16 +159,13 @@ impl AgentLaunchReservation {
             || self.mailbox_max_pending_requests == 0
             || self.global_capacity == 0
             || self.project_capacity == 0
-            || self.pool != "agent"
-            || self.role_session_id.trim().is_empty()
-            || self.role_session_id.chars().any(char::is_control)
+            || !matches!(self.pool.as_str(), "agent" | "rex_projects_hook")
         {
             return Err("Agent launch reservation has an invalid schema, counter, or limit".into());
         }
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("reservation parent AgentRun ID and role must be present together".into());
         }
-        validate_launch_parent_role(self.role, self.parent_role)?;
         match (self.role, self.worker_assignment.as_ref()) {
             (Role::Worker, Some(assignment)) => assignment.validate()?,
             (Role::Worker, None) => {
@@ -340,6 +353,28 @@ pub struct RexViewBlock {
     pub retained_until_unix: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RexViewBlockRecord {
+    pub block: RexViewBlock,
+    pub terminal_at_unix: Option<u64>,
+    pub archive_digest: Option<ContentDigest>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RexViewAnchorRecord {
+    pub view_id: ContentDigest,
+    pub block_id: String,
+    pub run_id: String,
+    pub owned_label: String,
+    pub command_digest: ContentDigest,
+    pub lifecycle: RexBlockLifecycle,
+    pub process_absent_confirmed: bool,
+    pub terminal_at_unix: Option<u64>,
+    pub archive_digest: Option<ContentDigest>,
+}
+
 impl RexViewBlock {
     pub fn validate(&self) -> Result<(), String> {
         if self.block_id.trim().is_empty() || self.block_id.chars().any(char::is_control) {
@@ -377,10 +412,6 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
     tx.execute_batch(
         "ALTER TABLE agent_runs ADD COLUMN role TEXT
             CHECK(role IS NULL OR role IN ('supervisor','coordinator','planner','worker','reviewer','merge_decision','operator','postmortem'));
-        CREATE TRIGGER agent_runs_role_immutable
-        BEFORE UPDATE OF role ON agent_runs
-        WHEN OLD.role IS NOT NEW.role
-        BEGIN SELECT RAISE(ABORT, 'AgentRun role reservation is immutable'); END;
         CREATE TABLE provider_qualifications (
             receipt_digest TEXT PRIMARY KEY CHECK(length(receipt_digest) = 64),
             project_id TEXT NOT NULL REFERENCES projects(project_id),
@@ -423,10 +454,10 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
             CHECK((view_kind='supervisor' AND ticket_namespace IS NULL AND ticket_id IS NULL) OR
                   (view_kind='ticket' AND ticket_namespace IS NOT NULL AND ticket_id IS NOT NULL))
         );
-        CREATE UNIQUE INDEX rex_views_project_supervisor_epoch
-            ON rex_views(project_id,view_epoch) WHERE view_kind='supervisor';
-        CREATE UNIQUE INDEX rex_views_project_ticket_epoch
-            ON rex_views(project_id,ticket_namespace,ticket_id,view_epoch) WHERE view_kind='ticket';
+        CREATE UNIQUE INDEX rex_views_one_open_supervisor
+            ON rex_views(project_id) WHERE view_kind='supervisor' AND lifecycle IN ('active','close_pending','unknown');
+        CREATE UNIQUE INDEX rex_views_one_open_ticket
+            ON rex_views(project_id,ticket_namespace,ticket_id) WHERE view_kind='ticket' AND lifecycle IN ('active','close_pending','unknown');
         CREATE INDEX rex_views_cleanup ON rex_views(lifecycle,pinned,updated_at_unix);
 
         CREATE TABLE rex_view_blocks (
@@ -470,6 +501,7 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
             run_epoch INTEGER NOT NULL CHECK(run_epoch > 0),
             controller_generation INTEGER NOT NULL CHECK(controller_generation > 0),
             launch_operation_id TEXT NOT NULL UNIQUE,
+            operation_recipe_id TEXT,
             rex_view_id TEXT NOT NULL REFERENCES rex_views(view_id),
             descriptor_digest TEXT NOT NULL CHECK(length(descriptor_digest) = 64),
             runtime_binary_digest TEXT NOT NULL CHECK(length(runtime_binary_digest) = 64),
@@ -574,69 +606,74 @@ pub fn migrate_v7(connection: &mut Connection) -> Result<(), String> {
         PRAGMA user_version = 7;",
     )
     .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
-}
-
-/// Add durable launch reservations and host-owned wake snapshots to a v7 database.
-pub fn migrate_v8(connection: &mut Connection) -> Result<(), String> {
-    let version: i64 = connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if version == 8 {
-        return Ok(());
-    }
-    if version != 7 {
-        return Err(format!(
-            "launch reservation migration requires schema 7, found {version}"
-        ));
-    }
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+    migrate_agent_run_role(&tx)?;
     migrate_launch_reservation_tables(&tx)?;
-    tx.execute_batch(
-        "ALTER TABLE agent_launch_authority ADD COLUMN operation_recipe_id TEXT;
-         ALTER TABLE agent_launch_authority ADD COLUMN wake_snapshot_digest TEXT CHECK(wake_snapshot_digest IS NULL OR length(wake_snapshot_digest)=64);"
-    ).map_err(|error| error.to_string())?;
-    tx.execute_batch("INSERT INTO schema_migrations(version,applied_at_unix) VALUES (8,unixepoch()); PRAGMA user_version=8;")
-        .map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
 }
 
-fn migrate_launch_reservation_tables(tx: &Transaction<'_>) -> Result<(), String> {
+pub(crate) const AGENT_RUN_ROLE_CHECK: &str = "CHECK(role IS NULL OR role IN ('supervisor','coordinator','planner','worker','reviewer','merge_decision','operator','postmortem'))";
+
+/// Add the v7 role projection without guessing roles for existing runs. The
+/// v12 migrator reuses this helper for databases created before the column existed.
+pub(crate) fn migrate_agent_run_role(tx: &Transaction<'_>) -> Result<(), String> {
+    let has_role_column: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_runs') WHERE name='role')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_role_column {
+        tx.execute_batch(&format!(
+            "ALTER TABLE agent_runs ADD COLUMN role TEXT {AGENT_RUN_ROLE_CHECK};"
+        ))
+        .map_err(|error| error.to_string())?;
+    }
     tx.execute_batch(
-        "CREATE TABLE agent_launch_reservations (
+        "DROP TRIGGER IF EXISTS agent_runs_role_immutable;
+         CREATE TRIGGER agent_runs_role_immutable
+         BEFORE UPDATE OF role ON agent_runs
+         WHEN OLD.role IS NOT NEW.role
+         BEGIN SELECT RAISE(ABORT, 'AgentRun role reservation is immutable'); END;",
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Ensure the durable StartAgent reservation projection exists. Schema-v7 uses this in its
+/// migration transaction; the central v12 upgrade also repairs databases whose recorded v7
+/// layout predates the table. Layout validation rejects incompatible pre-existing tables.
+pub(crate) fn migrate_launch_reservation_tables(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_launch_reservations (
             agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
             project_id TEXT NOT NULL REFERENCES projects(project_id),
             operation_id TEXT NOT NULL UNIQUE,
             controller_generation INTEGER NOT NULL CHECK(controller_generation > 0),
             project_epoch INTEGER NOT NULL CHECK(project_epoch > 0),
-            reservation_digest TEXT NOT NULL CHECK(length(reservation_digest)=64),
-            reservation_json TEXT NOT NULL CHECK(length(reservation_json)<=1048576),
+            reservation_digest TEXT NOT NULL CHECK(length(reservation_digest) = 64),
+            reservation_json TEXT NOT NULL CHECK(length(reservation_json) <= 1048576),
             lifecycle TEXT NOT NULL CHECK(lifecycle IN ('reserved','block_created','authorized','unknown','cancelled')),
             created_at_unix INTEGER NOT NULL,
             updated_at_unix INTEGER NOT NULL
-         );
-         CREATE INDEX agent_launch_reservations_project ON agent_launch_reservations(project_id,lifecycle,created_at_unix);
-         CREATE TRIGGER agent_launch_reservation_identity_guard BEFORE UPDATE ON agent_launch_reservations
-         WHEN OLD.agent_run_id IS NOT NEW.agent_run_id OR OLD.project_id IS NOT NEW.project_id
-           OR OLD.operation_id IS NOT NEW.operation_id OR OLD.controller_generation IS NOT NEW.controller_generation
-           OR OLD.project_epoch IS NOT NEW.project_epoch OR OLD.reservation_digest IS NOT NEW.reservation_digest
-           OR OLD.reservation_json IS NOT NEW.reservation_json OR OLD.created_at_unix IS NOT NEW.created_at_unix
-         BEGIN SELECT RAISE(ABORT,'Agent launch reservation identity is immutable'); END;
-         CREATE TRIGGER agent_launch_reservation_no_delete BEFORE DELETE ON agent_launch_reservations
-         BEGIN SELECT RAISE(ABORT,'Agent launch reservations are retained'); END;
-         CREATE TABLE agent_wake_context (
-            agent_run_id TEXT PRIMARY KEY REFERENCES agent_runs(agent_run_id),
-            snapshot_digest TEXT NOT NULL CHECK(length(snapshot_digest)=64),
-            snapshot_json TEXT NOT NULL CHECK(length(snapshot_json)<=1048576),
-            created_at_unix INTEGER NOT NULL
-         );
-         CREATE TRIGGER agent_wake_context_immutable_update BEFORE UPDATE ON agent_wake_context
-         BEGIN SELECT RAISE(ABORT,'Agent wake context is immutable'); END;
-         CREATE TRIGGER agent_wake_context_immutable_delete BEFORE DELETE ON agent_wake_context
-         BEGIN SELECT RAISE(ABORT,'Agent wake context is retained'); END;"
-    ).map_err(|error| error.to_string())
+        );
+        CREATE INDEX IF NOT EXISTS agent_launch_reservations_project
+            ON agent_launch_reservations(project_id,lifecycle,created_at_unix);
+        CREATE TRIGGER IF NOT EXISTS agent_launch_reservation_identity_guard
+        BEFORE UPDATE ON agent_launch_reservations
+        WHEN OLD.agent_run_id IS NOT NEW.agent_run_id
+          OR OLD.project_id IS NOT NEW.project_id
+          OR OLD.operation_id IS NOT NEW.operation_id
+          OR OLD.controller_generation IS NOT NEW.controller_generation
+          OR OLD.project_epoch IS NOT NEW.project_epoch
+          OR OLD.reservation_digest IS NOT NEW.reservation_digest
+          OR OLD.reservation_json IS NOT NEW.reservation_json
+          OR OLD.created_at_unix IS NOT NEW.created_at_unix
+        BEGIN SELECT RAISE(ABORT, 'Agent launch reservation identity is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS agent_launch_reservation_no_delete
+        BEFORE DELETE ON agent_launch_reservations
+        BEGIN SELECT RAISE(ABORT, 'Agent launch reservations are retained'); END;",
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -847,7 +884,6 @@ pub struct AgentLaunchAuthority {
     pub profile_digest: ContentDigest,
     pub instruction_digest: ContentDigest,
     pub result_schema_digest: ContentDigest,
-    #[serde(default = "empty_wake_snapshot_digest")]
     pub wake_snapshot_digest: ContentDigest,
     pub qualification_receipt_digest: ContentDigest,
     pub rex_server_identity: String,
@@ -871,7 +907,13 @@ impl AgentLaunchAuthority {
         if self.parent_run_id.is_some() != self.parent_role.is_some() {
             return Err("parent AgentRun ID and role must be present together".into());
         }
-        validate_historical_authority_parent_role(self.role, self.parent_role)?;
+        if self
+            .operation_recipe_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        {
+            return Err("Agent launch operation recipe ID is malformed".into());
+        }
         if self.role == Role::Supervisor {
             if self.ticket_run_id.is_some() || self.ticket_revision.is_some() {
                 return Err("Project Supervisor launch authority cannot have a TicketRun".into());
@@ -904,42 +946,9 @@ impl AgentLaunchAuthority {
         Ok(())
     }
 
-    /// Validate topology for a newly-created authority. Persisted v7 authorities are read
-    /// through `validate`, which preserves their historical Operator/Supervisor edge.
-    pub(crate) fn validate_new_launch_topology(&self) -> Result<(), String> {
-        validate_launch_parent_role(self.role, self.parent_role)
-    }
-
     pub fn digest(&self) -> Result<ContentDigest, String> {
-        let json = self.storage_json()?;
-        ContentDigest::parse(format!("{:x}", Sha256::digest(json.as_bytes())))
-    }
-
-    /// Serialize the immutable authority as stored. Schema-v7 records predate both optional
-    /// fields and were digested without them; preserve those bytes only when both fields have
-    /// their v7 defaults. Non-default schema-v8 authorities keep the current serialization.
-    pub(crate) fn storage_json(&self) -> Result<String, String> {
-        let mut json = serde_json::to_string(self).map_err(|error| error.to_string())?;
-        if self.operation_recipe_id.is_none()
-            && self.wake_snapshot_digest == empty_wake_snapshot_digest()
-        {
-            let fields = [
-                String::from(",\"operation_recipe_id\":null"),
-                format!(
-                    ",\"wake_snapshot_digest\":\"{}\"",
-                    self.wake_snapshot_digest
-                ),
-            ];
-            for field in fields {
-                if !json.contains(&field) {
-                    return Err(
-                        "Agent launch authority JSON omitted an expected default field".into(),
-                    );
-                }
-                json = json.replacen(&field, "", 1);
-            }
-        }
-        Ok(json)
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        ContentDigest::parse(format!("{:x}", Sha256::digest(bytes)))
     }
 
     pub fn expectation(&self, qualification: &ProviderQualification) -> LaunchExpectation {
@@ -970,44 +979,6 @@ impl AgentLaunchAuthority {
     }
 }
 
-fn empty_wake_snapshot_digest() -> ContentDigest {
-    ContentDigest::parse("0".repeat(64)).expect("fixed digest is valid")
-}
-
-fn validate_launch_parent_role(child_role: Role, parent_role: Option<Role>) -> Result<(), String> {
-    let Some(parent_role) = parent_role else {
-        return Ok(());
-    };
-    let expected = match child_role {
-        Role::Supervisor => {
-            return Err("Project Supervisor cannot have a parent AgentRun".into());
-        }
-        Role::Coordinator => Role::Supervisor,
-        Role::Planner
-        | Role::Worker
-        | Role::Reviewer
-        | Role::MergeDecision
-        | Role::Operator
-        | Role::Postmortem => Role::Coordinator,
-    };
-    if parent_role != expected {
-        return Err(format!(
-            "{child_role:?} launch parent role must be {expected:?}, got {parent_role:?}"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_historical_authority_parent_role(
-    child_role: Role,
-    parent_role: Option<Role>,
-) -> Result<(), String> {
-    if child_role == Role::Operator && parent_role == Some(Role::Supervisor) {
-        return Ok(());
-    }
-    validate_launch_parent_role(child_role, parent_role)
-}
-
 /// The process wrapper's start observation. It contains identity facts only, never environment
 /// values, provider stdout, prompts, or SQLite paths.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1024,11 +995,15 @@ pub struct AgentStartRequest {
     pub qualification_receipt_digest: ContentDigest,
     pub wrapper_pid: u32,
     pub wrapper_start_identity: String,
+    /// Rex-owned foreground shim which launched the finite-turn supervisor. Legacy runs have
+    /// no detached supervisor and therefore omit this exact identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<LaunchAnchorIdentity>,
     pub rex_session_id: String,
     pub rex_block_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedWrapperIdentity {
     pub pid: u32,
@@ -1036,6 +1011,15 @@ pub struct ObservedWrapperIdentity {
     pub rex_session_id: String,
     pub rex_block_id: String,
     pub runtime_binary_digest: ContentDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rex_launch_anchor: Option<LaunchAnchorIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchAnchorIdentity {
+    pub pid: u32,
+    pub start_identity: String,
 }
 
 /// Host process observation taken after provider spawn. Unknown tree state must remain
@@ -1050,6 +1034,19 @@ pub struct ObservedProviderStart {
     pub executable_digest: ContentDigest,
     pub process_tree_digest: ContentDigest,
     pub process_tree_confirmed: bool,
+    #[serde(default)]
+    pub process_tree: Vec<ProviderProcessIdentity>,
+}
+
+/// Secret free kernel identities retained so a vanished Rex block can still be reconciled.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderProcessIdentity {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub process_group_id: u32,
+    pub start_identity: String,
+    pub identity_quality: crate::process::ProcessIdentityQuality,
 }
 
 impl ObservedProviderStart {
@@ -1062,6 +1059,62 @@ impl ObservedProviderStart {
         {
             return Err("provider process start observation is incomplete or mismatched".into());
         }
+        if !self.process_tree.is_empty() {
+            crate::process::validate_process_evidence_tree(&self.process_tree)?;
+            let provider = self.process_tree.iter().find(|process| {
+                process.pid == self.provider_pid
+                    && process.start_identity == self.provider_start_identity
+            });
+            if provider.is_none()
+                || self.process_tree.iter().any(|process| {
+                    process.pid == 0
+                        || process.start_identity.trim().is_empty()
+                        || process.identity_quality
+                            != crate::process::ProcessIdentityQuality::KernelBirthToken
+                        || process.process_group_id == 0
+                })
+            {
+                return Err("provider process tree lacks exact kernel identities".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the full tree before it can authorize cleanup or capacity release. The older
+    /// `validate` path still accepts an empty tree for reading legacy receipts, but those
+    /// receipts do not establish host process ownership.
+    pub fn validate_complete_process_tree(
+        &self,
+        qualification: &ProviderQualification,
+    ) -> Result<(), String> {
+        self.validate(qualification)?;
+        if self.process_tree.is_empty() {
+            return Err("provider process tree is empty".into());
+        }
+        let mut pids = BTreeSet::new();
+        let mut provider_found = false;
+        for process in &self.process_tree {
+            if process.pid == 0
+                || process.start_identity.trim().is_empty()
+                || process.identity_quality
+                    != crate::process::ProcessIdentityQuality::KernelBirthToken
+                || process.process_group_id == 0
+                || !pids.insert(process.pid)
+            {
+                return Err("provider process tree has incomplete or duplicate identities".into());
+            }
+            provider_found |= process.pid == self.provider_pid
+                && process.start_identity == self.provider_start_identity;
+        }
+        if !provider_found {
+            return Err("provider process tree does not identify the provider".into());
+        }
+        let tree_bytes =
+            serde_json::to_vec(&self.process_tree).map_err(|error| error.to_string())?;
+        let tree_digest = ContentDigest::parse(format!("{:x}", Sha256::digest(tree_bytes)))?;
+        if tree_digest != self.process_tree_digest {
+            return Err("provider process tree digest does not match its identities".into());
+        }
         Ok(())
     }
 }
@@ -1073,6 +1126,7 @@ impl ObservedWrapperIdentity {
             || self.rex_session_id != request.rex_session_id
             || self.rex_block_id != request.rex_block_id
             || self.runtime_binary_digest != request.runtime_binary_digest
+            || self.rex_launch_anchor != request.rex_launch_anchor
             || self.start_identity.trim().is_empty()
         {
             return Err("observed Rex wrapper does not match the Agent start request".into());
@@ -1088,6 +1142,14 @@ impl AgentStartRequest {
         }
         if self.wrapper_pid == 0 || self.controller_generation == 0 {
             return Err("Agent start request lacks process or controller identity".into());
+        }
+        if let Some(anchor) = &self.rex_launch_anchor
+            && (anchor.pid == 0
+                || anchor.pid == self.wrapper_pid
+                || anchor.start_identity.trim().is_empty()
+                || anchor.start_identity.chars().any(char::is_control))
+        {
+            return Err("Agent start request has an invalid Rex launch anchor".into());
         }
         for (field, value) in [
             (
@@ -1224,42 +1286,47 @@ impl AgentLaunchReceipt {
 mod tests {
     use super::{
         AgentLaunchAuthority, AgentLaunchReceipt, AgentStartRequest, LaunchDecision,
-        LaunchExpectation, ObservedProviderStart, ProviderQualification, QualificationIdentity,
-        QualificationProof, QualificationStatus, authorize_start, migrate_v7,
-        validate_launch_parent_role,
+        LaunchExpectation, ObservedProviderStart, ProviderProcessIdentity, ProviderQualification,
+        QualificationIdentity, QualificationProof, QualificationStatus, WorkerLaunchBinding,
+        authorize_start, migrate_v7,
     };
     use crate::domain::ids::{
         AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketRunId,
     };
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
+    use sha2::Digest as _;
 
     fn digest(byte: char) -> Digest {
         Digest::parse(byte.to_string().repeat(64)).unwrap()
     }
 
     #[test]
-    fn parent_role_topology_is_closed_when_a_parent_is_declared() {
-        assert!(validate_launch_parent_role(Role::Supervisor, None).is_ok());
-        assert!(validate_launch_parent_role(Role::Coordinator, Some(Role::Supervisor)).is_ok());
-        for child in [
-            Role::Planner,
-            Role::Worker,
-            Role::Reviewer,
-            Role::MergeDecision,
-            Role::Operator,
-            Role::Postmortem,
-        ] {
-            assert!(validate_launch_parent_role(child, Some(Role::Coordinator)).is_ok());
-            assert!(validate_launch_parent_role(child, None).is_ok());
-            assert!(validate_launch_parent_role(child, Some(Role::Planner)).is_err());
-        }
-        assert!(validate_launch_parent_role(Role::Supervisor, Some(Role::Coordinator)).is_err());
-        assert!(validate_launch_parent_role(Role::Coordinator, Some(Role::Planner)).is_err());
-        let mut historical = authority();
-        historical.role = Role::Operator;
-        historical.parent_role = Some(Role::Supervisor);
-        assert!(historical.validate().is_ok());
-        assert!(historical.validate_new_launch_topology().is_err());
+    fn legacy_worker_binding_keeps_its_canonical_encoding_without_expected_head() {
+        let legacy = serde_json::json!({
+            "schema_version":1,
+            "accepted_revision":3,
+            "ticket_revision":4,
+            "configuration_digest":"a".repeat(64),
+            "plan_digest":"b".repeat(64),
+            "node_id":"node-a",
+            "repository_id":"repo-a",
+            "commit_mode":"host",
+            "worktree_path":"/tmp/repo-a/worktree",
+            "branch":"rex-projects/ticket/node-a",
+            "base_sha":"1".repeat(40),
+            "prepare_operation_id":"prepare-a",
+            "prepare_receipt_digest":"c".repeat(64),
+            "source_evidence_id":"evidence-a",
+            "source_agent_run_id":"agent-source",
+            "source_message_id":"message-a",
+            "source_result_digest":"d".repeat(64),
+            "coordinator_agent_run_id":"agent-coordinator",
+            "coordinator_role_session_id":"ticket:ticket-a:coordinator",
+            "coordinator_authority_digest":"e".repeat(64),
+        });
+        let binding: WorkerLaunchBinding = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(binding.expected_head(), binding.base_sha);
+        assert_eq!(serde_json::to_value(binding).unwrap(), legacy);
     }
 
     fn qualification(status: QualificationStatus) -> ProviderQualification {
@@ -1310,9 +1377,47 @@ mod tests {
             qualification_receipt_digest: digest('5'),
             wrapper_pid: 321,
             wrapper_start_identity: "pid-start-identity".into(),
+            rex_launch_anchor: None,
             rex_session_id: "session-1".into(),
             rex_block_id: "block-1".into(),
         }
+    }
+
+    #[test]
+    fn anchored_start_requires_a_distinct_exact_anchor_identity() {
+        let mut request = start_request();
+        request.rex_launch_anchor = Some(super::LaunchAnchorIdentity {
+            pid: 320,
+            start_identity: "anchor-birth".into(),
+        });
+        assert!(request.validate().is_ok());
+
+        request.rex_launch_anchor.as_mut().unwrap().pid = request.wrapper_pid;
+        assert!(request.validate().is_err());
+        request.rex_launch_anchor.as_mut().unwrap().pid = 320;
+        request.rex_launch_anchor.as_mut().unwrap().start_identity = "\n".into();
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn observed_identity_must_preserve_the_exact_anchor_binding() {
+        let mut request = start_request();
+        request.rex_launch_anchor = Some(super::LaunchAnchorIdentity {
+            pid: 320,
+            start_identity: "anchor-birth".into(),
+        });
+        let observed = super::ObservedWrapperIdentity {
+            pid: request.wrapper_pid,
+            start_identity: request.wrapper_start_identity.clone(),
+            rex_session_id: request.rex_session_id.clone(),
+            rex_block_id: request.rex_block_id.clone(),
+            runtime_binary_digest: request.runtime_binary_digest.clone(),
+            rex_launch_anchor: Some(super::LaunchAnchorIdentity {
+                pid: 320,
+                start_identity: "reused-pid".into(),
+            }),
+        };
+        assert!(observed.matches_start_request(&request).is_err());
     }
 
     fn authority() -> AgentLaunchAuthority {
@@ -1341,7 +1446,7 @@ mod tests {
             profile_digest: digest('a'),
             instruction_digest: digest('7'),
             result_schema_digest: digest('8'),
-            wake_snapshot_digest: digest('f'),
+            wake_snapshot_digest: digest('d'),
             qualification_receipt_digest: digest('5'),
             rex_server_identity: "rex-instance-1".into(),
             rex_session_id: "session-1".into(),
@@ -1417,6 +1522,7 @@ mod tests {
             executable_digest: qualification.executable_digest.clone(),
             process_tree_digest: digest('4'),
             process_tree_confirmed: true,
+            process_tree: Vec::new(),
         };
         assert!(observation.validate(&qualification).is_ok());
         observation.process_tree_confirmed = false;
@@ -1424,6 +1530,94 @@ mod tests {
         observation.process_tree_confirmed = true;
         observation.executable_digest = digest('5');
         assert!(observation.validate(&qualification).is_err());
+    }
+
+    #[test]
+    fn provider_start_accepts_process_tree_larger_than_1024_within_shared_budget() {
+        let qualification = qualification(QualificationStatus::Verified);
+        let process_tree = (1..=1_025)
+            .map(|pid| ProviderProcessIdentity {
+                pid,
+                parent_pid: pid.saturating_sub(1).max(1),
+                process_group_id: pid,
+                start_identity: format!("birth-{pid}"),
+                identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+            })
+            .collect::<Vec<_>>();
+        let process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+        ))
+        .unwrap();
+        let observation = ObservedProviderStart {
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            operation_id: OperationId::parse("op-1").unwrap(),
+            provider_pid: 44,
+            provider_start_identity: "birth-44".into(),
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest,
+            process_tree_confirmed: true,
+            process_tree,
+        };
+
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn cleanup_tree_requires_exact_digest_and_accepts_owned_descendant_groups() {
+        let qualification = qualification(QualificationStatus::Verified);
+        let mut observation = ObservedProviderStart {
+            agent_run_id: AgentRunId::parse("run-1").unwrap(),
+            operation_id: OperationId::parse("op-1").unwrap(),
+            provider_pid: 44,
+            provider_start_identity: "pid-start-44".into(),
+            executable_digest: qualification.executable_digest.clone(),
+            process_tree_digest: digest('4'),
+            process_tree_confirmed: true,
+            process_tree: vec![
+                ProviderProcessIdentity {
+                    pid: 43,
+                    parent_pid: 1,
+                    process_group_id: 43,
+                    start_identity: "pid-start-43".into(),
+                    identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+                },
+                ProviderProcessIdentity {
+                    pid: 44,
+                    parent_pid: 43,
+                    process_group_id: 44,
+                    start_identity: "pid-start-44".into(),
+                    identity_quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+                },
+            ],
+        };
+        observation.process_tree_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&observation.process_tree).unwrap())
+        ))
+        .unwrap();
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_ok()
+        );
+        observation.provider_pid = 45;
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_err()
+        );
+        observation.provider_pid = 44;
+        observation.process_tree_digest = digest('5');
+        assert!(
+            observation
+                .validate_complete_process_tree(&qualification)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1527,14 +1721,14 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 7);
-        let agent_role_column: i64 = connection
+        let role_column_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('agent_runs') WHERE name='role'",
+                "SELECT COUNT(*) FROM pragma_table_info('agent_runs') WHERE name='role' AND type='TEXT' AND \"notnull\"=0",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(agent_role_column, 1);
+        assert_eq!(role_column_count, 1);
         connection
             .execute(
                 "INSERT INTO agent_runs(agent_run_id,role) VALUES ('reserved-run','worker')",
@@ -1559,6 +1753,14 @@ mod tests {
             connection
                 .execute(
                     "UPDATE agent_runs SET role='worker' WHERE agent_run_id='legacy-run'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO agent_runs(agent_run_id,role) VALUES ('invalid-role','other')",
                     [],
                 )
                 .is_err()

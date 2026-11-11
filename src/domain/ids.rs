@@ -107,6 +107,7 @@ macro_rules! opaque_id {
 }
 
 opaque_id!(TicketId);
+opaque_id!(TicketRevision);
 opaque_id!(TicketNamespace);
 opaque_id!(TicketRunId);
 opaque_id!(AgentRunId);

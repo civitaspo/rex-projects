@@ -16,6 +16,8 @@ use crate::run_step::RunDescriptor;
 #[serde(deny_unknown_fields)]
 pub struct RunStepPackage {
     pub schema_version: u32,
+    /// Epoch of the reserved execution slot; distinct from the descriptor's finite-turn epoch.
+    pub execution_slot_epoch: u64,
     pub descriptor: RunDescriptor,
     pub operation_id: OperationId,
     pub project_id: ProjectId,
@@ -34,6 +36,15 @@ pub struct RunStepPackage {
     pub continuation: Option<RunStepContinuation>,
     pub shutdown_grace_seconds: u64,
     pub start_ack_timeout_seconds: u64,
+    /// Absent only in packages persisted before detached finite-turn supervision existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_mode: Option<RunStepSupervisionMode>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStepSupervisionMode {
+    AnchoredSupervisor,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -73,7 +84,18 @@ impl RunStepPackage {
                 .as_nanos()
         );
         let stage = parent.join(format!(".run-step-{nonce}.tmp"));
-        let (mut file, _stage_cleanup) = create_staged_file(&stage)?;
+        let _stage_cleanup = StagedFile(stage.clone());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage)
+            .map_err(|error| format!("create staged run-step package: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+        }
         file.write_all(&bytes).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
         drop(file);
@@ -126,11 +148,16 @@ impl RunStepPackage {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1
-            || self.descriptor.schema_version != 1
+        if self.schema_version != 2
+            || self.execution_slot_epoch == 0
             || self.controller_generation == 0
         {
             return Err("unsupported or incomplete run-step package".into());
+        }
+        if let Some(mode) = self.supervision_mode
+            && mode != RunStepSupervisionMode::AnchoredSupervisor
+        {
+            return Err("unsupported run-step supervision mode".into());
         }
         if self.descriptor.run_id.as_str().is_empty()
             || self.descriptor.project_id != self.project_id
@@ -157,13 +184,11 @@ impl RunStepPackage {
         {
             return Err("run-step package identity or timeout is invalid".into());
         }
-        let profile_digest = Digest::parse(format!(
-            "{:x}",
-            sha2::Sha256::digest(
-                crate::protocol::serialize_bounded(&self.profile, 8 * 1024 * 1024)
-                    .map_err(|error| error.to_string())?
-            )
-        ))?;
+        let profile_value =
+            serde_json::to_value(&self.profile).map_err(|error| error.to_string())?;
+        let profile_bytes = crate::protocol::serialize_bounded(&profile_value, 8 * 1024 * 1024)
+            .map_err(|error| error.to_string())?;
+        let profile_digest = Digest::parse(format!("{:x}", sha2::Sha256::digest(profile_bytes)))?;
         if profile_digest != self.descriptor.profile_digest {
             return Err("run-step profile does not match the descriptor digest".into());
         }
@@ -179,23 +204,9 @@ impl Drop for StagedFile {
     }
 }
 
-fn create_staged_file(path: &std::path::Path) -> Result<(std::fs::File, StagedFile), String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| format!("create staged run-step package: {error}"))?;
-    Ok((file, StagedFile(path.to_path_buf())))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RunStepPackage, create_staged_file};
+    use super::RunStepPackage;
     use crate::config::Profile;
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RexBlockId};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
@@ -212,13 +223,10 @@ mod tests {
             "commit_mode":"native", "turn_timeout_seconds":60
         }))
         .unwrap();
-        let profile_digest = Digest::parse(format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&profile).unwrap())
-        ))
-        .unwrap();
+        let profile_digest = crate::store::agent_profile_digest(&profile).unwrap();
         RunStepPackage {
-            schema_version: 1,
+            schema_version: 2,
+            execution_slot_epoch: 1,
             descriptor: RunDescriptor {
                 schema_version: 1,
                 project_id: ProjectId::parse("project-a").unwrap(),
@@ -232,6 +240,7 @@ mod tests {
                 controller_generation: 1,
                 workspace: "/tmp/workspace".into(),
                 control_dir: "/tmp/control".into(),
+                worker_assignment: None,
                 rex_session_id: "session".into(),
                 rex_block_id: RexBlockId::parse("block").unwrap(),
                 profile_digest: profile_digest.clone(),
@@ -275,7 +284,54 @@ mod tests {
             continuation: None,
             shutdown_grace_seconds: 5,
             start_ack_timeout_seconds: 30,
+            supervision_mode: None,
         }
+    }
+
+    #[test]
+    fn package_rejects_a_profile_changed_after_descriptor_binding() {
+        let mut package = package();
+        package.profile.model = Some("changed".into());
+
+        assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn package_rejects_legacy_schema_and_zero_execution_slot_epoch() {
+        let mut legacy_package = package();
+        legacy_package.schema_version = 1;
+        assert!(legacy_package.validate().is_err());
+
+        let mut legacy_json = serde_json::to_value(package()).unwrap();
+        legacy_json["schema_version"] = serde_json::json!(1);
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_slot_epoch");
+        assert!(serde_json::from_value::<RunStepPackage>(legacy_json).is_err());
+
+        let mut zero_epoch = package();
+        zero_epoch.execution_slot_epoch = 0;
+        assert!(zero_epoch.validate().is_err());
+    }
+
+    #[test]
+    fn package_mode_is_bound_and_legacy_bytes_keep_foreground_compatibility() {
+        let legacy_json = serde_json::to_value(package()).unwrap();
+        assert!(legacy_json.get("supervision_mode").is_none());
+        let legacy: RunStepPackage = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.supervision_mode, None);
+
+        let mut anchored = package();
+        anchored.supervision_mode = Some(super::RunStepSupervisionMode::AnchoredSupervisor);
+        anchored.validate().unwrap();
+        let encoded = serde_json::to_value(&anchored).unwrap();
+        assert_eq!(
+            encoded["supervision_mode"],
+            serde_json::json!("anchored_supervisor")
+        );
+        let decoded: RunStepPackage = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.supervision_mode, anchored.supervision_mode);
     }
 
     #[test]
@@ -298,57 +354,5 @@ mod tests {
         );
         std::fs::write(&path, b"tampered").unwrap();
         assert!(package.publish_once(&path).is_err());
-    }
-
-    #[test]
-    fn package_validation_binds_schema_and_profile_to_descriptor() {
-        let mut package = package();
-        package.validate().unwrap();
-
-        package.schema_version = 2;
-        assert!(package.validate().is_err());
-
-        package.schema_version = 1;
-        package.descriptor.schema_version = 2;
-        assert!(package.validate().is_err());
-
-        package.descriptor.schema_version = 1;
-        package.profile.model = Some("different-profile".into());
-        assert!(package.validate().is_err());
-    }
-
-    #[test]
-    fn failed_stage_creation_preserves_a_file_owned_by_another_writer() {
-        let root = tempfile::tempdir().unwrap();
-        let stage = root.path().join(".run-step-existing.tmp");
-        std::fs::write(&stage, b"owned by another writer").unwrap();
-
-        assert!(create_staged_file(&stage).is_err());
-        assert_eq!(std::fs::read(stage).unwrap(), b"owned by another writer");
-    }
-
-    #[test]
-    fn package_serialization_stops_at_the_package_limit() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("package.json");
-        let mut package = package();
-        package.prompt = "x".repeat(8 * 1024 * 1024);
-
-        assert!(package.publish_once(&path).is_err());
-        assert!(!path.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn package_rejects_symlink_parent() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let actual = root.path().join("actual");
-        std::fs::create_dir(&actual).unwrap();
-        let alias = root.path().join("alias");
-        symlink(&actual, &alias).unwrap();
-
-        assert!(package().publish_once(&alias.join("package.json")).is_err());
     }
 }

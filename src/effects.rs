@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub use crate::engine::reducer::EffectKind;
 use crate::engine::reducer::effect_name;
@@ -12,7 +12,8 @@ pub enum EffectMode {
     Reconcile,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbsentProof {
     handler_kind: String,
     operation_id: String,
@@ -47,6 +48,17 @@ impl AbsentProof {
             evidence,
         })
     }
+
+    pub(crate) fn matches_effect(&self, kind: EffectKind, intent: &EffectIntent) -> bool {
+        self.handler_kind == effect_name(&kind)
+            && self.operation_id == intent.operation_id
+            && self.request_digest == intent.request_digest
+            && self.project_id == intent.project_id.as_str()
+            && self.subject_type == intent.subject_type
+            && self.subject_id == intent.subject_id
+            && !self.authority.trim().is_empty()
+            && !self.evidence.trim().is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +74,15 @@ pub struct EffectRequest {
     pub intent: EffectIntent,
     pub attempt_count: u32,
     pub created_at_unix: i64,
+}
+
+/// Host-owned context for handlers that must persist a domain receipt through
+/// the controller's existing database connection. No second ConfigStore may be
+/// opened while the foreground controller owns the machine lock.
+pub struct EffectContext<'a> {
+    pub store: &'a mut ConfigStore,
+    pub owner_generation: u64,
+    pub now_unix: i64,
 }
 
 impl From<ClaimedEffect> for EffectRequest {
@@ -83,6 +104,7 @@ pub trait EffectHandler: Send + Sync {
         &self,
         mode: EffectMode,
         request: &EffectRequest,
+        context: &mut EffectContext<'_>,
     ) -> Result<EffectObservation, String>;
 }
 
@@ -221,7 +243,14 @@ impl EffectDispatcher {
             .ok_or_else(|| {
                 EffectDispatchError::Store("claimed effect kind has no registered handler".into())
             })?;
-        let observation = handler.handle(mode, &request);
+        let observation = {
+            let mut context = EffectContext {
+                store,
+                owner_generation,
+                now_unix,
+            };
+            handler.handle(mode, &request, &mut context)
+        };
         match observation {
             Ok(EffectObservation::Applied { receipt }) => {
                 store
@@ -255,6 +284,7 @@ impl EffectDispatcher {
                         &request.intent.operation_id,
                         owner_generation,
                         Some(&receipt),
+                        None,
                         now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                     )
                     .map_err(EffectDispatchError::Store)?;
@@ -262,12 +292,14 @@ impl EffectDispatcher {
                     operation_id: request.intent.operation_id,
                 })
             }
-            Err(_) => {
+            Err(_error) => {
+                let diagnostic = handler_error_diagnostic(handler.kind(), mode);
                 store
                     .defer_effect_reconciliation(
                         &request.intent.operation_id,
                         owner_generation,
                         None,
+                        Some(&diagnostic),
                         now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                     )
                     .map_err(EffectDispatchError::Store)?;
@@ -284,6 +316,7 @@ impl EffectDispatcher {
                             &request.intent.operation_id,
                             owner_generation,
                             Some("{\"error\":\"invalid absence proof\"}"),
+                            None,
                             now_unix
                                 .saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                         )
@@ -363,4 +396,15 @@ fn retry_delay_for_age(limits: EffectLimits, age_secs: u64) -> Duration {
 
 fn duration_seconds(duration: Duration) -> i64 {
     duration.as_secs().min(i64::MAX as u64) as i64
+}
+
+fn handler_error_diagnostic(kind: EffectKind, mode: EffectMode) -> String {
+    let stage = match mode {
+        EffectMode::Submit => "submit",
+        EffectMode::Reconcile => "reconcile",
+    };
+    format!(
+        "uncertain handler_error kind={} stage={stage}; reconciliation scheduled; inspect this operation before deciding next action",
+        effect_name(&kind)
+    )
 }
