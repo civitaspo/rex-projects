@@ -1,6 +1,6 @@
 //! Concrete host adapters assembled for one foreground controller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -251,6 +251,7 @@ pub struct RuntimeServices {
     rex_lifecycle_cursor: usize,
     rex_lifecycle_last_tick: Option<i64>,
     agent_recovery: crate::agent_recovery::AgentRecoveryRuntime,
+    provider_qualification_recovery_ids: BTreeSet<String>,
 }
 
 pub(crate) fn operator_plan_ready_for_launch(
@@ -1059,6 +1060,7 @@ impl RuntimeServices {
             rex_lifecycle_cursor: 0,
             rex_lifecycle_last_tick: None,
             agent_recovery: crate::agent_recovery::AgentRecoveryRuntime::default(),
+            provider_qualification_recovery_ids: BTreeSet::new(),
         })
     }
 
@@ -1109,8 +1111,74 @@ impl RuntimeServices {
         now_unix: i64,
     ) -> Result<(), String> {
         store.mark_orphaned_provider_qualification_jobs(self.owner_generation)?;
+        for pending in store.pending_provider_qualification_reconciles(self.owner_generation, 8)? {
+            use crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase as Phase;
+            if matches!(pending.launch_phase, Phase::NotStarted | Phase::Prepared) {
+                let job = store.claim_provider_qualification_recovery(
+                    self.owner_generation,
+                    &pending.request.request_id,
+                )?;
+                self.provider_qualification_recovery_ids
+                    .insert(job.request.request_id.clone());
+                if let Err(error) = self
+                    .preflight_provider_qualification_deadline(&job)
+                    .and_then(|_| self.start_provider_qualification(store, &job))
+                {
+                    let _ = store.mark_provider_qualification_unknown(
+                        self.owner_generation,
+                        &job.request.request_id,
+                    );
+                    return Err(format!(
+                        "provider qualification {} remains held after safe pre-create recovery failed: {error}",
+                        job.request.request_id
+                    ));
+                }
+            } else {
+                self.reconcile_provider_qualification(store, &pending)?;
+                store.acknowledge_provider_qualification_reconcile(
+                    self.owner_generation,
+                    &pending.request.request_id,
+                )?;
+            }
+        }
+        for request_id in self
+            .provider_qualification_recovery_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let job = store
+                .provider_qualification_job(&request_id)?
+                .ok_or("tracked recovered provider qualification disappeared")?;
+            if matches!(
+                job.status,
+                crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Verified
+                    | crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Failed
+            ) {
+                self.provider_qualification_recovery_ids.remove(&request_id);
+                continue;
+            }
+            if job.controller_generation != self.owner_generation {
+                continue;
+            }
+            self.reconcile_provider_qualification(store, &job)?;
+            let current = store
+                .provider_qualification_job(&request_id)?
+                .ok_or("recovered provider qualification disappeared during reconciliation")?;
+            if matches!(
+                current.status,
+                crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Verified
+                    | crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Failed
+            ) {
+                self.provider_qualification_recovery_ids.remove(&request_id);
+            }
+        }
         for job in store.provider_qualification_jobs_to_reconcile(8)? {
-            if job.controller_generation == self.owner_generation {
+            if job.controller_generation == self.owner_generation
+                && !self
+                    .provider_qualification_recovery_ids
+                    .contains(&job.request.request_id)
+            {
                 self.reconcile_provider_qualification(store, &job)?;
             }
         }
@@ -1206,14 +1274,47 @@ impl RuntimeServices {
             .state_root
             .join("provider-qualifications")
             .join(&operation_id);
-        create_private_qualification_tree(&root)?;
+        use crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase as Phase;
+        let handoff = match job.launch_phase {
+            Phase::NotStarted => {
+                if fs::symlink_metadata(&root).is_ok() {
+                    return Err("unprepared provider qualification already has a private root; retaining it as ambiguous".into());
+                }
+                create_private_qualification_tree(&root)?;
+                let handoff = self
+                    .environment
+                    .create_handoff_for_operation(&self.state_root, &operation_id)
+                    .map_err(|error| error.to_string())?;
+                store.mark_provider_qualification_prepared(
+                    self.owner_generation,
+                    &job.request.request_id,
+                    handoff.snapshot_id(),
+                )?;
+                handoff
+            }
+            Phase::Prepared => {
+                validate_private_qualification_tree(&root)?;
+                let snapshot_id = job
+                    .environment_snapshot_id
+                    .as_ref()
+                    .ok_or("prepared provider qualification has no saved environment snapshot")?;
+                crate::environment::EnvironmentHandoff::reopen_for_operation(
+                    &self.state_root,
+                    snapshot_id,
+                    &operation_id,
+                )
+                .map_err(|error| error.to_string())?
+            }
+            _ => {
+                return Err(
+                    "provider qualification launch boundary does not permit another Rex create"
+                        .into(),
+                );
+            }
+        };
         let workspace = root.join("workspace");
         let control_dir = root.join("control");
         let result_path = control_dir.join("result.json");
-        let handoff = self
-            .environment
-            .create_handoff_for_operation(&self.state_root, &operation_id)
-            .map_err(|error| error.to_string())?;
         let role_contract = crate::roles::builtin_role_contract(job.request.role).to_owned();
         let descriptor_path = root.join("package.json");
         let prompt = format!(
@@ -1248,6 +1349,10 @@ impl RuntimeServices {
             cwd: workspace.clone(),
             path_prepend: Vec::new(),
         };
+        store.mark_provider_qualification_create_attempted(
+            self.owner_generation,
+            &job.request.request_id,
+        )?;
         let rex_receipt = self
             .rex
             .create_disposable_qualification_session(&operation_id, &bootstrap_spec)
@@ -1278,7 +1383,7 @@ impl RuntimeServices {
             profile_digest: profile_digest.clone(),
             instruction_digest,
             plan_digest: None,
-            environment_snapshot_id: self.environment.metadata().id.clone(),
+            environment_snapshot_id: handoff.snapshot_id().clone(),
             wake_snapshot_digest: wake_digest,
             provider_capability: crate::run_step::ProviderCapabilityEvidence {
                 schema_version: 1,
@@ -1306,7 +1411,7 @@ impl RuntimeServices {
             role: job.request.role,
             profile_id: job.request.profile_id.clone(),
             profile_digest,
-            environment_snapshot_id: self.environment.metadata().id.clone(),
+            environment_snapshot_id: handoff.snapshot_id().clone(),
             profile: profile.clone(),
             descriptor,
             role_contract,
@@ -1764,6 +1869,65 @@ fn create_private_qualification_tree(root: &Path) -> Result<(), String> {
             != root.join("control")
     {
         return Err("qualification paths changed during creation".into());
+    }
+    Ok(())
+}
+
+fn validate_private_qualification_tree(root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("provider qualification root is not a real directory".into());
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err("provider qualification root is not private to the current user".into());
+    }
+    let mut names = fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    if names
+        != [
+            std::ffi::OsString::from("control"),
+            std::ffi::OsString::from("workspace"),
+        ]
+    {
+        return Err("provider qualification preparation directory has unexpected contents".into());
+    }
+    for name in ["workspace", "control"] {
+        let path = root.join(name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("provider qualification preparation path is not a real directory".into());
+        }
+        #[cfg(unix)]
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(
+                "provider qualification preparation path is not private to the current user".into(),
+            );
+        }
+        if fs::read_dir(&path)
+            .map_err(|error| error.to_string())?
+            .next()
+            .is_some()
+        {
+            return Err("provider qualification preparation path is not empty".into());
+        }
+        if fs::canonicalize(&path).map_err(|error| error.to_string())? != path {
+            return Err("provider qualification preparation path changed during validation".into());
+        }
+    }
+    if fs::canonicalize(root).map_err(|error| error.to_string())? != root {
+        return Err("provider qualification root changed during validation".into());
     }
     Ok(())
 }
@@ -5390,6 +5554,9 @@ mod provider_qualification_preflight_tests {
             request_digest: Digest::parse("b".repeat(64)).unwrap(),
             status: ProviderQualificationJobStatus::Running,
             controller_generation: 1,
+            launch_phase: crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::NotStarted,
+            environment_snapshot_id: None,
+            reconcile_requested_generation: None,
             rex_session_id: None,
             rex_window_id: None,
             rex_block_id: None,
@@ -7204,6 +7371,568 @@ mod worker_assignment_context_tests {
                 Some(&plan_record),
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod provider_qualification_requested_reconcile_tests {
+    use super::*;
+    use crate::domain::ids::{Digest, ProfileId, ProjectId};
+    use crate::domain::types::Role;
+    use crate::store::provider_qualification_runtime::{
+        ProviderQualificationJobStatus, ProviderQualificationLaunchPhase,
+        ProviderQualificationRequest,
+    };
+    use crate::store::{ExpectedRevision, OwnerMetadata};
+
+    #[test]
+    fn tick_observes_ninth_explicit_postmarker_request_before_acknowledging_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let state_root = std::fs::canonicalize(state_root).unwrap();
+        let rex = temp.path().join("rex fixture");
+        let calls = temp.path().join("rex calls.log");
+        let applied_config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let mut applied = crate::config::load(&applied_config_path).unwrap();
+        applied.config.runtime.rex_binary = rex.display().to_string();
+        applied.config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
+        applied.config.adapters.tickets.command =
+            vec![std::env::current_exe().unwrap().display().to_string()];
+        applied
+            .profiles
+            .get_mut(&ProfileId::parse("judgment_claude").unwrap())
+            .unwrap()
+            .command = vec![std::env::current_exe().unwrap().display().to_string()];
+        applied
+            .config
+            .repositories
+            .get_mut(&crate::domain::ids::RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .clone_url = "https://github.com/example/example.git".into();
+
+        let project_id = ProjectId::parse("goal_project").unwrap();
+        let profile_id = ProfileId::parse("judgment_claude").unwrap();
+        let profile = applied.profiles.get(&profile_id).unwrap();
+        let project_digest = applied.digest.clone();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let revision = store
+            .apply_snapshot("fixture", &applied, ExpectedRevision::Bootstrap)
+            .unwrap()
+            .revision;
+        let prior_owner_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "requested-reconcile-fixture".into(),
+                state_root: state_root.display().to_string(),
+                config_source: applied_config_path.display().to_string(),
+                process_start_identity: crate::cli::observed_process_start_identity(
+                    std::process::id(),
+                )
+                .expect("test process has a start identity"),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "c".repeat(64),
+                rex_endpoint: Some("unix:///tmp/provider-reconcile-fixture.sock".into()),
+                rex_server_identity: Some("provider-reconcile-fixture".into()),
+                rex_session_id: Some("fixture-controller-session".into()),
+                rex_block_id: Some("fixture-controller-block".into()),
+            })
+            .unwrap();
+
+        let mut request_ids = Vec::new();
+        for index in 0..9 {
+            let request_id = if index == 8 {
+                "qualification-99-target".to_owned()
+            } else {
+                format!("qualification-{index:02}-older")
+            };
+            let request = ProviderQualificationRequest {
+                request_id: request_id.clone(),
+                project_id: project_id.clone(),
+                role: Role::Coordinator,
+                profile_id: profile_id.clone(),
+                profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
+                config_revision: revision.0,
+                config_digest: project_digest.clone(),
+            };
+            store
+                .enqueue_provider_qualification(prior_owner_generation, &request)
+                .unwrap();
+            let crate::store::provider_qualification_runtime::QualificationClaim::Claimed {
+                ..
+            } = store
+                .claim_provider_qualification(prior_owner_generation, 9, 9)
+                .unwrap()
+            else {
+                panic!("fixture qualification should reserve its existing slot");
+            };
+            store
+                .mark_provider_qualification_prepared(
+                    prior_owner_generation,
+                    &request_id,
+                    &Digest::parse("e".repeat(64)).unwrap(),
+                )
+                .unwrap();
+            store
+                .mark_provider_qualification_create_attempted(prior_owner_generation, &request_id)
+                .unwrap();
+            store
+                .mark_provider_qualification_unknown(prior_owner_generation, &request_id)
+                .unwrap();
+            request_ids.push(request_id);
+        }
+        let requested_id = request_ids.last().unwrap();
+        store
+            .queue_provider_qualification_reconcile(prior_owner_generation, requested_id)
+            .unwrap();
+        drop(store);
+
+        let operation_id = format!(
+            "qualification-{}",
+            crate::store::provider_qualification_runtime::request_digest(
+                &ProviderQualificationRequest {
+                    request_id: requested_id.clone(),
+                    project_id: project_id.clone(),
+                    role: Role::Coordinator,
+                    profile_id: profile_id.clone(),
+                    profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
+                    config_revision: revision.0,
+                    config_digest: project_digest.clone(),
+                }
+            )
+            .unwrap()
+            .as_str()[..24]
+                .to_owned()
+        );
+        let session_label = format!("rex-projects-provider-qualification-{operation_id}");
+        let window_label = crate::adapters::rex::owned_ticket_window_label(
+            "rex-projects-provider-qualification",
+            &operation_id,
+        )
+        .unwrap();
+        let block_label = crate::adapters::rex::owned_agent_block_label(&operation_id).unwrap();
+        let session_list =
+            serde_json::json!({"sessions":[{"session_id":"target-session","label":session_label}]});
+        let session_view = serde_json::json!({"windows":[{"window_id":"target-window","label":window_label,"layers":[{"blocks":[{"block_id":"target-block","label":block_label,"flavor":"com.superlogical.terminal.shell"}]}]}]});
+        let whoami = serde_json::json!({"endpoint":"unix:///tmp/provider-reconcile-fixture.sock","instance_id":"provider-reconcile-fixture","host_id":"fixture-host","rex_version":"1.0"});
+        let api = serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}});
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{}' ;;\n  *'api list --json'*) printf '%s\\n' '{}' ;;\n  *'session ls --json'*) printf '%s\\n' '{}' ;;\n  *'api call session.view'*) printf '%s\\n' '{}' ;;\n  *) exit 64 ;;\nesac\n",
+            calls.display(),
+            whoami,
+            api,
+            session_list,
+            session_view
+        );
+        std::fs::write(&rex, script).unwrap();
+        std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = crate::environment::capture(&applied.config.runtime.environment).unwrap();
+        let runtime_binary = std::env::current_exe().unwrap();
+        let mut services = RuntimeServices::new(
+            &applied,
+            &environment,
+            &applied_config_path,
+            &state_root,
+            prior_owner_generation,
+            &RexIdentity {
+                endpoint: "unix:///tmp/provider-reconcile-fixture.sock".into(),
+                instance_id: "provider-reconcile-fixture".into(),
+                session_id: "fixture-controller-session".into(),
+                block_id: Some("fixture-controller-block".into()),
+            },
+            RuntimeExecutable {
+                path: &runtime_binary,
+                digest: &Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        services
+            .tick_provider_qualification_jobs(&mut store, 1_800_000_000)
+            .unwrap();
+
+        let target = store
+            .provider_qualification_job(requested_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.status, ProviderQualificationJobStatus::Unknown);
+        assert_eq!(target.launch_phase, ProviderQualificationLaunchPhase::Bound);
+        assert_eq!(target.rex_session_id.as_deref(), Some("target-session"));
+        assert_eq!(target.reconcile_requested_generation, None);
+        let slot = store
+            .provider_qualification_slot(requested_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot.disposition, "unknown");
+        let rex_calls = std::fs::read_to_string(calls).unwrap();
+        assert!(rex_calls.contains("session ls --json"));
+        assert!(rex_calls.contains("api call session.view"));
+        assert!(!rex_calls.contains("session.new_window"));
+    }
+
+    #[test]
+    fn tick_retries_prepared_launch_with_saved_environment_and_existing_slot_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let state_root = std::fs::canonicalize(state_root).unwrap();
+        let rex = temp.path().join("rex fixture");
+        let calls = temp.path().join("rex calls.log");
+        let applied_config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let mut applied = crate::config::load(&applied_config_path).unwrap();
+        applied.config.runtime.rex_binary = rex.display().to_string();
+        applied.config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
+        applied.config.adapters.tickets.command =
+            vec![std::env::current_exe().unwrap().display().to_string()];
+        applied
+            .profiles
+            .get_mut(&ProfileId::parse("judgment_claude").unwrap())
+            .unwrap()
+            .command = vec![std::env::current_exe().unwrap().display().to_string()];
+        applied
+            .config
+            .repositories
+            .get_mut(&crate::domain::ids::RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .clone_url = "https://github.com/example/example.git".into();
+        let old_environment =
+            crate::environment::capture(&applied.config.runtime.environment).unwrap();
+
+        let project_id = ProjectId::parse("goal_project").unwrap();
+        let profile_id = ProfileId::parse("judgment_claude").unwrap();
+        let profile = applied.profiles.get(&profile_id).unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let revision = store
+            .apply_snapshot("fixture", &applied, ExpectedRevision::Bootstrap)
+            .unwrap()
+            .revision;
+        let prior_owner_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "prepared-reconcile-fixture".into(),
+                state_root: state_root.display().to_string(),
+                config_source: applied_config_path.display().to_string(),
+                process_start_identity: crate::cli::observed_process_start_identity(
+                    std::process::id(),
+                )
+                .expect("test process has a start identity"),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "b".repeat(64),
+                rex_endpoint: Some("unix:///tmp/prepared-reconcile-fixture.sock".into()),
+                rex_server_identity: Some("prepared-reconcile-fixture".into()),
+                rex_session_id: Some("fixture-controller-session".into()),
+                rex_block_id: Some("fixture-controller-block".into()),
+            })
+            .unwrap();
+
+        let mut target_id = String::new();
+        let mut target_slot = None;
+        let mut target_operation = String::new();
+        for index in 0..9 {
+            let request_id = if index == 8 {
+                "qualification-99-prepared".to_owned()
+            } else {
+                format!("qualification-{index:02}-older")
+            };
+            let request = ProviderQualificationRequest {
+                request_id: request_id.clone(),
+                project_id: project_id.clone(),
+                role: Role::Coordinator,
+                profile_id: profile_id.clone(),
+                profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
+                config_revision: revision.0,
+                config_digest: applied.digest.clone(),
+            };
+            store
+                .enqueue_provider_qualification(prior_owner_generation, &request)
+                .unwrap();
+            let crate::store::provider_qualification_runtime::QualificationClaim::Claimed {
+                job,
+                slot_index,
+            } = store
+                .claim_provider_qualification(prior_owner_generation, 9, 9)
+                .unwrap()
+            else {
+                panic!("fixture qualification should reserve its original slot");
+            };
+            let slot = store
+                .provider_qualification_slot(&request_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(slot.slot_index, slot_index);
+            if index == 8 {
+                target_id = request_id.clone();
+                target_operation = format!("qualification-{}", &job.request_digest.as_str()[..24]);
+                let root = state_root
+                    .join("provider-qualifications")
+                    .join(&target_operation);
+                create_private_qualification_tree(&root).unwrap();
+                let handoff = old_environment
+                    .create_handoff_for_operation(&state_root, &target_operation)
+                    .unwrap();
+                let saved_handoff_path = handoff.path().to_owned();
+                let saved_snapshot_id = handoff.snapshot_id().clone();
+                drop(handoff);
+                store
+                    .mark_provider_qualification_prepared(
+                        prior_owner_generation,
+                        &request_id,
+                        &saved_snapshot_id,
+                    )
+                    .unwrap();
+                target_slot = Some(slot);
+                // Keep the saved input identity for later assertions without retaining secrets.
+                std::fs::write(
+                    temp.path().join("saved-handoff-path"),
+                    saved_handoff_path.display().to_string(),
+                )
+                .unwrap();
+            } else {
+                store
+                    .mark_provider_qualification_prepared(
+                        prior_owner_generation,
+                        &request_id,
+                        &old_environment.metadata().id,
+                    )
+                    .unwrap();
+                store
+                    .mark_provider_qualification_create_attempted(
+                        prior_owner_generation,
+                        &request_id,
+                    )
+                    .unwrap();
+            }
+            store
+                .mark_provider_qualification_unknown(prior_owner_generation, &request_id)
+                .unwrap();
+        }
+        let target_slot = target_slot.expect("target slot captured");
+        let current_owner_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "prepared-reconcile-restarted-controller".into(),
+                state_root: state_root.display().to_string(),
+                config_source: applied_config_path.display().to_string(),
+                process_start_identity: crate::cli::observed_process_start_identity(
+                    std::process::id(),
+                )
+                .expect("test process has a start identity"),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "a".repeat(64),
+                rex_endpoint: Some("unix:///tmp/prepared-reconcile-fixture.sock".into()),
+                rex_server_identity: Some("prepared-reconcile-fixture".into()),
+                rex_session_id: Some("fixture-controller-session".into()),
+                rex_block_id: Some("fixture-controller-block".into()),
+            })
+            .unwrap();
+        assert_eq!(current_owner_generation, prior_owner_generation + 1);
+        drop(store);
+
+        let window_label = crate::adapters::rex::owned_ticket_window_label(
+            "rex-projects-provider-qualification",
+            &target_operation,
+        )
+        .unwrap();
+        let session_label = format!("rex-projects-provider-qualification-{target_operation}");
+        let session_created = temp.path().join("prepared-session-created");
+        let session_view_checked = temp.path().join("prepared-session-view-checked");
+        let sessions = serde_json::json!({"sessions":[{"session_id":"prepared-session","label":session_label}]});
+        let created = serde_json::json!({
+            "session_id":"prepared-session",
+            "initial_windows":[{"window_id":"prepared-window","label":window_label,"block_ids":["prepared-block"]}]
+        });
+        let initial_view = serde_json::json!({"session_id":"prepared-session","label":session_label,"windows":[{"window_id":"prepared-window","label":window_label,"layers":[{"blocks":[{"block_id":"prepared-block","label":crate::adapters::rex::owned_agent_block_label(&target_operation).unwrap(),"flavor":"com.superlogical.terminal.shell"}]}]}]});
+        let finished_view =
+            serde_json::json!({"session_id":"prepared-session","label":session_label,"windows":[]});
+        let whoami = serde_json::json!({"endpoint":"unix:///tmp/prepared-reconcile-fixture.sock","instance_id":"prepared-reconcile-fixture","host_id":"fixture-host","rex_version":"1.0"});
+        let api = serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}});
+        let process = serde_json::json!({"last_exit":null,"child":{"pid":10,"user_id":501,"name":"codex","path":"/usr/bin/codex"},"foreground":{"pid":11,"user_id":501,"name":"node"},"ancestors":[]});
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{}' ;;\n  *'api list --json'*) printf '%s\\n' '{}' ;;\n  *'session ls --json'*) if [ -f '{}' ]; then printf '%s\\n' '{}'; else printf '{{\"sessions\":[]}}\\n'; fi ;;\n  *'new rex-projects-provider-qualification-'*) : > '{}'; printf '%s\\n' '{}' ;;\n  *'api call session.view'*) if [ ! -f '{}' ]; then : > '{}'; printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi ;;\n  *'api call com.superlogical.terminal.process'*) printf '%s\\n' '{}' ;;\n  *'kill prepared-session'*) rm -f '{}'; printf '{{}}\\n' ;;\n  *) exit 64 ;;\nesac\n",
+            calls.display(),
+            whoami,
+            api,
+            session_created.display(),
+            sessions,
+            session_created.display(),
+            created,
+            session_view_checked.display(),
+            session_view_checked.display(),
+            initial_view,
+            finished_view,
+            process,
+            session_created.display()
+        );
+        std::fs::write(&rex, script).unwrap();
+        std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A controller restart captures a new environment identity. Recovery must still use
+        // the previously persisted snapshot and handoff, not silently mint a replacement.
+        let new_environment =
+            crate::environment::capture(&applied.config.runtime.environment).unwrap();
+        assert_ne!(new_environment.metadata().id, old_environment.metadata().id);
+        let runtime_binary = std::env::current_exe().unwrap();
+        let mut services = RuntimeServices::new(
+            &applied,
+            &new_environment,
+            &applied_config_path,
+            &state_root,
+            current_owner_generation,
+            &RexIdentity {
+                endpoint: "unix:///tmp/prepared-reconcile-fixture.sock".into(),
+                instance_id: "prepared-reconcile-fixture".into(),
+                session_id: "fixture-controller-session".into(),
+                block_id: Some("fixture-controller-block".into()),
+            },
+            RuntimeExecutable {
+                path: &runtime_binary,
+                digest: &Digest::parse("a".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        services
+            .tick_provider_qualification_jobs(&mut store, 1_800_000_000)
+            .unwrap();
+
+        let rehomed = store
+            .provider_qualification_job(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rehomed.status, ProviderQualificationJobStatus::Unknown);
+        assert_eq!(rehomed.controller_generation, current_owner_generation);
+        assert_eq!(rehomed.reconcile_requested_generation, None);
+        let rehomed_slot = store
+            .provider_qualification_slot(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rehomed_slot.slot_index, target_slot.slot_index);
+        assert_eq!(
+            rehomed_slot.reservation_epoch,
+            target_slot.reservation_epoch
+        );
+        assert_eq!(rehomed_slot.controller_generation, current_owner_generation);
+        assert_eq!(rehomed_slot.disposition, "unknown");
+        store
+            .queue_provider_qualification_reconcile(current_owner_generation, &target_id)
+            .unwrap();
+        services
+            .tick_provider_qualification_jobs(&mut store, 1_800_000_010)
+            .unwrap();
+
+        let recovered = store
+            .provider_qualification_job(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ProviderQualificationJobStatus::Unknown);
+        assert_eq!(
+            recovered.launch_phase,
+            ProviderQualificationLaunchPhase::Bound
+        );
+        assert_eq!(
+            recovered.rex_session_id.as_deref(),
+            Some("prepared-session")
+        );
+        assert_eq!(
+            recovered.environment_snapshot_id,
+            Some(old_environment.metadata().id.clone())
+        );
+        let slot = store
+            .provider_qualification_slot(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot.slot_index, target_slot.slot_index);
+        assert_eq!(slot.reservation_epoch, target_slot.reservation_epoch);
+        assert_eq!(slot.disposition, "unknown");
+        let package_path = state_root
+            .join("provider-qualifications")
+            .join(&target_operation)
+            .join("package.json");
+        let package: crate::provider_qualification_run::QualificationRunPackage =
+            serde_json::from_slice(&std::fs::read(package_path).unwrap()).unwrap();
+        let receipt = serde_json::json!({
+            "run_id": package.descriptor.run_id,
+            "attempt": package.descriptor.attempt,
+            "provider": package.profile.adapter,
+            "effective_permission_mode": package.descriptor.provider_capability.permission_mode,
+            "conversation_id": null,
+            "provider_version": null,
+            "capability_receipt_digest": null,
+            "schema_projection": package.descriptor.provider_capability.schema_projection,
+            "launch_pid_hint": null,
+            "exit_code": 0,
+            "timed_out": false,
+            "cancellation_signal": null,
+            "cancellation_cause": null,
+            "cleanup": "confirmed",
+            "cleanup_detail": null,
+            "processes": [{
+                "pid": 4294967295_u32,
+                "parent_pid": 1,
+                "process_group_id": 4294967295_u32,
+                "start_identity": "synthetic-absent-process",
+                "command": "fixture-agent",
+                "identity_quality": "kernel_birth_token"
+            }],
+            "result_digest": null,
+            "provider_result_failure": null,
+            "provider_process_failure": null,
+            "outcome": "completed"
+        });
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "request_id": target_id,
+            "receipt": receipt,
+            "structured_result": null,
+            "result_digest": "a".repeat(64)
+        });
+        let result_path = state_root
+            .join("provider-qualifications")
+            .join(&target_operation)
+            .join("control/result.json");
+        std::fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+        services
+            .tick_provider_qualification_jobs(&mut store, 1_800_000_020)
+            .unwrap();
+
+        let recovered = store
+            .provider_qualification_job(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ProviderQualificationJobStatus::Failed);
+        let slot = store
+            .provider_qualification_slot(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot.slot_index, target_slot.slot_index);
+        assert_eq!(slot.reservation_epoch, target_slot.reservation_epoch);
+        assert_eq!(slot.disposition, "released");
+        assert!(!session_created.exists());
+        assert!(
+            std::fs::read_to_string(&calls)
+                .unwrap()
+                .contains("kill prepared-session")
+        );
+        assert_eq!(
+            package.environment_snapshot_id,
+            old_environment.metadata().id
+        );
+        assert_eq!(
+            package.environment_handoff,
+            PathBuf::from(std::fs::read_to_string(temp.path().join("saved-handoff-path")).unwrap())
+        );
+        let rex_calls = std::fs::read_to_string(calls).unwrap();
+        assert_eq!(
+            rex_calls
+                .lines()
+                .filter(|line| line.contains("new rex-projects-provider-qualification-"))
+                .count(),
+            1
         );
     }
 }

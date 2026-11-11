@@ -264,6 +264,11 @@ enum ProviderCommand {
         #[arg(long)]
         request_id: String,
     },
+    /// Queue idempotent reconciliation for one exact unknown qualification request.
+    Reconcile {
+        #[arg(long)]
+        request_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -2228,6 +2233,11 @@ fn provider_command(
                         "provider qualification request `{request_id}` was not found"
                     ))
                 })?;
+            let slot = store
+                .provider_qualification_slot(&request_id)
+                .map_err(CliError::unavailable)?;
+            let (hold_reason, next_safe_action, execution_slot) =
+                provider_status_fields(job.status, job.launch_phase, slot.as_ref());
             let report = serde_json::json!({
                 "request_id": job.request.request_id,
                 "request_digest": job.request_digest,
@@ -2240,6 +2250,12 @@ fn provider_command(
                 "config_digest": job.request.config_digest,
                 "controller_generation": job.controller_generation,
                 "qualification_receipt_digest": job.evidence_digest,
+                "launch_phase": job.launch_phase.as_str(),
+                "hold_reason": hold_reason,
+                "environment_snapshot_id": job.environment_snapshot_id,
+                "reconcile_pending": job.reconcile_requested_generation == Some(job.controller_generation),
+                "execution_slot": execution_slot,
+                "next_safe_action": next_safe_action,
                 "created_at_unix": job.created_at_unix,
                 "updated_at_unix": job.updated_at_unix,
             });
@@ -2262,9 +2278,54 @@ fn provider_command(
                     "Configuration revision: {} ({})",
                     job.request.config_revision, job.request.config_digest
                 );
+                println!("Launch phase: {:?}", job.launch_phase);
+                if let Some(hold_reason) = hold_reason {
+                    println!("Held because: {hold_reason}");
+                }
+                println!("Next safe action: {next_safe_action}");
+                if let Some(slot) = slot {
+                    println!(
+                        "Execution slot: {} / epoch {} / {:?}",
+                        slot.slot_index, slot.reservation_epoch, slot.disposition
+                    );
+                }
                 if let Some(digest) = job.evidence_digest {
                     println!("Qualification receipt: {digest}");
                 }
+                Ok(())
+            }
+        }
+        ProviderCommand::Reconcile { request_id } => {
+            let source_path = selected_config_path(config_path)?;
+            let state_root = selected_state_root(Some(&source_path), explicit_state_root)?;
+            let owner = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
+            let generation = owner.owner_generation.ok_or_else(|| CliError::unavailable(
+                "no foreground machine controller is running; start `rex-projects runtime run` first",
+            ))?;
+            if !owner.owner_is_live() {
+                return Err(CliError::unavailable(
+                    "controller ownership is stale or ambiguous; cannot queue provider reconciliation",
+                ));
+            }
+            let mut store =
+                ConfigStore::open_control(&state_root).map_err(CliError::unavailable)?;
+            store
+                .queue_provider_qualification_reconcile(generation, &request_id)
+                .map_err(CliError::conflict)?;
+            let report = serde_json::json!({
+                "accepted": true,
+                "request_id": request_id,
+                "state": "reconcile_queued",
+                "controller_generation": generation,
+                "effect": "foreground_controller_only",
+            });
+            if json {
+                print_json(&report)
+            } else {
+                println!("Queued reconciliation for provider qualification {request_id}.");
+                println!(
+                    "The foreground controller will inspect the saved launch boundary and exact Rex operation label."
+                );
                 Ok(())
             }
         }
@@ -2375,6 +2436,76 @@ fn provider_command(
             }
         }
     }
+}
+
+fn provider_status_fields(
+    status: crate::store::provider_qualification_runtime::ProviderQualificationJobStatus,
+    phase: crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase,
+    slot: Option<&crate::store::provider_qualification_runtime::ProviderQualificationSlot>,
+) -> (
+    Option<&'static str>,
+    &'static str,
+    Option<serde_json::Value>,
+) {
+    use crate::store::provider_qualification_runtime::{
+        ProviderQualificationJobStatus as Status, ProviderQualificationLaunchPhase as Phase,
+    };
+
+    let (hold_reason, next_safe_action) = match status {
+        Status::Verified => (
+            None,
+            "no action required; inspect the qualification receipt if details are needed",
+        ),
+        Status::Failed => (
+            None,
+            "no retry is available from this terminal request; inspect the failure receipt",
+        ),
+        Status::Queued => (
+            Some("qualification has not been claimed by the controller"),
+            "wait for the foreground controller to claim and launch the queued request",
+        ),
+        Status::Running | Status::Unknown => match phase {
+            Phase::LegacyUnknown => (
+                Some(
+                    "legacy request has no durable evidence proving whether Rex creation was attempted",
+                ),
+                "keep the existing slot held; inspect retained evidence manually",
+            ),
+            Phase::NotStarted => (
+                Some(
+                    "controller stopped before the durable preparation boundary; the prior process may have left ambiguous local preparation",
+                ),
+                "a human may request reconciliation; the controller will retry only if the deterministic preparation root is absent",
+            ),
+            Phase::Prepared => (
+                Some(
+                    "preparation and the original environment handoff are durable; retry is permitted only after exact local validation",
+                ),
+                "a human may request reconciliation; the controller will validate the saved handoff and retry once",
+            ),
+            Phase::CreateAttempted => (
+                Some(
+                    "Rex creation may have happened; retrying creation is forbidden until exact operation-label observation resolves it",
+                ),
+                "wait for exact-label Rex observation; a second create is forbidden",
+            ),
+            Phase::Bound => (
+                Some(
+                    "Rex resource identity is bound, but the qualification result is not terminal",
+                ),
+                "wait for the bound Rex run and its existing result and cleanup checks",
+            ),
+        },
+    };
+    let slot = slot.map(|slot| {
+        serde_json::json!({
+            "slot_index": slot.slot_index,
+            "reservation_epoch": slot.reservation_epoch,
+            "controller_generation": slot.controller_generation,
+            "disposition": slot.disposition,
+        })
+    });
+    (hold_reason, next_safe_action, slot)
 }
 
 fn parse_provider_role(value: &str) -> Option<crate::domain::types::Role> {
@@ -4096,6 +4227,20 @@ pub(crate) fn dispatch_ticket_command_for_test(args: &[&str]) -> Result<(), CliE
     )
 }
 
+#[cfg(test)]
+fn dispatch_provider_command_for_test(args: &[&str]) -> Result<(), CliError> {
+    let cli = Cli::try_parse_from(args).map_err(|error| CliError::usage(error.to_string()))?;
+    let Command::Provider { command } = cli.command else {
+        return Err(CliError::usage("test command must select `provider`"));
+    };
+    provider_command(
+        cli.config.as_deref(),
+        cli.state_root.as_deref(),
+        command,
+        cli.json,
+    )
+}
+
 fn version(json: bool) -> Result<(), CliError> {
     if json {
         let report = VersionInfo {
@@ -4271,6 +4416,160 @@ mod tests {
             } if request_id == "qualification-123"
         ));
         assert!(Cli::try_parse_from(["rex-projects", "provider", "status"]).is_err());
+        let reconcile = Cli::try_parse_from([
+            "rex-projects",
+            "provider",
+            "reconcile",
+            "--request-id",
+            "qualification-123",
+        ])
+        .unwrap();
+        assert!(matches!(
+            reconcile.command,
+            Command::Provider {
+                command: ProviderCommand::Reconcile { request_id }
+            } if request_id == "qualification-123"
+        ));
+        assert!(Cli::try_parse_from(["rex-projects", "provider", "reconcile"]).is_err());
+    }
+
+    #[test]
+    fn terminal_provider_status_shows_no_hold_and_preserves_actual_released_slot() {
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationJobStatus as Status, ProviderQualificationLaunchPhase as Phase,
+            ProviderQualificationSlot,
+        };
+
+        let slot = ProviderQualificationSlot {
+            slot_index: 3,
+            reservation_epoch: 5,
+            controller_generation: 7,
+            disposition: "released".into(),
+        };
+        for status in [Status::Verified, Status::Failed] {
+            let (hold_reason, next_safe_action, reported_slot) =
+                super::provider_status_fields(status, Phase::Bound, Some(&slot));
+            assert_eq!(hold_reason, None);
+            assert!(!next_safe_action.contains("held"));
+            assert_eq!(
+                reported_slot.unwrap()["disposition"],
+                serde_json::json!("released")
+            );
+        }
+    }
+
+    #[test]
+    fn public_provider_reconcile_handler_persists_only_the_exact_live_request_intent() {
+        use crate::domain::ids::{ProfileId, ProjectId};
+        use crate::domain::types::Role;
+        use crate::store::{ExpectedRevision, OwnerMetadata};
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let config_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let applied = config::load(&config_path).unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let revision = store
+            .apply_snapshot(
+                "provider-reconcile-fixture",
+                &applied,
+                ExpectedRevision::Bootstrap,
+            )
+            .unwrap()
+            .revision;
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "fixture-owner".into(),
+                state_root: state_root.display().to_string(),
+                config_source: config_path.display().to_string(),
+                process_start_identity: super::process_start_identity().unwrap(),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "d".repeat(64),
+                rex_endpoint: Some("fixture://rex".into()),
+                rex_server_identity: Some("fixture-server".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        let project_id = ProjectId::parse("goal_project").unwrap();
+        let profile_id = ProfileId::parse("judgment_claude").unwrap();
+        let profile = applied.profiles.get(&profile_id).unwrap();
+        let request = crate::store::provider_qualification_runtime::ProviderQualificationRequest {
+            request_id: "qualification-cli-reconcile".into(),
+            project_id,
+            role: Role::Coordinator,
+            profile_id,
+            profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
+            config_revision: revision.0,
+            config_digest: applied.digest.clone(),
+        };
+        store
+            .enqueue_provider_qualification(generation, &request)
+            .unwrap();
+        let crate::store::provider_qualification_runtime::QualificationClaim::Claimed { .. } =
+            store
+                .claim_provider_qualification(generation, 1, 1)
+                .unwrap()
+        else {
+            panic!("fixture qualification should reserve its normal slot");
+        };
+        store
+            .mark_provider_qualification_unknown(generation, &request.request_id)
+            .unwrap();
+        let held_slot = store
+            .provider_qualification_slot(&request.request_id)
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        super::dispatch_provider_command_for_test(&[
+            "rex-projects",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "--json",
+            "provider",
+            "reconcile",
+            "--request-id",
+            &request.request_id,
+        ])
+        .unwrap();
+
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let persisted = store
+            .provider_qualification_job(&request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.request, request);
+        assert_eq!(persisted.reconcile_requested_generation, Some(generation));
+        assert_eq!(
+            persisted.status,
+            crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Unknown
+        );
+        assert_eq!(
+            store
+                .provider_qualification_slot(&request.request_id)
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "unknown"
+        );
+        let recovered = store
+            .claim_provider_qualification_recovery(generation, &request.request_id)
+            .unwrap();
+        assert_eq!(
+            recovered.launch_phase,
+            crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::NotStarted
+        );
+        let retried_slot = store
+            .provider_qualification_slot(&request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried_slot.slot_index, held_slot.slot_index);
+        assert_eq!(retried_slot.reservation_epoch, held_slot.reservation_epoch);
+        assert_eq!(retried_slot.disposition, "launch_pending");
     }
 
     #[test]

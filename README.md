@@ -31,6 +31,9 @@ The ticket adapter protocol is implemented by a configured external command. See
 See [Recover an exhausted MergeDecision claim](docs/ticket-recovery.md) for the
 human-controlled recovery commands and their one-use limit.
 
+See [Reconcile an interrupted provider qualification](docs/provider-recovery.md)
+for exact-request recovery and retained execution-slot ownership.
+
 ## Development
 
 Install the pinned tools with `mise install`. Run `mise run lint`, `mise run test`, and `mise run build` to check changes. Run `mise run fix` to apply supported automatic fixes.

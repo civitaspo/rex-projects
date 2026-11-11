@@ -431,6 +431,7 @@ pub(crate) fn test_qualification_fixture() -> RexQualificationFixture {
 pub enum RexError {
     Invalid(String),
     Process,
+    ProcessDiagnostic(String),
     Protocol(String),
     Unsupported(String),
     WrongServer,
@@ -442,6 +443,7 @@ impl std::fmt::Display for RexError {
         match self {
             Self::Invalid(message) => write!(f, "invalid Rex request: {message}"),
             Self::Process => f.write_str("Rex CLI operation failed"),
+            Self::ProcessDiagnostic(diagnostic) => write!(f, "Rex CLI {diagnostic}"),
             Self::Protocol(message) => write!(f, "Rex returned an invalid response: {message}"),
             Self::Unsupported(method) => write!(f, "Rex server does not support {method}"),
             Self::WrongServer => {
@@ -605,6 +607,7 @@ impl RexCliTransport {
             &environment,
             timeout,
             shutdown_grace,
+            RexCliOperation::WhoAmI,
             &["whoami", "--json"],
         )?;
         let identity: WhoAmI = parse(&who.stdout)?;
@@ -617,6 +620,7 @@ impl RexCliTransport {
             &environment,
             timeout,
             shutdown_grace,
+            RexCliOperation::ApiList,
             &["api", "list", "--json"],
         )?;
         let methods = parse_method_names(&api.stdout)?;
@@ -1587,12 +1591,81 @@ struct WhoAmI {
     rex_version: String,
 }
 
+#[derive(Clone, Copy)]
+enum RexCliOperation {
+    WhoAmI,
+    ApiList,
+}
+
+impl RexCliOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WhoAmI => "whoami",
+            Self::ApiList => "api list",
+        }
+    }
+}
+
+fn process_error_diagnostic(
+    operation: RexCliOperation,
+    error: crate::process::ProcessError,
+) -> RexError {
+    use crate::process::ProcessError;
+
+    let failure = match error {
+        ProcessError::Start(error) => format!(
+            "spawn failed (kind={:?}, os_code={:?})",
+            error.kind(),
+            error.raw_os_error()
+        ),
+        ProcessError::Io(error) => format!(
+            "process I/O failed (kind={:?}, os_code={:?})",
+            error.kind(),
+            error.raw_os_error()
+        ),
+        ProcessError::Inspection(_) => "process inspection failed".into(),
+        ProcessError::CleanupUnconfirmed => "process cleanup is unconfirmed".into(),
+        ProcessError::Invalid(_) => "invalid process request".into(),
+    };
+    RexError::ProcessDiagnostic(format!("{} {failure}", operation.label()))
+}
+
+fn process_output_diagnostic(
+    operation: RexCliOperation,
+    output: &crate::process::ProcessOutput,
+) -> RexError {
+    let exit_code = output
+        .status
+        .as_ref()
+        .and_then(std::process::ExitStatus::code);
+    let exit_signal = output.status.as_ref().and_then(process_exit_signal);
+    RexError::ProcessDiagnostic(format!(
+        "{} process result rejected (timed_out={}, cleanup_confirmed={}, exit_code={exit_code:?}, exit_signal={exit_signal:?}, stdout_truncated={})",
+        operation.label(),
+        output.timed_out,
+        output.cleanup_confirmed,
+        output.stdout_truncated,
+    ))
+}
+
+#[cfg(unix)]
+fn process_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn process_exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 fn raw_cli(
     executable: &Path,
     endpoint: &str,
     environment: &BTreeMap<OsString, OsString>,
     timeout: Duration,
     shutdown_grace: Duration,
+    operation: RexCliOperation,
     args: &[&str],
 ) -> Result<crate::process::ProcessOutput, RexError> {
     let mut full = vec![
@@ -1615,13 +1688,13 @@ fn raw_cli(
         stdout_limit: 4 * 1024 * 1024,
         stderr_tail_limit: 64 * 1024,
     })
-    .map_err(|_| RexError::Process)?;
+    .map_err(|error| process_error_diagnostic(operation, error))?;
     if result.timed_out
         || !result.cleanup_confirmed
         || !result.status.is_some_and(|status| status.success())
         || result.stdout_truncated
     {
-        return Err(RexError::Process);
+        return Err(process_output_diagnostic(operation, &result));
     }
     Ok(result)
 }
@@ -2006,6 +2079,91 @@ mod tests {
             RexIdentity::discover(&script, &[], &environment, Some("unix:///tmp/other.sock"))
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_reports_bounded_api_list_failure_without_process_output_or_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = "unix:///tmp/endpoint-secret-marker.sock";
+        let script = dir.path().join("rex failure fixture");
+        let whoami = serde_json::json!({
+            "endpoint": endpoint,
+            "instance_id": "instance-1",
+            "host_id": "host-1",
+            "rex_version": "1.2.3"
+        });
+        let body = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{}' ;;\n  *\"api list --json\"*) printf '%s\\n' 'stderr-secret-marker' >&2; exit 23 ;;\n  *) exit 3 ;;\nesac\n",
+            whoami
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = BTreeMap::from([(
+            OsString::from("REX_TEST_SECRET"),
+            OsString::from("environment-secret-marker"),
+        )]);
+
+        let error = match RexCliTransport::connect(
+            &script,
+            &[],
+            endpoint.into(),
+            "instance-1".into(),
+            "session-1".into(),
+            environment,
+        ) {
+            Ok(_) => panic!("connect unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        for rendered in [display.as_str(), debug.as_str()] {
+            assert!(rendered.contains("api list"));
+            assert!(rendered.contains("exit_code=Some(23)"));
+            assert!(!rendered.contains("endpoint-secret-marker"));
+            assert!(!rendered.contains("stderr-secret-marker"));
+            assert!(!rendered.contains("environment-secret-marker"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_reports_bounded_spawn_failure_without_executable_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rex spawn-secret-marker");
+        std::fs::write(
+            &script,
+            "#!/rex-projects-missing-interpreter-secret-marker\nprintf '%s\\n' '{}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = match RexCliTransport::connect(
+            &script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "instance-1".into(),
+            "session-1".into(),
+            BTreeMap::new(),
+        ) {
+            Ok(_) => panic!("connect unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        for rendered in [display.as_str(), debug.as_str()] {
+            assert!(rendered.contains("whoami"));
+            assert!(rendered.contains("spawn failed"));
+            assert!(rendered.contains("NotFound"));
+            assert!(!rendered.contains("spawn-secret-marker"));
+            assert!(!rendered.contains("missing-interpreter-secret-marker"));
+        }
     }
 
     #[cfg(unix)]

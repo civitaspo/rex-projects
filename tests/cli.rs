@@ -582,6 +582,142 @@ fn agent_artifact_add_uses_limits_registered_for_its_run() {
 }
 
 #[test]
+#[ignore = "subprocess fixture for provider status CLI integration"]
+fn provider_status_state_fixture() {
+    use rex_projects::config;
+    use rex_projects::domain::ids::{Digest, ProfileId, ProjectId};
+    use rex_projects::domain::types::Role;
+    use rex_projects::store::provider_qualification_runtime::{
+        ProviderQualificationJobStatus, ProviderQualificationRequest, QualificationClaim,
+    };
+    use rex_projects::store::{ConfigStore, ExpectedRevision, OwnerMetadata};
+
+    let config_path = std::path::PathBuf::from(
+        std::env::var_os("REX_PROJECTS_TEST_CONFIG_PATH").expect("fixture config path is set"),
+    );
+    let state_root = std::path::PathBuf::from(
+        std::env::var_os("REX_PROJECTS_TEST_STATE_ROOT").expect("fixture state path is set"),
+    );
+    let applied = config::load(&config_path).unwrap();
+    let mut store = ConfigStore::open(&state_root).unwrap();
+    let revision = store
+        .apply_snapshot(
+            &config_path.canonicalize().unwrap().display().to_string(),
+            &applied,
+            ExpectedRevision::Bootstrap,
+        )
+        .unwrap()
+        .revision;
+    let generation = store
+        .start_owner(&OwnerMetadata {
+            owner_nonce: "provider-status-integration".into(),
+            state_root: state_root.display().to_string(),
+            config_source: config_path.canonicalize().unwrap().display().to_string(),
+            process_start_identity: "integration-test-process".into(),
+            executable_path: std::env::current_exe().unwrap().display().to_string(),
+            executable_digest: "a".repeat(64),
+            rex_endpoint: None,
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        })
+        .unwrap();
+    let request_id = "provider-status-terminal-failure";
+    let request = ProviderQualificationRequest {
+        request_id: request_id.into(),
+        project_id: ProjectId::parse("goal_project").unwrap(),
+        role: Role::Coordinator,
+        profile_id: ProfileId::parse("judgment_claude").unwrap(),
+        profile_digest: Digest::parse("b".repeat(64)).unwrap(),
+        config_revision: revision.0,
+        config_digest: applied.digest,
+    };
+    store
+        .enqueue_provider_qualification(generation, &request)
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_provider_qualification(generation, 1, 1)
+            .unwrap(),
+        QualificationClaim::Claimed { .. }
+    ));
+    store
+        .fail_provider_qualification_before_launch(generation, request_id, "fixture_failure")
+        .unwrap();
+    assert_eq!(
+        store
+            .provider_qualification_job(request_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ProviderQualificationJobStatus::Failed
+    );
+}
+
+#[test]
+fn provider_status_json_reports_terminal_failure_and_actual_released_slot() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+    let state_root = temp.path().join("state");
+    let xdg_state_home = temp.path().join("xdg-state");
+    let setup = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "provider_status_state_fixture"])
+        .env("REX_PROJECTS_TEST_CONFIG_PATH", &config_path)
+        .env("REX_PROJECTS_TEST_STATE_ROOT", &state_root)
+        .env("XDG_STATE_HOME", &xdg_state_home)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "could not prepare terminal-state fixture: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let request_id = "provider-status-terminal-failure";
+    let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .args(["--config"])
+        .arg(&config_path)
+        .args(["--state-root"])
+        .arg(&state_root)
+        .args(["--json", "provider", "status", "--request-id", request_id])
+        .env_remove("REX_PROJECTS_AGENT")
+        .env_remove("REX_PROJECTS_CONTEXT")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "provider status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "failed");
+    assert!(report["hold_reason"].is_null());
+    assert!(
+        report["next_safe_action"]
+            .as_str()
+            .unwrap()
+            .contains("terminal")
+    );
+    assert_eq!(report["execution_slot"]["disposition"], "released");
+
+    let text_output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
+        .args(["--config"])
+        .arg(&config_path)
+        .args(["--state-root"])
+        .arg(&state_root)
+        .args(["provider", "status", "--request-id", request_id])
+        .env_remove("REX_PROJECTS_AGENT")
+        .env_remove("REX_PROJECTS_CONTEXT")
+        .output()
+        .unwrap();
+    assert!(text_output.status.success());
+    let text_output = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text_output.contains("Execution slot:"));
+    assert!(!text_output.contains("Held slot:"));
+}
+
+#[test]
 #[ignore = "subprocess fixture invoked by the bounded stderr test"]
 fn stderr_exit_fixture() {
     use std::io::Write;

@@ -28,6 +28,9 @@ type ProviderQualificationJobRow = (
     Option<String>,
     i64,
     i64,
+    String,
+    Option<String>,
+    Option<u64>,
 );
 
 /// Exact applied-config identity requested by a human. The CLI cannot select an
@@ -55,7 +58,7 @@ pub enum ProviderQualificationJobStatus {
 }
 
 impl ProviderQualificationJobStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
@@ -78,8 +81,41 @@ pub struct ProviderQualificationJob {
     pub rex_block_id: Option<String>,
     pub result_json: Option<String>,
     pub evidence_digest: Option<Digest>,
+    pub launch_phase: ProviderQualificationLaunchPhase,
+    pub environment_snapshot_id: Option<Digest>,
+    pub reconcile_requested_generation: Option<u64>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderQualificationLaunchPhase {
+    LegacyUnknown,
+    NotStarted,
+    Prepared,
+    CreateAttempted,
+    Bound,
+}
+
+impl ProviderQualificationLaunchPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyUnknown => "legacy_unknown",
+            Self::NotStarted => "not_started",
+            Self::Prepared => "prepared",
+            Self::CreateAttempted => "create_attempted",
+            Self::Bound => "bound",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderQualificationSlot {
+    pub slot_index: u32,
+    pub reservation_epoch: u64,
+    pub controller_generation: u64,
+    pub disposition: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +167,265 @@ impl ProviderQualificationRequest {
 }
 
 impl ConfigStore {
+    pub fn queue_provider_qualification_reconcile(
+        &mut self,
+        owner_generation: u64,
+        request_id: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let job =
+            read_job(&tx, request_id)?.ok_or("provider qualification request does not exist")?;
+        if job.status != ProviderQualificationJobStatus::Unknown
+            || job.controller_generation != owner_generation
+        {
+            return Err("provider qualification request is not an unknown request owned by the live controller".into());
+        }
+        let slot = read_provider_qualification_slot(&tx, request_id)?
+            .ok_or("provider qualification execution slot is missing")?;
+        if slot.controller_generation != owner_generation || slot.disposition != "unknown" {
+            return Err("provider qualification execution slot is not held as unknown by the live controller".into());
+        }
+        let current_project: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [job.request.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if current_project
+            != Some((
+                job.request.config_revision,
+                job.request.config_digest.to_string(),
+            ))
+        {
+            return Err(
+                "provider qualification request does not match the current project config".into(),
+            );
+        }
+        let changed = tx.execute(
+            "UPDATE provider_qualification_jobs SET reconcile_requested_generation=?2,updated_at_unix=?3 WHERE request_id=?1 AND status='unknown' AND controller_generation=?2 AND request_digest=?4",
+            params![request_id, owner_generation, now_unix()?, job.request_digest.as_str()],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("provider qualification changed while queuing reconciliation".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn provider_qualification_slot(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ProviderQualificationSlot>, String> {
+        read_provider_qualification_slot(&self.connection, request_id)
+    }
+
+    pub fn pending_provider_qualification_reconciles(
+        &self,
+        owner_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<ProviderQualificationJob>, String> {
+        if limit == 0 || limit > MAX_PROVIDER_QUALIFICATION_JOBS {
+            return Err("provider qualification reconcile limit is invalid".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT request_id FROM provider_qualification_jobs WHERE status='unknown' AND controller_generation=?1 AND reconcile_requested_generation=?1 ORDER BY created_at_unix,request_id LIMIT ?2",
+        ).map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map(params![owner_generation, limit as u64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids.into_iter()
+            .map(|id| {
+                read_job(&self.connection, &id)?
+                    .ok_or_else(|| "provider qualification request disappeared".to_owned())
+            })
+            .collect()
+    }
+
+    pub fn acknowledge_provider_qualification_reconcile(
+        &mut self,
+        owner_generation: u64,
+        request_id: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let job =
+            read_job(&tx, request_id)?.ok_or("provider qualification request does not exist")?;
+        if job.controller_generation != owner_generation
+            || job.reconcile_requested_generation != Some(owner_generation)
+            || !matches!(
+                job.status,
+                ProviderQualificationJobStatus::Unknown | ProviderQualificationJobStatus::Running
+            )
+        {
+            return Err(
+                "provider qualification reconciliation request is no longer pending".into(),
+            );
+        }
+        let slot = read_provider_qualification_slot(&tx, request_id)?
+            .ok_or("provider qualification execution slot is missing")?;
+        let expected_disposition = match job.status {
+            ProviderQualificationJobStatus::Unknown => "unknown",
+            ProviderQualificationJobStatus::Running => "launch_pending",
+            _ => unreachable!("status was checked above"),
+        };
+        if slot.controller_generation != owner_generation
+            || slot.disposition != expected_disposition
+        {
+            return Err(
+                "provider qualification execution slot changed during reconciliation".into(),
+            );
+        }
+        let changed = tx.execute(
+            "UPDATE provider_qualification_jobs SET reconcile_requested_generation=NULL,updated_at_unix=?3 WHERE request_id=?1 AND controller_generation=?2 AND reconcile_requested_generation=?2 AND status IN ('unknown','running')",
+            params![request_id, owner_generation, now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(
+                "provider qualification reconciliation request is no longer pending".into(),
+            );
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn claim_provider_qualification_recovery(
+        &mut self,
+        owner_generation: u64,
+        request_id: &str,
+    ) -> Result<ProviderQualificationJob, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let job =
+            read_job(&tx, request_id)?.ok_or("provider qualification request does not exist")?;
+        if job.status != ProviderQualificationJobStatus::Unknown
+            || job.controller_generation != owner_generation
+            || !matches!(
+                job.launch_phase,
+                ProviderQualificationLaunchPhase::NotStarted
+                    | ProviderQualificationLaunchPhase::Prepared
+            )
+            || job.reconcile_requested_generation != Some(owner_generation)
+        {
+            return Err(
+                "provider qualification request is not eligible for safe pre-create recovery"
+                    .into(),
+            );
+        }
+        let project: Option<(u64, String)> = tx
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [job.request.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if project
+            != Some((
+                job.request.config_revision,
+                job.request.config_digest.to_string(),
+            ))
+        {
+            return Err("provider qualification config changed before retry".into());
+        }
+        let slot = read_provider_qualification_slot(&tx, request_id)?
+            .ok_or("provider qualification execution slot is missing")?;
+        if slot.controller_generation != owner_generation || slot.disposition != "unknown" {
+            return Err("provider qualification execution slot changed before retry".into());
+        }
+        let updated_slot = tx.execute(
+            "UPDATE execution_slots SET disposition='launch_pending' WHERE pool='agent' AND slot_index=?1 AND owner_kind='provider_qualification' AND owner_id=?2 AND project_id=?3 AND reservation_epoch=?4 AND controller_generation=?5 AND disposition='unknown'",
+            params![slot.slot_index, request_id, job.request.project_id.as_str(), slot.reservation_epoch, owner_generation],
+        ).map_err(|error| error.to_string())?;
+        if updated_slot != 1 {
+            return Err("provider qualification execution slot changed concurrently".into());
+        }
+        let updated_job = tx.execute(
+            "UPDATE provider_qualification_jobs SET status='running',reconcile_requested_generation=NULL,updated_at_unix=?3 WHERE request_id=?1 AND controller_generation=?2 AND status='unknown' AND request_digest=?4",
+            params![request_id, owner_generation, now_unix()?, job.request_digest.as_str()],
+        ).map_err(|error| error.to_string())?;
+        if updated_job != 1 {
+            return Err("provider qualification request changed concurrently".into());
+        }
+        let recovered =
+            read_job(&tx, request_id)?.ok_or("provider qualification request disappeared")?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(recovered)
+    }
+
+    pub fn mark_provider_qualification_prepared(
+        &mut self,
+        owner_generation: u64,
+        request_id: &str,
+        environment_snapshot_id: &Digest,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let slot = read_provider_qualification_slot(&tx, request_id)?
+            .ok_or("provider qualification execution slot is missing")?;
+        if slot.controller_generation != owner_generation || slot.disposition != "launch_pending" {
+            return Err("provider qualification execution slot is not launch-pending".into());
+        }
+        let changed = tx.execute(
+            "UPDATE provider_qualification_jobs SET launch_phase='prepared',environment_snapshot_id=?3,updated_at_unix=?4 WHERE request_id=?1 AND controller_generation=?2 AND status='running' AND launch_phase='not_started' AND environment_snapshot_id IS NULL",
+            params![request_id, owner_generation, environment_snapshot_id.as_str(), now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("provider qualification could not record prepared launch inputs".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn mark_provider_qualification_create_attempted(
+        &mut self,
+        owner_generation: u64,
+        request_id: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let job =
+            read_job(&tx, request_id)?.ok_or("provider qualification request does not exist")?;
+        if job.request_digest != request_digest(&job.request)?
+            || job.controller_generation != owner_generation
+            || job.status != ProviderQualificationJobStatus::Running
+        {
+            return Err(
+                "provider qualification identity changed before the Rex create boundary".into(),
+            );
+        }
+        let slot = read_provider_qualification_slot(&tx, request_id)?
+            .ok_or("provider qualification execution slot is missing")?;
+        if slot.controller_generation != owner_generation || slot.disposition != "launch_pending" {
+            return Err("provider qualification execution slot is not launch-pending".into());
+        }
+        let changed = tx.execute(
+            "UPDATE provider_qualification_jobs SET launch_phase='create_attempted',updated_at_unix=?3 WHERE request_id=?1 AND controller_generation=?2 AND status='running' AND launch_phase='prepared' AND environment_snapshot_id IS NOT NULL",
+            params![request_id, owner_generation, now_unix()?],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("provider qualification launch is not prepared for Rex".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
     /// Terminally fail a claimed job only when its deterministic local preflight
     /// failed before any Rex session was created. The slot release and job
     /// receipt are one fenced transaction.
@@ -221,7 +516,7 @@ impl ConfigStore {
         }
         let now = now_unix()?;
         tx.execute(
-            "INSERT INTO provider_qualification_jobs(request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,?10,?10) ON CONFLICT(request_id) DO NOTHING",
+            "INSERT INTO provider_qualification_jobs(request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,launch_phase,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,'not_started',?10,?10) ON CONFLICT(request_id) DO NOTHING",
             params![request.request_id, request.project_id.as_str(), serde_json::to_value(request.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(), request.profile_id.as_str(), request.profile_digest.as_str(), request.config_revision, request.config_digest.as_str(), digest.as_str(), owner_generation, now],
         )
         .map_err(|error| error.to_string())?;
@@ -402,7 +697,7 @@ impl ConfigStore {
         } else {
             let changed = tx
                 .execute(
-                    "UPDATE provider_qualification_jobs SET rex_session_id=?3,rex_window_id=?4,rex_block_id=?5,updated_at_unix=?6 WHERE request_id=?1 AND controller_generation=?2 AND status IN ('running','unknown') AND rex_session_id IS NULL AND rex_window_id IS NULL AND rex_block_id IS NULL",
+                    "UPDATE provider_qualification_jobs SET rex_session_id=?3,rex_window_id=?4,rex_block_id=?5,launch_phase=CASE WHEN launch_phase='create_attempted' THEN 'bound' ELSE launch_phase END,updated_at_unix=?6 WHERE request_id=?1 AND controller_generation=?2 AND status IN ('running','unknown') AND rex_session_id IS NULL AND rex_window_id IS NULL AND rex_block_id IS NULL",
                     params![request_id, owner_generation, session_id, window_id, block_id, now_unix()?],
                 )
                 .map_err(|error| error.to_string())?;
@@ -562,9 +857,9 @@ fn read_job(
     request_id: &str,
 ) -> Result<Option<ProviderQualificationJob>, String> {
     let row: Option<ProviderQualificationJobRow> = connection.query_row(
-        "SELECT request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,rex_session_id,rex_window_id,rex_block_id,result_json,evidence_digest,created_at_unix,updated_at_unix FROM provider_qualification_jobs WHERE request_id=?1",
+        "SELECT request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,rex_session_id,rex_window_id,rex_block_id,result_json,evidence_digest,created_at_unix,updated_at_unix,launch_phase,environment_snapshot_id,reconcile_requested_generation FROM provider_qualification_jobs WHERE request_id=?1",
         [request_id],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?,row.get(17)?,row.get(18)?,row.get(19)?)),
     ).optional().map_err(|error| error.to_string())?;
     row.map(
         |(
@@ -585,6 +880,9 @@ fn read_job(
             evidence,
             created,
             updated,
+            launch_phase,
+            environment_snapshot_id,
+            reconcile_requested_generation,
         )| {
             let request = ProviderQualificationRequest {
                 request_id,
@@ -619,10 +917,58 @@ fn read_job(
                 rex_block_id: block,
                 result_json: result,
                 evidence_digest: evidence.map(Digest::parse).transpose()?,
+                launch_phase: match launch_phase.as_str() {
+                    "legacy_unknown" => ProviderQualificationLaunchPhase::LegacyUnknown,
+                    "not_started" => ProviderQualificationLaunchPhase::NotStarted,
+                    "prepared" => ProviderQualificationLaunchPhase::Prepared,
+                    "create_attempted" => ProviderQualificationLaunchPhase::CreateAttempted,
+                    "bound" => ProviderQualificationLaunchPhase::Bound,
+                    _ => {
+                        return Err("provider qualification job has an unknown launch phase".into());
+                    }
+                },
+                environment_snapshot_id: environment_snapshot_id.map(Digest::parse).transpose()?,
+                reconcile_requested_generation,
                 created_at_unix: created,
                 updated_at_unix: updated,
             })
         },
     )
     .transpose()
+}
+
+fn read_provider_qualification_slot(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<Option<ProviderQualificationSlot>, String> {
+    let mut statement = connection
+        .prepare("SELECT pool,slot_index,reservation_epoch,controller_generation,disposition FROM execution_slots WHERE owner_kind='provider_qualification' AND owner_id=?1 ORDER BY pool,slot_index")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([request_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [(pool, slot_index, reservation_epoch, controller_generation, disposition)]
+            if pool == "agent" && *reservation_epoch > 0 =>
+        {
+            Ok(Some(ProviderQualificationSlot {
+                slot_index: *slot_index,
+                reservation_epoch: *reservation_epoch,
+                controller_generation: *controller_generation,
+                disposition: disposition.clone(),
+            }))
+        }
+        _ => Err("provider qualification execution slot owner is ambiguous or invalid".into()),
+    }
 }

@@ -313,7 +313,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 12..=16) {
+    if !matches!(version, 12..=17) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -335,6 +335,9 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
             .map_err(|error| error.to_string())?;
         crate::store::ConfigStore::migrate_v14_process_evidence(&tx)?;
         tx.commit().map_err(|error| error.to_string())?;
+    }
+    if version >= 17 {
+        crate::store::provider_qualification_recovery::apply_v17_layout(&canonical)?;
     }
     for table in V12_TABLES {
         let actual = read_table_layout(connection, table)?;
@@ -419,7 +422,7 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 13..=16) {
+    if !matches!(version, 13..=17) {
         return Err(format!(
             "Agent block lifecycle schema version mismatch: {version}"
         ));
@@ -496,7 +499,7 @@ pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 14..=16) {
+    if !matches!(version, 14..=17) {
         return Err(format!(
             "process evidence schema version mismatch: {version}"
         ));
@@ -557,7 +560,7 @@ pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
 
 /// Build the expected v12 layout by replaying the same migration helpers into an isolated
 /// in-memory database. This keeps startup validation tied to the DDL that creates the schema.
-fn canonical_v12_schema() -> Result<Connection, String> {
+pub(super) fn canonical_v12_schema() -> Result<Connection, String> {
     let mut canonical = Connection::open_in_memory().map_err(|error| error.to_string())?;
     canonical
         .execute_batch(
@@ -1656,6 +1659,17 @@ mod tests {
 
         let database = state_root.join("state.sqlite3");
         let canonical = super::canonical_v12_schema().unwrap();
+        let provider_layout = canonical
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                 WHERE tbl_name='provider_qualification_jobs' AND sql IS NOT NULL
+                 ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let adoption_sql: String = canonical
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_run_adoptions'",
@@ -1697,6 +1711,17 @@ mod tests {
                 .unwrap()
         });
         let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_qualification_jobs",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0,
+            "this historical fixture rebuilds an empty qualification job table"
+        );
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=OFF;
@@ -1711,11 +1736,15 @@ mod tests {
                  DROP TABLE agent_terminal_receipts;
                  DROP TABLE merge_observation_deferrals;
                  DROP TABLE merge_claim_recovery_requests;
+                 DROP TABLE provider_qualification_jobs;
                  DELETE FROM schema_migrations WHERE version>=14;
                  PRAGMA user_version=13;
                  ",
             )
             .unwrap();
+        for statement in provider_layout {
+            connection.execute_batch(&statement).unwrap();
+        }
         connection.execute_batch(&adoption_sql).unwrap();
         connection
             .execute_batch(
