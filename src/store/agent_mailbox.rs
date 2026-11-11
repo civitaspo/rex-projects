@@ -823,6 +823,44 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    fn terminal_commit_request(run_id: &str, request_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            operation_id: None,
+            method: crate::protocol::MethodName::new("repository.commit").unwrap(),
+            project_id: None,
+            run_id: Some(run_id.into()),
+            attempt: None,
+            run_epoch: None,
+            expected_subject_revision: None,
+            role: None,
+            request_type: None,
+            params: serde_json::json!({"message_id": request_id}),
+        })
+        .unwrap()
+    }
+
+    fn terminal_commit_rejection(
+        request_id: &str,
+        message: &str,
+    ) -> ValidatedTerminalCommitResponse {
+        let response = crate::protocol::ResponseEnvelope::<serde_json::Value> {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            result: None,
+            error: Some(crate::protocol::ProtocolError {
+                code: crate::protocol::ErrorCode::Unavailable,
+                message: message.into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: Default::default(),
+            }),
+            extensions: Default::default(),
+        };
+        ValidatedTerminalCommitResponse::new(serde_json::to_vec(&response).unwrap())
+    }
+
     #[test]
     fn terminal_commit_replay_requires_a_persisted_typed_rejection_receipt() {
         let receipt = serde_json::json!({
@@ -937,6 +975,152 @@ mod tests {
                     Sha256::digest(request_id.as_bytes())
                 ))
                 .exists()
+        );
+    }
+
+    #[test]
+    fn terminal_commit_replay_refuses_other_entry_or_descriptor_changes() {
+        for mutate_descriptor in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let run_id = "terminal-replay-inventory-binding";
+            let mailbox_path = temp.path().join("mailbox");
+            let mailbox = MailboxCapability::create(
+                run_id,
+                &mailbox_path,
+                crate::mailbox::unix_time_now().unwrap() + 60,
+                crate::mailbox::MailboxLimits::default(),
+            )
+            .unwrap();
+            let request_id = "registered-commit-request";
+            mailbox
+                .queue(
+                    request_id,
+                    &terminal_commit_request(run_id, request_id),
+                    crate::mailbox::unix_time_now().unwrap(),
+                )
+                .unwrap();
+            let replay = match mailbox.inspect_terminal_commit_replay(false) {
+                TerminalCommitReplayInspection::Ready(replay) => replay,
+                _ => panic!("expected one inspected repository.commit request"),
+            };
+            let proof = terminal_commit_rejection(request_id, "validated terminal rejection");
+            if mutate_descriptor {
+                let descriptor = std::fs::read(mailbox_path.join("descriptor.json")).unwrap();
+                let changed = format!("{}\n", String::from_utf8(descriptor).unwrap());
+                std::fs::write(mailbox_path.join("descriptor.json"), changed).unwrap();
+            } else {
+                mailbox
+                    .queue(
+                        "other-request",
+                        &serde_json::to_vec(&crate::protocol::RequestEnvelope {
+                            schema_version: crate::protocol::SCHEMA_VERSION,
+                            request_id: crate::protocol::RequestId::new("other-request").unwrap(),
+                            operation_id: None,
+                            method: crate::protocol::MethodName::new("agent.submit").unwrap(),
+                            project_id: None,
+                            run_id: Some(run_id.into()),
+                            attempt: None,
+                            run_epoch: None,
+                            expected_subject_revision: None,
+                            role: None,
+                            request_type: None,
+                            params: serde_json::json!({}),
+                        })
+                        .unwrap(),
+                        crate::mailbox::unix_time_now().unwrap(),
+                    )
+                    .unwrap();
+            }
+
+            assert!(
+                replay
+                    .publish_response(&proof)
+                    .unwrap_err()
+                    .contains("inventory changed before response publication")
+            );
+            assert!(
+                !mailbox_path
+                    .join(format!(
+                        "receipt-{:x}.json",
+                        Sha256::digest(request_id.as_bytes())
+                    ))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_commit_replay_revalidates_complete_history_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_id = "terminal-replay-complete-history";
+        let mailbox = MailboxCapability::create(
+            run_id,
+            &temp.path().join("mailbox"),
+            crate::mailbox::unix_time_now().unwrap() + 60,
+            crate::mailbox::MailboxLimits::default(),
+        )
+        .unwrap();
+        for index in 0..8 {
+            let request_id = format!("history-{index}");
+            let request = serde_json::to_vec(&crate::protocol::RequestEnvelope {
+                schema_version: crate::protocol::SCHEMA_VERSION,
+                request_id: crate::protocol::RequestId::new(&request_id).unwrap(),
+                operation_id: None,
+                method: crate::protocol::MethodName::new("agent.submit").unwrap(),
+                project_id: None,
+                run_id: Some(run_id.into()),
+                attempt: None,
+                run_epoch: None,
+                expected_subject_revision: None,
+                role: None,
+                request_type: None,
+                params: serde_json::json!({"value": "x".repeat(32 * 1024)}),
+            })
+            .unwrap();
+            mailbox
+                .queue(
+                    &request_id,
+                    &request,
+                    crate::mailbox::unix_time_now().unwrap(),
+                )
+                .unwrap();
+            let receipt = crate::protocol::ResponseEnvelope::<serde_json::Value> {
+                schema_version: crate::protocol::SCHEMA_VERSION,
+                request_id: crate::protocol::RequestId::new(&request_id).unwrap(),
+                result: Some(serde_json::json!({"accepted": true})),
+                error: None,
+                extensions: Default::default(),
+            };
+            mailbox
+                .publish_receipt(
+                    &request_id,
+                    &serde_json::to_vec(&receipt).unwrap(),
+                    crate::mailbox::unix_time_now().unwrap(),
+                )
+                .unwrap();
+        }
+        let request_id = "registered-commit-request";
+        mailbox
+            .queue(
+                request_id,
+                &terminal_commit_request(run_id, request_id),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let replay = match mailbox.inspect_terminal_commit_replay(false) {
+            TerminalCommitReplayInspection::Ready(replay) => replay,
+            _ => panic!("complete history plus one commit request must be replayable"),
+        };
+        let proof = terminal_commit_rejection(request_id, "validated terminal rejection");
+        replay.publish_response(&proof).unwrap();
+        replay.publish_response(&proof).unwrap();
+
+        let conflicting = terminal_commit_rejection(request_id, "different terminal rejection");
+        assert!(
+            replay
+                .publish_response(&conflicting)
+                .unwrap_err()
+                .contains("response conflicts with an existing receipt")
         );
     }
 
