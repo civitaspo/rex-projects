@@ -3112,7 +3112,7 @@ fn load_stored_receipt(
     })
 }
 
-fn load_qualification(
+pub(super) fn load_qualification(
     connection: &rusqlite::Connection,
     authority: &AgentLaunchAuthority,
 ) -> Result<ProviderQualification, String> {
@@ -6690,9 +6690,17 @@ pub(crate) mod tests {
             "receipt-{:x}.json",
             Sha256::digest(invalid_request_id.as_bytes())
         ));
+        let accepted_rejection_bytes = std::fs::read(&invalid_receipt_path).unwrap();
         std::fs::remove_file(&invalid_receipt_path).unwrap();
         let expired_mailbox_time =
             i64::try_from(stored_reservation.mailbox_expires_at_unix + 1).unwrap();
+        let changed_adapter_profiles = BTreeMap::from([(
+            prior_authority.profile_id.clone(),
+            serde_json::from_value(serde_json::json!({
+                "adapter":"claude_code", "command":["fixture"], "commit_mode":"host"
+            }))
+            .unwrap(),
+        )]);
         assert!(
             worker
                 .store
@@ -6701,7 +6709,7 @@ pub(crate) mod tests {
                     worker_id.as_str(),
                     expired_mailbox_time,
                     &worker.artifacts,
-                    &profiles,
+                    &changed_adapter_profiles,
                 )
                 .unwrap()
         );
@@ -6713,6 +6721,10 @@ pub(crate) mod tests {
                     .unwrap(),
             )
             .unwrap();
+        assert_eq!(
+            std::fs::read(&invalid_receipt_path).unwrap(),
+            accepted_rejection_bytes
+        );
         assert_eq!(replayed_rejection.request_id.as_str(), invalid_request_id);
         assert!(!replayed_rejection.error.unwrap().retryable);
         assert!(
@@ -7231,7 +7243,7 @@ pub(crate) mod tests {
             worker_id.as_str(),
             i64::try_from(stored_reservation.mailbox_expires_at_unix + 1).unwrap(),
             &worker.artifacts,
-            &profiles,
+            &BTreeMap::new(),
         );
         assert!(replay_result.unwrap());
         let receipt_bytes = mailbox

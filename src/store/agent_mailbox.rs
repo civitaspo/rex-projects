@@ -335,10 +335,15 @@ impl crate::store::ConfigStore {
             request
                 .validate()
                 .map_err(AgentMailboxProcessingError::LocalMailbox)?;
-            let profile = profiles
-                .get(&authority.profile_id)
-                .ok_or("repository.commit Agent profile is no longer configured")?;
-            let required_trailer = match profile.adapter {
+            let adapter = if mode == MailboxDispatchMode::TerminalReceiptReplay {
+                super::agent_results::load_qualification(&self.connection, &authority)?.adapter
+            } else {
+                profiles
+                    .get(&authority.profile_id)
+                    .ok_or("repository.commit Agent profile is no longer configured")?
+                    .adapter
+            };
+            let required_trailer = match adapter {
                 crate::domain::types::AgentAdapter::Codex => {
                     "Co-authored-by: Codex <noreply@openai.com>"
                 }
