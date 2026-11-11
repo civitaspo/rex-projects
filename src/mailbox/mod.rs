@@ -9,6 +9,40 @@ use sha2::{Digest as _, Sha256};
 
 use crate::protocol::{RequestEnvelope, RequestId, ResponseEnvelope, parse_unique};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailboxDrainReason {
+    Unreadable,
+    Malformed,
+    IdentityMismatch,
+    MissingPair,
+    UnexpectedEntry,
+    LimitExceeded,
+}
+
+impl MailboxDrainReason {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable_entry",
+            Self::Malformed => "malformed_entry",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::MissingPair => "missing_pair",
+            Self::UnexpectedEntry => "unexpected_entry",
+            Self::LimitExceeded => "inventory_limit_exceeded",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MailboxDrainInspection {
+    Drained {
+        fingerprint: crate::domain::ids::Digest,
+    },
+    Unresolved {
+        fingerprint: crate::domain::ids::Digest,
+        reason: MailboxDrainReason,
+    },
+}
+
 const REQUEST_PREFIX: &str = "request-";
 const RECEIPT_PREFIX: &str = "receipt-";
 const MAX_ID_BYTES: usize = 255;
@@ -367,6 +401,136 @@ impl MailboxCapability {
         Ok(requests)
     }
 
+    /// Inspect whether this pinned mailbox contains only complete, matching request/response
+    /// pairs. This is read-only and deliberately does not grant any post-expiry processing
+    /// authority; callers must verify the run's terminal receipt before using it.
+    pub(crate) fn inspect_drain(&self) -> MailboxDrainInspection {
+        use MailboxDrainInspection::{Drained, Unresolved};
+
+        let entry_limit = self
+            .limits
+            .max_pending_requests
+            .saturating_mul(2)
+            .saturating_add(2);
+        let (names, exceeded) = match self.directory_file_names_bounded(entry_limit) {
+            Ok(result) => result,
+            Err(_) => {
+                return self.unresolved_inventory(
+                    MailboxDrainReason::Unreadable,
+                    &[("directory".to_owned(), "unreadable".to_owned())],
+                );
+            }
+        };
+        let mut inventory = Vec::with_capacity(names.len());
+        let mut requests = std::collections::BTreeMap::<String, String>::new();
+        let mut receipts = std::collections::BTreeMap::<String, String>::new();
+        let mut reason = exceeded.then_some(MailboxDrainReason::LimitExceeded);
+
+        for file_name in names {
+            let Some(name) = file_name.to_str() else {
+                reason.get_or_insert(MailboxDrainReason::UnexpectedEntry);
+                inventory.push(("non_utf8_name".to_owned(), "unknown".to_owned()));
+                continue;
+            };
+            if name == "descriptor.json" {
+                match self.read_bounded(name, 4096) {
+                    Ok(bytes) => inventory.push((name.to_owned(), digest(&bytes))),
+                    Err(_) => {
+                        reason.get_or_insert(MailboxDrainReason::Unreadable);
+                        inventory.push((name.to_owned(), "unreadable".to_owned()));
+                    }
+                }
+                continue;
+            }
+            let kind = if let Some(key) = name
+                .strip_prefix(REQUEST_PREFIX)
+                .and_then(|name| name.strip_suffix(".json"))
+            {
+                Some((true, key))
+            } else {
+                name.strip_prefix(RECEIPT_PREFIX)
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .map(|key| (false, key))
+            };
+            let Some((is_request, filename_key)) = kind else {
+                reason.get_or_insert(MailboxDrainReason::UnexpectedEntry);
+                inventory.push((name.to_owned(), "unexpected".to_owned()));
+                continue;
+            };
+            let bytes = match self.read_bounded(name, self.limits.max_request_bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    reason.get_or_insert(MailboxDrainReason::Unreadable);
+                    inventory.push((name.to_owned(), "unreadable".to_owned()));
+                    continue;
+                }
+            };
+            let content_digest = digest(&bytes);
+            inventory.push((name.to_owned(), content_digest.clone()));
+            if is_request {
+                let parsed = parse_unique::<RequestEnvelope<Value>>(&bytes)
+                    .and_then(|request| {
+                        request.validate()?;
+                        if key(request.request_id.as_str()) != filename_key {
+                            return Err("request filename key differs from request id".into());
+                        }
+                        Ok(request.request_id.as_str().to_owned())
+                    });
+                match parsed {
+                    Ok(request_id) => {
+                        if requests.insert(request_id, content_digest).is_some() {
+                            reason.get_or_insert(MailboxDrainReason::IdentityMismatch);
+                        }
+                    }
+                    Err(_) => {
+                        reason.get_or_insert(MailboxDrainReason::Malformed);
+                    }
+                }
+            } else {
+                let parsed = parse_unique::<ResponseEnvelope<Value>>(&bytes).and_then(|receipt| {
+                    receipt.validate_for(&receipt.request_id)?;
+                    if key(receipt.request_id.as_str()) != filename_key {
+                        return Err("receipt filename key differs from request id".into());
+                    }
+                    Ok(receipt.request_id.as_str().to_owned())
+                });
+                match parsed {
+                    Ok(request_id) => {
+                        if receipts.insert(request_id, content_digest).is_some() {
+                            reason.get_or_insert(MailboxDrainReason::IdentityMismatch);
+                        }
+                    }
+                    Err(_) => {
+                        reason.get_or_insert(MailboxDrainReason::Malformed);
+                    }
+                }
+            }
+        }
+        if requests.keys().ne(receipts.keys()) {
+            reason.get_or_insert(MailboxDrainReason::MissingPair);
+        }
+        inventory.sort();
+        let fingerprint = inventory_fingerprint(&inventory, exceeded);
+        match reason {
+            Some(reason) => Unresolved {
+                fingerprint,
+                reason,
+            },
+            None => Drained { fingerprint },
+        }
+    }
+
+    fn unresolved_inventory(
+        &self,
+        reason: MailboxDrainReason,
+        inventory: &[(String, String)],
+    ) -> MailboxDrainInspection {
+        MailboxDrainInspection::Unresolved {
+            fingerprint: inventory_fingerprint(inventory, false),
+            reason,
+        }
+    }
+
     fn unacknowledged_request_names(&self) -> Result<Vec<String>, String> {
         let entries = self
             .directory_file_names()
@@ -444,6 +608,71 @@ impl MailboxCapability {
             return Err(std::io::Error::last_os_error());
         }
         Ok(names)
+    }
+
+    #[cfg(unix)]
+    fn directory_file_names_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<std::ffi::OsString>, bool), std::io::Error> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStringExt;
+        let duplicate = unsafe {
+            libc::openat(
+                self.directory_handle.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(duplicate) };
+            return Err(error);
+        }
+        let mut names = Vec::with_capacity(limit.min(64));
+        let mut exceeded = false;
+        loop {
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            if names.len() == limit {
+                exceeded = true;
+                break;
+            }
+            names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        names.sort();
+        Ok((names, exceeded))
+    }
+
+    #[cfg(not(unix))]
+    fn directory_file_names_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<std::ffi::OsString>, bool), std::io::Error> {
+        let mut names = Vec::with_capacity(limit.min(64));
+        let mut exceeded = false;
+        for entry in fs::read_dir(&self.directory)? {
+            if names.len() == limit {
+                exceeded = true;
+                break;
+            }
+            names.push(entry?.file_name());
+        }
+        names.sort();
+        Ok((names, exceeded))
     }
     #[cfg(not(unix))]
     fn directory_file_names(&self) -> Result<Vec<std::ffi::OsString>, std::io::Error> {
@@ -600,6 +829,13 @@ fn lock_with_timeout(file: File) -> Result<File, String> {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn inventory_fingerprint(inventory: &[(String, String)], exceeded: bool) -> crate::domain::ids::Digest {
+    let serialized = serde_json::to_vec(&(inventory, exceeded))
+        .expect("mailbox inventory fingerprint serialization is infallible");
+    crate::domain::ids::Digest::parse(digest(&serialized))
+        .expect("SHA-256 is a valid mailbox inventory digest")
 }
 
 fn key(value: &str) -> String {

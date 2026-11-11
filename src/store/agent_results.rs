@@ -7132,6 +7132,72 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
             .unwrap();
         assert_eq!(effect_count_after, effect_count_before);
+
+        let state: String = worker
+            .store
+            .connection
+            .query_row(
+                "SELECT state FROM agent_runs WHERE agent_run_id=?1",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "completed");
+        assert!(worker
+            .store
+            .agent_mailbox_registration(worker_id.as_str())
+            .unwrap()
+            .is_some());
+        let mailbox_registration = worker
+            .store
+            .agent_mailbox_registration(worker_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mailbox_registration.expires_at_unix,
+            stored_reservation.mailbox_expires_at_unix
+        );
+        assert!(mailbox
+            .pending(mailbox_registration.expires_at_unix + 1)
+            .unwrap_err()
+            .contains("expired"));
+
+        let unresolved_id = "terminal-restart-expired-unresolved";
+        let unresolved_request = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(unresolved_id).unwrap(),
+            operation_id: Some(prior_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("artifact.add").unwrap(),
+            project_id: Some(project.clone()),
+            run_id: Some(worker_id.to_string()),
+            attempt: Some(prior_authority.attempt),
+            run_epoch: Some(prior_authority.run_epoch),
+            expected_subject_revision: Some(current.revision),
+            role: Some(Role::Worker),
+            request_type: None,
+            params: serde_json::json!({}),
+        };
+        mailbox
+            .queue(
+                unresolved_id,
+                &serde_json::to_vec(&unresolved_request).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+
+        let expired_tick = worker.store.process_one_agent_mailbox_request(
+            restarted_generation,
+            worker_id.as_str(),
+            i64::try_from(mailbox_registration.expires_at_unix + 1).unwrap(),
+            &worker.artifacts,
+            &profiles,
+        );
+        eprintln!("expired mailbox handler outcome: {expired_tick:?}");
+        assert!(matches!(
+            expired_tick,
+            Err(crate::store::agent_mailbox::AgentMailboxProcessingError::LocalMailbox(ref error))
+                if error != "mailbox capability has expired"
+        ));
     }
 
     #[test]
