@@ -71,12 +71,14 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
     ) -> Result<Self, ForgeError> {
         let host = host.into();
         if !valid_host(&host) || !gh_path.is_absolute() {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "GitHub host must be a hostname and gh path must be absolute".into(),
             ));
         }
         if timeout.is_zero() || shutdown_grace.is_zero() || page_limit == 0 {
-            return Err(ForgeError("GitHub runner bounds must be positive".into()));
+            return Err(ForgeError::permanent(
+                "GitHub runner bounds must be positive".into(),
+            ));
         }
         Ok(Self {
             runner,
@@ -93,7 +95,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
 
     fn validate_target(&self, target: &RepositoryRef) -> Result<(), ForgeError> {
         if target.host != self.host {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "repository host differs from GitHub adapter host".into(),
             ));
         }
@@ -102,7 +104,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
             number: 1,
             expected_node_id: None,
         };
-        pull.validate().map_err(ForgeError)
+        pull.validate().map_err(ForgeError::permanent)
     }
 
     fn endpoint(&self, repository: &RepositoryRef, suffix: &str) -> Result<String, ForgeError> {
@@ -173,27 +175,62 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                 stdout_limit: self.stdout_limit,
                 stderr_tail_limit: self.stderr_tail_limit,
             };
-            let output = self
-                .runner
-                .run(request)
-                .map_err(|error| ForgeError(format!("gh process could not complete: {error}")))?;
+            let output = self.runner.run(request).map_err(|error| match error {
+                ProcessError::Start(source)
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    ForgeError::retryable(
+                        crate::forge::ForgeTransientFailure::ProcessUnavailable,
+                        "gh process was temporarily unavailable".into(),
+                    )
+                }
+                ProcessError::Io(source)
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::NotConnected
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    ForgeError::retryable(
+                        crate::forge::ForgeTransientFailure::ProcessUnavailable,
+                        "gh transport was temporarily unavailable".into(),
+                    )
+                }
+                error => ForgeError::permanent(format!("gh process could not complete: {error}")),
+            })?;
             if output.timed_out {
-                return Err(ForgeError(
-                    "gh request timed out; effect state is uncertain".into(),
-                ));
+                return Err(if output.cleanup_confirmed {
+                    ForgeError::retryable(
+                        crate::forge::ForgeTransientFailure::TimedOut,
+                        "gh observation timed out after process cleanup was confirmed".into(),
+                    )
+                } else {
+                    ForgeError::permanent(
+                        "gh observation timed out and process cleanup is unconfirmed".into(),
+                    )
+                });
             }
             if output.stdout_truncated || output.stderr_truncated {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "gh response exceeded the configured output limit".into(),
                 ));
             }
             if !output.status.as_ref().is_some_and(ExitStatus::success) {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "gh API request failed; remote state is unknown".into(),
                 ));
             }
             let value: Value = serde_json::from_slice(&output.stdout)
-                .map_err(|_| ForgeError("gh returned malformed JSON".into()))?;
+                .map_err(|_| ForgeError::permanent("gh returned malformed JSON".into()))?;
             let page_records = if paginate {
                 if let Some(records) = value.as_array() {
                     records.clone()
@@ -204,10 +241,10 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                         .max_by_key(|records| records.len())
                         .cloned()
                         .ok_or_else(|| {
-                            ForgeError("paginated gh response had no collection".into())
+                            ForgeError::permanent("paginated gh response had no collection".into())
                         })?
                 } else {
-                    return Err(ForgeError(
+                    return Err(ForgeError::permanent(
                         "paginated gh response was not a collection".into(),
                     ));
                 }
@@ -220,7 +257,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                 break;
             }
             if page == max_pages {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "GitHub pagination reached the configured page limit with more results possible".into(),
                 ));
             }
@@ -238,7 +275,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
             .records
             .into_iter()
             .next()
-            .ok_or_else(|| ForgeError("gh returned no response document".into()))
+            .ok_or_else(|| ForgeError::permanent("gh returned no response document".into()))
     }
 
     fn read_records(
@@ -251,10 +288,9 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         let records = if let Some(field) = collection_field {
             let mut collected = Vec::new();
             for page in response.page_documents {
-                let values = page
-                    .get(field)
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| ForgeError(format!("gh page did not contain `{field}`")))?;
+                let values = page.get(field).and_then(Value::as_array).ok_or_else(|| {
+                    ForgeError::permanent(format!("gh page did not contain `{field}`"))
+                })?;
                 collected.extend(values.iter().cloned());
             }
             collected
@@ -295,7 +331,9 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
             })
             .map(|check| {
                 check.check_suite_id.ok_or_else(|| {
-                    ForgeError("duplicate GitHub Actions check has no suite identity".into())
+                    ForgeError::permanent(
+                        "duplicate GitHub Actions check has no suite identity".into(),
+                    )
                 })
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
@@ -312,21 +350,21 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                 if string(&run, "head_sha")? != head_sha
                     || number(&run, "check_suite_id")? != suite_id
                 {
-                    return Err(ForgeError(
+                    return Err(ForgeError::permanent(
                         "GitHub Actions run did not match the requested check suite and head"
                             .into(),
                     ));
                 }
                 let workflow_id = number(&run, "workflow_id")?;
                 if workflow_id == 0 {
-                    return Err(ForgeError(
+                    return Err(ForgeError::permanent(
                         "GitHub Actions run has an invalid workflow identity".into(),
                     ));
                 }
                 workflow_ids.insert(workflow_id);
             }
             if workflow_ids.len() != 1 {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "GitHub Actions check suite has missing or ambiguous workflow lineage".into(),
                 ));
             }
@@ -342,7 +380,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                     .check_suite_id
                     .and_then(|suite| suite_workflows.get(&suite).copied());
                 if check.workflow_id.is_none() {
-                    return Err(ForgeError(
+                    return Err(ForgeError::permanent(
                         "GitHub Actions check run has unknown workflow lineage".into(),
                     ));
                 }
@@ -352,21 +390,28 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
     }
 
     fn unknown<T>(error: ForgeError) -> Observed<T> {
-        Observed::Unknown { reason: error.0 }
+        let failure = match error.kind {
+            crate::forge::ForgeFailureKind::Permanent => None,
+            crate::forge::ForgeFailureKind::Retryable(failure) => Some(failure),
+        };
+        Observed::Unknown {
+            reason: error.message,
+            failure,
+        }
     }
 
     fn observe_repository(&self, repository: &RepositoryRef) -> Observed<RepositoryIdentity> {
         let result = self.read_value(repository, "").and_then(parse_repository);
         match result {
-            Ok(value) if repository.expected_id.is_some_and(|id| id != value.id) => {
-                Self::unknown(ForgeError("repository numeric identity changed".into()))
-            }
+            Ok(value) if repository.expected_id.is_some_and(|id| id != value.id) => Self::unknown(
+                ForgeError::permanent("repository numeric identity changed".into()),
+            ),
             Ok(value)
                 if !value
                     .full_name
                     .eq_ignore_ascii_case(&format!("{}/{}", repository.owner, repository.name)) =>
             {
-                Self::unknown(ForgeError(
+                Self::unknown(ForgeError::permanent(
                     "repository full name differs from configured identity".into(),
                 ))
             }
@@ -394,7 +439,9 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                         .as_ref()
                         .is_some_and(|id| id != &value.node_id) =>
             {
-                Self::unknown(ForgeError("pull request identity changed".into()))
+                Self::unknown(ForgeError::permanent(
+                    "pull request identity changed".into(),
+                ))
             }
             Ok(value) => {
                 Self::observed(value, 1).expect("typed response serialization is infallible")
@@ -471,10 +518,10 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
             // behavior that the classic endpoint does not report.
             let rules = self.read_value(repository, &format!("rules/branches/{branch}"))?;
             let rules = rules.as_array().ok_or_else(|| {
-                ForgeError("effective repository rules are not a complete array".into())
+                ForgeError::permanent("effective repository rules are not a complete array".into())
             })?;
             if !rules.is_empty() {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "active repository rules need a registered executor or human handling".into(),
                 ));
             }
@@ -483,9 +530,11 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
             let protected = branch_identity
                 .get("protected")
                 .and_then(Value::as_bool)
-                .ok_or_else(|| ForgeError("branch protection state is unknown".into()))?;
+                .ok_or_else(|| {
+                    ForgeError::permanent("branch protection state is unknown".into())
+                })?;
             if observed_name != base_ref {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "GitHub returned a different base branch identity".into(),
                 ));
             }
@@ -513,40 +562,43 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
             }
         });
         let result = serde_json::to_vec(&body)
-            .map_err(|error| ForgeError(error.to_string()))
+            .map_err(|error| ForgeError::permanent(error.to_string()))
             .and_then(|body| self.run_api("POST", "graphql", Some(&body), false))
             .and_then(|response| {
-                let value =
-                    response.records.into_iter().next().ok_or_else(|| {
-                        ForgeError("GraphQL returned no response document".into())
-                    })?;
+                let value = response.records.into_iter().next().ok_or_else(|| {
+                    ForgeError::permanent("GraphQL returned no response document".into())
+                })?;
                 let connection = value
                     .pointer("/data/repository/pullRequest/reviewThreads")
-                    .ok_or_else(|| ForgeError("review thread connection is unavailable".into()))?;
+                    .ok_or_else(|| {
+                        ForgeError::permanent("review thread connection is unavailable".into())
+                    })?;
                 if connection
                     .pointer("/pageInfo/hasNextPage")
                     .and_then(Value::as_bool)
                     != Some(false)
                 {
-                    return Err(ForgeError(
+                    return Err(ForgeError::permanent(
                         "review threads exceed the complete observation page".into(),
                     ));
                 }
                 let nodes = connection
                     .get("nodes")
                     .and_then(Value::as_array)
-                    .ok_or_else(|| ForgeError("review thread nodes are malformed".into()))?;
+                    .ok_or_else(|| {
+                        ForgeError::permanent("review thread nodes are malformed".into())
+                    })?;
                 let mut threads = Vec::with_capacity(nodes.len());
                 for node in nodes {
                     let comments = node.pointer("/comments").ok_or_else(|| {
-                        ForgeError("review thread comments are unavailable".into())
+                        ForgeError::permanent("review thread comments are unavailable".into())
                     })?;
                     if comments
                         .pointer("/pageInfo/hasNextPage")
                         .and_then(Value::as_bool)
                         != Some(false)
                     {
-                        return Err(ForgeError(
+                        return Err(ForgeError::permanent(
                             "review thread comments exceed the complete observation page".into(),
                         ));
                     }
@@ -554,7 +606,9 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                         .get("nodes")
                         .and_then(Value::as_array)
                         .ok_or_else(|| {
-                            ForgeError("review thread comment nodes are malformed".into())
+                            ForgeError::permanent(
+                                "review thread comment nodes are malformed".into(),
+                            )
                         })?
                         .iter()
                         .map(|comment| string(comment, "id"))
@@ -606,7 +660,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         let user = response
             .records
             .first()
-            .ok_or_else(|| ForgeError("gh user response is empty".into()))?;
+            .ok_or_else(|| ForgeError::permanent("gh user response is empty".into()))?;
         string(user, "login")
     }
 
@@ -616,7 +670,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
     ) -> Result<PullRequestObservation, ForgeError> {
         match self.observe_pull(pull) {
             Observed::Complete { value, .. } => Ok(value),
-            Observed::Unknown { reason } => Err(ForgeError(reason)),
+            Observed::Unknown { reason, .. } => Err(ForgeError::permanent(reason)),
         }
     }
 
@@ -629,10 +683,12 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         request_digest: &Digest,
     ) -> Result<EffectAcknowledgement, ForgeError> {
         if operation_key.is_empty() {
-            return Err(ForgeError("effect operation key must be non-empty".into()));
+            return Err(ForgeError::permanent(
+                "effect operation key must be non-empty".into(),
+            ));
         }
         let body_bytes =
-            serde_json::to_vec(&body).map_err(|error| ForgeError(error.to_string()))?;
+            serde_json::to_vec(&body).map_err(|error| ForgeError::permanent(error.to_string()))?;
         let request_digest = request_digest.clone();
         let output = self.run_api(method, endpoint, Some(&body_bytes), false);
         match output {
@@ -675,7 +731,7 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
                 external_url: None,
                 resulting_head_sha: None,
                 resulting_merge_sha: None,
-                reason: Some(error.0),
+                reason: Some(error.message),
             }),
         }
     }
@@ -683,10 +739,36 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
 
 impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
     fn observe(&self, pull: &PullRequestRef) -> Result<ForgeObservation, ForgeError> {
-        pull.validate().map_err(ForgeError)?;
+        pull.validate().map_err(ForgeError::permanent)?;
         self.validate_target(&pull.repository)?;
         let repository = self.observe_repository(&pull.repository);
+        match &repository {
+            Observed::Unknown {
+                reason,
+                failure: Some(failure),
+            } => return Err(ForgeError::retryable(*failure, reason.clone())),
+            Observed::Unknown {
+                reason,
+                failure: None,
+            } => return Err(ForgeError::permanent(reason.clone())),
+            Observed::Complete { .. } => {}
+        }
         let pull_request = self.observe_pull(pull);
+        match &pull_request {
+            Observed::Unknown {
+                reason,
+                failure: Some(failure),
+            } => {
+                // The PR identity is the authority for all head-bound checks. Do not synthesize
+                // permanent-looking dependent failures that would erase a typed transport retry.
+                return Err(ForgeError::retryable(*failure, reason.clone()));
+            }
+            Observed::Unknown {
+                reason,
+                failure: None,
+            } => return Err(ForgeError::permanent(reason.clone())),
+            Observed::Complete { .. } => {}
+        }
         let pr = match &pull_request {
             Observed::Complete { value, .. } => Some(value),
             Observed::Unknown { .. } => None,
@@ -698,9 +780,12 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             parse_file,
         );
         let files = match files {
-            Observed::Complete { value, .. } if value.len() >= 3_000 => Self::unknown(ForgeError(
-                "GitHub file listing reached its 3,000-file cap; complete diff is unknown".into(),
-            )),
+            Observed::Complete { value, .. } if value.len() >= 3_000 => {
+                Self::unknown(ForgeError::permanent(
+                    "GitHub file listing reached its 3,000-file cap; complete diff is unknown"
+                        .into(),
+                ))
+            }
             other => other,
         };
         let check_runs = match pr {
@@ -730,11 +815,11 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 }
                 Err(error) => Self::unknown(error),
             },
-            None => Self::unknown(ForgeError("pull request head is unknown".into())),
+            None => Self::unknown(ForgeError::permanent("pull request head is unknown".into())),
         };
         let statuses = match pr {
             Some(pr) => self.observe_statuses(pull, &pr.head_sha),
-            None => Self::unknown(ForgeError("pull request head is unknown".into())),
+            None => Self::unknown(ForgeError::permanent("pull request head is unknown".into())),
         };
         let reviews = self.observe_list(
             &pull.repository,
@@ -757,7 +842,9 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         );
         let branch_protection = match pr {
             Some(pr) => self.observe_protection(&pull.repository, &pr.base_ref),
-            None => Self::unknown(ForgeError("pull request base branch is unknown".into())),
+            None => Self::unknown(ForgeError::permanent(
+                "pull request base branch is unknown".into(),
+            )),
         };
         let (merge_commit, target_comparison) = match pr.filter(|pr| pr.merged) {
             Some(pr) => match pr.merge_commit_sha.as_deref() {
@@ -773,7 +860,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                                 Some(Ok(item)) => Self::observed(Some(item), 1)
                                     .expect("typed response serialization is infallible"),
                                 Some(Err(error)) => Self::unknown(error),
-                                None => Self::unknown(ForgeError(
+                                None => Self::unknown(ForgeError::permanent(
                                     "merge commit has no recorded parent".into(),
                                 )),
                             },
@@ -782,10 +869,10 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                     Err(error) => (Self::unknown(error.clone()), Self::unknown(error)),
                 },
                 None => (
-                    Self::unknown(ForgeError(
+                    Self::unknown(ForgeError::permanent(
                         "merged pull request has no merge commit SHA".into(),
                     )),
-                    Self::unknown(ForgeError("merge base is unavailable".into())),
+                    Self::unknown(ForgeError::permanent("merge base is unavailable".into())),
                 ),
             },
             None => (
@@ -835,18 +922,19 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
     }
 
     fn update_body(&self, intent: &BodyUpdateIntent) -> Result<EffectAcknowledgement, ForgeError> {
-        intent.pull.validate().map_err(ForgeError)?;
+        intent.pull.validate().map_err(ForgeError::permanent)?;
         if !valid_sha(&intent.expected_head_sha)
             || intent.operation_key.is_empty()
             || hex_digest(intent.exact_body.as_bytes()) != intent.approved_body_digest.as_str()
         {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "PR body update has an invalid operation key, head, or approved body digest".into(),
             ));
         }
         let before = self.observe_pull_for_effect(&intent.pull)?;
         let current_body = before.body.as_deref().unwrap_or_default();
-        let request_digest = canonical_digest(intent).map_err(|error| ForgeError(error.0))?;
+        let request_digest =
+            canonical_digest(intent).map_err(|error| ForgeError::permanent(error.message))?;
         if before.state == PullRequestState::Open
             && !before.merged
             && before.head_sha == intent.expected_head_sha
@@ -899,14 +987,14 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
     }
 
     fn post_comment(&self, intent: &CommentIntent) -> Result<EffectAcknowledgement, ForgeError> {
-        intent.pull.validate().map_err(ForgeError)?;
+        intent.pull.validate().map_err(ForgeError::permanent)?;
         if intent.exact_body.is_empty() || intent.authenticated_actor.is_empty() {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "merge request comment identity/body is empty".into(),
             ));
         }
         if self.current_actor(&intent.pull.repository)? != intent.authenticated_actor {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "authenticated GitHub actor differs from effect intent".into(),
             ));
         }
@@ -918,7 +1006,8 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         {
             return Ok(EffectAcknowledgement {
                 operation_key: intent.operation_key.clone(),
-                request_digest: canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
+                request_digest: canonical_digest(intent)
+                    .map_err(|error| ForgeError::permanent(error.message))?,
                 certainty: EffectCertainty::DefinitelyAbsent,
                 external_id: None,
                 external_url: None,
@@ -938,7 +1027,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             &endpoint,
             serde_json::json!({"body": intent.exact_body}),
             &intent.operation_key,
-            &canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
+            &canonical_digest(intent).map_err(|error| ForgeError::permanent(error.message))?,
         )
     }
 
@@ -946,9 +1035,9 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         &self,
         intent: &DirectMergeIntent,
     ) -> Result<EffectAcknowledgement, ForgeError> {
-        intent.pull.validate().map_err(ForgeError)?;
+        intent.pull.validate().map_err(ForgeError::permanent)?;
         if !valid_sha(&intent.expected_head_sha) || !valid_sha(&intent.expected_base_sha) {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "merge expected revisions must be full SHA-1 or SHA-256 hex".into(),
             ));
         }
@@ -960,7 +1049,8 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         {
             return Ok(EffectAcknowledgement {
                 operation_key: intent.operation_key.clone(),
-                request_digest: canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
+                request_digest: canonical_digest(intent)
+                    .map_err(|error| ForgeError::permanent(error.message))?,
                 certainty: EffectCertainty::DefinitelyAbsent,
                 external_id: None,
                 external_url: None,
@@ -973,7 +1063,8 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         if !direct_merge_body_matches(intent, live_body) {
             return Ok(EffectAcknowledgement {
                 operation_key: intent.operation_key.clone(),
-                request_digest: canonical_digest(intent).map_err(|error| ForgeError(error.0))?,
+                request_digest: canonical_digest(intent)
+                    .map_err(|error| ForgeError::permanent(error.message))?,
                 certainty: EffectCertainty::DefinitelyAbsent,
                 external_id: None,
                 external_url: None,
@@ -1004,7 +1095,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         );
         if !intent.expected_trailers.is_empty() {
             if intent.method != MergeMethod::Squash {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "GitHub only accepts a custom commit message for squash merges; required trailers cannot be guaranteed for this merge method".into(),
                 ));
             }
@@ -1013,11 +1104,13 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 .iter()
                 .any(|line| !line.starts_with("Co-authored-by: ") || line.contains(['\n', '\r']))
             {
-                return Err(ForgeError("required merge trailer block is invalid".into()));
+                return Err(ForgeError::permanent(
+                    "required merge trailer block is invalid".into(),
+                ));
             }
             let derived = merge_commit_message(&intent.expected_body, &intent.expected_trailers)?;
             if derived != intent.expected_commit_message {
-                return Err(ForgeError(
+                return Err(ForgeError::permanent(
                     "exact squash commit message differs from the reviewed merge intent".into(),
                 ));
             }
@@ -1026,13 +1119,14 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 Value::String(intent.expected_commit_message.clone()),
             );
         } else if !intent.expected_commit_message.is_empty() {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "unreviewed squash commit message is not allowed".into(),
             ));
         }
         // GitHub accepts an expected head SHA but no expected base SHA. The separate base SHA is
         // retained in the durable request digest and must be re-observed by the executor.
-        let mutation_digest = canonical_digest(intent).map_err(|error| ForgeError(error.0))?;
+        let mutation_digest =
+            canonical_digest(intent).map_err(|error| ForgeError::permanent(error.message))?;
         if !human_approval_current(intent.approval_expires_at_unix, now_unix_seconds()) {
             return Ok(EffectAcknowledgement {
                 operation_key: intent.operation_key.clone(),
@@ -1060,7 +1154,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
         let observed = self.observe(&intent.pull)?;
         let pull = match observed.pull_request {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => return Ok(Reconciliation::Unknown(reason)),
+            Observed::Unknown { reason, .. } => return Ok(Reconciliation::Unknown(reason)),
         };
         match &intent.operation {
             MergeEffectOperation::UpdateBody(body_intent) => {
@@ -1092,7 +1186,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                 }
                 let comments = match observed.issue_comments {
                     Observed::Complete { value, .. } => value,
-                    Observed::Unknown { reason } => return Ok(Reconciliation::Unknown(reason)),
+                    Observed::Unknown { reason, .. } => return Ok(Reconciliation::Unknown(reason)),
                 };
                 let matches = comments
                     .iter()
@@ -1131,7 +1225,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                                 "merge commit identity differs".into(),
                             ));
                         }
-                        Err(error) => return Ok(Reconciliation::Unknown(error.0)),
+                        Err(error) => return Ok(Reconciliation::Unknown(error.message)),
                     };
                     let includes_head = match merge_intent.method {
                         MergeMethod::Merge => {
@@ -1152,7 +1246,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
                         base_parent,
                     ) {
                         Ok(comparison) => comparison.behind_by == 0,
-                        Err(error) => return Ok(Reconciliation::Unknown(error.0)),
+                        Err(error) => return Ok(Reconciliation::Unknown(error.message)),
                     };
                     if !includes_head
                         || !base_guard
@@ -1204,7 +1298,11 @@ fn parse_pull_request(value: Value) -> Result<PullRequestObservation, ForgeError
     let state = match string(&value, "state")?.as_str() {
         "open" => PullRequestState::Open,
         "closed" => PullRequestState::Closed,
-        _ => return Err(ForgeError("unknown GitHub pull request state".into())),
+        _ => {
+            return Err(ForgeError::permanent(
+                "unknown GitHub pull request state".into(),
+            ));
+        }
     };
     Ok(PullRequestObservation {
         repository_id: number_path(&value, &["base", "repo", "id"])
@@ -1269,7 +1367,7 @@ fn parse_status(
         .unwrap_or(requested_sha)
         .to_owned();
     if sha != requested_sha {
-        return Err(ForgeError(
+        return Err(ForgeError::permanent(
             "commit status belongs to a different SHA".into(),
         ));
     }
@@ -1331,19 +1429,21 @@ fn parse_branch_protection(value: Value) -> Result<BranchProtection, ForgeError>
         .get("required_status_checks")
         .and_then(|v| v.get("strict"))
         .and_then(Value::as_bool)
-        .ok_or_else(|| ForgeError("required status check strictness is unknown".into()))?;
+        .ok_or_else(|| {
+            ForgeError::permanent("required status check strictness is unknown".into())
+        })?;
     let contexts = value
         .get("required_status_checks")
         .and_then(|v| v.get("contexts"))
         .and_then(Value::as_array)
-        .ok_or_else(|| ForgeError("required check contexts are unknown".into()))?
+        .ok_or_else(|| ForgeError::permanent("required check contexts are unknown".into()))?
         .iter()
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    let review_policy = value
-        .get("required_pull_request_reviews")
-        .ok_or_else(|| ForgeError("required pull request review state is unknown".into()))?;
+    let review_policy = value.get("required_pull_request_reviews").ok_or_else(|| {
+        ForgeError::permanent("required pull request review state is unknown".into())
+    })?;
     let (required_approving_review_count, dismiss_stale_reviews) = if review_policy.is_null() {
         (None, None)
     } else {
@@ -1356,7 +1456,7 @@ fn parse_branch_protection(value: Value) -> Result<BranchProtection, ForgeError>
         .get("enforce_admins")
         .and_then(|v| v.get("enabled"))
         .and_then(Value::as_bool)
-        .ok_or_else(|| ForgeError("admin enforcement state is unknown".into()))?;
+        .ok_or_else(|| ForgeError::permanent("admin enforcement state is unknown".into()))?;
     let allow_force_pushes = nested_enabled(&value, "allow_force_pushes")?;
     let allow_deletions = nested_enabled(&value, "allow_deletions")?;
     let mut normalized = BTreeMap::new();
@@ -1418,7 +1518,7 @@ fn parse_commit(value: Value) -> Result<crate::forge::CommitObservation, ForgeEr
     let parents = value
         .get("parents")
         .and_then(Value::as_array)
-        .ok_or_else(|| ForgeError("commit parents are missing".into()))?
+        .ok_or_else(|| ForgeError::permanent("commit parents are missing".into()))?
         .iter()
         .map(|v| string(v, "sha"))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1444,7 +1544,7 @@ fn parse_comparison(
         .and_then(Value::as_str)
         .unwrap_or(requested_head);
     if base_sha != requested_base || head_sha != requested_head {
-        return Err(ForgeError(
+        return Err(ForgeError::permanent(
             "comparison response revisions differ from the requested pair".into(),
         ));
     }
@@ -1461,9 +1561,9 @@ fn parse_comparison(
 fn flatten_pages(value: Value, limit: u16) -> Result<(Vec<Value>, u16), ForgeError> {
     let pages = value
         .as_array()
-        .ok_or_else(|| ForgeError("paginated gh response was not an array".into()))?;
+        .ok_or_else(|| ForgeError::permanent("paginated gh response was not an array".into()))?;
     if pages.len() > usize::from(limit) {
-        return Err(ForgeError(
+        return Err(ForgeError::permanent(
             "GitHub pagination exceeded the configured page limit".into(),
         ));
     }
@@ -1481,7 +1581,7 @@ fn flatten_pages(value: Value, limit: u16) -> Result<(Vec<Value>, u16), ForgeErr
 
 fn number(value: &Value, key: &str) -> Result<u64, ForgeError> {
     value.get(key).and_then(Value::as_u64).ok_or_else(|| {
-        ForgeError(format!(
+        ForgeError::permanent(format!(
             "GitHub response field `{key}` is missing or invalid"
         ))
     })
@@ -1489,7 +1589,7 @@ fn number(value: &Value, key: &str) -> Result<u64, ForgeError> {
 
 fn boolean(value: &Value, key: &str) -> Result<bool, ForgeError> {
     value.get(key).and_then(Value::as_bool).ok_or_else(|| {
-        ForgeError(format!(
+        ForgeError::permanent(format!(
             "GitHub response field `{key}` is missing or invalid"
         ))
     })
@@ -1501,7 +1601,7 @@ fn string(value: &Value, key: &str) -> Result<String, ForgeError> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| {
-            ForgeError(format!(
+            ForgeError::permanent(format!(
                 "GitHub response field `{key}` is missing or invalid"
             ))
         })
@@ -1518,7 +1618,7 @@ fn string_path(value: &Value, path: &[&str]) -> Result<String, ForgeError> {
     node.and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| {
-            ForgeError(format!(
+            ForgeError::permanent(format!(
                 "GitHub response path `{}` is missing",
                 path.join(".")
             ))
@@ -1534,7 +1634,7 @@ fn number_path(value: &Value, path: &[&str]) -> Result<u64, ForgeError> {
         }
     });
     node.and_then(Value::as_u64).ok_or_else(|| {
-        ForgeError(format!(
+        ForgeError::permanent(format!(
             "GitHub response path `{}` is missing",
             path.join(".")
         ))
@@ -1558,12 +1658,14 @@ fn nested_enabled(value: &Value, key: &str) -> Result<bool, ForgeError> {
         .get(key)
         .and_then(|item| item.get("enabled"))
         .and_then(Value::as_bool)
-        .ok_or_else(|| ForgeError(format!("branch protection `{key}` state is unknown")))
+        .ok_or_else(|| ForgeError::permanent(format!("branch protection `{key}` state is unknown")))
 }
 
 fn path_component(value: &str) -> Result<String, ForgeError> {
     if value.is_empty() || value == "." || value == ".." || value.chars().any(char::is_control) {
-        return Err(ForgeError("invalid GitHub path component".into()));
+        return Err(ForgeError::permanent(
+            "invalid GitHub path component".into(),
+        ));
     }
     let mut result = String::new();
     for byte in value.bytes() {
@@ -1696,6 +1798,7 @@ fn ack_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge::{ForgeFailureKind, ForgeTransientFailure};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -1713,7 +1816,30 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("fixture reply");
-            let status = std::process::Command::new("true")
+            if stdout == b"fixture-timeout" {
+                return Ok(ProcessOutput {
+                    status: None,
+                    stdout: Vec::new(),
+                    stderr_tail: Vec::new(),
+                    stderr_truncated: false,
+                    stdout_truncated: false,
+                    timed_out: true,
+                    cleanup_confirmed: true,
+                });
+            }
+            if stdout == b"fixture-unconfirmed-timeout" {
+                return Ok(ProcessOutput {
+                    status: None,
+                    stdout: Vec::new(),
+                    stderr_tail: Vec::new(),
+                    stderr_truncated: false,
+                    stdout_truncated: false,
+                    timed_out: true,
+                    cleanup_confirmed: false,
+                });
+            }
+            let nonzero = stdout == b"fixture-nonzero";
+            let status = std::process::Command::new(if nonzero { "false" } else { "true" })
                 .status()
                 .map_err(ProcessError::Start)?;
             Ok(ProcessOutput {
@@ -1755,14 +1881,18 @@ mod tests {
     }
 
     fn fixture_forge_responses(replies: Vec<Value>) -> GitHubCliForge<FixtureRunner> {
+        fixture_forge_raw_responses(
+            replies
+                .into_iter()
+                .map(|reply| serde_json::to_vec(&reply).unwrap())
+                .collect(),
+        )
+    }
+
+    fn fixture_forge_raw_responses(replies: Vec<Vec<u8>>) -> GitHubCliForge<FixtureRunner> {
         GitHubCliForge::new(
             FixtureRunner {
-                replies: Mutex::new(
-                    replies
-                        .into_iter()
-                        .map(|reply| serde_json::to_vec(&reply).unwrap())
-                        .collect(),
-                ),
+                replies: Mutex::new(replies.into()),
                 requests: Mutex::new(Vec::new()),
             },
             PathBuf::from("/usr/bin/gh"),
@@ -1791,6 +1921,61 @@ mod tests {
             },
             number: 7,
             expected_node_id: None,
+        }
+    }
+
+    #[test]
+    fn permanent_repository_failure_precedes_later_pr_timeout() {
+        let forge =
+            fixture_forge_raw_responses(vec![b"not-json".to_vec(), b"fixture-timeout".to_vec()]);
+        let error = forge.observe(&test_pull()).unwrap_err();
+        assert_eq!(error.kind, ForgeFailureKind::Permanent);
+        assert_eq!(
+            forge.runner.requests.lock().unwrap().len(),
+            1,
+            "a later transient PR failure must not mask the known permanent repository response"
+        );
+    }
+
+    #[test]
+    fn pr_endpoint_timeout_is_typed_retryable() {
+        let forge = fixture_forge_raw_responses(vec![
+            serde_json::to_vec(&serde_json::json!({
+                "id": 1,
+                "full_name": "octo/repo",
+                "default_branch": "main",
+                "allow_merge_commit": true,
+                "allow_squash_merge": true,
+                "allow_rebase_merge": true
+            }))
+            .unwrap(),
+            b"fixture-timeout".to_vec(),
+        ]);
+        let error = forge.observe(&test_pull()).unwrap_err();
+        assert_eq!(
+            error.kind,
+            ForgeFailureKind::Retryable(ForgeTransientFailure::TimedOut)
+        );
+        let requests = forge.runner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("pulls/7"))
+        );
+    }
+
+    #[test]
+    fn unknown_nonzero_and_unconfirmed_timeout_are_permanent() {
+        for reply in [
+            b"fixture-nonzero".to_vec(),
+            b"fixture-unconfirmed-timeout".to_vec(),
+        ] {
+            let forge = fixture_forge_raw_responses(vec![reply]);
+            let error = forge.observe(&test_pull()).unwrap_err();
+            assert_eq!(error.kind, ForgeFailureKind::Permanent);
+            assert_eq!(forge.runner.requests.lock().unwrap().len(), 1);
         }
     }
 
@@ -1880,7 +2065,7 @@ mod tests {
                 assert_eq!(pages, 2);
                 value
             }
-            Observed::Unknown { reason } => panic!("status observation failed: {reason}"),
+            Observed::Unknown { reason, .. } => panic!("status observation failed: {reason}"),
         };
         assert_eq!(statuses.len(), 101);
         assert_eq!(

@@ -36,7 +36,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -549,7 +549,7 @@ impl ConfigStore {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
         }
-        if existing_version == 14 {
+        if matches!(existing_version, 14 | 15) {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
             artifact_registry::validate_v14_schema(&connection)?;
@@ -636,6 +636,12 @@ impl ConfigStore {
             artifact_registry::migrate_v14(&connection)?;
         }
         artifact_registry::validate_v14_schema(&connection)?;
+        if existing_version < 15 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            agent_results::migrate_v15_merge_observation_deferrals(&mut connection)?;
+        }
         Ok(Self {
             connection,
             _machine_lock: machine_lock,
@@ -6711,32 +6717,42 @@ pub(crate) mod tests {
 
     #[test]
     fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
-        published_publication_fixture(false, false, false, false, false);
+        published_publication_fixture(false, false, false, false, false, false, false);
     }
 
     #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
-        published_publication_fixture(true, false, false, false, false);
+        published_publication_fixture(true, false, false, false, false, false, false);
     }
 
     #[test]
     fn generated_direct_merge_intent_reaches_host_preparation() {
-        published_publication_fixture(true, false, false, false, true);
+        published_publication_fixture(true, false, false, false, true, false, false);
     }
 
     #[test]
     fn publication_and_review_results_wake_current_coordinator_child_requests() {
-        published_publication_fixture(true, false, false, true, false);
+        published_publication_fixture(true, false, false, true, false, false, false);
     }
 
     #[test]
     fn repeated_merge_reference_mismatch_blocks_and_notifies_supervisor_once() {
-        published_publication_fixture(true, true, false, false, false);
+        published_publication_fixture(true, true, false, false, false, false, false);
     }
 
     #[test]
     fn host_base_refresh_publication_drives_fresh_reviewer_subject() {
-        published_publication_fixture(true, false, true, false, false);
+        published_publication_fixture(true, false, true, false, false, false, false);
+    }
+
+    #[test]
+    fn obsolete_deferred_merge_assessment_does_not_abort_tick() {
+        published_publication_fixture(true, false, false, false, false, true, false);
+    }
+
+    #[test]
+    fn exhausted_observation_crash_gap_replays_block_transition_after_restart() {
+        published_publication_fixture(true, false, false, false, false, false, true);
     }
 
     fn assert_registered_staging_survives_verification(
@@ -7111,6 +7127,8 @@ pub(crate) mod tests {
         base_refresh: bool,
         verify_coordinator_handoff: bool,
         direct_merge_intent: bool,
+        obsolete_deferred_assessment: bool,
+        terminal_deferral_crash_gap: bool,
     ) {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
@@ -7991,8 +8009,21 @@ pub(crate) mod tests {
                 return;
             }
 
+            let claimed_pr_reference = if single_publication && !reject_twice && !base_refresh {
+                format!(
+                    "https://github.com/acme/repo-a/pull/{}",
+                    subject.publications[0].pull_request_number
+                )
+            } else {
+                format!(
+                    "https://github.com/acme/repo-a/pull/{} (PR_{}); head {}; base main",
+                    subject.publications[0].pull_request_number,
+                    subject.publications[0].pull_request_node_id,
+                    subject.publications[0].published_head
+                )
+            };
             let merge_result_json = serde_json::json!({
-                "pr_references": [format!("https://github.com/acme/repo-a/pull/{} (PR_{}); head {}; base main", subject.publications[0].pull_request_number, subject.publications[0].pull_request_node_id, subject.publications[0].published_head)],
+                "pr_references": [claimed_pr_reference],
                 "subject_digest": subject.digest().unwrap().as_str(),
                 "deterministic_gate_evidence": [
                     {"gate_id":"pull_request_open","outcome":"pass","evidence_references":[]},
@@ -8052,6 +8083,550 @@ pub(crate) mod tests {
                 serde_json::json!({"name":"main","protected":true}),
                 serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
             ];
+            if single_publication && !reject_twice && !base_refresh {
+                let (prepared_observation, prepared_body_proposal) =
+                    crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
+                        applied.clone(),
+                        &subject,
+                        &merge_result.ingested,
+                        &accepted.proposal,
+                        &project_id,
+                        replies.clone(),
+                    )
+                    .unwrap();
+                let mut stale_replies = replies.clone();
+                stale_replies[1]["head"]["sha"] = serde_json::Value::String("f".repeat(40));
+                let mut stale_raw_replies = stale_replies[..2]
+                    .iter()
+                    .map(|response| serde_json::to_vec(response).unwrap())
+                    .collect::<Vec<_>>();
+                stale_raw_replies.push(b"fixture-timeout".to_vec());
+                stale_raw_replies.extend(
+                    stale_replies[3..]
+                        .iter()
+                        .map(|response| serde_json::to_vec(response).unwrap()),
+                );
+                assert!(matches!(
+                    crate::runtime_services::merge::tests::observe_publication_raw_replies_for_store_test(
+                        applied.clone(),
+                        &subject,
+                        &merge_result.ingested,
+                        stale_raw_replies,
+                    ),
+                    Err(crate::merge_runtime::MergeObservationError::Permanent(_))
+                ));
+                let timeout_artifacts =
+                    crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+                let pending_results = store
+                    .pending_validated_agent_results(&timeout_artifacts, owner_generation, 32)
+                    .unwrap();
+                for pending in pending_results {
+                    if pending.validated.message_id == "coordinator-plan-result" {
+                        store
+                            .acknowledge_validated_agent_result(
+                                owner_generation,
+                                pending.receipt.evidence_id(),
+                                pending.validated.binding.ticket_revision.unwrap().0,
+                                crate::store::agent_results::ResultDisposition::Applied,
+                            )
+                            .unwrap();
+                    }
+                }
+                let runnable_results = store
+                    .pending_validated_agent_results(&timeout_artifacts, owner_generation, 8)
+                    .unwrap();
+                assert_eq!(runnable_results.len(), 1);
+                assert_eq!(
+                    runnable_results[0].validated.message_id,
+                    "single-publication-merge-assessment"
+                );
+                let tick = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                    &mut store,
+                    owner_generation,
+                    11,
+                    &config,
+                    config_digest.clone(),
+                    timeout_artifacts.clone(),
+                    applied.clone(),
+                );
+                assert!(
+                    tick.as_ref()
+                        .is_ok_and(|report| report.ingested_agent_result),
+                    "transient MergeDecision observation must defer without aborting the controller tick: {tick:?}"
+                );
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    None,
+                    "a failed fresh observation must leave its exact MergeAssessment unacknowledged"
+                );
+                let deferred = store
+                    .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(deferred.attempt_count, 1);
+                assert_eq!(deferred.next_attempt_at_unix, 16);
+                assert!(matches!(
+                    deferred.state,
+                    crate::store::agent_results::MergeObservationDeferralState::Waiting { .. }
+                ));
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM merge_work_items WHERE ticket_run_id=?1",
+                            [ticket_run_id.as_str()],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .unwrap(),
+                    0,
+                    "a deferred observation must not create merge work"
+                );
+                if terminal_deferral_crash_gap {
+                    for (attempt_at, expected_attempt, expected_due) in
+                        [(16, 2, 46), (46, 3, 166), (166, 4, 766), (766, 5, 766)]
+                    {
+                        let state = store
+                            .record_merge_observation_failure(
+                                owner_generation,
+                                &merge_result.ingested,
+                                &subject.digest().unwrap(),
+                                attempt_at,
+                                crate::store::agent_results::MergeObservationFailureCode::TimedOut,
+                            )
+                            .unwrap();
+                        let row = store
+                            .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(row.attempt_count, expected_attempt);
+                        assert_eq!(row.next_attempt_at_unix, expected_due);
+                        if expected_attempt == 5 {
+                            assert_eq!(
+                                state,
+                                crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                                    attempt_count: 5
+                                }
+                            );
+                        }
+                    }
+                    let state_root = temp.path().to_path_buf();
+                    drop(store);
+                    let mut store = ConfigStore::open_test(&state_root).unwrap();
+                    let restart_artifacts =
+                        crate::artifacts::ArtifactStore::open(&state_root.join("artifacts"))
+                            .unwrap();
+                    let restarted = crate::engine::factory_runtime::tests::tick_with_merge_observation_replies_for_test(
+                        &mut store,
+                        owner_generation,
+                        766,
+                        &config,
+                        config_digest.clone(),
+                        restart_artifacts,
+                        applied.clone(),
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap();
+                    assert!(restarted.ingested_agent_result);
+                    assert_eq!(
+                        store
+                            .merge_observation_deferral(
+                                merge_result.ingested.receipt.evidence_id(),
+                            )
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                            attempt_count: 5
+                        }
+                    );
+                    assert_eq!(
+                        crate::store::agent_results::host_validation_fixture::result_ack(
+                            &store,
+                            merge_result.ingested.receipt.evidence_id(),
+                        )
+                        .unwrap(),
+                        None
+                    );
+                    assert!(
+                        store
+                            .trusted_merge_assessment(
+                                &project_id,
+                                &ticket_run_id,
+                                Revision(assessing.revision),
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    let blocked = store
+                        .active_ticket_runs(owner_generation, 8)
+                        .unwrap()
+                        .into_iter()
+                        .find(|run| run.ticket_run_id == ticket_run_id)
+                        .unwrap();
+                    assert_eq!(blocked.activity, crate::engine::reducer::Activity::Blocked);
+                    assert_eq!(
+                        blocked.external_status,
+                        crate::domain::types::TicketStatus::InProgress
+                    );
+                    assert!(
+                        store
+                            .pending_role_wake_inputs(
+                                &project_id,
+                                &format!("project:{project_id}:supervisor"),
+                                16,
+                            )
+                            .unwrap()
+                            .iter()
+                            .any(|wake| {
+                                wake.payload_json["target"] == "supervisor"
+                                    && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                            })
+                    );
+                    return;
+                }
+                if obsolete_deferred_assessment {
+                    let pause_payload = serde_json::json!({
+                        "kind": "fixture_pause_after_merge_observation_deferral",
+                        "ticket_run_id": ticket_run_id.as_str(),
+                    });
+                    let pause_payload_json = crate::store::canonical_json(&pause_payload).unwrap();
+                    store
+                        .commit_ticket_transition(
+                            owner_generation,
+                            &ticket_run_id,
+                            Revision(assessing.revision),
+                            &crate::store::DurableInput {
+                                producer_id: "fixture".into(),
+                                message_id: "pause-after-merge-observation-deferral".into(),
+                                content_digest: crate::store::durable_input_digest(
+                                    "ticket_run",
+                                    &pause_payload_json,
+                                ),
+                                recipient: "ticket_run".into(),
+                                payload: pause_payload_json.clone(),
+                            },
+                            crate::engine::reducer::Input::Pause,
+                            "fixture changed the TicketRun revision after deferral",
+                            &pause_payload_json,
+                            &[staged_plan_effect(
+                                &project_id,
+                                &ticket_run_id,
+                                "pause-after-merge-observation-deferral",
+                                "stop_owned_runs",
+                                assessing.revision + 1,
+                                &serde_json::json!({}),
+                            )],
+                        )
+                        .unwrap();
+                    let stale_tick_artifacts =
+                        crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts"))
+                            .unwrap();
+                    let stale_tick = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                        &mut store,
+                        owner_generation,
+                        16,
+                        &config,
+                        config_digest.clone(),
+                        stale_tick_artifacts,
+                        applied.clone(),
+                    )
+                    .unwrap();
+                    assert!(stale_tick.ingested_agent_result);
+                    assert_eq!(
+                        store
+                            .merge_observation_deferral(
+                                merge_result.ingested.receipt.evidence_id(),
+                            )
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        crate::store::agent_results::MergeObservationDeferralState::PermanentlyInvalid
+                    );
+                    assert_eq!(
+                        crate::store::agent_results::host_validation_fixture::result_ack(
+                            &store,
+                            merge_result.ingested.receipt.evidence_id(),
+                        )
+                        .unwrap(),
+                        None
+                    );
+                    let permanent_binding = store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        store
+                            .record_merge_observation_failure(
+                                owner_generation,
+                                &merge_result.ingested,
+                                &Digest::parse("b".repeat(64)).unwrap(),
+                                17,
+                                crate::store::agent_results::MergeObservationFailureCode::TimedOut,
+                            )
+                            .unwrap(),
+                        crate::store::agent_results::MergeObservationDeferralState::PermanentlyInvalid
+                    );
+                    let after_mismatch = store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        after_mismatch.binding_digest,
+                        permanent_binding.binding_digest
+                    );
+                    assert_eq!(
+                        after_mismatch.attempt_count,
+                        permanent_binding.attempt_count
+                    );
+                    assert!(
+                        store
+                            .trusted_merge_assessment(
+                                &project_id,
+                                &ticket_run_id,
+                                Revision(assessing.revision),
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    return;
+                }
+                let second_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "single-publication-merge-assessment-fairness".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: Some(Digest::parse(content_digest(&merge_result_json.to_string())).unwrap()),
+                        structured_result: merge_result_json.clone(),
+                        artifact_refs: Vec::new(),
+                    },
+                    crate::domain::ids::AgentRunId::parse("single-publication-merge-run-fairness").unwrap(),
+                ).unwrap();
+                let fair_tick_artifacts =
+                    crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+                let fair_tick = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    fair_tick_artifacts,
+                    applied.clone(),
+                ).unwrap();
+                assert!(fair_tick.ingested_agent_result);
+                assert_eq!(
+                    store
+                        .merge_observation_deferral(second_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap()
+                        .next_attempt_at_unix,
+                    17,
+                    "a later runnable result must proceed while the older one is deferred"
+                );
+                assert_eq!(
+                    store
+                        .pending_validated_agent_results(&timeout_artifacts, owner_generation, 8)
+                        .unwrap()
+                        .len(),
+                    2,
+                    "diagnostic pending results must retain deferred unacknowledged evidence"
+                );
+                assert!(
+                    store
+                        .runnable_validated_agent_results(
+                            &timeout_artifacts,
+                            owner_generation,
+                            15,
+                            8
+                        )
+                        .unwrap()
+                        .is_empty()
+                );
+                let state_root = temp.path().to_path_buf();
+                drop(store);
+                let mut store = ConfigStore::open_test(&state_root).unwrap();
+                let reopened_artifacts =
+                    crate::artifacts::ArtifactStore::open(&state_root.join("artifacts")).unwrap();
+                let before_due = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                    &mut store,
+                    owner_generation,
+                    15,
+                    &config,
+                    config_digest.clone(),
+                    reopened_artifacts,
+                    applied.clone(),
+                )
+                .unwrap();
+                assert!(!before_due.ingested_agent_result);
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap()
+                        .attempt_count,
+                    1,
+                    "a pre-due tick must not consume a retry attempt"
+                );
+                let due_artifacts =
+                    crate::artifacts::ArtifactStore::open(&state_root.join("artifacts")).unwrap();
+                let due = crate::engine::factory_runtime::tests::tick_with_merge_observation_replies_for_test(
+                    &mut store,
+                    owner_generation,
+                    16,
+                    &config,
+                    config_digest.clone(),
+                    due_artifacts,
+                    applied.clone(),
+                    replies.clone(),
+                    Some(prepared_body_proposal),
+                )
+                .unwrap();
+                assert!(due.ingested_agent_result);
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap()
+                    .map(|(_, disposition)| disposition),
+                    Some("applied".into()),
+                    "the due retry must use fresh evidence and acknowledge the same valid claim"
+                );
+                let trusted = store
+                    .trusted_merge_assessment(
+                        &project_id,
+                        &ticket_run_id,
+                        Revision(assessing.revision),
+                    )
+                    .unwrap()
+                    .expect("fresh due observation must persist the trusted assessment");
+                assert_eq!(
+                    trusted.evidence.current_subject.remote_checks_digest,
+                    prepared_observation
+                        .evidence
+                        .current_subject
+                        .remote_checks_digest,
+                    "the due tick's newly returned evidence must be persisted exactly"
+                );
+                assert!(
+                    store
+                        .merge_observation_deferral(merge_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .is_none()
+                );
+                for (attempt_at, expected_attempt, expected_due) in
+                    [(17, 2, 47), (47, 3, 167), (167, 4, 767), (767, 5, 767)]
+                {
+                    let attempt_artifacts =
+                        crate::artifacts::ArtifactStore::open(&state_root.join("artifacts"))
+                            .unwrap();
+                    let attempt = crate::engine::factory_runtime::tests::tick_with_merge_observation_timeout_for_test(
+                        &mut store,
+                        owner_generation,
+                        attempt_at,
+                        &config,
+                        config_digest.clone(),
+                        attempt_artifacts,
+                        applied.clone(),
+                    )
+                    .unwrap();
+                    assert!(attempt.ingested_agent_result);
+                    let row = store
+                        .merge_observation_deferral(second_result.ingested.receipt.evidence_id())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.attempt_count, expected_attempt);
+                    assert_eq!(row.next_attempt_at_unix, expected_due);
+                    if expected_attempt == 5 {
+                        assert!(matches!(
+                            row.state,
+                            crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                                attempt_count: 5
+                            }
+                        ));
+                    }
+                }
+                let blocked = store
+                    .active_ticket_runs(owner_generation, 10)
+                    .unwrap()
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == ticket_run_id)
+                    .unwrap();
+                assert_eq!(blocked.activity, crate::engine::reducer::Activity::Blocked);
+                assert_eq!(
+                    blocked.external_status,
+                    crate::domain::types::TicketStatus::InProgress
+                );
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        second_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    None,
+                    "exhaustion must keep source evidence unacknowledged"
+                );
+                assert!(
+                    store
+                        .trusted_merge_assessment(
+                            &project_id,
+                            &ticket_run_id,
+                            Revision(assessing.revision),
+                        )
+                        .unwrap()
+                        .is_some()
+                );
+                let supervisor_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("project:{project_id}:supervisor"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| {
+                        wake.source_type == "ticket_run_transition"
+                            && wake.payload_json["target"] == "supervisor"
+                            && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                    })
+                    .count();
+                assert_eq!(supervisor_wakes, 1);
+                assert_eq!(
+                    store
+                        .record_merge_observation_failure(
+                            owner_generation,
+                            &second_result.ingested,
+                            &subject.digest().unwrap(),
+                            800,
+                            crate::store::agent_results::MergeObservationFailureCode::TimedOut,
+                        )
+                        .unwrap(),
+                    crate::store::agent_results::MergeObservationDeferralState::Exhausted {
+                        attempt_count: 5
+                    },
+                    "a later retry call must not revive an exhausted binding"
+                );
+                return;
+            }
             let observation =
                 crate::runtime_services::merge::tests::observe_publication_for_store_test(
                     applied.clone(),

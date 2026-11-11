@@ -624,6 +624,11 @@ impl crate::store::ConfigStore {
                 }
             }
         }
+        tx.execute(
+            "DELETE FROM merge_observation_deferrals WHERE source_evidence_id=?1",
+            [assessment.source_evidence_id.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(existing.is_none())
     }

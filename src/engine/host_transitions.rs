@@ -1983,7 +1983,7 @@ pub(crate) mod tests {
 
         impl Forge for VerificationForge {
             fn observe(&self, _: &PullRequestRef) -> Result<ForgeObservation, ForgeError> {
-                Err(ForgeError(
+                Err(ForgeError::permanent(
                     "verification fixture supplies its observation directly".into(),
                 ))
             }
@@ -1994,7 +1994,7 @@ pub(crate) mod tests {
                 sha: &str,
             ) -> Result<Observed<CommitObservation>, ForgeError> {
                 if self.commit.sha != sha {
-                    return Err(ForgeError("unexpected merge commit SHA".into()));
+                    return Err(ForgeError::permanent("unexpected merge commit SHA".into()));
                 }
                 Ok(Observed::Complete {
                     value: self.commit.clone(),
@@ -2026,22 +2026,30 @@ pub(crate) mod tests {
                 &self,
                 _: &BodyUpdateIntent,
             ) -> Result<EffectAcknowledgement, ForgeError> {
-                Err(ForgeError("unused verification fixture method".into()))
+                Err(ForgeError::permanent(
+                    "unused verification fixture method".into(),
+                ))
             }
 
             fn post_comment(&self, _: &CommentIntent) -> Result<EffectAcknowledgement, ForgeError> {
-                Err(ForgeError("unused verification fixture method".into()))
+                Err(ForgeError::permanent(
+                    "unused verification fixture method".into(),
+                ))
             }
 
             fn execute_merge(
                 &self,
                 _: &DirectMergeIntent,
             ) -> Result<EffectAcknowledgement, ForgeError> {
-                Err(ForgeError("unused verification fixture method".into()))
+                Err(ForgeError::permanent(
+                    "unused verification fixture method".into(),
+                ))
             }
 
             fn reconcile(&self, _: &MergeEffectIntent) -> Result<Reconciliation, ForgeError> {
-                Err(ForgeError("unused verification fixture method".into()))
+                Err(ForgeError::permanent(
+                    "unused verification fixture method".into(),
+                ))
             }
         }
 
@@ -2665,6 +2673,7 @@ pub(crate) mod tests {
         let observed = ForgeObservation {
             repository: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             pull_request: Observed::Complete {
                 value: crate::forge::PullRequestObservation {
@@ -2686,33 +2695,43 @@ pub(crate) mod tests {
             },
             files: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             check_runs: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             statuses: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             reviews: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             review_comments: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             review_threads: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             issue_comments: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             branch_protection: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             merge_commit: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
             target_comparison: Observed::Unknown {
                 reason: "not needed for commit verification".into(),
+                failure: None,
             },
         };
         let executor = MergeProcedureExecutor::new(VerificationForge { commit });

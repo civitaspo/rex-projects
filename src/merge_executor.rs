@@ -857,7 +857,7 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             .map_err(|error| MergeExecutionError::Forge(error.to_string()))?
         {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => {
+            Observed::Unknown { reason, .. } => {
                 return Err(MergeExecutionError::VerificationFailed(reason));
             }
         };
@@ -905,7 +905,7 @@ impl<F: Forge> MergeProcedureExecutor<F> {
             .map_err(|error| MergeExecutionError::Forge(error.to_string()))?
         {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => {
+            Observed::Unknown { reason, .. } => {
                 return Err(MergeExecutionError::VerificationFailed(reason));
             }
         };
@@ -1460,7 +1460,7 @@ fn ensure_open_same_revisions(
 fn complete_observation<T>(observation: &Observed<T>) -> Result<&T, MergeExecutionError> {
     match observation {
         Observed::Complete { value, .. } => Ok(value),
-        Observed::Unknown { reason } => Err(MergeExecutionError::Blocked(reason.clone())),
+        Observed::Unknown { reason, .. } => Err(MergeExecutionError::Blocked(reason.clone())),
     }
 }
 
@@ -1963,7 +1963,7 @@ mod tests {
             sha: &str,
         ) -> Result<Observed<crate::forge::CommitObservation>, ForgeError> {
             if self.commit.sha != sha {
-                return Err(ForgeError("unexpected commit SHA".into()));
+                return Err(ForgeError::permanent("unexpected commit SHA".into()));
             }
             Ok(Observed::Complete {
                 value: self.commit.clone(),
@@ -1997,7 +1997,7 @@ mod tests {
         ) -> Result<EffectAcknowledgement, ForgeError> {
             let mut observation = self.observation.lock().unwrap();
             let Observed::Complete { value, .. } = &mut observation.pull_request else {
-                return Err(ForgeError("PR observation is unknown".into()));
+                return Err(ForgeError::permanent("PR observation is unknown".into()));
             };
             value.body = Some(intent.exact_body.clone());
             Ok(EffectAcknowledgement {
@@ -2021,7 +2021,7 @@ mod tests {
                 value: comments, ..
             } = &mut observation.issue_comments
             else {
-                return Err(ForgeError("issue comments are unknown".into()));
+                return Err(ForgeError::permanent("issue comments are unknown".into()));
             };
             comments.push(crate::forge::IssueComment {
                 id: 42,
@@ -2030,7 +2030,7 @@ mod tests {
                 created_at: "2026-11-09T00:00:00Z".into(),
             });
             let Observed::Complete { value: pull, .. } = &observation.pull_request else {
-                return Err(ForgeError("PR observation is unknown".into()));
+                return Err(ForgeError::permanent("PR observation is unknown".into()));
             };
             Ok(EffectAcknowledgement {
                 operation_key: intent.operation_key.clone(),
@@ -2054,7 +2054,7 @@ mod tests {
                     value: comments, ..
                 } = &mut observation.issue_comments
                 else {
-                    return Err(ForgeError("issue comments are unknown".into()));
+                    return Err(ForgeError::permanent("issue comments are unknown".into()));
                 };
                 comments.push(crate::forge::IssueComment {
                     id: 43,
@@ -2065,7 +2065,9 @@ mod tests {
             }
             if self.add_post_merge_check {
                 let Observed::Complete { value: checks, .. } = &mut observation.check_runs else {
-                    return Err(ForgeError("check-run observation is unknown".into()));
+                    return Err(ForgeError::permanent(
+                        "check-run observation is unknown".into(),
+                    ));
                 };
                 checks.push(crate::forge::CheckRun {
                     id: 2,
@@ -2080,7 +2082,7 @@ mod tests {
                 });
             }
             let Observed::Complete { value: pull, .. } = &mut observation.pull_request else {
-                return Err(ForgeError("PR observation is unknown".into()));
+                return Err(ForgeError::permanent("PR observation is unknown".into()));
             };
             pull.state = crate::forge::PullRequestState::Closed;
             pull.merged = true;

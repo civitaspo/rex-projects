@@ -140,7 +140,7 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
         .collect::<Result<Vec<_>, String>>()?
     };
 
-    let waits = {
+    let mut waits = {
         let mut statement = db.prepare("SELECT project_id,subject_type,subject_id,kind,status,last_error FROM effects WHERE status IN ('pending','claimed','uncertain','failed') ORDER BY created_at_unix").map_err(|error| error.to_string())?;
         statement
             .query_map([], |row| {
@@ -163,6 +163,41 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
+    if version >= 15 {
+        let mut statement = db.prepare(
+            "SELECT d.project_id,d.ticket_run_id,d.state,d.failure_code,d.attempt_count,d.next_attempt_at_unix FROM merge_observation_deferrals d JOIN agent_result_evidence e ON e.evidence_id=d.source_evidence_id LEFT JOIN agent_result_reducer_ack a ON a.evidence_id=d.source_evidence_id WHERE a.evidence_id IS NULL ORDER BY d.created_at_unix,d.source_evidence_id",
+        ).map_err(|error| error.to_string())?;
+        let deferrals = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for deferral in deferrals {
+            let (project_id, ticket_run_id, state, failure_code, attempts, next_attempt) =
+                deferral.map_err(|error| error.to_string())?;
+            if !matches!(
+                state.as_str(),
+                "waiting" | "exhausted" | "permanently_invalid"
+            ) {
+                return Err("stored MergeAssessment observation state is invalid".into());
+            }
+            waits.push(WaitRow {
+                project_id,
+                ticket_run_id: Some(TicketRunId::parse(ticket_run_id)?),
+                kind: "merge_observation".into(),
+                detail: format!(
+                    "{state}; failure={failure_code}; attempts={attempts}; next_attempt_at_unix={next_attempt}"
+                ),
+            });
+        }
+    }
 
     let human_requests = ConfigStore::list_human_requests(state_root, None)?
         .into_iter()
@@ -394,6 +429,82 @@ mod tests {
         assert!(snapshot.agents.is_empty());
         assert!(snapshot.waits.is_empty());
         assert!(snapshot.human_requests.is_empty());
+    }
+
+    #[test]
+    fn merge_observation_deferrals_are_visible_and_acknowledged_rows_are_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::open_test(temp.path()).unwrap();
+        let db = store.test_connection();
+        db.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        for (evidence_id, state, failure, attempt, next_at) in [
+            ("waiting-evidence", "waiting", "timed_out", 1, 105_i64),
+            ("exhausted-evidence", "exhausted", "timed_out", 5, 100_i64),
+            (
+                "invalid-evidence",
+                "permanently_invalid",
+                "permanent_invalid",
+                1,
+                100_i64,
+            ),
+            ("resolved-evidence", "waiting", "timed_out", 1, 105_i64),
+        ] {
+            db.execute(
+                "INSERT INTO agent_result_evidence(evidence_id,agent_run_id,project_id,role,ticket_run_id,attempt,run_epoch,message_id,content_digest,outcome,result_digest,result_json,artifact_refs_json,received_at_unix) VALUES (?1,'fixture-agent','project-a','merge_decision','ticket-run-a',1,1,?1,?2,'completed',?2,'{}','[]',1)",
+                rusqlite::params![evidence_id, "a".repeat(64)],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO merge_observation_deferrals(source_evidence_id,binding_digest,source_result_digest,project_id,config_revision,config_digest,ticket_run_id,ticket_run_revision,publication_set_digest,attempt_count,next_attempt_at_unix,state,failure_code,created_at_unix,updated_at_unix) VALUES (?1,?2,?2,'project-a',1,?2,'ticket-run-a',4,?2,?3,?4,?5,?6,1,1)",
+                rusqlite::params![evidence_id, "a".repeat(64), attempt, next_at, state, failure],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES ('resolved-evidence',4,'applied',2)",
+            [],
+        )
+        .unwrap();
+        drop(store);
+
+        let snapshot = read_projection(temp.path()).unwrap();
+        let deferrals = snapshot
+            .waits
+            .iter()
+            .filter(|wait| wait.kind == "merge_observation")
+            .collect::<Vec<_>>();
+        assert_eq!(deferrals.len(), 3);
+        assert!(deferrals.iter().any(|wait| {
+            wait.detail
+                .starts_with("waiting; failure=timed_out; attempts=1; next_attempt_at_unix=105")
+        }));
+        assert!(deferrals.iter().any(|wait| {
+            wait.detail
+                .starts_with("exhausted; failure=timed_out; attempts=5;")
+        }));
+        assert!(deferrals.iter().any(|wait| {
+            wait.detail
+                .starts_with("permanently_invalid; failure=permanent_invalid;")
+        }));
+        assert!(deferrals.iter().all(|wait| {
+            wait.ticket_run_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "ticket-run-a")
+        }));
+    }
+
+    #[test]
+    fn schema_v14_dashboard_does_not_query_v15_deferrals() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::open_test(temp.path()).unwrap();
+        store
+            .test_connection()
+            .execute_batch("DROP TABLE merge_observation_deferrals; PRAGMA user_version=14;")
+            .unwrap();
+        drop(store);
+
+        let snapshot = read_projection(temp.path()).unwrap();
+        assert!(snapshot.waits.is_empty());
     }
 
     #[test]

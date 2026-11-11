@@ -63,6 +63,8 @@ pub enum Observed<T> {
     },
     Unknown {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<ForgeTransientFailure>,
     },
 }
 
@@ -248,6 +250,52 @@ pub struct ForgeObservation {
     pub target_comparison: Observed<Option<CommitComparison>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeTransientFailure {
+    ProcessUnavailable,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForgeFailureKind {
+    Permanent,
+    Retryable(ForgeTransientFailure),
+}
+
+impl ForgeObservation {
+    pub fn retryable_failure(&self) -> Option<ForgeTransientFailure> {
+        let mut retryable = None;
+        macro_rules! inspect {
+            ($observation:expr) => {
+                match $observation {
+                    Observed::Complete { .. } => {}
+                    Observed::Unknown {
+                        failure: Some(failure),
+                        ..
+                    } => {
+                        retryable.get_or_insert(*failure);
+                    }
+                    Observed::Unknown { .. } => return None,
+                }
+            };
+        }
+        inspect!(&self.repository);
+        inspect!(&self.pull_request);
+        inspect!(&self.files);
+        inspect!(&self.check_runs);
+        inspect!(&self.statuses);
+        inspect!(&self.reviews);
+        inspect!(&self.review_comments);
+        inspect!(&self.review_threads);
+        inspect!(&self.issue_comments);
+        inspect!(&self.branch_protection);
+        inspect!(&self.merge_commit);
+        inspect!(&self.target_comparison);
+        retryable
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteEvidenceDigests {
     pub diff: Digest,
@@ -264,7 +312,7 @@ impl ForgeObservation {
         fn complete<T>(value: &Observed<T>) -> Result<&T, ForgeError> {
             match value {
                 Observed::Complete { value, .. } => Ok(value),
-                Observed::Unknown { reason } => Err(ForgeError(reason.clone())),
+                Observed::Unknown { reason, .. } => Err(ForgeError::permanent(reason.clone())),
             }
         }
         let mut files = complete(&self.files)?.clone();
@@ -315,7 +363,7 @@ impl ForgeObservation {
             || digests.merge_comments != subject.merge_comments_digest
             || subject.base_guard_digest.as_ref() != Some(&digests.base_guard)
         {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "live forge evidence differs from approved subject".into(),
             ));
         }
@@ -329,11 +377,11 @@ impl ForgeObservation {
     ) -> Result<(), ForgeError> {
         let repository = match &self.repository {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => return Err(ForgeError(reason.clone())),
+            Observed::Unknown { reason, .. } => return Err(ForgeError::permanent(reason.clone())),
         };
         let pr = match &self.pull_request {
             Observed::Complete { value, .. } => value,
-            Observed::Unknown { reason } => return Err(ForgeError(reason.clone())),
+            Observed::Unknown { reason, .. } => return Err(ForgeError::permanent(reason.clone())),
         };
         if subject.forge != "github"
             || subject.forge_host != pull.repository.host
@@ -357,7 +405,7 @@ impl ForgeObservation {
             || pr.base_sha != subject.base_sha
             || pr.base_ref != subject.base_ref
         {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "live forge identity or revision differs from approved subject".into(),
             ));
         }
@@ -451,11 +499,30 @@ pub enum Reconciliation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ForgeError(pub String);
+pub struct ForgeError {
+    pub message: String,
+    pub kind: ForgeFailureKind,
+}
+
+impl ForgeError {
+    pub fn permanent(message: String) -> Self {
+        Self {
+            message,
+            kind: ForgeFailureKind::Permanent,
+        }
+    }
+
+    pub fn retryable(failure: ForgeTransientFailure, message: String) -> Self {
+        Self {
+            message,
+            kind: ForgeFailureKind::Retryable(failure),
+        }
+    }
+}
 
 impl std::fmt::Display for ForgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -484,13 +551,14 @@ pub trait Forge {
 }
 
 pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<Digest, ForgeError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| ForgeError(error.to_string()))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|error| ForgeError::permanent(error.to_string()))?;
     let hash = sha2::Sha256::digest(bytes);
     let hex = hash
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    Digest::parse(hex).map_err(ForgeError)
+    Digest::parse(hex).map_err(ForgeError::permanent)
 }
 
 pub(crate) fn merge_commit_message(
@@ -502,7 +570,9 @@ pub(crate) fn merge_commit_message(
             .iter()
             .any(|line| !line.starts_with("Co-authored-by: ") || line.contains(['\n', '\r']))
     {
-        return Err(ForgeError("required merge trailer block is invalid".into()));
+        return Err(ForgeError::permanent(
+            "required merge trailer block is invalid".into(),
+        ));
     }
     let body = body.trim_end();
     let trailer_lines = body
@@ -516,7 +586,7 @@ pub(crate) fn merge_commit_message(
     if !trailer_lines.is_empty() {
         let body_lines = body.lines().collect::<Vec<_>>();
         if trailer_lines != expected || !body_lines.ends_with(&expected) {
-            return Err(ForgeError(
+            return Err(ForgeError::permanent(
                 "PR body has a different or misplaced co-author trailer block".into(),
             ));
         }
