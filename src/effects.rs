@@ -292,18 +292,14 @@ impl EffectDispatcher {
                     operation_id: request.intent.operation_id,
                 })
             }
-            Err(error) => {
-                let diagnostic = matches!(
-                    request.intent.kind.as_str(),
-                    "start_agent" | "merge" | "prepare_worktrees"
-                )
-                .then(|| bounded_handler_error(&error));
+            Err(_error) => {
+                let diagnostic = handler_error_diagnostic(handler.kind(), mode);
                 store
                     .defer_effect_reconciliation(
                         &request.intent.operation_id,
                         owner_generation,
                         None,
-                        diagnostic.as_deref(),
+                        Some(&diagnostic),
                         now_unix.saturating_add(duration_seconds(retry_delay_for_age(limits, age))),
                     )
                     .map_err(EffectDispatchError::Store)?;
@@ -402,30 +398,13 @@ fn duration_seconds(duration: Duration) -> i64 {
     duration.as_secs().min(i64::MAX as u64) as i64
 }
 
-fn bounded_handler_error(error: &str) -> String {
-    let mut diagnostic = String::new();
-    for character in error.chars() {
-        if diagnostic.len() + character.len_utf8() > 512 {
-            break;
-        }
-        diagnostic.push(if character.is_control() {
-            ' '
-        } else {
-            character
-        });
-    }
-    diagnostic
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bounded_handler_error;
-
-    #[test]
-    fn handler_error_diagnostic_is_bounded_and_single_line() {
-        let error = format!("{}\nend", "x".repeat(600));
-        let diagnostic = bounded_handler_error(&error);
-        assert_eq!(diagnostic.len(), 512);
-        assert!(!diagnostic.chars().any(char::is_control));
-    }
+fn handler_error_diagnostic(kind: EffectKind, mode: EffectMode) -> String {
+    let stage = match mode {
+        EffectMode::Submit => "submit",
+        EffectMode::Reconcile => "reconcile",
+    };
+    format!(
+        "uncertain handler_error kind={} stage={stage}; reconciliation scheduled; inspect this operation before deciding next action",
+        effect_name(&kind)
+    )
 }
