@@ -92,6 +92,16 @@ pub(crate) fn worker_publication_identity(
     Ok((operation_id, logical_key))
 }
 
+fn finalize_worker_publication_body(
+    applied: &AppliedConfig,
+    project_id: &crate::domain::ids::ProjectId,
+    accepted_plan: &crate::engine::orchestration::WorkPlan,
+    body: &str,
+) -> Result<String, String> {
+    let trailers = merge::worker_authorship_trailers(applied, project_id, accepted_plan)?;
+    Ok(merge::append_trailers(body, &trailers))
+}
+
 /// Long-lived adapters and effect handlers for a single controller process.
 /// Adapter namespaces are learned once and pinned by their `describe` call.
 pub struct RuntimeServices {
@@ -2706,6 +2716,12 @@ impl FactoryRuntimeServices for RuntimeServices {
             run.ticket_run_id,
             node_id,
         );
+        let body = finalize_worker_publication_body(
+            &self.applied_config,
+            &run.project_id,
+            &plan.proposal,
+            &body,
+        )?;
         let mut prior_publications = succeeded
             .iter()
             .filter_map(|prior| {
