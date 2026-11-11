@@ -16,6 +16,7 @@ use rex_projects::process::{ProcessRequest, resolve_executable, run};
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const STDERR_LIMIT: usize = 16 * 1024;
+const FIXTURE_ACTOR: &str = "fixture-operator";
 
 pub fn run_cli(root: &Path, args: &[OsString]) -> Result<(), String> {
     validate_root(root)?;
@@ -164,7 +165,7 @@ fn dispatch(
     if request.endpoint == "user" && request.method == "GET" {
         return Ok((
             200,
-            json!({"login":"fixture-operator","id":1,"node_id":"fixture-user"}),
+            json!({"login":FIXTURE_ACTOR,"id":1,"node_id":"fixture-user"}),
         ));
     }
     let (path, query) = request
@@ -602,11 +603,21 @@ fn create_comment(
         return not_found("pull request not found");
     }
     let text = required_string(&body, "body")?;
-    connection.execute("INSERT INTO comments(pull_number,kind,user,body,created_at) VALUES(?1,?2,'fixture-human',?3,datetime('now'))",params![number,kind,text]).map_err(|error|error.to_string())?;
+    let created_at: String = connection
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO comments(pull_number,kind,user,body,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![number, kind, FIXTURE_ACTOR, text, created_at],
+        )
+        .map_err(|error| error.to_string())?;
     let id = connection.last_insert_rowid() as u64;
     Ok((
         201,
-        json!({"id":id,"user":{"login":"fixture-human"},"body":text,"created_at":"2026-11-07T00:00:00Z"}),
+        json!({"id":id,"user":{"login":FIXTURE_ACTOR},"body":text,"created_at":created_at}),
     ))
 }
 
@@ -796,6 +807,59 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rex_projects::forge::github::{GitHubCliForge, GitHubCommandRunner};
+    use rex_projects::forge::{
+        CommentIntent, EffectCertainty, Forge, MergeEffectIntent, MergeEffectOperation,
+        PullRequestRef, Reconciliation, RepositoryRef,
+    };
+    use rex_projects::process::{ProcessError, ProcessOutput};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct AdapterFixtureRunner {
+        root: std::path::PathBuf,
+        connection: Mutex<Connection>,
+        requests: Mutex<Vec<(String, String, Value, Value)>>,
+    }
+
+    impl GitHubCommandRunner for AdapterFixtureRunner {
+        fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+            let parsed = parse_args(&request.args).map_err(ProcessError::Invalid)?;
+            let body = if parsed.input {
+                serde_json::from_slice(&request.stdin)
+                    .map_err(|error| ProcessError::Invalid(error.to_string()))?
+            } else {
+                Value::Null
+            };
+            let (status, response) = dispatch(
+                &self.root,
+                &self.connection.lock().unwrap(),
+                &parsed,
+                body.clone(),
+            )
+            .map_err(ProcessError::Invalid)?;
+            self.requests.lock().unwrap().push((
+                parsed.method.clone(),
+                parsed.endpoint.clone(),
+                body,
+                response.clone(),
+            ));
+            use std::os::unix::process::ExitStatusExt;
+            Ok(ProcessOutput {
+                status: Some(std::process::ExitStatus::from_raw(if status < 400 {
+                    0
+                } else {
+                    1 << 8
+                })),
+                stdout: serde_json::to_vec(&response).unwrap_or_default(),
+                stderr_tail: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                timed_out: false,
+                cleanup_confirmed: true,
+            })
+        }
+    }
 
     fn git(remote: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
@@ -903,6 +967,143 @@ mod tests {
         );
         assert_eq!(protection["enforce_admins"]["enabled"], true);
         (temporary, connection, remote, number, base_sha, head_sha)
+    }
+
+    #[test]
+    fn request_comment_reconciles_through_github_adapter_and_fixture_cli_contract() {
+        let (temporary, connection, _remote, number, base_sha, head_sha) = fixture_pull();
+        let root = temporary.path().to_path_buf();
+        let runner = Arc::new(AdapterFixtureRunner {
+            root,
+            connection: Mutex::new(connection),
+            requests: Mutex::new(Vec::new()),
+        });
+        let forge = GitHubCliForge::new(
+            runner.clone(),
+            "/fixture/bin/gh".into(),
+            "github.test",
+            BTreeMap::new(),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            OUTPUT_LIMIT,
+            STDERR_LIMIT,
+            2,
+        )
+        .unwrap();
+        let repository = RepositoryRef {
+            host: "github.test".into(),
+            owner: "fixture".into(),
+            name: "repository".into(),
+            expected_id: None,
+        };
+        let pull = PullRequestRef {
+            repository,
+            number,
+            expected_node_id: None,
+        };
+        let user_output = runner
+            .run(ProcessRequest {
+                executable: "/fixture/bin/gh".into(),
+                args: [
+                    "--hostname",
+                    "github.test",
+                    "api",
+                    "user",
+                    "--method",
+                    "GET",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+                stdin: Vec::new(),
+                cwd: None,
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(5),
+                shutdown_grace: Duration::from_secs(1),
+                stdout_limit: OUTPUT_LIMIT,
+                stderr_tail_limit: STDERR_LIMIT,
+            })
+            .unwrap();
+        assert!(user_output.status.unwrap().success());
+        let actor = serde_json::from_slice::<Value>(&user_output.stdout).unwrap()["login"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let attempt_started_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let comment = CommentIntent {
+            pull: pull.clone(),
+            operation_key: "fixture-request-comment".into(),
+            expected_head_sha: head_sha,
+            expected_base_sha: base_sha,
+            exact_body: "/merge".into(),
+            authenticated_actor: actor.clone(),
+            attempt_started_unix,
+        };
+        let acknowledgement = forge.post_comment(&comment).unwrap();
+        assert_eq!(acknowledgement.certainty, EffectCertainty::Applied);
+        let reconciliation = forge
+            .reconcile(&MergeEffectIntent {
+                pull: pull.clone(),
+                operation_key: comment.operation_key.clone(),
+                request_digest: acknowledgement.request_digest.clone(),
+                operation: MergeEffectOperation::RequestComment(comment),
+                attempt_started_unix,
+            })
+            .unwrap();
+        let Reconciliation::Recovered(recovered) = reconciliation else {
+            panic!("request comment was not recovered from the fixture observation");
+        };
+        assert_eq!(recovered.certainty, EffectCertainty::Recovered);
+
+        let requests = runner.requests.lock().unwrap();
+        let user = requests
+            .iter()
+            .find(|(method, endpoint, _, _)| method == "GET" && endpoint == "user")
+            .unwrap();
+        assert_eq!(user.3["login"], actor);
+        let post = requests
+            .iter()
+            .find(|(method, endpoint, _, _)| {
+                method == "POST" && endpoint.ends_with("/issues/1/comments")
+            })
+            .unwrap();
+        let get = requests
+            .iter()
+            .find(|(method, endpoint, _, _)| {
+                method == "GET"
+                    && endpoint.starts_with("repos/fixture/repository/issues/1/comments")
+            })
+            .unwrap();
+        let posted_comment_id = post.3["id"].as_u64().unwrap();
+        assert_eq!(
+            recovered.external_id.as_deref(),
+            Some(posted_comment_id.to_string().as_str())
+        );
+        assert_eq!(post.2["body"], "/merge");
+        assert_eq!(post.3["user"]["login"], actor);
+        assert_eq!(get.3[0]["user"]["login"], post.3["user"]["login"]);
+        assert_eq!(get.3[0]["created_at"], post.3["created_at"]);
+        assert_eq!(get.3[0]["id"], posted_comment_id);
+        assert!(
+            get.3[0]["created_at"]
+                .as_str()
+                .is_some_and(|value| { value.contains('T') && value.ends_with('Z') })
+        );
+        let (status, pull_state) = get_pull(
+            &runner.connection.lock().unwrap(),
+            "fixture",
+            "repository",
+            number,
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(pull_state["state"], "open");
+        assert_eq!(pull_state["merged"], false);
+        assert!(pull_state["merge_commit_sha"].is_null());
     }
 
     #[test]
