@@ -198,7 +198,10 @@ pub trait FactoryRuntimeServices {
         &mut self,
         _subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
         _result: &crate::store::agent_results::IngestedAgentResult,
-    ) -> Result<Option<crate::merge_runtime::MergeEvidenceObservation>, String> {
+    ) -> Result<
+        Option<crate::merge_runtime::MergeEvidenceObservation>,
+        crate::merge_runtime::MergeObservationError,
+    > {
         Err("host MergeDecision evidence observation is unavailable".into())
     }
 
@@ -1893,6 +1896,43 @@ fn apply_reviewer_result(
     Ok(true)
 }
 
+fn block_merge_observation_for_human(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    result: &crate::store::agent_results::IngestedAgentResult,
+    now_unix: i64,
+    state: &str,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "kind": "merge_observation_blocked",
+        "source_evidence_id": result.receipt.evidence_id(),
+        "source_result_digest": result.validated.result_digest.as_str(),
+        "state": state,
+        "external_status": "in_progress"
+    });
+    let payload_json = crate::store::canonical_json(&payload)?;
+    let durable = DurableInput {
+        producer_id: "rex-projects-merge-observation".into(),
+        message_id: format!("merge-observation-blocked:{}", result.receipt.evidence_id()),
+        content_digest: durable_input_digest("ticket_run", &payload_json),
+        recipient: "ticket_run".into(),
+        payload: payload_json.clone(),
+    };
+    store.commit_ticket_transition(
+        owner_generation,
+        &run.ticket_run_id,
+        crate::domain::ids::Revision(run.revision),
+        &durable,
+        crate::engine::reducer::Input::MergeAssessmentCorrectionExhausted,
+        "fresh MergeDecision evidence could not be safely obtained",
+        &payload_json,
+        &[],
+    )?;
+    let _ = now_unix;
+    Ok(())
+}
+
 fn apply_merge_assessment(
     store: &mut ConfigStore,
     owner_generation: u64,
@@ -1917,17 +1957,38 @@ fn apply_merge_assessment(
     {
         return Ok(true);
     }
-    let run = store
+    let deferred = store
+        .merge_observation_deferral(result.receipt.evidence_id())?
+        .is_some();
+    let active_run = store
         .active_ticket_runs(owner_generation, 128)?
         .into_iter()
-        .find(|run| run.ticket_run_id == *ticket_run_id)
-        .ok_or("MergeAssessment result references no active TicketRun")?;
+        .find(|run| run.ticket_run_id == *ticket_run_id);
+    let Some(run) = active_run else {
+        if deferred {
+            store.invalidate_merge_observation_deferral(
+                owner_generation,
+                result.receipt.evidence_id(),
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        return Err("MergeAssessment result references no active TicketRun".into());
+    };
     if binding.role != Role::MergeDecision
         || run.project_id != binding.project_id
         || run.revision != source_revision.0
         || run.phase != Phase::Assessing
         || run.activity != Activity::Running
     {
+        if deferred {
+            store.invalidate_merge_observation_deferral(
+                owner_generation,
+                result.receipt.evidence_id(),
+                now_unix,
+            )?;
+            return Ok(true);
+        }
         return Err("MergeAssessment result is stale, blocked, or outside active Assessing".into());
     }
     if crate::store::agent_results::acknowledge_obsolete_configuration_result(
@@ -1948,6 +2009,28 @@ fn apply_merge_assessment(
         || binding.config_revision != project_record.config_revision
     {
         return Err("MergeAssessment result belongs to a stale Project configuration".into());
+    }
+    if let Some(deferral) = store.merge_observation_deferral(result.receipt.evidence_id())? {
+        let blocked_reason = match deferral.state {
+            crate::store::agent_results::MergeObservationDeferralState::Waiting { .. } => None,
+            crate::store::agent_results::MergeObservationDeferralState::Exhausted { .. } => {
+                Some("retry_exhausted")
+            }
+            crate::store::agent_results::MergeObservationDeferralState::PermanentlyInvalid => {
+                Some("permanent_invalid")
+            }
+        };
+        if let Some(reason) = blocked_reason {
+            block_merge_observation_for_human(
+                store,
+                owner_generation,
+                &run,
+                result,
+                now_unix,
+                reason,
+            )?;
+            return Ok(true);
+        }
     }
     let project = config
         .projects
@@ -2010,9 +2093,60 @@ fn apply_merge_assessment(
         }
     });
     let publication_set_digest = publication_subject.digest()?;
-    let observation = services
-        .observe_merge_assessment(&publication_subject, result)?
-        .ok_or("fresh MergeDecision evidence is temporarily unavailable")?;
+    let observation = match services.observe_merge_assessment(&publication_subject, result) {
+        Ok(Some(observation)) => observation,
+        Ok(None) => return Err("host MergeDecision observation is unavailable".into()),
+        Err(crate::merge_runtime::MergeObservationError::Retryable(failure)) => {
+            let failure_code = match failure {
+                crate::forge::ForgeTransientFailure::ProcessUnavailable => {
+                    crate::store::agent_results::MergeObservationFailureCode::ProcessUnavailable
+                }
+                crate::forge::ForgeTransientFailure::TimedOut => {
+                    crate::store::agent_results::MergeObservationFailureCode::TimedOut
+                }
+            };
+            let state = store.record_merge_observation_failure(
+                owner_generation,
+                result,
+                &publication_set_digest,
+                now_unix,
+                failure_code,
+            )?;
+            if matches!(
+                state,
+                crate::store::agent_results::MergeObservationDeferralState::Waiting { .. }
+            ) {
+                return Ok(true);
+            }
+            block_merge_observation_for_human(
+                store,
+                owner_generation,
+                &run,
+                result,
+                now_unix,
+                "retry_exhausted",
+            )?;
+            return Ok(true);
+        }
+        Err(crate::merge_runtime::MergeObservationError::Permanent(_)) => {
+            store.record_merge_observation_failure(
+                owner_generation,
+                result,
+                &publication_set_digest,
+                now_unix,
+                crate::store::agent_results::MergeObservationFailureCode::PermanentlyInvalid,
+            )?;
+            block_merge_observation_for_human(
+                store,
+                owner_generation,
+                &run,
+                result,
+                now_unix,
+                "permanent_invalid",
+            )?;
+            return Ok(true);
+        }
+    };
     if observation.publication_set_digest != publication_set_digest {
         return Err(
             "host MergeDecision observation is bound to a different publication set".into(),
@@ -3835,6 +3969,8 @@ pub(crate) mod tests {
         pending_artifacts: Option<crate::artifacts::ArtifactStore>,
         ticket_page: Option<super::ExternalTicketPage>,
         merge_observation: Option<crate::merge_runtime::MergeEvidenceObservation>,
+        merge_observation_timeout: Option<crate::config::AppliedConfig>,
+        merge_observation_replies: Option<(crate::config::AppliedConfig, Vec<serde_json::Value>)>,
         merge_body_proposal: Option<crate::store::merge_work::PreparedMergeBodyProposal>,
         merge_work_document: Option<crate::store::merge_work::MergeWorkDocument>,
     }
@@ -3866,13 +4002,13 @@ pub(crate) mod tests {
             &mut self,
             store: &mut crate::store::ConfigStore,
             owner_generation: u64,
-            _: i64,
+            now_unix: i64,
         ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> {
             self.pending_artifacts
                 .as_ref()
                 .map(|artifacts| {
                     store
-                        .pending_validated_agent_results(artifacts, owner_generation, 1)
+                        .runnable_validated_agent_results(artifacts, owner_generation, now_unix, 1)
                         .map(|mut results| results.pop())
                 })
                 .unwrap_or(Ok(None))
@@ -3930,9 +4066,30 @@ pub(crate) mod tests {
 
         fn observe_merge_assessment(
             &mut self,
-            _: &crate::delivery_runtime::ImplementationPublicationSetSubject,
-            _: &crate::store::agent_results::IngestedAgentResult,
-        ) -> Result<Option<crate::merge_runtime::MergeEvidenceObservation>, String> {
+            subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+            result: &crate::store::agent_results::IngestedAgentResult,
+        ) -> Result<
+            Option<crate::merge_runtime::MergeEvidenceObservation>,
+            crate::merge_runtime::MergeObservationError,
+        > {
+            if let Some(applied) = &self.merge_observation_timeout {
+                return crate::runtime_services::merge::tests::observe_publication_timeout_for_store_test(
+                    applied.clone(),
+                    subject,
+                    result,
+                )
+                .map(Some);
+            }
+            if let Some((applied, replies)) = &self.merge_observation_replies {
+                return crate::runtime_services::merge::tests::observe_publication_for_store_test(
+                    applied.clone(),
+                    subject,
+                    result,
+                    replies.clone(),
+                )
+                .map(Some)
+                .map_err(Into::into);
+            }
             self.merge_observation
                 .clone()
                 .map(Some)
@@ -4105,6 +4262,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -4138,6 +4297,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: Some(observation),
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: proposal,
             merge_work_document: None,
         };
@@ -4149,6 +4310,58 @@ pub(crate) mod tests {
             &mut services,
             result,
         )
+    }
+
+    pub(crate) fn tick_with_merge_observation_timeout_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        artifacts: crate::artifacts::ArtifactStore,
+        applied: crate::config::AppliedConfig,
+    ) -> Result<super::FactoryTickReport, String> {
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+            pending_artifacts: Some(artifacts),
+            ticket_page: None,
+            merge_observation: None,
+            merge_observation_timeout: Some(applied),
+            merge_observation_replies: None,
+            merge_body_proposal: None,
+            merge_work_document: None,
+        };
+        super::FactoryRuntime::tick(store, owner_generation, now_unix, config, &mut services)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The fixture binds fresh Forge replies and the body proposal to one runtime tick"
+    )]
+    pub(crate) fn tick_with_merge_observation_replies_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        artifacts: crate::artifacts::ArtifactStore,
+        applied: crate::config::AppliedConfig,
+        replies: Vec<serde_json::Value>,
+        proposal: Option<crate::store::merge_work::PreparedMergeBodyProposal>,
+    ) -> Result<super::FactoryTickReport, String> {
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+            pending_artifacts: Some(artifacts),
+            ticket_page: None,
+            merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: Some((applied, replies)),
+            merge_body_proposal: proposal,
+            merge_work_document: None,
+        };
+        super::FactoryRuntime::tick(store, owner_generation, now_unix, config, &mut services)
     }
 
     pub(crate) fn apply_merge_intent_for_test(
@@ -4166,6 +4379,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: Some(document),
         };
@@ -4287,6 +4502,8 @@ pub(crate) mod tests {
                 pending_artifacts: None,
                 ticket_page: None,
                 merge_observation: None,
+                merge_observation_timeout: None,
+                merge_observation_replies: None,
                 merge_body_proposal: None,
                 merge_work_document: None,
             };
@@ -4388,6 +4605,8 @@ pub(crate) mod tests {
             pending_artifacts: Some(fixture.artifacts),
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -4653,6 +4872,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -4723,6 +4944,8 @@ pub(crate) mod tests {
                 next_cursor: None,
             }),
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -5375,6 +5598,8 @@ pub(crate) mod tests {
             pending_artifacts: Some(fixture.artifacts),
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -5497,6 +5722,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -5626,6 +5853,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -5721,6 +5950,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -6065,6 +6296,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -6368,6 +6601,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };
@@ -6537,6 +6772,8 @@ pub(crate) mod tests {
                 pending_artifacts: None,
                 ticket_page: None,
                 merge_observation: None,
+                merge_observation_timeout: None,
+                merge_observation_replies: None,
                 merge_body_proposal: None,
                 merge_work_document: None,
             };
@@ -6723,6 +6960,8 @@ pub(crate) mod tests {
             pending_artifacts: None,
             ticket_page: None,
             merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
         };

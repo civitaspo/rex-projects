@@ -2334,9 +2334,9 @@ impl FactoryRuntimeServices for RuntimeServices {
         &mut self,
         store: &mut ConfigStore,
         owner_generation: u64,
-        _now_unix: i64,
+        now_unix: i64,
     ) -> Result<Option<crate::store::agent_results::IngestedAgentResult>, String> {
-        store.ingest_next_spooled_agent_result(&self.artifacts, owner_generation, 32)
+        store.ingest_next_spooled_agent_result_at(&self.artifacts, owner_generation, now_unix, 32)
     }
 
     fn read_verified_artifact(
@@ -2831,7 +2831,10 @@ impl FactoryRuntimeServices for RuntimeServices {
         &mut self,
         subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
         result: &crate::store::agent_results::IngestedAgentResult,
-    ) -> Result<Option<crate::merge_runtime::MergeEvidenceObservation>, String> {
+    ) -> Result<
+        Option<crate::merge_runtime::MergeEvidenceObservation>,
+        crate::merge_runtime::MergeObservationError,
+    > {
         if result.validated.binding.config_digest != self.configuration_digest {
             return Err("MergeAssessment source belongs to a stale runtime configuration".into());
         }

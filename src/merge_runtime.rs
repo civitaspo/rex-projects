@@ -15,6 +15,37 @@ use crate::merge_policy::{
     Confidence, EvidenceState, MergeAssessment, MergeEvidenceSnapshot, MergePolicy, RiskDimension,
     RiskRating, evaluate_merge_policy,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeObservationError {
+    Retryable(crate::forge::ForgeTransientFailure),
+    Permanent(String),
+}
+
+impl std::fmt::Display for MergeObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(crate::forge::ForgeTransientFailure::ProcessUnavailable) => {
+                formatter.write_str("GitHub observation process is temporarily unavailable")
+            }
+            Self::Retryable(crate::forge::ForgeTransientFailure::TimedOut) => formatter
+                .write_str("GitHub observation timed out after process cleanup was confirmed"),
+            Self::Permanent(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for MergeObservationError {
+    fn from(reason: String) -> Self {
+        Self::Permanent(reason)
+    }
+}
+
+impl From<&str> for MergeObservationError {
+    fn from(reason: &str) -> Self {
+        Self::Permanent(reason.to_owned())
+    }
+}
 use sha2::Digest as _;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

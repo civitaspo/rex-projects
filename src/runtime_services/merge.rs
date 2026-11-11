@@ -80,7 +80,9 @@ impl RuntimeMergeEvidenceSource {
         use crate::merge_policy::{MergeProcedureOperation as Operation, MergeProcedureStep};
 
         assessment.validate()?;
-        let observation = self.observe_publication_subject(subject, result)?;
+        let observation = self
+            .observe_publication_subject(subject, result)
+            .map_err(|error| error.to_string())?;
         if observation.publication_set_digest != assessment.publication_set_digest
             || observation.evidence.subject != assessment.evidence.subject
             || observation.policy != assessment.policy
@@ -285,7 +287,10 @@ impl RuntimeMergeEvidenceSource {
         &self,
         subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
         result: &crate::store::agent_results::IngestedAgentResult,
-    ) -> Result<crate::merge_runtime::MergeEvidenceObservation, String> {
+    ) -> Result<
+        crate::merge_runtime::MergeEvidenceObservation,
+        crate::merge_runtime::MergeObservationError,
+    > {
         let fact = subject
             .publications
             .first()
@@ -324,7 +329,10 @@ impl RuntimeMergeEvidenceSource {
         subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
         result: &crate::store::agent_results::IngestedAgentResult,
         adapter: &impl Forge,
-    ) -> Result<crate::merge_runtime::MergeEvidenceObservation, String> {
+    ) -> Result<
+        crate::merge_runtime::MergeEvidenceObservation,
+        crate::merge_runtime::MergeObservationError,
+    > {
         if subject.publications.len() != 1 {
             return Err("MergeDecision currently requires exactly one published pull request per assessment".into());
         }
@@ -347,14 +355,21 @@ impl RuntimeMergeEvidenceSource {
             number: fact.pull_request_number,
             expected_node_id: Some(fact.pull_request_node_id.clone()),
         };
-        let observed = adapter.observe(&pull).map_err(|error| error.to_string())?;
+        let observed = adapter.observe(&pull).map_err(|error| match error.kind {
+            crate::forge::ForgeFailureKind::Permanent => {
+                crate::merge_runtime::MergeObservationError::Permanent(error.message)
+            }
+            crate::forge::ForgeFailureKind::Retryable(failure) => {
+                crate::merge_runtime::MergeObservationError::Retryable(failure)
+            }
+        })?;
         let repository = match &observed.repository {
             crate::forge::Observed::Complete { value, .. } => value,
-            crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+            crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone().into()),
         };
         let pr = match &observed.pull_request {
             crate::forge::Observed::Complete { value, .. } => value,
-            crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+            crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone().into()),
         };
         if pr.repository_id != repository.id
             || pr.number != fact.pull_request_number
@@ -369,6 +384,11 @@ impl RuntimeMergeEvidenceSource {
                 "accepted publication no longer identifies the current open pull request head"
                     .into(),
             );
+        }
+        if let Some(failure) = observed.retryable_failure() {
+            return Err(crate::merge_runtime::MergeObservationError::Retryable(
+                failure,
+            ));
         }
         let digests = observed
             .semantic_digests()
@@ -414,7 +434,7 @@ impl RuntimeMergeEvidenceSource {
                 comments.sort_by_key(|comment| comment.id);
                 comments
             }
-            crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+            crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone().into()),
         };
         let evidence = MergeEvidenceSnapshot {
             subject: merge_subject.clone(),
@@ -520,7 +540,7 @@ impl RuntimeMergeEvidenceSource {
             .map_err(|error| error.to_string())?;
         let pr = match &observed.pull_request {
             crate::forge::Observed::Complete { value, .. } => value,
-            crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+            crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone()),
         };
         let mut current = subject.clone();
         current.head_sha = pr.head_sha.clone();
@@ -775,7 +795,7 @@ impl RuntimeMergeEvidenceSource {
             let live = forge.observe(&pull).map_err(|error| error.to_string())?;
             let live_body = match live.pull_request {
                 crate::forge::Observed::Complete { value, .. } => value.body.unwrap_or_default(),
-                crate::forge::Observed::Unknown { reason } => {
+                crate::forge::Observed::Unknown { reason, .. } => {
                     return Ok(EffectObservation::Pending { receipt: reason });
                 }
             };
@@ -1077,23 +1097,23 @@ fn host_gates(
 ) -> Result<Vec<GateEvidence>, String> {
     let pr = match &observed.pull_request {
         crate::forge::Observed::Complete { value, .. } => value,
-        crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+        crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone()),
     };
     let checks = match &observed.check_runs {
         crate::forge::Observed::Complete { value, .. } => value,
-        crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+        crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone()),
     };
     let statuses = match &observed.statuses {
         crate::forge::Observed::Complete { value, .. } => value,
-        crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+        crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone()),
     };
     let reviews = match &observed.reviews {
         crate::forge::Observed::Complete { value, .. } => value,
-        crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+        crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone()),
     };
     let protection = match &observed.branch_protection {
         crate::forge::Observed::Complete { value, .. } => value,
-        crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+        crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone()),
     };
     let allowed = repo
         .merge
@@ -1186,7 +1206,7 @@ fn host_gates(
         crate::forge::Observed::Complete { value, .. } => {
             value.iter().any(|thread| !thread.is_resolved)
         }
-        crate::forge::Observed::Unknown { reason } => return Err(reason.clone()),
+        crate::forge::Observed::Unknown { reason, .. } => return Err(reason.clone()),
     };
     gates.push(GateEvidence {
         key: "review_threads_resolved".into(),
@@ -1595,13 +1615,115 @@ pub(crate) mod tests {
             ),
             requests: Mutex::new(Vec::new()),
         });
-        RuntimeMergeEvidenceSource::with_github_runner(
+        let source = RuntimeMergeEvidenceSource::with_github_runner(
             applied,
             vec![binary_dir],
             BTreeMap::new(),
-            runner,
-        )
-        .observe_publication_subject(subject, result)
+            runner.clone(),
+        );
+        let observation = source.observe_publication_subject(subject, result);
+        assert!(
+            !runner.requests.lock().unwrap().is_empty(),
+            "production Forge observer must invoke gh for successful evidence"
+        );
+        observation.map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn observe_publication_timeout_for_store_test(
+        applied: crate::config::AppliedConfig,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<
+        crate::merge_runtime::MergeEvidenceObservation,
+        crate::merge_runtime::MergeObservationError,
+    > {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let binary_dir = root.path().join("bin");
+        std::fs::create_dir(&binary_dir).map_err(|error| error.to_string())?;
+        let gh_path = binary_dir.join("gh");
+        std::fs::write(&gh_path, "#!/bin/sh\nexit 0\n").map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        let repository_response = serde_json::to_vec(&serde_json::json!({
+            "id": 7,
+            "full_name": "acme/repo-a",
+            "default_branch": "main",
+            "allow_merge_commit": true,
+            "allow_squash_merge": true,
+            "allow_rebase_merge": true
+        }))
+        .map_err(|error| error.to_string())?;
+        let mut replies = vec![repository_response];
+        replies.extend(vec![b"fixture-timeout".to_vec(); 32]);
+        let runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(VecDeque::from(replies)),
+            requests: Mutex::new(Vec::new()),
+        });
+        let source = RuntimeMergeEvidenceSource::with_github_runner(
+            applied,
+            vec![binary_dir],
+            BTreeMap::new(),
+            runner.clone(),
+        );
+        let observation = source.observe_publication_subject(subject, result);
+        let requests = runner.requests.lock().unwrap();
+        assert!(
+            requests.len() >= 2,
+            "production Forge observer must invoke the PR endpoint"
+        );
+        assert!(requests[0].args.iter().any(|argument| argument == "api"));
+        let expected_endpoint = format!("pulls/{}", subject.publications[0].pull_request_number);
+        assert!(
+            requests[1]
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains(&expected_endpoint)),
+            "second observed request should target {expected_endpoint}: {:?}",
+            requests[1].args
+        );
+        observation
+    }
+
+    pub(crate) fn observe_publication_raw_replies_for_store_test(
+        applied: crate::config::AppliedConfig,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        replies: Vec<Vec<u8>>,
+    ) -> Result<
+        crate::merge_runtime::MergeEvidenceObservation,
+        crate::merge_runtime::MergeObservationError,
+    > {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let binary_dir = root.path().join("bin");
+        std::fs::create_dir(&binary_dir).map_err(|error| error.to_string())?;
+        let gh_path = binary_dir.join("gh");
+        std::fs::write(&gh_path, "#!/bin/sh\nexit 0\n").map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        let runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(VecDeque::from(replies)),
+            requests: Mutex::new(Vec::new()),
+        });
+        let source = RuntimeMergeEvidenceSource::with_github_runner(
+            applied,
+            vec![binary_dir],
+            BTreeMap::new(),
+            runner.clone(),
+        );
+        let observation = source.observe_publication_subject(subject, result);
+        assert!(
+            runner.requests.lock().unwrap().len() >= 3,
+            "production Forge observer must reach a later endpoint after reading the PR identity"
+        );
+        observation
     }
 
     pub(crate) fn observe_and_prepare_for_store_test(
@@ -1644,7 +1766,9 @@ pub(crate) mod tests {
             BTreeMap::new(),
             runner,
         );
-        let observation = source.observe_publication_subject(subject, result)?;
+        let observation = source
+            .observe_publication_subject(subject, result)
+            .map_err(|error| error.to_string())?;
         let crate::engine::orchestration::RoleResultPayload::MergeAssessment(claim) =
             &result.validated.typed_payload
         else {
@@ -1735,6 +1859,17 @@ pub(crate) mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("fixture reply");
+            if stdout == b"fixture-timeout" {
+                return Ok(crate::process::ProcessOutput {
+                    status: None,
+                    stdout: Vec::new(),
+                    stderr_tail: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    timed_out: true,
+                    cleanup_confirmed: true,
+                });
+            }
             let status = std::process::Command::new("true")
                 .status()
                 .map_err(crate::process::ProcessError::Start)?;

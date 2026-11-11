@@ -313,7 +313,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 12..=14) {
+    if !matches!(version, 12..=15) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -329,7 +329,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
         return Err("schema 12 migration record is missing".into());
     }
     let canonical = canonical_v12_schema()?;
-    if version == 14 {
+    if version >= 14 {
         let tx = canonical
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
@@ -419,7 +419,7 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 13 | 14) {
+    if !matches!(version, 13..=15) {
         return Err(format!(
             "Agent block lifecycle schema version mismatch: {version}"
         ));
@@ -496,7 +496,7 @@ pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version != 14 {
+    if !matches!(version, 14 | 15) {
         return Err(format!(
             "process evidence schema version mismatch: {version}"
         ));
@@ -1550,14 +1550,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v14_migration_composes_helpers_and_reopens_without_schema_changes() {
+    fn fresh_migration_composes_helpers_and_reopens_without_schema_changes() {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::store::ConfigStore::open_test(temp.path()).unwrap();
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
         for table in [
             "registered_artifacts",
             "agent_terminal_receipts",
@@ -1571,6 +1571,7 @@ mod tests {
             "publication_baselines",
             "merge_work_items",
             "agent_block_lifecycle_facts",
+            "merge_observation_deferrals",
         ] {
             let found: bool = store
                 .connection
@@ -1580,7 +1581,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert!(found, "schema v14 is missing {table}");
+            assert!(found, "current schema is missing {table}");
         }
         drop(store);
 
@@ -1589,7 +1590,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
         super::validate_v12_schema(&reopened.connection).unwrap();
         super::validate_v13_schema(&reopened.connection).unwrap();
         super::validate_v14_schema(&reopened.connection).unwrap();
@@ -1696,7 +1697,8 @@ mod tests {
                  DROP TRIGGER agent_terminal_receipts_immutable_delete;
                  CREATE TEMP TABLE saved_agent_terminal_receipts AS SELECT * FROM agent_terminal_receipts;
                  DROP TABLE agent_terminal_receipts;
-                 DELETE FROM schema_migrations WHERE version=14;
+                 DROP TABLE merge_observation_deferrals;
+                 DELETE FROM schema_migrations WHERE version>=14;
                  PRAGMA user_version=13;
                  ",
             )
@@ -1731,7 +1733,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
         let adoption_json: String = migrated
             .connection
             .query_row(
@@ -1823,11 +1825,11 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
     }
 
     #[test]
-    fn valid_v10_database_migrates_to_v14_and_reopens() {
+    fn valid_v10_database_migrates_to_current_and_reopens() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite3");
         let mut connection = Connection::open(&path).unwrap();
@@ -1853,7 +1855,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
         super::validate_v12_schema(&store.connection).unwrap();
         super::validate_v13_schema(&store.connection).unwrap();
         super::validate_v14_schema(&store.connection).unwrap();

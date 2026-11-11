@@ -856,8 +856,8 @@ mod tests {
     use super::*;
     use rex_projects::forge::github::{GitHubCliForge, GitHubCommandRunner};
     use rex_projects::forge::{
-        CommentIntent, EffectCertainty, Forge, MergeEffectIntent, MergeEffectOperation, Observed,
-        PullRequestRef, Reconciliation, RepositoryRef,
+        CommentIntent, EffectCertainty, Forge, ForgeFailureKind, MergeEffectIntent,
+        MergeEffectOperation, Observed, PullRequestRef, Reconciliation, RepositoryRef,
     };
     use rex_projects::process::{ProcessError, ProcessOutput};
     use std::sync::{Arc, Mutex};
@@ -1208,11 +1208,19 @@ mod tests {
             number: number + 100,
             ..pull.clone()
         };
-        let unknown_observation = forge.observe(&unknown).unwrap();
-        assert!(matches!(
-            unknown_observation.review_threads,
-            Observed::Unknown { .. }
-        ));
+        let graphql_requests = || {
+            runner
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, endpoint, _, _)| endpoint == "graphql")
+                .count()
+        };
+        let known_query_count = graphql_requests();
+        let unknown_observation = forge.observe(&unknown).unwrap_err();
+        assert_eq!(unknown_observation.kind, ForgeFailureKind::Permanent);
+        assert_eq!(graphql_requests(), known_query_count);
     }
 
     #[test]

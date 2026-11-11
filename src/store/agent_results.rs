@@ -1541,24 +1541,70 @@ pub fn pending_agent_results(
     owner_generation: u64,
     limit: usize,
 ) -> Result<Vec<IngestedAgentResult>, String> {
+    pending_agent_results_with_due_at(store, artifact_store, owner_generation, None, limit)
+}
+
+pub fn pending_agent_results_at(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    now_unix: i64,
+    limit: usize,
+) -> Result<Vec<IngestedAgentResult>, String> {
+    pending_agent_results_with_due_at(
+        store,
+        artifact_store,
+        owner_generation,
+        Some(now_unix),
+        limit,
+    )
+}
+
+fn pending_agent_results_with_due_at(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    now_unix: Option<i64>,
+    limit: usize,
+) -> Result<Vec<IngestedAgentResult>, String> {
     if limit == 0 || limit > 256 {
         return Err("pending Agent result limit must be between 1 and 256".into());
     }
     let ids = {
-        let mut statement = store.connection.prepare(
-            "SELECT e.evidence_id,e.agent_run_id,e.message_id FROM agent_result_evidence e LEFT JOIN agent_result_reducer_ack a USING(evidence_id) WHERE a.evidence_id IS NULL ORDER BY e.received_at_unix,e.evidence_id LIMIT ?1",
-        ).map_err(|error| error.to_string())?;
-        statement
-            .query_map([limit as u64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
+        let sql = if now_unix.is_some() {
+            "SELECT e.evidence_id,e.agent_run_id,e.message_id FROM agent_result_evidence e LEFT JOIN agent_result_reducer_ack a USING(evidence_id) WHERE a.evidence_id IS NULL AND NOT EXISTS(SELECT 1 FROM merge_observation_deferrals d WHERE d.source_evidence_id=e.evidence_id AND ((d.state='waiting' AND d.next_attempt_at_unix>?1) OR (d.state IN ('exhausted','permanently_invalid') AND NOT EXISTS(SELECT 1 FROM ticket_runs tr WHERE tr.ticket_run_id=d.ticket_run_id AND tr.project_id=d.project_id AND tr.revision=d.ticket_run_revision AND tr.internal_phase='assessing' AND tr.activity='running')))) ORDER BY e.received_at_unix,e.evidence_id LIMIT ?2"
+        } else {
+            "SELECT e.evidence_id,e.agent_run_id,e.message_id FROM agent_result_evidence e LEFT JOIN agent_result_reducer_ack a USING(evidence_id) WHERE a.evidence_id IS NULL ORDER BY e.received_at_unix,e.evidence_id LIMIT ?1"
+        };
+        let mut statement = store
+            .connection
+            .prepare(sql)
+            .map_err(|error| error.to_string())?;
+        if let Some(now) = now_unix {
+            statement
+                .query_map(rusqlite::params![now, limit as u64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        } else {
+            statement
+                .query_map([limit as u64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        }
     };
     let mut results = Vec::with_capacity(ids.len());
     for (evidence_id, run_id, message_id) in ids {
@@ -1603,6 +1649,194 @@ pub fn pending_agent_results(
         results.push(replayed);
     }
     Ok(results)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeObservationDeferralState {
+    Waiting {
+        attempt_count: u32,
+        next_attempt_at_unix: i64,
+    },
+    Exhausted {
+        attempt_count: u32,
+    },
+    PermanentlyInvalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeObservationFailureCode {
+    ProcessUnavailable,
+    TimedOut,
+    PermanentlyInvalid,
+}
+
+impl MergeObservationFailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessUnavailable => "process_unavailable",
+            Self::TimedOut => "timed_out",
+            Self::PermanentlyInvalid => "permanent_invalid",
+        }
+    }
+
+    fn retryable(self) -> bool {
+        !matches!(self, Self::PermanentlyInvalid)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeObservationDeferralRecord {
+    pub source_evidence_id: String,
+    pub binding_digest: Digest,
+    pub attempt_count: u32,
+    pub next_attempt_at_unix: i64,
+    pub state: MergeObservationDeferralState,
+    pub failure_code: String,
+}
+
+pub const MERGE_OBSERVATION_MAX_ATTEMPTS: u32 = 5;
+
+/// Persist an observation failure against the host-validated MergeAssessment identity.
+/// Only an allowlisted code is stored; diagnostics and provider output are never persisted.
+pub fn record_merge_observation_failure(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    result: &IngestedAgentResult,
+    publication_set_digest: &Digest,
+    now_unix: i64,
+    failure: MergeObservationFailureCode,
+) -> Result<MergeObservationDeferralState, String> {
+    let failure_code = failure.as_str();
+    let retryable = failure.retryable();
+    let binding = &result.validated.binding;
+    let ticket_run_id = binding
+        .ticket_run_id
+        .as_ref()
+        .ok_or("MergeAssessment observation binding lacks a TicketRun")?;
+    let ticket_revision = binding
+        .ticket_revision
+        .ok_or("MergeAssessment observation binding lacks a TicketRun revision")?;
+    if binding.role != Role::MergeDecision
+        || result.validated.kind != crate::engine::orchestration::RoleOutputKind::MergeAssessment
+    {
+        return Err("observation deferral requires a validated MergeAssessment result".into());
+    }
+    let binding_json = crate::store::canonical_json(&(
+        result.receipt.evidence_id(),
+        &result.validated.result_digest,
+        &binding.project_id,
+        binding.config_revision,
+        &binding.config_digest,
+        ticket_run_id,
+        ticket_revision,
+        publication_set_digest,
+    ))?;
+    let binding_digest = Digest::parse(format!("{:x}", Sha256::digest(binding_json.as_bytes())))?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    super::validate_active_generation(&tx, owner_generation)?;
+    let prior: Option<(String, u32, String)> = tx.query_row(
+        "SELECT binding_digest,attempt_count,state FROM merge_observation_deferrals WHERE source_evidence_id=?1",
+        [result.receipt.evidence_id()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    if let Some((prior_digest, prior_attempts, prior_state)) = &prior {
+        if prior_state != "waiting" {
+            let state = match prior_state.as_str() {
+                "exhausted" => MergeObservationDeferralState::Exhausted {
+                    attempt_count: *prior_attempts,
+                },
+                _ => MergeObservationDeferralState::PermanentlyInvalid,
+            };
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(state);
+        }
+        if prior_digest != binding_digest.as_str() {
+            tx.execute(
+                "UPDATE merge_observation_deferrals SET state='permanently_invalid',failure_code='permanent_invalid',next_attempt_at_unix=?2,updated_at_unix=?2 WHERE source_evidence_id=?1",
+                params![result.receipt.evidence_id(), now_unix],
+            ).map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(MergeObservationDeferralState::PermanentlyInvalid);
+        }
+    }
+    let attempt_count = if retryable {
+        prior
+            .as_ref()
+            .filter(|(digest, _, _)| digest == binding_digest.as_str())
+            .map_or(1, |(_, count, _)| {
+                count.saturating_add(1).min(MERGE_OBSERVATION_MAX_ATTEMPTS)
+            })
+    } else {
+        prior
+            .as_ref()
+            .filter(|(digest, _, _)| digest == binding_digest.as_str())
+            .map_or(0, |(_, count, _)| *count)
+    };
+    let state = if !retryable {
+        "permanently_invalid"
+    } else if attempt_count >= MERGE_OBSERVATION_MAX_ATTEMPTS {
+        "exhausted"
+    } else {
+        "waiting"
+    };
+    let delay = match attempt_count {
+        0 | 1 => 5_i64,
+        2 => 30,
+        3 => 120,
+        _ => 600,
+    };
+    let next_attempt = if state == "waiting" {
+        now_unix.saturating_add(delay)
+    } else {
+        now_unix
+    };
+    tx.execute(
+        "INSERT INTO merge_observation_deferrals(source_evidence_id,binding_digest,source_result_digest,project_id,config_revision,config_digest,ticket_run_id,ticket_run_revision,publication_set_digest,attempt_count,next_attempt_at_unix,state,failure_code,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14) ON CONFLICT(source_evidence_id) DO UPDATE SET binding_digest=excluded.binding_digest,source_result_digest=excluded.source_result_digest,project_id=excluded.project_id,config_revision=excluded.config_revision,config_digest=excluded.config_digest,ticket_run_id=excluded.ticket_run_id,ticket_run_revision=excluded.ticket_run_revision,publication_set_digest=excluded.publication_set_digest,attempt_count=excluded.attempt_count,next_attempt_at_unix=excluded.next_attempt_at_unix,state=excluded.state,failure_code=excluded.failure_code,updated_at_unix=excluded.updated_at_unix",
+        params![result.receipt.evidence_id(),binding_digest.as_str(),result.validated.result_digest.as_str(),binding.project_id.as_str(),binding.config_revision.0,binding.config_digest.as_str(),ticket_run_id.as_str(),ticket_revision.0,publication_set_digest.as_str(),attempt_count,next_attempt,state,failure_code,now_unix],
+    ).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(match state {
+        "waiting" => MergeObservationDeferralState::Waiting {
+            attempt_count,
+            next_attempt_at_unix: next_attempt,
+        },
+        "exhausted" => MergeObservationDeferralState::Exhausted { attempt_count },
+        _ => MergeObservationDeferralState::PermanentlyInvalid,
+    })
+}
+
+pub(crate) fn migrate_v15_merge_observation_deferrals(
+    connection: &mut rusqlite::Connection,
+) -> Result<(), String> {
+    let tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE merge_observation_deferrals(
+            source_evidence_id TEXT PRIMARY KEY NOT NULL REFERENCES agent_result_evidence(evidence_id),
+            binding_digest TEXT NOT NULL CHECK(length(binding_digest)=64),
+            source_result_digest TEXT NOT NULL CHECK(length(source_result_digest)=64),
+            project_id TEXT NOT NULL,
+            config_revision INTEGER NOT NULL,
+            config_digest TEXT NOT NULL CHECK(length(config_digest)=64),
+            ticket_run_id TEXT NOT NULL,
+            ticket_run_revision INTEGER NOT NULL,
+            publication_set_digest TEXT NOT NULL CHECK(length(publication_set_digest)=64),
+            attempt_count INTEGER NOT NULL CHECK(attempt_count BETWEEN 0 AND 5),
+            next_attempt_at_unix INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('waiting','exhausted','permanently_invalid')),
+            failure_code TEXT NOT NULL CHECK(failure_code IN ('process_unavailable','timed_out','permanent_invalid')),
+            created_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL
+        );
+        CREATE INDEX merge_observation_deferrals_due ON merge_observation_deferrals(state,next_attempt_at_unix);
+        INSERT INTO schema_migrations(version,applied_at_unix) VALUES (15,unixepoch());
+        PRAGMA user_version=15;",
+    ).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
 }
 
 /// Resolve a pending wake to its persisted source result, revalidating the host terminal receipt,
@@ -1679,13 +1913,47 @@ pub fn ingest_next_spooled_agent_result(
     owner_generation: u64,
     candidate_limit: usize,
 ) -> Result<Option<IngestedAgentResult>, String> {
+    ingest_next_spooled_agent_result_inner(
+        store,
+        artifact_store,
+        owner_generation,
+        candidate_limit,
+        None,
+    )
+}
+
+pub fn ingest_next_spooled_agent_result_at(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    now_unix: i64,
+    candidate_limit: usize,
+) -> Result<Option<IngestedAgentResult>, String> {
+    ingest_next_spooled_agent_result_inner(
+        store,
+        artifact_store,
+        owner_generation,
+        candidate_limit,
+        Some(now_unix),
+    )
+}
+
+fn ingest_next_spooled_agent_result_inner(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    candidate_limit: usize,
+    now_unix: Option<i64>,
+) -> Result<Option<IngestedAgentResult>, String> {
     if candidate_limit == 0 || candidate_limit > 128 {
         return Err("Agent result candidate limit must be between 1 and 128".into());
     }
-    if let Some(existing) = pending_agent_results(store, artifact_store, owner_generation, 1)?
-        .into_iter()
-        .next()
-    {
+    let pending = if let Some(now) = now_unix {
+        pending_agent_results_at(store, artifact_store, owner_generation, now, 1)?
+    } else {
+        pending_agent_results(store, artifact_store, owner_generation, 1)?
+    };
+    if let Some(existing) = pending.into_iter().next() {
         return Ok(Some(existing));
     }
 
@@ -7025,6 +7293,62 @@ fn accepted_correction_publication_head(
 
 #[allow(clippy::items_after_test_module)]
 impl ConfigStore {
+    pub fn merge_observation_deferral(
+        &self,
+        source_evidence_id: &str,
+    ) -> Result<Option<MergeObservationDeferralRecord>, String> {
+        let stored: Option<(String, u32, i64, String, String)> = self.connection
+            .query_row(
+                "SELECT binding_digest,attempt_count,next_attempt_at_unix,state,failure_code FROM merge_observation_deferrals WHERE source_evidence_id=?1",
+                [source_evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        stored
+            .map(|(digest, attempt_count, next, state, failure_code)| {
+                let state = match state.as_str() {
+                    "waiting" => MergeObservationDeferralState::Waiting {
+                        attempt_count,
+                        next_attempt_at_unix: next,
+                    },
+                    "exhausted" => MergeObservationDeferralState::Exhausted { attempt_count },
+                    "permanently_invalid" => MergeObservationDeferralState::PermanentlyInvalid,
+                    _ => return Err("stored MergeAssessment observation state is invalid".into()),
+                };
+                Ok(MergeObservationDeferralRecord {
+                    source_evidence_id: source_evidence_id.to_owned(),
+                    binding_digest: Digest::parse(digest)?,
+                    attempt_count,
+                    next_attempt_at_unix: next,
+                    state,
+                    failure_code,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn invalidate_merge_observation_deferral(
+        &mut self,
+        owner_generation: u64,
+        source_evidence_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        super::validate_active_generation(&tx, owner_generation)?;
+        let changed = tx
+            .execute(
+                "UPDATE merge_observation_deferrals SET state='permanently_invalid',failure_code='permanent_invalid',next_attempt_at_unix=?2,updated_at_unix=?2 WHERE source_evidence_id=?1 AND state='waiting'",
+                params![source_evidence_id, now_unix],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
     /// Atomically consumes a host-validated Supervisor intervention and wakes the exact
     /// canonical Coordinator for the still-current TicketRun revision.
     pub fn apply_supervisor_intervention(
@@ -7557,6 +7881,22 @@ impl ConfigStore {
         ingest_next_spooled_agent_result(self, artifact_store, owner_generation, candidate_limit)
     }
 
+    pub fn ingest_next_spooled_agent_result_at(
+        &mut self,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+        now_unix: i64,
+        candidate_limit: usize,
+    ) -> Result<Option<IngestedAgentResult>, String> {
+        ingest_next_spooled_agent_result_at(
+            self,
+            artifact_store,
+            owner_generation,
+            now_unix,
+            candidate_limit,
+        )
+    }
+
     pub fn record_verified_agent_terminal(
         &mut self,
         owner_generation: u64,
@@ -7585,6 +7925,16 @@ impl ConfigStore {
         pending_agent_results(self, artifact_store, owner_generation, limit)
     }
 
+    pub fn runnable_validated_agent_results(
+        &mut self,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+        now_unix: i64,
+        limit: usize,
+    ) -> Result<Vec<IngestedAgentResult>, String> {
+        pending_agent_results_at(self, artifact_store, owner_generation, now_unix, limit)
+    }
+
     pub fn acknowledge_validated_agent_result(
         &mut self,
         owner_generation: u64,
@@ -7598,6 +7948,24 @@ impl ConfigStore {
             evidence_id,
             reducer_revision,
             disposition,
+        )
+    }
+
+    pub fn record_merge_observation_failure(
+        &mut self,
+        owner_generation: u64,
+        result: &IngestedAgentResult,
+        publication_set_digest: &Digest,
+        now_unix: i64,
+        failure: MergeObservationFailureCode,
+    ) -> Result<MergeObservationDeferralState, String> {
+        record_merge_observation_failure(
+            self,
+            owner_generation,
+            result,
+            publication_set_digest,
+            now_unix,
+            failure,
         )
     }
 
@@ -9529,6 +9897,11 @@ impl ConfigStore {
             "INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'rejected_by_host',?3)",
             rusqlite::params![result.receipt.evidence_id(),ack_revision,now],
         ).map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM merge_observation_deferrals WHERE source_evidence_id=?1",
+            [result.receipt.evidence_id()],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(outcome)
     }
