@@ -1967,6 +1967,53 @@ mod tests {
     }
 
     #[test]
+    fn already_prepared_approved_body_is_recovered_without_patch() {
+        let exact_body = "reviewed PR body\n\nCo-authored-by: Agent <agent@example.com>";
+        let head_sha = "a".repeat(40);
+        let base_sha = "b".repeat(40);
+        let forge = fixture_forge_responses(vec![serde_json::json!({
+            "id": 1,
+            "node_id": "PR_node",
+            "number": 7,
+            "state": "open",
+            "draft": false,
+            "merged": false,
+            "head": {"sha": head_sha, "ref": "feature", "repo": {"id": 1}},
+            "base": {"sha": base_sha, "ref": "main", "repo": {"id": 1}},
+            "body": exact_body
+        })]);
+        let intent = BodyUpdateIntent {
+            pull: test_pull(),
+            operation_key: "body-op".into(),
+            expected_head_sha: head_sha.clone(),
+            expected_prior_body_digest: Digest::parse(hex_digest(b"prior PR body")).unwrap(),
+            exact_body: exact_body.into(),
+            approved_body_digest: Digest::parse(hex_digest(exact_body.as_bytes())).unwrap(),
+        };
+
+        let acknowledgement = forge.update_body(&intent).unwrap();
+
+        assert_eq!(acknowledgement.certainty, EffectCertainty::Recovered);
+        assert_eq!(acknowledgement.operation_key, "body-op");
+        assert_eq!(
+            acknowledgement.request_digest,
+            canonical_digest(&intent).unwrap()
+        );
+        assert_eq!(
+            acknowledgement.resulting_head_sha.as_deref(),
+            Some(head_sha.as_str())
+        );
+        let requests = forge.runner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let method = requests[0]
+            .args
+            .iter()
+            .position(|arg| arg == "--method")
+            .map(|index| requests[0].args.get(index + 1).unwrap());
+        assert_eq!(method, Some(&std::ffi::OsString::from("GET")));
+    }
+
+    #[test]
     fn body_update_does_not_patch_after_prior_body_changed() {
         let head_sha = "a".repeat(40);
         let base_sha = "b".repeat(40);

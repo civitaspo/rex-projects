@@ -1102,13 +1102,11 @@ fn advance_approved_merge_procedure(
         return Ok(true);
     }
 
-    // A provider-reconciled prepared-body step proves the old effect's exact
-    // target is already present, but it does not authorize continuing into a
-    // merge when the immutable work item has no execution-time base guard.
-    // Start a fresh assessment now; this preserves the body receipt while
-    // ensuring no later step is emitted under the stale approval.
-    if item.document.authority.execution_time_base_guard != crate::merge_policy::EvidenceState::Pass
-        && completed.len() == 1
+    // Reassess after the exact prepared body was reconciled if the base guard
+    // is unknown, or if a recovered receipt observes a target that differed
+    // from the body approved at assessment time. A no-op recovered receipt
+    // and a successfully applied body update can continue under that approval.
+    if completed.len() == 1
         && item.document.procedure.steps.first().is_some_and(|first| {
             first.key == completed[0].step_key
                 && matches!(
@@ -1117,6 +1115,14 @@ fn advance_approved_merge_procedure(
                 )
         })
         && item.document.procedure.steps.len() > 1
+        && (item.document.authority.execution_time_base_guard
+            != crate::merge_policy::EvidenceState::Pass
+            || matches!(
+                &completed[0].effect_intent.operation,
+                crate::forge::MergeEffectOperation::UpdateBody(body)
+                    if completed[0].certainty == crate::forge::EffectCertainty::Recovered
+                        && body.expected_prior_body_digest != body.approved_body_digest
+            ))
     {
         let receipt = &completed[0];
         let subject = &item.document.assessment.subject;
@@ -1176,7 +1182,7 @@ fn advance_approved_merge_procedure(
             revision,
             &input,
             Input::MergeReassessmentRequired(proof),
-            "host reconciled the prepared body but the saved merge work has no execution-time base guard; a fresh assessment and approval are required",
+            "host reconciled a prepared body that requires fresh assessment and approval before continuing the saved merge procedure",
             &payload,
             &[],
         )?;
@@ -1668,17 +1674,47 @@ pub(crate) mod tests {
 
     #[test]
     fn merge_work_receipt_consumer_enforces_approval_and_builds_postmortem_inbox() {
-        merge_review_approval_fixture(false, false);
+        merge_review_approval_fixture(false, None);
     }
 
     #[test]
     fn verified_merge_persists_required_operator_plan_and_launch_readiness() {
-        merge_review_approval_fixture(true, false);
+        merge_review_approval_fixture(true, None);
     }
 
     #[test]
     fn reconciled_prepared_body_reassesses_before_old_merge_step_is_queued() {
-        merge_review_approval_fixture(false, true);
+        merge_review_approval_fixture(false, Some(PreparedBodyReceiptCase::UnknownRecovered));
+    }
+
+    #[test]
+    fn recovered_prepared_body_with_passing_base_guard_reassesses_before_old_merge_step_is_queued()
+    {
+        merge_review_approval_fixture(
+            false,
+            Some(PreparedBodyReceiptCase::PassingRecoveredChangedBody),
+        );
+    }
+
+    #[test]
+    fn recovered_noop_body_with_passing_base_guard_continues_approved_procedure() {
+        merge_review_approval_fixture(false, Some(PreparedBodyReceiptCase::PassingRecoveredNoop));
+    }
+
+    #[test]
+    fn applied_body_with_passing_base_guard_continues_approved_procedure() {
+        merge_review_approval_fixture(
+            false,
+            Some(PreparedBodyReceiptCase::PassingAppliedChangedBody),
+        );
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum PreparedBodyReceiptCase {
+        UnknownRecovered,
+        PassingRecoveredChangedBody,
+        PassingRecoveredNoop,
+        PassingAppliedChangedBody,
     }
 
     pub(crate) fn merge_work_fixture_item(
@@ -1687,6 +1723,24 @@ pub(crate) mod tests {
         config_digest: Digest,
         accepted_plan_digest: Digest,
         reassessment_case: bool,
+        head_sha: &str,
+    ) -> crate::store::merge_work::MergeWorkItem {
+        merge_work_fixture_item_with_body_case(
+            project_id,
+            ticket_run_id,
+            config_digest,
+            accepted_plan_digest,
+            reassessment_case.then_some(PreparedBodyReceiptCase::UnknownRecovered),
+            head_sha,
+        )
+    }
+
+    fn merge_work_fixture_item_with_body_case(
+        project_id: crate::domain::ids::ProjectId,
+        ticket_run_id: TicketRunId,
+        config_digest: Digest,
+        accepted_plan_digest: Digest,
+        body_case: Option<PreparedBodyReceiptCase>,
         head_sha: &str,
     ) -> crate::store::merge_work::MergeWorkItem {
         use crate::domain::ids::Revision;
@@ -1702,6 +1756,12 @@ pub(crate) mod tests {
         fn digest(ch: char) -> Digest {
             Digest::parse(ch.to_string().repeat(64)).unwrap()
         }
+        let reassessment_case = body_case.is_some();
+        let prior_body = if body_case == Some(PreparedBodyReceiptCase::PassingRecoveredNoop) {
+            "Reviewed body\n"
+        } else {
+            "Prior body\n"
+        };
         let comments = Vec::<crate::forge::IssueComment>::new();
         let comments_digest = crate::forge::canonical_digest(&comments).unwrap();
         let subject = MergeSubject {
@@ -1723,7 +1783,7 @@ pub(crate) mod tests {
             base_guard_digest: Some(digest('6')),
             review_digest: digest('7'),
             prepared_body_digest: Some(if reassessment_case {
-                Digest::parse(super::sha256_hex(b"Prior body\n")).unwrap()
+                Digest::parse(super::sha256_hex(prior_body.as_bytes())).unwrap()
             } else {
                 digest('8')
             }),
@@ -1744,10 +1804,9 @@ pub(crate) mod tests {
             risk: Vec::new(),
             confidence: Confidence::High,
             human_review_required: true,
-            execution_time_base_guard: if reassessment_case {
-                EvidenceState::Unknown
-            } else {
-                EvidenceState::Pass
+            execution_time_base_guard: match body_case {
+                Some(PreparedBodyReceiptCase::UnknownRecovered) => EvidenceState::Unknown,
+                _ => EvidenceState::Pass,
             },
         };
         let assessment = evaluate_merge_policy(&policy, &evidence).unwrap();
@@ -1859,10 +1918,9 @@ pub(crate) mod tests {
                 instruction_digest: subject.instruction_digest.clone(),
                 sources: Default::default(),
                 request_comment_proofs: Vec::new(),
-                execution_time_base_guard: if reassessment_case {
-                    EvidenceState::Unknown
-                } else {
-                    EvidenceState::Pass
+                execution_time_base_guard: match body_case {
+                    Some(PreparedBodyReceiptCase::UnknownRecovered) => EvidenceState::Unknown,
+                    _ => EvidenceState::Pass,
                 },
                 base_guard_digest: subject.base_guard_digest.clone(),
             },
@@ -1883,7 +1941,10 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    fn merge_review_approval_fixture(required_operations: bool, reassessment_case: bool) {
+    fn merge_review_approval_fixture(
+        required_operations: bool,
+        body_case: Option<PreparedBodyReceiptCase>,
+    ) {
         use crate::domain::ids::{
             Digest, HumanRequestId, OperationId, ProjectId, Revision, TicketRunId,
         };
@@ -2128,12 +2189,18 @@ pub(crate) mod tests {
             "INSERT INTO accepted_work_plans(project_id,ticket_run_id,accepted_revision,configuration_digest,plan_digest,plan_json,source_evidence_id,source_agent_run_id,source_message_id,source_result_digest,coordinator_agent_run_id,coordinator_role_session_id,coordinator_authority_digest,created_at_unix) VALUES (?1,?2,2,?3,?4,?5,'source-evidence','coordinator-run','source-message',?6,'coordinator-run','coordinator-session',?7,1)",
             params![project_id.as_str(), ticket_run_id.as_str(), loaded.digest.as_str(), plan_digest.as_str(), plan_json, "a".repeat(64), "b".repeat(64)],
         ).unwrap();
-        let work_item = merge_work_fixture_item(
+        let reassessment_case = body_case.is_some();
+        let prior_body = if body_case == Some(PreparedBodyReceiptCase::PassingRecoveredNoop) {
+            "Reviewed body\n"
+        } else {
+            "Prior body\n"
+        };
+        let work_item = merge_work_fixture_item_with_body_case(
             project_id.clone(),
             ticket_run_id.clone(),
             loaded.digest.clone(),
             plan_digest,
-            reassessment_case,
+            body_case,
             &"a".repeat(40),
         );
         let work_json = crate::store::canonical_json(&serde_json::json!({
@@ -2342,7 +2409,7 @@ pub(crate) mod tests {
                 pull: pull.clone(),
                 operation_key: operation_key.clone(),
                 expected_head_sha: "a".repeat(40),
-                expected_prior_body_digest: Digest::parse(super::sha256_hex(b"Prior body\n"))
+                expected_prior_body_digest: Digest::parse(super::sha256_hex(prior_body.as_bytes()))
                     .unwrap(),
                 exact_body: "Reviewed body\n".into(),
                 approved_body_digest: Digest::parse(super::sha256_hex(b"Reviewed body\n")).unwrap(),
@@ -2358,20 +2425,34 @@ pub(crate) mod tests {
             let receipt = MergeStepReceipt {
                 step_key: "body".into(),
                 operation_key: operation_key.clone(),
-                certainty: EffectCertainty::Recovered,
+                certainty: if body_case == Some(PreparedBodyReceiptCase::PassingAppliedChangedBody)
+                {
+                    EffectCertainty::Applied
+                } else {
+                    EffectCertainty::Recovered
+                },
                 request_digest: request_digest.clone(),
                 effect_intent,
                 acknowledgement: EffectAcknowledgement {
                     operation_key,
                     request_digest,
-                    certainty: EffectCertainty::Recovered,
+                    certainty: if body_case
+                        == Some(PreparedBodyReceiptCase::PassingAppliedChangedBody)
+                    {
+                        EffectCertainty::Applied
+                    } else {
+                        EffectCertainty::Recovered
+                    },
                     external_id: None,
                     external_url: None,
                     resulting_head_sha: Some("a".repeat(40)),
                     resulting_merge_sha: None,
-                    reason: Some(
-                        "exact prepared body observed during provider reconciliation".into(),
-                    ),
+                    reason: Some(match body_case {
+                        Some(PreparedBodyReceiptCase::PassingAppliedChangedBody) => {
+                            "approved body update applied".into()
+                        }
+                        _ => "exact prepared body observed during provider reconciliation".into(),
+                    }),
                 },
             };
             let receipt_json = crate::store::canonical_json(&receipt).unwrap();
@@ -2393,56 +2474,85 @@ pub(crate) mod tests {
                 )
                 .unwrap()
             );
-            let reassessed = store
+            let after_body = store
                 .active_ticket_runs(generation, 10)
                 .unwrap()
                 .into_iter()
                 .find(|run| run.ticket_run_id == ticket_run_id)
                 .unwrap();
-            assert_eq!(reassessed.phase, super::Phase::Planning);
-            assert_eq!(reassessed.revision, 7);
-            assert!(
-                store
+            let should_reassess = matches!(
+                body_case,
+                Some(PreparedBodyReceiptCase::UnknownRecovered)
+                    | Some(PreparedBodyReceiptCase::PassingRecoveredChangedBody)
+            );
+            if should_reassess {
+                assert_eq!(after_body.phase, super::Phase::Planning);
+                assert_eq!(after_body.revision, 7);
+                assert!(
+                    store
+                        .effect_by_logical_key(&format!(
+                            "{}:6:{}:001:merge",
+                            ticket_run_id, work_item.work_id
+                        ))
+                        .unwrap()
+                        .is_none()
+                );
+                let coordinator_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("ticket_run:{ticket_run_id}:coordinator"),
+                        8,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| {
+                        wake.source_type == "ticket_run_transition"
+                            && wake.source_revision == 7
+                            && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(coordinator_wakes.len(), 1);
+                let transition_evidence = store
+                    .ticket_run_transition_evidence(generation, &project_id, &ticket_run_id, 6, 1)
+                    .unwrap();
+                assert_eq!(transition_evidence.len(), 1);
+                assert_eq!(
+                    transition_evidence[0].1["kind"],
+                    "merge_reassessment_required"
+                );
+                assert_eq!(
+                    transition_evidence[0].1["work_id"],
+                    work_item.work_id.as_str()
+                );
+                let expected_receipt_digest = Digest::parse(super::sha256_hex(
+                    crate::store::canonical_json(&receipt).unwrap().as_bytes(),
+                ))
+                .unwrap();
+                assert_eq!(
+                    transition_evidence[0].1["receipt_digest"],
+                    expected_receipt_digest.as_str()
+                );
+                assert!(
+                    store
+                        .accepted_merge_work_review_approval(&request_id, &work_item, 15)
+                        .unwrap()
+                        .is_some()
+                );
+            } else {
+                assert_eq!(after_body.phase, super::Phase::AwaitingMerge);
+                assert_eq!(after_body.revision, 6);
+                let next = store
                     .effect_by_logical_key(&format!(
                         "{}:6:{}:001:merge",
                         ticket_run_id, work_item.work_id
                     ))
                     .unwrap()
-                    .is_none()
-            );
-            let coordinator_wakes = store
-                .pending_role_wake_inputs(
-                    &project_id,
-                    &format!("ticket_run:{ticket_run_id}:coordinator"),
-                    8,
-                )
-                .unwrap()
-                .into_iter()
-                .filter(|wake| {
-                    wake.source_type == "ticket_run_transition"
-                        && wake.source_revision == 7
-                        && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(coordinator_wakes.len(), 1);
-            let transition_evidence = store
-                .ticket_run_transition_evidence(generation, &project_id, &ticket_run_id, 6, 1)
-                .unwrap();
-            assert_eq!(
-                transition_evidence[0].1["kind"],
-                "merge_reassessment_required"
-            );
-            assert_eq!(
-                transition_evidence[0].1["work_id"],
-                work_item.work_id.as_str()
-            );
-            assert!(transition_evidence[0].1["receipt_digest"].is_string());
-            assert!(
-                store
-                    .accepted_merge_work_review_approval(&request_id, &work_item, 15)
-                    .unwrap()
-                    .is_some()
-            );
+                    .expect("passing base guard keeps the approved procedure moving");
+                let next_request: MergeStepEffectRequest =
+                    serde_json::from_str(&next.request_json).unwrap();
+                assert_eq!(next_request.step_key, "merge");
+                assert_eq!(next_request.prior_receipts, vec![receipt]);
+            }
             return;
         }
         let direct_merge = DirectMergeIntent {
