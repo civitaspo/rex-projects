@@ -1957,28 +1957,10 @@ fn ingest_next_spooled_agent_result_inner(
         return Ok(Some(existing));
     }
 
-    // A terminal may commit before role validation or before the next controller tick.
-    // Revisit that durable gap without rereading an Agent-writable spool.
-    let terminal_ids = {
-        let mut statement = store.connection.prepare(
-            "SELECT t.agent_run_id FROM agent_terminal_receipts t
-             WHERE NOT EXISTS(SELECT 1 FROM agent_result_evidence e WHERE e.agent_run_id=t.agent_run_id)
-               AND NOT EXISTS(SELECT 1 FROM role_wake_inputs w WHERE w.source_type='role_result_rejected' AND w.source_id=t.agent_run_id AND json_extract(w.payload_json,'$.terminal_digest')=t.terminal_digest)
-             ORDER BY t.observed_at_unix,t.agent_run_id LIMIT ?1",
-        ).map_err(|error| error.to_string())?;
-        statement
-            .query_map([candidate_limit as u64], |row| row.get::<_, String>(0))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
-    };
-    for run_id in terminal_ids {
-        let terminal = verify_agent_terminal(store, owner_generation, &AgentRunId::parse(run_id)?)?;
-        if let Some(result) =
-            ingest_verified_terminal_result(store, artifact_store, owner_generation, &terminal)?
-        {
-            return Ok(Some(result));
-        }
+    if let Some(result) =
+        ingest_pending_verified_terminals(store, artifact_store, owner_generation, candidate_limit)?
+    {
+        return Ok(Some(result));
     }
 
     let candidates = {
@@ -2079,6 +2061,38 @@ fn ingest_next_spooled_agent_result_inner(
     Ok(None)
 }
 
+/// Reconcile the durable terminal-before-result gap. Kept as one production helper so tests and
+/// controller ticks exercise the same candidate query and terminal ingestion path.
+fn ingest_pending_verified_terminals(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    candidate_limit: usize,
+) -> Result<Option<IngestedAgentResult>, String> {
+    let terminal_ids = {
+        let mut statement = store.connection.prepare(
+            "SELECT t.agent_run_id FROM agent_terminal_receipts t
+             WHERE NOT EXISTS(SELECT 1 FROM agent_result_evidence e WHERE e.agent_run_id=t.agent_run_id)
+               AND NOT EXISTS(SELECT 1 FROM role_wake_inputs w WHERE w.source_type='role_result_rejected' AND w.source_id=t.agent_run_id AND json_extract(w.payload_json,'$.terminal_digest')=t.terminal_digest)
+             ORDER BY t.observed_at_unix,t.agent_run_id LIMIT ?1",
+        ).map_err(|error| error.to_string())?;
+        statement
+            .query_map([candidate_limit as u64], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for run_id in terminal_ids {
+        let terminal = verify_agent_terminal(store, owner_generation, &AgentRunId::parse(run_id)?)?;
+        if let Some(result) =
+            ingest_verified_terminal_result(store, artifact_store, owner_generation, &terminal)?
+        {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
 fn ingest_verified_terminal_result(
     store: &mut ConfigStore,
     artifact_store: &crate::artifacts::ArtifactStore,
@@ -2119,6 +2133,13 @@ fn ingest_verified_terminal_result(
         }
     }
     if !valid {
+        reblock_rejected_merge_claim_recovery_terminal(
+            store,
+            owner_generation,
+            terminal,
+            &authority,
+            "the authorized recovery Agent exited with an invalid role result",
+        )?;
         record_rejected_role_result(
             store,
             owner_generation,
@@ -2144,6 +2165,13 @@ fn ingest_verified_terminal_result(
         Err(error)
             if error == "TicketRun revision or config no longer matches Agent launch authority" =>
         {
+            reblock_rejected_merge_claim_recovery_terminal(
+                store,
+                owner_generation,
+                terminal,
+                &authority,
+                "the authorized recovery Agent terminal belongs to a stale launch snapshot",
+            )?;
             record_rejected_role_result(
                 store,
                 owner_generation,
@@ -2160,6 +2188,163 @@ fn ingest_verified_terminal_result(
         }
         Err(error) => Err(error),
     }
+}
+
+/// A verified terminal with malformed role output is not role evidence, but it can prove that an
+/// already-authorized one-shot recovery turn has ended. Use only the persisted launch authority,
+/// exact consumed recovery wake / parent evidence, and verified terminal receipt to close that
+/// recovery attempt; never interpret the malformed payload as authority.
+fn reblock_rejected_merge_claim_recovery_terminal(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    terminal: &VerifiedAgentTerminal,
+    authority: &AgentLaunchAuthority,
+    reason: &str,
+) -> Result<(), String> {
+    if !matches!(authority.role, Role::Coordinator | Role::MergeDecision) {
+        return Ok(());
+    }
+    let Some(ticket_run_id) = authority.ticket_run_id.as_ref() else {
+        return Ok(());
+    };
+    let recovery = match authority.role {
+        Role::Coordinator => super::merge_claim_recovery::authorized_recovery_for_coordinator_run(
+            &store.connection,
+            &authority.project_id,
+            ticket_run_id,
+            &authority.agent_run_id,
+            authority
+                .ticket_revision
+                .map(|revision| revision.0)
+                .unwrap_or_default(),
+        )?,
+        Role::MergeDecision => {
+            let Some(parent_run_id) = authority.parent_run_id.as_ref() else {
+                return Ok(());
+            };
+            if authority.parent_role != Some(Role::Coordinator) {
+                return Ok(());
+            }
+            let row: Option<(String, String, String, String)> = store.connection.query_row(
+                "SELECT request_id,subject_json,subject_digest,authorization_key FROM merge_claim_recovery_requests WHERE project_id=?1 AND ticket_run_id=?2 AND state IN ('consumed','accepted') AND coordinator_evidence_id=(SELECT e.evidence_id FROM agent_result_evidence e WHERE e.agent_run_id=?3 AND e.role='coordinator' AND e.outcome='completed') ORDER BY updated_at_unix DESC LIMIT 1",
+                rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str(), parent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            row.map(|(request_id, subject_json, subject_digest, authorization_key)| {
+                let subject: super::merge_claim_recovery::MergeClaimRecoverySubject =
+                    crate::protocol::parse_unique(subject_json.as_bytes())?;
+                let subject_digest = Digest::parse(subject_digest)?;
+                let authorization_key = Digest::parse(authorization_key)?;
+                if subject.digest()? != subject_digest
+                    || subject.project_id != authority.project_id
+                    || subject.ticket_run_id != *ticket_run_id
+                    || authority.config_digest != subject.configuration_digest
+                    || authority.instruction_digest != subject.instruction_digest
+                    || authority.ticket_revision.map(|revision| revision.0)
+                        != subject.blocked_revision.checked_add(1)
+                {
+                    return Err("rejected MergeDecision terminal differs from immutable recovery subject".into());
+                }
+                Ok::<super::merge_claim_recovery::AuthorizedMergeClaimRecovery, String>(super::merge_claim_recovery::AuthorizedMergeClaimRecovery {
+                    request_id,
+                    subject,
+                    subject_digest,
+                    authorization_key,
+                    state: "consumed".into(),
+                    coordinator_evidence_id: None,
+                })
+            }).transpose()?
+        }
+        _ => None,
+    };
+    let Some(recovery) = recovery else {
+        return Ok(());
+    };
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    super::validate_active_generation(&tx, owner_generation)?;
+    verify_persisted_authority(&tx, authority, &terminal.authority_digest)?;
+    verify_terminal_row(&tx, terminal)?;
+    let run: Option<(u64, String, String, String)> = tx.query_row(
+        "SELECT revision,internal_phase,activity,external_status FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+        rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((revision, phase, activity, status)) = run else {
+        return Ok(());
+    };
+    if authority.ticket_revision.map(|value| value.0) != Some(revision)
+        || revision != recovery.subject.blocked_revision.saturating_add(1)
+        || serde_json::from_str::<crate::engine::reducer::Phase>(&format!("\"{phase}\""))
+            .map_err(|error| error.to_string())?
+            != crate::engine::reducer::Phase::Assessing
+        || serde_json::from_str::<crate::engine::reducer::Activity>(&format!("\"{activity}\""))
+            .map_err(|error| error.to_string())?
+            != crate::engine::reducer::Activity::Running
+    {
+        return Ok(());
+    }
+    let stored: Option<(String, String, String)> = tx.query_row(
+        "SELECT state,subject_digest,authorization_key FROM merge_claim_recovery_requests WHERE request_id=?1 AND project_id=?2 AND ticket_run_id=?3",
+        rusqlite::params![recovery.request_id, authority.project_id.as_str(), ticket_run_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((state, subject_digest, authorization_key)) = stored else {
+        return Ok(());
+    };
+    let allowed_state = match authority.role {
+        Role::Coordinator => state == "authorized",
+        Role::MergeDecision => matches!(state.as_str(), "consumed" | "accepted"),
+        _ => false,
+    };
+    if !allowed_state
+        || subject_digest != recovery.subject_digest.as_str()
+        || authorization_key != recovery.authorization_key.as_str()
+    {
+        return Ok(());
+    }
+    let current = crate::engine::reducer::TicketRun {
+        project_id: authority.project_id.clone(),
+        ticket_run_id: ticket_run_id.clone(),
+        revision: Revision(revision),
+        phase: crate::engine::reducer::Phase::Assessing,
+        activity: crate::engine::reducer::Activity::Running,
+        external_status: super::parse_ticket_status(&status)?,
+        required_review_revision: None,
+    };
+    let decision = crate::engine::reducer::reduce(
+        &current,
+        current.revision,
+        crate::engine::reducer::Input::HumanMergeDecisionResumeFailed,
+    )?;
+    let terminal_ref = format!("terminal:{}", terminal.terminal_digest.as_str());
+    let evidence = serde_json::json!({"kind":"human_merge_claim_recovery_reblocked","request_id":recovery.request_id,"verified_terminal_digest":terminal.terminal_digest,"authorization_key":recovery.authorization_key,"reason":reason,"source_revision":revision});
+    tx.execute(
+        "UPDATE ticket_runs SET internal_phase=?3,activity=?4,external_status=?5,revision=?6 WHERE project_id=?1 AND ticket_run_id=?2 AND revision=?7",
+        rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str(), super::enum_string(&decision.ticket_run.phase)?, super::enum_string(&decision.ticket_run.activity)?, super::enum_string(&decision.ticket_run.external_status)?, decision.ticket_run.revision.0, revision],
+    ).map_err(|error| error.to_string())?;
+    if tx.changes() != 1 {
+        return Err("TicketRun changed while reblocking rejected recovery terminal".into());
+    }
+    tx.execute(
+        "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'ticket_run',?2,?3,?4,?5,'rejected recovery Agent terminal',?6,?7)",
+        rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str(), revision, decision.ticket_run.revision.0, format!("merge-claim-recovery-reblocked:{}", recovery.request_id), crate::store::canonical_json(&evidence)?, unix_now()?],
+    ).map_err(|error| error.to_string())?;
+    let wake = serde_json::json!({"kind":"human_merge_claim_recovery_reblocked","ticket_run_id":ticket_run_id.as_str(),"request_id":recovery.request_id,"reason":reason,"revision":decision.ticket_run.revision.0});
+    tx.execute(
+        "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'merge_claim_recovery_reblocked',?3,?4,100,?5,'pending',?6)",
+        rusqlite::params![authority.project_id.as_str(), format!("project:{}:supervisor", authority.project_id.as_str()), recovery.request_id, decision.ticket_run.revision.0, crate::store::canonical_json(&wake)?, unix_now()?],
+    ).map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE merge_claim_recovery_requests SET state='reblocked',resumed_result_evidence_id=?2,rejection_reason=?3,updated_at_unix=?4 WHERE request_id=?1 AND state=?5",
+        rusqlite::params![recovery.request_id, terminal_ref, reason, unix_now()?, state],
+    ).map_err(|error| error.to_string())?;
+    if tx.changes() != 1 {
+        return Err("recovery attempt changed while reblocking rejected terminal".into());
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 
 fn record_rejected_role_result(
@@ -3316,10 +3501,13 @@ pub(crate) mod tests {
                  CREATE TABLE agent_launch_authority(agent_run_id TEXT, authority_json TEXT, descriptor_digest TEXT, authority_digest TEXT);
                  CREATE TABLE agent_result_evidence(evidence_id TEXT, agent_run_id TEXT, project_id TEXT, role TEXT, outcome TEXT, ticket_run_id TEXT, run_epoch INTEGER);
                  INSERT INTO agent_result_evidence VALUES ('evidence-spawn','coordinator-run','project-a','coordinator','completed','ticket-run',3);
-                 CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, source_revision INTEGER, priority INTEGER, payload_json TEXT, lifecycle TEXT, created_at_unix INTEGER, UNIQUE(role_session_id,source_type,source_id,source_revision));
-                 CREATE TABLE agent_result_reducer_ack(evidence_id TEXT PRIMARY KEY, reducer_revision INTEGER, disposition TEXT, acknowledged_at_unix INTEGER);",
+                 CREATE TABLE role_wake_inputs(wake_input_id INTEGER PRIMARY KEY, project_id TEXT, role_session_id TEXT, source_type TEXT, source_id TEXT, source_revision INTEGER, priority INTEGER, payload_json TEXT, lifecycle TEXT, created_at_unix INTEGER, consuming_agent_run_id TEXT, UNIQUE(role_session_id,source_type,source_id,source_revision));
+                 CREATE TABLE agent_result_reducer_ack(evidence_id TEXT PRIMARY KEY, reducer_revision INTEGER, disposition TEXT, acknowledged_at_unix INTEGER);
+                 CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at_unix INTEGER NOT NULL);
+                 PRAGMA user_version=15;",
             )
             .unwrap();
+        super::super::merge_claim_recovery::migrate_v16(&connection).unwrap();
         connection
             .execute(
                 "INSERT INTO agent_launch_authority VALUES ('coordinator-run',?1,?2,?3)",
@@ -5547,6 +5735,8 @@ pub(crate) mod tests {
             Some(AgentRunId::parse("fixture-artifact-source-worker").unwrap()),
             Vec::new(),
             Some("node-artifact-source"),
+            None,
+            None,
         )
         .unwrap();
         let source_references = source.message.artifact_refs.clone();
@@ -5594,18 +5784,29 @@ pub(crate) mod tests {
             prior_worker_result_evidence_id: source_evidence_id.clone(),
             prior_artifact_refs: source_references.clone(),
         };
+        let role_session = format!("ticket:{ticket}:{role}", role = "worker:node-a");
+        let wake_payload = serde_json::json!({"authorization":wake_authorization});
+        worker.store.test_connection().execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'worker_recovery_authorization',?3,4,1,?4,'pending',1)",
+            rusqlite::params![project.as_str(), role_session, source_evidence_id, crate::store::canonical_json(&wake_payload).unwrap()],
+        ).unwrap();
+        let wake_input_id: u64 = worker
+            .store
+            .test_connection()
+            .last_insert_rowid()
+            .try_into()
+            .unwrap();
         let wake_input = crate::agent_api::AgentWakeItem {
-            wake_input_id: 1,
+            wake_input_id,
             source_type: "worker_recovery_authorization".into(),
             source_id: source_evidence_id,
             source_revision: 4,
             priority: 1,
-            payload_json: serde_json::json!({"authorization":wake_authorization}),
+            payload_json: wake_payload,
             host_artifact_source_evidence_ids: Vec::new(),
             host_artifacts: staged_locators,
             host_completion_context: None,
         };
-        let role_session = format!("ticket:{ticket}:{role}", role = "worker:node-a");
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: project.clone(),
@@ -5637,6 +5838,8 @@ pub(crate) mod tests {
             Some(worker_id.clone()),
             wake_snapshot.inputs.clone(),
             Some("node-a"),
+            None,
+            None,
         )
         .unwrap();
         let _recipient_result = worker
@@ -8501,12 +8704,12 @@ pub(crate) mod host_validation_fixture {
         pub ingested: IngestedAgentResult,
     }
 
-    pub(super) struct InPlaceTerminalFixture {
-        pub(super) artifacts: crate::artifacts::ArtifactStore,
-        pub(super) terminal: VerifiedAgentTerminal,
-        pub(super) message: RoleResultMessage,
-        pub(super) start: StartRequestEnvelope,
-        pub(super) result: AgentTurnResult,
+    pub(crate) struct InPlaceTerminalFixture {
+        pub(crate) artifacts: crate::artifacts::ArtifactStore,
+        pub(crate) terminal: VerifiedAgentTerminal,
+        pub(crate) message: RoleResultMessage,
+        pub(crate) start: StartRequestEnvelope,
+        pub(crate) result: AgentTurnResult,
     }
 
     /// Builds real host terminal and result evidence around test-seeded running launch records.
@@ -8728,6 +8931,38 @@ pub(crate) mod host_validation_fixture {
         agent_run_id: AgentRunId,
         wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
     ) -> Result<InPlaceValidatedResultFixture, String> {
+        host_validated_result_in_with_wake_inputs_and_parent(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            ticket_run_id,
+            role,
+            message,
+            agent_run_id,
+            wake_inputs,
+            None,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixture binds explicit wake and Coordinator parent identities"
+    )]
+    pub(crate) fn host_validated_result_in_with_wake_inputs_and_parent(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        role: Role,
+        message: RoleResultMessage,
+        agent_run_id: AgentRunId,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
+        parent_run_id: Option<AgentRunId>,
+        instruction_digest: Option<Digest>,
+    ) -> Result<InPlaceValidatedResultFixture, String> {
         let prepared = host_validated_result_inner(
             store,
             root,
@@ -8739,6 +8974,8 @@ pub(crate) mod host_validation_fixture {
             Some(agent_run_id),
             wake_inputs,
             None,
+            parent_run_id,
+            instruction_digest,
         )
         .map_err(|error| format!("host validated result fixture setup: {error}"))?;
         let ingested = store
@@ -8753,6 +8990,66 @@ pub(crate) mod host_validation_fixture {
             artifacts: prepared.artifacts,
             ingested,
         })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fixture supplies exact launch and recovery wake lineage for a crash-cut test"
+    )]
+    pub(crate) fn host_validated_terminal_in_with_wake_inputs_and_parent(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        role: Role,
+        message: RoleResultMessage,
+        agent_run_id: AgentRunId,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
+        parent_run_id: Option<AgentRunId>,
+        instruction_digest: Option<Digest>,
+    ) -> Result<InPlaceTerminalFixture, String> {
+        host_validated_result_inner(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            Some(ticket_run_id),
+            role,
+            message,
+            Some(agent_run_id),
+            wake_inputs,
+            None,
+            parent_run_id,
+            instruction_digest,
+        )
+        .map_err(|error| format!("host terminal fixture setup: {error}"))
+    }
+
+    pub(crate) fn close_recovery_terminal_for_test(
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        terminal: &VerifiedAgentTerminal,
+        reason: &str,
+    ) -> Result<(), String> {
+        let authority = store
+            .agent_launch_authority(terminal.agent_run_id())?
+            .ok_or("fixture terminal has no launch authority")?;
+        super::reblock_rejected_merge_claim_recovery_terminal(
+            store,
+            owner_generation,
+            terminal,
+            &authority,
+            reason,
+        )
+    }
+
+    pub(crate) fn reconcile_pending_terminals_for_test(
+        store: &mut ConfigStore,
+        artifacts: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+    ) -> Result<Option<IngestedAgentResult>, String> {
+        ingest_pending_verified_terminals(store, artifacts, owner_generation, 128)
     }
 
     #[expect(
@@ -8780,6 +9077,8 @@ pub(crate) mod host_validation_fixture {
             agent_run_id_override,
             Vec::new(),
             None,
+            None,
+            None,
         )
     }
 
@@ -8801,6 +9100,8 @@ pub(crate) mod host_validation_fixture {
             None,
             Vec::new(),
             None,
+            None,
+            None,
         )
     }
 
@@ -8819,6 +9120,8 @@ pub(crate) mod host_validation_fixture {
         agent_run_id_override: Option<AgentRunId>,
         wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
         worker_node_id: Option<&str>,
+        parent_run_id_override: Option<AgentRunId>,
+        instruction_digest_override: Option<Digest>,
     ) -> Result<InPlaceTerminalFixture, String> {
         let project = store
             .project(&project_id)?
@@ -8878,6 +9181,9 @@ pub(crate) mod host_validation_fixture {
             Role::Supervisor => format!("project:{}:supervisor", project_id.as_str()),
             _ => format!("fixture-{:?}", role).to_lowercase(),
         };
+        if let Some(instruction_digest) = instruction_digest_override {
+            authority.instruction_digest = instruction_digest;
+        }
         let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: project_id.clone(),
@@ -8889,11 +9195,15 @@ pub(crate) mod host_validation_fixture {
         };
         wake_snapshot.digest = wake_snapshot.content_digest()?;
         authority.wake_snapshot_digest = wake_snapshot.digest.clone();
-        let parent_run_id = AgentRunId::parse(if has_run_id_override {
-            format!("{agent_run_id}-parent")
+        let parent_run_id = if let Some(parent_run_id) = parent_run_id_override {
+            parent_run_id
         } else {
-            "fixture-parent-run".to_owned()
-        })?;
+            AgentRunId::parse(if has_run_id_override {
+                format!("{agent_run_id}-parent")
+            } else {
+                "fixture-parent-run".to_owned()
+            })?
+        };
         let parent_role = if role == Role::Coordinator {
             Role::Supervisor
         } else {
@@ -9024,87 +9334,131 @@ pub(crate) mod host_validation_fixture {
         authority.descriptor_digest = package.publish_once(&authority.descriptor_path)?;
         if role != Role::Supervisor {
             let parent_run_id_str = parent_run_id.as_str();
-            let mut parent_authority = authority.clone();
-            parent_authority.agent_run_id = parent_run_id.clone();
-            parent_authority.role = parent_role;
-            parent_authority.role_session_id = parent_role_session_id.clone().unwrap_or_default();
-            parent_authority.parent_run_id = None;
-            parent_authority.parent_role = None;
-            if parent_role == Role::Supervisor {
-                parent_authority.ticket_run_id = None;
-                parent_authority.ticket_revision = None;
-                let existing_view: Option<(String, String, String, String)> = store.connection.query_row(
+            let existing_parent: Option<(String, String)> = store
+                .connection
+                .query_row(
+                    "SELECT authority_json,authority_digest FROM agent_launch_authority WHERE agent_run_id=?1 AND project_id=?2",
+                    rusqlite::params![parent_run_id_str, project_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some((authority_json, authority_digest)) = &existing_parent {
+                let existing: crate::launch::AgentLaunchAuthority =
+                    crate::protocol::parse_unique(authority_json.as_bytes())?;
+                existing.validate()?;
+                let completed: bool = store.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_result_evidence WHERE agent_run_id=?1 AND project_id=?2 AND role='coordinator' AND outcome='completed')",
+                    rusqlite::params![parent_run_id_str, project_id.as_str()],
+                    |row| row.get(0),
+                ).map_err(|error| error.to_string())?;
+                if existing.digest()?.as_str() != authority_digest
+                    || existing.role != parent_role
+                    || existing.role_session_id
+                        != parent_role_session_id.as_deref().unwrap_or_default()
+                    || existing.ticket_run_id != ticket_run_id
+                    || !completed
+                {
+                    return Err(
+                        "existing fixture parent is not a completed canonical Coordinator".into(),
+                    );
+                }
+            }
+            if existing_parent.is_none() {
+                let mut parent_authority = authority.clone();
+                parent_authority.agent_run_id = parent_run_id.clone();
+                parent_authority.role = parent_role;
+                parent_authority.role_session_id =
+                    parent_role_session_id.clone().unwrap_or_default();
+                parent_authority.parent_run_id = None;
+                parent_authority.parent_role = None;
+                if parent_role == Role::Supervisor {
+                    parent_authority.ticket_run_id = None;
+                    parent_authority.ticket_revision = None;
+                    let existing_view: Option<(String, String, String, String)> = store.connection.query_row(
                     "SELECT view_id,rex_server_identity,rex_session_id,rex_window_id FROM rex_views WHERE project_id=?1 AND view_kind='supervisor' AND lifecycle='active' LIMIT 1",
                     [project_id.as_str()],
                     |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
                 ).optional().map_err(|error| error.to_string())?;
-                let (supervisor_view_id, server_identity, session_id, window_id) = if let Some(
-                    existing,
-                ) =
-                    existing_view
-                {
-                    existing
-                } else {
-                    let view_id = crate::launch::RexView::derive_id(
-                        &project_id,
-                        crate::launch::RexViewKind::Supervisor,
-                        None,
-                        None,
-                        mailbox_now,
-                    )?;
-                    store.connection.execute(
+                    let (supervisor_view_id, server_identity, session_id, window_id) = if let Some(
+                        existing,
+                    ) =
+                        existing_view
+                    {
+                        existing
+                    } else {
+                        let view_id = crate::launch::RexView::derive_id(
+                            &project_id,
+                            crate::launch::RexViewKind::Supervisor,
+                            None,
+                            None,
+                            mailbox_now,
+                        )?;
+                        store.connection.execute(
                             "INSERT INTO rex_views(view_id,project_id,view_kind,ticket_namespace,ticket_id,view_epoch,rex_server_identity,rex_session_id,rex_window_id,pinned,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,'supervisor',NULL,NULL,?3,'fixture-rex','fixture-supervisor-session','fixture-supervisor-window',0,'active',?4,?4)",
                             rusqlite::params![view_id.as_str(), project_id.as_str(), mailbox_now, now],
                         ).map_err(|error| error.to_string())?;
-                    (
-                        view_id.as_str().to_owned(),
-                        "fixture-rex".into(),
-                        "fixture-supervisor-session".into(),
-                        "fixture-supervisor-window".into(),
-                    )
-                };
-                parent_authority.rex_view_id = Digest::parse(supervisor_view_id)?;
-                parent_authority.rex_server_identity = server_identity;
-                parent_authority.rex_session_id = session_id;
-                parent_authority.rex_window_id = window_id;
-            }
-            parent_authority.operation_id = OperationId::parse(if has_run_id_override {
-                format!("{agent_run_id}-parent-op")
-            } else {
-                "fixture-parent-operation".to_owned()
-            })?;
-            parent_authority.rex_block_id = "fixture-parent-block".into();
-            parent_authority.descriptor_path = root.join("parent-package.json");
-            parent_authority.workspace_path = root.join("parent-workspace");
-            parent_authority.control_dir = root.join("parent-control");
-            parent_authority.mailbox_capability_digest =
-                Digest::parse(crate::mailbox::MailboxDescriptor::capability_digest(
-                    parent_run_id_str,
-                    mailbox_expires_at,
-                    mailbox_limits,
-                )?)?;
-            parent_authority.validate()?;
-            let parent_authority_json =
-                serde_json::to_string(&parent_authority).map_err(|error| error.to_string())?;
-            let parent_authority_digest = parent_authority.digest()?;
-            let parent_role_json = serde_json::to_value(parent_role)
-                .map_err(|error| error.to_string())?
-                .as_str()
-                .unwrap()
-                .to_owned();
-            store.connection.execute(
+                        (
+                            view_id.as_str().to_owned(),
+                            "fixture-rex".into(),
+                            "fixture-supervisor-session".into(),
+                            "fixture-supervisor-window".into(),
+                        )
+                    };
+                    parent_authority.rex_view_id = Digest::parse(supervisor_view_id)?;
+                    parent_authority.rex_server_identity = server_identity;
+                    parent_authority.rex_session_id = session_id;
+                    parent_authority.rex_window_id = window_id;
+                }
+                parent_authority.operation_id = OperationId::parse(if has_run_id_override {
+                    format!("{agent_run_id}-parent-op")
+                } else {
+                    "fixture-parent-operation".to_owned()
+                })?;
+                parent_authority.rex_block_id = "fixture-parent-block".into();
+                parent_authority.descriptor_path = root.join("parent-package.json");
+                parent_authority.workspace_path = root.join("parent-workspace");
+                parent_authority.control_dir = root.join("parent-control");
+                parent_authority.mailbox_capability_digest =
+                    Digest::parse(crate::mailbox::MailboxDescriptor::capability_digest(
+                        parent_run_id_str,
+                        mailbox_expires_at,
+                        mailbox_limits,
+                    )?)?;
+                parent_authority.validate()?;
+                let parent_authority_json =
+                    serde_json::to_string(&parent_authority).map_err(|error| error.to_string())?;
+                let parent_authority_digest = parent_authority.digest()?;
+                let parent_role_json = serde_json::to_value(parent_role)
+                    .map_err(|error| error.to_string())?
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                store.connection.execute(
                 "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,role,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES (?1,?2,?3,?4,?5,?6,?7,'fixture-owner',1,?8,'completed',?9)",
                 rusqlite::params![parent_run_id_str, project_id.as_str(), config_source, config_revision.0, config_digest, parent_role_session_id, parent_role_json, parent_authority.operation_id.as_str(), owner_generation],
             ).map_err(|error| error.to_string())?;
-            store.connection.execute(
+                store.connection.execute(
                 "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)",
             rusqlite::params![parent_authority.agent_run_id.as_str(), parent_authority.project_id.as_str(), parent_role_json, parent_authority.role_session_id, parent_authority.ticket_run_id.as_ref().map(TicketRunId::as_str), parent_authority.ticket_revision.map(|revision| revision.0), parent_authority.config_revision.0, parent_authority.config_digest.as_str(), parent_authority.attempt, parent_authority.run_epoch, parent_authority.controller_generation, parent_authority.operation_id.as_str(), parent_authority.rex_view_id.as_str(), parent_authority.descriptor_digest.as_str(), parent_authority.runtime_binary_digest.as_str(), parent_authority.descriptor_path.display().to_string(), parent_authority.environment_snapshot_id.as_str(), parent_authority.profile_id.as_str(), parent_authority.profile_digest.as_str(), parent_authority.instruction_digest.as_str(), parent_authority.result_schema_digest.as_str(), parent_authority.qualification_receipt_digest.as_str(), parent_authority.rex_server_identity, parent_authority.rex_session_id, parent_authority.rex_window_id, parent_authority.rex_block_id, parent_authority.workspace_path.display().to_string(), parent_authority.control_dir.display().to_string(), parent_authority.mailbox_capability_digest.as_str(), parent_authority_json, parent_authority_digest.as_str(), now],
         ).map_err(|error| error.to_string())?;
+            }
         }
         store.connection.execute(
             "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
             rusqlite::params![run_id_str, project_id.as_str(), role_str, authority.role_session_id, authority.parent_run_id.as_ref().map(AgentRunId::as_str), authority.parent_role.map(|role| serde_json::to_value(role).unwrap().as_str().unwrap().to_owned()), authority.ticket_run_id.as_ref().map(TicketRunId::as_str), authority.ticket_revision.map(|revision| revision.0), authority.config_revision.0, authority.config_digest.as_str(), authority.attempt, authority.run_epoch, owner_generation, authority.operation_id.as_str(), authority.rex_view_id.as_str(), authority.descriptor_digest.as_str(), authority.runtime_binary_digest.as_str(), authority.descriptor_path.display().to_string(), authority.environment_snapshot_id.as_str(), authority.profile_id.as_str(), authority.profile_digest.as_str(), authority.instruction_digest.as_str(), authority.result_schema_digest.as_str(), authority.qualification_receipt_digest.as_str(), authority.rex_server_identity, authority.rex_session_id, authority.rex_window_id, authority.rex_block_id, authority.workspace_path.display().to_string(), authority.control_dir.display().to_string(), authority.mailbox_capability_digest.as_str(), serde_json::to_string(&authority).map_err(|error| error.to_string())?, authority.digest()?.as_str(), now],
         ).map_err(|error| error.to_string())?;
+        for wake in &wake_snapshot.inputs {
+            let changed = store.connection.execute(
+                "UPDATE role_wake_inputs SET lifecycle='assigned',consuming_agent_run_id=?2 WHERE wake_input_id=?1 AND project_id=?3 AND role_session_id=?4 AND lifecycle='pending'",
+                rusqlite::params![wake.wake_input_id, run_id_str, project_id.as_str(), authority.role_session_id],
+            ).map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "fixture launch wake input was not pending for the exact role session".into(),
+                );
+            }
+        }
         let project_epoch: u64 = store
             .connection
             .query_row(
@@ -10629,6 +10983,23 @@ impl ConfigStore {
                 "Coordinator child source has a noncanonical Coordinator role session".into(),
             );
         }
+        let recovery_authorization = if let Some(revision) = binding.ticket_revision {
+            super::merge_claim_recovery::authorized_recovery_for_coordinator_run(
+                &tx,
+                &binding.project_id,
+                ticket_run_id,
+                &binding.agent_run_id,
+                revision.0,
+            )?
+        } else {
+            None
+        };
+        if recovery_authorization.is_some() && child_role != Role::MergeDecision {
+            return Err(
+                "a human MergeDecision recovery Coordinator may request only one MergeDecision child"
+                    .into(),
+            );
+        }
         let run: Option<(u64, String, u64, String)> = tx
             .query_row(
                 "SELECT revision,internal_phase,config_revision,config_digest FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
@@ -10774,6 +11145,26 @@ impl ConfigStore {
             )
             .map_err(|error| error.to_string())?;
         }
+        if let Some(recovery) = recovery_authorization {
+            if recovery.subject.configuration_digest != binding.config_digest
+                || recovery.subject.blocked_revision.checked_add(1) != Some(source_revision)
+            {
+                return Err("Coordinator result is outside the exact authorized MergeDecision recovery revision".into());
+            }
+            match recovery.state.as_str() {
+                "authorized" => {
+                    tx.execute(
+                        "UPDATE merge_claim_recovery_requests SET state='consumed',coordinator_evidence_id=?2,updated_at_unix=?3 WHERE request_id=?1 AND state='authorized' AND authorization_key=?4 AND coordinator_evidence_id IS NULL",
+                        rusqlite::params![recovery.request_id,evidence_id,super::now_unix()?,recovery.authorization_key.as_str()],
+                    ).map_err(|error| error.to_string())?;
+                    if tx.changes() != 1 {
+                        return Err("MergeDecision recovery authorization was already consumed or changed".into());
+                    }
+                }
+                "consumed" if recovery.coordinator_evidence_id.as_deref()==Some(evidence_id) => {}
+                _ => return Err("MergeDecision recovery authorization was already consumed by another Coordinator result".into()),
+            }
+        }
         let prior_ack: Option<(u64, String)> = tx
             .query_row(
                 "SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
@@ -10815,6 +11206,26 @@ impl ConfigStore {
         let Some(evidence_id) = evidence_id else {
             return Ok(None);
         };
+        self.coordinator_child_parent_for_evidence(project_id, role_session_id, &evidence_id)
+    }
+
+    /// Resolve the parent for one exact pending Coordinator child source.
+    /// Callers that already have the consumed wake snapshot must not substitute
+    /// the oldest pending child for a different evidence item.
+    pub fn coordinator_child_parent_for_evidence(
+        &self,
+        project_id: &crate::domain::ids::ProjectId,
+        role_session_id: &str,
+        evidence_id: &str,
+    ) -> Result<Option<crate::launch::AgentLaunchAuthority>, String> {
+        let pending: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='coordinator_child' AND source_id=?3 AND lifecycle='pending')",
+            rusqlite::params![project_id.as_str(), role_session_id, evidence_id],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !pending {
+            return Ok(None);
+        }
         let (parent_run, ticket_run_id): (String, String) = self
             .connection
             .query_row(
@@ -10841,6 +11252,83 @@ impl ConfigStore {
             );
         }
         Ok(Some(authority))
+    }
+
+    /// Resolve the Coordinator authority for a later MergeDecision turn from its
+    /// exact host-validated assessment. A consumed child wake is not reusable;
+    /// the assessment's immutable result authority preserves the parent link.
+    pub fn coordinator_parent_for_merge_assessment(
+        &self,
+        project_id: &crate::domain::ids::ProjectId,
+        ticket_run_id: &crate::domain::ids::TicketRunId,
+        revision: crate::domain::ids::Revision,
+    ) -> Result<Option<crate::launch::AgentLaunchAuthority>, String> {
+        let Some(assessment) =
+            self.trusted_merge_assessment(project_id, ticket_run_id, revision)?
+        else {
+            return Ok(None);
+        };
+        let (run_id, role, outcome, evidence_ticket): (String, String, String, Option<String>) = self.connection
+            .query_row(
+                "SELECT agent_run_id,role,outcome,ticket_run_id FROM agent_result_evidence WHERE evidence_id=?1 AND project_id=?2",
+                rusqlite::params![assessment.source_evidence_id, project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if role != "merge_decision"
+            || outcome != "completed"
+            || evidence_ticket.as_deref() != Some(ticket_run_id.as_str())
+        {
+            return Err(
+                "trusted MergeAssessment source is not a completed result for this TicketRun"
+                    .into(),
+            );
+        }
+        let merge_authority = self
+            .agent_launch_authority(&crate::domain::ids::AgentRunId::parse(run_id)?)?
+            .ok_or("trusted MergeAssessment source has no immutable launch authority")?;
+        let parent_id = merge_authority
+            .parent_run_id
+            .as_ref()
+            .ok_or("MergeDecision authority has no Coordinator parent")?;
+        if merge_authority.role != crate::domain::types::Role::MergeDecision
+            || merge_authority.project_id != *project_id
+            || merge_authority.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || merge_authority.ticket_revision != Some(revision)
+            || merge_authority.config_digest != assessment.configuration_digest
+            || merge_authority.parent_role != Some(crate::domain::types::Role::Coordinator)
+            || merge_authority.role_session_id
+                != format!("ticket_run:{ticket_run_id}:merge_decision")
+        {
+            return Err(
+                "trusted MergeAssessment source authority differs from its exact launch scope"
+                    .into(),
+            );
+        }
+        let parent = self
+            .agent_launch_authority(parent_id)?
+            .ok_or("MergeDecision Coordinator parent has no immutable launch authority")?;
+        let parent_completed: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_result_evidence WHERE agent_run_id=?1 AND project_id=?2 AND role='coordinator' AND outcome='completed' AND ticket_run_id=?3)",
+            rusqlite::params![parent_id.as_str(), project_id.as_str(), ticket_run_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !parent_completed
+            || parent.agent_run_id != *parent_id
+            || parent.role != crate::domain::types::Role::Coordinator
+            || parent.project_id != *project_id
+            || parent.ticket_run_id.as_ref() != Some(ticket_run_id)
+            || parent.role_session_id != format!("ticket_run:{ticket_run_id}:coordinator")
+            || parent.config_revision != merge_authority.config_revision
+            || parent.config_digest != assessment.configuration_digest
+            || parent.ticket_revision != Some(revision)
+        {
+            return Err(
+                "MergeDecision parent is not the exact completed Coordinator for this assessment"
+                    .into(),
+            );
+        }
+        Ok(Some(parent))
     }
 
     /// Resolve a TicketRun Coordinator's Supervisor from its immutable dispatch source.

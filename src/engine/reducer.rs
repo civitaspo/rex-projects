@@ -61,6 +61,8 @@ pub enum Input {
     ReviewEscalationRequired,
     RequireHumanReview,
     MergeAssessmentCorrectionExhausted,
+    HumanMergeDecisionResume,
+    HumanMergeDecisionResumeFailed,
     MergeReassessmentRequired(MergeReassessmentProof),
     HumanReviewApproved,
     HumanReviewRevisionRequested,
@@ -249,6 +251,22 @@ pub fn reduce(
             // No Agent assessment is trusted. Keep external status In Progress; the
             // Supervisor must surface the blocked decision for human direction.
             next.activity = Activity::Blocked;
+            wakes.push(WakeTarget::Supervisor);
+        }
+        Input::HumanMergeDecisionResume
+            if current.phase == Phase::Assessing && current.activity == Activity::Blocked =>
+        {
+            // A controller-authorized human recovery gives the Coordinator one
+            // bounded chance to request a fresh MergeDecision child.
+            next.activity = Activity::Running;
+            next.external_status = TicketStatus::InProgress;
+            wakes.push(WakeTarget::TicketRole(Role::Coordinator));
+        }
+        Input::HumanMergeDecisionResumeFailed
+            if current.phase == Phase::Assessing && current.activity == Activity::Running =>
+        {
+            next.activity = Activity::Blocked;
+            next.external_status = TicketStatus::InProgress;
             wakes.push(WakeTarget::Supervisor);
         }
         Input::MergeReassessmentRequired(proof) if current.phase == Phase::AwaitingMerge => {

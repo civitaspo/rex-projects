@@ -192,6 +192,29 @@ enum TicketCommand {
         #[arg(long)]
         request_id: Option<String>,
     },
+    /// Show the exact exhausted MergeDecision blocker and digest-bound recovery subject.
+    BlockedReason {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        run: String,
+    },
+    /// Queue human intent to resume one exhausted MergeDecision claim.
+    ResumeMergeDecision {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        expected_subject_digest: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Show the latest durable state of one MergeDecision recovery request.
+    RecoveryStatus {
+        #[arg(long)]
+        request_id: String,
+    },
     ReleaseClaim {
         namespace: String,
         ticket: String,
@@ -1750,6 +1773,102 @@ fn ticket_command(
                 );
             }
             Ok(())
+        }
+        TicketCommand::BlockedReason { project, run } => {
+            let state_root = selected_state_root(config_path, explicit_state_root)?;
+            let project_id = ProjectId::parse(project).map_err(CliError::usage)?;
+            let ticket_run_id = TicketRunId::parse(run).map_err(CliError::usage)?;
+            let store = ConfigStore::open_readonly(&state_root).map_err(CliError::unavailable)?;
+            let subject = store
+                .merge_claim_recovery_subject(&project_id, &ticket_run_id)
+                .map_err(CliError::not_found)?;
+            let digest = subject.digest().map_err(CliError::unavailable)?;
+            let budget_used = store
+                .merge_claim_recovery_budget_used(&subject)
+                .map_err(CliError::unavailable)?;
+            if json {
+                print_json(
+                    &serde_json::json!({"subject":subject,"subject_digest":digest,"recovery_budget":{"limit":1,"used":budget_used}}),
+                )
+            } else {
+                println!(
+                    "Blocked at revision {}: {}",
+                    subject.blocked_revision, subject.reason
+                );
+                println!(
+                    "Expected pull request: {}",
+                    subject.expected_pull_request_reference
+                );
+                println!("Recovery subject digest: {digest}");
+                println!("Recovery attempt used: {budget_used}");
+                Ok(())
+            }
+        }
+        TicketCommand::ResumeMergeDecision {
+            project,
+            run,
+            expected_subject_digest,
+            request_id,
+        } => {
+            require_human_context()?;
+            let state_root = selected_state_root(config_path, explicit_state_root)?;
+            let project_id = ProjectId::parse(project).map_err(CliError::usage)?;
+            let ticket_run_id = TicketRunId::parse(run).map_err(CliError::usage)?;
+            let expected_subject_digest =
+                Digest::parse(expected_subject_digest).map_err(CliError::usage)?;
+            let request_id = request_id.unwrap_or(generated_request_id()?);
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| CliError::unavailable(error.to_string()))?
+                .as_secs() as i64;
+            let mut store =
+                ConfigStore::open_control(&state_root).map_err(CliError::unavailable)?;
+            let receipt = store
+                .enqueue_merge_claim_recovery(
+                    &request_id,
+                    &expected_subject_digest,
+                    &project_id,
+                    &ticket_run_id,
+                    now_unix,
+                )
+                .map_err(CliError::conflict)?;
+            if json {
+                print_json(
+                    &serde_json::json!({"request_id":receipt.request_id,"ticket_run_id":receipt.ticket_run_id,"blocked_revision":receipt.blocked_revision,"subject_digest":receipt.subject_digest,"state":receipt.state,"replayed":receipt.replayed,"message":"queued for controller validation"}),
+                )
+            } else {
+                println!(
+                    "Recovery request {}: {}{}",
+                    receipt.request_id,
+                    if receipt.state == "pending" {
+                        "queued for controller validation"
+                    } else {
+                        receipt.state.as_str()
+                    },
+                    if receipt.replayed { " (replayed)" } else { "" }
+                );
+                Ok(())
+            }
+        }
+        TicketCommand::RecoveryStatus { request_id } => {
+            let state_root = selected_state_root(config_path, explicit_state_root)?;
+            let store = ConfigStore::open_readonly(&state_root).map_err(CliError::unavailable)?;
+            let status = store
+                .merge_claim_recovery_status(&request_id)
+                .map_err(CliError::unavailable)?
+                .ok_or_else(|| {
+                    CliError::not_found("MergeDecision recovery request was not found")
+                })?;
+            if json {
+                print_json(&status)
+            } else {
+                println!("Recovery request {}: {}", status.request_id, status.state);
+                println!("One-use recovery budget used: {}", status.budget_used);
+                if let Some(reason) = status.rejection_reason {
+                    println!("Reason: {reason}");
+                }
+                Ok(())
+            }
         }
         TicketCommand::ReleaseClaim {
             namespace,
@@ -3963,6 +4082,20 @@ fn executable_file(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
+#[cfg(test)]
+pub(crate) fn dispatch_ticket_command_for_test(args: &[&str]) -> Result<(), CliError> {
+    let cli = Cli::try_parse_from(args).map_err(|error| CliError::usage(error.to_string()))?;
+    let Command::Ticket { command } = cli.command else {
+        return Err(CliError::usage("test command must select `ticket`"));
+    };
+    ticket_command(
+        cli.config.as_deref(),
+        cli.state_root.as_deref(),
+        command,
+        cli.json,
+    )
+}
+
 fn version(json: bool) -> Result<(), CliError> {
     if json {
         let report = VersionInfo {
@@ -4038,8 +4171,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, ProviderCommand, factory_context_present, read_effective_snapshot,
-        resolve_executable, terminal_safe,
+        Cli, Command, ProviderCommand, TicketCommand, factory_context_present,
+        read_effective_snapshot, resolve_executable, terminal_safe,
     };
     use crate::config;
     use crate::store::{ConfigStore, ExpectedRevision};
@@ -4059,6 +4192,64 @@ mod tests {
             resolve_executable(executable.to_str().unwrap()).as_deref(),
             Some(canonical.as_path())
         );
+    }
+
+    #[test]
+    fn parsed_recovery_status_command_reads_the_generated_state_database() {
+        use crate::domain::ids::{ProjectId, TicketRunId};
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let ticket_run_id = TicketRunId::parse("ticket-run-a").unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        store
+            .insert_merge_claim_recovery_status_fixture(
+                "recovery-cli-fixture",
+                &project_id,
+                &ticket_run_id,
+                "accepted",
+                Some(&"a".repeat(64)),
+            )
+            .unwrap();
+        drop(store);
+
+        let cli = Cli::try_parse_from([
+            "rex-projects",
+            "--config",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fixture/config.toml"),
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "--json",
+            "ticket",
+            "recovery-status",
+            "--request-id",
+            "recovery-cli-fixture",
+        ])
+        .unwrap();
+        let Command::Ticket {
+            command: TicketCommand::RecoveryStatus { request_id },
+        } = cli.command
+        else {
+            panic!(
+                "public parser must route the recovery-status command to its production handler"
+            );
+        };
+        assert_eq!(request_id, "recovery-cli-fixture");
+        super::dispatch_ticket_command_for_test(&[
+            "rex-projects",
+            "--config",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fixture/config.toml"),
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "--json",
+            "ticket",
+            "recovery-status",
+            "--request-id",
+            &request_id,
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -4186,6 +4377,47 @@ mod tests {
                 "alpha",
                 "--id",
                 "T-1"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rex-projects",
+                "--json",
+                "ticket",
+                "blocked-reason",
+                "--project",
+                "alpha",
+                "--run",
+                "run-1",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rex-projects",
+                "--json",
+                "ticket",
+                "resume-merge-decision",
+                "--project",
+                "alpha",
+                "--run",
+                "run-1",
+                "--expected-subject-digest",
+                &"a".repeat(64),
+                "--request-id",
+                "human-recovery-1",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rex-projects",
+                "--json",
+                "ticket",
+                "recovery-status",
+                "--request-id",
+                "human-recovery-1",
             ])
             .is_ok()
         );
