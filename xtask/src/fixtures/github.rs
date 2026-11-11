@@ -288,7 +288,7 @@ fn dispatch_repository_route(
             let state = check_state(remote, sha)?;
             Ok((
                 200,
-                json!([{"context":"required-tests","state":state,"sha":sha,"creator":{"login":"fixture-ci"}}]),
+                json!([{"id":1,"context":"required-tests","state":state,"sha":sha,"creator":{"login":"fixture-ci"},"created_at":"2026-11-11T00:00:00Z"}]),
             ))
         }
         ["commits", sha] if request.method == "GET" => commit_observation(remote, sha),
@@ -781,4 +781,49 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_status_fixture_includes_freshness_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let state = root.join("state");
+        let remote = root.join("git/fixture/repository.git");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(
+            state.join("checks.json"),
+            serde_json::to_vec(&json!({"abc123":"success"})).unwrap(),
+        )
+        .unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        let request = Request {
+            method: "GET".into(),
+            endpoint: "repos/fixture/repository/commits/abc123/statuses".into(),
+            input: false,
+        };
+
+        let (status, response) = dispatch_repository_route(
+            &connection,
+            &remote,
+            "fixture",
+            "repository",
+            &request,
+            &["commits", "abc123", "statuses"],
+            Value::Null,
+        )
+        .unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(response[0]["id"], 1);
+        assert_eq!(response[0]["context"], "required-tests");
+        assert_eq!(response[0]["state"], "success");
+        assert_eq!(response[0]["sha"], "abc123");
+        assert_eq!(response[0]["created_at"], "2026-11-11T00:00:00Z");
+    }
 }

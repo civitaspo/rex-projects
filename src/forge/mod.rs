@@ -131,6 +131,15 @@ pub struct CommitStatus {
     pub state: String,
     pub sha: String,
     pub creator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<CommitStatusObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct CommitStatusObservation {
+    pub status_id: u64,
+    pub created_at: String,
+    pub observed_ordinal: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -264,8 +273,13 @@ impl ForgeObservation {
         checks.sort_by_key(|a| a.id);
         let mut statuses = complete(&self.statuses)?.clone();
         statuses.sort_by(|a, b| {
-            (&a.context, &a.sha, &a.state, &a.creator)
-                .cmp(&(&b.context, &b.sha, &b.state, &b.creator))
+            (&a.context, &a.sha, &a.observation, &a.state, &a.creator).cmp(&(
+                &b.context,
+                &b.sha,
+                &b.observation,
+                &b.state,
+                &b.creator,
+            ))
         });
         let mut reviews = complete(&self.reviews)?.clone();
         reviews.sort_by_key(|a| a.id);
