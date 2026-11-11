@@ -2688,22 +2688,12 @@ esac
             .unwrap();
         let ready_deadline = Instant::now() + Duration::from_secs(5);
         let (anchor_pid, supervisor_pid, provider_pid) = loop {
-            if anchor_pid_file.exists()
-                && supervisor_pid_file.exists()
-                && provider_pid_file.exists()
-            {
-                let read_pid = |path: &std::path::Path| {
-                    fs::read_to_string(path)
-                        .unwrap()
-                        .trim()
-                        .parse::<u32>()
-                        .unwrap()
-                };
-                break (
-                    read_pid(&anchor_pid_file),
-                    read_pid(&supervisor_pid_file),
-                    read_pid(&provider_pid_file),
-                );
+            if let (Some(anchor_pid), Some(supervisor_pid), Some(provider_pid)) = (
+                read_pid_file(&anchor_pid_file),
+                read_pid_file(&supervisor_pid_file),
+                read_pid_file(&provider_pid_file),
+            ) {
+                break (anchor_pid, supervisor_pid, provider_pid);
             }
             assert!(
                 Instant::now() < ready_deadline,
@@ -4760,8 +4750,26 @@ esac
 
     #[cfg(unix)]
     fn wait_for_pid_file(path: &std::path::Path) -> u32 {
-        wait_until(|| std::fs::read_to_string(path).ok()?.trim().parse().ok())
-            .expect("child PID should be published")
+        wait_until(|| read_pid_file(path)).expect("child PID should be published")
+    }
+
+    #[cfg(unix)]
+    fn read_pid_file(path: &std::path::Path) -> Option<u32> {
+        fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_file_reader_waits_for_a_complete_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("provider.pid");
+        fs::write(&path, "").unwrap();
+
+        assert_eq!(read_pid_file(&path), None);
+
+        fs::write(&path, "48314").unwrap();
+
+        assert_eq!(read_pid_file(&path), Some(48314));
     }
 
     #[cfg(unix)]
