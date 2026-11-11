@@ -305,6 +305,48 @@ pub struct EnvironmentHandoff {
 }
 
 impl EnvironmentHandoff {
+    /// Reopen the exact operation handoff saved before an uncertain Rex launch.
+    /// The snapshot ID and operation ID select one deterministic private file; this
+    /// function never creates a replacement when that file is missing or consumed.
+    pub fn reopen_for_operation(
+        state_root: &Path,
+        snapshot_id: &Digest,
+        operation_id: &str,
+    ) -> Result<Self, EnvironmentError> {
+        if operation_id.is_empty() || operation_id.len() > 128 || operation_id.contains('\0') {
+            return Err(EnvironmentError::Invalid(
+                "invalid launch operation identity",
+            ));
+        }
+        let directory = state_root.join("environment-handoffs");
+        let identity = [
+            snapshot_id.as_str().as_bytes(),
+            b"\0",
+            operation_id.as_bytes(),
+        ]
+        .concat();
+        let path = directory.join(format!("{:x}.env", Sha256::digest(identity)));
+        if !has_private_parent(&path) {
+            return Err(EnvironmentError::Handoff);
+        }
+        let _lock = lock_handoff(&path)?;
+        let claim_path = path.with_extension("env.claim");
+        if std::fs::symlink_metadata(&claim_path).is_ok() {
+            return Err(EnvironmentError::Handoff);
+        }
+        let bytes = read_handoff_bytes(&path)?;
+        let nonce = handoff_nonce(&bytes, snapshot_id, operation_id)?;
+        let _ = read_handoff(&path, snapshot_id, operation_id, &nonce)?;
+        Ok(Self {
+            path,
+            snapshot_id: snapshot_id.clone(),
+            operation_id: operation_id.to_owned(),
+            nonce,
+            consumed: false,
+            retained: true,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1162,6 +1204,49 @@ mod tests {
         let values = handoff.consume().unwrap();
         assert_eq!(get(&values, "API_TOKEN").unwrap(), "ephemeral");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn saved_operation_handoff_reopens_after_a_new_environment_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first_values = BTreeMap::new();
+        first_values.insert("PATH".into(), "/first/bin".into());
+        first_values.insert("TOKEN".into(), "first-snapshot-secret".into());
+        let first =
+            snapshot_from_variables(EnvironmentSource::Inherit, None, first_values).unwrap();
+        let saved_id = first.metadata().id.clone();
+        let original = first
+            .create_handoff_for_operation(root.path(), "qualification-test")
+            .unwrap();
+        let original_path = original.path().to_owned();
+        drop(original);
+        drop(first);
+
+        let mut restarted_values = BTreeMap::new();
+        restarted_values.insert("PATH".into(), "/restarted/bin".into());
+        restarted_values.insert("TOKEN".into(), "new-snapshot-secret".into());
+        let restarted =
+            snapshot_from_variables(EnvironmentSource::Inherit, None, restarted_values).unwrap();
+        assert_ne!(saved_id, restarted.metadata().id);
+
+        let reopened =
+            EnvironmentHandoff::reopen_for_operation(root.path(), &saved_id, "qualification-test")
+                .unwrap();
+        assert_eq!(reopened.path(), original_path);
+        assert_eq!(reopened.snapshot_id(), &saved_id);
+        let values = reopened.consume().unwrap();
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("PATH")).unwrap(),
+            "/first/bin"
+        );
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("TOKEN")).unwrap(),
+            "first-snapshot-secret"
+        );
+        assert!(
+            EnvironmentHandoff::reopen_for_operation(root.path(), &saved_id, "qualification-test")
+                .is_err()
+        );
     }
 
     #[test]

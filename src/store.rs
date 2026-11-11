@@ -36,7 +36,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -53,6 +53,8 @@ pub use learning_store::{
     StoredTrial, SupervisorCandidateEntry, SupervisorKnowledgeEntry, TrialProgress,
 };
 pub mod operations;
+#[path = "store/provider_qualification_recovery.rs"]
+pub(crate) mod provider_qualification_recovery;
 pub mod provider_qualification_runtime;
 pub mod publication_monitor;
 pub mod scheduler;
@@ -565,13 +567,16 @@ impl ConfigStore {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
         }
-        if matches!(existing_version, 14..=16) {
+        if matches!(existing_version, 14..=17) {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
             artifact_registry::validate_v14_schema(&connection)?;
         }
-        if existing_version == 16 {
+        if existing_version >= 16 {
             merge_claim_recovery::validate_v16_schema(&connection)?;
+        }
+        if existing_version == 17 {
+            provider_qualification_recovery::validate_v17_schema(&connection)?;
         }
         connection
             .execute_batch(
@@ -667,6 +672,13 @@ impl ConfigStore {
             }
             merge_claim_recovery::migrate_v16(&connection)?;
         }
+        if existing_version < 17 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            provider_qualification_recovery::migrate_v17(&connection)?;
+        }
+        provider_qualification_recovery::validate_v17_schema(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,
