@@ -76,3 +76,164 @@ rex-projects ticket show --config /path/to/config.toml --project example --id TI
   correct normalized status after checking the tracker's semantics, and keep
   its `adapter.describe` status labels consistent. If no mapping is known,
   return a normalized error instead of inventing a default status.
+
+## Example: GitHub CLI read-only adapter
+
+This example uses Bash, `jq`, and `gh` on `PATH`. Authenticate `gh` in your
+existing user configuration before running it (for example, `gh auth login`).
+The wrapper uses that configuration; it does not accept or store credentials.
+Save the following as an executable file, such as `/absolute/path/github-tickets`.
+Replace `OWNER` and `REPO` with the repository you own or can access. The scope
+and namespace are deliberately fixed; requests for any other scope are rejected.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo='OWNER/REPO'
+namespace="github:$repo"
+request=$(cat)
+id=$(jq -r '.request_id' <<<"$request")
+method=$(jq -r '.method' <<<"$request")
+params=$(jq -c '.params' <<<"$request")
+
+error() {
+  jq -n --arg id "$id" --arg code "$1" --arg message "$2" \
+    '{schema_version:1, request_id:$id, error:{code:$code, message:$message, retryable:false}}'
+  exit 0
+}
+respond() {
+  jq -n --arg id "$id" --argjson result "$1" \
+    '{schema_version:1, request_id:$id, result:$result}'
+}
+
+if [[ $(jq -r '.schema_version' <<<"$request") != 1 ]]; then
+  error invalid_request 'Expected schema version 1'
+fi
+if [[ $method == adapter.describe ]]; then
+  respond "$(jq -n --arg ns "$namespace" '{
+    ticket_namespace:$ns, identity:{}, supported_schema_versions:[1],
+    native_value_convention:"GitHub issue state and state_reason; unsupported values are placeholders",
+    status_values:{triage:"unsupported:triage", backlog:"open", ready:"unsupported:ready",
+      in_progress:"unsupported:in_progress", in_review:"unsupported:in_review",
+      done:"closed:completed", canceled:"closed:not_planned"},
+    capabilities:{pagination:true, filters:["status"], revision_support:true,
+      conditional_revision_mutation:false, atomic_scope_mutation:false,
+      remote_idempotency:[], reconciliation:{}, visibility_grace_seconds:0,
+      supported_optional_methods:[]}}')"
+  exit 0
+fi
+case "$method" in
+  ticket.list|ticket.get) ;;
+  *) error unsupported 'Method is not supported by this read-only adapter' ;;
+esac
+if ! jq -e --arg repo "$repo" '.scope == {repository:$repo}' <<<"$params" >/dev/null; then
+  error invalid_request 'Scope must match the configured repository'
+fi
+
+# Normalize only known states; fail the whole response on an unknown state.
+normalize='def ticket:
+  (if .state == "open" then "backlog"
+   elif .state == "closed" and .state_reason == "completed" then "done"
+   elif .state == "closed" and .state_reason == "not_planned" then "canceled"
+   else error("unknown GitHub issue state") end) as $status |
+  {ticket_namespace:$ns, scope:{repository:$repo}, id:(.number|tostring),
+   key:(.number|tostring), url:.html_url, revision:.updated_at,
+   title:.title, body:(.body // ""),
+   status:{value:$status, native_value:(if .state == "open" then "open" else "closed:" + .state_reason end)},
+   labels:[.labels[].name], created_at:.created_at, updated_at:.updated_at};'
+
+if [[ $method == ticket.get ]]; then
+  ticket_id=$(jq -r '.ticket_id' <<<"$params")
+  [[ $ticket_id =~ ^[1-9][0-9]*$ ]] || error invalid_request 'Ticket ID must be an issue number'
+  if ! issue=$(gh api "repos/$repo/issues/$ticket_id"); then
+    error unavailable 'GitHub issue request failed; see stderr'
+  fi
+  if ! result=$(jq -ce --arg ns "$namespace" --arg repo "$repo" \
+    "$normalize if .pull_request then error(\"not an issue\") else {ticket_namespace:\$ns, ticket:ticket, timeline:[]} end" <<<"$issue"); then
+    error invalid_request 'GitHub returned a pull request or an unknown issue state'
+  fi
+else
+  if ! jq -e 'keys - ["scope", "status", "cursor", "page_size"] | length == 0' <<<"$params" >/dev/null; then
+    error unsupported 'Only the status filter is supported'
+  fi
+  status=$(jq -r '.status // "all"' <<<"$params")
+  case "$status" in
+    all) state=all ;;
+    backlog) state=open ;;
+    done|canceled) state=closed ;;
+    *) error unsupported 'Status filter is not supported' ;;
+  esac
+  page=$(jq -r '.cursor // "1"' <<<"$params")
+  size=$(jq -r '.page_size // 30' <<<"$params")
+  [[ $page =~ ^[1-9][0-9]{0,14}$ && $size =~ ^([1-9]|[1-9][0-9]|100)$ ]] || error invalid_request 'Invalid page or page size'
+  if ! issues=$(gh api --method GET "repos/$repo/issues" -f state="$state" -f per_page="$size" -f page="$page"); then
+    error unavailable 'GitHub issue request failed; see stderr'
+  fi
+  if [[ $page == 999999999999999 ]] && jq -e --argjson size "$size" 'length == $size' <<<"$issues" >/dev/null; then
+    error invalid_request 'The next page exceeds the supported cursor range'
+  fi
+  if ! result=$(jq -ce --arg ns "$namespace" --arg repo "$repo" --arg status "$status" \
+    --argjson params "$params" --argjson size "$size" --arg page "$page" \
+    --arg observed "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$normalize {ticket_namespace:\$ns,
+      tickets:[.[] | select(.pull_request == null) | ticket | select(\$status == \"all\" or .status.value == \$status)],
+      applied_filters:(\$params | del(.scope, .cursor, .page_size)),
+      next_cursor:(if length == \$size then ((\$page | tonumber) + 1 | tostring) else null end),
+      observed_at:\$observed, scan:{}}" <<<"$issues"); then
+    error invalid_request 'GitHub returned an unknown issue state'
+  fi
+fi
+respond "$result"
+```
+
+The `status_values` placeholders satisfy the protocol's required seven distinct
+labels; they do not claim that GitHub supports those states. This example maps
+open to `backlog`, closed/completed to `done`, and closed/not_planned to
+`canceled`; any other native state fails instead of being guessed. Only the
+status filter is supported. Pagination uses GitHub page numbers as opaque
+cursors, and a full last page may lead to one extra empty page. Pull requests
+are excluded after fetching, so a page can contain fewer issues than requested.
+The `updated_at` timestamp is an opaque revision, not a compare-and-set token.
+The example returns no timeline and treats GitHub CLI failures as `unavailable`;
+a production adapter may distinguish HTTP errors and implement more methods.
+
+In your existing configuration, allow `HOME` so `gh` can read its existing
+configuration. If your installation uses `GH_CONFIG_DIR`, allow that variable
+too. Allow `XDG_CONFIG_HOME` if it selects your `gh` configuration directory.
+If authentication uses `GH_TOKEN` or `GITHUB_TOKEN`, allow that variable rather
+than putting a token in the wrapper or configuration file. Use the same fixed
+repository scope:
+
+```toml
+[adapters.tickets]
+kind = "command"
+command = ["/absolute/path/github-tickets"]
+environment_allow = ["PATH", "HOME"]
+# Add "GH_CONFIG_DIR" or "XDG_CONFIG_HOME" if your gh installation uses it.
+# For environment-based authentication, add the token variable name only.
+read_timeout_seconds = 30
+write_timeout_seconds = 120
+
+[projects.example]
+mode = "goal"
+ticket_adapter = "tickets"
+ticket_scope = { repository = "OWNER/REPO" }
+repositories = ["app"]
+```
+
+With `app` configured as a repository in that configuration, run:
+
+```sh
+rex-projects ticket list --project example --limit 20
+rex-projects ticket list --project example --status backlog --limit 20
+rex-projects ticket show --project example --id 123
+```
+
+Follow the printed next-page command to continue a scan; if you supplied
+`--status`, add the same filter to that command. The wrapper decides whether a
+next page exists from the raw GitHub page before it removes pull requests. A
+page can therefore show fewer issues than requested, and the last full page can
+lead to one extra empty page. Numeric cursors accept at most 15 decimal digits.
+If the last supported page is full, the wrapper returns `invalid_request` rather
+than produce a cursor it cannot safely represent.
