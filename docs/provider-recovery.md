@@ -24,7 +24,10 @@ rex-projects --config /path/to/config.toml --state-root /path/to/state \
 This human-only command queues an intent. It does not launch an Agent or release
 a slot itself. Read `provider status` again to observe the controller's result.
 Repeating the request coalesces the pending intent; it does not allocate another
-execution slot.
+execution slot. After a safe pre-create retry starts, that foreground controller
+continues reconciling the same request until the ordinary result and cleanup
+path reaches a terminal status. If the controller restarts again first, its
+new generation requires a fresh human reconciliation request.
 
 | Saved launch phase | Controller behavior |
 | --- | --- |
@@ -40,6 +43,8 @@ state, edit receipts, or create a new request to bypass an unknown reservation.
 Qualification succeeds only through the ordinary verified result and cleanup
 path. An accepted reconciliation request is not a successful qualification.
 
-Schema 17 records these launch boundaries. Existing requests migrate to
-`legacy_unknown`; upgrading does not establish that they never launched. Older
-binaries cannot open the upgraded state directory.
+Schema 17 records these launch boundaries. Existing `queued` requests migrate
+to `not_started` because the controller has not claimed them and the launch
+side effect cannot have begun. Existing `running` or `unknown` requests migrate
+to `legacy_unknown`; upgrading does not establish whether Rex creation was
+attempted. Older binaries cannot open the upgraded state directory.

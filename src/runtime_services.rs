@@ -1,6 +1,6 @@
 //! Concrete host adapters assembled for one foreground controller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -251,6 +251,7 @@ pub struct RuntimeServices {
     rex_lifecycle_cursor: usize,
     rex_lifecycle_last_tick: Option<i64>,
     agent_recovery: crate::agent_recovery::AgentRecoveryRuntime,
+    provider_qualification_recovery_ids: BTreeSet<String>,
 }
 
 pub(crate) fn operator_plan_ready_for_launch(
@@ -1059,6 +1060,7 @@ impl RuntimeServices {
             rex_lifecycle_cursor: 0,
             rex_lifecycle_last_tick: None,
             agent_recovery: crate::agent_recovery::AgentRecoveryRuntime::default(),
+            provider_qualification_recovery_ids: BTreeSet::new(),
         })
     }
 
@@ -1116,6 +1118,8 @@ impl RuntimeServices {
                     self.owner_generation,
                     &pending.request.request_id,
                 )?;
+                self.provider_qualification_recovery_ids
+                    .insert(job.request.request_id.clone());
                 if let Err(error) = self
                     .preflight_provider_qualification_deadline(&job)
                     .and_then(|_| self.start_provider_qualification(store, &job))
@@ -1137,8 +1141,44 @@ impl RuntimeServices {
                 )?;
             }
         }
+        for request_id in self
+            .provider_qualification_recovery_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let job = store
+                .provider_qualification_job(&request_id)?
+                .ok_or("tracked recovered provider qualification disappeared")?;
+            if matches!(
+                job.status,
+                crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Verified
+                    | crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Failed
+            ) {
+                self.provider_qualification_recovery_ids.remove(&request_id);
+                continue;
+            }
+            if job.controller_generation != self.owner_generation {
+                continue;
+            }
+            self.reconcile_provider_qualification(store, &job)?;
+            let current = store
+                .provider_qualification_job(&request_id)?
+                .ok_or("recovered provider qualification disappeared during reconciliation")?;
+            if matches!(
+                current.status,
+                crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Verified
+                    | crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Failed
+            ) {
+                self.provider_qualification_recovery_ids.remove(&request_id);
+            }
+        }
         for job in store.provider_qualification_jobs_to_reconcile(8)? {
-            if job.controller_generation == self.owner_generation {
+            if job.controller_generation == self.owner_generation
+                && !self
+                    .provider_qualification_recovery_ids
+                    .contains(&job.request.request_id)
+            {
                 self.reconcile_provider_qualification(store, &job)?;
             }
         }
@@ -7698,21 +7738,35 @@ mod provider_qualification_requested_reconcile_tests {
             &target_operation,
         )
         .unwrap();
-        let block_label = crate::adapters::rex::owned_agent_block_label(&target_operation).unwrap();
+        let session_label = format!("rex-projects-provider-qualification-{target_operation}");
+        let session_created = temp.path().join("prepared-session-created");
+        let session_view_checked = temp.path().join("prepared-session-view-checked");
+        let sessions = serde_json::json!({"sessions":[{"session_id":"prepared-session","label":session_label}]});
         let created = serde_json::json!({
             "session_id":"prepared-session",
             "initial_windows":[{"window_id":"prepared-window","label":window_label,"block_ids":["prepared-block"]}]
         });
-        let view = serde_json::json!({"windows":[{"window_id":"prepared-window","label":window_label,"layers":[{"blocks":[{"block_id":"prepared-block","label":block_label,"flavor":"com.superlogical.terminal.shell"}]}]}]});
+        let initial_view = serde_json::json!({"session_id":"prepared-session","label":session_label,"windows":[{"window_id":"prepared-window","label":window_label,"layers":[{"blocks":[{"block_id":"prepared-block","label":crate::adapters::rex::owned_agent_block_label(&target_operation).unwrap(),"flavor":"com.superlogical.terminal.shell"}]}]}]});
+        let finished_view =
+            serde_json::json!({"session_id":"prepared-session","label":session_label,"windows":[]});
         let whoami = serde_json::json!({"endpoint":"unix:///tmp/prepared-reconcile-fixture.sock","instance_id":"prepared-reconcile-fixture","host_id":"fixture-host","rex_version":"1.0"});
         let api = serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}});
+        let process = serde_json::json!({"last_exit":null,"child":{"pid":10,"user_id":501,"name":"codex","path":"/usr/bin/codex"},"foreground":{"pid":11,"user_id":501,"name":"node"},"ancestors":[]});
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{}' ;;\n  *'api list --json'*) printf '%s\\n' '{}' ;;\n  *'session ls --json'*) printf '{{\"sessions\":[]}}\\n' ;;\n  *'new rex-projects-provider-qualification-'*) printf '%s\\n' '{}' ;;\n  *'api call session.view'*) printf '%s\\n' '{}' ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{}' ;;\n  *'api list --json'*) printf '%s\\n' '{}' ;;\n  *'session ls --json'*) if [ -f '{}' ]; then printf '%s\\n' '{}'; else printf '{{\"sessions\":[]}}\\n'; fi ;;\n  *'new rex-projects-provider-qualification-'*) : > '{}'; printf '%s\\n' '{}' ;;\n  *'api call session.view'*) if [ ! -f '{}' ]; then : > '{}'; printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi ;;\n  *'api call com.superlogical.terminal.process'*) printf '%s\\n' '{}' ;;\n  *'kill prepared-session'*) rm -f '{}'; printf '{{}}\\n' ;;\n  *) exit 64 ;;\nesac\n",
             calls.display(),
             whoami,
             api,
+            session_created.display(),
+            sessions,
+            session_created.display(),
             created,
-            view
+            session_view_checked.display(),
+            session_view_checked.display(),
+            initial_view,
+            finished_view,
+            process,
+            session_created.display()
         );
         std::fs::write(&rex, script).unwrap();
         std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -7775,7 +7829,7 @@ mod provider_qualification_requested_reconcile_tests {
             .provider_qualification_job(&target_id)
             .unwrap()
             .unwrap();
-        assert_eq!(recovered.status, ProviderQualificationJobStatus::Running);
+        assert_eq!(recovered.status, ProviderQualificationJobStatus::Unknown);
         assert_eq!(
             recovered.launch_phase,
             ProviderQualificationLaunchPhase::Bound
@@ -7794,13 +7848,76 @@ mod provider_qualification_requested_reconcile_tests {
             .unwrap();
         assert_eq!(slot.slot_index, target_slot.slot_index);
         assert_eq!(slot.reservation_epoch, target_slot.reservation_epoch);
-        assert_eq!(slot.disposition, "launch_pending");
+        assert_eq!(slot.disposition, "unknown");
         let package_path = state_root
             .join("provider-qualifications")
             .join(&target_operation)
             .join("package.json");
         let package: crate::provider_qualification_run::QualificationRunPackage =
             serde_json::from_slice(&std::fs::read(package_path).unwrap()).unwrap();
+        let receipt = serde_json::json!({
+            "run_id": package.descriptor.run_id,
+            "attempt": package.descriptor.attempt,
+            "provider": package.profile.adapter,
+            "effective_permission_mode": package.descriptor.provider_capability.permission_mode,
+            "conversation_id": null,
+            "provider_version": null,
+            "capability_receipt_digest": null,
+            "schema_projection": package.descriptor.provider_capability.schema_projection,
+            "launch_pid_hint": null,
+            "exit_code": 0,
+            "timed_out": false,
+            "cancellation_signal": null,
+            "cancellation_cause": null,
+            "cleanup": "confirmed",
+            "cleanup_detail": null,
+            "processes": [{
+                "pid": 4294967295_u32,
+                "parent_pid": 1,
+                "process_group_id": 4294967295_u32,
+                "start_identity": "synthetic-absent-process",
+                "command": "fixture-agent",
+                "identity_quality": "kernel_birth_token"
+            }],
+            "result_digest": null,
+            "provider_result_failure": null,
+            "provider_process_failure": null,
+            "outcome": "completed"
+        });
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "request_id": target_id,
+            "receipt": receipt,
+            "structured_result": null,
+            "result_digest": "a".repeat(64)
+        });
+        let result_path = state_root
+            .join("provider-qualifications")
+            .join(&target_operation)
+            .join("control/result.json");
+        std::fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+        services
+            .tick_provider_qualification_jobs(&mut store, 1_800_000_020)
+            .unwrap();
+
+        let recovered = store
+            .provider_qualification_job(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ProviderQualificationJobStatus::Failed);
+        let slot = store
+            .provider_qualification_slot(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot.slot_index, target_slot.slot_index);
+        assert_eq!(slot.reservation_epoch, target_slot.reservation_epoch);
+        assert_eq!(slot.disposition, "released");
+        assert!(!session_created.exists());
+        assert!(
+            std::fs::read_to_string(&calls)
+                .unwrap()
+                .contains("kill prepared-session")
+        );
         assert_eq!(
             package.environment_snapshot_id,
             old_environment.metadata().id

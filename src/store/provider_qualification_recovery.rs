@@ -95,6 +95,7 @@ pub(crate) fn apply_v17_layout(connection: &Connection) -> Result<(), String> {
         "ALTER TABLE provider_qualification_jobs ADD COLUMN launch_phase TEXT NOT NULL DEFAULT 'legacy_unknown' CHECK(launch_phase IN ('legacy_unknown','not_started','prepared','create_attempted','bound'));
          ALTER TABLE provider_qualification_jobs ADD COLUMN environment_snapshot_id TEXT CHECK(environment_snapshot_id IS NULL OR length(environment_snapshot_id)=64);
          ALTER TABLE provider_qualification_jobs ADD COLUMN reconcile_requested_generation INTEGER CHECK(reconcile_requested_generation IS NULL OR reconcile_requested_generation>0);
+         UPDATE provider_qualification_jobs SET launch_phase='not_started' WHERE status='queued';
          DROP TRIGGER provider_qualification_status_transitions;
          {STATUS_TRANSITIONS}
          {PHASE_TRANSITIONS}
@@ -134,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn v16_unknown_row_migrates_to_legacy_unknown_and_keeps_its_slot_held() {
+    fn v16_queued_row_remains_claimable_while_ambiguous_row_stays_legacy_unknown() {
         use crate::domain::ids::{ProfileId, ProjectId};
         use crate::domain::types::Role;
         use crate::store::provider_qualification_runtime::{
@@ -190,6 +191,18 @@ mod tests {
         };
         store
             .mark_provider_qualification_unknown(owner_generation, &request.request_id)
+            .unwrap();
+        let queued_request = ProviderQualificationRequest {
+            request_id: "legacy-queued-qualification".into(),
+            project_id: request.project_id.clone(),
+            role: request.role,
+            profile_id: request.profile_id.clone(),
+            profile_digest: request.profile_digest.clone(),
+            config_revision: request.config_revision,
+            config_digest: request.config_digest.clone(),
+        };
+        store
+            .enqueue_provider_qualification(owner_generation, &queued_request)
             .unwrap();
         let original_slot = store
             .provider_qualification_slot(&request.request_id)
@@ -282,6 +295,59 @@ mod tests {
                 .unwrap()
                 .disposition,
             "unknown"
+        );
+        let queued = migrated
+            .provider_qualification_job(&queued_request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queued.status,
+            crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Queued
+        );
+        assert_eq!(
+            queued.launch_phase,
+            ProviderQualificationLaunchPhase::NotStarted
+        );
+        let crate::store::provider_qualification_runtime::QualificationClaim::Claimed {
+            job: claimed,
+            ..
+        } = migrated
+            .claim_provider_qualification(owner_generation, 2, 2)
+            .unwrap()
+        else {
+            panic!("migrated queued qualification should be claimable");
+        };
+        assert_eq!(claimed.request.request_id, queued_request.request_id);
+        assert_eq!(
+            claimed.launch_phase,
+            ProviderQualificationLaunchPhase::NotStarted
+        );
+        assert_eq!(
+            claimed.status,
+            crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Running
+        );
+        migrated
+            .mark_provider_qualification_prepared(
+                owner_generation,
+                &queued_request.request_id,
+                &crate::domain::ids::Digest::parse("b".repeat(64)).unwrap(),
+            )
+            .unwrap();
+        let prepared = migrated
+            .provider_qualification_job(&queued_request.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared.launch_phase,
+            ProviderQualificationLaunchPhase::Prepared
+        );
+        assert_eq!(
+            migrated
+                .provider_qualification_slot(&queued_request.request_id)
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "launch_pending"
         );
     }
 

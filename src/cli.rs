@@ -2236,20 +2236,8 @@ fn provider_command(
             let slot = store
                 .provider_qualification_slot(&request_id)
                 .map_err(CliError::unavailable)?;
-            let next_safe_action = match job.launch_phase {
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::LegacyUnknown => "keep the existing slot held; inspect retained evidence manually",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::NotStarted => "a human may request reconciliation; the controller will retry only if the deterministic preparation root is absent",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::Prepared => "a human may request reconciliation; the controller will validate the saved handoff and retry once",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::CreateAttempted => "wait for exact-label Rex observation; a second create is forbidden",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::Bound => "wait for the bound Rex run and its existing result and cleanup checks",
-            };
-            let hold_reason = match job.launch_phase {
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::LegacyUnknown => "legacy request has no durable evidence proving whether Rex creation was attempted",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::NotStarted => "controller stopped before the durable preparation boundary; the prior process may have left ambiguous local preparation",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::Prepared => "preparation and the original environment handoff are durable; retry is permitted only after exact local validation",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::CreateAttempted => "Rex creation may have happened; retrying creation is forbidden until exact operation-label observation resolves it",
-                crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase::Bound => "Rex resource identity is bound, but the qualification result is not terminal",
-            };
+            let (hold_reason, next_safe_action, execution_slot) =
+                provider_status_fields(job.status, job.launch_phase, slot.as_ref());
             let report = serde_json::json!({
                 "request_id": job.request.request_id,
                 "request_digest": job.request_digest,
@@ -2266,12 +2254,7 @@ fn provider_command(
                 "hold_reason": hold_reason,
                 "environment_snapshot_id": job.environment_snapshot_id,
                 "reconcile_pending": job.reconcile_requested_generation == Some(job.controller_generation),
-                "execution_slot": slot.as_ref().map(|slot| serde_json::json!({
-                    "slot_index": slot.slot_index,
-                    "reservation_epoch": slot.reservation_epoch,
-                    "controller_generation": slot.controller_generation,
-                    "disposition": slot.disposition,
-                })),
+                "execution_slot": execution_slot,
                 "next_safe_action": next_safe_action,
                 "created_at_unix": job.created_at_unix,
                 "updated_at_unix": job.updated_at_unix,
@@ -2296,11 +2279,13 @@ fn provider_command(
                     job.request.config_revision, job.request.config_digest
                 );
                 println!("Launch phase: {:?}", job.launch_phase);
-                println!("Held because: {hold_reason}");
+                if let Some(hold_reason) = hold_reason {
+                    println!("Held because: {hold_reason}");
+                }
                 println!("Next safe action: {next_safe_action}");
                 if let Some(slot) = slot {
                     println!(
-                        "Held slot: {} / epoch {} / {:?}",
+                        "Execution slot: {} / epoch {} / {:?}",
                         slot.slot_index, slot.reservation_epoch, slot.disposition
                     );
                 }
@@ -2451,6 +2436,76 @@ fn provider_command(
             }
         }
     }
+}
+
+fn provider_status_fields(
+    status: crate::store::provider_qualification_runtime::ProviderQualificationJobStatus,
+    phase: crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase,
+    slot: Option<&crate::store::provider_qualification_runtime::ProviderQualificationSlot>,
+) -> (
+    Option<&'static str>,
+    &'static str,
+    Option<serde_json::Value>,
+) {
+    use crate::store::provider_qualification_runtime::{
+        ProviderQualificationJobStatus as Status, ProviderQualificationLaunchPhase as Phase,
+    };
+
+    let (hold_reason, next_safe_action) = match status {
+        Status::Verified => (
+            None,
+            "no action required; inspect the qualification receipt if details are needed",
+        ),
+        Status::Failed => (
+            None,
+            "no retry is available from this terminal request; inspect the failure receipt",
+        ),
+        Status::Queued => (
+            Some("qualification has not been claimed by the controller"),
+            "wait for the foreground controller to claim and launch the queued request",
+        ),
+        Status::Running | Status::Unknown => match phase {
+            Phase::LegacyUnknown => (
+                Some(
+                    "legacy request has no durable evidence proving whether Rex creation was attempted",
+                ),
+                "keep the existing slot held; inspect retained evidence manually",
+            ),
+            Phase::NotStarted => (
+                Some(
+                    "controller stopped before the durable preparation boundary; the prior process may have left ambiguous local preparation",
+                ),
+                "a human may request reconciliation; the controller will retry only if the deterministic preparation root is absent",
+            ),
+            Phase::Prepared => (
+                Some(
+                    "preparation and the original environment handoff are durable; retry is permitted only after exact local validation",
+                ),
+                "a human may request reconciliation; the controller will validate the saved handoff and retry once",
+            ),
+            Phase::CreateAttempted => (
+                Some(
+                    "Rex creation may have happened; retrying creation is forbidden until exact operation-label observation resolves it",
+                ),
+                "wait for exact-label Rex observation; a second create is forbidden",
+            ),
+            Phase::Bound => (
+                Some(
+                    "Rex resource identity is bound, but the qualification result is not terminal",
+                ),
+                "wait for the bound Rex run and its existing result and cleanup checks",
+            ),
+        },
+    };
+    let slot = slot.map(|slot| {
+        serde_json::json!({
+            "slot_index": slot.slot_index,
+            "reservation_epoch": slot.reservation_epoch,
+            "controller_generation": slot.controller_generation,
+            "disposition": slot.disposition,
+        })
+    });
+    (hold_reason, next_safe_action, slot)
 }
 
 fn parse_provider_role(value: &str) -> Option<crate::domain::types::Role> {
@@ -4376,6 +4431,31 @@ mod tests {
             } if request_id == "qualification-123"
         ));
         assert!(Cli::try_parse_from(["rex-projects", "provider", "reconcile"]).is_err());
+    }
+
+    #[test]
+    fn terminal_provider_status_shows_no_hold_and_preserves_actual_released_slot() {
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationJobStatus as Status, ProviderQualificationLaunchPhase as Phase,
+            ProviderQualificationSlot,
+        };
+
+        let slot = ProviderQualificationSlot {
+            slot_index: 3,
+            reservation_epoch: 5,
+            controller_generation: 7,
+            disposition: "released".into(),
+        };
+        for status in [Status::Verified, Status::Failed] {
+            let (hold_reason, next_safe_action, reported_slot) =
+                super::provider_status_fields(status, Phase::Bound, Some(&slot));
+            assert_eq!(hold_reason, None);
+            assert!(!next_safe_action.contains("held"));
+            assert_eq!(
+                reported_slot.unwrap()["disposition"],
+                serde_json::json!("released")
+            );
+        }
     }
 
     #[test]
