@@ -321,13 +321,46 @@ impl RuntimeMergeEvidenceSource {
             GH_PAGE_LIMIT,
         )
         .map_err(|error| error.to_string())?;
-        self.observe_publication_subject_with_forge(subject, result, &adapter)
+        self.observe_publication_subject_with_instruction_digest(
+            subject,
+            &result.validated.binding.instruction_digest,
+            &adapter,
+        )
     }
 
-    fn observe_publication_subject_with_forge(
+    pub(super) fn observe_recovery_publication_subject(
         &self,
         subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
-        result: &crate::store::agent_results::IngestedAgentResult,
+        instruction_digest: &Digest,
+    ) -> Result<
+        crate::merge_runtime::MergeEvidenceObservation,
+        crate::merge_runtime::MergeObservationError,
+    > {
+        let gh = crate::process::resolve_executable(Path::new("gh"), &self.search_path)
+            .ok_or("configured host environment has no GitHub CLI")?;
+        let adapter = GitHubCliForge::new(
+            self.github_runner.clone(),
+            gh,
+            "github.com",
+            self.host_environment.clone(),
+            GH_TIMEOUT,
+            GH_SHUTDOWN_GRACE,
+            GH_STDOUT_LIMIT,
+            GH_STDERR_TAIL_LIMIT,
+            GH_PAGE_LIMIT,
+        )
+        .map_err(|error| error.to_string())?;
+        self.observe_publication_subject_with_instruction_digest(
+            subject,
+            instruction_digest,
+            &adapter,
+        )
+    }
+
+    fn observe_publication_subject_with_instruction_digest(
+        &self,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        instruction_digest: &Digest,
         adapter: &impl Forge,
     ) -> Result<
         crate::merge_runtime::MergeEvidenceObservation,
@@ -395,12 +428,8 @@ impl RuntimeMergeEvidenceSource {
             .map_err(|error| error.to_string())?;
         let policy = policy_for(repo);
         let gates = host_gates(repo, &observed, &pull)?;
-        let instruction_digest = merge_instruction_digest(
-            &self.applied_config,
-            &repo_id,
-            repo,
-            &result.validated.binding.instruction_digest,
-        )?;
+        let instruction_digest =
+            merge_instruction_digest(&self.applied_config, &repo_id, repo, instruction_digest)?;
         let hooks_digest = crate::forge::canonical_digest(&repo.rex_projects_hooks)
             .map_err(|error| error.to_string())?;
         let subject_digest = subject
@@ -2759,6 +2788,36 @@ pub(crate) mod tests {
         let observation = source
             .observe_publication_subject(&publication_subject, &result.ingested)
             .unwrap();
+        let recovery_runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(
+                responses
+                    .clone()
+                    .into_iter()
+                    .map(|response| serde_json::to_vec(&response).unwrap())
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let recovery_source = RuntimeMergeEvidenceSource::with_github_runner(
+            applied.clone(),
+            vec![binary_dir.clone()],
+            BTreeMap::new(),
+            recovery_runner.clone(),
+        );
+        let recovery_observation = recovery_source
+            .observe_recovery_publication_subject(
+                &publication_subject,
+                &result.ingested.validated.binding.instruction_digest,
+            )
+            .unwrap();
+        assert_eq!(
+            recovery_observation.pull_request_reference,
+            "https://github.com/team/example/pull/42"
+        );
+        assert!(
+            !recovery_runner.requests.lock().unwrap().is_empty(),
+            "recovery observation must invoke the configured production Forge adapter"
+        );
         assert_eq!(observation.current_pr_body.as_deref(), Some(body));
         assert_eq!(
             observation

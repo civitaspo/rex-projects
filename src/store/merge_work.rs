@@ -452,7 +452,7 @@ impl crate::store::ConfigStore {
     ) -> Result<Option<TrustedMergeAssessment>, String> {
         let session = format!("ticket_run:{ticket_run_id}:merge_decision");
         let row: Option<(String, String)> = self.connection.query_row(
-            "SELECT source_id,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='host_merge_assessment' AND source_revision=?3 AND lifecycle IN ('pending','claimed','consumed') ORDER BY created_at_unix DESC LIMIT 1",
+            "SELECT source_id,payload_json FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='host_merge_assessment' AND source_revision=?3 AND lifecycle IN ('pending','claimed','assigned','consumed') ORDER BY created_at_unix DESC LIMIT 1",
             params![project_id.as_str(), session, revision.0],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
@@ -493,6 +493,7 @@ impl crate::store::ConfigStore {
         owner_generation: u64,
         result: &crate::store::agent_results::IngestedAgentResult,
         assessment: &TrustedMergeAssessment,
+        recovery: Option<&crate::store::merge_claim_recovery::ConsumedMergeClaimRecovery>,
         now_unix: i64,
     ) -> Result<bool, String> {
         assessment.validate()?;
@@ -629,6 +630,15 @@ impl crate::store::ConfigStore {
             [assessment.source_evidence_id.as_str()],
         )
         .map_err(|error| error.to_string())?;
+        if let Some(recovery) = recovery {
+            let changed = tx.execute(
+                "UPDATE merge_claim_recovery_requests SET state='accepted',resumed_result_evidence_id=?2,updated_at_unix=?3 WHERE request_id=?1 AND project_id=?4 AND ticket_run_id=?5 AND state='consumed' AND authorization_key=?6 AND coordinator_evidence_id=?7 AND (resumed_result_evidence_id IS NULL OR resumed_result_evidence_id=?2)",
+                rusqlite::params![recovery.request_id,assessment.source_evidence_id,now_unix,assessment.project_id.as_str(),assessment.ticket_run_id.as_str(),recovery.authorization_key.as_str(),recovery.coordinator_evidence_id],
+            ).map_err(|error|error.to_string())?;
+            if changed != 1 {
+                return Err("trusted MergeAssessment does not match its one-use human recovery authorization".into());
+            }
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(existing.is_none())
     }

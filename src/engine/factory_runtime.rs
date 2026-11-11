@@ -113,6 +113,18 @@ pub trait FactoryRuntimeServices {
         Ok(false)
     }
 
+    /// Validate one human request to resume an exhausted MergeDecision claim using
+    /// the configured external ticket CLI and fresh host Forge evidence.
+    fn process_one_merge_claim_recovery(
+        &mut self,
+        _store: &mut ConfigStore,
+        _owner_generation: u64,
+        _now_unix: i64,
+        _config: &Config,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn recover_agents(
         &mut self,
         store: &mut ConfigStore,
@@ -203,6 +215,19 @@ pub trait FactoryRuntimeServices {
         crate::merge_runtime::MergeObservationError,
     > {
         Err("host MergeDecision evidence observation is unavailable".into())
+    }
+
+    /// Re-observe a previously accepted publication set for a one-use human recovery.
+    /// The original immutable instruction digest remains part of the subject.
+    fn observe_recovery_merge_assessment(
+        &mut self,
+        _subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        _instruction_digest: &Digest,
+    ) -> Result<
+        Option<crate::merge_runtime::MergeEvidenceObservation>,
+        crate::merge_runtime::MergeObservationError,
+    > {
+        Err("fresh recovery MergeDecision observation is unavailable".into())
     }
 
     /// Construct the exact immutable PR-body target from the same fresh host observation and
@@ -358,6 +383,8 @@ impl FactoryRuntime {
             services.process_one_agent_request(store, owner_generation, now_unix)?;
         let _processed_merge_human_response =
             services.process_one_merge_human_response(store, owner_generation, now_unix)?;
+        let _processed_merge_claim_recovery =
+            services.process_one_merge_claim_recovery(store, owner_generation, now_unix, config)?;
         let agent_result = services.ingest_one_agent_result(store, owner_generation, now_unix)?;
         let ingested_agent_result = if let Some(result) = &agent_result {
             apply_agent_result(store, owner_generation, now_unix, config, services, result)?
@@ -718,12 +745,94 @@ fn apply_agent_result(
     use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload, WorkBaseSource};
 
     let binding = &result.validated.binding;
+    if binding.role == Role::Coordinator
+        && binding.ticket_run_id.is_some()
+        && let Some(recovery) = store.recovery_authorization_for_coordinator_result(result)?
+    {
+        let is_recovery_spawn = result.validated.kind == RoleOutputKind::SpawnRequest
+            && result.validated.assertion
+                == crate::engine::orchestration::AgentAssertion::Succeeded;
+        if is_recovery_spawn {
+            return apply_coordinator_spawn_request(
+                store,
+                owner_generation,
+                now_unix,
+                config,
+                services,
+                result,
+            );
+        }
+        store.fail_merge_claim_recovery_attempt(
+            owner_generation,
+            &recovery.request_id,
+            result,
+            "the authorized Coordinator turn did not return its one MergeDecision SpawnRequest",
+            now_unix,
+        )?;
+        return Ok(true);
+    }
+    if binding.role == Role::MergeDecision
+        && binding.ticket_run_id.is_some()
+        && let Some(recovery) = store.recovery_authorization_for_merge_result(result)?
+    {
+        let recovery_status = store
+            .merge_claim_recovery_status(&recovery.request_id)?
+            .ok_or("MergeDecision recovery request disappeared during result dispatch")?;
+        let is_resumed_assessment = recovery_status.state == "consumed"
+            && result.validated.kind == RoleOutputKind::MergeAssessment
+            && result.validated.assertion
+                == crate::engine::orchestration::AgentAssertion::Succeeded;
+        let is_resumed_merge_intent = if recovery_status.state == "accepted"
+            && result.validated.kind == RoleOutputKind::MergeIntent
+            && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+        {
+            let ticket_run_id = binding
+                .ticket_run_id
+                .as_ref()
+                .ok_or("recovery MergeIntent has no TicketRun")?;
+            match store.trusted_merge_assessment(
+                &binding.project_id,
+                ticket_run_id,
+                binding
+                    .ticket_revision
+                    .ok_or("recovery MergeIntent has no TicketRun revision")?,
+            )? {
+                Some(assessment) => store
+                    .merge_claim_recovery_subject_for_assessment(
+                        &binding.project_id,
+                        ticket_run_id,
+                        &assessment.source_evidence_id,
+                    )?
+                    .is_some_and(|subject| subject == recovery.subject),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !is_resumed_assessment && !is_resumed_merge_intent {
+            store.fail_resumed_merge_claim_recovery(
+                owner_generation,
+                &recovery,
+                result,
+                "the one authorized MergeDecision turn did not return a successful assessment",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+    }
     if result.validated.kind == RoleOutputKind::SpawnRequest
         && binding.role == Role::Coordinator
         && binding.ticket_run_id.is_some()
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
     {
-        return apply_coordinator_spawn_request(store, owner_generation, config, services, result);
+        return apply_coordinator_spawn_request(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            services,
+            result,
+        );
     }
     if binding.role == Role::Supervisor
         && result.validated.kind == RoleOutputKind::Intervention
@@ -2036,12 +2145,29 @@ fn apply_merge_assessment(
         .projects
         .get(&binding.project_id)
         .ok_or("MergeDecision Project is no longer configured")?;
-    let snapshot = store.accepted_implementation_publication_snapshot(
-        owner_generation,
-        &run.project_id,
-        ticket_run_id,
-        run.revision,
-    )?;
+    let recovery = store.recovery_authorization_for_merge_result(result)?;
+    let snapshot = if let Some(recovery) = &recovery {
+        if recovery.subject.instruction_digest != binding.instruction_digest
+            || recovery.subject.blocked_revision.checked_add(1) != Some(run.revision)
+        {
+            store.fail_resumed_merge_claim_recovery(
+                owner_generation,
+                recovery,
+                result,
+                "resumed MergeDecision authority or revision differs from the approved recovery subject",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        store.merge_claim_recovery_publication_snapshot(&recovery.subject)?
+    } else {
+        store.accepted_implementation_publication_snapshot(
+            owner_generation,
+            &run.project_id,
+            ticket_run_id,
+            run.revision,
+        )?
+    };
     let accepted = snapshot.accepted_plan();
     if accepted.configuration_digest != configuration_digest {
         return Err("accepted work plan belongs to a stale configuration snapshot".into());
@@ -2057,7 +2183,7 @@ fn apply_merge_assessment(
             .checked_add(1)
             .ok_or("publication review revision overflow")?,
     };
-    if run.revision != expected_assessing_revision {
+    if recovery.is_none() && run.revision != expected_assessing_revision {
         return Err(
             "MergeDecision is not at the exact accepted review-convergence revision".into(),
         );
@@ -2093,10 +2219,51 @@ fn apply_merge_assessment(
         }
     });
     let publication_set_digest = publication_subject.digest()?;
-    let observation = match services.observe_merge_assessment(&publication_subject, result) {
+    if let Some(recovery) = &recovery
+        && publication_set_digest != recovery.subject.publication_set_digest
+    {
+        store.fail_resumed_merge_claim_recovery(
+            owner_generation,
+            recovery,
+            result,
+            "accepted publication set changed during the resumed MergeDecision turn",
+            now_unix,
+        )?;
+        return Ok(true);
+    }
+    let observation_result = match &recovery {
+        Some(recovery) => services.observe_recovery_merge_assessment(
+            &publication_subject,
+            &recovery.subject.instruction_digest,
+        ),
+        None => services.observe_merge_assessment(&publication_subject, result),
+    };
+    let observation = match observation_result {
         Ok(Some(observation)) => observation,
-        Ok(None) => return Err("host MergeDecision observation is unavailable".into()),
+        Ok(None) => {
+            if let Some(recovery) = &recovery {
+                store.fail_resumed_merge_claim_recovery(
+                    owner_generation,
+                    recovery,
+                    result,
+                    "host MergeDecision observation was empty during the one resumed turn",
+                    now_unix,
+                )?;
+                return Ok(true);
+            }
+            return Err("host MergeDecision observation is unavailable".into());
+        }
         Err(crate::merge_runtime::MergeObservationError::Retryable(failure)) => {
+            if let Some(recovery) = &recovery {
+                store.fail_resumed_merge_claim_recovery(
+                    owner_generation,
+                    recovery,
+                    result,
+                    "fresh Forge evidence was temporarily unavailable during the one resumed turn",
+                    now_unix,
+                )?;
+                return Ok(true);
+            }
             let failure_code = match failure {
                 crate::forge::ForgeTransientFailure::ProcessUnavailable => {
                     crate::store::agent_results::MergeObservationFailureCode::ProcessUnavailable
@@ -2129,6 +2296,16 @@ fn apply_merge_assessment(
             return Ok(true);
         }
         Err(crate::merge_runtime::MergeObservationError::Permanent(_)) => {
+            if let Some(recovery) = &recovery {
+                store.fail_resumed_merge_claim_recovery(
+                    owner_generation,
+                    recovery,
+                    result,
+                    "fresh Forge evidence no longer validates the one resumed turn",
+                    now_unix,
+                )?;
+                return Ok(true);
+            }
             store.record_merge_observation_failure(
                 owner_generation,
                 result,
@@ -2148,6 +2325,16 @@ fn apply_merge_assessment(
         }
     };
     if observation.publication_set_digest != publication_set_digest {
+        if let Some(recovery) = &recovery {
+            store.fail_resumed_merge_claim_recovery(
+                owner_generation,
+                recovery,
+                result,
+                "fresh Forge observation belongs to a different publication set",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
         return Err(
             "host MergeDecision observation is bound to a different publication set".into(),
         );
@@ -2162,6 +2349,18 @@ fn apply_merge_assessment(
     ) {
         Ok(trusted) => trusted,
         Err(crate::merge_runtime::MergeAssessmentError::PullRequestReferenceMismatch(reason)) => {
+            if let Some(recovery) = &recovery {
+                store.fail_resumed_merge_claim_recovery(
+                    owner_generation,
+                    recovery,
+                    result,
+                    &format!(
+                        "resumed MergeDecision still mismatched the observed pull request: {reason}"
+                    ),
+                    now_unix,
+                )?;
+                return Ok(true);
+            }
             store.reject_merge_assessment_claim(
                 owner_generation,
                 result,
@@ -2174,7 +2373,19 @@ fn apply_merge_assessment(
         Err(
             crate::merge_runtime::MergeAssessmentError::InvalidAgentClaim(error)
             | crate::merge_runtime::MergeAssessmentError::Host(error),
-        ) => return Err(error),
+        ) => {
+            if let Some(recovery) = &recovery {
+                store.fail_resumed_merge_claim_recovery(
+                    owner_generation,
+                    recovery,
+                    result,
+                    &format!("resumed MergeDecision claim failed host validation: {error}"),
+                    now_unix,
+                )?;
+                return Ok(true);
+            }
+            return Err(error);
+        }
     };
     let assessment_id = crate::merge_runtime::assessment_id(
         &run.project_id,
@@ -2209,7 +2420,13 @@ fn apply_merge_assessment(
         baseline_issue_comments: trusted.baseline_issue_comments,
         prepared_body_proposal: Some(prepared_body_proposal),
     };
-    store.persist_trusted_merge_assessment(owner_generation, result, &persisted, now_unix)?;
+    store.persist_trusted_merge_assessment(
+        owner_generation,
+        result,
+        &persisted,
+        recovery.as_ref(),
+        now_unix,
+    )?;
     Ok(true)
 }
 
@@ -2297,12 +2514,27 @@ fn apply_merge_intent(
         .projects
         .get(&run.project_id)
         .ok_or("MergeDecision Project is no longer configured")?;
-    let snapshot = store.accepted_implementation_publication_snapshot(
-        owner_generation,
+    let snapshot = if let Some(subject) = store.merge_claim_recovery_subject_for_assessment(
         &run.project_id,
         ticket_run_id,
-        run.revision,
-    )?;
+        &trusted.source_evidence_id,
+    )? {
+        if subject.blocked_revision.checked_add(1) != Some(run.revision)
+            || subject.configuration_digest != binding.config_digest
+        {
+            return Err(
+                "MergeIntent recovery lineage differs from the accepted resumed assessment".into(),
+            );
+        }
+        store.merge_claim_recovery_publication_snapshot(&subject)?
+    } else {
+        store.accepted_implementation_publication_snapshot(
+            owner_generation,
+            &run.project_id,
+            ticket_run_id,
+            run.revision,
+        )?
+    };
     let accepted = snapshot.accepted_plan();
     if accepted.configuration_digest != *services.configuration_digest() {
         return Err("accepted work plan belongs to a stale configuration snapshot".into());
@@ -3570,6 +3802,7 @@ impl FilterRotation {
 fn apply_coordinator_spawn_request(
     store: &mut ConfigStore,
     owner_generation: u64,
+    now_unix: i64,
     config: &Config,
     services: &impl FactoryRuntimeServices,
     result: &crate::store::agent_results::IngestedAgentResult,
@@ -3584,6 +3817,111 @@ fn apply_coordinator_spawn_request(
     else {
         return Err("validated SpawnRequest kind has a different typed payload".into());
     };
+    if let Some(recovery) = store.recovery_authorization_for_coordinator_result(result)? {
+        let requested_plan_matches = store
+            .latest_accepted_work_plan(&binding.project_id, ticket_run_id)?
+            .is_some_and(|plan| {
+                request.plan_digest.as_ref() == Some(&plan.plan_digest)
+                    && plan.plan_digest == recovery.subject.accepted_plan_digest
+                    && plan
+                        .proposal
+                        .nodes
+                        .iter()
+                        .any(|node| node.id == request.work_node)
+            });
+        if request.role != Role::MergeDecision
+            || request.worker_recovery.is_some()
+            || !request.allowed_repositories.is_empty()
+            || !request.artifact_inputs.is_empty()
+            || request.parent_run_id.as_ref() != Some(&binding.agent_run_id)
+            || !requested_plan_matches
+            || request.plan_digest.as_ref() != Some(&recovery.subject.accepted_plan_digest)
+        {
+            store.fail_merge_claim_recovery_attempt(
+                owner_generation,
+                &recovery.request_id,
+                result,
+                "Coordinator did not request exactly the accepted MergeDecision node",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        let project_record = store
+            .project(&binding.project_id)?
+            .ok_or("Coordinator SpawnRequest Project has no durable configuration record")?;
+        let configuration_digest = services.configuration_digest();
+        if project_record.config_digest != *configuration_digest
+            || binding.config_digest != *configuration_digest
+            || binding.config_revision != project_record.config_revision
+        {
+            store.fail_merge_claim_recovery_attempt(
+                owner_generation,
+                &recovery.request_id,
+                result,
+                "Coordinator recovery result belongs to a stale configuration snapshot",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        let current = store
+            .active_ticket_runs(owner_generation, 128)?
+            .into_iter()
+            .find(|run| run.ticket_run_id == *ticket_run_id)
+            .ok_or("Coordinator recovery SpawnRequest references no active TicketRun")?;
+        if current.project_id != binding.project_id
+            || binding.ticket_revision.map(|revision| revision.0) != Some(current.revision)
+            || current.revision != recovery.subject.blocked_revision.saturating_add(1)
+            || current.phase != Phase::Assessing
+            || current.activity != Activity::Running
+        {
+            store.fail_merge_claim_recovery_attempt(
+                owner_generation,
+                &recovery.request_id,
+                result,
+                "Coordinator recovery result is stale or outside the authorized Assessing revision",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        let mut profile =
+            crate::config::effective_project_roles(&binding.project_id, &config.projects)?
+                .get(&Role::MergeDecision)
+                .cloned()
+                .ok_or("Project has no MergeDecision profile")?;
+        if let Some(recipe_id) = current.recipe_id.as_ref()
+            && let Some(recipe_profile) = config
+                .operation_recipes
+                .get(recipe_id)
+                .and_then(|recipe| recipe.roles.get(&Role::MergeDecision))
+        {
+            profile = recipe_profile.clone();
+        }
+        if request.profile_id != profile {
+            store.fail_merge_claim_recovery_attempt(
+                owner_generation,
+                &recovery.request_id,
+                result,
+                "Coordinator requested a MergeDecision profile outside current Project policy",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        let session = format!("ticket_run:{ticket_run_id}:merge_decision");
+        let payload = serde_json::json!({
+            "kind": "coordinator_spawn",
+            "request": request,
+            "source_evidence_id": result.receipt.evidence_id(),
+        });
+        store.persist_coordinator_child_wake(
+            owner_generation,
+            result,
+            Role::MergeDecision,
+            &session,
+            current.revision,
+            &payload,
+        )?;
+        return Ok(true);
+    }
     if matches!(request.role, Role::Supervisor | Role::Coordinator)
         || (request.role == Role::Worker && request.worker_recovery.is_none())
         || (request.role != Role::Worker && request.worker_recovery.is_some())
@@ -4096,6 +4434,20 @@ pub(crate) mod tests {
                 .ok_or_else(|| "MergeAssessment fixture observation is missing".into())
         }
 
+        fn observe_recovery_merge_assessment(
+            &mut self,
+            _: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+            _: &Digest,
+        ) -> Result<
+            Option<crate::merge_runtime::MergeEvidenceObservation>,
+            crate::merge_runtime::MergeObservationError,
+        > {
+            self.merge_observation
+                .clone()
+                .map(Some)
+                .ok_or_else(|| "recovery MergeAssessment fixture observation is missing".into())
+        }
+
         fn prepare_merge_body_proposal(
             &self,
             _: &ProjectId,
@@ -4273,6 +4625,35 @@ pub(crate) mod tests {
             now_unix,
             config,
             &mut services,
+            result,
+        )
+    }
+
+    pub(crate) fn apply_coordinator_spawn_request_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<bool, String> {
+        let services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: None,
+            merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
+            merge_body_proposal: None,
+            merge_work_document: None,
+        };
+        super::apply_coordinator_spawn_request(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            &services,
             result,
         )
     }

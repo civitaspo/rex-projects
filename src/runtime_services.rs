@@ -30,6 +30,125 @@ use crate::store::scheduler::{ObservedTicket, TicketScanKey};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+fn get_recovery_ticket(
+    adapter: &dyn TicketAdapter,
+    request_id: RequestId,
+    project_id: &crate::domain::ids::ProjectId,
+    scope: TicketScope,
+    ticket_id: String,
+) -> Result<crate::adapters::tickets::TicketGetResult, crate::adapters::tickets::TicketAdapterError>
+{
+    adapter.get(
+        request_id,
+        Some(project_id.clone()),
+        TicketGetRequest {
+            scope,
+            ticket_id,
+            timeline_limit: Some(1),
+        },
+    )
+}
+
+#[cfg(test)]
+mod merge_claim_recovery_ticket_cli_tests {
+    use super::*;
+    use crate::adapters::tickets::{AdapterCapabilities, AdapterDescription, TicketCommandAdapter};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::Duration;
+
+    #[test]
+    fn recovery_reobservation_uses_configured_ticket_cli_get_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let command = temp.path().join("ticket-adapter");
+        let description = serde_json::to_string(&AdapterDescription {
+            ticket_namespace: "fixture:workspace".into(),
+            identity: BTreeMap::new(),
+            supported_schema_versions: vec![1],
+            native_value_convention: "fixture-native-values".into(),
+            status_values: [
+                "triage",
+                "backlog",
+                "ready",
+                "in_progress",
+                "in_review",
+                "done",
+                "canceled",
+            ]
+            .into_iter()
+            .map(|status| (status.into(), format!("native-{status}")))
+            .collect(),
+            capabilities: AdapterCapabilities {
+                pagination: false,
+                filters: BTreeSet::new(),
+                revision_support: false,
+                conditional_revision_mutation: false,
+                atomic_scope_mutation: false,
+                remote_idempotency: Vec::new(),
+                reconciliation: BTreeMap::new(),
+                visibility_grace_seconds: 0.0,
+                supported_optional_methods: BTreeSet::new(),
+            },
+        })
+        .unwrap();
+        let get = serde_json::json!({
+            "ticket_namespace": "fixture:workspace",
+            "ticket": {
+                "ticket_namespace": "fixture:workspace",
+                "scope": {"project": "fixture"},
+                "id": "PAY-50",
+                "title": "Recovery ticket",
+                "body": "",
+                "status": {"value": "in_progress"}
+            },
+            "timeline": []
+        })
+        .to_string();
+        let script = format!(
+            "#!/bin/sh\nrequest=$(cat)\nrequest_id=$(printf '%s' \"$request\" | sed -E -n 's/.*\"request_id\":\"([^\"]*)\".*/\\1/p')\ncase \"$request\" in\n  *adapter.describe*) result='{description}' ;;\n  *ticket.get*) result='{get}' ;;\n  *) exit 64 ;;\nesac\nprintf '{{\"schema_version\":1,\"request_id\":\"%s\",\"result\":%s}}\\n' \"$request_id\" \"$result\"\n",
+            description = description.replace('\'', "'\\''"),
+            get = get.replace('\'', "'\\''"),
+        );
+        std::fs::write(&command, script).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let env = BTreeMap::from([(
+            std::ffi::OsString::from("PATH"),
+            std::ffi::OsString::from("/usr/bin:/bin"),
+        )]);
+        let adapter = TicketCommandAdapter::new_discovering_namespace(
+            &[command.display().to_string()],
+            &env,
+            &[],
+            &cwd,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        adapter
+            .describe(RequestId::new("recovery-describe").unwrap())
+            .unwrap();
+        let scope =
+            TicketScope::new(BTreeMap::from([("project".into(), "fixture".into())])).unwrap();
+        let observed = get_recovery_ticket(
+            &adapter,
+            RequestId::new("recovery-ticket-get").unwrap(),
+            &crate::domain::ids::ProjectId::parse("fixture-project").unwrap(),
+            scope,
+            "PAY-50".into(),
+        )
+        .unwrap();
+        assert_eq!(observed.ticket_namespace, "fixture:workspace");
+        assert_eq!(observed.ticket.id, "PAY-50");
+        assert_eq!(
+            observed.ticket.status.value,
+            NormalizedTicketStatus::InProgress
+        );
+    }
+}
+
 struct RuntimeTicketStatusAdoptionSource {
     adapter: Arc<dyn TicketAdapter>,
     scopes: BTreeMap<crate::domain::ids::ProjectId, TicketScope>,
@@ -247,6 +366,102 @@ fn accepted_publication_subject(
         );
     }
     publication_subject_for_snapshot(&snapshot, project_id, config)
+}
+
+fn accepted_publication_subject_for_role_launch(
+    store: &ConfigStore,
+    owner_generation: u64,
+    project_id: &crate::domain::ids::ProjectId,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    revision: u64,
+    (role, wake_sources): (Role, &[(String, String)]),
+    config: &ReviewerPublicationConfig<'_>,
+) -> Result<crate::delivery_runtime::ImplementationPublicationSetSubject, String> {
+    if role == Role::MergeDecision {
+        for (source_type, coordinator_evidence_id) in wake_sources {
+            if source_type != "coordinator_child" {
+                continue;
+            }
+            let Some(subject) = store.merge_claim_recovery_subject_for_coordinator_child(
+                project_id,
+                ticket_run_id,
+                coordinator_evidence_id,
+            )?
+            else {
+                continue;
+            };
+            if subject.blocked_revision.checked_add(1) != Some(revision)
+                || subject.configuration_digest != *config.configuration_digest
+            {
+                return Err("recovery MergeDecision wake is outside its exact authorized revision or configuration".into());
+            }
+            let snapshot = store.merge_claim_recovery_publication_snapshot(&subject)?;
+            let publication = publication_subject_for_snapshot(&snapshot, project_id, config)?;
+            if publication.digest()? != subject.publication_set_digest {
+                return Err("recovery MergeDecision publication snapshot differs from the human-reviewed subject".into());
+            }
+            return Ok(publication);
+        }
+        if let Some(assessment) = store.trusted_merge_assessment(
+            project_id,
+            ticket_run_id,
+            crate::domain::ids::Revision(revision),
+        )? && let Some(subject) = store.merge_claim_recovery_subject_for_assessment(
+            project_id,
+            ticket_run_id,
+            &assessment.source_evidence_id,
+        )? {
+            if subject.blocked_revision.checked_add(1) != Some(revision)
+                || subject.configuration_digest != *config.configuration_digest
+            {
+                return Err("resumed MergeIntent wake is outside its accepted recovery revision or configuration".into());
+            }
+            let snapshot = store.merge_claim_recovery_publication_snapshot(&subject)?;
+            let publication = publication_subject_for_snapshot(&snapshot, project_id, config)?;
+            if publication.digest()? != subject.publication_set_digest {
+                return Err("resumed MergeIntent publication snapshot differs from the human-reviewed subject".into());
+            }
+            return Ok(publication);
+        }
+    }
+    accepted_publication_subject(
+        store,
+        owner_generation,
+        project_id,
+        ticket_run_id,
+        revision,
+        config,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn accepted_publication_subject_for_role_launch_for_test(
+    store: &ConfigStore,
+    owner_generation: u64,
+    project_id: &crate::domain::ids::ProjectId,
+    ticket_run_id: &crate::domain::ids::TicketRunId,
+    revision: u64,
+    (role, wake_sources): (Role, &[(String, String)]),
+    applied: &AppliedConfig,
+) -> Result<crate::delivery_runtime::ImplementationPublicationSetSubject, String> {
+    let project = applied
+        .config
+        .projects
+        .get(project_id)
+        .ok_or("test Project is missing from applied configuration")?;
+    accepted_publication_subject_for_role_launch(
+        store,
+        owner_generation,
+        project_id,
+        ticket_run_id,
+        revision,
+        (role, wake_sources),
+        &ReviewerPublicationConfig {
+            project,
+            configuration_digest: &applied.digest,
+            repositories: &applied.config.repositories,
+        },
+    )
 }
 
 fn publication_subject_for_snapshot(
@@ -478,6 +693,132 @@ pub(crate) fn postmortem_completion_context_for_test(
 }
 
 impl RuntimeServices {
+    #[cfg(test)]
+    pub(crate) fn build_run_step_package_for_test(
+        &self,
+        store: &mut ConfigStore,
+        now_unix: i64,
+        reservation: &crate::launch::AgentLaunchReservation,
+        observed_block: &RexContextBlock,
+    ) -> Result<crate::run_step_package::RunStepPackage, String> {
+        let materializer = RuntimeAgentMaterializer {
+            applied_config: self.applied_config.clone(),
+            environment: self.environment.clone(),
+            state_root: self.state_root.clone(),
+            owner_generation: self.owner_generation,
+            runtime_binary: self.runtime_binary.clone(),
+            runtime_binary_digest: self.runtime_binary_digest.clone(),
+            rex_cli_path: self.rex_cli_path.clone(),
+            rex_search_path: self.rex_search_path.clone(),
+            rex_identity: self.rex_identity.clone(),
+            rex: self.rex.clone(),
+            tickets: self.tickets.clone(),
+            delivery_effects: self.delivery.shared_effects(),
+        };
+        <RuntimeAgentMaterializer as crate::start_agent::StartAgentMaterializer>::build_package(
+            &materializer,
+            store,
+            self.owner_generation,
+            now_unix,
+            reservation,
+            observed_block,
+            &self.state_root.join("environment-handoff-fixture"),
+        )
+    }
+
+    fn observe_merge_claim_recovery(
+        &mut self,
+        store: &ConfigStore,
+        request: &crate::store::merge_claim_recovery::PendingMergeClaimRecovery,
+    ) -> Result<crate::store::merge_claim_recovery::MergeClaimRecoveryObservation, String> {
+        use crate::store::merge_claim_recovery::MergeClaimRecoveryObservation as Observation;
+
+        let subject = &request.subject;
+        if subject.configuration_digest != self.configuration_digest {
+            return Ok(Observation::Stale(
+                "Project configuration changed after the human reviewed the blocker".into(),
+            ));
+        }
+        let Some(project) = self.applied_config.config.projects.get(&subject.project_id) else {
+            return Ok(Observation::Stale("Project is no longer configured".into()));
+        };
+        let scope_values = project
+            .ticket_scope
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| (key.clone(), value.to_owned()))
+                    .ok_or_else(|| format!("ticket scope `{key}` must be a string"))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let scope = TicketScope::new(scope_values).map_err(|error| error.to_string())?;
+        let ticket = match get_recovery_ticket(
+            self.tickets.as_ref(),
+            RequestId::new(format!(
+                "rex-projects-recovery-{}",
+                REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ))?,
+            &subject.project_id,
+            scope.clone(),
+            subject.ticket_id.clone(),
+        ) {
+            Ok(ticket) => ticket.ticket,
+            Err(_) => return Ok(Observation::TemporarilyUnavailable),
+        };
+        if ticket.ticket_namespace != subject.ticket_namespace
+            || ticket.id != subject.ticket_id
+            || ticket.scope != scope
+            || ticket.status.value != NormalizedTicketStatus::InProgress
+        {
+            return Ok(Observation::Stale(
+                "external ticket identity, scope, or In Progress status changed".into(),
+            ));
+        }
+        let snapshot = match store.merge_claim_recovery_publication_snapshot(subject) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => return Ok(Observation::Stale(reason)),
+        };
+        let publication = publication_subject_for_snapshot(
+            &snapshot,
+            &subject.project_id,
+            &ReviewerPublicationConfig {
+                project,
+                configuration_digest: &self.configuration_digest,
+                repositories: &self.applied_config.config.repositories,
+            },
+        )?;
+        let publication_set_digest = publication.digest()?;
+        if publication_set_digest != subject.publication_set_digest {
+            return Ok(Observation::Stale(
+                "accepted publication set changed after the human reviewed the blocker".into(),
+            ));
+        }
+        let source = merge::RuntimeMergeEvidenceSource::new(
+            self.applied_config.clone(),
+            self.rex_search_path.clone(),
+            self.host_environment.clone(),
+        );
+        let observed = match source
+            .observe_recovery_publication_subject(&publication, &subject.instruction_digest)
+        {
+            Ok(observed) => observed,
+            Err(crate::merge_runtime::MergeObservationError::Retryable(_)) => {
+                return Ok(Observation::TemporarilyUnavailable);
+            }
+            Err(crate::merge_runtime::MergeObservationError::Permanent(reason)) => {
+                return Ok(Observation::Stale(reason));
+            }
+        };
+        Ok(Observation::Current {
+            ticket_namespace: ticket.ticket_namespace,
+            ticket_id: ticket.id,
+            ticket_status: ticket.status.value,
+            publication_set_digest: observed.publication_set_digest,
+            pull_request_reference: observed.pull_request_reference,
+        })
+    }
+
     pub fn new(
         applied_config: &AppliedConfig,
         environment: &EnvironmentSnapshot,
@@ -1881,12 +2222,19 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 let run = active_run
                     .as_ref()
                     .ok_or("review or MergeDecision reservation has no TicketRun")?;
-                Some(accepted_publication_subject(
+                let wake_sources = reservation
+                    .wake_snapshot
+                    .inputs
+                    .iter()
+                    .map(|input| (input.source_type.clone(), input.source_id.clone()))
+                    .collect::<Vec<_>>();
+                Some(accepted_publication_subject_for_role_launch(
                     store,
                     self.owner_generation,
                     &run.project_id,
                     &run.ticket_run_id,
                     run.revision,
+                    (reservation.role, &wake_sources),
                     &ReviewerPublicationConfig {
                         project,
                         configuration_digest: &self.applied_config.digest,
@@ -2253,6 +2601,30 @@ impl FactoryRuntimeServices for RuntimeServices {
                 crate::human_runtime::HumanSubjectObservation::TemporarilyUnavailable => continue,
             }
             return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn process_one_merge_claim_recovery(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        _config: &Config,
+    ) -> Result<bool, String> {
+        if owner_generation != self.owner_generation {
+            return Err("RuntimeServices owner generation changed".into());
+        }
+        for request in store.pending_merge_claim_recoveries(32)? {
+            let observation = self.observe_merge_claim_recovery(store, &request)?;
+            if store.authorize_merge_claim_recovery(
+                owner_generation,
+                &request,
+                &observation,
+                now_unix,
+            )? {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -2847,6 +3219,24 @@ impl FactoryRuntimeServices for RuntimeServices {
         );
         source
             .observe_publication_subject(subject, result)
+            .map(Some)
+    }
+
+    fn observe_recovery_merge_assessment(
+        &mut self,
+        subject: &crate::delivery_runtime::ImplementationPublicationSetSubject,
+        instruction_digest: &Digest,
+    ) -> Result<
+        Option<crate::merge_runtime::MergeEvidenceObservation>,
+        crate::merge_runtime::MergeObservationError,
+    > {
+        let source = merge::RuntimeMergeEvidenceSource::new(
+            self.applied_config.clone(),
+            self.rex_search_path.clone(),
+            self.host_environment.clone(),
+        );
+        source
+            .observe_recovery_publication_subject(subject, instruction_digest)
             .map(Some)
     }
 
@@ -4118,12 +4508,17 @@ impl RuntimeServices {
         )?;
         let implementation_publication_subject =
             if matches!(candidate.role, Role::Reviewer | Role::MergeDecision) {
-                Some(accepted_publication_subject(
+                let wake_sources = wake_inputs
+                    .iter()
+                    .map(|input| (input.source_type.clone(), input.source_id.clone()))
+                    .collect::<Vec<_>>();
+                Some(accepted_publication_subject_for_role_launch(
                     store,
                     self.owner_generation,
                     &active_run.project_id,
                     ticket_run_id,
                     active_run.revision,
+                    (candidate.role, &wake_sources),
                     &ReviewerPublicationConfig {
                         project: &project,
                         configuration_digest: &self.configuration_digest,
@@ -4341,10 +4736,55 @@ impl RuntimeServices {
             Role::Worker => None,
             _ => Some(Role::Coordinator),
         };
+        let recovery_parent = if candidate.role == Role::MergeDecision {
+            let mut parent = None;
+            for input in &wake_inputs {
+                if input.source_type != "coordinator_child" {
+                    continue;
+                }
+                if let Some(subject) = store.merge_claim_recovery_subject_for_coordinator_child(
+                    &candidate.project_id,
+                    ticket_run_id,
+                    &input.source_id,
+                )? && subject.blocked_revision.checked_add(1) == Some(active_run.revision)
+                    && subject.configuration_digest == self.configuration_digest
+                {
+                    parent = store.coordinator_child_parent_for_evidence(
+                        &candidate.project_id,
+                        &candidate.role_session_id,
+                        &input.source_id,
+                    )?;
+                    break;
+                }
+            }
+            parent
+        } else {
+            None
+        };
         let parent_authority = if candidate.role == Role::Coordinator {
             Some(store.supervisor_parent_for_ticket_run(&candidate.project_id, ticket_run_id)?)
         } else if candidate.role == Role::Worker {
             None
+        } else if candidate.role == Role::MergeDecision
+            && store
+                .trusted_merge_assessment(
+                    &candidate.project_id,
+                    ticket_run_id,
+                    crate::domain::ids::Revision(active_run.revision),
+                )?
+                .is_some()
+        {
+            let Some(parent) = store.coordinator_parent_for_merge_assessment(
+                &candidate.project_id,
+                ticket_run_id,
+                crate::domain::ids::Revision(active_run.revision),
+            )?
+            else {
+                return Ok(false);
+            };
+            Some(parent)
+        } else if let Some(parent) = recovery_parent {
+            Some(parent)
         } else {
             let Some(parent) = store
                 .coordinator_child_parent(&candidate.project_id, &candidate.role_session_id)?

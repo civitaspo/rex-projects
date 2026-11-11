@@ -36,7 +36,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -44,6 +44,7 @@ pub mod host_jobs;
 pub mod human;
 #[path = "store/learning.rs"]
 mod learning_store;
+pub mod merge_claim_recovery;
 pub mod merge_work;
 pub use learning_store::{
     CandidateRegistration, KnowledgePublicationIntent, KnowledgePublicationReceipt,
@@ -564,10 +565,13 @@ impl ConfigStore {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
         }
-        if matches!(existing_version, 14 | 15) {
+        if matches!(existing_version, 14..=16) {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
             artifact_registry::validate_v14_schema(&connection)?;
+        }
+        if existing_version == 16 {
+            merge_claim_recovery::validate_v16_schema(&connection)?;
         }
         connection
             .execute_batch(
@@ -656,6 +660,12 @@ impl ConfigStore {
                 backup_before_migration(&connection, state_root)?;
             }
             agent_results::migrate_v15_merge_observation_deferrals(&mut connection)?;
+        }
+        if existing_version < 16 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            merge_claim_recovery::migrate_v16(&connection)?;
         }
         Ok(Self {
             connection,
@@ -6732,42 +6742,115 @@ pub(crate) mod tests {
 
     #[test]
     fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
-        published_publication_fixture(false, false, false, false, false, false, false);
+        published_publication_fixture(false, None, false, false, false, false, false);
     }
 
     #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
-        published_publication_fixture(true, false, false, false, false, false, false);
+        published_publication_fixture(true, None, false, false, false, false, false);
     }
 
     #[test]
     fn generated_direct_merge_intent_reaches_host_preparation() {
-        published_publication_fixture(true, false, false, false, true, false, false);
+        published_publication_fixture(true, None, false, false, true, false, false);
     }
 
     #[test]
     fn publication_and_review_results_wake_current_coordinator_child_requests() {
-        published_publication_fixture(true, false, false, true, false, false, false);
+        published_publication_fixture(true, None, false, true, false, false, false);
     }
 
     #[test]
     fn repeated_merge_reference_mismatch_blocks_and_notifies_supervisor_once() {
-        published_publication_fixture(true, true, false, false, false, false, false);
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::Resume),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn resumed_merge_decision_passes_runtime_preparation_and_builds_package() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::AssessmentLaunch),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn resumed_merge_intent_passes_runtime_preparation_and_builds_package() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::IntentLaunch),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn stale_recovery_coordinator_config_reblocks_without_second_child() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::StaleCoordinatorConfig),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn failed_resumed_merge_decision_reblocks_with_budget_retained() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::FailedMergeDecision),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn failed_recovery_coordinator_reblocks_without_merge_child() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::FailedCoordinator),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
     }
 
     #[test]
     fn host_base_refresh_publication_drives_fresh_reviewer_subject() {
-        published_publication_fixture(true, false, true, false, false, false, false);
+        published_publication_fixture(true, None, true, false, false, false, false);
     }
 
     #[test]
     fn obsolete_deferred_merge_assessment_does_not_abort_tick() {
-        published_publication_fixture(true, false, false, false, false, true, false);
+        published_publication_fixture(true, None, false, false, false, true, false);
     }
 
     #[test]
     fn exhausted_observation_crash_gap_replays_block_transition_after_restart() {
-        published_publication_fixture(true, false, false, false, false, false, true);
+        published_publication_fixture(true, None, false, false, false, false, true);
     }
 
     fn assert_registered_staging_survives_verification(
@@ -7136,15 +7219,44 @@ pub(crate) mod tests {
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum MergeClaimRecoveryFixture {
+        Resume,
+        AssessmentLaunch,
+        IntentLaunch,
+        StaleCoordinatorConfig,
+        FailedMergeDecision,
+        FailedCoordinator,
+    }
+
     fn published_publication_fixture(
         single_publication: bool,
-        reject_twice: bool,
+        recovery_case: Option<MergeClaimRecoveryFixture>,
         base_refresh: bool,
         verify_coordinator_handoff: bool,
         direct_merge_intent: bool,
         obsolete_deferred_assessment: bool,
         terminal_deferral_crash_gap: bool,
     ) {
+        let reject_twice = recovery_case.is_some();
+        let exercise_runtime_launch = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::AssessmentLaunch)
+        );
+        let exercise_stale_recovery_config = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::StaleCoordinatorConfig)
+        );
+        let exercise_failed_resumed_merge = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::FailedMergeDecision)
+        );
+        let exercise_failed_recovery_coordinator = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::FailedCoordinator)
+        );
+        let exercise_runtime_second_turn =
+            matches!(recovery_case, Some(MergeClaimRecoveryFixture::IntentLaunch));
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
         use crate::delivery_runtime::{
@@ -7195,6 +7307,63 @@ pub(crate) mod tests {
         ]);
         let corrected_head = run_git(&["rev-parse", "HEAD"]);
         let mut applied = snapshot(&"a".repeat(64));
+        let runtime_launch_config = if exercise_runtime_launch || exercise_runtime_second_turn {
+            use std::os::unix::fs::PermissionsExt;
+
+            let bin = temp.path().join("recovery-runtime-bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let write_executable = |path: &std::path::Path, contents: &str| {
+                std::fs::write(path, contents).unwrap();
+                let mut permissions = std::fs::metadata(path).unwrap().permissions();
+                permissions.set_mode(0o700);
+                std::fs::set_permissions(path, permissions).unwrap();
+            };
+            let ticket_cli = bin.join("ticket-cli");
+            let rex_cli = bin.join("rex");
+            let provider_cli = bin.join("codex");
+            let description = serde_json::json!({
+                "ticket_namespace": "github:acme/repo-a", "identity": {},
+                "supported_schema_versions": [1], "native_value_convention": "fixture-native-values",
+                "status_values": {"triage":"native-triage","backlog":"native-backlog","ready":"native-ready","in_progress":"native-in_progress","in_review":"native-in_review","done":"native-done","canceled":"native-canceled"},
+                "capabilities": {"pagination":false,"filters":[],"revision_support":false,"conditional_revision_mutation":false,"atomic_scope_mutation":false,"remote_idempotency":[],"reconciliation":{},"visibility_grace_seconds":0.0,"supported_optional_methods":[]}
+            }).to_string();
+            let ticket = serde_json::json!({
+                "ticket_namespace": "github:acme/repo-a",
+                "ticket": {"ticket_namespace":"github:acme/repo-a","scope":{"project":"project-a"},"id":"PAY-12","title":"Recovery ticket","body":"","revision":"ticket-revision-1","status":{"value":"in_progress"}},
+                "timeline": []
+            }).to_string();
+            write_executable(
+                &ticket_cli,
+                &format!(
+                    "#!/bin/sh\nrequest=$(cat)\nrequest_id=$(printf '%s' \"$request\" | sed -E -n 's/.*\"request_id\":\"([^\"]*)\".*/\\1/p')\ncase \"$request\" in *adapter.describe*) result='{description}' ;; *ticket.get*) result='{ticket}' ;; *) exit 64 ;; esac\nprintf '{{\"schema_version\":1,\"request_id\":\"%s\",\"result\":%s}}\\n' \"$request_id\" \"$result\"\n"
+                ),
+            );
+            let window_state = temp.path().join("recovery-window-label");
+            let split_state = temp.path().join("recovery-split-created");
+            std::fs::write(
+                &window_state,
+                crate::adapters::rex::owned_ticket_window_label("github:acme/repo-a", "PAY-12")
+                    .unwrap(),
+            )
+            .unwrap();
+            write_executable(
+                &rex_cli,
+                &format!(
+                    "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"http://fixture\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"test\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) label=$(cat '{window_state}'); if [ -f '{split_state}' ]; then printf '{{\"windows\":[{{\"window_id\":\"fixture-window\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block\",\"label\":\"agent\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$label\"; else printf '{{\"windows\":[{{\"window_id\":\"fixture-window\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$label\"; fi ;;\n  *\"api call session.new_split\"*) touch '{split_state}'; printf '%s\\n' '{{\"block_ids\":[\"recovery-merge-decision-block\"]}}' ;;\n  *\"api call session.new_window\"*) for arg do payload=$arg; done; label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"window_label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$label\" > '{window_state}'; printf '%s\\n' '{{\"window_id\":\"fixture-window\",\"block_ids\":[\"anchor-block\"]}}' ;;\n  *\"events -s fixture-session --json\"*) exit 0 ;;\n  *) exit 91 ;;\nesac\n",
+                    window_state = window_state.display(),
+                    split_state = split_state.display(),
+                ),
+            );
+            write_executable(&provider_cli, "#!/bin/sh\nexit 0\n");
+            applied.config.adapters.tickets.command = vec![ticket_cli.display().to_string()];
+            applied.config.runtime.rex_binary = rex_cli.display().to_string();
+            applied.config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
+            let config_file = temp.path().join("recovery-runtime-config.toml");
+            std::fs::write(&config_file, "fixture runtime config\n").unwrap();
+            Some((config_file, provider_cli))
+        } else {
+            None
+        };
         applied.source_files[0].sha256 = Digest::parse(content_digest("x")).unwrap();
         applied.source_files.push(crate::config::SourceFile {
             kind: crate::config::SourceKind::Directory,
@@ -7221,6 +7390,7 @@ pub(crate) mod tests {
             serde_json::from_value::<ProjectConfig>(serde_json::json!({
                 "mode": "goal",
                 "ticket_adapter": "tickets",
+                "ticket_scope": if exercise_runtime_launch || exercise_runtime_second_turn { serde_json::json!({"project":"project-a"}) } else { serde_json::json!({}) },
                 "repositories": ["repo-a"],
                 "roles": {
                     "coordinator": "worker_codex",
@@ -7247,6 +7417,13 @@ pub(crate) mod tests {
                 options: None,
             },
         );
+        if let Some((_, provider_cli)) = &runtime_launch_config {
+            applied
+                .profiles
+                .get_mut(&crate::domain::ids::ProfileId::parse("worker_codex").unwrap())
+                .unwrap()
+                .command = vec![provider_cli.display().to_string()];
+        }
         let config_digest = applied.digest.clone();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
         let applied_record = store
@@ -7279,6 +7456,66 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert_eq!(owner_generation, 1);
+        if exercise_runtime_launch || exercise_runtime_second_turn {
+            let profile_id = crate::domain::ids::ProfileId::parse("worker_codex").unwrap();
+            let profile = applied.profiles.get(&profile_id).unwrap();
+            let profile_digest = agent_profile_digest(profile).unwrap();
+            let identity = crate::run_step::profile_runtime_identity(profile).unwrap();
+            let markers = [
+                "REX_PROJECTS_AGENT",
+                "REX_PROJECTS_CONTEXT",
+                "REX_PROJECTS_PROJECT_ID",
+                "REX_PROJECTS_ROLE",
+                "REX_PROJECTS_RUN_ID",
+            ];
+            let qualification: crate::launch::ProviderQualification =
+                serde_json::from_value(serde_json::json!({
+                    "schema_version": 1,
+                    "project_id": project_id,
+                    "profile_id": profile_id,
+                    "profile_digest": profile_digest,
+                    "adapter": identity.adapter,
+                    "executable_path": identity.executable_path.display().to_string(),
+                    "executable_digest": identity.executable_digest,
+                    "provider_version": "fixture-1",
+                    "permission_mode": identity.effective_permission_mode,
+                    "invocation_options_digest": identity.invocation_options_digest,
+                    "commit_mode": identity.commit_mode,
+                    "proof": {
+                        "schema_version": 1,
+                        "probe_id": "recovery-launch-probe",
+                        "fixture_digest": "b".repeat(64),
+                        "rex_instance_id": "fixture-rex",
+                        "tool_shell_marker_digest": "c".repeat(64),
+                        "tool_shell_markers_present": markers,
+                        "descendant_marker_digest": "d".repeat(64),
+                        "descendant_markers_present": markers,
+                        "automatic_turn_result_digest": "e".repeat(64),
+                        "automatic_turn_completed": true,
+                        "structured_result_valid": true,
+                        "observed_permission_mode": identity.effective_permission_mode,
+                        "permission_prompt_count": 0,
+                        "cleanup_process_tree_digest": "f".repeat(64),
+                        "process_tree_absent": true,
+                        "cleanup_confirmed": true
+                    },
+                    "status": "verified"
+                }))
+                .unwrap();
+            qualification.validate_for_storage().unwrap();
+            let receipt_json = serde_json::to_string(&qualification).unwrap();
+            store.connection.execute(
+                "INSERT INTO provider_qualifications(receipt_digest,project_id,profile_id,profile_digest,adapter,executable_path,executable_digest,provider_version,permission_mode,invocation_options_digest,commit_mode,status,receipt_json,created_by_generation,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'verified',?12,?13,?14)",
+                rusqlite::params![
+                    qualification.canonical_digest().unwrap().as_str(), project_id.as_str(),
+                    profile_id.as_str(), profile_digest.as_str(), serde_json::to_value(identity.adapter).unwrap().as_str().unwrap(),
+                    identity.executable_path.display().to_string(), identity.executable_digest.as_str(),
+                    "fixture-1", identity.effective_permission_mode, identity.invocation_options_digest.as_str(),
+                    serde_json::to_value(identity.commit_mode).unwrap().as_str().unwrap(), receipt_json,
+                    owner_generation, 1_i64,
+                ],
+            ).unwrap();
+        }
         let ticket_namespace = TicketNamespace::parse("github:acme/repo-a").unwrap();
         let ticket_id = TicketId::parse("PAY-12").unwrap();
         let ticket_run_id = TicketRunId::parse("fixture-ticket-run").unwrap();
@@ -8728,6 +8965,11 @@ pub(crate) mod tests {
                 structured_result: coordinator_payload,
                 artifact_refs: Vec::new(),
             };
+            let coordinator_run_id = if reject_twice {
+                "single-publication-merge-run-still-annotated-parent"
+            } else {
+                "single-publication-correct-merge-coordinator"
+            };
             let coordinator_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs(
                 &mut store,
                 &std::fs::canonicalize(temp.path()).unwrap(),
@@ -8736,7 +8978,7 @@ pub(crate) mod tests {
                 ticket_run_id.clone(),
                 crate::domain::types::Role::Coordinator,
                 coordinator_result_message,
-                crate::domain::ids::AgentRunId::parse("single-publication-correct-merge-coordinator").unwrap(),
+                crate::domain::ids::AgentRunId::parse(coordinator_run_id).unwrap(),
                 vec![coordinator_wake_item.clone()],
             ).unwrap();
             let coordinator_authority = store
@@ -8888,6 +9130,15 @@ pub(crate) mod tests {
                     supervisor_wakes[0].payload_json["ticket_run_id"],
                     ticket_run_id.as_str()
                 );
+                // This is the real exhausted path: the immutable result receipt records
+                // `completed`, while `Succeeded` is only the Agent assertion. The public
+                // recovery view must recognize that durable evidence before it can be queued.
+                let recovery_subject = store
+                    .merge_claim_recovery_subject(&project_id, &ticket_run_id)
+                    .unwrap_or_else(|error| {
+                        panic!("the exhausted MergeDecision result must produce a recovery subject: {error}")
+                    });
+                assert!(recovery_subject.digest().is_ok());
                 assert!(
                     crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
                         &mut store,
@@ -8912,6 +9163,984 @@ pub(crate) mod tests {
                     .filter(|wake| wake.source_type == "merge_assessment_correction_exhausted")
                     .count();
                 assert_eq!(replayed_supervisor_wakes, 1);
+                let subject = store
+                    .merge_claim_recovery_subject(&project_id, &ticket_run_id)
+                    .unwrap();
+                let subject_digest = subject.digest().unwrap();
+                let state_root = temp.path().to_str().unwrap();
+                let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("examples/fixture/config.toml");
+                let config_path = config_path.to_str().unwrap();
+                crate::cli::dispatch_ticket_command_for_test(&[
+                    "rex-projects",
+                    "--config",
+                    config_path,
+                    "--state-root",
+                    state_root,
+                    "--json",
+                    "ticket",
+                    "blocked-reason",
+                    "--project",
+                    project_id.as_str(),
+                    "--run",
+                    ticket_run_id.as_str(),
+                ])
+                .unwrap();
+                crate::cli::dispatch_ticket_command_for_test(&[
+                    "rex-projects",
+                    "--config",
+                    config_path,
+                    "--state-root",
+                    state_root,
+                    "--json",
+                    "ticket",
+                    "resume-merge-decision",
+                    "--project",
+                    project_id.as_str(),
+                    "--run",
+                    ticket_run_id.as_str(),
+                    "--expected-subject-digest",
+                    subject_digest.as_str(),
+                    "--request-id",
+                    "recovery-fixture-request",
+                ])
+                .unwrap();
+                let queued = store
+                    .merge_claim_recovery_status("recovery-fixture-request")
+                    .unwrap()
+                    .expect("public CLI must durably enqueue human intent");
+                assert_eq!(queued.state, "pending");
+                assert!(!queued.budget_used);
+                crate::cli::dispatch_ticket_command_for_test(&[
+                    "rex-projects",
+                    "--config",
+                    config_path,
+                    "--state-root",
+                    state_root,
+                    "--json",
+                    "ticket",
+                    "recovery-status",
+                    "--request-id",
+                    "recovery-fixture-request",
+                ])
+                .unwrap();
+                assert!(
+                    store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("ticket_run:{ticket_run_id}:coordinator"),
+                            32,
+                        )
+                        .unwrap()
+                        .iter()
+                        .all(|wake| wake.source_type != "merge_claim_recovery_authorized"),
+                    "the public CLI must only queue intent; it must not authorize or wake an Agent itself"
+                );
+                let second_queued = store
+                    .enqueue_merge_claim_recovery(
+                        "recovery-fixture-request-later",
+                        &subject_digest,
+                        &project_id,
+                        &ticket_run_id,
+                        queued.updated_at_unix,
+                    )
+                    .unwrap();
+                assert_eq!(second_queued.state, "pending");
+                let first_pending = store.pending_merge_claim_recoveries(2).unwrap();
+                assert_eq!(first_pending[0].request_id, queued.request_id);
+                assert!(!store.authorize_merge_claim_recovery(
+                    owner_generation,
+                    &first_pending[0],
+                    &crate::store::merge_claim_recovery::MergeClaimRecoveryObservation::TemporarilyUnavailable,
+                    14,
+                ).unwrap());
+                let rotated = store.pending_merge_claim_recoveries(2).unwrap();
+                assert_eq!(
+                    rotated[0].request_id, second_queued.request_id,
+                    "a temporarily unavailable oldest request rotates behind other pending requests"
+                );
+                assert_eq!(rotated[1].request_id, queued.request_id);
+                assert!(!store.authorize_merge_claim_recovery(
+                    owner_generation,
+                    &rotated[0],
+                    &crate::store::merge_claim_recovery::MergeClaimRecoveryObservation::Stale("fixture superseded duplicate".into()),
+                    15,
+                ).unwrap());
+                let pending = store.pending_merge_claim_recoveries(1).unwrap().remove(0);
+                assert_eq!(pending.request_id, queued.request_id);
+                let observation =
+                    crate::store::merge_claim_recovery::MergeClaimRecoveryObservation::Current {
+                        ticket_namespace: subject.ticket_namespace.clone(),
+                        ticket_id: subject.ticket_id.clone(),
+                        ticket_status: crate::adapters::tickets::NormalizedTicketStatus::InProgress,
+                        publication_set_digest: subject.publication_set_digest.clone(),
+                        pull_request_reference: subject.expected_pull_request_reference.clone(),
+                    };
+                assert!(
+                    store
+                        .authorize_merge_claim_recovery(
+                            owner_generation,
+                            &pending,
+                            &observation,
+                            14
+                        )
+                        .unwrap()
+                );
+                let replay = store
+                    .enqueue_merge_claim_recovery(
+                        "recovery-fixture-request",
+                        &subject_digest,
+                        &project_id,
+                        &ticket_run_id,
+                        15,
+                    )
+                    .unwrap();
+                assert!(replay.replayed);
+                assert_eq!(replay.state, "authorized");
+                assert!(
+                    store
+                        .enqueue_merge_claim_recovery(
+                            "recovery-fixture-request",
+                            &Digest::parse("d".repeat(64)).unwrap(),
+                            &project_id,
+                            &ticket_run_id,
+                            15,
+                        )
+                        .is_err(),
+                    "an idempotency key cannot be replayed with changed subject contents"
+                );
+                assert!(store.merge_claim_recovery_budget_used(&subject).unwrap());
+                let recovery_status = store
+                    .merge_claim_recovery_status("recovery-fixture-request")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovery_status.state, "authorized");
+                assert!(recovery_status.budget_used);
+                let coordinator_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("ticket_run:{ticket_run_id}:coordinator"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| wake.source_type == "merge_claim_recovery_authorized")
+                    .collect::<Vec<_>>();
+                assert_eq!(coordinator_wakes.len(), 1);
+                let coordinator_inputs = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("ticket_run:{ticket_run_id}:coordinator"),
+                        16,
+                    )
+                    .unwrap();
+                let wake_items = coordinator_inputs
+                    .iter()
+                    .map(|input| crate::agent_api::AgentWakeItem {
+                        wake_input_id: input.wake_input_id,
+                        source_type: input.source_type.clone(),
+                        source_id: input.source_id.clone(),
+                        source_revision: input.source_revision,
+                        priority: input.priority,
+                        payload_json: input.payload_json.clone(),
+                        host_artifact_source_evidence_ids: Vec::new(),
+                        host_artifacts: Vec::new(),
+                        host_completion_context: None,
+                    })
+                    .collect::<Vec<_>>();
+                let coordinator_run =
+                    crate::domain::ids::AgentRunId::parse("recovery-coordinator-run").unwrap();
+                let coordinator_message = if exercise_failed_recovery_coordinator {
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "recovery-coordinator-failed".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::HumanRequest,
+                        assertion: crate::engine::orchestration::AgentAssertion::Failed {
+                            reason: "provider turn failed".into(),
+                        },
+                        result_digest: None,
+                        structured_result: serde_json::json!({
+                            "kind":"clarification",
+                            "question":"The recovery Coordinator turn failed.",
+                            "choices":[],
+                            "evidence_references":[],
+                            "subject_digest":subject.publication_set_digest.as_str(),
+                            "requested_continuation":null
+                        }),
+                        artifact_refs: Vec::new(),
+                    }
+                } else {
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "recovery-coordinator-spawn-merge-decision".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::SpawnRequest,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: None,
+                        structured_result: serde_json::json!({
+                            "work_node": root_id.as_str(),
+                            "role": "merge_decision",
+                            "profile_id": "worker_codex",
+                            "plan_digest": subject.accepted_plan_digest.as_str(),
+                            "allowed_repositories": [],
+                            "artifact_inputs": [],
+                            "parent_run_id": coordinator_run.as_str(),
+                        }),
+                        artifact_refs: Vec::new(),
+                    }
+                };
+                let coordinator_result =
+                    crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs(
+                        &mut store,
+                        &std::fs::canonicalize(temp.path()).unwrap(),
+                        owner_generation,
+                        project_id.clone(),
+                        ticket_run_id.clone(),
+                        crate::domain::types::Role::Coordinator,
+                        coordinator_message,
+                        coordinator_run.clone(),
+                        wake_items,
+                    )
+                    .unwrap();
+                let assigned_recovery_inputs: i64 = store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='merge_claim_recovery_authorized' AND source_id=?3 AND source_revision=?4 AND consuming_agent_run_id=?5",
+                        rusqlite::params![project_id.as_str(), format!("ticket_run:{ticket_run_id}:coordinator"), queued.request_id, subject.blocked_revision + 1, coordinator_result.ingested.validated.binding.agent_run_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(assigned_recovery_inputs, 1);
+                if exercise_failed_recovery_coordinator {
+                    assert!(
+                        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                            &mut store,
+                            owner_generation,
+                            16,
+                            &config,
+                            config_digest.clone(),
+                            &coordinator_result.ingested,
+                        )
+                        .unwrap()
+                    );
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(status.state, "reblocked");
+                    assert!(status.budget_used);
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "blocked".into()));
+                    let md_child_count: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='coordinator_child' AND source_id=?3",
+                        rusqlite::params![project_id.as_str(), format!("ticket_run:{ticket_run_id}:merge_decision"), coordinator_result.ingested.receipt.evidence_id()],
+                        |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(md_child_count, 0);
+                    let supervisor_wakes = store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("project:{}:supervisor", project_id.as_str()),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| wake.source_type == "merge_claim_recovery_reblocked")
+                        .count();
+                    assert_eq!(supervisor_wakes, 1);
+                    return;
+                }
+                if exercise_stale_recovery_config {
+                    let stale_digest = Digest::parse("c".repeat(64)).unwrap();
+                    assert!(
+                        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                            &mut store,
+                            owner_generation,
+                            16,
+                            &config,
+                            stale_digest,
+                            &coordinator_result.ingested,
+                        )
+                        .unwrap()
+                    );
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(status.state, "reblocked");
+                    assert!(
+                        status.budget_used,
+                        "a failed recovery cannot renew its one-use budget"
+                    );
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "blocked".into()));
+                    let md_child_created: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='coordinator_child' AND source_id=?3",
+                        rusqlite::params![project_id.as_str(), format!("ticket_run:{ticket_run_id}:merge_decision"), coordinator_result.ingested.receipt.evidence_id()],
+                        |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(
+                        md_child_created, 0,
+                        "stale configuration must not create the recovery MergeDecision child"
+                    );
+                    let supervisor_wakes = store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("project:{}:supervisor", project_id.as_str()),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| wake.source_type == "merge_claim_recovery_reblocked")
+                        .count();
+                    assert_eq!(supervisor_wakes, 1);
+                    return;
+                }
+                assert!(crate::engine::factory_runtime::tests::apply_coordinator_spawn_request_for_test(
+                    &mut store,
+                    owner_generation,
+                    16,
+                    &config,
+                    config_digest.clone(),
+                    &coordinator_result.ingested,
+                )
+                .unwrap());
+                let merge_decision_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("ticket_run:{ticket_run_id}:merge_decision"),
+                        16,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| {
+                        wake.source_type == "coordinator_child"
+                            && wake.source_id == coordinator_result.ingested.receipt.evidence_id()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(merge_decision_wakes.len(), 1);
+                assert_eq!(merge_decision_wakes[0].source_type, "coordinator_child");
+                if exercise_failed_resumed_merge {
+                    let md_inputs = store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("ticket_run:{ticket_run_id}:merge_decision"),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| {
+                            wake.source_type == "coordinator_child"
+                                && wake.source_id
+                                    == coordinator_result.ingested.receipt.evidence_id()
+                        })
+                        .map(|input| crate::agent_api::AgentWakeItem {
+                            wake_input_id: input.wake_input_id,
+                            source_type: input.source_type,
+                            source_id: input.source_id,
+                            source_revision: input.source_revision,
+                            priority: input.priority,
+                            payload_json: input.payload_json,
+                            host_artifact_source_evidence_ids: Vec::new(),
+                            host_artifacts: Vec::new(),
+                            host_completion_context: None,
+                        })
+                        .collect();
+                    let failed_message = crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "recovery-merge-decision-failed".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::HumanRequest,
+                        assertion: crate::engine::orchestration::AgentAssertion::Failed {
+                            reason: "provider turn failed".into(),
+                        },
+                        result_digest: None,
+                        structured_result: serde_json::json!({
+                            "kind":"clarification",
+                            "question":"The MergeDecision turn failed.",
+                            "choices":[],
+                            "evidence_references":[],
+                            "subject_digest":subject.publication_set_digest.as_str(),
+                            "requested_continuation":null
+                        }),
+                        artifact_refs: Vec::new(),
+                    };
+                    let failed_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs_and_parent(
+                        &mut store,
+                        &std::fs::canonicalize(temp.path()).unwrap(),
+                        owner_generation,
+                        project_id.clone(),
+                        ticket_run_id.clone(),
+                        crate::domain::types::Role::MergeDecision,
+                        failed_message,
+                        crate::domain::ids::AgentRunId::parse("recovery-merge-failure-run").unwrap(),
+                        md_inputs,
+                        Some(coordinator_result.ingested.validated.binding.agent_run_id.clone()),
+                        None,
+                    ).unwrap();
+                    assert!(
+                        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                            &mut store,
+                            owner_generation,
+                            17,
+                            &config,
+                            config_digest.clone(),
+                            &failed_result.ingested,
+                        )
+                        .unwrap()
+                    );
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(status.state, "reblocked");
+                    assert!(
+                        status.budget_used,
+                        "failed resumed MergeDecision cannot renew its one-use budget"
+                    );
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "blocked".into()));
+                    let md_child_count: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='coordinator_child' AND source_id=?3",
+                        rusqlite::params![project_id.as_str(), format!("ticket_run:{ticket_run_id}:merge_decision"), coordinator_result.ingested.receipt.evidence_id()],
+                        |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(
+                        md_child_count, 1,
+                        "failed MergeDecision keeps its original child but creates no retry child"
+                    );
+                    let recovery_reblocks: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='merge_claim_recovery_reblocked' AND source_id='recovery-fixture-request'",
+                        rusqlite::params![project_id.as_str(), format!("project:{}:supervisor", project_id.as_str())],
+                        |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(recovery_reblocks, 1);
+                    return;
+                }
+                let wake_sources = merge_decision_wakes
+                    .iter()
+                    .map(|wake| (wake.source_type.clone(), wake.source_id.clone()))
+                    .collect::<Vec<_>>();
+                let resumed_subject =
+                    crate::runtime_services::accepted_publication_subject_for_role_launch_for_test(
+                        &store,
+                        owner_generation,
+                        &project_id,
+                        &ticket_run_id,
+                        subject.blocked_revision + 1,
+                        (crate::domain::types::Role::MergeDecision, &wake_sources),
+                        &applied,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    resumed_subject.digest().unwrap(),
+                    subject.publication_set_digest
+                );
+                if exercise_runtime_launch {
+                    let config_file = &runtime_launch_config.as_ref().unwrap().0;
+                    let runtime_state = temp.path().join("runtime-state");
+                    std::fs::create_dir_all(&runtime_state).unwrap();
+                    let runtime_state = std::fs::canonicalize(runtime_state).unwrap();
+                    let environment =
+                        crate::environment::capture(&applied.config.runtime.environment).unwrap();
+                    let active_ticket_view = store
+                        .rex_view_history(&project_id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|record| {
+                            record.lifecycle == "active"
+                                && record.view.kind == crate::launch::RexViewKind::Ticket
+                                && record.view.ticket_id.as_deref() == Some(ticket_id.as_str())
+                        })
+                        .expect("the ticket fixture already owns an active Rex view");
+                    let rex_identity = crate::adapters::rex::RexIdentity {
+                        endpoint: "http://fixture".into(),
+                        instance_id: active_ticket_view.view.rex_server_identity.clone(),
+                        session_id: active_ticket_view.view.rex_session_id.clone(),
+                        block_id: Some("fixture-block".into()),
+                    };
+                    let runtime_binary = std::env::current_exe().unwrap();
+                    let runtime_digest = Digest::parse("9".repeat(64)).unwrap();
+                    let mut services = crate::runtime_services::RuntimeServices::new(
+                        &applied,
+                        &environment,
+                        config_file,
+                        &runtime_state,
+                        owner_generation,
+                        &rex_identity,
+                        crate::runtime_services::RuntimeExecutable {
+                            path: &runtime_binary,
+                            digest: &runtime_digest,
+                        },
+                    )
+                    .unwrap();
+                    let candidates = store
+                        .pending_role_wake_sessions(owner_generation, 16)
+                        .unwrap();
+                    let candidate = candidates
+                        .iter()
+                        .find(|candidate| {
+                            candidate.role_session_id
+                                == format!("ticket_run:{ticket_run_id}:merge_decision")
+                        })
+                        .expect(
+                            "authorized recovery child must be a real runtime launch candidate",
+                        );
+                    assert!(crate::engine::factory_runtime::FactoryRuntimeServices::prepare_role_launch(
+                        &mut services,
+                        &mut store,
+                        owner_generation,
+                        &applied.config,
+                        candidate,
+                        20,
+                    ).unwrap(), "the production runtime must prepare the authorized resumed MergeDecision");
+                    let agent_run_id = store.connection.query_row::<String, _, _>(
+                        "SELECT consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=?1 AND project_id=?2 AND role_session_id=?3 AND source_type='coordinator_child' AND source_id=?4 AND source_revision=?5 AND lifecycle='assigned'",
+                        rusqlite::params![merge_decision_wakes[0].wake_input_id, project_id.as_str(), candidate.role_session_id, coordinator_result.ingested.receipt.evidence_id(), subject.blocked_revision + 1],
+                        |row| row.get(0),
+                    ).unwrap();
+                    let agent_run_id = crate::domain::ids::AgentRunId::parse(agent_run_id).unwrap();
+                    let reservation = store
+                        .agent_launch_reservation_for_run(&agent_run_id)
+                        .unwrap()
+                        .expect("runtime preparation persists an immutable launch reservation");
+                    assert_eq!(
+                        reservation.ticket_revision.unwrap().0,
+                        subject.blocked_revision + 1
+                    );
+                    assert_eq!(
+                        reservation
+                            .wake_snapshot
+                            .inputs
+                            .iter()
+                            .filter(|input| input.source_type == "coordinator_child"
+                                && input.source_id
+                                    == coordinator_result.ingested.receipt.evidence_id())
+                            .count(),
+                        1
+                    );
+                    let view = store
+                        .rex_view_history(&project_id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|record| record.view.view_id == reservation.rex_view_id)
+                        .expect("prepared MergeDecision retains its exact ticket view");
+                    let observed_block = crate::adapters::rex::RexContextBlock {
+                        server_instance_id: rex_identity.instance_id.clone(),
+                        session_id: rex_identity.session_id.clone(),
+                        window_id: view.view.rex_window_id,
+                        block_id: "recovery-merge-decision-block".into(),
+                        label: crate::adapters::rex::owned_agent_block_label(agent_run_id.as_str())
+                            .unwrap(),
+                        flavor: "shell".into(),
+                    };
+                    let package = services
+                        .build_run_step_package_for_test(
+                            &mut store,
+                            20,
+                            &reservation,
+                            &observed_block,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        package.descriptor.wake_snapshot_digest,
+                        reservation.wake_snapshot.digest
+                    );
+                    assert!(
+                        reservation
+                            .wake_snapshot
+                            .inputs
+                            .iter()
+                            .any(|input| input.source_type == "coordinator_child"
+                                && input.source_id
+                                    == coordinator_result.ingested.receipt.evidence_id())
+                    );
+                    let package_digest =
+                        package.publish_once(&reservation.descriptor_path).unwrap();
+                    let package_bytes = std::fs::read(&reservation.descriptor_path).unwrap();
+                    let persisted: crate::run_step_package::RunStepPackage =
+                        crate::protocol::parse_unique(&package_bytes).unwrap();
+                    persisted.validate().unwrap();
+                    assert_eq!(persisted.descriptor.run_id, agent_run_id);
+                    assert_eq!(
+                        persisted.descriptor.expected_subject_revision,
+                        subject.blocked_revision + 1
+                    );
+                    assert_eq!(
+                        persisted.descriptor.wake_snapshot_digest,
+                        reservation.wake_snapshot.digest
+                    );
+                    assert_eq!(
+                        package_digest.as_str(),
+                        content_digest(std::str::from_utf8(&package_bytes).unwrap())
+                    );
+                    return;
+                }
+
+                let mut resumed_assessment_json = merge_result_json.clone();
+                resumed_assessment_json["pr_references"] =
+                    serde_json::json!([expected_pr_reference]);
+                let resumed_assessment_message = crate::roles::RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "recovery-resumed-merge-assessment".into(),
+                    kind: crate::engine::orchestration::RoleOutputKind::MergeAssessment,
+                    assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                    result_digest: Some(
+                        Digest::parse(content_digest(&resumed_assessment_json.to_string()))
+                            .unwrap(),
+                    ),
+                    structured_result: resumed_assessment_json,
+                    artifact_refs: Vec::new(),
+                };
+                let assessment_wake = merge_decision_wakes[0].clone();
+                let resumed_assessment_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs_and_parent(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    resumed_assessment_message,
+                    crate::domain::ids::AgentRunId::parse("recovery-merge-assessment-run").unwrap(),
+                    vec![crate::agent_api::AgentWakeItem {
+                        wake_input_id: assessment_wake.wake_input_id,
+                        source_type: assessment_wake.source_type.clone(),
+                        source_id: assessment_wake.source_id.clone(),
+                        source_revision: assessment_wake.source_revision,
+                        priority: assessment_wake.priority,
+                        payload_json: assessment_wake.payload_json.clone(),
+                        host_artifact_source_evidence_ids: Vec::new(),
+                        host_artifacts: Vec::new(),
+                        host_completion_context: None,
+                    }],
+                    Some(coordinator_run.clone()),
+                    Some(subject.instruction_digest.clone()),
+                ).unwrap();
+                assert_eq!(store.connection.execute(
+                    "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE project_id=?1 AND role_session_id=?2 AND source_type='coordinator_child' AND source_id=?3 AND lifecycle='assigned'",
+                    rusqlite::params![project_id.as_str(), format!("ticket_run:{ticket_run_id}:merge_decision"), coordinator_result.ingested.receipt.evidence_id()],
+                ).unwrap(), 1, "the completed recovery MergeDecision consumes its exact Coordinator child wake");
+                store.connection.execute(
+                    "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE project_id=?1 AND role_session_id=?2 AND source_type='coordinator_child' AND lifecycle IN ('pending','assigned')",
+                    rusqlite::params![project_id.as_str(), format!("ticket_run:{ticket_run_id}:merge_decision")],
+                ).unwrap();
+                let (resumed_observation, resumed_body_proposal) =
+                    crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
+                        applied.clone(),
+                        &resumed_subject,
+                        &resumed_assessment_result.ingested,
+                        &accepted.proposal,
+                        &project_id,
+                        replies.clone(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    resumed_assessment_result
+                        .ingested
+                        .validated
+                        .binding
+                        .instruction_digest,
+                    subject.instruction_digest
+                );
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
+                        &mut store,
+                        owner_generation,
+                        17,
+                        &config,
+                        config_digest.clone(),
+                        &resumed_assessment_result.ingested,
+                        resumed_observation,
+                        Some(resumed_body_proposal),
+                    )
+                    .unwrap()
+                );
+                let resumed_trusted = store.trusted_merge_assessment(
+                    &project_id,
+                    &ticket_run_id,
+                    Revision(subject.blocked_revision + 1),
+                ).unwrap().expect("recovery assessment must produce the exact host-validated second-turn wake");
+                let parent = store
+                    .coordinator_parent_for_merge_assessment(
+                        &project_id,
+                        &ticket_run_id,
+                        resumed_trusted.revision,
+                    )
+                    .unwrap()
+                    .expect("host-validated MergeIntent turn retains its exact Coordinator parent");
+                assert_eq!(parent.agent_run_id, coordinator_run);
+                let assessment_wake = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("ticket_run:{ticket_run_id}:merge_decision"),
+                        16,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .find(|wake| wake.source_type == "host_merge_assessment")
+                    .unwrap();
+                let second_turn_subject =
+                    crate::runtime_services::accepted_publication_subject_for_role_launch_for_test(
+                        &store,
+                        owner_generation,
+                        &project_id,
+                        &ticket_run_id,
+                        resumed_trusted.revision.0,
+                        (
+                            crate::domain::types::Role::MergeDecision,
+                            &[(
+                                assessment_wake.source_type.clone(),
+                                assessment_wake.source_id.clone(),
+                            )],
+                        ),
+                        &applied,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    second_turn_subject.digest().unwrap(),
+                    subject.publication_set_digest
+                );
+                if exercise_runtime_second_turn {
+                    let config_file = &runtime_launch_config.as_ref().unwrap().0;
+                    let runtime_state = temp.path().join("runtime-state-second-turn");
+                    std::fs::create_dir_all(&runtime_state).unwrap();
+                    let runtime_state = std::fs::canonicalize(runtime_state).unwrap();
+                    let environment =
+                        crate::environment::capture(&applied.config.runtime.environment).unwrap();
+                    let active_ticket_view = store
+                        .rex_view_history(&project_id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|record| {
+                            record.lifecycle == "active"
+                                && record.view.kind == crate::launch::RexViewKind::Ticket
+                                && record.view.ticket_id.as_deref() == Some(ticket_id.as_str())
+                        })
+                        .expect("the ticket fixture already owns an active Rex view");
+                    let rex_identity = crate::adapters::rex::RexIdentity {
+                        endpoint: "http://fixture".into(),
+                        instance_id: active_ticket_view.view.rex_server_identity.clone(),
+                        session_id: active_ticket_view.view.rex_session_id.clone(),
+                        block_id: Some("fixture-block".into()),
+                    };
+                    let runtime_binary = std::env::current_exe().unwrap();
+                    let runtime_digest = Digest::parse("9".repeat(64)).unwrap();
+                    let mut services = crate::runtime_services::RuntimeServices::new(
+                        &applied,
+                        &environment,
+                        config_file,
+                        &runtime_state,
+                        owner_generation,
+                        &rex_identity,
+                        crate::runtime_services::RuntimeExecutable {
+                            path: &runtime_binary,
+                            digest: &runtime_digest,
+                        },
+                    )
+                    .unwrap();
+                    let candidate = store.pending_role_wake_sessions(owner_generation, 16).unwrap()
+                        .into_iter()
+                        .find(|candidate| candidate.role_session_id == format!("ticket_run:{ticket_run_id}:merge_decision"))
+                        .expect("the accepted host_merge_assessment wake must schedule a second finite MD turn");
+                    assert!(crate::engine::factory_runtime::FactoryRuntimeServices::prepare_role_launch(
+                        &mut services,
+                        &mut store,
+                        owner_generation,
+                        &applied.config,
+                        &candidate,
+                        21,
+                    ).unwrap(), "the production runtime must prepare the trusted MergeIntent turn");
+                    let agent_run_id = store.connection.query_row::<String, _, _>(
+                        "SELECT consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=?1 AND project_id=?2 AND role_session_id=?3 AND source_type='host_merge_assessment' AND source_id=?4 AND source_revision=?5 AND lifecycle='assigned'",
+                        rusqlite::params![assessment_wake.wake_input_id, project_id.as_str(), candidate.role_session_id, assessment_wake.source_id, resumed_trusted.revision.0],
+                        |row| row.get(0),
+                    ).unwrap();
+                    let agent_run_id = crate::domain::ids::AgentRunId::parse(agent_run_id).unwrap();
+                    let reservation = store
+                        .agent_launch_reservation_for_run(&agent_run_id)
+                        .unwrap()
+                        .expect("second finite MD turn has a durable launch reservation");
+                    assert_eq!(reservation.project_id, project_id);
+                    assert_eq!(reservation.role, crate::domain::types::Role::MergeDecision);
+                    assert_eq!(reservation.role_session_id, candidate.role_session_id);
+                    assert_eq!(
+                        reservation.ticket_revision.unwrap().0,
+                        resumed_trusted.revision.0
+                    );
+                    assert!(
+                        reservation
+                            .wake_snapshot
+                            .inputs
+                            .iter()
+                            .any(|input| input.source_type == "host_merge_assessment"
+                                && input.source_id == assessment_wake.source_id)
+                    );
+                    let view = store
+                        .rex_view_history(&project_id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|record| record.view.view_id == reservation.rex_view_id)
+                        .expect("second MD turn uses the ticket Rex view");
+                    let observed_block = crate::adapters::rex::RexContextBlock {
+                        server_instance_id: rex_identity.instance_id.clone(),
+                        session_id: rex_identity.session_id.clone(),
+                        window_id: view.view.rex_window_id,
+                        block_id: "recovery-merge-decision-block".into(),
+                        label: crate::adapters::rex::owned_agent_block_label(agent_run_id.as_str())
+                            .unwrap(),
+                        flavor: "shell".into(),
+                    };
+                    let package = services
+                        .build_run_step_package_for_test(
+                            &mut store,
+                            21,
+                            &reservation,
+                            &observed_block,
+                        )
+                        .unwrap();
+                    let package_digest =
+                        package.publish_once(&reservation.descriptor_path).unwrap();
+                    let package_bytes = std::fs::read(&reservation.descriptor_path).unwrap();
+                    let persisted: crate::run_step_package::RunStepPackage =
+                        crate::protocol::parse_unique(&package_bytes).unwrap();
+                    persisted.validate().unwrap();
+                    assert_eq!(persisted.descriptor.run_id, agent_run_id);
+                    assert_eq!(
+                        persisted.descriptor.expected_subject_revision,
+                        resumed_trusted.revision.0
+                    );
+                    assert_eq!(
+                        persisted.descriptor.wake_snapshot_digest,
+                        reservation.wake_snapshot.digest
+                    );
+                    assert_eq!(
+                        package_digest.as_str(),
+                        content_digest(std::str::from_utf8(&package_bytes).unwrap())
+                    );
+                    return;
+                }
+                let typed_intent = serde_json::json!({
+                    "assessment_id": resumed_trusted.assessment_id.as_str(),
+                    "pr_identities": [resumed_trusted.pull_request_reference],
+                    "policy_digest": resumed_trusted.policy_digest.as_str(),
+                    "prepared_body_digest": resumed_trusted.prepared_body_proposal.as_ref().unwrap().target_body_digest.as_str(),
+                    "steps": [
+                        {"kind":"update_pull_request_body","instruction_reference":"repository:repo-a:merge#prepare-body","rationale":"apply the host-prepared PR body"},
+                        {"kind":"request_merge","instruction_reference":"repository:repo-a:merge#request-merge","rationale":"request the repository-configured merge"},
+                        {"kind":"verify_merge_commit","instruction_reference":"repository:repo-a:merge#verify-merge","rationale":"verify the resulting commit"}
+                    ],
+                    "post_merge_verification": [
+                        {"kind":"merge_commit_recorded","instruction_reference":"repository:repo-a:merge#verify-merge","rationale":"confirm the remote merge commit"}
+                    ]
+                });
+                let merge_intent_message = crate::roles::RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "recovery-resumed-merge-intent".into(),
+                    kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                    assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                    result_digest: None,
+                    structured_result: typed_intent.clone(),
+                    artifact_refs: Vec::new(),
+                };
+                let intent_wake = assessment_wake;
+                let merge_intent_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs_and_parent(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    merge_intent_message.clone(),
+                    crate::domain::ids::AgentRunId::parse("recovery-merge-intent-run").unwrap(),
+                    vec![crate::agent_api::AgentWakeItem {
+                        wake_input_id: intent_wake.wake_input_id,
+                        source_type: intent_wake.source_type.clone(),
+                        source_id: intent_wake.source_id.clone(),
+                        source_revision: intent_wake.source_revision,
+                        priority: intent_wake.priority,
+                        payload_json: intent_wake.payload_json.clone(),
+                        host_artifact_source_evidence_ids: Vec::new(),
+                        host_artifacts: Vec::new(),
+                        host_completion_context: None,
+                    }],
+                    Some(coordinator_run.clone()),
+                    Some(subject.instruction_digest.clone()),
+                ).unwrap();
+                assert_eq!(store.connection.execute(
+                    "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE wake_input_id=?1 AND project_id=?2 AND source_type='host_merge_assessment' AND lifecycle='assigned'",
+                    rusqlite::params![intent_wake.wake_input_id, project_id.as_str()],
+                ).unwrap(), 1, "the finite MergeDecision turn consumes its exact trusted assessment wake");
+                let bound_intent = merge_intent_message
+                    .bind(merge_intent_result.ingested.validated.binding.clone())
+                    .unwrap();
+                let crate::engine::orchestration::RoleResultPayload::MergeIntent(intent_payload) =
+                    bound_intent.typed_payload
+                else {
+                    panic!("resumed public result must bind to a MergeIntent")
+                };
+                let work_document = crate::runtime_services::merge::tests::prepare_merge_work_document_for_store_test(
+                    applied.clone(),
+                    &resumed_subject,
+                    &accepted.proposal,
+                    &resumed_trusted,
+                    &intent_payload,
+                    &merge_intent_result.ingested,
+                    replies.clone(),
+                ).unwrap();
+                assert!(
+                    crate::engine::factory_runtime::tests::apply_merge_intent_for_test(
+                        &mut store,
+                        owner_generation,
+                        18,
+                        &config,
+                        config_digest.clone(),
+                        &merge_intent_result.ingested,
+                        work_document,
+                    )
+                    .unwrap()
+                );
+                let merge_work = store
+                    .merge_work_item(
+                        &project_id,
+                        &ticket_run_id,
+                        Revision(subject.blocked_revision + 3),
+                    )
+                    .unwrap()
+                    .expect("resumed MergeIntent must create the exact durable MergeWork item");
+                assert_eq!(
+                    merge_work.publication_set_digest,
+                    subject.publication_set_digest
+                );
+                let postmortem_revision = merge_work.awaiting_merge_revision.0 + 1;
+                store.connection.execute(
+                    "UPDATE ticket_runs SET internal_phase='postmortem',revision=?2 WHERE project_id=?1 AND ticket_run_id=?3",
+                    rusqlite::params![project_id.as_str(), postmortem_revision, ticket_run_id.as_str()],
+                ).unwrap();
+                let merge_verified = serde_json::json!({
+                    "kind":"merge_verified",
+                    "source_revision": merge_work.awaiting_merge_revision.0,
+                    "work_id": merge_work.work_id,
+                });
+                store.connection.execute(
+                    "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'ticket_run',?2,?3,?4,'recovery-postmortem-history-fixture','accepted MergeWork evidence fixture',?5,19)",
+                    rusqlite::params![project_id.as_str(), ticket_run_id.as_str(), merge_work.awaiting_merge_revision.0, postmortem_revision, merge_verified.to_string()],
+                ).unwrap();
+                let historical = store.historical_implementation_publication_snapshot(owner_generation, &merge_work)
+                    .unwrap().expect("accepted recovery proof must preserve the exact publication for Postmortem");
+                assert_eq!(
+                    historical.accepted_plan().plan_digest,
+                    merge_work.accepted_plan_digest
+                );
                 return;
             }
             let mut corrected_merge_json = merge_result_json.clone();
@@ -10363,8 +11592,13 @@ pub(crate) mod tests {
             &worker_result.ingested.validated.claimed_artifact_refs,
         )
         .unwrap();
+        second_correction_store.connection.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'agent_result',?3,?4,1,'{}','pending',21)",
+            rusqlite::params![project_id.as_str(), source_authority.role_session_id, worker_result.ingested.receipt.evidence_id(), source_authority.ticket_revision.unwrap().0],
+        ).unwrap();
         let second_worker_inputs = vec![crate::agent_api::AgentWakeItem {
-            wake_input_id: 1,
+            wake_input_id: u64::try_from(second_correction_store.connection.last_insert_rowid())
+                .unwrap(),
             source_type: "agent_result".into(),
             source_id: worker_result.ingested.receipt.evidence_id().to_owned(),
             source_revision: source_authority.ticket_revision.unwrap().0,

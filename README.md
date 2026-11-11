@@ -28,6 +28,9 @@ See [Release assets](docs/release-assets.md) for versioned target builds.
 The ticket adapter protocol is implemented by a configured external command. See
 [External ticket adapters](docs/ticket-adapter.md) for its normalization and schema contract.
 
+See [Recover an exhausted MergeDecision claim](docs/ticket-recovery.md) for the
+human-controlled recovery commands and their one-use limit.
+
 ## Development
 
 Install the pinned tools with `mise install`. Run `mise run lint`, `mise run test`, and `mise run build` to check changes. Run `mise run fix` to apply supported automatic fixes.

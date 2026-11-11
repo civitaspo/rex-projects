@@ -1038,6 +1038,34 @@ impl ConfigStore {
         {
             return Ok(None);
         }
+        if let Some(subject) = self.merge_claim_recovery_subject_for_assessment(
+            &work.project_id,
+            &work.ticket_run_id,
+            &work.document.assessment_evidence_id,
+        )? {
+            if subject.blocked_revision.checked_add(1) != Some(work.assessed_revision.0)
+                || subject.configuration_digest != work.configuration_digest
+                || subject.accepted_plan_digest != work.accepted_plan_digest
+                || subject.publication_set_digest != work.publication_set_digest
+            {
+                return Err(
+                    "historical MergeWork recovery lineage differs from its accepted assessment"
+                        .into(),
+                );
+            }
+            let snapshot = self.merge_claim_recovery_publication_snapshot(&subject)?;
+            if snapshot.accepted_plan().plan_digest != work.accepted_plan_digest
+                || crate::forge::canonical_digest(snapshot.prepared_receipt())
+                    .map_err(|error| error.to_string())?
+                    != work.prepared_receipt_digest
+            {
+                return Err(
+                    "historical MergeWork recovery snapshot differs from its accepted artifacts"
+                        .into(),
+                );
+            }
+            return Ok(Some(snapshot));
+        }
         let mut transitions = self.connection.prepare(
             "SELECT new_revision,evidence_json FROM transitions WHERE entity_type='ticket_run' AND entity_id=?1 AND project_id=?2 AND new_revision<=?3 ORDER BY new_revision DESC LIMIT 256",
         ).map_err(|error| error.to_string())?;
@@ -1460,6 +1488,23 @@ impl ConfigStore {
             publication_receipts,
             verification,
         })
+    }
+
+    pub(crate) fn merge_claim_recovery_publication_snapshot(
+        &self,
+        subject: &crate::store::merge_claim_recovery::MergeClaimRecoverySubject,
+    ) -> Result<AcceptedImplementationPublicationSnapshot, String> {
+        let snapshot = self.implementation_publication_snapshot_at_review(
+            &subject.project_id,
+            &subject.ticket_run_id,
+            subject.convergence_revision,
+            "assessing".into(),
+            subject.configuration_digest.as_str().to_owned(),
+        )?;
+        if snapshot.accepted_plan().plan_digest != subject.accepted_plan_digest {
+            return Err("recovery subject no longer matches the accepted work plan".into());
+        }
+        Ok(snapshot)
     }
 
     /// Return a Worker context only when the supplied success receipt was

@@ -313,7 +313,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 12..=15) {
+    if !matches!(version, 12..=16) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -419,7 +419,7 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 13..=15) {
+    if !matches!(version, 13..=16) {
         return Err(format!(
             "Agent block lifecycle schema version mismatch: {version}"
         ));
@@ -496,7 +496,7 @@ pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 14 | 15) {
+    if !matches!(version, 14..=16) {
         return Err(format!(
             "process evidence schema version mismatch: {version}"
         ));
@@ -616,6 +616,17 @@ fn read_column_layout(
         .find(|layout| layout.name == column))
 }
 
+pub(super) fn validate_table_layout_against(
+    connection: &Connection,
+    canonical: &Connection,
+    table: &str,
+) -> Result<(), String> {
+    if read_table_layout(connection, table)? != read_table_layout(canonical, table)? {
+        return Err(format!("table {table} has an incompatible schema layout"));
+    }
+    Ok(())
+}
+
 fn read_table_layout(connection: &Connection, table: &str) -> Result<TableLayout, String> {
     let sql: Option<String> = connection
         .query_row(
@@ -625,7 +636,7 @@ fn read_table_layout(connection: &Connection, table: &str) -> Result<TableLayout
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let sql = sql.ok_or_else(|| format!("schema 12 is missing table {table}"))?;
+    let sql = sql.ok_or_else(|| format!("schema is missing table {table}"))?;
 
     let mut statement = connection
         .prepare(
@@ -1572,6 +1583,7 @@ mod tests {
             "merge_work_items",
             "agent_block_lifecycle_facts",
             "merge_observation_deferrals",
+            "merge_claim_recovery_requests",
         ] {
             let found: bool = store
                 .connection
@@ -1698,6 +1710,7 @@ mod tests {
                  CREATE TEMP TABLE saved_agent_terminal_receipts AS SELECT * FROM agent_terminal_receipts;
                  DROP TABLE agent_terminal_receipts;
                  DROP TABLE merge_observation_deferrals;
+                 DROP TABLE merge_claim_recovery_requests;
                  DELETE FROM schema_migrations WHERE version>=14;
                  PRAGMA user_version=13;
                  ",
