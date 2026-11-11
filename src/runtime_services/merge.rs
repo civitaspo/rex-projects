@@ -1008,7 +1008,7 @@ fn trusted_request_command(
     ))
 }
 
-fn worker_authorship_trailers(
+pub(super) fn worker_authorship_trailers(
     applied: &AppliedConfig,
     project_id: &crate::domain::ids::ProjectId,
     plan: &crate::engine::orchestration::WorkPlan,
@@ -1038,7 +1038,7 @@ fn worker_authorship_trailers(
     Ok(vec![trailer.to_owned()])
 }
 
-fn append_trailers(body: &str, trailers: &[String]) -> String {
+pub(super) fn append_trailers(body: &str, trailers: &[String]) -> String {
     let mut lines = body.lines().map(str::to_owned).collect::<Vec<_>>();
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -2811,6 +2811,48 @@ pub(crate) mod tests {
                 "{:x}",
                 Sha256::digest(proposal.exact_target_body.as_bytes())
             )
+        );
+
+        let initial_body = super::super::finalize_worker_publication_body(
+            &source.applied_config,
+            &ProjectId::parse("operations_project").unwrap(),
+            &work_plan,
+            body,
+        )
+        .unwrap();
+        let mut initial_responses = responses.clone();
+        initial_responses[1]["body"] = json!(initial_body);
+        let initial_runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(
+                initial_responses
+                    .into_iter()
+                    .map(|response| serde_json::to_vec(&response).unwrap())
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let initial_source = RuntimeMergeEvidenceSource::with_github_runner(
+            source.applied_config.clone(),
+            vec![binary_dir.clone()],
+            BTreeMap::new(),
+            initial_runner,
+        );
+        let initial_observation = initial_source
+            .observe_publication_subject(&publication_subject, &result.ingested)
+            .unwrap();
+        let initial_proposal = initial_source
+            .prepare_body_proposal(
+                &ProjectId::parse("operations_project").unwrap(),
+                &publication_subject,
+                &work_plan,
+                &assessment_id,
+                &initial_observation,
+            )
+            .unwrap();
+        assert_eq!(initial_proposal.exact_target_body, initial_body);
+        assert_eq!(
+            initial_proposal.target_body_digest,
+            initial_proposal.prior_body_digest.unwrap()
         );
 
         let absent_runner = std::sync::Arc::new(FixtureRunner {
