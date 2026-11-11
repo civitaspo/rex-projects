@@ -2029,12 +2029,9 @@ mod tests {
                 body: intent.exact_body.clone(),
                 created_at: "2026-11-09T00:00:00Z".into(),
             });
-            let Observed::Complete { value: pull, .. } = &mut observation.pull_request else {
+            let Observed::Complete { value: pull, .. } = &observation.pull_request else {
                 return Err(ForgeError("PR observation is unknown".into()));
             };
-            pull.state = crate::forge::PullRequestState::Closed;
-            pull.merged = true;
-            pull.merge_commit_sha = Some(self.commit.sha.clone());
             Ok(EffectAcknowledgement {
                 operation_key: intent.operation_key.clone(),
                 request_digest: canonical_digest(intent)?,
@@ -2042,7 +2039,7 @@ mod tests {
                 external_id: Some("42".into()),
                 external_url: None,
                 resulting_head_sha: Some(pull.head_sha.clone()),
-                resulting_merge_sha: Some(self.commit.sha.clone()),
+                resulting_merge_sha: None,
                 reason: None,
             })
         }
@@ -2181,6 +2178,15 @@ mod tests {
 
     #[test]
     fn exact_human_approval_covers_body_update_request_comment_and_verified_merge() {
+        run_exact_human_approval_procedure(crate::domain::types::MergeExecutor::Direct);
+    }
+
+    #[test]
+    fn request_executor_acknowledges_comment_then_waits_for_external_merge() {
+        run_exact_human_approval_procedure(crate::domain::types::MergeExecutor::Request);
+    }
+
+    fn run_exact_human_approval_procedure(executor_kind: crate::domain::types::MergeExecutor) {
         use crate::domain::types::MergeExecutor;
         use crate::merge_policy::{
             EvidenceState, MergeProcedureOperation, MergeProcedureStep, build_merge_procedure,
@@ -2263,7 +2269,7 @@ mod tests {
             auto_merge_enabled: false,
             minimum_reliability_score: 0,
             method: MergeMethod::Squash,
-            executor: MergeExecutor::Direct,
+            executor: executor_kind,
             required_checks: vec!["ci".into()],
             required_approving_reviews: None,
             risk_weights: RiskWeights::default(),
@@ -2286,9 +2292,14 @@ mod tests {
                 MergeProcedureStep {
                     key: "merge".into(),
                     prerequisites: vec!["body".into()],
-                    operation: MergeProcedureOperation::ExecuteMerge {
-                        expected_head_sha: subject.head_sha.clone(),
-                        base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
+                    operation: match executor_kind {
+                        MergeExecutor::Direct => MergeProcedureOperation::ExecuteMerge {
+                            expected_head_sha: subject.head_sha.clone(),
+                            base_guard_rule_digest: subject.base_guard_digest.clone().unwrap(),
+                        },
+                        MergeExecutor::Request => MergeProcedureOperation::RequestMerge {
+                            exact_comment: "/merge".into(),
+                        },
                     },
                     instruction_digest: subject.instruction_digest.clone(),
                 },
@@ -2315,7 +2326,16 @@ mod tests {
             policy_digest: policy_digest.clone(),
             instruction_digest: subject.instruction_digest.clone(),
             sources: BTreeMap::from([(source.key.clone(), source.clone())]),
-            request_comment_proofs: Vec::new(),
+            request_comment_proofs: if executor_kind == MergeExecutor::Request {
+                vec![RequestCommentProof {
+                    source_key: source.key.clone(),
+                    source_digest: source.digest.clone(),
+                    byte_start: 0,
+                    exact_comment: "/merge".into(),
+                }]
+            } else {
+                Vec::new()
+            },
             execution_time_base_guard: EvidenceState::Pass,
             base_guard_digest: subject.base_guard_digest.clone(),
         };
@@ -2457,6 +2477,150 @@ mod tests {
             Err(MergeExecutionError::Stale(reason))
                 if reason == "a merge subject field outside the recorded body/comment procedure changed"
         ));
+
+        if executor_kind == MergeExecutor::Request {
+            let mut receipts = Vec::new();
+            let actor = "reviewer@example.com";
+            for (index, key) in ["body", "merge"].into_iter().enumerate() {
+                let observation_now = forge.observe(&pull).unwrap();
+                let evidence_now = procedure_evidence(&observation_now, &subject);
+                let intent = StepIntent {
+                    operation_key: format!("outbox:request:{index}:{key}"),
+                    authenticated_actor: if key == "merge" {
+                        actor.into()
+                    } else {
+                        String::new()
+                    },
+                    attempt_started_unix: 300 + index as u64,
+                    exact_prepared_body: Some(prepared_body.into()),
+                };
+                let StepOutcome::Effect {
+                    effect_intent,
+                    acknowledgement,
+                } = executor
+                    .execute_one(
+                        &pull,
+                        &policy,
+                        &assessment,
+                        &evidence,
+                        &evidence_now,
+                        Some(&approval),
+                        &authority,
+                        &procedure,
+                        &[],
+                        key,
+                        &intent,
+                        &receipts,
+                    )
+                    .unwrap()
+                else {
+                    panic!("body and request steps produce effects")
+                };
+                if key == "merge" {
+                    let crate::forge::MergeEffectOperation::RequestComment(comment) =
+                        &effect_intent.operation
+                    else {
+                        panic!("Request step records a comment intent");
+                    };
+                    assert_eq!(comment.exact_body, "/merge");
+                    assert_eq!(comment.authenticated_actor, actor);
+                    assert_eq!(comment.attempt_started_unix, 301);
+                    assert_eq!(acknowledgement.external_id.as_deref(), Some("42"));
+                    assert_eq!(acknowledgement.resulting_merge_sha, None);
+                    let observation_after_comment = forge.observe(&pull).unwrap();
+                    let Observed::Complete { value: pr, .. } =
+                        observation_after_comment.pull_request
+                    else {
+                        panic!("fixture PR observation is complete");
+                    };
+                    assert_eq!(pr.state, crate::forge::PullRequestState::Open);
+                    assert!(!pr.merged);
+                    assert_eq!(pr.merge_commit_sha, None);
+                    let Observed::Complete {
+                        value: comments, ..
+                    } = observation_after_comment.issue_comments
+                    else {
+                        panic!("fixture comments observation is complete");
+                    };
+                    assert!(comments.iter().any(|comment| {
+                        comment.id.to_string()
+                            == acknowledgement.external_id.as_deref().unwrap_or_default()
+                            && comment.user.as_deref() == Some(actor)
+                            && comment.body == "/merge"
+                    }));
+                }
+                receipts.push(MergeStepReceipt {
+                    step_key: key.into(),
+                    operation_key: intent.operation_key,
+                    certainty: acknowledgement.certainty,
+                    request_digest: effect_intent.request_digest.clone(),
+                    effect_intent: *effect_intent,
+                    acknowledgement,
+                });
+            }
+            let pending_observation = forge.observe(&pull).unwrap();
+            let pending_evidence = procedure_evidence(&pending_observation, &subject);
+            assert!(matches!(
+                executor
+                    .execute_one(
+                        &pull,
+                        &policy,
+                        &assessment,
+                        &evidence,
+                        &pending_evidence,
+                        Some(&approval),
+                        &authority,
+                        &procedure,
+                        &[],
+                        "verify",
+                        &StepIntent {
+                            operation_key: "outbox:request:verify-pending".into(),
+                            authenticated_actor: actor.into(),
+                            attempt_started_unix: 302,
+                            exact_prepared_body: Some(prepared_body.into()),
+                        },
+                        &receipts,
+                    )
+                    .unwrap(),
+                StepOutcome::Pending(_)
+            ));
+            {
+                let mut observed = forge.observation.lock().unwrap();
+                let Observed::Complete { value: pr, .. } = &mut observed.pull_request else {
+                    panic!("fixture PR observation is complete");
+                };
+                pr.state = crate::forge::PullRequestState::Closed;
+                pr.merged = true;
+                pr.merge_commit_sha = Some(forge.commit.sha.clone());
+            }
+            let merged_observation = forge.observe(&pull).unwrap();
+            let merged_evidence = procedure_evidence(&merged_observation, &subject);
+            let outcome = executor
+                .execute_one(
+                    &pull,
+                    &policy,
+                    &assessment,
+                    &evidence,
+                    &merged_evidence,
+                    Some(&approval),
+                    &authority,
+                    &procedure,
+                    &[],
+                    "verify",
+                    &StepIntent {
+                        operation_key: "outbox:request:verify-merged".into(),
+                        authenticated_actor: actor.into(),
+                        attempt_started_unix: 303,
+                        exact_prepared_body: Some(prepared_body.into()),
+                    },
+                    &receipts,
+                )
+                .unwrap();
+            assert!(
+                matches!(outcome, StepOutcome::Verified(ref receipt) if receipt.merge_commit_sha == "merge-sha")
+            );
+            return;
+        }
 
         let mut receipts = Vec::new();
         for (index, key) in ["body", "merge", "verify"].into_iter().enumerate() {
