@@ -200,14 +200,18 @@ a production adapter may distinguish HTTP errors and implement more methods.
 
 In your existing configuration, allow `HOME` so `gh` can read its existing
 configuration. If your installation uses `GH_CONFIG_DIR`, allow that variable
-too. Use the same fixed repository scope:
+too. Allow `XDG_CONFIG_HOME` if it selects your `gh` configuration directory.
+If authentication uses `GH_TOKEN` or `GITHUB_TOKEN`, allow that variable rather
+than putting a token in the wrapper or configuration file. Use the same fixed
+repository scope:
 
 ```toml
 [adapters.tickets]
 kind = "command"
 command = ["/absolute/path/github-tickets"]
 environment_allow = ["PATH", "HOME"]
-# Add "GH_CONFIG_DIR" if your gh installation uses it.
+# Add "GH_CONFIG_DIR" or "XDG_CONFIG_HOME" if your gh installation uses it.
+# For environment-based authentication, add the token variable name only.
 read_timeout_seconds = 30
 write_timeout_seconds = 120
 
