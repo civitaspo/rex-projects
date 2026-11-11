@@ -37,6 +37,7 @@ const HOST_COMMIT_WORKER_REWORK_STAGE: &str = "host_commit_worker_rework_inbox";
 const HOST_COMMIT_VERIFICATION_REVIEWER_STAGE: &str = "host_commit_verification_reviewer_inbox";
 const WORKER_RECOVERY_INBOX_STAGE: &str = "worker_recovery_inbox";
 const NATIVE_WORKER_BLOCK_LOSS_STAGE: &str = "native_worker_block_loss";
+const REQUEST_MERGE_STAGE: &str = "request_merge";
 const NATIVE_WORKER_CODEX_ENV: &str = "REX_PROJECTS_NATIVE_WORKER_CODEX";
 const ACCEPTANCE_FREEZE_MARKER_ENV: &str = "REX_PROJECTS_ACCEPTANCE_FREEZE_MARKER";
 const CONTROLLER_WINDOW_LABEL: &str = "rex-projects-controller";
@@ -92,7 +93,8 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
                 || stage == HOST_COMMIT_REVIEWER_INBOX_STAGE
                 || stage == HOST_COMMIT_WORKER_REWORK_STAGE
                 || stage == HOST_COMMIT_VERIFICATION_REVIEWER_STAGE
-                || stage == NATIVE_WORKER_BLOCK_LOSS_STAGE =>
+                || stage == NATIVE_WORKER_BLOCK_LOSS_STAGE
+                || stage == REQUEST_MERGE_STAGE =>
         {
             Ok(Some(stage))
         }
@@ -103,7 +105,9 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
 }
 
 fn qualification_roles_for_stage(stage: Option<&str>) -> &'static [&'static str] {
-    if stage == Some(NATIVE_WORKER_BLOCK_LOSS_STAGE) {
+    if stage == Some(REQUEST_MERGE_STAGE) {
+        &PROVIDER_ROLES
+    } else if stage == Some(NATIVE_WORKER_BLOCK_LOSS_STAGE) {
         &["planner", "worker", "supervisor", "coordinator"]
     } else if matches!(
         stage,
@@ -287,7 +291,8 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         Err(error) => return Err(format!("read {ACCEPTANCE_STAGE_ENV}: {error}")),
     };
     let stage = parse_acceptance_stage(stage_value)?;
-    let bounded_coordinator_stage = stage.is_some();
+    let request_merge_stage = stage.as_deref() == Some(REQUEST_MERGE_STAGE);
+    let bounded_coordinator_stage = stage.is_some() && !request_merge_stage;
     let coordinator_block_loss_stage = stage.as_deref() == Some(COORDINATOR_BLOCK_LOSS_STAGE);
     let coordinator_worker_inbox_stage = stage.as_deref() == Some(COORDINATOR_WORKER_INBOX_STAGE);
     let worker_verification_stage =
@@ -333,10 +338,12 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             host_worker: host_commit_reviewer_inbox_stage
                 || coordinator_worker_inbox_stage
                 || worker_recovery_inbox_stage
+                || request_merge_stage
                 || native_worker_block_loss_stage,
             worker_recovery_stage: worker_recovery_inbox_stage,
             worker_review_rework_stage,
             worker_verification_stage,
+            request_merge_stage,
             native_worker_codex: native_worker_codex.as_deref(),
         },
     )?;
@@ -345,7 +352,12 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let config_path = request.fixture_root.join("config.toml");
     fs::write(
         &config_path,
-        config_text(&request, &executable, native_worker_block_loss_stage),
+        config_text_for_stage(
+            &request,
+            &executable,
+            native_worker_block_loss_stage,
+            request_merge_stage,
+        ),
     )
     .map_err(|error| format!("write fixture config: {error}"))?;
     let seeded_ticket = seed_operations_ticket(&request, &executable)?;
@@ -531,6 +543,8 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let mut host_commit_reviewer_boundary_reached = false;
     let mut host_commit_connection_evidence = None;
     let mut coordinator_block_loss_proof = None;
+    let mut request_merge_evidence = RequestMergeEvidence::default();
+    let mut request_merge_stop = None;
     loop {
         let status = product(&request, &state_root, &["status", "--json"])?;
         if !status.status.is_some_and(|status| status.success()) {
@@ -556,6 +570,19 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             .as_str()
             .unwrap_or("unknown")
             .to_owned();
+        if request_merge_stage {
+            match advance_request_merge_acceptance(
+                &request,
+                &state_root,
+                &mut request_merge_evidence,
+            ) {
+                Ok(progress) => trace.extend(progress),
+                Err(error) => {
+                    request_merge_stop = Some(error);
+                    break;
+                }
+            }
+        }
         if external_ticket["status"]
             .as_str()
             .is_some_and(|status| status.eq_ignore_ascii_case("done"))
@@ -773,17 +800,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         .find(|role| observed_roles.contains(**role))
         .copied();
     let external_done = external_ticket_status.eq_ignore_ascii_case("done");
-    let current_stop = if external_done {
-        "external ticket is Done, but host evidence for every required role stage has not been established".to_owned()
-    } else if let Some(role) = furthest_role {
-        format!(
-            "external ticket remains {external_ticket_status}; latest public inbox role observed: {role}"
-        )
-    } else {
-        format!(
-            "external ticket remains {external_ticket_status}; no public Agent inbox turn was observed"
-        )
-    };
+    request_merge_evidence.external_ticket_done = external_done;
     let coordinator_observation = inbox_observations
         .iter()
         .find(|observation| is_coordinator_dispatch_observation(observation));
@@ -814,11 +831,35 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 .and_then(Value::as_str)
                 == Some("fixture_coordinator")
         });
-    let stage_valid = bounded_stage_contract_valid(
-        stage.as_deref(),
-        coordinator_stage_valid,
-        native_worker_ready_marker_is_valid(&request.fixture_root.join("native-worker-ready.json")),
-    );
+    let stage_valid = if request_merge_stage {
+        request_merge_evidence.passed(external_done)
+    } else {
+        bounded_stage_contract_valid(
+            stage.as_deref(),
+            coordinator_stage_valid,
+            native_worker_ready_marker_is_valid(
+                &request.fixture_root.join("native-worker-ready.json"),
+            ),
+        )
+    };
+    let current_stop = if request_merge_stage && stage_valid {
+        "configured Request-merge acceptance reached host verification and external ticket Done"
+            .to_owned()
+    } else if request_merge_stage {
+        request_merge_stop
+            .clone()
+            .unwrap_or_else(|| request_merge_evidence.next_missing_milestone(external_done))
+    } else if external_done {
+        "external ticket is Done, but host evidence for every required role stage has not been established".to_owned()
+    } else if let Some(role) = furthest_role {
+        format!(
+            "external ticket remains {external_ticket_status}; latest public inbox role observed: {role}"
+        )
+    } else {
+        format!(
+            "external ticket remains {external_ticket_status}; no public Agent inbox turn was observed"
+        )
+    };
     if bounded_coordinator_stage {
         let hold_evidence = if coordinator_block_loss_stage {
             json!({
@@ -848,7 +889,11 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         "furthest_stage":furthest_role.unwrap_or("project_started"),
         "external_ticket_status":external_ticket_status,
         "current_stop":current_stop,
-        "missing_capabilities":if bounded_coordinator_stage {vec!["This bounded emulated stage does not claim downstream role completion or external Done."]} else {vec!["This emulated lane does not establish host-verified completion of every required role stage and external Done."]},
+        "request_merge_stop":request_merge_stop,
+        "request_merge_evidence":request_merge_evidence,
+        "missing_capabilities":if request_merge_stage {
+            request_merge_evidence.missing_milestones(external_done)
+        } else if bounded_coordinator_stage {vec!["This bounded emulated stage does not claim downstream role completion or external Done."]} else {vec!["This emulated lane does not establish host-verified completion of every required role stage and external Done."]},
         "fixture_provider":"EMULATED",
         "resources_created":true,
         "owned_rex_session":request.rex_session,
@@ -856,8 +901,13 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         "fixture_root":request.fixture_root
     });
     emit_report(request.fixture_root, &report)?;
-    if bounded_coordinator_stage && !stage_valid {
-        return Err("bounded Supervisor-to-Coordinator connection stage did not reach its contract boundary".into());
+    if (bounded_coordinator_stage || request_merge_stage) && !stage_valid {
+        return Err(if request_merge_stage {
+            request_merge_stop.unwrap_or_else(|| "configured Request-merge acceptance did not reach every required durable milestone".into())
+        } else {
+            "bounded Supervisor-to-Coordinator connection stage did not reach its contract boundary"
+                .into()
+        });
     }
     Ok(())
 }
@@ -885,6 +935,1013 @@ fn is_coordinator_dispatch_observation(observation: &Value) -> bool {
             .pointer("/input_files/snapshot_digest")
             .and_then(Value::as_str)
             .is_some_and(|digest| digest.len() == 64)
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct RequestMergeEvidence {
+    presented_review: bool,
+    approval_response_queued: bool,
+    human_approval_accepted: bool,
+    body_update_recovered: bool,
+    request_comment_succeeded: bool,
+    verify_pending_while_open: bool,
+    separate_merge_observed: bool,
+    host_merge_verified: bool,
+    external_ticket_done: bool,
+    request_id: Option<String>,
+    work_id: Option<String>,
+    merge_commit_sha: Option<String>,
+}
+
+impl RequestMergeEvidence {
+    fn missing_milestones(&self, external_ticket_done: bool) -> Vec<&'static str> {
+        [
+            (
+                !self.presented_review,
+                "exact TicketReview was not presented through public human list/show",
+            ),
+            (
+                !self.approval_response_queued,
+                "exact-digest approval was not queued through public human respond",
+            ),
+            (
+                !self.human_approval_accepted,
+                "host controller has not accepted the exact human approval",
+            ),
+            (
+                !self.body_update_recovered,
+                "exact approved PR body update has no recovered host receipt",
+            ),
+            (
+                !self.request_comment_succeeded,
+                "configured Request comment has no succeeded host receipt",
+            ),
+            (
+                !self.verify_pending_while_open,
+                "durable Verify pending observation while the PR is open is missing",
+            ),
+            (
+                !self.separate_merge_observed,
+                "separate provider merge operation has not been observed",
+            ),
+            (
+                !self.host_merge_verified,
+                "host MergeVerificationReceipt is missing",
+            ),
+            (
+                !external_ticket_done,
+                "external ticket has not reached Done",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(missing, description)| missing.then_some(description))
+        .collect()
+    }
+
+    fn next_missing_milestone(&self, external_ticket_done: bool) -> String {
+        self.missing_milestones(external_ticket_done)
+            .into_iter()
+            .next()
+            .unwrap_or("configured Request-merge acceptance is not yet complete")
+            .to_owned()
+    }
+
+    fn passed(&self, external_ticket_done: bool) -> bool {
+        self.presented_review
+            && self.approval_response_queued
+            && self.human_approval_accepted
+            && self.body_update_recovered
+            && self.request_comment_succeeded
+            && self.verify_pending_while_open
+            && self.separate_merge_observed
+            && self.host_merge_verified
+            && external_ticket_done
+    }
+}
+
+fn advance_request_merge_acceptance(
+    request: &Request<'_>,
+    state_root: &Path,
+    evidence: &mut RequestMergeEvidence,
+) -> Result<Vec<Value>, String> {
+    let mut trace = Vec::new();
+    let listed = product_as_human(
+        request,
+        state_root,
+        &["human", "list", "--project", FIXTURE_PROJECT_ID, "--json"],
+    )?;
+    require_success("list public human requests", &listed)?;
+    let requests = json_stdout(&listed)["requests"]
+        .as_array()
+        .cloned()
+        .ok_or("public human list omitted requests array")?;
+    let Some(ticket_run_id) = acceptance_ticket_run_id(state_root)? else {
+        return Ok(trace);
+    };
+    let mut candidate = None;
+    for raw in requests {
+        let summary: rex_projects::human_runtime::HumanRequestSummary = serde_json::from_value(raw)
+            .map_err(|error| format!("parse public human request: {error}"))?;
+        if summary.request.purpose != rex_projects::human_runtime::HumanPurpose::TicketReview
+            || summary.request.subject.kind
+                != rex_projects::human_runtime::HumanSubjectKind::TicketRun
+            || summary.request.subject.project_id.as_str() != FIXTURE_PROJECT_ID
+            || summary.request.subject.subject_id != ticket_run_id
+            || summary
+                .request
+                .subject
+                .ticket_run_id
+                .as_ref()
+                .map(|id| id.as_str())
+                != Some(ticket_run_id.as_str())
+        {
+            continue;
+        }
+        let Some(work) = read_review_merge_work_item(state_root, &summary.request.subject)? else {
+            continue;
+        };
+        let canonical_request_id = format!("merge-review-{}", work.document.intent_evidence_id);
+        if summary.request.request_id.as_str() != canonical_request_id {
+            return Err(
+                "public human request ID is not the canonical MergeWork review request ID".into(),
+            );
+        }
+        let expected =
+            rex_projects::human_runtime::HumanAuthorityMaterial::merge_work_review_request(
+                summary.request.request_id.clone(),
+                work.clone(),
+                summary.request.expires_at_unix,
+            )?;
+        if expected != summary.request {
+            continue;
+        }
+        candidate = Some((summary, work));
+        break;
+    }
+    let Some((listed_summary, work)) = candidate else {
+        return Ok(trace);
+    };
+    let request_id = listed_summary.request.request_id.as_str().to_owned();
+    let shown = product_as_human(
+        request,
+        state_root,
+        &["human", "show", &request_id, "--json"],
+    )?;
+    require_success("show exact public human review", &shown)?;
+    let summary: rex_projects::human_runtime::HumanRequestSummary =
+        serde_json::from_slice(&shown.stdout)
+            .map_err(|error| format!("parse public human show response: {error}"))?;
+    if summary != listed_summary {
+        return Err("public human request changed between list and show".into());
+    }
+    validate_request_merge_work(&work)?;
+    evidence.request_id = Some(request_id.clone());
+    evidence.work_id = Some(work.work_id.as_str().to_owned());
+    if !evidence.presented_review {
+        evidence.presented_review = true;
+        trace.push(json!({"step":"exact_merge_review_presented","status":"observed","request_id":request_id,"work_id":work.work_id.as_str(),"project_id":FIXTURE_PROJECT_ID,"ticket_run_id":ticket_run_id}));
+    }
+
+    if summary.lifecycle == rex_projects::human_runtime::HumanRequestLifecycle::Presented {
+        let subject_digest = summary
+            .request
+            .subject
+            .digest()
+            .map_err(|error| format!("digest exact presented review subject: {error}"))?;
+        let response = product_as_human(
+            request,
+            state_root,
+            &[
+                "human",
+                "respond",
+                &request_id,
+                "--subject-digest",
+                subject_digest.as_str(),
+                "--choice",
+                "approve",
+                "--explanation",
+                "Acceptance fixture approves this exact immutable merge work review.",
+                "--json",
+            ],
+        )?;
+        require_success("queue exact public human approval", &response)?;
+        let queued = json_stdout(&response);
+        if queued["state"] != "queued_for_validation" || queued["accepted_for_validation"] != true {
+            return Err("human respond did not queue the exact review for host validation".into());
+        }
+        if !evidence.approval_response_queued {
+            evidence.approval_response_queued = true;
+            trace.push(json!({"step":"exact_human_approval_response","status":"queued_for_validation","request_id":request_id,"subject_digest":subject_digest.as_str(),"evidence":queued}));
+        }
+    } else if matches!(
+        summary.lifecycle,
+        rex_projects::human_runtime::HumanRequestLifecycle::ResponseQueued
+            | rex_projects::human_runtime::HumanRequestLifecycle::Decided
+    ) && !evidence.approval_response_queued
+    {
+        evidence.approval_response_queued = true;
+        trace.push(json!({"step":"exact_human_approval_response","status":"observed_queued","request_id":request_id}));
+    }
+
+    let Some(accepted_response) = accepted_merge_review_response(state_root, &summary)? else {
+        return Ok(trace);
+    };
+    if !evidence.human_approval_accepted {
+        evidence.human_approval_accepted = true;
+        trace.push(json!({"step":"exact_human_approval_accepted","status":"passed","request_id":request_id,"response_id":accepted_response,"subject_digest":summary.request.subject.digest()?.as_str()}));
+    }
+
+    let effects = read_request_merge_effects(state_root, &work, &summary)?;
+    if let Some(update) = effects.body_update {
+        if !evidence.body_update_recovered {
+            evidence.body_update_recovered = true;
+            trace.push(json!({"step":"approved_body_update_recovered_noop","status":"passed","operation_id":update.operation_id,"receipt":update.receipt}));
+        }
+    } else {
+        return Ok(trace);
+    }
+    let Some(request_effect) = effects.request.as_ref() else {
+        return Ok(trace);
+    };
+    if !evidence.request_comment_succeeded {
+        evidence.request_comment_succeeded = true;
+        trace.push(json!({"step":"request_merge_effect_succeeded","status":"passed","operation_id":request_effect.operation_id,"receipt":request_effect.receipt}));
+    }
+    let verify_effect = effects.verify_pending.as_ref();
+    let pull = work_pull_ref(&work)?;
+    let pull_observation = fixture_gh_api(
+        request,
+        "GET",
+        &format!(
+            "repos/{}/{}/pulls/{}",
+            pull.repository.owner, pull.repository.name, pull.number
+        ),
+        None,
+    )?;
+    let request_receipt = request_effect
+        .receipt
+        .as_ref()
+        .ok_or("succeeded Request effect has no parsed receipt")?;
+    let comment_intent = match &request_receipt.effect_intent.operation {
+        rex_projects::forge::MergeEffectOperation::RequestComment(intent) => intent,
+        _ => return Err("succeeded Request receipt is not a RequestComment effect".into()),
+    };
+    if pull_observation["state"] == "open"
+        && (pull_observation["merged"] != false
+            || pull_observation
+                .pointer("/head/sha")
+                .and_then(Value::as_str)
+                != Some(work.document.evidence.subject.head_sha.as_str())
+            || pull_observation["body"].as_str() != work.document.prepared_body.as_deref())
+    {
+        return Err(
+            "open PR observation does not match the approved Request work and exact prepared body"
+                .into(),
+        );
+    }
+    let comments = fixture_gh_api(
+        request,
+        "GET",
+        &format!(
+            "repos/{}/{}/issues/{}/comments",
+            pull.repository.owner, pull.repository.name, pull.number
+        ),
+        None,
+    )?;
+    let comments = comments
+        .as_array()
+        .ok_or("request comment observation is not a complete array")?;
+    let external_id = request_receipt
+        .acknowledgement
+        .external_id
+        .as_deref()
+        .ok_or("Request receipt omitted the exact external comment ID")?;
+    let observed_comment = comments
+        .iter()
+        .find(|comment| {
+            comment["id"]
+                .as_u64()
+                .is_some_and(|id| id.to_string() == external_id)
+                && comment["body"].as_str() == Some(comment_intent.exact_body.as_str())
+                && comment.pointer("/user/login").and_then(Value::as_str)
+                    == Some(comment_intent.authenticated_actor.as_str())
+        })
+        .ok_or("provider does not expose the exact acknowledged Request comment")?;
+    let created_at = observed_comment["created_at"]
+        .as_str()
+        .ok_or("Request comment lacks a provider timestamp")?;
+    if comment_timestamp_unix(created_at)
+        .is_none_or(|created| created < comment_intent.attempt_started_unix)
+    {
+        return Err(
+            "Request comment timestamp is missing, malformed, or predates its durable attempt"
+                .into(),
+        );
+    }
+    if pull_observation["state"] == "open" {
+        let Some(verify_effect) = verify_effect else {
+            return Ok(trace);
+        };
+        if !evidence.verify_pending_while_open {
+            evidence.verify_pending_while_open = true;
+            trace.push(json!({"step":"verify_pending_while_provider_pr_open","status":"passed","operation_id":verify_effect.operation_id,"status_in_sqlite":"uncertain","receipt_json":"pull request has not merged yet","next_attempt_at_unix":verify_effect.next_attempt_at_unix,"provider_pull_request":pull_observation,"request_comment":observed_comment}));
+        }
+    } else if pull_observation["state"] != "closed" || pull_observation["merged"] != true {
+        return Err("provider PR is neither the expected open state nor a completed merge".into());
+    } else if !evidence.verify_pending_while_open {
+        return Err(
+            "provider PR merged before the acceptance observed the durable pending Verify effect"
+                .into(),
+        );
+    }
+
+    if pull_observation["state"] == "open" {
+        let reviews = fixture_gh_api(
+            request,
+            "GET",
+            &format!(
+                "repos/{}/{}/pulls/{}/reviews",
+                pull.repository.owner, pull.repository.name, pull.number
+            ),
+            None,
+        )?;
+        let has_current_approval = reviews.as_array().is_some_and(|reviews| {
+            reviews.iter().any(|review| {
+                review["state"] == "APPROVED"
+                    && review["commit_id"].as_str()
+                        == Some(comment_intent.expected_head_sha.as_str())
+            })
+        });
+        if !has_current_approval {
+            let review = fixture_gh_api(
+                request,
+                "POST",
+                &format!(
+                    "repos/{}/{}/pulls/{}/reviews",
+                    pull.repository.owner, pull.repository.name, pull.number
+                ),
+                Some(json!({"event":"APPROVE"})),
+            )?;
+            if review["state"] != "APPROVED"
+                || review["commit_id"].as_str() != Some(comment_intent.expected_head_sha.as_str())
+            {
+                return Err(
+                    "fixture provider did not accept approval for the reviewed head".into(),
+                );
+            }
+            trace.push(json!({"step":"fixture_human_provider_review","status":"passed","head_sha":comment_intent.expected_head_sha}));
+        }
+        let merge_method = serde_json::to_value(work.document.procedure.method)
+            .map_err(|error| error.to_string())?;
+        let merge_method = merge_method
+            .as_str()
+            .ok_or("configured merge method is not a string")?;
+        if merge_method != "squash" {
+            return Err("configured Request acceptance fixture expects its repository's squash merge method".into());
+        }
+        let merge = fixture_gh_api(
+            request,
+            "PUT",
+            &format!(
+                "repos/{}/{}/pulls/{}/merge",
+                pull.repository.owner, pull.repository.name, pull.number
+            ),
+            Some(
+                json!({"sha":comment_intent.expected_head_sha,"merge_method":merge_method,"commit_message":work.document.prepared_body}),
+            ),
+        )?;
+        if merge["merged"] != true {
+            return Err(format!(
+                "fixture provider refused the separate merge operation: {merge}"
+            ));
+        }
+        trace.push(json!({"step":"separate_provider_merge","status":"applied","response":merge}));
+    }
+    let merged = fixture_gh_api(
+        request,
+        "GET",
+        &format!(
+            "repos/{}/{}/pulls/{}",
+            pull.repository.owner, pull.repository.name, pull.number
+        ),
+        None,
+    )?;
+    if merged["state"] != "closed" || merged["merged"] != true {
+        return Ok(trace);
+    }
+    let merge_sha = merged["merge_commit_sha"]
+        .as_str()
+        .ok_or("provider merge observation omitted merge_commit_sha")?
+        .to_owned();
+    if !evidence.separate_merge_observed {
+        evidence.separate_merge_observed = true;
+        evidence.merge_commit_sha = Some(merge_sha.clone());
+        trace.push(json!({"step":"separate_provider_merge_observed","status":"passed","merge_commit_sha":merge_sha,"pull_request":merged}));
+    }
+    if let Some(verified) = effects.verify_verified.as_ref() {
+        if verified.merge_commit_sha != merge_sha
+            || verified.included_head_sha != comment_intent.expected_head_sha
+            || verified.merge_method != work.document.procedure.method
+        {
+            return Err("host MergeVerificationReceipt does not match the separately observed provider merge".into());
+        }
+        if !evidence.host_merge_verified {
+            evidence.host_merge_verified = true;
+            trace.push(json!({"step":"host_merge_verification_receipt","status":"passed","receipt":verified}));
+        }
+    }
+    Ok(trace)
+}
+
+fn acceptance_ticket_run_id(state_root: &Path) -> Result<Option<String>, String> {
+    let database = open_acceptance_state_read_only(state_root)?;
+    database
+        .query_row(
+            "SELECT ticket_run_id FROM ticket_runs WHERE project_id=?1 AND namespace=?2 AND ticket_id=?3 ORDER BY generation DESC LIMIT 1",
+            params![FIXTURE_PROJECT_ID, FIXTURE_TICKET_NAMESPACE, FIXTURE_TICKET_ID],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("read acceptance TicketRun identity: {error}"))
+}
+
+fn open_acceptance_state_read_only(state_root: &Path) -> Result<Connection, String> {
+    Connection::open_with_flags(
+        state_root.join("state.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("open acceptance state read-only: {error}"))
+}
+
+fn read_review_merge_work_item(
+    state_root: &Path,
+    subject: &rex_projects::human_runtime::HumanSubjectBinding,
+) -> Result<Option<rex_projects::store::merge_work::MergeWorkItem>, String> {
+    if subject.kind != rex_projects::human_runtime::HumanSubjectKind::TicketRun
+        || subject.ticket_run_id.as_ref().map(|id| id.as_str()) != Some(subject.subject_id.as_str())
+    {
+        return Ok(None);
+    }
+    let database = open_acceptance_state_read_only(state_root)?;
+    let row: Option<(String, String)> = database
+        .query_row(
+            "SELECT work_id,work_json FROM merge_work_items WHERE project_id=?1 AND ticket_run_id=?2 AND awaiting_merge_revision=?3",
+            params![subject.project_id.as_str(), subject.subject_id, subject.revision.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("read immutable merge work for public review: {error}"))?;
+    let Some((stored_work_id, work_json)) = row else {
+        return Ok(None);
+    };
+    let work: rex_projects::store::merge_work::MergeWorkItem = serde_json::from_str(&work_json)
+        .map_err(|error| format!("parse stored immutable merge work: {error}"))?;
+    let rebuilt = rex_projects::store::merge_work::MergeWorkItem::new(
+        work.project_id.clone(),
+        work.ticket_run_id.clone(),
+        work.assessed_revision,
+        work.awaiting_merge_revision,
+        work.configuration_digest.clone(),
+        work.accepted_plan_digest.clone(),
+        work.prepared_receipt_digest.clone(),
+        work.publication_set_digest.clone(),
+        work.document.clone(),
+    )?;
+    if work.work_id.as_str() != stored_work_id
+        || rebuilt != work
+        || work.project_id.as_str() != subject.project_id.as_str()
+        || work.ticket_run_id.as_str() != subject.subject_id
+        || work.awaiting_merge_revision != subject.revision
+    {
+        return Err(
+            "stored immutable merge work does not match its canonical identity and review subject"
+                .into(),
+        );
+    }
+    work.document
+        .validate_for(&work.configuration_digest, &work.document.assessment_id)?;
+    Ok(Some(work))
+}
+
+fn validate_request_merge_work(
+    work: &rex_projects::store::merge_work::MergeWorkItem,
+) -> Result<(), String> {
+    use rex_projects::merge_policy::MergeProcedureOperation as Operation;
+    if work.project_id.as_str() != FIXTURE_PROJECT_ID
+        || work.document.policy.executor != rex_projects::domain::types::MergeExecutor::Request
+        || work.document.procedure.executor != rex_projects::domain::types::MergeExecutor::Request
+        || work.document.procedure.method != rex_projects::domain::types::MergeMethod::Squash
+        || work.document.procedure.steps.len() != 3
+    {
+        return Err(
+            "presented MergeWork is not the configured Request/squash fixture procedure".into(),
+        );
+    }
+    let operations = work
+        .document
+        .procedure
+        .steps
+        .iter()
+        .map(|step| &step.operation)
+        .collect::<Vec<_>>();
+    if !matches!(operations[0], Operation::UpdatePullRequestBody { .. })
+        || !matches!(operations[1], Operation::RequestMerge { exact_comment } if exact_comment == "/merge")
+        || !matches!(operations[2], Operation::VerifyMergeCommit { .. })
+        || work
+            .document
+            .prepared_body
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || work.document.evidence.subject.repository_id != "fixture"
+        || work.document.evidence.subject.forge != "github"
+        || work
+            .document
+            .evidence
+            .subject
+            .pull_request_id
+            .parse::<u64>()
+            .is_err()
+    {
+        return Err(
+            "MergeWork procedure is not the expected typed body-recovery, /merge, verify sequence"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn accepted_merge_review_response(
+    state_root: &Path,
+    summary: &rex_projects::human_runtime::HumanRequestSummary,
+) -> Result<Option<String>, String> {
+    type AcceptedMergeReviewRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    let database = open_acceptance_state_read_only(state_root)?;
+    let row: Option<AcceptedMergeReviewRow> = database
+        .query_row(
+            "SELECT hr.lifecycle,hd.response_id,hd.choice,hd.approved,hd.subject_digest,hd.configuration_digest,hd.policy_digest FROM human_requests hr LEFT JOIN human_decisions hd ON hd.request_id=hr.request_id WHERE hr.request_id=?1",
+            [summary.request.request_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        )
+        .optional()
+        .map_err(|error| format!("read exact accepted human review receipt: {error}"))?;
+    let Some((
+        lifecycle,
+        response_id,
+        choice,
+        approved,
+        subject_digest,
+        configuration_digest,
+        policy_digest,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let expected_subject = summary.request.subject.digest()?;
+    match (
+        lifecycle.as_str(),
+        response_id,
+        choice,
+        approved,
+        subject_digest,
+        configuration_digest,
+        policy_digest,
+    ) {
+        (
+            "decided",
+            Some(response_id),
+            Some(choice),
+            Some(1),
+            Some(subject),
+            Some(configuration),
+            Some(policy),
+        ) if choice == "approve"
+            && subject == expected_subject.as_str()
+            && configuration == summary.request.subject.configuration_digest.as_str()
+            && policy == summary.request.subject.policy_digest.as_str() =>
+        {
+            Ok(Some(response_id))
+        }
+        ("decided", ..) => {
+            Err("the exact MergeWork review was decided without an accepted approval".into())
+        }
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug)]
+struct StoredMergeStep {
+    operation_id: String,
+    receipt: Option<rex_projects::merge_executor::MergeStepReceipt>,
+    next_attempt_at_unix: i64,
+}
+
+#[derive(Debug)]
+struct RequestMergeEffects {
+    body_update: Option<StoredMergeStep>,
+    request: Option<StoredMergeStep>,
+    verify_pending: Option<StoredMergeStep>,
+    verify_verified: Option<rex_projects::merge_executor::MergeVerificationReceipt>,
+}
+
+fn validate_recovered_body_update_receipt(
+    receipt: &rex_projects::merge_executor::MergeStepReceipt,
+    step_key: &str,
+    operation_id: &str,
+    exact_body: &str,
+    expected_head_sha: &str,
+) -> Result<(), String> {
+    let operation_key = format!("{operation_id}:{step_key}");
+    let rex_projects::forge::MergeEffectOperation::UpdateBody(body) =
+        &receipt.effect_intent.operation
+    else {
+        return Err("body update receipt contains a different Forge operation".into());
+    };
+    let approved_bytes_digest = rex_projects::domain::ids::Digest::parse(format!(
+        "{:x}",
+        Sha256::digest(exact_body.as_bytes())
+    ))?;
+    let canonical_request_digest = serialized_sha256_digest(body)?;
+    if receipt.step_key != step_key
+        || receipt.operation_key != operation_key
+        || receipt.effect_intent.operation_key != operation_key
+        || receipt.certainty != rex_projects::forge::EffectCertainty::Recovered
+        || receipt.acknowledgement.certainty != rex_projects::forge::EffectCertainty::Recovered
+        || receipt.effect_intent.request_digest != canonical_request_digest
+        || receipt.request_digest != canonical_request_digest
+        || receipt.acknowledgement.request_digest != canonical_request_digest
+        || receipt.acknowledgement.operation_key != operation_key
+        || body.exact_body != exact_body
+        || body.expected_head_sha != expected_head_sha
+        || body.approved_body_digest != approved_bytes_digest
+    {
+        return Err(
+            "body update receipt does not prove exact recovered no-op for approved body".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_request_comment_receipt(
+    receipt: &rex_projects::merge_executor::MergeStepReceipt,
+    effect: &rex_projects::merge_executor::MergeStepEffectRequest,
+    step_key: &str,
+    operation_id: &str,
+    exact_comment: &str,
+    body_receipt: &rex_projects::merge_executor::MergeStepReceipt,
+) -> Result<(), String> {
+    let operation_key = format!("{operation_id}:{step_key}");
+    let rex_projects::forge::MergeEffectOperation::RequestComment(comment) =
+        &receipt.effect_intent.operation
+    else {
+        return Err("Request receipt contains a different Forge operation".into());
+    };
+    let canonical_request_digest = serialized_sha256_digest(comment)?;
+    if receipt.step_key != step_key
+        || receipt.operation_key != operation_key
+        || receipt.effect_intent.operation_key != operation_key
+        || !matches!(
+            receipt.certainty,
+            rex_projects::forge::EffectCertainty::Applied
+                | rex_projects::forge::EffectCertainty::Recovered
+        )
+        || receipt.effect_intent.request_digest != canonical_request_digest
+        || receipt.request_digest != canonical_request_digest
+        || receipt.acknowledgement.request_digest != canonical_request_digest
+        || receipt.acknowledgement.operation_key != operation_key
+        || comment.exact_body != exact_comment
+        || comment.authenticated_actor.trim().is_empty()
+        || comment.attempt_started_unix == 0
+        || effect.prior_receipts.len() != 1
+        || effect.prior_receipts.first() != Some(body_receipt)
+        || receipt.acknowledgement.external_id.is_none()
+    {
+        return Err("Request receipt is not the exact approved comment operation after recovered body preparation".into());
+    }
+    Ok(())
+}
+
+fn validate_pending_verify_effect(
+    effect: &rex_projects::merge_executor::MergeStepEffectRequest,
+    receipt_json: Option<&str>,
+    next_attempt_at_unix: i64,
+    body_receipt: &rex_projects::merge_executor::MergeStepReceipt,
+    request_receipt: &rex_projects::merge_executor::MergeStepReceipt,
+) -> Result<(), String> {
+    if effect.prior_receipts.len() != 2
+        || effect.prior_receipts.first() != Some(body_receipt)
+        || effect.prior_receipts.get(1) != Some(request_receipt)
+        || receipt_json != Some("pull request has not merged yet")
+        || next_attempt_at_unix <= 0
+    {
+        return Err(
+            "Verify effect is not the durable scheduled pending observation for the open PR".into(),
+        );
+    }
+    Ok(())
+}
+
+fn serialized_sha256_digest<T: serde::Serialize>(
+    value: &T,
+) -> Result<rex_projects::domain::ids::Digest, String> {
+    let encoded = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    rex_projects::domain::ids::Digest::parse(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn read_request_merge_effects(
+    state_root: &Path,
+    work: &rex_projects::store::merge_work::MergeWorkItem,
+    summary: &rex_projects::human_runtime::HumanRequestSummary,
+) -> Result<RequestMergeEffects, String> {
+    use rex_projects::merge_policy::MergeProcedureOperation as Operation;
+    let database = open_acceptance_state_read_only(state_root)?;
+    let mut statement = database
+        .prepare("SELECT operation_id,expected_revision,request_json,status,receipt_json,next_attempt_at_unix FROM effects WHERE project_id=?1 AND subject_type='ticket_run' AND subject_id=?2 AND kind='merge' ORDER BY created_at_unix,operation_id")
+        .map_err(|error| format!("prepare read-only merge outbox evidence query: {error}"))?;
+    let rows = statement
+        .query_map(
+            params![work.project_id.as_str(), work.ticket_run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("query read-only merge outbox evidence: {error}"))?;
+    let mut effects = RequestMergeEffects {
+        body_update: None,
+        request: None,
+        verify_pending: None,
+        verify_verified: None,
+    };
+    for row in rows {
+        let (
+            operation_id,
+            expected_revision,
+            request_json,
+            status,
+            receipt_json,
+            next_attempt_at_unix,
+        ) = row.map_err(|error| format!("read merge outbox evidence row: {error}"))?;
+        let effect: rex_projects::merge_executor::MergeStepEffectRequest =
+            serde_json::from_str(&request_json)
+                .map_err(|error| format!("parse durable merge effect request: {error}"))?;
+        if effect.work_id != work.work_id
+            || effect.request_id != summary.request.request_id
+            || effect.assessed_revision != work.assessed_revision
+            || effect.awaiting_merge_revision != work.awaiting_merge_revision
+            || expected_revision != Some(work.awaiting_merge_revision.0 as i64)
+        {
+            continue;
+        }
+        let (index, step) = work
+            .document
+            .procedure
+            .steps
+            .iter()
+            .enumerate()
+            .find(|(_, step)| step.key == effect.step_key)
+            .ok_or("durable merge effect references a step outside the approved procedure")?;
+        let raw = receipt_json.clone();
+        match (&step.operation, status.as_str()) {
+            (Operation::UpdatePullRequestBody { .. }, "succeeded") => {
+                let receipt: rex_projects::merge_executor::MergeStepReceipt = serde_json::from_str(
+                    raw.as_deref()
+                        .ok_or("succeeded body update omitted its durable receipt")?,
+                )
+                .map_err(|error| format!("parse body update receipt: {error}"))?;
+                let exact_body = work
+                    .document
+                    .prepared_body
+                    .as_deref()
+                    .ok_or("MergeWork omitted its exact prepared body")?;
+                validate_recovered_body_update_receipt(
+                    &receipt,
+                    &step.key,
+                    &operation_id,
+                    exact_body,
+                    &work.document.evidence.subject.head_sha,
+                )?;
+                effects.body_update = Some(StoredMergeStep {
+                    operation_id,
+                    receipt: Some(receipt),
+                    next_attempt_at_unix,
+                });
+            }
+            (Operation::RequestMerge { exact_comment }, "succeeded") if index == 1 => {
+                let receipt: rex_projects::merge_executor::MergeStepReceipt = serde_json::from_str(
+                    raw.as_deref()
+                        .ok_or("succeeded Request step omitted its durable receipt")?,
+                )
+                .map_err(|error| format!("parse Request step receipt: {error}"))?;
+                let body_receipt = effects
+                    .body_update
+                    .as_ref()
+                    .and_then(|row| row.receipt.as_ref())
+                    .ok_or("Request receipt preceded the recovered body update receipt")?;
+                validate_request_comment_receipt(
+                    &receipt,
+                    &effect,
+                    &step.key,
+                    &operation_id,
+                    exact_comment,
+                    body_receipt,
+                )?;
+                effects.request = Some(StoredMergeStep {
+                    operation_id,
+                    receipt: Some(receipt),
+                    next_attempt_at_unix,
+                });
+            }
+            (Operation::VerifyMergeCommit { .. }, "uncertain") => {
+                let request_receipt = effects
+                    .request
+                    .as_ref()
+                    .and_then(|row| row.receipt.as_ref())
+                    .ok_or("Verify pending observation preceded the succeeded Request receipt")?;
+                let body_receipt = effects
+                    .body_update
+                    .as_ref()
+                    .and_then(|row| row.receipt.as_ref())
+                    .ok_or("Verify has no body update prerequisite")?;
+                validate_pending_verify_effect(
+                    &effect,
+                    raw.as_deref(),
+                    next_attempt_at_unix,
+                    body_receipt,
+                    request_receipt,
+                )?;
+                effects.verify_pending = Some(StoredMergeStep {
+                    operation_id,
+                    receipt: None,
+                    next_attempt_at_unix,
+                });
+            }
+            (Operation::VerifyMergeCommit { .. }, "succeeded") => {
+                let request_receipt = effects
+                    .request
+                    .as_ref()
+                    .and_then(|row| row.receipt.as_ref())
+                    .ok_or("verified Merge effect has no prior Request receipt")?;
+                if effect.prior_receipts.len() != 2 || effect.prior_receipts[1] != *request_receipt
+                {
+                    return Err(
+                        "verified Merge effect is not bound to the exact Request receipt".into(),
+                    );
+                }
+                let verification: rex_projects::merge_executor::MergeVerificationReceipt =
+                    serde_json::from_str(
+                        raw.as_deref()
+                            .ok_or("verified Merge effect omitted typed verification receipt")?,
+                    )
+                    .map_err(|error| format!("parse host MergeVerificationReceipt: {error}"))?;
+                effects.verify_verified = Some(verification);
+            }
+            _ => {}
+        }
+    }
+    Ok(effects)
+}
+
+fn work_pull_ref(
+    work: &rex_projects::store::merge_work::MergeWorkItem,
+) -> Result<rex_projects::forge::PullRequestRef, String> {
+    let subject = &work.document.evidence.subject;
+    if subject.repository_id != "fixture"
+        || subject.forge != "github"
+        || subject.forge_host != "github.com"
+    {
+        return Err("MergeWork does not identify the configured local GitHub fixture".into());
+    }
+    Ok(rex_projects::forge::PullRequestRef {
+        repository: rex_projects::forge::RepositoryRef {
+            host: subject.forge_host.clone(),
+            owner: "fixture".into(),
+            name: "repository".into(),
+            expected_id: Some(subject.forge_repository_id),
+        },
+        number: subject
+            .pull_request_id
+            .parse()
+            .map_err(|_| "MergeWork pull request ID is invalid")?,
+        expected_node_id: Some(subject.pull_request_node_id.clone()),
+    })
+}
+
+fn product_as_human(
+    request: &Request<'_>,
+    state_root: &Path,
+    words: &[&str],
+) -> Result<ProcessOutput, String> {
+    let mut args = vec![
+        OsString::from("--config"),
+        request.fixture_root.join("config.toml").into_os_string(),
+        OsString::from("--state-root"),
+        state_root.as_os_str().to_owned(),
+    ];
+    args.extend(words.iter().map(OsString::from));
+    let mut environment = std::env::vars_os()
+        .filter(|(key, _)| {
+            key != std::ffi::OsStr::new("REX_PROJECTS_AGENT")
+                && key != std::ffi::OsStr::new("REX_PROJECTS_CONTEXT")
+        })
+        .collect::<BTreeMap<_, _>>();
+    environment.insert(
+        "XDG_STATE_HOME".into(),
+        request.fixture_root.join("xdg-state").into_os_string(),
+    );
+    run_process(ProcessRequest {
+        executable: request.cli.to_path_buf(),
+        args,
+        stdin: Vec::new(),
+        cwd: Some(request.fixture_root.to_path_buf()),
+        clear_environment: true,
+        environment,
+        timeout: STEP_TIMEOUT,
+        shutdown_grace: SHUTDOWN_GRACE,
+        stdout_limit: OUTPUT_LIMIT,
+        stderr_tail_limit: OUTPUT_LIMIT,
+    })
+    .map_err(|error| format!("run public human command outside Agent context: {error}"))
+}
+
+fn fixture_gh_api(
+    request: &Request<'_>,
+    method: &str,
+    endpoint: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let mut args = vec![
+        OsString::from("api"),
+        OsString::from(endpoint),
+        OsString::from("--method"),
+        OsString::from(method),
+    ];
+    let stdin = if let Some(body) = body {
+        args.extend([OsString::from("--input"), OsString::from("-")]);
+        serde_json::to_vec(&body).map_err(|error| error.to_string())?
+    } else {
+        Vec::new()
+    };
+    let output = run_process(ProcessRequest {
+        executable: request.fixture_root.join("bin/gh"),
+        args,
+        stdin,
+        cwd: Some(request.fixture_root.to_path_buf()),
+        clear_environment: false,
+        environment: std::env::vars_os().collect(),
+        timeout: STEP_TIMEOUT,
+        shutdown_grace: SHUTDOWN_GRACE,
+        stdout_limit: OUTPUT_LIMIT,
+        stderr_tail_limit: OUTPUT_LIMIT,
+    })
+    .map_err(|error| format!("run fixture provider API process: {error}"))?;
+    require_success("fixture provider API request", &output)?;
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("parse fixture provider response JSON: {error}"))
+}
+
+fn comment_timestamp_unix(value: &str) -> Option<u64> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date = date.split('-');
+    let year = date.next()?.parse::<i64>().ok()?;
+    let month = date.next()?.parse::<i64>().ok()?;
+    let day = date.next()?.parse::<i64>().ok()?;
+    if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (clock, _) = time.split_once('.').unwrap_or((time, ""));
+    let mut clock = clock.split(':');
+    let hour = clock.next()?.parse::<u64>().ok()?;
+    let minute = clock.next()?.parse::<u64>().ok()?;
+    let second = clock.next()?.parse::<u64>().ok()?;
+    if clock.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days_since_epoch = era * 146_097 + day_of_era - 719_468;
+    let seconds =
+        days_since_epoch * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64;
+    u64::try_from(seconds).ok()
 }
 
 fn bounded_stage_contract_valid(
@@ -1957,6 +3014,7 @@ struct ProfilePreparation<'a> {
     worker_recovery_stage: bool,
     worker_review_rework_stage: bool,
     worker_verification_stage: bool,
+    request_merge_stage: bool,
     native_worker_codex: Option<&'a Path>,
 }
 
@@ -1997,6 +3055,11 @@ fn prepare_profiles(
                 preparation.host_worker,
                 preparation.native_worker_codex.is_some(),
             )?
+        };
+        let messages = if preparation.request_merge_stage && role == "merge_decision" {
+            request_merge_messages(messages)
+        } else {
+            messages
         };
         let hold = (preparation.hold_coordinator_after_inbox && role == "coordinator")
             || (preparation.hold_worker_after_inbox && role == "worker")
@@ -2443,6 +3506,28 @@ fn default_merge_intent_template(repository_id: &str) -> Value {
     serde_json::from_str(&template).expect("shared MergeIntent fixture is valid JSON")
 }
 
+fn request_merge_messages(mut messages: Vec<Value>) -> Vec<Value> {
+    let intent = messages
+        .iter_mut()
+        .find(|message| message["kind"] == "merge_intent")
+        .expect("MergeDecision fixture has an intent message");
+    intent["structured_result"] = json!({
+        "assessment_id":{"$fixture_ref":"prompt.assessment_id"},
+        "pr_identities":[{"$fixture_ref":"prompt.pr_reference"}],
+        "policy_digest":{"$fixture_ref":"prompt.policy_digest"},
+        "prepared_body_digest":{"$fixture_ref":"prompt.prepared_body_digest"},
+        "steps":[
+            {"kind":"update_pull_request_body","instruction_reference":"repository:fixture:merge#prepare-body","rationale":"Recover the exact host-prepared authorship-trailer body already published by the Worker."},
+            {"kind":"request_merge","instruction_reference":"repository:fixture:merge#request-merge","rationale":"Request the repository-configured merge through its exact public procedure."},
+            {"kind":"verify_merge_commit","instruction_reference":"repository:fixture:merge#verify-merge","rationale":"Verify the provider's recorded merge commit and required authorship trailers."}
+        ],
+        "post_merge_verification":[
+            {"kind":"merge_commit_recorded","instruction_reference":"repository:fixture:merge#verify-merge","rationale":"Confirm the provider records the verified merge commit."}
+        ]
+    });
+    messages
+}
+
 trait FixtureMessageExt {
     fn with_lane(self, lane: &str) -> Self;
     fn with_actions(self, actions: Vec<Value>) -> Self;
@@ -2468,7 +3553,17 @@ impl FixtureMessageExt for Value {
     }
 }
 
+#[cfg(test)]
 fn config_text(request: &Request<'_>, executable: &Path, native_stage: bool) -> String {
+    config_text_for_stage(request, executable, native_stage, false)
+}
+
+fn config_text_for_stage(
+    request: &Request<'_>,
+    executable: &Path,
+    native_stage: bool,
+    request_merge_stage: bool,
+) -> String {
     let db = request.fixture_root.join("tickets.sqlite");
     let native_runtime_limits = if native_stage {
         "max_agent_runs = 1\nmax_blocks_per_tab = 2\ncompleted_blocks_to_keep = 0\n"
@@ -2499,8 +3594,8 @@ forge = "github"
 auto_merge = true
 required_checks = ["required-tests"]
 method = "squash"
-executor = "direct"
-instructions = "Use the repository's configured merge procedure."
+executor = {:?}
+instructions = {:?}
 [repositories.fixture.operations]
 recipe = "docs_fixture"
 allowed_actions = ["fixture_echo"]
@@ -2548,6 +3643,16 @@ command = [{:?}, "fixture", "operations", "--state-dir", {:?}, "--observe-status
         native_runtime_limits,
         executable.display().to_string(),
         db.display().to_string(),
+        if request_merge_stage {
+            "request"
+        } else {
+            "direct"
+        },
+        if request_merge_stage {
+            "Request merge by posting the configured command.\n/merge\nVerify the provider records the squash merge commit and required Co-authored-by trailers."
+        } else {
+            "Use the repository's configured merge procedure."
+        },
         executable.display().to_string(),
         request
             .fixture_root
@@ -3980,6 +5085,56 @@ mod tests {
     use super::*;
     use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
 
+    fn fixture_body_receipt(
+        approved_body_digest: rex_projects::domain::ids::Digest,
+    ) -> rex_projects::merge_executor::MergeStepReceipt {
+        let pull = rex_projects::forge::PullRequestRef {
+            repository: rex_projects::forge::RepositoryRef {
+                host: "github.com".into(),
+                owner: "fixture".into(),
+                name: "repository".into(),
+                expected_id: Some(1),
+            },
+            number: 7,
+            expected_node_id: Some("fixture-pr-7".into()),
+        };
+        let operation_key = "body-operation:prepare-body".to_owned();
+        let body = rex_projects::forge::BodyUpdateIntent {
+            pull: pull.clone(),
+            operation_key: operation_key.clone(),
+            expected_head_sha: "a".repeat(40),
+            expected_prior_body_digest: rex_projects::domain::ids::Digest::parse("b".repeat(64))
+                .unwrap(),
+            exact_body: "approved body\nCo-authored-by: Codex <noreply@openai.com>\n".into(),
+            approved_body_digest,
+        };
+        let request_digest = serialized_sha256_digest(&body).unwrap();
+        let effect_intent = rex_projects::forge::MergeEffectIntent {
+            pull,
+            operation_key: operation_key.clone(),
+            request_digest: request_digest.clone(),
+            operation: rex_projects::forge::MergeEffectOperation::UpdateBody(body),
+            attempt_started_unix: 100,
+        };
+        rex_projects::merge_executor::MergeStepReceipt {
+            step_key: "prepare-body".into(),
+            operation_key: operation_key.clone(),
+            certainty: rex_projects::forge::EffectCertainty::Recovered,
+            request_digest: request_digest.clone(),
+            effect_intent,
+            acknowledgement: rex_projects::forge::EffectAcknowledgement {
+                operation_key,
+                request_digest,
+                certainty: rex_projects::forge::EffectCertainty::Recovered,
+                external_id: Some("7".into()),
+                external_url: None,
+                resulting_head_sha: None,
+                resulting_merge_sha: None,
+                reason: None,
+            },
+        }
+    }
+
     #[test]
     fn native_worker_block_loss_stage_is_supported_and_unknown_stages_are_rejected() {
         assert_eq!(
@@ -4055,6 +5210,265 @@ mod tests {
             "merge_commit_recorded"
         );
         crate::fixtures::agent::validate_payload(RoleOutputKind::MergeIntent, &payload).unwrap();
+    }
+
+    #[test]
+    fn request_merge_stage_generates_loadable_request_executor_and_typed_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let fixture_root = temporary.path().join("acceptance");
+        fs::create_dir(&fixture_root).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &fixture_root,
+        };
+        let executable = std::env::current_exe().unwrap();
+        prepare_profiles(
+            &request,
+            &executable,
+            request.cli,
+            ProfilePreparation {
+                host_worker: true,
+                request_merge_stage: true,
+                ..ProfilePreparation::default()
+            },
+        )
+        .unwrap();
+        let config_path = fixture_root.join("config.toml");
+        fs::write(
+            &config_path,
+            config_text_for_stage(&request, &executable, false, true),
+        )
+        .unwrap();
+
+        let loaded = rex_projects::config::load(&config_path).unwrap();
+        let fixture_repository = rex_projects::domain::ids::RepositoryId::parse("fixture").unwrap();
+        assert_eq!(
+            loaded.config.repositories[&fixture_repository]
+                .merge
+                .executor,
+            Some(rex_projects::domain::types::MergeExecutor::Request)
+        );
+        assert_eq!(
+            loaded.config.repositories[&fixture_repository]
+                .merge
+                .instructions
+                .as_deref(),
+            Some(
+                "Request merge by posting the configured command.\n/merge\nVerify the provider records the squash merge commit and required Co-authored-by trailers."
+            )
+        );
+        assert!(
+            loaded.config.repositories[&fixture_repository]
+                .merge
+                .instructions
+                .as_deref()
+                .unwrap()
+                .lines()
+                .any(|line| line == "/merge")
+        );
+
+        let context_bytes = fs::read(fixture_root.join("contexts/merge_decision.json")).unwrap();
+        let parsed: crate::fixtures::agent::AgentContext =
+            serde_json::from_slice(&context_bytes).unwrap();
+        assert_eq!(parsed.messages.len(), 3);
+        let intent = parsed
+            .messages
+            .iter()
+            .find(|message| message.kind == RoleOutputKind::MergeIntent)
+            .unwrap();
+        assert_eq!(
+            intent.recipe.structured_result["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| step["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "update_pull_request_body",
+                "request_merge",
+                "verify_merge_commit"
+            ]
+        );
+        assert_eq!(
+            intent.recipe.structured_result["steps"][1]["instruction_reference"],
+            "repository:fixture:merge#request-merge"
+        );
+        for step in intent.recipe.structured_result["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(
+                intent.recipe.structured_result["post_merge_verification"]
+                    .as_array()
+                    .unwrap(),
+            )
+        {
+            assert!(
+                step["instruction_reference"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("repository:fixture:merge#")
+            );
+        }
+        crate::fixtures::agent::validate_payload(
+            RoleOutputKind::MergeIntent,
+            &resolve_test_references(intent.recipe.structured_result.clone()),
+        )
+        .unwrap();
+        assert!(config_text(&request, &executable, false).contains("executor = \"direct\""));
+    }
+
+    #[test]
+    fn request_merge_acceptance_reports_only_unproven_milestones() {
+        let mut evidence = RequestMergeEvidence::default();
+        assert_eq!(
+            evidence.next_missing_milestone(false),
+            "exact TicketReview was not presented through public human list/show"
+        );
+        evidence.presented_review = true;
+        evidence.approval_response_queued = true;
+        evidence.human_approval_accepted = true;
+        evidence.body_update_recovered = true;
+        evidence.request_comment_succeeded = true;
+        evidence.verify_pending_while_open = true;
+        evidence.separate_merge_observed = true;
+        evidence.host_merge_verified = true;
+        assert_eq!(
+            evidence.missing_milestones(false),
+            vec!["external ticket has not reached Done"]
+        );
+        assert!(evidence.passed(true));
+        assert!(evidence.missing_milestones(true).is_empty());
+    }
+
+    #[test]
+    fn request_merge_receipt_chain_checks_body_bytes_and_exact_prerequisites() {
+        let body = "approved body\nCo-authored-by: Codex <noreply@openai.com>\n";
+        let body_digest = rex_projects::domain::ids::Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(body.as_bytes())
+        ))
+        .unwrap();
+        let body_receipt = fixture_body_receipt(body_digest);
+        validate_recovered_body_update_receipt(
+            &body_receipt,
+            "prepare-body",
+            "body-operation",
+            body,
+            &"a".repeat(40),
+        )
+        .unwrap();
+
+        let canonical_body_request = match &body_receipt.effect_intent.operation {
+            rex_projects::forge::MergeEffectOperation::UpdateBody(body) => {
+                serialized_sha256_digest(body).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let wrong_digest_receipt = fixture_body_receipt(canonical_body_request);
+        assert!(
+            validate_recovered_body_update_receipt(
+                &wrong_digest_receipt,
+                "prepare-body",
+                "body-operation",
+                body,
+                &"a".repeat(40),
+            )
+            .is_err()
+        );
+
+        let pull = body_receipt.effect_intent.pull.clone();
+        let operation_key = "request-operation:request-merge".to_owned();
+        let comment = rex_projects::forge::CommentIntent {
+            pull: pull.clone(),
+            operation_key: operation_key.clone(),
+            expected_head_sha: "a".repeat(40),
+            expected_base_sha: "b".repeat(40),
+            exact_body: "/merge".into(),
+            authenticated_actor: "fixture-bot".into(),
+            attempt_started_unix: 101,
+        };
+        let request_digest = serialized_sha256_digest(&comment).unwrap();
+        let request_receipt = rex_projects::merge_executor::MergeStepReceipt {
+            step_key: "request-merge".into(),
+            operation_key: operation_key.clone(),
+            certainty: rex_projects::forge::EffectCertainty::Applied,
+            request_digest: request_digest.clone(),
+            effect_intent: rex_projects::forge::MergeEffectIntent {
+                pull,
+                operation_key: operation_key.clone(),
+                request_digest: request_digest.clone(),
+                operation: rex_projects::forge::MergeEffectOperation::RequestComment(comment),
+                attempt_started_unix: 101,
+            },
+            acknowledgement: rex_projects::forge::EffectAcknowledgement {
+                operation_key,
+                request_digest,
+                certainty: rex_projects::forge::EffectCertainty::Applied,
+                external_id: Some("comment-9".into()),
+                external_url: None,
+                resulting_head_sha: None,
+                resulting_merge_sha: None,
+                reason: None,
+            },
+        };
+        let mut request_effect = rex_projects::merge_executor::MergeStepEffectRequest {
+            schema_version: 1,
+            work_id: rex_projects::domain::ids::Digest::parse("c".repeat(64)).unwrap(),
+            request_id: rex_projects::domain::ids::HumanRequestId::parse("review-1").unwrap(),
+            assessed_revision: rex_projects::domain::ids::Revision(4),
+            awaiting_merge_revision: rex_projects::domain::ids::Revision(6),
+            step_key: "request-merge".into(),
+            prior_receipts: vec![body_receipt.clone()],
+        };
+        validate_request_comment_receipt(
+            &request_receipt,
+            &request_effect,
+            "request-merge",
+            "request-operation",
+            "/merge",
+            &body_receipt,
+        )
+        .unwrap();
+        request_effect.prior_receipts.clear();
+        assert!(
+            validate_request_comment_receipt(
+                &request_receipt,
+                &request_effect,
+                "request-merge",
+                "request-operation",
+                "/merge",
+                &body_receipt,
+            )
+            .is_err()
+        );
+
+        let mut verify_effect = request_effect;
+        verify_effect.step_key = "verify-merge".into();
+        verify_effect.prior_receipts = vec![body_receipt.clone(), request_receipt.clone()];
+        validate_pending_verify_effect(
+            &verify_effect,
+            Some("pull request has not merged yet"),
+            200,
+            &body_receipt,
+            &request_receipt,
+        )
+        .unwrap();
+        verify_effect.prior_receipts.swap(0, 1);
+        assert!(
+            validate_pending_verify_effect(
+                &verify_effect,
+                Some("pull request has not merged yet"),
+                200,
+                &body_receipt,
+                &request_receipt,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4977,6 +6391,14 @@ mod tests {
         assert_eq!(
             parse_acceptance_stage(Some(WORKER_RECOVERY_INBOX_STAGE.into())).unwrap(),
             Some(WORKER_RECOVERY_INBOX_STAGE.into())
+        );
+        assert_eq!(
+            parse_acceptance_stage(Some("request_merge".into())).unwrap(),
+            Some("request_merge".into())
+        );
+        assert_eq!(
+            qualification_roles_for_stage(Some("request_merge")),
+            &PROVIDER_ROLES
         );
         assert!(parse_acceptance_stage(Some("unknown".into())).is_err());
     }
