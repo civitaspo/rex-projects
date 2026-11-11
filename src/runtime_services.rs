@@ -128,7 +128,7 @@ pub struct RuntimeServices {
     config_file: PathBuf,
     artifacts: ArtifactStore,
     delivery: RuntimeDelivery,
-    mailbox_cursor: Option<String>,
+    mailbox_scan: MailboxScanState,
     rex_lifecycle_cursor: usize,
     rex_lifecycle_last_tick: Option<i64>,
     agent_recovery: crate::agent_recovery::AgentRecoveryRuntime,
@@ -714,7 +714,7 @@ impl RuntimeServices {
             config_file,
             artifacts,
             delivery,
-            mailbox_cursor: None,
+            mailbox_scan: MailboxScanState::default(),
             rex_lifecycle_cursor: 0,
             rex_lifecycle_last_tick: None,
             agent_recovery: crate::agent_recovery::AgentRecoveryRuntime::default(),
@@ -2178,13 +2178,15 @@ impl FactoryRuntimeServices for RuntimeServices {
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<bool, String> {
+        let mut emit_diagnostic = |message| eprintln!("{message}");
         process_one_registered_agent_request(
             store,
             owner_generation,
             now_unix,
             &self.artifacts,
             &self.applied_config.profiles,
-            &mut self.mailbox_cursor,
+            &mut self.mailbox_scan,
+            &mut emit_diagnostic,
         )
     }
 
@@ -3257,50 +3259,106 @@ impl FactoryRuntimeServices for RuntimeServices {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct MailboxScanState {
+    cursor: Option<String>,
+    expired_cursor: Option<String>,
+    diagnostics: BTreeMap<String, String>,
+}
+
+const MAX_EXPIRED_MAILBOXES_PER_SCAN: usize = 1;
+
 pub(crate) fn process_one_registered_agent_request(
     store: &mut ConfigStore,
     owner_generation: u64,
     now_unix: i64,
     artifacts: &ArtifactStore,
     profiles: &BTreeMap<crate::domain::ids::ProfileId, crate::config::Profile>,
-    mailbox_cursor: &mut Option<String>,
+    scan: &mut MailboxScanState,
+    emit_diagnostic: &mut dyn FnMut(String),
 ) -> Result<bool, String> {
+    let MailboxScanState {
+        cursor: live_cursor,
+        expired_cursor,
+        diagnostics: mailbox_diagnostics,
+    } = scan;
     let mailboxes = store.registered_agent_mailboxes(owner_generation)?;
     if mailboxes.is_empty() {
         return Ok(false);
     }
-    let start = mailbox_cursor
+
+    let now = now_unix.max(0) as u64;
+    let mut process_registration =
+        |registration: &crate::store::AgentMailboxRegistration| match store
+            .process_one_agent_mailbox_request(
+                owner_generation,
+                &registration.agent_run_id,
+                now_unix,
+                artifacts,
+                profiles,
+            ) {
+            Ok(processed) => {
+                mailbox_diagnostics.remove(&registration.agent_run_id);
+                Ok(processed)
+            }
+            Err(crate::store::agent_mailbox::AgentMailboxProcessingError::LocalMailbox(error)) => {
+                if mailbox_diagnostics.get(&registration.agent_run_id) != Some(&error) {
+                    emit_diagnostic(format!(
+                        "rex-projects: AgentRun {} mailbox needs attention: {error}",
+                        registration.agent_run_id
+                    ));
+                    mailbox_diagnostics.insert(registration.agent_run_id.clone(), error);
+                }
+                Ok(false)
+            }
+            Err(crate::store::agent_mailbox::AgentMailboxProcessingError::Authority(error)) => {
+                Err(format!(
+                    "AgentRun {} mailbox authority/storage failure: {error}",
+                    registration.agent_run_id
+                ))
+            }
+        };
+    let live_mailboxes = mailboxes
+        .iter()
+        .filter(|registration| registration.expires_at_unix > now)
+        .collect::<Vec<_>>();
+    let start = live_cursor
         .as_ref()
         .and_then(|cursor| {
-            mailboxes
+            live_mailboxes
                 .iter()
                 .position(|entry| &entry.agent_run_id > cursor)
         })
         .unwrap_or(0);
-    for offset in 0..mailboxes.len() {
-        let registration = &mailboxes[(start + offset) % mailboxes.len()];
-        *mailbox_cursor = Some(registration.agent_run_id.clone());
-        match store.process_one_agent_mailbox_request(
-            owner_generation,
-            &registration.agent_run_id,
-            now_unix,
-            artifacts,
-            profiles,
-        ) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
-            Err(crate::store::agent_mailbox::AgentMailboxProcessingError::LocalMailbox(error)) => {
-                eprintln!(
-                    "rex-projects: AgentRun {} mailbox needs attention: {error}",
-                    registration.agent_run_id
-                );
-            }
-            Err(crate::store::agent_mailbox::AgentMailboxProcessingError::Authority(error)) => {
-                return Err(format!(
-                    "AgentRun {} mailbox authority/storage failure: {error}",
-                    registration.agent_run_id
-                ));
-            }
+    for offset in 0..live_mailboxes.len() {
+        let registration = live_mailboxes[(start + offset) % live_mailboxes.len()];
+        *live_cursor = Some(registration.agent_run_id.clone());
+        if process_registration(registration)? {
+            return Ok(true);
+        }
+    }
+
+    let expired_mailboxes = mailboxes
+        .iter()
+        .filter(|registration| registration.expires_at_unix <= now)
+        .collect::<Vec<_>>();
+    if expired_mailboxes.is_empty() {
+        return Ok(false);
+    }
+    let expired_start = expired_cursor
+        .as_ref()
+        .and_then(|cursor| {
+            expired_mailboxes
+                .iter()
+                .position(|entry| &entry.agent_run_id > cursor)
+        })
+        .unwrap_or(0);
+    let count = expired_mailboxes.len().min(MAX_EXPIRED_MAILBOXES_PER_SCAN);
+    for offset in 0..count {
+        let registration = expired_mailboxes[(expired_start + offset) % expired_mailboxes.len()];
+        *expired_cursor = Some(registration.agent_run_id.clone());
+        if process_registration(registration)? {
+            return Ok(true);
         }
     }
     Ok(false)

@@ -9,6 +9,40 @@ use sha2::{Digest as _, Sha256};
 
 use crate::protocol::{RequestEnvelope, RequestId, ResponseEnvelope, parse_unique};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailboxDrainReason {
+    Unreadable,
+    Malformed,
+    IdentityMismatch,
+    MissingPair,
+    UnexpectedEntry,
+    LimitExceeded,
+}
+
+impl MailboxDrainReason {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable_entry",
+            Self::Malformed => "malformed_entry",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::MissingPair => "missing_pair",
+            Self::UnexpectedEntry => "unexpected_entry",
+            Self::LimitExceeded => "inventory_limit_exceeded",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MailboxDrainInspection {
+    Drained {
+        fingerprint: crate::domain::ids::Digest,
+    },
+    Unresolved {
+        fingerprint: crate::domain::ids::Digest,
+        reason: MailboxDrainReason,
+    },
+}
+
 const REQUEST_PREFIX: &str = "request-";
 const RECEIPT_PREFIX: &str = "receipt-";
 const MAX_ID_BYTES: usize = 255;
@@ -367,6 +401,198 @@ impl MailboxCapability {
         Ok(requests)
     }
 
+    /// Inspect whether this pinned mailbox contains only complete, matching request/response
+    /// pairs. This is read-only and deliberately does not grant any post-expiry processing
+    /// authority; callers must verify the run's terminal receipt before using it.
+    pub(crate) fn inspect_drain(&self, shared_control_layout: bool) -> MailboxDrainInspection {
+        use MailboxDrainInspection::{Drained, Unresolved};
+
+        let entry_limit = self
+            .limits
+            .max_pending_requests
+            .saturating_mul(2)
+            .saturating_add(if shared_control_layout { 8 } else { 2 });
+        let (names, exceeded) = match self.directory_file_names_bounded(entry_limit) {
+            Ok(result) => result,
+            Err(_) => {
+                return self.unresolved_inventory(
+                    MailboxDrainReason::Unreadable,
+                    &[("directory".to_owned(), "unreadable".to_owned())],
+                );
+            }
+        };
+        let mut inventory = Vec::with_capacity(names.len());
+        let mut requests = std::collections::BTreeMap::<String, String>::new();
+        let mut receipts = std::collections::BTreeMap::<String, String>::new();
+        let mut reason = exceeded.then_some(MailboxDrainReason::LimitExceeded);
+
+        for file_name in names {
+            let Some(name) = file_name.to_str() else {
+                reason.get_or_insert(MailboxDrainReason::UnexpectedEntry);
+                inventory.push(("non_utf8_name".to_owned(), "unknown".to_owned()));
+                continue;
+            };
+            if name == "descriptor.json" {
+                match self.read_bounded(name, 4096) {
+                    Ok(bytes) => inventory.push((name.to_owned(), digest(&bytes))),
+                    Err(_) => {
+                        reason.get_or_insert(MailboxDrainReason::Unreadable);
+                        inventory.push((name.to_owned(), "unreadable".to_owned()));
+                    }
+                }
+                continue;
+            }
+            if shared_control_layout {
+                match name {
+                    "result.schema.json"
+                    | "changed-paths.json"
+                    | "change-reference.json"
+                    | "commit-message.txt" => {
+                        match self.read_bounded(name, MAX_REGISTERED_REQUEST_BYTES) {
+                            Ok(bytes) => inventory.push((name.to_owned(), digest(&bytes))),
+                            Err(_) => {
+                                reason.get_or_insert(MailboxDrainReason::Unreadable);
+                                inventory.push((name.to_owned(), "unreadable".to_owned()));
+                            }
+                        }
+                    }
+                    "run-step" | "inbox" => match self.is_real_directory_entry(name) {
+                        Ok(true) => inventory.push((name.to_owned(), "directory".to_owned())),
+                        Ok(false) | Err(_) => {
+                            reason.get_or_insert(MailboxDrainReason::Unreadable);
+                            inventory.push((name.to_owned(), "unreadable".to_owned()));
+                        }
+                    },
+                    _ => {}
+                }
+                if matches!(
+                    name,
+                    "result.schema.json"
+                        | "changed-paths.json"
+                        | "change-reference.json"
+                        | "commit-message.txt"
+                        | "run-step"
+                        | "inbox"
+                ) {
+                    continue;
+                }
+            }
+            let kind = if let Some(key) = name
+                .strip_prefix(REQUEST_PREFIX)
+                .and_then(|name| name.strip_suffix(".json"))
+            {
+                Some((true, key))
+            } else {
+                name.strip_prefix(RECEIPT_PREFIX)
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .map(|key| (false, key))
+            };
+            let Some((is_request, filename_key)) = kind else {
+                reason.get_or_insert(MailboxDrainReason::UnexpectedEntry);
+                inventory.push((name.to_owned(), "unexpected".to_owned()));
+                continue;
+            };
+            let bytes = match self.read_bounded(name, self.limits.max_request_bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    reason.get_or_insert(MailboxDrainReason::Unreadable);
+                    inventory.push((name.to_owned(), "unreadable".to_owned()));
+                    continue;
+                }
+            };
+            let content_digest = digest(&bytes);
+            inventory.push((name.to_owned(), content_digest.clone()));
+            if is_request {
+                let parsed = parse_unique::<RequestEnvelope<Value>>(&bytes).and_then(|request| {
+                    request.validate()?;
+                    if key(request.request_id.as_str()) != filename_key {
+                        return Err("request filename key differs from request id".into());
+                    }
+                    Ok(request.request_id.as_str().to_owned())
+                });
+                match parsed {
+                    Ok(request_id) => {
+                        if requests.insert(request_id, content_digest).is_some() {
+                            reason.get_or_insert(MailboxDrainReason::IdentityMismatch);
+                        }
+                    }
+                    Err(_) => {
+                        reason.get_or_insert(MailboxDrainReason::Malformed);
+                    }
+                }
+            } else {
+                let parsed = parse_unique::<ResponseEnvelope<Value>>(&bytes).and_then(|receipt| {
+                    receipt.validate_for(&receipt.request_id)?;
+                    if key(receipt.request_id.as_str()) != filename_key {
+                        return Err("receipt filename key differs from request id".into());
+                    }
+                    Ok(receipt.request_id.as_str().to_owned())
+                });
+                match parsed {
+                    Ok(request_id) => {
+                        if receipts.insert(request_id, content_digest).is_some() {
+                            reason.get_or_insert(MailboxDrainReason::IdentityMismatch);
+                        }
+                    }
+                    Err(_) => {
+                        reason.get_or_insert(MailboxDrainReason::Malformed);
+                    }
+                }
+            }
+        }
+        if requests.keys().ne(receipts.keys()) {
+            reason.get_or_insert(MailboxDrainReason::MissingPair);
+        }
+        inventory.sort();
+        let fingerprint = inventory_fingerprint(&inventory, exceeded);
+        match reason {
+            Some(reason) => Unresolved {
+                fingerprint,
+                reason,
+            },
+            None => Drained { fingerprint },
+        }
+    }
+
+    fn unresolved_inventory(
+        &self,
+        reason: MailboxDrainReason,
+        inventory: &[(String, String)],
+    ) -> MailboxDrainInspection {
+        MailboxDrainInspection::Unresolved {
+            fingerprint: inventory_fingerprint(inventory, false),
+            reason,
+        }
+    }
+
+    fn is_real_directory_entry(&self, name: &str) -> Result<bool, std::io::Error> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let name = std::ffi::CString::new(name).expect("internal control entry name");
+            // SAFETY: the retained descriptor is the registered mailbox directory; the name is
+            // an exact internal basename and O_NOFOLLOW rejects a substituted symlink.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory_handle.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: openat returned an owned descriptor.
+            let directory = unsafe { File::from_raw_fd(fd) };
+            directory.metadata().map(|metadata| metadata.is_dir())
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::symlink_metadata(self.directory.join(name))?;
+            Ok(metadata.is_dir() && !metadata.file_type().is_symlink())
+        }
+    }
+
     fn unacknowledged_request_names(&self) -> Result<Vec<String>, String> {
         let entries = self
             .directory_file_names()
@@ -429,8 +655,14 @@ impl MailboxCapability {
         let mut names = Vec::new();
         loop {
             // SAFETY: stream remains live until closedir below; readdir returns an entry owned by it.
+            set_errno(0);
             let entry = unsafe { libc::readdir(stream) };
             if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error().unwrap_or(0) != 0 {
+                    unsafe { libc::closedir(stream) };
+                    return Err(error);
+                }
                 break;
             }
             // SAFETY: dirent.d_name is a nul-terminated array provided by readdir.
@@ -444,6 +676,77 @@ impl MailboxCapability {
             return Err(std::io::Error::last_os_error());
         }
         Ok(names)
+    }
+
+    #[cfg(unix)]
+    fn directory_file_names_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<std::ffi::OsString>, bool), std::io::Error> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStringExt;
+        let duplicate = unsafe {
+            libc::openat(
+                self.directory_handle.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(duplicate) };
+            return Err(error);
+        }
+        let mut names = Vec::with_capacity(limit.min(64));
+        let mut exceeded = false;
+        loop {
+            set_errno(0);
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error().unwrap_or(0) != 0 {
+                    unsafe { libc::closedir(stream) };
+                    return Err(error);
+                }
+                break;
+            }
+            let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            if names.len() == limit {
+                exceeded = true;
+                break;
+            }
+            names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        names.sort();
+        Ok((names, exceeded))
+    }
+
+    #[cfg(not(unix))]
+    fn directory_file_names_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<std::ffi::OsString>, bool), std::io::Error> {
+        let mut names = Vec::with_capacity(limit.min(64));
+        let mut exceeded = false;
+        for entry in fs::read_dir(&self.directory)? {
+            if names.len() == limit {
+                exceeded = true;
+                break;
+            }
+            names.push(entry?.file_name());
+        }
+        names.sort();
+        Ok((names, exceeded))
     }
     #[cfg(not(unix))]
     fn directory_file_names(&self) -> Result<Vec<std::ffi::OsString>, std::io::Error> {
@@ -565,6 +868,24 @@ impl MailboxCapability {
     }
 }
 
+#[cfg(all(unix, target_os = "linux"))]
+fn set_errno(value: libc::c_int) {
+    // SAFETY: libc returns this thread's errno storage.
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn set_errno(value: libc::c_int) {
+    // SAFETY: libc returns this thread's errno storage on Darwin.
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn set_errno(_value: libc::c_int) {
+    // Without a known errno accessor, preserve fail-closed behavior: stale errno may turn EOF
+    // into an unreadable inventory, but cannot make a partial inventory appear drained.
+}
+
 fn validate_run_id(run_id: &str, limits: MailboxLimits) -> Result<(), String> {
     if run_id.is_empty() || run_id.len() > MAX_ID_BYTES || run_id.chars().any(char::is_control) {
         return Err("invalid mailbox run id".into());
@@ -600,6 +921,16 @@ fn lock_with_timeout(file: File) -> Result<File, String> {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn inventory_fingerprint(
+    inventory: &[(String, String)],
+    exceeded: bool,
+) -> crate::domain::ids::Digest {
+    let serialized = serde_json::to_vec(&(inventory, exceeded))
+        .expect("mailbox inventory fingerprint serialization is infallible");
+    crate::domain::ids::Digest::parse(digest(&serialized))
+        .expect("SHA-256 is a valid mailbox inventory digest")
 }
 
 fn key(value: &str) -> String {
@@ -778,7 +1109,10 @@ fn atomic_publish_at(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), s
 
 #[cfg(test)]
 mod tests {
-    use super::{MailboxCapability, MailboxDescriptor, MailboxLimits, QueueResult};
+    use super::{
+        MailboxCapability, MailboxDescriptor, MailboxDrainInspection, MailboxDrainReason,
+        MailboxLimits, QueueResult,
+    };
     use sha2::Digest as _;
     use std::fs;
 
@@ -838,6 +1172,129 @@ mod tests {
         assert!(mailbox.has_queued_request("r-1", 1).unwrap());
         assert!(mailbox.has_queued_request("../invalid", 1).is_err());
         assert!(mailbox.has_queued_request("r-1", 11).is_err());
+    }
+
+    #[test]
+    fn drain_inspection_requires_a_complete_valid_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let mailbox = capability(root.path());
+        mailbox.queue("r-1", &request("r-1", "same"), 1).unwrap();
+        assert!(matches!(
+            mailbox.inspect_drain(false),
+            MailboxDrainInspection::Unresolved {
+                reason: MailboxDrainReason::MissingPair,
+                ..
+            }
+        ));
+
+        mailbox
+            .publish_receipt(
+                "r-1",
+                br#"{"schema_version":1,"request_id":"r-1","result":{"accepted":true}}"#,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            mailbox.inspect_drain(false),
+            MailboxDrainInspection::Drained { .. }
+        ));
+
+        let malformed_root = tempfile::tempdir().unwrap();
+        let malformed = capability(malformed_root.path());
+        fs::write(
+            malformed_root
+                .path()
+                .join(format!("request-{}.json", super::key("r-1"))),
+            b"not-json",
+        )
+        .unwrap();
+        assert!(matches!(
+            malformed.inspect_drain(false),
+            MailboxDrainInspection::Unresolved {
+                reason: MailboxDrainReason::Malformed,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_inspection_fails_closed_for_symlinks_and_over_limit_inventory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside_root = tempfile::tempdir().unwrap();
+        let mailbox = capability(root.path());
+        let outside = outside_root.path().join("outside");
+        fs::write(&outside, request("r-1", "x")).unwrap();
+        symlink(
+            &outside,
+            root.path()
+                .join(format!("request-{}.json", super::key("r-1"))),
+        )
+        .unwrap();
+        let inspection = mailbox.inspect_drain(false);
+        assert!(
+            matches!(
+                inspection,
+                MailboxDrainInspection::Unresolved {
+                    reason: MailboxDrainReason::Unreadable,
+                    ..
+                }
+            ),
+            "unexpected symlink inspection: {inspection:?}"
+        );
+
+        let limited_root = tempfile::tempdir().unwrap();
+        let limited = MailboxCapability::create(
+            "agent-run-1",
+            limited_root.path(),
+            10,
+            MailboxLimits {
+                max_request_bytes: 4096,
+                max_pending_requests: 1,
+            },
+        )
+        .unwrap();
+        for index in 0..4 {
+            fs::write(limited_root.path().join(format!("extra-{index}")), b"x").unwrap();
+        }
+        assert!(matches!(
+            limited.inspect_drain(false),
+            MailboxDrainInspection::Unresolved {
+                reason: MailboxDrainReason::LimitExceeded,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_control_layout_does_not_allow_symlinked_host_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mailbox = capability(root.path());
+        symlink(outside.path(), root.path().join("run-step")).unwrap();
+        assert!(matches!(
+            mailbox.inspect_drain(true),
+            MailboxDrainInspection::Unresolved {
+                reason: MailboxDrainReason::Unreadable,
+                ..
+            }
+        ));
+        std::fs::remove_file(root.path().join("run-step")).unwrap();
+        let outside_file = outside.path().join("commit-message.txt");
+        fs::write(&outside_file, b"fixture message").unwrap();
+        symlink(&outside_file, root.path().join("commit-message.txt")).unwrap();
+        assert!(matches!(
+            mailbox.inspect_drain(true),
+            MailboxDrainInspection::Unresolved {
+                reason: MailboxDrainReason::Unreadable,
+                ..
+            }
+        ));
     }
 
     #[test]

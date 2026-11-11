@@ -5728,13 +5728,46 @@ pub(crate) mod tests {
         };
         assert_eq!(wake_snapshot.role_session_id, role_session);
         assert_eq!(wake_snapshot.digest, prior_authority.wake_snapshot_digest);
-        let mailbox_directory = prior_authority.control_dir.join("mailbox");
-        let descriptor_bytes = std::fs::read(mailbox_directory.join("descriptor.json")).unwrap();
+        let previous_mailbox_directory = prior_authority.control_dir.join("mailbox");
+        let descriptor_bytes =
+            std::fs::read(previous_mailbox_directory.join("descriptor.json")).unwrap();
         let descriptor: crate::mailbox::MailboxDescriptor =
             crate::protocol::parse_unique(&descriptor_bytes).unwrap();
         let expires = descriptor.expires_at_unix;
         let mailbox_max_request_bytes = descriptor.max_request_bytes as u64;
         let mailbox_max_pending_requests = descriptor.max_pending_requests as u32;
+        let mailbox_directory = prior_authority.control_dir.clone();
+        crate::run_step_spool::RunStepSpool::open(&mailbox_directory).unwrap();
+        crate::agent_api::publish_wake_snapshot(&mailbox_directory, wake_snapshot.clone()).unwrap();
+        let schema_bytes = serde_json::to_vec(&crate::roles::result_schema(Role::Worker)).unwrap();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(mailbox_directory.join("result.schema.json"))
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(&schema_bytes).unwrap();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                assert_eq!(
+                    std::fs::read(mailbox_directory.join("result.schema.json")).unwrap(),
+                    schema_bytes
+                );
+            }
+            Err(error) => panic!("create schema snapshot fixture: {error}"),
+        }
+        crate::mailbox::MailboxCapability::create(
+            worker_id.as_str(),
+            &mailbox_directory,
+            expires,
+            crate::mailbox::MailboxLimits {
+                max_request_bytes: descriptor.max_request_bytes,
+                max_pending_requests: descriptor.max_pending_requests,
+            },
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&previous_mailbox_directory).unwrap();
         let mailbox_digest = Digest::parse(
             crate::mailbox::MailboxDescriptor::capability_digest(
                 worker_id.as_str(),
@@ -6825,6 +6858,29 @@ pub(crate) mod tests {
             commit_message:
                 "docs: fixture retained commit\n\nCo-authored-by: Codex <noreply@openai.com>".into(),
         };
+        let changed_paths = crate::agent_api::RepositoryManifestRequest {
+            schema_version: 1,
+            worktree_id: request.worktree_id.clone(),
+            entries: vec![crate::agent_api::ManifestPath {
+                path: "README.md".into(),
+                operation: crate::agent_api::ManifestOperation::Capture,
+            }],
+        };
+        std::fs::write(
+            mailbox_directory.join("changed-paths.json"),
+            serde_json::to_vec(&changed_paths).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            mailbox_directory.join("change-reference.json"),
+            serde_json::to_vec(&request.manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            mailbox_directory.join("commit-message.txt"),
+            &request.commit_message,
+        )
+        .unwrap();
         let terminal_envelope = crate::protocol::RequestEnvelope {
             schema_version: crate::protocol::SCHEMA_VERSION,
             request_id: crate::protocol::RequestId::new(terminal_request_id).unwrap(),
@@ -7132,6 +7188,253 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
             .unwrap();
         assert_eq!(effect_count_after, effect_count_before);
+
+        let state: String = worker
+            .store
+            .connection
+            .query_row(
+                "SELECT state FROM agent_runs WHERE agent_run_id=?1",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "completed");
+        assert!(
+            worker
+                .store
+                .agent_mailbox_registration(worker_id.as_str())
+                .unwrap()
+                .is_some()
+        );
+        let mailbox_registration = worker
+            .store
+            .agent_mailbox_registration(worker_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mailbox_registration.expires_at_unix,
+            stored_reservation.mailbox_expires_at_unix
+        );
+        let slot_disposition_before_expiry: String = worker
+            .store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            mailbox
+                .pending(mailbox_registration.expires_at_unix + 1)
+                .unwrap_err()
+                .contains("expired")
+        );
+        let mut mailbox_scan = Default::default();
+        let emitted_diagnostics = std::cell::RefCell::new(Vec::new());
+        let mut emit_diagnostic = |message| emitted_diagnostics.borrow_mut().push(message);
+        macro_rules! scan_mailboxes {
+            ($now:expr) => {
+                assert!(
+                    !crate::runtime_services::process_one_registered_agent_request(
+                        &mut worker.store,
+                        restarted_generation,
+                        $now,
+                        &worker.artifacts,
+                        &profiles,
+                        &mut mailbox_scan,
+                        &mut emit_diagnostic,
+                    )
+                    .unwrap()
+                );
+            };
+        }
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut worker.store,
+                restarted_generation,
+                i64::try_from(mailbox_registration.expires_at_unix).unwrap(),
+                &worker.artifacts,
+                &profiles,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
+            )
+            .unwrap()
+        );
+        assert!(emitted_diagnostics.borrow().is_empty());
+
+        let unresolved_id = "terminal-restart-expired-unresolved";
+        let unresolved_request = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(unresolved_id).unwrap(),
+            operation_id: Some(prior_authority.operation_id.clone()),
+            method: crate::protocol::MethodName::new("artifact.add").unwrap(),
+            project_id: Some(project.clone()),
+            run_id: Some(worker_id.to_string()),
+            attempt: Some(prior_authority.attempt),
+            run_epoch: Some(prior_authority.run_epoch),
+            expected_subject_revision: Some(current.revision),
+            role: Some(Role::Worker),
+            request_type: None,
+            params: serde_json::json!({}),
+        };
+        let unresolved_request_bytes = serde_json::to_vec(&unresolved_request).unwrap();
+        mailbox
+            .queue(
+                unresolved_id,
+                &unresolved_request_bytes,
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+
+        let expired_at = i64::try_from(mailbox_registration.expires_at_unix + 1).unwrap();
+        worker
+            .store
+            .connection
+            .execute(
+                "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) SELECT ?1,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,1,?2,'unknown',controller_generation FROM agent_runs WHERE agent_run_id=?3",
+                rusqlite::params![
+                    "a-expired-budget-fixture",
+                    "expired-budget-fixture-operation",
+                    worker_id.as_str()
+                ],
+            )
+            .unwrap();
+        worker
+            .store
+            .connection
+            .execute(
+                "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    "a-expired-budget-fixture",
+                    root.path().join("not-opened-expired-mailbox").display().to_string(),
+                    "a".repeat(64),
+                    mailbox_registration.expires_at_unix,
+                    mailbox_registration.max_request_bytes as u64,
+                    mailbox_registration.max_pending_requests as u64
+                ],
+            )
+            .unwrap();
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut worker.store,
+                restarted_generation,
+                expired_at,
+                &worker.artifacts,
+                &profiles,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
+            )
+            .unwrap()
+        );
+        assert!(emitted_diagnostics.borrow().is_empty());
+        scan_mailboxes!(expired_at);
+        assert_eq!(emitted_diagnostics.borrow().len(), 1);
+        let first_diagnostic = emitted_diagnostics.borrow()[0].clone();
+
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut worker.store,
+                restarted_generation,
+                expired_at,
+                &worker.artifacts,
+                &profiles,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
+            )
+            .unwrap()
+        );
+        assert_eq!(emitted_diagnostics.borrow().len(), 1);
+        scan_mailboxes!(expired_at);
+        assert_eq!(emitted_diagnostics.borrow().len(), 1);
+
+        let changed_inventory = mailbox_directory.join("unexpected-entry");
+        std::fs::write(&changed_inventory, b"visible change").unwrap();
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut worker.store,
+                restarted_generation,
+                expired_at,
+                &worker.artifacts,
+                &profiles,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
+            )
+            .unwrap()
+        );
+        assert_eq!(emitted_diagnostics.borrow().len(), 1);
+        scan_mailboxes!(expired_at);
+        assert_eq!(emitted_diagnostics.borrow().len(), 2);
+        assert_ne!(emitted_diagnostics.borrow()[1], first_diagnostic);
+
+        std::fs::remove_file(&changed_inventory).unwrap();
+        let unresolved_request_path = mailbox_directory.join(format!(
+            "request-{:x}.json",
+            Sha256::digest(unresolved_id.as_bytes())
+        ));
+        std::fs::remove_file(&unresolved_request_path).unwrap();
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut worker.store,
+                restarted_generation,
+                expired_at,
+                &worker.artifacts,
+                &profiles,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
+            )
+            .unwrap()
+        );
+        assert_eq!(emitted_diagnostics.borrow().len(), 2);
+        scan_mailboxes!(expired_at);
+        assert_eq!(emitted_diagnostics.borrow().len(), 2);
+
+        std::fs::write(&unresolved_request_path, &unresolved_request_bytes).unwrap();
+        scan_mailboxes!(expired_at);
+        assert_eq!(emitted_diagnostics.borrow().len(), 2);
+        assert!(
+            !crate::runtime_services::process_one_registered_agent_request(
+                &mut worker.store,
+                restarted_generation,
+                expired_at,
+                &worker.artifacts,
+                &profiles,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
+            )
+            .unwrap()
+        );
+        assert_eq!(emitted_diagnostics.borrow().len(), 3);
+        assert_eq!(emitted_diagnostics.borrow()[2], first_diagnostic);
+        assert!(
+            !mailbox_directory
+                .join(format!(
+                    "receipt-{:x}.json",
+                    Sha256::digest(unresolved_id.as_bytes())
+                ))
+                .exists()
+        );
+        assert_eq!(
+            worker
+                .store
+                .connection
+                .query_row("SELECT COUNT(*) FROM effects", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            effect_count_after
+        );
+        assert_eq!(
+            worker
+                .store
+                .connection
+                .query_row(
+                    "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                    [worker_id.as_str()],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            slot_disposition_before_expiry
+        );
     }
 
     #[test]
