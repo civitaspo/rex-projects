@@ -5714,20 +5714,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn start_agent_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
-        handler_error_stays_uncertain_and_keeps_diagnostic(crate::effects::EffectKind::StartAgent);
-    }
+    fn every_effect_handler_error_stays_uncertain_with_safe_diagnostic() {
+        use crate::effects::EffectKind;
 
-    #[test]
-    fn merge_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
-        handler_error_stays_uncertain_and_keeps_diagnostic(crate::effects::EffectKind::Merge);
-    }
-
-    #[test]
-    fn prepare_worktrees_handler_error_stays_uncertain_and_keeps_bounded_diagnostic() {
-        handler_error_stays_uncertain_and_keeps_diagnostic(
-            crate::effects::EffectKind::PrepareWorktrees,
-        );
+        for kind in [
+            EffectKind::PublishTicketStatus,
+            EffectKind::TicketCreate,
+            EffectKind::TicketDuplicateComment,
+            EffectKind::TicketCancelDuplicate,
+            EffectKind::TicketResolveDuplicate,
+            EffectKind::PrepareWorktrees,
+            EffectKind::CommitWorkerManifest,
+            EffectKind::PublishImplementation,
+            EffectKind::RequestHumanReview,
+            EffectKind::Merge,
+            EffectKind::Operation,
+            EffectKind::StartPostmortem,
+            EffectKind::PublishKnowledge,
+            EffectKind::PublishProfile,
+            EffectKind::CompleteTicket,
+            EffectKind::StartAgent,
+            EffectKind::StartProfileTrial,
+            EffectKind::StopOwnedRuns,
+        ] {
+            handler_error_stays_uncertain_and_keeps_diagnostic(kind);
+        }
     }
 
     fn handler_error_stays_uncertain_and_keeps_diagnostic(kind: crate::effects::EffectKind) {
@@ -5803,20 +5814,23 @@ pub(crate) mod tests {
             ) -> Result<crate::effects::EffectObservation, String> {
                 Err(match _mode {
                     crate::effects::EffectMode::Submit => {
-                        "Rex wrapper request was not observed".into()
+                        "token=secret-submit; command=gh pr merge 123; path=/Users/private/repo"
+                            .into()
                     }
                     crate::effects::EffectMode::Reconcile => {
-                        "later Rex process observation failed".into()
+                        "authorization=secret-reconcile; args=--token abc; path=/private/state"
+                            .into()
                     }
                 })
             }
         }
         let handler = ErrorHandler(kind);
         let handlers: [&dyn crate::effects::EffectHandler; 1] = [&handler];
+        let submit_now = super::now_unix().unwrap();
         let result = crate::effects::EffectDispatcher::tick(
             &mut store,
             generation,
-            super::now_unix().unwrap(),
+            submit_now,
             &handlers,
             crate::effects::EffectLimits {
                 max_attempts: 3,
@@ -5832,10 +5846,28 @@ pub(crate) mod tests {
                 operation_id: intent.operation_id.clone(),
             }
         );
+        let submit_diagnostic: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT last_error FROM effects WHERE operation_id=?1",
+                [&intent.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let effect_name = crate::engine::reducer::effect_name(&kind);
+        let expected_submit_diagnostic = format!(
+            "uncertain handler_error kind={effect_name} stage=submit; reconciliation scheduled; inspect this operation before deciding next action"
+        );
+        assert_eq!(
+            submit_diagnostic.as_deref(),
+            Some(expected_submit_diagnostic.as_str())
+        );
+        assert!(!submit_diagnostic.unwrap().contains("secret-submit"));
+        let reconcile_now = submit_now.saturating_add(21);
         let reconciliation_result = crate::effects::EffectDispatcher::tick(
             &mut store,
             generation,
-            super::now_unix().unwrap().saturating_add(21),
+            reconcile_now,
             &handlers,
             crate::effects::EffectLimits {
                 max_attempts: 3,
@@ -5851,22 +5883,34 @@ pub(crate) mod tests {
                 operation_id: intent.operation_id.clone(),
             }
         );
-        let persisted: (String, Option<String>, Option<String>) = store
+        let persisted: (String, Option<String>, Option<String>, String, String, u32, i64) = store
             .connection
             .query_row(
-                "SELECT status,receipt_json,last_error FROM effects WHERE operation_id=?1",
+                "SELECT status,receipt_json,last_error,operation_id,request_digest,attempt_count,next_attempt_at_unix FROM effects WHERE operation_id=?1",
                 [&intent.operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
             )
             .unwrap();
-        assert_eq!(
-            persisted,
-            (
-                "uncertain".into(),
-                Some(prior_receipt.into()),
-                Some("later Rex process observation failed".into()),
-            )
+        let expected_diagnostic = format!(
+            "uncertain handler_error kind={effect_name} stage=reconcile; reconciliation scheduled; inspect this operation before deciding next action"
         );
+        assert_eq!(persisted.0, "uncertain");
+        assert_eq!(persisted.1.as_deref(), Some(prior_receipt));
+        assert_eq!(persisted.2.as_deref(), Some(expected_diagnostic.as_str()));
+        assert_eq!(persisted.3, intent.operation_id);
+        assert_eq!(persisted.4, intent.request_digest);
+        assert_eq!(persisted.5, 1);
+        assert_eq!(persisted.6, reconcile_now.saturating_add(20));
+        assert!(!persisted.2.unwrap().contains("secret-reconcile"));
+
+        let projection = crate::store::dashboard_projection::read_projection(temp.path()).unwrap();
+        let wait = projection
+            .waits
+            .iter()
+            .find(|wait| wait.kind == effect_name)
+            .unwrap();
+        assert_eq!(wait.detail, format!("uncertain {expected_diagnostic}"));
+        assert!(!wait.detail.contains("secret"));
     }
 
     #[test]
