@@ -2186,7 +2186,23 @@ mod tests {
         run_exact_human_approval_procedure(crate::domain::types::MergeExecutor::Request);
     }
 
+    #[test]
+    fn request_executor_rejects_advanced_base_after_approval_before_comment() {
+        run_exact_human_approval_procedure_with_advanced_base();
+    }
+
     fn run_exact_human_approval_procedure(executor_kind: crate::domain::types::MergeExecutor) {
+        run_exact_human_approval_procedure_case(executor_kind, false);
+    }
+
+    fn run_exact_human_approval_procedure_with_advanced_base() {
+        run_exact_human_approval_procedure_case(crate::domain::types::MergeExecutor::Request, true);
+    }
+
+    fn run_exact_human_approval_procedure_case(
+        executor_kind: crate::domain::types::MergeExecutor,
+        advance_base_before_request: bool,
+    ) {
         use crate::domain::types::MergeExecutor;
         use crate::merge_policy::{
             EvidenceState, MergeProcedureOperation, MergeProcedureStep, build_merge_procedure,
@@ -2494,6 +2510,76 @@ mod tests {
                     attempt_started_unix: 300 + index as u64,
                     exact_prepared_body: Some(prepared_body.into()),
                 };
+                if key == "merge" && advance_base_before_request {
+                    let mut unknown_authority = authority.clone();
+                    unknown_authority.execution_time_base_guard =
+                        crate::merge_policy::EvidenceState::Unknown;
+                    assert!(matches!(
+                        executor.execute_one(
+                            &pull,
+                            &policy,
+                            &assessment,
+                            &evidence,
+                            &evidence_now,
+                            Some(&approval),
+                            &unknown_authority,
+                            &procedure,
+                            &[],
+                            key,
+                            &intent,
+                            &receipts,
+                        ),
+                        Err(MergeExecutionError::Blocked(_))
+                    ));
+                    let mut advanced_observation = observation_now.clone();
+                    let Observed::Complete { value: pr, .. } =
+                        &mut advanced_observation.pull_request
+                    else {
+                        panic!("fixture PR observation is complete");
+                    };
+                    pr.base_sha = "advanced-base".into();
+                    let advanced_forge = ProcedureForge {
+                        observation: std::sync::Arc::new(std::sync::Mutex::new(
+                            advanced_observation.clone(),
+                        )),
+                        commit: forge.commit.clone(),
+                        add_service_comment_after_merge: false,
+                        add_post_merge_check: false,
+                    };
+                    let advanced_result = MergeProcedureExecutor::new(advanced_forge.clone())
+                        .execute_one(
+                            &pull,
+                            &policy,
+                            &assessment,
+                            &evidence,
+                            &procedure_evidence(&advanced_observation, &subject),
+                            Some(&approval),
+                            &authority,
+                            &procedure,
+                            &[],
+                            key,
+                            &intent,
+                            &receipts,
+                        );
+                    assert!(matches!(
+                        advanced_result,
+                        Err(MergeExecutionError::Stale(_))
+                    ));
+                    let observed = advanced_forge.observe(&pull).unwrap();
+                    let Observed::Complete {
+                        value: comments, ..
+                    } = observed.issue_comments
+                    else {
+                        panic!("fixture comments observation is complete");
+                    };
+                    assert!(comments.is_empty());
+                    let Observed::Complete { value: pr, .. } = observed.pull_request else {
+                        panic!("fixture PR observation is complete");
+                    };
+                    assert_eq!(pr.state, crate::forge::PullRequestState::Open);
+                    assert!(!pr.merged);
+                    return;
+                }
                 let StepOutcome::Effect {
                     effect_intent,
                     acknowledgement,
