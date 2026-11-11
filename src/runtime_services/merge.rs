@@ -2581,7 +2581,7 @@ pub(crate) mod tests {
             json!([]),
             json!([]),
             json!({"name":"main","protected":true}),
-            json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
+            json!({"required_status_checks":{"strict":true,"contexts":["ci"]},"required_pull_request_reviews":{"required_approving_review_count":2,"dismiss_stale_reviews":true},"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
         ];
         let mut absent_body_responses = responses.clone();
         absent_body_responses[1]["body"] = serde_json::Value::Null;
@@ -2633,6 +2633,10 @@ pub(crate) mod tests {
                 .find(|gate| gate.key == "approvals")
                 .unwrap()
                 .state,
+            EvidenceState::Pass
+        );
+        assert_eq!(
+            observation.evidence.execution_time_base_guard,
             EvidenceState::Pass
         );
         assert_eq!(

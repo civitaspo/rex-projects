@@ -6667,27 +6667,32 @@ pub(crate) mod tests {
 
     #[test]
     fn published_predecessor_and_host_validated_reviewer_result_drive_consumer() {
-        published_publication_fixture(false, false, false, false);
+        published_publication_fixture(false, false, false, false, false);
     }
 
     #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
-        published_publication_fixture(true, false, false, false);
+        published_publication_fixture(true, false, false, false, false);
+    }
+
+    #[test]
+    fn generated_direct_merge_intent_reaches_host_preparation() {
+        published_publication_fixture(true, false, false, false, true);
     }
 
     #[test]
     fn publication_and_review_results_wake_current_coordinator_child_requests() {
-        published_publication_fixture(true, false, false, true);
+        published_publication_fixture(true, false, false, true, false);
     }
 
     #[test]
     fn repeated_merge_reference_mismatch_blocks_and_notifies_supervisor_once() {
-        published_publication_fixture(true, true, false, false);
+        published_publication_fixture(true, true, false, false, false);
     }
 
     #[test]
     fn host_base_refresh_publication_drives_fresh_reviewer_subject() {
-        published_publication_fixture(true, false, true, false);
+        published_publication_fixture(true, false, true, false, false);
     }
 
     fn assert_registered_staging_survives_verification(
@@ -7061,6 +7066,7 @@ pub(crate) mod tests {
         reject_twice: bool,
         base_refresh: bool,
         verify_coordinator_handoff: bool,
+        direct_merge_intent: bool,
     ) {
         use crate::config::ProjectConfig;
         use crate::delivery_forge::PublishedPullRequest;
@@ -7129,7 +7135,7 @@ pub(crate) mod tests {
                 "clone_url": "https://github.com/acme/repo-a.git",
                 "base_branch": "main",
                 "forge": "github",
-                "merge": {"executor": "request", "instructions": "# Merge instructions\nPrepare the body, request the configured merge, then verify the result.\n/merge\n"}
+                "merge": {"executor": if direct_merge_intent {"direct"} else {"request"}, "instructions": "# Merge instructions\nPrepare the body, request the configured merge, then verify the result.\n/merge\n"}
             }))
             .unwrap(),
         );
@@ -8481,20 +8487,35 @@ pub(crate) mod tests {
                 .expect("rendered MergeDecision prompt includes the repository merge source")
                 .source
                 .clone();
-            let typed_intent = serde_json::json!({
-                "assessment_id": public_assessment["assessment_id"],
-                "pr_identities": [public_assessment["pull_request_reference"].as_str().unwrap()],
-                "policy_digest": public_assessment["policy_digest"],
-                "prepared_body_digest": public_assessment["prepared_body_proposal"]["target_body_digest"],
-                "steps": [
-                    {"kind":"update_pull_request_body","instruction_reference":format!("{merge_instruction_source}#prepare-body"),"rationale":"add the host-prepared authorship trailer"},
-                    {"kind":"request_merge","instruction_reference":format!("{merge_instruction_source}#request-merge"),"rationale":"request the configured merge"},
-                    {"kind":"verify_merge_commit","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"verify the resulting merge commit"}
-                ],
-                "post_merge_verification": [
-                    {"kind":"merge_commit_recorded","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"confirm the remote merge commit"}
-                ]
-            });
+            let typed_intent = if direct_merge_intent {
+                let template = include_str!("../xtask/src/fixtures/merge_intent.json")
+                    .replace("{repository_id}", repository_id.as_str());
+                let mut payload: serde_json::Value = serde_json::from_str(&template).unwrap();
+                payload["assessment_id"] = public_assessment["assessment_id"].clone();
+                payload["pr_identities"] =
+                    serde_json::json!([public_assessment["pull_request_reference"]
+                        .as_str()
+                        .unwrap()]);
+                payload["policy_digest"] = public_assessment["policy_digest"].clone();
+                payload["prepared_body_digest"] =
+                    public_assessment["prepared_body_proposal"]["target_body_digest"].clone();
+                payload
+            } else {
+                serde_json::json!({
+                    "assessment_id": public_assessment["assessment_id"],
+                    "pr_identities": [public_assessment["pull_request_reference"].as_str().unwrap()],
+                    "policy_digest": public_assessment["policy_digest"],
+                    "prepared_body_digest": public_assessment["prepared_body_proposal"]["target_body_digest"],
+                    "steps": [
+                        {"kind":"update_pull_request_body","instruction_reference":format!("{merge_instruction_source}#prepare-body"),"rationale":"add the host-prepared authorship trailer"},
+                        {"kind":"request_merge","instruction_reference":format!("{merge_instruction_source}#request-merge"),"rationale":"request the configured merge"},
+                        {"kind":"verify_merge_commit","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"verify the resulting merge commit"}
+                    ],
+                    "post_merge_verification": [
+                        {"kind":"merge_commit_recorded","instruction_reference":format!("{merge_instruction_source}#verify-merge"),"rationale":"confirm the remote merge commit"}
+                    ]
+                })
+            };
             let intent_message = crate::roles::RoleResultMessage {
                 schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
                 message_id: "single-publication-merge-intent".into(),
@@ -8553,9 +8574,80 @@ pub(crate) mod tests {
                     &trusted,
                     &intent_payload,
                     &host_intent.ingested,
-                    document_replies,
+                    document_replies.clone(),
                 )
                 .unwrap();
+            if direct_merge_intent {
+                assert!(matches!(
+                    document.procedure.steps[0].operation,
+                    crate::merge_policy::MergeProcedureOperation::UpdatePullRequestBody { .. }
+                ));
+                assert!(matches!(
+                    document.procedure.steps[1].operation,
+                    crate::merge_policy::MergeProcedureOperation::ExecuteMerge { .. }
+                ));
+                assert!(matches!(
+                    document.procedure.steps[2].operation,
+                    crate::merge_policy::MergeProcedureOperation::VerifyMergeCommit { .. }
+                ));
+                assert_eq!(document.intent.post_merge_verification.len(), 1);
+                assert_eq!(
+                    document.intent.post_merge_verification[0].kind,
+                    crate::engine::orchestration::PostMergeVerificationKind::MergeCommitRecorded
+                );
+                let mut unsupported = typed_intent.clone();
+                unsupported["post_merge_verification"][0]["kind"] =
+                    serde_json::json!("target_branch_contains_commit");
+                let unsupported: crate::engine::orchestration::MergeIntentPayload =
+                    serde_json::from_value(unsupported).unwrap();
+                let unsupported_result = crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_agent_run_id(
+                    &mut store,
+                    &std::fs::canonicalize(temp.path()).unwrap(),
+                    owner_generation,
+                    project_id.clone(),
+                    ticket_run_id.clone(),
+                    crate::domain::types::Role::MergeDecision,
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "unsupported-post-merge-kind".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: None,
+                        structured_result: serde_json::to_value(&unsupported).unwrap(),
+                        artifact_refs: Vec::new(),
+                    },
+                    crate::domain::ids::AgentRunId::parse("unsupported-post-merge-run").unwrap(),
+                )
+                .unwrap();
+                let error = crate::runtime_services::merge::tests::prepare_merge_work_document_for_store_test(
+                    applied.clone(),
+                    &subject,
+                    &accepted.proposal,
+                    &trusted,
+                    &unsupported,
+                    &unsupported_result.ingested,
+                    document_replies,
+                )
+                .unwrap_err();
+                assert!(error.contains("host currently supports only"), "{error}");
+                let saved_documents: u64 = store
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM merge_work_items", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(saved_documents, 0);
+                let saved_reviews: u64 = store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM effects WHERE kind='request_human_review'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(saved_reviews, 0);
+                return;
+            }
             assert!(matches!(
                 document.procedure.steps[1].operation,
                 crate::merge_policy::MergeProcedureOperation::RequestMerge { ref exact_comment }

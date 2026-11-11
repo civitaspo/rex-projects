@@ -268,7 +268,7 @@ fn dispatch_repository_route(
             json!({
                 "required_status_checks":{"strict":true,"contexts":["required-tests"]},
                 "required_pull_request_reviews":{"required_approving_review_count":1,"dismiss_stale_reviews":true},
-                "enforce_admins":{"enabled":false},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false},"branch":branch
+                "enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false},"branch":branch
             }),
         )),
         ["rules", "branches", _branch] if request.method == "GET" => Ok((200, json!([]))),
@@ -495,6 +495,16 @@ fn merge_pull(
     let requested_head = required_string(&body, "sha")?;
     if pull.merged || pull.state != "open" || requested_head != pull.head_sha {
         return Ok((409, json!({"message":"PR state or expected head is stale"})));
+    }
+    let live_base_sha = git_text(
+        remote,
+        &["rev-parse", &format!("refs/heads/{}", pull.base_ref)],
+    )?;
+    if live_base_sha != pull.base_sha {
+        return Ok((
+            409,
+            json!({"message":"PR base is out of date with the target branch"}),
+        ));
     }
     let approvals:i64=connection.query_row("SELECT COUNT(*) FROM reviews WHERE pull_number=?1 AND state='APPROVED' AND commit_id=?2",params![number,pull.head_sha],|r|r.get(0)).map_err(|error|error.to_string())?;
     if approvals < 1 {
@@ -787,6 +797,114 @@ fn now_ms() -> u128 {
 mod tests {
     use super::*;
 
+    fn git(remote: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(remote)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn fixture_pull() -> (
+        tempfile::TempDir,
+        Connection,
+        std::path::PathBuf,
+        u64,
+        String,
+        String,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let state = root.join("state");
+        let remote = root.join("git/fixture/repository.git");
+        let work = root.join("work");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(remote.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.name", "Fixture User"]);
+        git(&work, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(work.join("README.md"), "base\n").unwrap();
+        git(&work, &["add", "README.md"]);
+        git(&work, &["commit", "-m", "base"]);
+        let base_sha = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["branch", "feature"]);
+        git(&work, &["checkout", "feature"]);
+        std::fs::write(work.join("feature.txt"), "feature\n").unwrap();
+        git(&work, &["add", "feature.txt"]);
+        git(&work, &["commit", "-m", "feature"]);
+        let head_sha = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["init", "--bare", remote.to_str().unwrap()]);
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "origin", "main", "feature"]);
+
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        let create = Request {
+            method: "POST".into(),
+            endpoint: "repos/fixture/repository/pulls".into(),
+            input: true,
+        };
+        let (status, pull) = dispatch(
+            root,
+            &connection,
+            &create,
+            json!({"title":"Fixture change","head":"feature","base":"main"}),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        let number = pull["number"].as_u64().unwrap();
+        let review = Request {
+            method: "POST".into(),
+            endpoint: format!("repos/fixture/repository/pulls/{number}/reviews"),
+            input: true,
+        };
+        assert_eq!(
+            dispatch(root, &connection, &review, json!({"event":"APPROVE"}))
+                .unwrap()
+                .0,
+            201
+        );
+        std::fs::write(
+            state.join("checks.json"),
+            serde_json::to_vec(&json!({(head_sha.clone()):"success"})).unwrap(),
+        )
+        .unwrap();
+        let protection = Request {
+            method: "GET".into(),
+            endpoint: "repos/fixture/repository/branches/main/protection".into(),
+            input: false,
+        };
+        let (protection_status, protection) =
+            dispatch(root, &connection, &protection, Value::Null).unwrap();
+        assert_eq!(protection_status, 200);
+        assert_eq!(protection["required_status_checks"]["strict"], true);
+        assert_eq!(
+            protection["required_status_checks"]["contexts"],
+            json!(["required-tests"])
+        );
+        assert_eq!(
+            protection["required_pull_request_reviews"]["required_approving_review_count"],
+            1
+        );
+        assert_eq!(
+            protection["required_pull_request_reviews"]["dismiss_stale_reviews"],
+            true
+        );
+        assert_eq!(protection["enforce_admins"]["enabled"], true);
+        (temporary, connection, remote, number, base_sha, head_sha)
+    }
+
     #[test]
     fn required_status_fixture_includes_freshness_identity() {
         let temporary = tempfile::tempdir().unwrap();
@@ -825,5 +943,76 @@ mod tests {
         assert_eq!(response[0]["state"], "success");
         assert_eq!(response[0]["sha"], "abc123");
         assert_eq!(response[0]["created_at"], "2026-11-11T00:00:00Z");
+    }
+
+    #[test]
+    fn merge_route_rejects_target_base_advance_without_mutation() {
+        let (_temporary, connection, remote, number, base_sha, head_sha) = fixture_pull();
+        let work = remote
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("work");
+        git(&work, &["checkout", "main"]);
+        std::fs::write(work.join("README.md"), "advanced base\n").unwrap();
+        git(&work, &["add", "README.md"]);
+        git(&work, &["commit", "-m", "advance base"]);
+        git(&work, &["push", "origin", "main"]);
+        let advanced_base = git(&remote, &["rev-parse", "refs/heads/main"]);
+        assert_ne!(advanced_base, base_sha);
+
+        let request = Request {
+            method: "PUT".into(),
+            endpoint: format!("repos/fixture/repository/pulls/{number}/merge"),
+            input: true,
+        };
+        let (status, response) = dispatch(
+            remote.parent().unwrap().parent().unwrap().parent().unwrap(),
+            &connection,
+            &request,
+            json!({"sha":head_sha,"merge_method":"squash"}),
+        )
+        .unwrap();
+
+        assert_eq!(status, 409);
+        assert!(response["message"].as_str().unwrap().contains("base"));
+        let (pull_status, pull) = get_pull(&connection, "fixture", "repository", number).unwrap();
+        assert_eq!(pull_status, 200);
+        assert_eq!(pull["state"], "open");
+        assert_eq!(pull["merged"], false);
+        assert_eq!(pull["base"]["sha"], base_sha);
+        assert_eq!(
+            git(&remote, &["rev-parse", "refs/heads/main"]),
+            advanced_base
+        );
+    }
+
+    #[test]
+    fn merge_route_accepts_current_base_with_current_head_check_and_approval() {
+        let (_temporary, connection, remote, number, base_sha, head_sha) = fixture_pull();
+        let request = Request {
+            method: "PUT".into(),
+            endpoint: format!("repos/fixture/repository/pulls/{number}/merge"),
+            input: true,
+        };
+        let root = remote.parent().unwrap().parent().unwrap().parent().unwrap();
+        let (status, response) = dispatch(
+            root,
+            &connection,
+            &request,
+            json!({"sha":head_sha,"merge_method":"squash"}),
+        )
+        .unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(response["merged"], true);
+        assert_ne!(response["sha"], base_sha);
+        let (pull_status, pull) = get_pull(&connection, "fixture", "repository", number).unwrap();
+        assert_eq!(pull_status, 200);
+        assert_eq!(pull["state"], "closed");
+        assert_eq!(pull["merged"], true);
     }
 }
