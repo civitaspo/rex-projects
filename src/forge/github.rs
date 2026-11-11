@@ -1728,6 +1728,32 @@ mod tests {
         }
     }
 
+    struct InterleavingRunner {
+        live_body: std::sync::Arc<Mutex<String>>,
+        requests: Mutex<Vec<ProcessRequest>>,
+        reply: Vec<u8>,
+    }
+
+    impl GitHubCommandRunner for InterleavingRunner {
+        fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+            self.requests.lock().unwrap().push(request);
+            let snapshot = self.reply.clone();
+            *self.live_body.lock().unwrap() = "concurrent human edit".into();
+            let status = std::process::Command::new("true")
+                .status()
+                .map_err(ProcessError::Start)?;
+            Ok(ProcessOutput {
+                status: Some(status),
+                stdout: snapshot,
+                stderr_tail: Vec::new(),
+                stderr_truncated: false,
+                stdout_truncated: false,
+                timed_out: false,
+                cleanup_confirmed: true,
+            })
+        }
+    }
+
     fn fixture_forge_responses(replies: Vec<Value>) -> GitHubCliForge<FixtureRunner> {
         GitHubCliForge::new(
             FixtureRunner {
@@ -2041,6 +2067,61 @@ mod tests {
 
         assert_eq!(acknowledgement.certainty, EffectCertainty::DefinitelyAbsent);
         assert_eq!(forge.runner.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_body_edit_after_preflight_is_not_overwritten() {
+        let prior_body = "prior approved body";
+        let live_body = std::sync::Arc::new(Mutex::new(prior_body.into()));
+        let runner = InterleavingRunner {
+            live_body: live_body.clone(),
+            requests: Mutex::new(Vec::new()),
+            reply: serde_json::to_vec(&serde_json::json!({
+                "id": 1,
+                "node_id": "PR_node",
+                "number": 7,
+                "state": "open",
+                "draft": false,
+                "merged": false,
+                "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ref": "feature", "repo": {"id": 1}},
+                "base": {"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ref": "main", "repo": {"id": 1}},
+                "body": prior_body
+            })).unwrap(),
+        };
+        let forge = GitHubCliForge::new(
+            runner,
+            PathBuf::from("/usr/bin/gh"),
+            "github.com",
+            BTreeMap::new(),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            10_000,
+            1_000,
+            5,
+        )
+        .unwrap();
+        let target_body = "approved body";
+        let intent = BodyUpdateIntent {
+            pull: test_pull(),
+            operation_key: "body-op".into(),
+            expected_head_sha: "a".repeat(40),
+            expected_prior_body_digest: Digest::parse(hex_digest(prior_body.as_bytes())).unwrap(),
+            exact_body: target_body.into(),
+            approved_body_digest: Digest::parse(hex_digest(target_body.as_bytes())).unwrap(),
+        };
+
+        let acknowledgement = forge.update_body(&intent).unwrap();
+
+        assert_eq!(acknowledgement.certainty, EffectCertainty::DefinitelyAbsent);
+        assert_eq!(*live_body.lock().unwrap(), "concurrent human edit");
+        let requests = forge.runner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let method = requests[0]
+            .args
+            .iter()
+            .position(|arg| arg == "--method")
+            .map(|index| requests[0].args.get(index + 1).unwrap());
+        assert_eq!(method, Some(&std::ffi::OsString::from("GET")));
     }
 
     #[test]
