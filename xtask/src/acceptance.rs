@@ -2306,13 +2306,11 @@ fn profile_messages_for_native_worker(
                 "ratings":{"change_impact":{"rating":1,"source":"emulated fixture diff","rationale":"One bounded documentation file.","evidence_references":[],"uncertainty":null},"complexity":{"rating":1,"source":"emulated fixture diff","rationale":"One-file change.","evidence_references":[],"uncertainty":null},"verification_gaps":{"rating":1,"source":"fixture checks","rationale":"The fixture CLI reports deterministic checks.","evidence_references":[],"uncertainty":null},"review_uncertainty":{"rating":0,"source":"fixture review artifact","rationale":"No findings were reported.","evidence_references":[],"uncertainty":null},"operational_exposure":{"rating":0,"source":"repository fixture policy","rationale":"No production target is selected.","evidence_references":[],"uncertainty":null}},
                 "confidence":"high","rationale":"The emulated fixture exposes exact host and forge observations.","disposition":"merge"
             })).with_artifact("merge_assessment", "fixture-merge-assessment.md", "merge_assessment"),
-            message("merge_decision", "merge_intent", json!({
-                "assessment_id":{"$fixture_ref":"prompt.assessment_id"},
-                "pr_identities":[{"$fixture_ref":"prompt.pr_reference"}],
-                "policy_digest":{"$fixture_ref":"prompt.policy_digest"},"prepared_body_digest":{"$fixture_ref":"prompt.prepared_body_digest"},
-                "steps":[{"kind":"direct_merge","instruction_reference":"repository.merge.instructions#procedure","rationale":"Use the fixture repository's declared merge procedure."},{"kind":"verify_merge_commit","instruction_reference":"repository.merge.instructions#verification","rationale":"Verify the host-observed target commit."}],
-                "post_merge_verification":[{"kind":"merge_commit_recorded","instruction_reference":"repository.merge.instructions#verification","rationale":"Confirm the forge records the merge commit."},{"kind":"target_branch_contains_commit","instruction_reference":"repository.merge.instructions#verification","rationale":"Confirm the target branch contains the merged head."}]
-            }))
+            message(
+                "merge_decision",
+                "merge_intent",
+                default_merge_intent_template("fixture"),
+            )
         ],
         "operator" => vec![message("operator", "operation_action", json!({
             "operation_plan_digest":{"$fixture_ref":"prompt.operation_plan_digest"},
@@ -2437,6 +2435,12 @@ fn ticket_adapter_call(
 
 fn message(role: &str, kind: &str, structured_result: Value) -> Value {
     json!({"role":role,"kind":kind,"assertion":{"assertion":"succeeded"},"structured_result":structured_result})
+}
+
+fn default_merge_intent_template(repository_id: &str) -> Value {
+    let template =
+        include_str!("fixtures/merge_intent.json").replace("{repository_id}", repository_id);
+    serde_json::from_str(&template).expect("shared MergeIntent fixture is valid JSON")
 }
 
 trait FixtureMessageExt {
@@ -3983,6 +3987,74 @@ mod tests {
             Some(NATIVE_WORKER_BLOCK_LOSS_STAGE.into())
         );
         assert!(parse_acceptance_stage(Some("unknown-stage".into())).is_err());
+    }
+
+    #[test]
+    fn generated_direct_merge_context_uses_supported_typed_procedure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let fixture_root = temporary.path().join("acceptance");
+        fs::create_dir(&fixture_root).unwrap();
+        let request = Request {
+            cli: Path::new("/usr/bin/true"),
+            rex: Path::new("/usr/bin/true"),
+            rex_server: "unix:///fixture.sock",
+            rex_session: "acceptance-session",
+            expected_instance: "fixture-instance",
+            fixture_root: &fixture_root,
+        };
+        prepare_profiles(
+            &request,
+            Path::new("/opt/xtask"),
+            request.cli,
+            ProfilePreparation::default(),
+        )
+        .unwrap();
+
+        let context: Value = serde_json::from_slice(
+            &fs::read(fixture_root.join("contexts/merge_decision.json")).unwrap(),
+        )
+        .unwrap();
+        let generated = context["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["kind"] == "merge_intent")
+            .unwrap();
+        let payload = resolve_test_references(generated["structured_result"].clone());
+        assert_eq!(
+            generated["structured_result"]["steps"][1]["instruction_reference"],
+            "repository:fixture:merge#procedure"
+        );
+        assert_eq!(
+            generated["structured_result"]["steps"][2]["instruction_reference"],
+            "repository:fixture:merge#verification"
+        );
+        assert_eq!(
+            generated["structured_result"]["steps"][0]["instruction_reference"],
+            "repository:fixture:merge#prepare-body"
+        );
+        assert_eq!(
+            payload["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| step["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "update_pull_request_body",
+                "direct_merge",
+                "verify_merge_commit"
+            ]
+        );
+        assert_eq!(
+            payload["post_merge_verification"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            payload["post_merge_verification"][0]["kind"],
+            "merge_commit_recorded"
+        );
+        crate::fixtures::agent::validate_payload(RoleOutputKind::MergeIntent, &payload).unwrap();
     }
 
     #[test]
