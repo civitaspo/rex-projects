@@ -2615,7 +2615,7 @@ impl FactoryRuntimeServices for RuntimeServices {
         if owner_generation != self.owner_generation {
             return Err("RuntimeServices owner generation changed".into());
         }
-        for request in store.pending_merge_claim_recoveries(32)? {
+        for request in store.pending_merge_claim_recoveries(1)? {
             let observation = self.observe_merge_claim_recovery(store, &request)?;
             if store.authorize_merge_claim_recovery(
                 owner_generation,

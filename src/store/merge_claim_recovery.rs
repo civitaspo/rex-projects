@@ -408,6 +408,24 @@ impl ConfigStore {
         &self,
         result: &crate::store::agent_results::IngestedAgentResult,
     ) -> Result<Option<ConsumedMergeClaimRecovery>, String> {
+        self.recovery_authorization_for_merge_result_inner(result, true)
+    }
+
+    /// Resolve the immutable recovery lineage even when the current Project configuration has
+    /// advanced. This is used only to fail closed and reblock a result; it must never authorize
+    /// publication or a new Agent launch under the obsolete configuration.
+    pub(crate) fn recovery_authorization_for_merge_failure(
+        &self,
+        result: &crate::store::agent_results::IngestedAgentResult,
+    ) -> Result<Option<ConsumedMergeClaimRecovery>, String> {
+        self.recovery_authorization_for_merge_result_inner(result, false)
+    }
+
+    fn recovery_authorization_for_merge_result_inner(
+        &self,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        require_current_config: bool,
+    ) -> Result<Option<ConsumedMergeClaimRecovery>, String> {
         let binding = &result.validated.binding;
         let Some(ticket_run_id) = &binding.ticket_run_id else {
             return Ok(None);
@@ -477,7 +495,7 @@ impl ConfigStore {
             || project != binding.project_id.as_str()
             || run != ticket_run_id.as_str()
             || subject.configuration_digest != binding.config_digest
-            || config_digest != binding.config_digest.as_str()
+            || (require_current_config && config_digest != binding.config_digest.as_str())
             || revision
                 != binding
                     .ticket_revision
@@ -733,40 +751,15 @@ impl ConfigStore {
         ticket_run_id: &TicketRunId,
         now_unix: i64,
     ) -> Result<MergeClaimRecoveryReceipt, String> {
-        if request_id.is_empty() || request_id.len() > 128 || request_id.contains('\0') {
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || request_id.chars().any(char::is_control)
+        {
             return Err("recovery request ID is invalid".into());
         }
-        let prior: Option<(String,String,u64,String,String)> = self.connection.query_row(
-            "SELECT subject_digest,state,CAST(json_extract(subject_json,'$.blocked_revision') AS INTEGER),project_id,ticket_run_id FROM merge_claim_recovery_requests WHERE request_id=?1",
-            [request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
-        ).optional().map_err(|error| error.to_string())?;
-        if let Some((digest, state, revision, prior_project, prior_run)) = prior {
-            if digest != subject_digest.as_str()
-                || prior_project != project_id.as_str()
-                || prior_run != ticket_run_id.as_str()
-            {
-                return Err("recovery request ID was already used with different contents".into());
-            }
-            let receipt = MergeClaimRecoveryReceipt {
-                request_id: request_id.into(),
-                subject_digest: Digest::parse(digest)?,
-                project_id: project_id.clone(),
-                ticket_run_id: ticket_run_id.clone(),
-                blocked_revision: revision,
-                state,
-                replayed: true,
-            };
-            return Ok(receipt);
-        }
-        let shown = self.merge_claim_recovery_subject(project_id, ticket_run_id)?;
-        if shown.digest()? != *subject_digest {
-            return Err("recovery subject changed; refresh the blocker view".into());
-        }
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        // Recheck request identity after the write lock to close a concurrent duplicate race.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
         let prior: Option<(String,String,u64,String,String)> = tx.query_row(
             "SELECT subject_digest,state,CAST(json_extract(subject_json,'$.blocked_revision') AS INTEGER),project_id,ticket_run_id FROM merge_claim_recovery_requests WHERE request_id=?1",
             [request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -794,6 +787,7 @@ impl ConfigStore {
         if actual_digest != *subject_digest {
             return Err("recovery subject changed; refresh the blocker view".into());
         }
+        self.merge_claim_recovery_publication_snapshot(&current)?;
         let subject_json = serde_json::to_string(&current).map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO merge_claim_recovery_requests(request_id,project_id,ticket_run_id,subject_digest,subject_json,state,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,'pending',?6,?6)",

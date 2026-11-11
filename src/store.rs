@@ -6813,6 +6813,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stale_resumed_merge_assessment_config_reblocks_before_obsolete_ack() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::StaleMergeDecisionConfig),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
     fn failed_resumed_merge_decision_reblocks_with_budget_retained() {
         published_publication_fixture(
             true,
@@ -6830,6 +6843,58 @@ pub(crate) mod tests {
         published_publication_fixture(
             true,
             Some(MergeClaimRecoveryFixture::FailedCoordinator),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn invalid_recovery_coordinator_terminal_reblocks_without_role_evidence() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::InvalidRecoveryCoordinator),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn invalid_recovery_merge_decision_terminal_reblocks_without_role_evidence() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::InvalidRecoveryMergeDecision),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn resumed_merge_intent_validation_failure_reblocks_before_durable_work() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::FailedMergeIntentBeforePersist),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn resumed_merge_intent_post_persist_failure_preserves_durable_work() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::FailedMergeIntentAfterPersist),
             false,
             false,
             false,
@@ -7225,6 +7290,11 @@ pub(crate) mod tests {
         AssessmentLaunch,
         IntentLaunch,
         StaleCoordinatorConfig,
+        StaleMergeDecisionConfig,
+        InvalidRecoveryCoordinator,
+        InvalidRecoveryMergeDecision,
+        FailedMergeIntentBeforePersist,
+        FailedMergeIntentAfterPersist,
         FailedMergeDecision,
         FailedCoordinator,
     }
@@ -7246,6 +7316,26 @@ pub(crate) mod tests {
         let exercise_stale_recovery_config = matches!(
             recovery_case,
             Some(MergeClaimRecoveryFixture::StaleCoordinatorConfig)
+        );
+        let exercise_stale_merge_decision_config = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::StaleMergeDecisionConfig)
+        );
+        let exercise_invalid_recovery_coordinator = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::InvalidRecoveryCoordinator)
+        );
+        let exercise_invalid_recovery_merge_decision = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::InvalidRecoveryMergeDecision)
+        );
+        let exercise_merge_intent_pre_persist_failure = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::FailedMergeIntentBeforePersist)
+        );
+        let exercise_merge_intent_post_persist_failure = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::FailedMergeIntentAfterPersist)
         );
         let exercise_failed_resumed_merge = matches!(
             recovery_case,
@@ -9369,6 +9459,16 @@ pub(crate) mod tests {
                         }),
                         artifact_refs: Vec::new(),
                     }
+                } else if exercise_invalid_recovery_coordinator {
+                    crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "recovery-coordinator-invalid-output".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::SpawnRequest,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: None,
+                        structured_result: serde_json::json!({"role":"merge_decision"}),
+                        artifact_refs: Vec::new(),
+                    }
                 } else {
                     crate::roles::RoleResultMessage {
                         schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
@@ -9388,6 +9488,83 @@ pub(crate) mod tests {
                         artifact_refs: Vec::new(),
                     }
                 };
+                if exercise_invalid_recovery_coordinator {
+                    let terminal_fixture = crate::store::agent_results::host_validation_fixture::host_validated_terminal_in_with_wake_inputs_and_parent(
+                        &mut store,
+                        &std::fs::canonicalize(temp.path()).unwrap(),
+                        owner_generation,
+                        project_id.clone(),
+                        ticket_run_id.clone(),
+                        crate::domain::types::Role::Coordinator,
+                        coordinator_message,
+                        crate::domain::ids::AgentRunId::parse("recovery-invalid-coordinator-run").unwrap(),
+                        wake_items,
+                        None,
+                        Some(subject.instruction_digest.clone()),
+                    ).unwrap();
+                    crate::store::agent_results::host_validation_fixture::close_recovery_terminal_for_test(
+                        &mut store,
+                        owner_generation,
+                        &terminal_fixture.terminal,
+                        "simulated crash cut after recovery closure and before generic rejection marker",
+                    ).unwrap();
+                    let before_marker: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id='recovery-invalid-coordinator-run'",
+                        [], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(before_marker, 0);
+                    for _ in 0..128 {
+                        let rejected_marker: i64 = store.connection.query_row(
+                            "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id='recovery-invalid-coordinator-run'",
+                            [], |row| row.get(0),
+                        ).unwrap();
+                        if rejected_marker == 1 {
+                            break;
+                        }
+                        let _ = crate::store::agent_results::host_validation_fixture::reconcile_pending_terminals_for_test(
+                            &mut store,
+                            &terminal_fixture.artifacts,
+                            owner_generation,
+                        ).unwrap();
+                    }
+                    let rejected_marker: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id='recovery-invalid-coordinator-run'",
+                        [], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(
+                        rejected_marker, 1,
+                        "terminal replay after the simulated crash must still reach generic rejection recording"
+                    );
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(status.state, "reblocked");
+                    assert!(status.budget_used);
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "blocked".into()));
+                    let evidence_count: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM agent_result_evidence WHERE agent_run_id='recovery-invalid-coordinator-run'",
+                        [], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(evidence_count, 0);
+                    let supervisor_wakes = store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("project:{}:supervisor", project_id.as_str()),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| wake.source_type == "merge_claim_recovery_reblocked")
+                        .count();
+                    assert_eq!(supervisor_wakes, 1);
+                    return;
+                }
                 let coordinator_result =
                     crate::store::agent_results::host_validation_fixture::host_validated_result_in_with_wake_inputs(
                         &mut store,
@@ -9527,6 +9704,106 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(merge_decision_wakes.len(), 1);
                 assert_eq!(merge_decision_wakes[0].source_type, "coordinator_child");
+                if exercise_invalid_recovery_merge_decision {
+                    let md_inputs = merge_decision_wakes
+                        .iter()
+                        .map(|input| crate::agent_api::AgentWakeItem {
+                            wake_input_id: input.wake_input_id,
+                            source_type: input.source_type.clone(),
+                            source_id: input.source_id.clone(),
+                            source_revision: input.source_revision,
+                            priority: input.priority,
+                            payload_json: input.payload_json.clone(),
+                            host_artifact_source_evidence_ids: Vec::new(),
+                            host_artifacts: Vec::new(),
+                            host_completion_context: None,
+                        })
+                        .collect();
+                    let invalid_message = crate::roles::RoleResultMessage {
+                        schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                        message_id: "recovery-merge-decision-invalid-output".into(),
+                        kind: crate::engine::orchestration::RoleOutputKind::MergeIntent,
+                        assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+                        result_digest: None,
+                        structured_result: serde_json::json!({"pr_references":"not-an-array"}),
+                        artifact_refs: Vec::new(),
+                    };
+                    let terminal_fixture = crate::store::agent_results::host_validation_fixture::host_validated_terminal_in_with_wake_inputs_and_parent(
+                        &mut store,
+                        &std::fs::canonicalize(temp.path()).unwrap(),
+                        owner_generation,
+                        project_id.clone(),
+                        ticket_run_id.clone(),
+                        crate::domain::types::Role::MergeDecision,
+                        invalid_message,
+                        crate::domain::ids::AgentRunId::parse("recovery-invalid-merge-decision-run").unwrap(),
+                        md_inputs,
+                        Some(coordinator_result.ingested.validated.binding.agent_run_id.clone()),
+                        Some(subject.instruction_digest.clone()),
+                    ).unwrap();
+                    crate::store::agent_results::host_validation_fixture::close_recovery_terminal_for_test(
+                        &mut store,
+                        owner_generation,
+                        &terminal_fixture.terminal,
+                        "simulated crash cut after recovery closure and before generic rejection marker",
+                    ).unwrap();
+                    let before_marker: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id='recovery-invalid-merge-decision-run'",
+                        [], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(before_marker, 0);
+                    for _ in 0..128 {
+                        let rejected_marker: i64 = store.connection.query_row(
+                            "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id='recovery-invalid-merge-decision-run'",
+                            [], |row| row.get(0),
+                        ).unwrap();
+                        if rejected_marker == 1 {
+                            break;
+                        }
+                        let _ = crate::store::agent_results::host_validation_fixture::reconcile_pending_terminals_for_test(
+                            &mut store,
+                            &terminal_fixture.artifacts,
+                            owner_generation,
+                        ).unwrap();
+                    }
+                    let rejected_marker: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='role_result_rejected' AND source_id='recovery-invalid-merge-decision-run'",
+                        [], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(
+                        rejected_marker, 1,
+                        "terminal replay after the simulated crash must still reach generic rejection recording"
+                    );
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(status.state, "reblocked");
+                    assert!(status.budget_used);
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "blocked".into()));
+                    let evidence_count: i64 = store.connection.query_row(
+                        "SELECT COUNT(*) FROM agent_result_evidence WHERE agent_run_id='recovery-invalid-merge-decision-run'",
+                        [], |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(evidence_count, 0);
+                    let supervisor_wakes = store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("project:{}:supervisor", project_id.as_str()),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| wake.source_type == "merge_claim_recovery_reblocked")
+                        .count();
+                    assert_eq!(supervisor_wakes, 1);
+                    return;
+                }
                 if exercise_failed_resumed_merge {
                     let md_inputs = store
                         .pending_role_wake_inputs(
@@ -9852,19 +10129,50 @@ pub(crate) mod tests {
                         .instruction_digest,
                     subject.instruction_digest
                 );
+                let assessment_config_digest = if exercise_stale_merge_decision_config {
+                    Digest::parse("c".repeat(64)).unwrap()
+                } else {
+                    config_digest.clone()
+                };
                 assert!(
                     crate::engine::factory_runtime::tests::apply_merge_assessment_for_test(
                         &mut store,
                         owner_generation,
                         17,
                         &config,
-                        config_digest.clone(),
+                        assessment_config_digest,
                         &resumed_assessment_result.ingested,
                         resumed_observation,
                         Some(resumed_body_proposal),
                     )
                     .unwrap()
                 );
+                if exercise_stale_merge_decision_config {
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(status.state, "reblocked");
+                    assert!(status.budget_used);
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "blocked".into()));
+                    let supervisor_wakes = store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("project:{}:supervisor", project_id.as_str()),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| wake.source_type == "merge_claim_recovery_reblocked")
+                        .count();
+                    assert_eq!(supervisor_wakes, 1);
+                    return;
+                }
                 let resumed_trusted = store.trusted_merge_assessment(
                     &project_id,
                     &ticket_run_id,
@@ -10097,6 +10405,84 @@ pub(crate) mod tests {
                     &merge_intent_result.ingested,
                     replies.clone(),
                 ).unwrap();
+                if exercise_merge_intent_pre_persist_failure {
+                    assert!(
+                        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                            &mut store,
+                            owner_generation,
+                            18,
+                            &config,
+                            config_digest.clone(),
+                            &merge_intent_result.ingested,
+                        )
+                        .unwrap()
+                    );
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(status.state, "reblocked");
+                    assert!(status.budget_used);
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "blocked".into()));
+                    assert!(
+                        store
+                            .merge_work_item(
+                                &project_id,
+                                &ticket_run_id,
+                                Revision(subject.blocked_revision + 3)
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    return;
+                }
+                if exercise_merge_intent_post_persist_failure {
+                    let closed_views = store.connection.execute(
+                        "UPDATE rex_views SET lifecycle='closed' WHERE project_id=?1 AND view_kind='ticket' AND lifecycle='active'",
+                        [project_id.as_str()],
+                    ).unwrap();
+                    assert!(closed_views > 0);
+                    let error = crate::engine::factory_runtime::tests::apply_agent_result_with_merge_work_document_for_test(
+                        &mut store,
+                        owner_generation,
+                        18,
+                        &config,
+                        config_digest.clone(),
+                        &merge_intent_result.ingested,
+                        work_document,
+                    ).unwrap_err();
+                    assert!(error.contains("active TicketRun Rex view"));
+                    let status = store
+                        .merge_claim_recovery_status("recovery-fixture-request")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        status.state, "accepted",
+                        "post-persist errors must not reblock an already durable merge work item"
+                    );
+                    let phase: (String, String) = store.connection.query_row(
+                        "SELECT internal_phase,activity FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+                        rusqlite::params![project_id.as_str(), ticket_run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(phase, ("assessing".into(), "running".into()));
+                    assert!(
+                        store
+                            .merge_work_item(
+                                &project_id,
+                                &ticket_run_id,
+                                Revision(subject.blocked_revision + 3)
+                            )
+                            .unwrap()
+                            .is_some()
+                    );
+                    return;
+                }
                 assert!(
                     crate::engine::factory_runtime::tests::apply_merge_intent_for_test(
                         &mut store,

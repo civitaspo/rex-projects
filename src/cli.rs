@@ -1838,8 +1838,13 @@ fn ticket_command(
                 )
             } else {
                 println!(
-                    "Recovery request {} queued for controller validation{}",
+                    "Recovery request {}: {}{}",
                     receipt.request_id,
+                    if receipt.state == "pending" {
+                        "queued for controller validation"
+                    } else {
+                        receipt.state.as_str()
+                    },
                     if receipt.replayed { " (replayed)" } else { "" }
                 );
                 Ok(())

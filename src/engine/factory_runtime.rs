@@ -917,7 +917,47 @@ fn apply_agent_result(
         && binding.role == Role::MergeDecision
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
     {
-        return apply_merge_intent(store, owner_generation, now_unix, config, services, result);
+        let recovery = store.recovery_authorization_for_merge_failure(result)?;
+        return match apply_merge_intent(store, owner_generation, now_unix, config, services, result)
+        {
+            Ok(applied) => Ok(applied),
+            Err(error) => {
+                let Some(recovery) = recovery else {
+                    return Err(error);
+                };
+                let revision = binding
+                    .ticket_revision
+                    .ok_or("resumed MergeIntent has no TicketRun revision")?;
+                let ticket_run_id = binding
+                    .ticket_run_id
+                    .as_ref()
+                    .ok_or("resumed MergeIntent has no TicketRun")?;
+                let awaiting_merge_revision = revision
+                    .0
+                    .checked_add(2)
+                    .ok_or("resumed MergeIntent awaiting-merge revision overflow")?;
+                let work_item_already_persisted = store
+                    .merge_work_item(
+                        &binding.project_id,
+                        ticket_run_id,
+                        Revision(awaiting_merge_revision),
+                    )?
+                    .is_some();
+                if work_item_already_persisted {
+                    return Err(error);
+                }
+                store.fail_resumed_merge_claim_recovery(
+                    owner_generation,
+                    &recovery,
+                    result,
+                    &format!(
+                        "resumed MergeIntent failed before its durable merge-work item: {error}"
+                    ),
+                    now_unix,
+                )?;
+                Ok(true)
+            }
+        };
     }
     if result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
         && binding.role == Role::Postmortem
@@ -2099,6 +2139,18 @@ fn apply_merge_assessment(
             return Ok(true);
         }
         return Err("MergeAssessment result is stale, blocked, or outside active Assessing".into());
+    }
+    if binding.config_digest != *services.configuration_digest()
+        && let Some(recovery) = store.recovery_authorization_for_merge_failure(result)?
+    {
+        store.fail_resumed_merge_claim_recovery(
+            owner_generation,
+            &recovery,
+            result,
+            "resumed MergeDecision result belongs to an obsolete Project configuration",
+            now_unix,
+        )?;
+        return Ok(true);
     }
     if crate::store::agent_results::acknowledge_obsolete_configuration_result(
         store,
@@ -4618,6 +4670,36 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+        };
+        super::apply_agent_result(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            &mut services,
+            result,
+        )
+    }
+
+    pub(crate) fn apply_agent_result_with_merge_work_document_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        document: crate::store::merge_work::MergeWorkDocument,
+    ) -> Result<bool, String> {
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest,
+            published_effect: None,
+            pending_artifacts: None,
+            ticket_page: None,
+            merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
+            merge_body_proposal: None,
+            merge_work_document: Some(document),
         };
         super::apply_agent_result(
             store,

@@ -1957,28 +1957,10 @@ fn ingest_next_spooled_agent_result_inner(
         return Ok(Some(existing));
     }
 
-    // A terminal may commit before role validation or before the next controller tick.
-    // Revisit that durable gap without rereading an Agent-writable spool.
-    let terminal_ids = {
-        let mut statement = store.connection.prepare(
-            "SELECT t.agent_run_id FROM agent_terminal_receipts t
-             WHERE NOT EXISTS(SELECT 1 FROM agent_result_evidence e WHERE e.agent_run_id=t.agent_run_id)
-               AND NOT EXISTS(SELECT 1 FROM role_wake_inputs w WHERE w.source_type='role_result_rejected' AND w.source_id=t.agent_run_id AND json_extract(w.payload_json,'$.terminal_digest')=t.terminal_digest)
-             ORDER BY t.observed_at_unix,t.agent_run_id LIMIT ?1",
-        ).map_err(|error| error.to_string())?;
-        statement
-            .query_map([candidate_limit as u64], |row| row.get::<_, String>(0))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
-    };
-    for run_id in terminal_ids {
-        let terminal = verify_agent_terminal(store, owner_generation, &AgentRunId::parse(run_id)?)?;
-        if let Some(result) =
-            ingest_verified_terminal_result(store, artifact_store, owner_generation, &terminal)?
-        {
-            return Ok(Some(result));
-        }
+    if let Some(result) =
+        ingest_pending_verified_terminals(store, artifact_store, owner_generation, candidate_limit)?
+    {
+        return Ok(Some(result));
     }
 
     let candidates = {
@@ -2079,6 +2061,38 @@ fn ingest_next_spooled_agent_result_inner(
     Ok(None)
 }
 
+/// Reconcile the durable terminal-before-result gap. Kept as one production helper so tests and
+/// controller ticks exercise the same candidate query and terminal ingestion path.
+fn ingest_pending_verified_terminals(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    candidate_limit: usize,
+) -> Result<Option<IngestedAgentResult>, String> {
+    let terminal_ids = {
+        let mut statement = store.connection.prepare(
+            "SELECT t.agent_run_id FROM agent_terminal_receipts t
+             WHERE NOT EXISTS(SELECT 1 FROM agent_result_evidence e WHERE e.agent_run_id=t.agent_run_id)
+               AND NOT EXISTS(SELECT 1 FROM role_wake_inputs w WHERE w.source_type='role_result_rejected' AND w.source_id=t.agent_run_id AND json_extract(w.payload_json,'$.terminal_digest')=t.terminal_digest)
+             ORDER BY t.observed_at_unix,t.agent_run_id LIMIT ?1",
+        ).map_err(|error| error.to_string())?;
+        statement
+            .query_map([candidate_limit as u64], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for run_id in terminal_ids {
+        let terminal = verify_agent_terminal(store, owner_generation, &AgentRunId::parse(run_id)?)?;
+        if let Some(result) =
+            ingest_verified_terminal_result(store, artifact_store, owner_generation, &terminal)?
+        {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
 fn ingest_verified_terminal_result(
     store: &mut ConfigStore,
     artifact_store: &crate::artifacts::ArtifactStore,
@@ -2119,6 +2133,13 @@ fn ingest_verified_terminal_result(
         }
     }
     if !valid {
+        reblock_rejected_merge_claim_recovery_terminal(
+            store,
+            owner_generation,
+            terminal,
+            &authority,
+            "the authorized recovery Agent exited with an invalid role result",
+        )?;
         record_rejected_role_result(
             store,
             owner_generation,
@@ -2144,6 +2165,13 @@ fn ingest_verified_terminal_result(
         Err(error)
             if error == "TicketRun revision or config no longer matches Agent launch authority" =>
         {
+            reblock_rejected_merge_claim_recovery_terminal(
+                store,
+                owner_generation,
+                terminal,
+                &authority,
+                "the authorized recovery Agent terminal belongs to a stale launch snapshot",
+            )?;
             record_rejected_role_result(
                 store,
                 owner_generation,
@@ -2160,6 +2188,163 @@ fn ingest_verified_terminal_result(
         }
         Err(error) => Err(error),
     }
+}
+
+/// A verified terminal with malformed role output is not role evidence, but it can prove that an
+/// already-authorized one-shot recovery turn has ended. Use only the persisted launch authority,
+/// exact consumed recovery wake / parent evidence, and verified terminal receipt to close that
+/// recovery attempt; never interpret the malformed payload as authority.
+fn reblock_rejected_merge_claim_recovery_terminal(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    terminal: &VerifiedAgentTerminal,
+    authority: &AgentLaunchAuthority,
+    reason: &str,
+) -> Result<(), String> {
+    if !matches!(authority.role, Role::Coordinator | Role::MergeDecision) {
+        return Ok(());
+    }
+    let Some(ticket_run_id) = authority.ticket_run_id.as_ref() else {
+        return Ok(());
+    };
+    let recovery = match authority.role {
+        Role::Coordinator => super::merge_claim_recovery::authorized_recovery_for_coordinator_run(
+            &store.connection,
+            &authority.project_id,
+            ticket_run_id,
+            &authority.agent_run_id,
+            authority
+                .ticket_revision
+                .map(|revision| revision.0)
+                .unwrap_or_default(),
+        )?,
+        Role::MergeDecision => {
+            let Some(parent_run_id) = authority.parent_run_id.as_ref() else {
+                return Ok(());
+            };
+            if authority.parent_role != Some(Role::Coordinator) {
+                return Ok(());
+            }
+            let row: Option<(String, String, String, String)> = store.connection.query_row(
+                "SELECT request_id,subject_json,subject_digest,authorization_key FROM merge_claim_recovery_requests WHERE project_id=?1 AND ticket_run_id=?2 AND state IN ('consumed','accepted') AND coordinator_evidence_id=(SELECT e.evidence_id FROM agent_result_evidence e WHERE e.agent_run_id=?3 AND e.role='coordinator' AND e.outcome='completed') ORDER BY updated_at_unix DESC LIMIT 1",
+                rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str(), parent_run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            row.map(|(request_id, subject_json, subject_digest, authorization_key)| {
+                let subject: super::merge_claim_recovery::MergeClaimRecoverySubject =
+                    crate::protocol::parse_unique(subject_json.as_bytes())?;
+                let subject_digest = Digest::parse(subject_digest)?;
+                let authorization_key = Digest::parse(authorization_key)?;
+                if subject.digest()? != subject_digest
+                    || subject.project_id != authority.project_id
+                    || subject.ticket_run_id != *ticket_run_id
+                    || authority.config_digest != subject.configuration_digest
+                    || authority.instruction_digest != subject.instruction_digest
+                    || authority.ticket_revision.map(|revision| revision.0)
+                        != subject.blocked_revision.checked_add(1)
+                {
+                    return Err("rejected MergeDecision terminal differs from immutable recovery subject".into());
+                }
+                Ok::<super::merge_claim_recovery::AuthorizedMergeClaimRecovery, String>(super::merge_claim_recovery::AuthorizedMergeClaimRecovery {
+                    request_id,
+                    subject,
+                    subject_digest,
+                    authorization_key,
+                    state: "consumed".into(),
+                    coordinator_evidence_id: None,
+                })
+            }).transpose()?
+        }
+        _ => None,
+    };
+    let Some(recovery) = recovery else {
+        return Ok(());
+    };
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    super::validate_active_generation(&tx, owner_generation)?;
+    verify_persisted_authority(&tx, authority, &terminal.authority_digest)?;
+    verify_terminal_row(&tx, terminal)?;
+    let run: Option<(u64, String, String, String)> = tx.query_row(
+        "SELECT revision,internal_phase,activity,external_status FROM ticket_runs WHERE project_id=?1 AND ticket_run_id=?2",
+        rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((revision, phase, activity, status)) = run else {
+        return Ok(());
+    };
+    if authority.ticket_revision.map(|value| value.0) != Some(revision)
+        || revision != recovery.subject.blocked_revision.saturating_add(1)
+        || serde_json::from_str::<crate::engine::reducer::Phase>(&format!("\"{phase}\""))
+            .map_err(|error| error.to_string())?
+            != crate::engine::reducer::Phase::Assessing
+        || serde_json::from_str::<crate::engine::reducer::Activity>(&format!("\"{activity}\""))
+            .map_err(|error| error.to_string())?
+            != crate::engine::reducer::Activity::Running
+    {
+        return Ok(());
+    }
+    let stored: Option<(String, String, String)> = tx.query_row(
+        "SELECT state,subject_digest,authorization_key FROM merge_claim_recovery_requests WHERE request_id=?1 AND project_id=?2 AND ticket_run_id=?3",
+        rusqlite::params![recovery.request_id, authority.project_id.as_str(), ticket_run_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some((state, subject_digest, authorization_key)) = stored else {
+        return Ok(());
+    };
+    let allowed_state = match authority.role {
+        Role::Coordinator => state == "authorized",
+        Role::MergeDecision => matches!(state.as_str(), "consumed" | "accepted"),
+        _ => false,
+    };
+    if !allowed_state
+        || subject_digest != recovery.subject_digest.as_str()
+        || authorization_key != recovery.authorization_key.as_str()
+    {
+        return Ok(());
+    }
+    let current = crate::engine::reducer::TicketRun {
+        project_id: authority.project_id.clone(),
+        ticket_run_id: ticket_run_id.clone(),
+        revision: Revision(revision),
+        phase: crate::engine::reducer::Phase::Assessing,
+        activity: crate::engine::reducer::Activity::Running,
+        external_status: super::parse_ticket_status(&status)?,
+        required_review_revision: None,
+    };
+    let decision = crate::engine::reducer::reduce(
+        &current,
+        current.revision,
+        crate::engine::reducer::Input::HumanMergeDecisionResumeFailed,
+    )?;
+    let terminal_ref = format!("terminal:{}", terminal.terminal_digest.as_str());
+    let evidence = serde_json::json!({"kind":"human_merge_claim_recovery_reblocked","request_id":recovery.request_id,"verified_terminal_digest":terminal.terminal_digest,"authorization_key":recovery.authorization_key,"reason":reason,"source_revision":revision});
+    tx.execute(
+        "UPDATE ticket_runs SET internal_phase=?3,activity=?4,external_status=?5,revision=?6 WHERE project_id=?1 AND ticket_run_id=?2 AND revision=?7",
+        rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str(), super::enum_string(&decision.ticket_run.phase)?, super::enum_string(&decision.ticket_run.activity)?, super::enum_string(&decision.ticket_run.external_status)?, decision.ticket_run.revision.0, revision],
+    ).map_err(|error| error.to_string())?;
+    if tx.changes() != 1 {
+        return Err("TicketRun changed while reblocking rejected recovery terminal".into());
+    }
+    tx.execute(
+        "INSERT INTO transitions(project_id,entity_type,entity_id,old_revision,new_revision,input_id,decision_reason,evidence_json,created_at_unix) VALUES (?1,'ticket_run',?2,?3,?4,?5,'rejected recovery Agent terminal',?6,?7)",
+        rusqlite::params![authority.project_id.as_str(), ticket_run_id.as_str(), revision, decision.ticket_run.revision.0, format!("merge-claim-recovery-reblocked:{}", recovery.request_id), crate::store::canonical_json(&evidence)?, unix_now()?],
+    ).map_err(|error| error.to_string())?;
+    let wake = serde_json::json!({"kind":"human_merge_claim_recovery_reblocked","ticket_run_id":ticket_run_id.as_str(),"request_id":recovery.request_id,"reason":reason,"revision":decision.ticket_run.revision.0});
+    tx.execute(
+        "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'merge_claim_recovery_reblocked',?3,?4,100,?5,'pending',?6)",
+        rusqlite::params![authority.project_id.as_str(), format!("project:{}:supervisor", authority.project_id.as_str()), recovery.request_id, decision.ticket_run.revision.0, crate::store::canonical_json(&wake)?, unix_now()?],
+    ).map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE merge_claim_recovery_requests SET state='reblocked',resumed_result_evidence_id=?2,rejection_reason=?3,updated_at_unix=?4 WHERE request_id=?1 AND state=?5",
+        rusqlite::params![recovery.request_id, terminal_ref, reason, unix_now()?, state],
+    ).map_err(|error| error.to_string())?;
+    if tx.changes() != 1 {
+        return Err("recovery attempt changed while reblocking rejected terminal".into());
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 
 fn record_rejected_role_result(
@@ -8519,12 +8704,12 @@ pub(crate) mod host_validation_fixture {
         pub ingested: IngestedAgentResult,
     }
 
-    pub(super) struct InPlaceTerminalFixture {
-        pub(super) artifacts: crate::artifacts::ArtifactStore,
-        pub(super) terminal: VerifiedAgentTerminal,
-        pub(super) message: RoleResultMessage,
-        pub(super) start: StartRequestEnvelope,
-        pub(super) result: AgentTurnResult,
+    pub(crate) struct InPlaceTerminalFixture {
+        pub(crate) artifacts: crate::artifacts::ArtifactStore,
+        pub(crate) terminal: VerifiedAgentTerminal,
+        pub(crate) message: RoleResultMessage,
+        pub(crate) start: StartRequestEnvelope,
+        pub(crate) result: AgentTurnResult,
     }
 
     /// Builds real host terminal and result evidence around test-seeded running launch records.
@@ -8805,6 +8990,66 @@ pub(crate) mod host_validation_fixture {
             artifacts: prepared.artifacts,
             ingested,
         })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fixture supplies exact launch and recovery wake lineage for a crash-cut test"
+    )]
+    pub(crate) fn host_validated_terminal_in_with_wake_inputs_and_parent(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        role: Role,
+        message: RoleResultMessage,
+        agent_run_id: AgentRunId,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
+        parent_run_id: Option<AgentRunId>,
+        instruction_digest: Option<Digest>,
+    ) -> Result<InPlaceTerminalFixture, String> {
+        host_validated_result_inner(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            Some(ticket_run_id),
+            role,
+            message,
+            Some(agent_run_id),
+            wake_inputs,
+            None,
+            parent_run_id,
+            instruction_digest,
+        )
+        .map_err(|error| format!("host terminal fixture setup: {error}"))
+    }
+
+    pub(crate) fn close_recovery_terminal_for_test(
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        terminal: &VerifiedAgentTerminal,
+        reason: &str,
+    ) -> Result<(), String> {
+        let authority = store
+            .agent_launch_authority(terminal.agent_run_id())?
+            .ok_or("fixture terminal has no launch authority")?;
+        super::reblock_rejected_merge_claim_recovery_terminal(
+            store,
+            owner_generation,
+            terminal,
+            &authority,
+            reason,
+        )
+    }
+
+    pub(crate) fn reconcile_pending_terminals_for_test(
+        store: &mut ConfigStore,
+        artifacts: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+    ) -> Result<Option<IngestedAgentResult>, String> {
+        ingest_pending_verified_terminals(store, artifacts, owner_generation, 128)
     }
 
     #[expect(
