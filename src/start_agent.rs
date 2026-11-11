@@ -128,6 +128,9 @@ impl EffectHandler for StartAgentEffectHandler {
             });
         }
 
+        context
+            .store
+            .validate_start_agent_ticket_run(context.owner_generation, &reservation)?;
         let environment_handoff = self.materializer.environment_handoff_path(
             context.store,
             context.owner_generation,

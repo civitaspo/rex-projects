@@ -727,6 +727,54 @@ impl RuntimeServices {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn handle_start_agent_for_test(
+        &self,
+        mode: crate::effects::EffectMode,
+        request: &crate::effects::EffectRequest,
+        context: &mut crate::effects::EffectContext<'_>,
+    ) -> Result<crate::effects::EffectObservation, String> {
+        let handler = self
+            .handlers
+            .iter()
+            .find(|handler| handler.kind() == crate::engine::reducer::EffectKind::StartAgent)
+            .ok_or("RuntimeServices has no StartAgent effect handler")?;
+        handler.handle(mode, request, context)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_parked_wrapper_for_test(
+        &self,
+        store: &mut ConfigStore,
+        now_unix: i64,
+        reservation: &crate::launch::AgentLaunchReservation,
+        environment_handoff: &Path,
+    ) -> Result<RexContextBlock, String> {
+        let materializer = RuntimeAgentMaterializer {
+            applied_config: self.applied_config.clone(),
+            environment: self.environment.clone(),
+            state_root: self.state_root.clone(),
+            owner_generation: self.owner_generation,
+            runtime_binary: self.runtime_binary.clone(),
+            runtime_binary_digest: self.runtime_binary_digest.clone(),
+            rex_cli_path: self.rex_cli_path.clone(),
+            rex_search_path: self.rex_search_path.clone(),
+            rex_identity: self.rex_identity.clone(),
+            rex: self.rex.clone(),
+            tickets: self.tickets.clone(),
+            delivery_effects: self.delivery.shared_effects(),
+        };
+        <RuntimeAgentMaterializer as crate::start_agent::StartAgentMaterializer>::ensure_parked_wrapper(
+            &materializer,
+            store,
+            self.owner_generation,
+            now_unix,
+            reservation,
+            &reservation.descriptor_path,
+            environment_handoff,
+        )
+    }
+
     fn observe_merge_claim_recovery(
         &mut self,
         store: &ConfigStore,
@@ -2250,6 +2298,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             cwd: reservation.workspace_path.clone(),
             path_prepend: self.rex_search_path.clone(),
         };
+        store.validate_start_agent_ticket_run(owner_generation, reservation)?;
         let block_id = self
             .rex
             .create_agent_block(&window, &anchor.block_id, &spec)
