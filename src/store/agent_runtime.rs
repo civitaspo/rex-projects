@@ -3080,7 +3080,8 @@ pub(crate) mod tests {
             .unwrap();
         let artifact_store =
             crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
-        let mut mailbox_cursor = None;
+        let mut mailbox_scan = Default::default();
+        let mut emit_diagnostic = |_| {};
         store
             .connection
             .execute(
@@ -3095,7 +3096,8 @@ pub(crate) mod tests {
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
                 &Default::default(),
-                &mut mailbox_cursor,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
             )
             .unwrap()
         );
@@ -3114,7 +3116,8 @@ pub(crate) mod tests {
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
                 &Default::default(),
-                &mut mailbox_cursor,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
             )
             .unwrap()
         );
@@ -3125,7 +3128,8 @@ pub(crate) mod tests {
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
                 &Default::default(),
-                &mut mailbox_cursor,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
             )
             .is_err()
         );
@@ -3143,7 +3147,8 @@ pub(crate) mod tests {
                 crate::store::now_unix().unwrap(),
                 &artifact_store,
                 &Default::default(),
-                &mut mailbox_cursor,
+                &mut mailbox_scan,
+                &mut emit_diagnostic,
             )
             .unwrap()
         );

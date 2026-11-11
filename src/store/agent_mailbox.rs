@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifacts::ArtifactStore;
 use crate::domain::ids::{AgentRunId, Digest, OperationId};
-use crate::mailbox::{MailboxCapability, MailboxLimits};
+use crate::mailbox::{MailboxCapability, MailboxDrainInspection, MailboxLimits};
 
 type MailboxRunAuthorityStateRow = (
     String,
@@ -258,6 +258,24 @@ impl crate::store::ConfigStore {
             &registration.capability_digest,
         )
         .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+        if now_unix.max(0) as u64 >= registration.expires_at_unix {
+            if mode == MailboxDispatchMode::TerminalReceiptReplay {
+                return match mailbox.inspect_drain() {
+                    MailboxDrainInspection::Drained { .. } => Ok(false),
+                    MailboxDrainInspection::Unresolved {
+                        fingerprint,
+                        reason,
+                    } => Err(AgentMailboxProcessingError::LocalMailbox(format!(
+                        "expired terminal mailbox remains unresolved ({}; inventory {})",
+                        reason.code(),
+                        fingerprint
+                    ))),
+                };
+            }
+            return Err(AgentMailboxProcessingError::LocalMailbox(
+                "mailbox capability has expired".into(),
+            ));
+        }
         let Some(mailbox_request) = mailbox
             .pending(now_unix.max(0) as u64)
             .map_err(AgentMailboxProcessingError::LocalMailbox)?
