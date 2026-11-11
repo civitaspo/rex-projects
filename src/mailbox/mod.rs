@@ -32,15 +32,39 @@ impl MailboxDrainReason {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MailboxDrainInspection {
-    Drained {
-        fingerprint: crate::domain::ids::Digest,
-    },
+pub(crate) enum TerminalCommitReplayInspection<'a> {
+    Drained,
+    Ready(TerminalCommitReplay<'a>),
     Unresolved {
         fingerprint: crate::domain::ids::Digest,
         reason: MailboxDrainReason,
     },
+}
+
+pub(crate) struct TerminalCommitReplay<'a> {
+    capability: &'a MailboxCapability,
+    request: Box<MailboxRequest>,
+}
+
+impl TerminalCommitReplay<'_> {
+    pub(crate) fn request(&self) -> &MailboxRequest {
+        &self.request
+    }
+
+    pub(crate) fn publish_response(
+        &self,
+        response: &crate::store::agent_mailbox::ValidatedTerminalCommitResponse,
+    ) -> Result<(), String> {
+        self.capability
+            .publish_terminal_commit_replay(&self.request, response.bytes())
+    }
+}
+
+struct MailboxInventory {
+    fingerprint: crate::domain::ids::Digest,
+    reason: Option<MailboxDrainReason>,
+    pending_requests: Vec<MailboxRequest>,
+    unmatched_receipt: bool,
 }
 
 const REQUEST_PREFIX: &str = "request-";
@@ -401,12 +425,55 @@ impl MailboxCapability {
         Ok(requests)
     }
 
-    /// Inspect whether this pinned mailbox contains only complete, matching request/response
-    /// pairs. This is read-only and deliberately does not grant any post-expiry processing
-    /// authority; callers must verify the run's terminal receipt before using it.
-    pub(crate) fn inspect_drain(&self, shared_control_layout: bool) -> MailboxDrainInspection {
-        use MailboxDrainInspection::{Drained, Unresolved};
+    /// Reads the one pending commit request that may be reconciled against a verified terminal
+    /// host effect. This token carries the exact stored request digest for the later publication.
+    pub(crate) fn inspect_terminal_commit_replay(
+        &self,
+        shared_control_layout: bool,
+    ) -> TerminalCommitReplayInspection<'_> {
+        use TerminalCommitReplayInspection::{Drained, Ready, Unresolved};
 
+        let mut inventory = self.inspect_inventory(shared_control_layout);
+        if let Some(reason) = inventory.reason {
+            return Unresolved {
+                fingerprint: inventory.fingerprint,
+                reason,
+            };
+        }
+        if inventory.unmatched_receipt {
+            return Unresolved {
+                fingerprint: inventory.fingerprint,
+                reason: MailboxDrainReason::MissingPair,
+            };
+        }
+        match inventory.pending_requests.len() {
+            0 => Drained,
+            1 => {
+                let request = inventory.pending_requests.pop().unwrap();
+                if serde_json::to_value(&request.envelope.method)
+                    .ok()
+                    .and_then(|method| method.as_str().map(str::to_owned))
+                    .as_deref()
+                    != Some("repository.commit")
+                {
+                    return Unresolved {
+                        fingerprint: inventory.fingerprint,
+                        reason: MailboxDrainReason::UnexpectedEntry,
+                    };
+                }
+                Ready(TerminalCommitReplay {
+                    capability: self,
+                    request: Box::new(request),
+                })
+            }
+            _ => Unresolved {
+                fingerprint: inventory.fingerprint,
+                reason: MailboxDrainReason::MissingPair,
+            },
+        }
+    }
+
+    fn inspect_inventory(&self, shared_control_layout: bool) -> MailboxInventory {
         let entry_limit = self
             .limits
             .max_pending_requests
@@ -415,16 +482,22 @@ impl MailboxCapability {
         let (names, exceeded) = match self.directory_file_names_bounded(entry_limit) {
             Ok(result) => result,
             Err(_) => {
-                return self.unresolved_inventory(
-                    MailboxDrainReason::Unreadable,
-                    &[("directory".to_owned(), "unreadable".to_owned())],
-                );
+                return MailboxInventory {
+                    fingerprint: inventory_fingerprint(
+                        &[("directory".to_owned(), "unreadable".to_owned())],
+                        false,
+                    ),
+                    reason: Some(MailboxDrainReason::Unreadable),
+                    pending_requests: Vec::new(),
+                    unmatched_receipt: false,
+                };
             }
         };
         let mut inventory = Vec::with_capacity(names.len());
-        let mut requests = std::collections::BTreeMap::<String, String>::new();
+        let mut requests = std::collections::BTreeMap::<String, MailboxRequest>::new();
         let mut receipts = std::collections::BTreeMap::<String, String>::new();
         let mut reason = exceeded.then_some(MailboxDrainReason::LimitExceeded);
+        let mut descriptor_seen = false;
 
         for file_name in names {
             let Some(name) = file_name.to_str() else {
@@ -433,6 +506,7 @@ impl MailboxCapability {
                 continue;
             };
             if name == "descriptor.json" {
+                descriptor_seen = true;
                 match self.read_bounded(name, 4096) {
                     Ok(bytes) => inventory.push((name.to_owned(), digest(&bytes))),
                     Err(_) => {
@@ -508,11 +582,22 @@ impl MailboxCapability {
                     if key(request.request_id.as_str()) != filename_key {
                         return Err("request filename key differs from request id".into());
                     }
-                    Ok(request.request_id.as_str().to_owned())
+                    Ok(request)
                 });
                 match parsed {
-                    Ok(request_id) => {
-                        if requests.insert(request_id, content_digest).is_some() {
+                    Ok(envelope) => {
+                        let request_id = envelope.request_id.as_str().to_owned();
+                        if requests
+                            .insert(
+                                request_id.clone(),
+                                MailboxRequest {
+                                    request_id,
+                                    digest: content_digest,
+                                    envelope,
+                                },
+                            )
+                            .is_some()
+                        {
                             reason.get_or_insert(MailboxDrainReason::IdentityMismatch);
                         }
                     }
@@ -540,28 +625,28 @@ impl MailboxCapability {
                 }
             }
         }
-        if requests.keys().ne(receipts.keys()) {
-            reason.get_or_insert(MailboxDrainReason::MissingPair);
+        if !descriptor_seen {
+            reason.get_or_insert(MailboxDrainReason::Unreadable);
         }
         inventory.sort();
         let fingerprint = inventory_fingerprint(&inventory, exceeded);
-        match reason {
-            Some(reason) => Unresolved {
-                fingerprint,
-                reason,
-            },
-            None => Drained { fingerprint },
+        let unmatched_receipt = receipts
+            .keys()
+            .any(|request_id| !requests.contains_key(request_id));
+        let pending_requests = requests
+            .into_iter()
+            .filter_map(|(request_id, request)| {
+                (!receipts.contains_key(&request_id)).then_some(request)
+            })
+            .collect::<Vec<_>>();
+        if pending_requests.len() > self.limits.max_pending_requests {
+            reason.get_or_insert(MailboxDrainReason::LimitExceeded);
         }
-    }
-
-    fn unresolved_inventory(
-        &self,
-        reason: MailboxDrainReason,
-        inventory: &[(String, String)],
-    ) -> MailboxDrainInspection {
-        MailboxDrainInspection::Unresolved {
-            fingerprint: inventory_fingerprint(inventory, false),
+        MailboxInventory {
+            fingerprint,
             reason,
+            pending_requests,
+            unmatched_receipt,
         }
     }
 
@@ -786,6 +871,49 @@ impl MailboxCapability {
                 }
             }
             Err(error) => Err(format!("publish mailbox receipt: {error}")),
+        }
+    }
+
+    fn publish_terminal_commit_replay(
+        &self,
+        request: &MailboxRequest,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if bytes.len() > self.limits.max_request_bytes {
+            return Err("mailbox receipt exceeds configured byte limit".into());
+        }
+        let response: ResponseEnvelope<Value> = parse_unique(bytes)?;
+        response.validate_for(&RequestId::new(&request.request_id)?)?;
+        let request_name = format!("{REQUEST_PREFIX}{}.json", key(&request.request_id));
+        let receipt_name = format!("{RECEIPT_PREFIX}{}.json", key(&request.request_id));
+        let _guard = self.lock_mailbox()?;
+        let request_bytes = self
+            .read_bounded(&request_name, self.limits.max_request_bytes)
+            .map_err(|error| format!("read terminal commit request: {error}"))?;
+        if digest(&request_bytes) != request.digest {
+            return Err("terminal commit request changed before response publication".into());
+        }
+        match self.read_bounded(&receipt_name, self.limits.max_request_bytes) {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => {
+                return Err("terminal commit response conflicts with an existing receipt".into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect terminal commit receipt: {error}")),
+        }
+        match self.atomic_publish(&receipt_name, bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = self
+                    .read_bounded(&receipt_name, self.limits.max_request_bytes)
+                    .map_err(|error| format!("inspect terminal commit receipt: {error}"))?;
+                if existing == bytes {
+                    Ok(())
+                } else {
+                    Err("terminal commit response conflicts with an existing receipt".into())
+                }
+            }
+            Err(error) => Err(format!("publish terminal commit receipt: {error}")),
         }
     }
 
@@ -1110,8 +1238,8 @@ fn atomic_publish_at(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), s
 #[cfg(test)]
 mod tests {
     use super::{
-        MailboxCapability, MailboxDescriptor, MailboxDrainInspection, MailboxDrainReason,
-        MailboxLimits, QueueResult,
+        MailboxCapability, MailboxDescriptor, MailboxDrainReason, MailboxLimits, QueueResult,
+        TerminalCommitReplayInspection,
     };
     use sha2::Digest as _;
     use std::fs;
@@ -1175,14 +1303,14 @@ mod tests {
     }
 
     #[test]
-    fn drain_inspection_requires_a_complete_valid_pair() {
+    fn terminal_replay_inspection_requires_only_complete_valid_history() {
         let root = tempfile::tempdir().unwrap();
         let mailbox = capability(root.path());
         mailbox.queue("r-1", &request("r-1", "same"), 1).unwrap();
         assert!(matches!(
-            mailbox.inspect_drain(false),
-            MailboxDrainInspection::Unresolved {
-                reason: MailboxDrainReason::MissingPair,
+            mailbox.inspect_terminal_commit_replay(false),
+            TerminalCommitReplayInspection::Unresolved {
+                reason: MailboxDrainReason::UnexpectedEntry,
                 ..
             }
         ));
@@ -1195,8 +1323,8 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            mailbox.inspect_drain(false),
-            MailboxDrainInspection::Drained { .. }
+            mailbox.inspect_terminal_commit_replay(false),
+            TerminalCommitReplayInspection::Drained
         ));
 
         let malformed_root = tempfile::tempdir().unwrap();
@@ -1209,8 +1337,8 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            malformed.inspect_drain(false),
-            MailboxDrainInspection::Unresolved {
+            malformed.inspect_terminal_commit_replay(false),
+            TerminalCommitReplayInspection::Unresolved {
                 reason: MailboxDrainReason::Malformed,
                 ..
             }
@@ -1219,7 +1347,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn drain_inspection_fails_closed_for_symlinks_and_over_limit_inventory() {
+    fn terminal_replay_inspection_fails_closed_for_symlinks_and_over_limit_inventory() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -1233,16 +1361,16 @@ mod tests {
                 .join(format!("request-{}.json", super::key("r-1"))),
         )
         .unwrap();
-        let inspection = mailbox.inspect_drain(false);
+        let inspection = mailbox.inspect_terminal_commit_replay(false);
         assert!(
             matches!(
                 inspection,
-                MailboxDrainInspection::Unresolved {
+                TerminalCommitReplayInspection::Unresolved {
                     reason: MailboxDrainReason::Unreadable,
                     ..
                 }
             ),
-            "unexpected symlink inspection: {inspection:?}"
+            "symlinked request must remain unresolved"
         );
 
         let limited_root = tempfile::tempdir().unwrap();
@@ -1260,8 +1388,8 @@ mod tests {
             fs::write(limited_root.path().join(format!("extra-{index}")), b"x").unwrap();
         }
         assert!(matches!(
-            limited.inspect_drain(false),
-            MailboxDrainInspection::Unresolved {
+            limited.inspect_terminal_commit_replay(false),
+            TerminalCommitReplayInspection::Unresolved {
                 reason: MailboxDrainReason::LimitExceeded,
                 ..
             }
@@ -1278,8 +1406,8 @@ mod tests {
         let mailbox = capability(root.path());
         symlink(outside.path(), root.path().join("run-step")).unwrap();
         assert!(matches!(
-            mailbox.inspect_drain(true),
-            MailboxDrainInspection::Unresolved {
+            mailbox.inspect_terminal_commit_replay(true),
+            TerminalCommitReplayInspection::Unresolved {
                 reason: MailboxDrainReason::Unreadable,
                 ..
             }
@@ -1289,8 +1417,8 @@ mod tests {
         fs::write(&outside_file, b"fixture message").unwrap();
         symlink(&outside_file, root.path().join("commit-message.txt")).unwrap();
         assert!(matches!(
-            mailbox.inspect_drain(true),
-            MailboxDrainInspection::Unresolved {
+            mailbox.inspect_terminal_commit_replay(true),
+            TerminalCommitReplayInspection::Unresolved {
                 reason: MailboxDrainReason::Unreadable,
                 ..
             }
