@@ -8,7 +8,23 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifacts::ArtifactStore;
 use crate::domain::ids::{AgentRunId, Digest, OperationId};
-use crate::mailbox::{MailboxCapability, MailboxDrainInspection, MailboxLimits};
+use crate::mailbox::{
+    MailboxCapability, MailboxLimits, TerminalCommitReplay, TerminalCommitReplayInspection,
+};
+
+pub(crate) struct ValidatedTerminalCommitResponse {
+    bytes: Vec<u8>,
+}
+
+impl ValidatedTerminalCommitResponse {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 
 type MailboxRunAuthorityStateRow = (
     String,
@@ -258,7 +274,7 @@ impl crate::store::ConfigStore {
             &registration.capability_digest,
         )
         .map_err(AgentMailboxProcessingError::LocalMailbox)?;
-        if now_unix.max(0) as u64 >= registration.expires_at_unix {
+        let terminal_commit_replay = if now_unix.max(0) as u64 >= registration.expires_at_unix {
             if mode == MailboxDispatchMode::TerminalReceiptReplay {
                 let canonical_control_directory = std::fs::canonicalize(&reservation.control_dir)
                     .map_err(|error| {
@@ -268,29 +284,41 @@ impl crate::store::ConfigStore {
                 })?;
                 let shared_control_layout =
                     canonical_mailbox_directory == canonical_control_directory;
-                return match mailbox.inspect_drain(shared_control_layout) {
-                    MailboxDrainInspection::Drained { .. } => Ok(false),
-                    MailboxDrainInspection::Unresolved {
+                match mailbox.inspect_terminal_commit_replay(shared_control_layout) {
+                    TerminalCommitReplayInspection::Drained => return Ok(false),
+                    TerminalCommitReplayInspection::Ready(replay) => Some(replay),
+                    TerminalCommitReplayInspection::Unresolved {
                         fingerprint,
                         reason,
-                    } => Err(AgentMailboxProcessingError::LocalMailbox(format!(
-                        "expired terminal mailbox remains unresolved ({}; inventory {})",
-                        reason.code(),
-                        fingerprint
-                    ))),
-                };
+                    } => {
+                        return Err(AgentMailboxProcessingError::LocalMailbox(format!(
+                            "expired terminal mailbox remains unresolved ({}; inventory {})",
+                            reason.code(),
+                            fingerprint
+                        )));
+                    }
+                }
+            } else {
+                return Err(AgentMailboxProcessingError::LocalMailbox(
+                    "mailbox capability has expired".into(),
+                ));
             }
-            return Err(AgentMailboxProcessingError::LocalMailbox(
-                "mailbox capability has expired".into(),
-            ));
-        }
-        let Some(mailbox_request) = mailbox
-            .pending(now_unix.max(0) as u64)
-            .map_err(AgentMailboxProcessingError::LocalMailbox)?
-            .into_iter()
-            .next()
-        else {
-            return Ok(false);
+        } else {
+            None
+        };
+        let mailbox_request = match terminal_commit_replay.as_ref() {
+            Some(replay) => replay.request().clone(),
+            None => {
+                let Some(mailbox_request) = mailbox
+                    .pending(now_unix.max(0) as u64)
+                    .map_err(AgentMailboxProcessingError::LocalMailbox)?
+                    .into_iter()
+                    .next()
+                else {
+                    return Ok(false);
+                };
+                mailbox_request
+            }
         };
 
         let method = serde_json::to_value(&mailbox_request.envelope.method)
@@ -307,10 +335,15 @@ impl crate::store::ConfigStore {
             request
                 .validate()
                 .map_err(AgentMailboxProcessingError::LocalMailbox)?;
-            let profile = profiles
-                .get(&authority.profile_id)
-                .ok_or("repository.commit Agent profile is no longer configured")?;
-            let required_trailer = match profile.adapter {
+            let adapter = if mode == MailboxDispatchMode::TerminalReceiptReplay {
+                super::agent_results::load_qualification(&self.connection, &authority)?.adapter
+            } else {
+                profiles
+                    .get(&authority.profile_id)
+                    .ok_or("repository.commit Agent profile is no longer configured")?
+                    .adapter
+            };
+            let required_trailer = match adapter {
                 crate::domain::types::AgentAdapter::Codex => {
                     "Co-authored-by: Codex <noreply@openai.com>"
                 }
@@ -318,7 +351,7 @@ impl crate::store::ConfigStore {
                     "Co-authored-by: Claude <noreply@anthropic.com>"
                 }
             };
-            return self.process_repository_commit(
+            let processed = self.process_repository_commit(
                 owner_generation,
                 &authority,
                 &reservation,
@@ -328,7 +361,15 @@ impl crate::store::ConfigStore {
                 &request,
                 required_trailer,
                 mode,
-            );
+                terminal_commit_replay.as_ref(),
+            )?;
+            if terminal_commit_replay.is_some() && !processed {
+                return Err(AgentMailboxProcessingError::LocalMailbox(
+                    "expired repository.commit request has no previously accepted terminal outcome"
+                        .into(),
+                ));
+            }
+            return Ok(processed);
         }
         if mode == MailboxDispatchMode::TerminalReceiptReplay {
             let response = crate::protocol::ResponseEnvelope {
@@ -469,6 +510,7 @@ impl crate::store::ConfigStore {
         request: &crate::agent_api::RepositoryCommitRequest,
         required_trailer: &str,
         mode: MailboxDispatchMode,
+        expired_replay: Option<&TerminalCommitReplay<'_>>,
     ) -> Result<bool, AgentMailboxProcessingError> {
         use crate::delivery_runtime::{
             CommitWorkerManifestEffectPayload, PrepareWorktreesEffectPayload,
@@ -678,13 +720,20 @@ impl crate::store::ConfigStore {
                 extensions: Default::default(),
             };
             let bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
-            mailbox
-                .publish_receipt(
-                    &request.message_id,
-                    &bytes,
-                    crate::mailbox::unix_time_now()?,
-                )
-                .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+            if let Some(replay) = expired_replay {
+                let validated = ValidatedTerminalCommitResponse::new(bytes);
+                replay
+                    .publish_response(&validated)
+                    .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+            } else {
+                mailbox
+                    .publish_receipt(
+                        &request.message_id,
+                        &bytes,
+                        crate::mailbox::unix_time_now()?,
+                    )
+                    .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+            }
             return Ok(true);
         }
         let Some(receipt) = self.succeeded_effect_receipt(&intent.operation_id)? else {
@@ -736,13 +785,20 @@ impl crate::store::ConfigStore {
             extensions: Default::default(),
         };
         let response_bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
-        mailbox
-            .publish_receipt(
-                &request.message_id,
-                &response_bytes,
-                crate::mailbox::unix_time_now()?,
-            )
-            .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+        if let Some(replay) = expired_replay {
+            let validated = ValidatedTerminalCommitResponse::new(response_bytes);
+            replay
+                .publish_response(&validated)
+                .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+        } else {
+            mailbox
+                .publish_receipt(
+                    &request.message_id,
+                    &response_bytes,
+                    crate::mailbox::unix_time_now()?,
+                )
+                .map_err(AgentMailboxProcessingError::LocalMailbox)?;
+        }
         Ok(true)
     }
 }
@@ -771,6 +827,44 @@ fn terminal_rejected_commit_reason(status: &str, receipt_json: Option<&str>) -> 
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    fn terminal_commit_request(run_id: &str, request_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            operation_id: None,
+            method: crate::protocol::MethodName::new("repository.commit").unwrap(),
+            project_id: None,
+            run_id: Some(run_id.into()),
+            attempt: None,
+            run_epoch: None,
+            expected_subject_revision: None,
+            role: None,
+            request_type: None,
+            params: serde_json::json!({"message_id": request_id}),
+        })
+        .unwrap()
+    }
+
+    fn terminal_commit_rejection(
+        request_id: &str,
+        message: &str,
+    ) -> ValidatedTerminalCommitResponse {
+        let response = crate::protocol::ResponseEnvelope::<serde_json::Value> {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            result: None,
+            error: Some(crate::protocol::ProtocolError {
+                code: crate::protocol::ErrorCode::Unavailable,
+                message: message.into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: Default::default(),
+            }),
+            extensions: Default::default(),
+        };
+        ValidatedTerminalCommitResponse::new(serde_json::to_vec(&response).unwrap())
+    }
 
     #[test]
     fn terminal_commit_replay_requires_a_persisted_typed_rejection_receipt() {
@@ -804,6 +898,235 @@ mod tests {
         );
         assert!(terminal_rejected_commit_reason("cancelled", Some(&receipt)).is_none());
         assert!(terminal_rejected_commit_reason("failed", None).is_none());
+    }
+
+    #[test]
+    fn terminal_commit_replay_refuses_request_changed_after_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_id = "terminal-replay-request-binding";
+        let expires_at = crate::mailbox::unix_time_now().unwrap() + 60;
+        let mailbox = MailboxCapability::create(
+            run_id,
+            &temp.path().join("mailbox"),
+            expires_at,
+            crate::mailbox::MailboxLimits::default(),
+        )
+        .unwrap();
+        let request_id = "registered-commit-request";
+        let envelope = crate::protocol::RequestEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            operation_id: None,
+            method: crate::protocol::MethodName::new("repository.commit").unwrap(),
+            project_id: None,
+            run_id: Some(run_id.into()),
+            attempt: None,
+            run_epoch: None,
+            expected_subject_revision: None,
+            role: None,
+            request_type: None,
+            params: serde_json::json!({"message_id": request_id}),
+        };
+        let request_bytes = serde_json::to_vec(&envelope).unwrap();
+        mailbox
+            .queue(
+                request_id,
+                &request_bytes,
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let replay = match mailbox.inspect_terminal_commit_replay(false) {
+            TerminalCommitReplayInspection::Ready(replay) => replay,
+            _ => panic!("expected one inspected repository.commit request"),
+        };
+        let response = crate::protocol::ResponseEnvelope::<serde_json::Value> {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new(request_id).unwrap(),
+            result: None,
+            error: Some(crate::protocol::ProtocolError {
+                code: crate::protocol::ErrorCode::Unavailable,
+                message: "fixture validated terminal rejection".into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: Default::default(),
+            }),
+            extensions: Default::default(),
+        };
+        let proof = ValidatedTerminalCommitResponse::new(serde_json::to_vec(&response).unwrap());
+        let mut changed_envelope = envelope;
+        changed_envelope.params["message_id"] = serde_json::json!("changed-after-inspection");
+        let changed_request = serde_json::to_vec(&changed_envelope).unwrap();
+        std::fs::write(
+            temp.path().join("mailbox").join(format!(
+                "request-{:x}.json",
+                Sha256::digest(request_id.as_bytes())
+            )),
+            changed_request,
+        )
+        .unwrap();
+
+        assert!(
+            replay
+                .publish_response(&proof)
+                .unwrap_err()
+                .contains("request changed before response publication")
+        );
+        assert!(
+            !temp
+                .path()
+                .join("mailbox")
+                .join(format!(
+                    "receipt-{:x}.json",
+                    Sha256::digest(request_id.as_bytes())
+                ))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn terminal_commit_replay_refuses_other_entry_or_descriptor_changes() {
+        for mutate_descriptor in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let run_id = "terminal-replay-inventory-binding";
+            let mailbox_path = temp.path().join("mailbox");
+            let mailbox = MailboxCapability::create(
+                run_id,
+                &mailbox_path,
+                crate::mailbox::unix_time_now().unwrap() + 60,
+                crate::mailbox::MailboxLimits::default(),
+            )
+            .unwrap();
+            let request_id = "registered-commit-request";
+            mailbox
+                .queue(
+                    request_id,
+                    &terminal_commit_request(run_id, request_id),
+                    crate::mailbox::unix_time_now().unwrap(),
+                )
+                .unwrap();
+            let replay = match mailbox.inspect_terminal_commit_replay(false) {
+                TerminalCommitReplayInspection::Ready(replay) => replay,
+                _ => panic!("expected one inspected repository.commit request"),
+            };
+            let proof = terminal_commit_rejection(request_id, "validated terminal rejection");
+            if mutate_descriptor {
+                let descriptor = std::fs::read(mailbox_path.join("descriptor.json")).unwrap();
+                let changed = format!("{}\n", String::from_utf8(descriptor).unwrap());
+                std::fs::write(mailbox_path.join("descriptor.json"), changed).unwrap();
+            } else {
+                mailbox
+                    .queue(
+                        "other-request",
+                        &serde_json::to_vec(&crate::protocol::RequestEnvelope {
+                            schema_version: crate::protocol::SCHEMA_VERSION,
+                            request_id: crate::protocol::RequestId::new("other-request").unwrap(),
+                            operation_id: None,
+                            method: crate::protocol::MethodName::new("agent.submit").unwrap(),
+                            project_id: None,
+                            run_id: Some(run_id.into()),
+                            attempt: None,
+                            run_epoch: None,
+                            expected_subject_revision: None,
+                            role: None,
+                            request_type: None,
+                            params: serde_json::json!({}),
+                        })
+                        .unwrap(),
+                        crate::mailbox::unix_time_now().unwrap(),
+                    )
+                    .unwrap();
+            }
+
+            assert!(
+                replay
+                    .publish_response(&proof)
+                    .unwrap_err()
+                    .contains("inventory changed before response publication")
+            );
+            assert!(
+                !mailbox_path
+                    .join(format!(
+                        "receipt-{:x}.json",
+                        Sha256::digest(request_id.as_bytes())
+                    ))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_commit_replay_revalidates_complete_history_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_id = "terminal-replay-complete-history";
+        let mailbox = MailboxCapability::create(
+            run_id,
+            &temp.path().join("mailbox"),
+            crate::mailbox::unix_time_now().unwrap() + 60,
+            crate::mailbox::MailboxLimits::default(),
+        )
+        .unwrap();
+        for index in 0..8 {
+            let request_id = format!("history-{index}");
+            let request = serde_json::to_vec(&crate::protocol::RequestEnvelope {
+                schema_version: crate::protocol::SCHEMA_VERSION,
+                request_id: crate::protocol::RequestId::new(&request_id).unwrap(),
+                operation_id: None,
+                method: crate::protocol::MethodName::new("agent.submit").unwrap(),
+                project_id: None,
+                run_id: Some(run_id.into()),
+                attempt: None,
+                run_epoch: None,
+                expected_subject_revision: None,
+                role: None,
+                request_type: None,
+                params: serde_json::json!({"value": "x".repeat(32 * 1024)}),
+            })
+            .unwrap();
+            mailbox
+                .queue(
+                    &request_id,
+                    &request,
+                    crate::mailbox::unix_time_now().unwrap(),
+                )
+                .unwrap();
+            let receipt = crate::protocol::ResponseEnvelope::<serde_json::Value> {
+                schema_version: crate::protocol::SCHEMA_VERSION,
+                request_id: crate::protocol::RequestId::new(&request_id).unwrap(),
+                result: Some(serde_json::json!({"accepted": true})),
+                error: None,
+                extensions: Default::default(),
+            };
+            mailbox
+                .publish_receipt(
+                    &request_id,
+                    &serde_json::to_vec(&receipt).unwrap(),
+                    crate::mailbox::unix_time_now().unwrap(),
+                )
+                .unwrap();
+        }
+        let request_id = "registered-commit-request";
+        mailbox
+            .queue(
+                request_id,
+                &terminal_commit_request(run_id, request_id),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let replay = match mailbox.inspect_terminal_commit_replay(false) {
+            TerminalCommitReplayInspection::Ready(replay) => replay,
+            _ => panic!("complete history plus one commit request must be replayable"),
+        };
+        let proof = terminal_commit_rejection(request_id, "validated terminal rejection");
+        replay.publish_response(&proof).unwrap();
+        replay.publish_response(&proof).unwrap();
+
+        let conflicting = terminal_commit_rejection(request_id, "different terminal rejection");
+        assert!(
+            replay
+                .publish_response(&conflicting)
+                .unwrap_err()
+                .contains("response conflicts with an existing receipt")
+        );
     }
 
     fn adopt_fixture_run(

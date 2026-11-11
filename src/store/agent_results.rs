@@ -3112,7 +3112,7 @@ fn load_stored_receipt(
     })
 }
 
-fn load_qualification(
+pub(super) fn load_qualification(
     connection: &rusqlite::Connection,
     authority: &AgentLaunchAuthority,
 ) -> Result<ProviderQualification, String> {
@@ -6683,6 +6683,72 @@ pub(crate) mod tests {
             effect_count_before_invalid_replay
         );
 
+        // The Worker already has a typed terminal rejection for this exact commit intent. If
+        // its response disappeared after expiry, the registered Store may republish that exact
+        // outcome without re-running the host effect.
+        let invalid_receipt_path = mailbox_directory.join(format!(
+            "receipt-{:x}.json",
+            Sha256::digest(invalid_request_id.as_bytes())
+        ));
+        let accepted_rejection_bytes = std::fs::read(&invalid_receipt_path).unwrap();
+        std::fs::remove_file(&invalid_receipt_path).unwrap();
+        let expired_mailbox_time =
+            i64::try_from(stored_reservation.mailbox_expires_at_unix + 1).unwrap();
+        let changed_adapter_profiles = BTreeMap::from([(
+            prior_authority.profile_id.clone(),
+            serde_json::from_value(serde_json::json!({
+                "adapter":"claude_code", "command":["fixture"], "commit_mode":"host"
+            }))
+            .unwrap(),
+        )]);
+        assert!(
+            worker
+                .store
+                .process_one_agent_mailbox_request(
+                    restarted_generation,
+                    worker_id.as_str(),
+                    expired_mailbox_time,
+                    &worker.artifacts,
+                    &changed_adapter_profiles,
+                )
+                .unwrap()
+        );
+        let replayed_rejection: crate::protocol::ResponseEnvelope<serde_json::Value> =
+            crate::protocol::parse_unique(
+                &mailbox
+                    .read_receipt(invalid_request_id, crate::mailbox::unix_time_now().unwrap())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&invalid_receipt_path).unwrap(),
+            accepted_rejection_bytes
+        );
+        assert_eq!(replayed_rejection.request_id.as_str(), invalid_request_id);
+        assert!(!replayed_rejection.error.unwrap().retryable);
+        assert!(
+            !worker
+                .store
+                .process_one_agent_mailbox_request(
+                    restarted_generation,
+                    worker_id.as_str(),
+                    expired_mailbox_time,
+                    &worker.artifacts,
+                    &profiles,
+                )
+                .unwrap()
+        );
+        let effect_count_after_rejection_replay: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            effect_count_after_rejection_replay,
+            effect_count_before_invalid_replay
+        );
+
         std::fs::write(worktree.join("README.md"), manifested_bytes).unwrap();
         let prepared_request_id = "terminal-restart-registered-artifact-prepare";
         let prepared_request = crate::agent_api::RepositoryCommitRequest {
@@ -7142,6 +7208,19 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("durable receipt does not match its exact accepted intent")
         );
+        let expired_mismatched_receipt = worker.store.process_one_agent_mailbox_request(
+            restarted_generation,
+            worker_id.as_str(),
+            i64::try_from(stored_reservation.mailbox_expires_at_unix + 1).unwrap(),
+            &worker.artifacts,
+            &profiles,
+        );
+        assert!(
+            expired_mismatched_receipt
+                .unwrap_err()
+                .to_string()
+                .contains("durable receipt does not match its exact accepted intent")
+        );
         assert!(
             mailbox
                 .read_receipt(
@@ -7162,9 +7241,9 @@ pub(crate) mod tests {
         let replay_result = worker.store.process_one_agent_mailbox_request(
             restarted_generation,
             worker_id.as_str(),
-            crate::store::now_unix().unwrap(),
+            i64::try_from(stored_reservation.mailbox_expires_at_unix + 1).unwrap(),
             &worker.artifacts,
-            &profiles,
+            &BTreeMap::new(),
         );
         assert!(replay_result.unwrap());
         let receipt_bytes = mailbox
@@ -7435,6 +7514,103 @@ pub(crate) mod tests {
                 .unwrap(),
             slot_disposition_before_expiry
         );
+
+        // A new valid request without a previously accepted effect is not an expired replay
+        // authority. Leave it visible and preserve the execution slot for human reconciliation.
+        std::fs::remove_file(&unresolved_request_path).unwrap();
+        let missing_effect_id = "terminal-restart-missing-accepted-effect";
+        let mut missing_effect_request = request.clone();
+        missing_effect_request.message_id = missing_effect_id.into();
+        let mut missing_effect_envelope = terminal_envelope.clone();
+        missing_effect_envelope.request_id =
+            crate::protocol::RequestId::new(missing_effect_id).unwrap();
+        missing_effect_envelope.params = serde_json::to_value(&missing_effect_request).unwrap();
+        mailbox
+            .queue(
+                missing_effect_id,
+                &serde_json::to_vec(&missing_effect_envelope).unwrap(),
+                crate::mailbox::unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let effects_before_missing_replay: u64 = worker
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
+            .unwrap();
+        let missing_effect = worker
+            .store
+            .process_one_agent_mailbox_request(
+                restarted_generation,
+                worker_id.as_str(),
+                expired_at,
+                &worker.artifacts,
+                &profiles,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(missing_effect.contains("no previously accepted terminal outcome"));
+        assert!(
+            !mailbox_directory
+                .join(format!(
+                    "receipt-{:x}.json",
+                    Sha256::digest(missing_effect_id.as_bytes())
+                ))
+                .exists()
+        );
+        assert_eq!(
+            worker
+                .store
+                .connection
+                .query_row("SELECT COUNT(*) FROM effects", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            effects_before_missing_replay
+        );
+        assert_eq!(
+            worker
+                .store
+                .connection
+                .query_row(
+                    "SELECT disposition FROM execution_slots WHERE owner_id=?1",
+                    [worker_id.as_str()],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            slot_disposition_before_expiry
+        );
+        let descriptor_path = mailbox_directory.join("descriptor.json");
+        let descriptor_bytes = std::fs::read(&descriptor_path).unwrap();
+        let mut stale_descriptor: serde_json::Value =
+            crate::protocol::parse_unique(&descriptor_bytes).unwrap();
+        stale_descriptor["expires_at_unix"] =
+            serde_json::json!(stored_reservation.mailbox_expires_at_unix + 2);
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec(&stale_descriptor).unwrap(),
+        )
+        .unwrap();
+        let stale_registration = worker.store.process_one_agent_mailbox_request(
+            restarted_generation,
+            worker_id.as_str(),
+            expired_at,
+            &worker.artifacts,
+            &profiles,
+        );
+        assert!(
+            stale_registration
+                .unwrap_err()
+                .to_string()
+                .contains("registered mailbox descriptor digest")
+        );
+        assert!(
+            !mailbox_directory
+                .join(format!(
+                    "receipt-{:x}.json",
+                    Sha256::digest(missing_effect_id.as_bytes())
+                ))
+                .exists()
+        );
+        std::fs::write(&descriptor_path, descriptor_bytes).unwrap();
     }
 
     #[test]
