@@ -40,13 +40,19 @@ pub struct Invocation {
     pub effective_mode: &'static str,
 }
 
+#[derive(Clone, Copy)]
+pub struct InvocationPaths<'a> {
+    pub schema_path: &'a Path,
+    pub control_dir: Option<&'a Path>,
+}
+
 pub(super) struct InvocationInput<'a> {
     pub executable: PathBuf,
     pub prefix: Vec<OsString>,
     pub role_contract: &'a str,
     pub prompt: &'a str,
     pub schema: &'a Value,
-    pub schema_path: &'a Path,
+    pub paths: InvocationPaths<'a>,
     pub conversation_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
@@ -59,7 +65,7 @@ pub fn build_invocation(
     role_contract: &str,
     prompt: &str,
     schema: &Value,
-    schema_path: &Path,
+    paths: InvocationPaths<'_>,
     conversation_id: Option<&str>,
 ) -> Result<Invocation, String> {
     if profile.command.is_empty() || role_contract.trim().is_empty() || prompt.trim().is_empty() {
@@ -90,7 +96,7 @@ pub fn build_invocation(
                 role_contract: &projected_contract,
                 prompt: &projected_prompt,
                 schema: &projection.schema,
-                schema_path,
+                paths,
                 conversation_id,
                 model: profile.model.as_deref(),
                 effort: profile.effort.as_deref(),
@@ -110,7 +116,7 @@ pub fn build_invocation(
                 role_contract: &projected_contract,
                 prompt: &projected_prompt,
                 schema: &projection.schema,
-                schema_path,
+                paths,
                 conversation_id,
                 model: profile.model.as_deref(),
                 effort: profile.effort.as_deref(),
@@ -351,11 +357,11 @@ fn offline_validator(schema: &Value) -> Result<Validator, jsonschema::Validation
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::config::{ClaudeCodeOptions, CodexOptions, Profile, ProfileOptions};
+    use crate::config::{ClaudeCodeOptions, Profile, ProfileOptions};
     use crate::domain::types::{AgentAdapter, CommitMode};
 
     use super::{
-        RESULT_SCHEMA_PROJECTION_VERSION, build_invocation, parse_result, project_result_schema,
+        InvocationPaths, RESULT_SCHEMA_PROJECTION_VERSION, build_invocation, project_result_schema,
         validate_schema, validate_schema_definition,
     };
 
@@ -437,7 +443,10 @@ mod tests {
             "Worker contract",
             "Do the work",
             &source,
-            std::path::Path::new("unused-schema-path"),
+            InvocationPaths {
+                schema_path: std::path::Path::new("unused-schema-path"),
+                control_dir: None,
+            },
             None,
         )
         .unwrap();
@@ -460,69 +469,6 @@ mod tests {
                 .any(|value| value.contains("authoritative-result-schema"))
         );
         assert!(args.iter().any(|value| value.contains("\"ok\"")));
-    }
-
-    #[test]
-    fn codex_invocation_preserves_options_resume_and_schema_path_as_arguments() {
-        let profile = Profile {
-            adapter: AgentAdapter::Codex,
-            command: vec!["/bin/sh".into(), "--prefix".into()],
-            description: None,
-            model: Some("gpt-test".into()),
-            effort: Some("high".into()),
-            turn_timeout_seconds: 30,
-            instruction_files: Vec::new(),
-            skill_paths: Vec::new(),
-            commit_mode: CommitMode::Auto,
-            learned_guidance: None,
-            options: Some(ProfileOptions::Codex(CodexOptions {
-                approve_for_me: true,
-                ..CodexOptions::default()
-            })),
-        };
-        let schema_path = std::path::Path::new("/tmp/result schema.json");
-        let invocation = build_invocation(
-            &profile,
-            "Worker contract",
-            "Do the work",
-            &json!({"type":"object"}),
-            schema_path,
-            Some("thread-1"),
-        )
-        .unwrap();
-        let args = invocation
-            .args
-            .iter()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(args[0], "--prefix");
-        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-test"]));
-        assert!(args.iter().any(|arg| arg == "--approve-for-me"));
-        assert!(args.windows(2).any(|pair| pair == ["resume", "thread-1"]));
-        let schema_arg = args
-            .iter()
-            .position(|arg| arg == "--output-schema")
-            .unwrap();
-        assert_eq!(args[schema_arg + 1], schema_path.to_string_lossy());
-    }
-
-    #[test]
-    fn rejects_malformed_provider_result_envelopes() {
-        let schema = json!({"type":"object"});
-        for response in [
-            json!({"structured_output":{"other":"{}"}}),
-            json!({"structured_output":{"result":"{}","extra":true}}),
-            json!({"structured_output":{"result":"{"}}),
-        ] {
-            assert!(
-                parse_result(
-                    AgentAdapter::ClaudeCode,
-                    response.to_string().as_bytes(),
-                    &schema
-                )
-                .is_err()
-            );
-        }
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub struct RuntimeConfig {
     pub max_blocks_per_tab: usize,
     #[serde(default = "default_completed_blocks_to_keep")]
     pub completed_blocks_to_keep: usize,
+    #[serde(default = "default_max_host_jobs")]
+    pub max_host_jobs: usize,
     #[serde(default = "default_tab_retention_hours")]
     pub completed_ticket_tab_retention_hours: u64,
     #[serde(default = "default_max_hooks")]
@@ -74,6 +76,7 @@ impl Default for RuntimeConfig {
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
             max_blocks_per_tab: default_max_blocks_per_tab(),
             completed_blocks_to_keep: default_completed_blocks_to_keep(),
+            max_host_jobs: default_max_host_jobs(),
             completed_ticket_tab_retention_hours: default_tab_retention_hours(),
             max_rex_projects_hook_runs: default_max_hooks(),
             environment: EnvironmentConfig::default(),
@@ -98,6 +101,9 @@ fn default_shutdown_grace_seconds() -> u64 {
 }
 fn default_max_blocks_per_tab() -> usize {
     8
+}
+fn default_max_host_jobs() -> usize {
+    4
 }
 fn default_completed_blocks_to_keep() -> usize {
     1
@@ -733,6 +739,7 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
         ),
         ("runtime.max_agent_runs", runtime.max_agent_runs as u64),
         ("runtime.max_ticket_runs", runtime.max_ticket_runs as u64),
+        ("runtime.max_host_jobs", runtime.max_host_jobs as u64),
         (
             "runtime.shutdown_grace_seconds",
             runtime.shutdown_grace_seconds,
@@ -784,8 +791,10 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
         validate_argv("human.command", &human.command)?;
     }
     if let Some(knowledge) = &config.knowledge {
-        if knowledge.format != "okf" && knowledge.format != "llmwiki" {
-            return Err("knowledge.format must be `okf` or `llmwiki`".into());
+        if knowledge.format != "okf" {
+            return Err(
+                "knowledge.format must be `okf`; other formats are not supported yet".into(),
+            );
         }
         if knowledge.max_source_bytes == 0 {
             return Err("knowledge.max_source_bytes must be positive".into());
@@ -1243,12 +1252,11 @@ fn resolve_roles<'a>(
     Ok(roles)
 }
 
-/// Resolve inherited role profiles for a project from an already validated configuration.
 pub fn effective_project_roles(
-    id: &ProjectId,
+    project_id: &ProjectId,
     projects: &BTreeMap<ProjectId, ProjectConfig>,
 ) -> Result<BTreeMap<Role, ProfileId>, String> {
-    resolve_roles(id, projects, &mut BTreeSet::new())
+    resolve_roles(project_id, projects, &mut BTreeSet::new())
 }
 
 fn validate_selector(target_id: &str, selector: &BTreeMap<String, String>) -> Result<(), String> {
@@ -1636,6 +1644,24 @@ mod tests {
             super::validate_config(&config, &loaded.profiles)
                 .unwrap_err()
                 .contains("adapters.tickets.kind must be `command`")
+        );
+    }
+
+    #[test]
+    fn unsupported_knowledge_format_is_rejected_during_config_validation() {
+        let config_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let loaded = super::load(&config_path).unwrap();
+        let mut config = loaded.config;
+        config.knowledge = Some(super::KnowledgeConfig {
+            format: "llmwiki".into(),
+            root: "knowledge".into(),
+            max_source_bytes: 1024,
+        });
+        assert!(
+            super::validate_config(&config, &loaded.profiles)
+                .unwrap_err()
+                .contains("knowledge.format must be `okf`")
         );
     }
 

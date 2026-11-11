@@ -12,6 +12,8 @@ use crate::protocol::{RequestEnvelope, RequestId, ResponseEnvelope, parse_unique
 const REQUEST_PREFIX: &str = "request-";
 const RECEIPT_PREFIX: &str = "receipt-";
 const MAX_ID_BYTES: usize = 255;
+const MAX_REGISTERED_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_REGISTERED_PENDING_REQUESTS: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub struct MailboxLimits {
@@ -43,6 +45,32 @@ pub struct MailboxDescriptor {
     pub expires_at_unix: u64,
     pub max_request_bytes: usize,
     pub max_pending_requests: usize,
+}
+
+impl MailboxDescriptor {
+    pub fn serialized(
+        run_id: &str,
+        expires_at_unix: u64,
+        limits: MailboxLimits,
+    ) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&Self {
+            schema_version: 1,
+            run_id: run_id.to_owned(),
+            expires_at_unix,
+            max_request_bytes: limits.max_request_bytes,
+            max_pending_requests: limits.max_pending_requests,
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn capability_digest(
+        run_id: &str,
+        expires_at_unix: u64,
+        limits: MailboxLimits,
+    ) -> Result<String, String> {
+        let bytes = Self::serialized(run_id, expires_at_unix, limits)?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,14 +110,7 @@ impl MailboxCapability {
         }
         #[cfg(not(unix))]
         set_private_directory_permissions(&capability.directory)?;
-        let descriptor = MailboxDescriptor {
-            schema_version: 1,
-            run_id: capability.run_id.clone(),
-            expires_at_unix: expires_at,
-            max_request_bytes: limits.max_request_bytes,
-            max_pending_requests: limits.max_pending_requests,
-        };
-        let descriptor = serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?;
+        let descriptor = MailboxDescriptor::serialized(&capability.run_id, expires_at, limits)?;
         match capability.atomic_publish("descriptor.json", &descriptor) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -150,6 +171,36 @@ impl MailboxCapability {
         {
             return Err("mailbox descriptor does not match its run-scoped capability".into());
         }
+        capability.expires_at = descriptor.expires_at_unix;
+        Ok(capability)
+    }
+
+    /// Opens an existing Agent mailbox using the limits recorded in its run-scoped descriptor.
+    /// This is useful to read Agent-owned control data without SQLite or changing the registered
+    /// limits expected by the host.
+    pub fn open_registered_for_run(
+        run_id: impl Into<String>,
+        directory: &Path,
+    ) -> Result<Self, String> {
+        let mut capability =
+            Self::open_unregistered(run_id, directory, u64::MAX, MailboxLimits::default())?;
+        let bytes = capability
+            .read_bounded("descriptor.json", 4096)
+            .map_err(|error| format!("read mailbox descriptor: {error}"))?;
+        let descriptor: MailboxDescriptor = parse_unique(&bytes)?;
+        if descriptor.schema_version != 1
+            || descriptor.run_id != capability.run_id
+            || descriptor.max_request_bytes == 0
+            || descriptor.max_request_bytes > MAX_REGISTERED_REQUEST_BYTES
+            || descriptor.max_pending_requests == 0
+            || descriptor.max_pending_requests > MAX_REGISTERED_PENDING_REQUESTS
+        {
+            return Err("mailbox descriptor is not a bounded capability for this AgentRun".into());
+        }
+        capability.limits = MailboxLimits {
+            max_request_bytes: descriptor.max_request_bytes,
+            max_pending_requests: descriptor.max_pending_requests,
+        };
         capability.expires_at = descriptor.expires_at_unix;
         Ok(capability)
     }
@@ -266,6 +317,19 @@ impl MailboxCapability {
                 }
             }
             Err(error) => Err(format!("write mailbox request: {error}")),
+        }
+    }
+
+    pub(crate) fn has_queued_request(&self, request_id: &str, now: u64) -> Result<bool, String> {
+        self.check_live(now)?;
+        if !valid_request_id(request_id) {
+            return Err("invalid mailbox request id".into());
+        }
+        let name = format!("{REQUEST_PREFIX}{}.json", key(request_id));
+        match self.read_bounded(&name, self.limits.max_request_bytes) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("inspect queued mailbox request: {error}")),
         }
     }
 
@@ -714,7 +778,8 @@ fn atomic_publish_at(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), s
 
 #[cfg(test)]
 mod tests {
-    use super::{MailboxCapability, MailboxLimits, QueueResult};
+    use super::{MailboxCapability, MailboxDescriptor, MailboxLimits, QueueResult};
+    use sha2::Digest as _;
     use std::fs;
 
     fn request(id: &str, value: &str) -> Vec<u8> {
@@ -723,6 +788,21 @@ mod tests {
 
     fn capability(path: &std::path::Path) -> MailboxCapability {
         MailboxCapability::create("agent-run-1", path, 10, MailboxLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn descriptor_digest_is_for_the_exact_published_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = MailboxLimits {
+            max_request_bytes: 4096,
+            max_pending_requests: 7,
+        };
+        MailboxCapability::create("agent-run-1", root.path(), 10, limits).unwrap();
+        let descriptor = fs::read(root.path().join("descriptor.json")).unwrap();
+        assert_eq!(
+            MailboxDescriptor::capability_digest("agent-run-1", 10, limits).unwrap(),
+            format!("{:x}", sha2::Sha256::digest(&descriptor))
+        );
     }
 
     #[test]
@@ -740,6 +820,7 @@ mod tests {
     fn queues_valid_request_and_replays_same_receipt_key() {
         let root = tempfile::tempdir().unwrap();
         let mailbox = capability(root.path());
+        assert!(!mailbox.has_queued_request("r-1", 1).unwrap());
         let bytes = request("r-1", "same");
         assert!(matches!(
             mailbox.queue("r-1", &bytes, 1).unwrap(),
@@ -753,6 +834,10 @@ mod tests {
         let receipt = br#"{"schema_version":1,"request_id":"r-1","result":{"accepted":true}}"#;
         mailbox.publish_receipt("r-1", receipt, 1).unwrap();
         assert_eq!(mailbox.read_receipt("r-1", 1).unwrap().unwrap(), receipt);
+        assert!(mailbox.pending(1).unwrap().is_empty());
+        assert!(mailbox.has_queued_request("r-1", 1).unwrap());
+        assert!(mailbox.has_queued_request("../invalid", 1).is_err());
+        assert!(mailbox.has_queued_request("r-1", 11).is_err());
     }
 
     #[test]

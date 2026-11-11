@@ -113,6 +113,13 @@
           "minItems": 1,
           "type": "array"
         },
+        "host_commit_operation_id": {
+          "description": "Host-mode commits must name the durable `repository.commit` receipt whose SHA is reported above.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "previous_head": {
           "maxLength": 64,
           "minLength": 40,
@@ -127,6 +134,7 @@
         },
         "worktree_id": {
           "$ref": "#/$defs/WorkNodeId",
+          "description": "New Worker results use the logical `assigned_node.node_id` in schema v1.\nHost validation also accepts the exact managed worktree directory ID\nderived from the same immutable assignment for existing schema-v1 results.",
           "maxLength": 80,
           "minLength": 1,
           "pattern": "^[A-Za-z0-9._-]+$"
@@ -263,6 +271,7 @@
         "prepare_worktrees",
         "plan_ready",
         "implementation_ready",
+        "verification_ready",
         "review_ready",
         "merge_assessment",
         "merge_intent",
@@ -502,6 +511,52 @@
             "structured_result"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "verification_ready"
+            },
+            "structured_result": {
+              "additionalProperties": false,
+              "properties": {
+                "publication_operation_id": {
+                  "type": "string"
+                },
+                "published_head": {
+                  "type": "string"
+                },
+                "repository": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                  "type": "string"
+                },
+                "test_receipt_artifact_ids": {
+                  "items": {
+                    "$ref": "#/$defs/ArtifactId"
+                  },
+                  "type": "array"
+                },
+                "work_node_id": {
+                  "$ref": "#/$defs/WorkNodeId"
+                }
+              },
+              "required": [
+                "work_node_id",
+                "repository",
+                "publication_operation_id",
+                "published_head",
+                "test_receipt_artifact_ids"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "structured_result"
+          ],
+          "type": "object"
         }
       ]
     }
@@ -523,7 +578,8 @@
         "progress",
         "irregularity",
         "human_request",
-        "implementation_ready"
+        "implementation_ready",
+        "verification_ready"
       ]
     },
     "message_id": {
@@ -551,7 +607,6 @@
     "kind",
     "assertion",
     "structured_result",
-    "result_digest",
     "artifact_refs"
   ],
   "title": "rex-projects worker result message",

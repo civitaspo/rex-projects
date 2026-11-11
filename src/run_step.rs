@@ -21,6 +21,8 @@ const MAX_PROVIDER_STDOUT: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_STDERR_TAIL: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+const QUALIFICATION_CLEANUP_RESERVE_SECONDS: u64 = 7;
+const MAX_QUALIFICATION_SHUTDOWN_GRACE_SECONDS: u64 = 300;
 
 pub trait ProcessObserver {
     type Identity: Clone + std::fmt::Debug + Eq + ProcessIdentityView;
@@ -31,6 +33,12 @@ pub trait ProcessObserver {
     fn inspect(&mut self) -> Result<Vec<Self::Identity>, String>;
     fn try_wait(&mut self, child: &mut std::process::Child) -> std::io::Result<Option<ExitStatus>> {
         child.try_wait()
+    }
+    fn cancellation_requested(&mut self) -> bool {
+        false
+    }
+    fn cancellation_cause(&self) -> Option<CancellationCause> {
+        None
     }
     fn pid(identity: &Self::Identity) -> u32;
     fn group(identity: &Self::Identity) -> u32;
@@ -47,6 +55,32 @@ pub trait ProcessObserver {
         current: &[Self::Identity],
         signal: ProcessSignal,
     ) -> Result<bool, String>;
+    fn observe_provider_image(
+        &mut self,
+        _pid: u32,
+        _start_identity: &str,
+        _expected_path: &Path,
+        _expected_digest: &Digest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn checkpoint_family(
+        &mut self,
+        _provider_pid: u32,
+        _tree: &[Self::Identity],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn complete_family(
+        &mut self,
+        _provider_pid: u32,
+        _tree: &[Self::Identity],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn interrupt_family(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Production observer backed by identity-checked process-table operations.
@@ -111,6 +145,9 @@ pub struct RunDescriptor {
     pub controller_generation: u64,
     pub workspace: PathBuf,
     pub control_dir: PathBuf,
+    /// Host-validated Worker assignment copied from the immutable launch reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_assignment: Option<crate::launch::WorkerLaunchBinding>,
     pub rex_session_id: String,
     pub rex_block_id: RexBlockId,
     pub profile_digest: Digest,
@@ -196,8 +233,38 @@ pub(crate) struct QualificationPermit {
     issued_at: std::time::Instant,
 }
 
-#[allow(dead_code)]
-const MAX_QUALIFICATION_DEADLINE: Duration = Duration::from_secs(30 * 60);
+pub(crate) fn qualification_deadline_seconds(
+    turn_timeout_seconds: u64,
+    shutdown_grace_seconds: u64,
+) -> Result<u64, String> {
+    let deadline = qualification_deadline(
+        turn_timeout_seconds,
+        Duration::from_secs(shutdown_grace_seconds),
+    )?;
+    deadline
+        .as_secs()
+        .checked_add(u64::from(deadline.subsec_nanos() != 0))
+        .ok_or_else(|| "provider qualification deadline overflow".into())
+}
+
+pub(crate) fn qualification_deadline(
+    turn_timeout_seconds: u64,
+    shutdown_grace: Duration,
+) -> Result<Duration, String> {
+    if turn_timeout_seconds == 0
+        || shutdown_grace.is_zero()
+        || shutdown_grace > Duration::from_secs(MAX_QUALIFICATION_SHUTDOWN_GRACE_SECONDS)
+    {
+        return Err("provider qualification timeout is outside the supported bounds".into());
+    }
+    Duration::from_secs(turn_timeout_seconds)
+        .checked_add(shutdown_grace)
+        .and_then(|duration| duration.checked_add(shutdown_grace))
+        .and_then(|duration| {
+            duration.checked_add(Duration::from_secs(QUALIFICATION_CLEANUP_RESERVE_SECONDS))
+        })
+        .ok_or_else(|| "provider qualification deadline overflow".into())
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -225,6 +292,13 @@ pub enum TurnOutcome {
     TimedOut,
     Cancelled,
     MissingResult,
+}
+
+/// A non-signal cancellation tied to one immutable Rex launch anchor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CancellationCause {
+    RexLaunchAnchorClosed { pid: u32, start_identity: String },
 }
 
 /// Bounded non-sensitive reason a provider's structured result was rejected.
@@ -267,6 +341,8 @@ pub struct RunReceipt {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cancellation_signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_cause: Option<CancellationCause>,
     pub cleanup: CleanupState,
     pub cleanup_detail: Option<String>,
     pub processes: Vec<ObservedProcess>,
@@ -356,7 +432,10 @@ pub(crate) fn profile_runtime_identity(
         "runtime identity probe",
         "runtime identity probe",
         &serde_json::json!({"type":"object"}),
-        Path::new("qualification-schema.json"),
+        providers::InvocationPaths {
+            schema_path: Path::new("qualification-schema.json"),
+            control_dir: None,
+        },
         None,
     )
     .map_err(RunError::Invalid)?;
@@ -381,15 +460,21 @@ pub(crate) fn issue_qualification_permit(
             "qualification bootstrap requires unknown, not persisted provider evidence".into(),
         ));
     }
-    if context.deadline.is_zero() || context.deadline > MAX_QUALIFICATION_DEADLINE {
+    if context.deadline.is_zero() {
         return Err(RunError::Invalid(
-            "disposable qualification deadline must be positive and at most 30 minutes".into(),
+            "disposable qualification deadline must be positive".into(),
         ));
     }
-    let cleanup_budget = qualification_cleanup_budget(request.shutdown_grace)?;
-    if context.deadline <= cleanup_budget {
+    let required_deadline =
+        qualification_deadline(request.profile.turn_timeout_seconds, request.shutdown_grace)
+            .map_err(RunError::Invalid)?;
+    if context.deadline < required_deadline
+        || std::time::Instant::now()
+            .checked_add(context.deadline)
+            .is_none()
+    {
         return Err(RunError::Invalid(
-            "qualification deadline leaves no bounded time for provider execution and cleanup"
+            "qualification deadline must cover the provider turn and bounded cleanup reserve"
                 .into(),
         ));
     }
@@ -430,10 +515,14 @@ pub(crate) fn issue_qualification_permit(
         true,
     )?;
     let request_binding = qualification_request_binding(request, &context)?;
+    let issued_at = std::time::Instant::now();
+    issued_at
+        .checked_add(context.deadline)
+        .ok_or_else(|| RunError::Invalid("qualification deadline is not representable".into()))?;
     Ok(QualificationPermit {
         request_binding,
         context,
-        issued_at: std::time::Instant::now(),
+        issued_at,
     })
 }
 
@@ -462,22 +551,25 @@ pub(crate) fn run_qualification_turn<O: ProcessObserver>(
         ));
     }
     let remaining = context.deadline.saturating_sub(permit.issued_at.elapsed());
-    let cleanup_budget = qualification_cleanup_budget(request.shutdown_grace)?;
-    if remaining <= cleanup_budget {
+    let maximum_turn = Duration::from_secs(request.profile.turn_timeout_seconds)
+        .checked_add(request.shutdown_grace)
+        .ok_or_else(|| RunError::Invalid("qualification timeout overflow".into()))?;
+    if maximum_turn > remaining {
         return Err(RunError::Invalid(
-            "qualification deadline leaves no bounded time for provider execution and cleanup"
+            "qualification permit no longer has enough time for the bounded turn and cleanup grace"
                 .into(),
         ));
     }
     let mut prepared = prepare_with_qualification(request, false, true)?;
-    prepared.absolute_deadline = Some(permit.issued_at + context.deadline);
+    prepared.absolute_deadline = Some(
+        permit
+            .issued_at
+            .checked_add(context.deadline)
+            .ok_or_else(|| {
+                RunError::Invalid("qualification deadline is not representable".into())
+            })?,
+    );
     run_prepared(request, prepared, observer)
-}
-
-fn qualification_cleanup_budget(shutdown_grace: Duration) -> Result<Duration, RunError> {
-    shutdown_grace
-        .checked_add(Duration::from_secs(7))
-        .ok_or_else(|| RunError::Invalid("qualification cleanup budget overflow".into()))
 }
 
 pub fn prepare(request: &TurnRequest) -> Result<PreparedTurn, RunError> {
@@ -493,16 +585,16 @@ fn prepare_with_qualification(
     let conversation_id = validate_continuation(request)?;
     let provider_schema = providers::project_result_schema(&request.descriptor.result_schema)
         .map_err(RunError::Invalid)?;
-    let schema_path = if request.profile.adapter == AgentAdapter::Codex {
-        let control_dir = request
-            .descriptor
-            .control_dir
-            .canonicalize()
-            .map_err(RunError::Io)?;
-        Some(write_schema_snapshot(
-            &control_dir,
-            &provider_schema.schema,
+    let control_dir = if request.profile.adapter == AgentAdapter::Codex {
+        Some(canonical_real_directory(
+            &request.descriptor.control_dir,
+            "control directory",
         )?)
+    } else {
+        None
+    };
+    let schema_path = if let Some(control_dir) = &control_dir {
+        Some(write_schema_snapshot(control_dir, &provider_schema.schema)?)
     } else {
         None
     };
@@ -511,7 +603,10 @@ fn prepare_with_qualification(
         &request.role_contract,
         &request.prompt,
         &request.descriptor.result_schema,
-        schema_path.as_deref().unwrap_or_else(|| Path::new("")),
+        providers::InvocationPaths {
+            schema_path: schema_path.as_deref().unwrap_or_else(|| Path::new("")),
+            control_dir: control_dir.as_deref(),
+        },
         conversation_id.as_deref(),
     )
     .map_err(RunError::Invalid)?;
@@ -645,7 +740,10 @@ fn run_prepared<O: ProcessObserver>(
     }
     let mut turn_timeout = if let Some(absolute_deadline) = prepared.absolute_deadline {
         let remaining = absolute_deadline.saturating_duration_since(std::time::Instant::now());
-        let cleanup_budget = qualification_cleanup_budget(prepared.shutdown_grace)?;
+        let cleanup_budget = prepared
+            .shutdown_grace
+            .checked_add(Duration::from_secs(QUALIFICATION_CLEANUP_RESERVE_SECONDS))
+            .ok_or_else(|| RunError::Invalid("qualification cleanup budget overflow".into()))?;
         if remaining <= cleanup_budget {
             return Err(RunError::Invalid(
                 "qualification deadline leaves no bounded time for provider execution and cleanup"
@@ -687,7 +785,10 @@ fn run_prepared<O: ProcessObserver>(
     }
     if let Some(absolute_deadline) = prepared.absolute_deadline {
         let remaining = absolute_deadline.saturating_duration_since(std::time::Instant::now());
-        let cleanup_budget = qualification_cleanup_budget(prepared.shutdown_grace)?;
+        let cleanup_budget = prepared
+            .shutdown_grace
+            .checked_add(Duration::from_secs(QUALIFICATION_CLEANUP_RESERVE_SECONDS))
+            .ok_or_else(|| RunError::Invalid("qualification cleanup budget overflow".into()))?;
         if remaining <= cleanup_budget {
             return Err(RunError::Invalid(
                 "qualification deadline leaves no bounded time for provider execution and cleanup"
@@ -695,6 +796,11 @@ fn run_prepared<O: ProcessObserver>(
             ));
         }
         turn_timeout = turn_timeout.min(remaining - cleanup_budget);
+    }
+    if observer.cancellation_requested() {
+        return Err(RunError::Process(
+            "run-step launch anchor closed before provider start".into(),
+        ));
     }
     let mut child = command.spawn().map_err(RunError::Io)?;
     let pid = child.id();
@@ -769,15 +875,51 @@ fn run_prepared<O: ProcessObserver>(
     if !observed.iter().any(|item| O::pid(item) == pid) {
         observed.push(root_identity);
     }
-    if let Some(error) = registration_error {
-        let cleanup = stop_observed_groups(
+    let family_start_error = observer
+        .observe_provider_image(
+            pid,
+            observed
+                .iter()
+                .find(|identity| O::pid(identity) == pid)
+                .map(|identity| identity.start_identity())
+                .unwrap_or_default(),
+            &prepared.executable,
+            &prepared.executable_digest,
+        )
+        .err()
+        .or_else(|| observer.checkpoint_family(pid, &observed).err());
+    if let Some(family_start_error) = family_start_error {
+        let _ = stop_observed_groups(
             observer,
             &mut child,
             process_group,
             &mut observed,
             &prepared,
-        )
-        .unwrap_or(false);
+        );
+        let _ = observer.interrupt_family();
+        discard_readers(stdout_reader, stderr_reader);
+        return Ok(unresolved_receipt(
+            request,
+            &prepared,
+            Some(format!(
+                "provider process-family checkpoint failed: {family_start_error}"
+            )),
+            false,
+            None,
+            Some(pid),
+            observed.into_iter().map(observed_process).collect(),
+            CleanupState::Unknown,
+        ));
+    }
+    if let Some(error) = registration_error {
+        let _ = stop_observed_groups(
+            observer,
+            &mut child,
+            process_group,
+            &mut observed,
+            &prepared,
+        );
+        let _ = observer.interrupt_family();
         discard_readers(stdout_reader, stderr_reader);
         return Ok(unresolved_receipt(
             request,
@@ -787,16 +929,15 @@ fn run_prepared<O: ProcessObserver>(
             None,
             Some(pid),
             observed.into_iter().map(observed_process).collect(),
-            if cleanup {
-                CleanupState::Confirmed
-            } else {
-                CleanupState::Unknown
-            },
+            CleanupState::Unknown,
         ));
     }
     let started = std::time::Instant::now();
     let deadline = if let Some(absolute_deadline) = prepared.absolute_deadline {
-        let cleanup_budget = qualification_cleanup_budget(prepared.shutdown_grace)?;
+        let cleanup_budget = prepared
+            .shutdown_grace
+            .checked_add(Duration::from_secs(7))
+            .ok_or_else(|| RunError::Invalid("qualification cleanup budget overflow".into()))?;
         let remaining = absolute_deadline
             .saturating_duration_since(started)
             .saturating_sub(cleanup_budget);
@@ -808,6 +949,7 @@ fn run_prepared<O: ProcessObserver>(
     let mut outcome = TurnOutcome::ProviderFailed;
     let mut timed_out = false;
     let mut cancellation_signal = None;
+    let mut cancellation_cause = None;
     let mut cleanup_known = true;
     let mut inspection_error = None;
 
@@ -857,12 +999,35 @@ fn run_prepared<O: ProcessObserver>(
             }
         };
         merge_observed(observer, pid, &table, &mut observed);
+        if let Err(error) = observer.checkpoint_family(pid, &observed) {
+            inspection_error = Some(format!(
+                "provider process-family checkpoint failed: {error}"
+            ));
+            cleanup_known = match stop_observed_groups(
+                observer,
+                &mut child,
+                process_group,
+                &mut observed,
+                &prepared,
+            ) {
+                Ok(stopped) => stopped,
+                Err(error) => {
+                    inspection_error = Some(error.to_string());
+                    false
+                }
+            };
+            let _ = observer.interrupt_family();
+            break;
+        }
         #[cfg(unix)]
         let received = PENDING_SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(unix))]
         let received = 0;
-        if received != 0 {
-            cancellation_signal = Some(received);
+        if received != 0 || observer.cancellation_requested() {
+            cancellation_signal = (received != 0).then_some(received);
+            cancellation_cause = (received == 0)
+                .then(|| observer.cancellation_cause())
+                .flatten();
             outcome = TurnOutcome::Cancelled;
             cleanup_known = match stop_observed_groups(
                 observer,
@@ -1038,6 +1203,34 @@ fn run_prepared<O: ProcessObserver>(
         structured_result = None;
         inspection_error.get_or_insert_with(|| "qualification deadline exceeded".into());
     }
+    if inspection_error.is_some() {
+        cleanup_known = false;
+    }
+    if cleanup_known {
+        match observer.inspect() {
+            Ok(final_table) => {
+                merge_observed(observer, pid, &final_table, &mut observed);
+                if observer.checkpoint_family(pid, &observed).is_err()
+                    || !observer.matching(&observed, &final_table).is_empty()
+                    || observer.complete_family(pid, &observed).is_err()
+                {
+                    cleanup_known = false;
+                    inspection_error.get_or_insert_with(|| {
+                        "provider process-family terminal coverage was not confirmed".into()
+                    });
+                }
+            }
+            Err(error) => {
+                cleanup_known = false;
+                inspection_error.get_or_insert(error);
+            }
+        }
+    }
+    if !cleanup_known {
+        let _ = observer.interrupt_family();
+        outcome = TurnOutcome::ProviderFailed;
+        structured_result = None;
+    }
     let result_digest = structured_result
         .as_ref()
         .and_then(|value| serde_json::to_vec(value).ok())
@@ -1060,6 +1253,7 @@ fn run_prepared<O: ProcessObserver>(
             exit_code,
             timed_out,
             cancellation_signal,
+            cancellation_cause,
             cleanup: if cleanup_known {
                 CleanupState::Confirmed
             } else {
@@ -1164,6 +1358,7 @@ fn unresolved_receipt(
             exit_code: None,
             timed_out,
             cancellation_signal,
+            cancellation_cause: None,
             cleanup,
             cleanup_detail: error,
             processes,
@@ -1270,7 +1465,13 @@ fn merge_observed<O: ProcessObserver>(
     observed: &mut Vec<O::Identity>,
 ) {
     for identity in observer.capture_tree(root_pid, current) {
-        if !observed.contains(&identity) {
+        if let Some(previous) = observed.iter_mut().find(|previous| {
+            previous.pid() == identity.pid()
+                && previous.start_identity() == identity.start_identity()
+                && previous.identity_quality() == identity.identity_quality()
+        }) {
+            *previous = identity;
+        } else {
             observed.push(identity);
         }
     }
@@ -1361,6 +1562,9 @@ fn observe_until_stopped<O: ProcessObserver>(
             .map(O::pid)
             .unwrap_or(root_group);
         merge_observed(observer, root, &current, observed);
+        if observer.checkpoint_family(root, observed).is_err() {
+            let _ = observer.interrupt_family();
+        }
         let live = observer.matching(observed, &current);
         if live.is_empty() {
             return Ok(true);
@@ -1631,7 +1835,6 @@ pub(crate) fn invocation_options_digest(profile: &Profile) -> Result<Digest, Run
     Ok(sha256(&bytes))
 }
 
-#[allow(dead_code)]
 fn canonical_real_directory(path: &Path, name: &str) -> Result<PathBuf, RunError> {
     let metadata = fs::symlink_metadata(path).map_err(RunError::Io)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -1756,25 +1959,10 @@ fn factory_environment(
 ) -> Result<BTreeMap<OsString, OsString>, RunError> {
     let mut environment = snapshot
         .iter()
-        .filter(|(key, _)| {
-            let key = key.to_string_lossy();
-            !key.starts_with("REX_PROJECTS_")
-                && !matches!(
-                    key.as_ref(),
-                    "GIT_DIR"
-                        | "GIT_WORK_TREE"
-                        | "GIT_INDEX_FILE"
-                        | "GIT_COMMON_DIR"
-                        | "GIT_OBJECT_DIRECTORY"
-                        | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
-                        | "GIT_CEILING_DIRECTORIES"
-                        | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
-                        | "GIT_PREFIX"
-                        | "GIT_IMPLICIT_WORK_TREE"
-                )
-        })
+        .filter(|(key, _)| !key.to_string_lossy().starts_with("REX_PROJECTS_"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
+    process::clear_git_repository_environment(&mut environment);
     environment.insert(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"));
     for (key, value) in [
         ("REX_PROJECTS_CONTEXT", "agent"),
@@ -1805,10 +1993,33 @@ fn factory_environment(
         OsString::from("REX_PROJECTS_CONTROL_DIR"),
         descriptor.control_dir.as_os_str().to_owned(),
     );
+    environment.insert(
+        OsString::from("REX_PROJECTS_WORKSPACE_PATH"),
+        descriptor.workspace.as_os_str().to_owned(),
+    );
     if let Some(ticket_run_id) = &descriptor.ticket_run_id {
         environment.insert(
             OsString::from("REX_PROJECTS_TICKET_RUN_ID"),
             OsString::from(ticket_run_id.as_str()),
+        );
+    }
+    if let Some(worker) = &descriptor.worker_assignment {
+        let commit_mode = match worker.commit_mode {
+            CommitMode::Auto => "auto",
+            CommitMode::Native => "native",
+            CommitMode::Host => "host",
+        };
+        environment.insert(
+            OsString::from("REX_PROJECTS_COMMIT_MODE"),
+            OsString::from(commit_mode),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_WORKTREE_ID"),
+            OsString::from(worker.node_id.as_str()),
+        );
+        environment.insert(
+            OsString::from("REX_PROJECTS_WORKTREE_PATH"),
+            worker.worktree_path.as_os_str().to_owned(),
         );
     }
     environment.insert(
@@ -1930,15 +2141,15 @@ mod tests {
     use crate::config::{ClaudeCodeOptions, CodexOptions, Profile};
     use crate::domain::ids::{AgentRunId, Digest, OperationId, ProjectId, RexBlockId, TicketRunId};
     use crate::domain::types::{AgentAdapter, CommitMode, Role};
-    use crate::process;
+    use crate::process::{self, ProcessIdentity};
 
     use super::{
-        CleanupState, ConversationContinuation, DisposableQualificationContext, ObservedProcess,
-        ProcessObserver, ProcessSignal, ProviderCapabilityEvidence, ProviderProcessFailure,
-        ProviderQualificationStatus, RunDescriptor, RunReceipt, SystemProcessObserver, TurnOutcome,
-        TurnRequest, classify_provider_process_failure, factory_environment,
-        issue_qualification_permit, prepare, prepare_with_qualification, run_fixture_turn,
-        run_qualification_turn, run_turn,
+        CancellationCause, CleanupState, ConversationContinuation, DisposableQualificationContext,
+        ObservedProcess, ProcessObserver, ProcessSignal, ProviderCapabilityEvidence,
+        ProviderProcessFailure, ProviderQualificationStatus, RunDescriptor, RunReceipt,
+        SystemProcessObserver, TurnOutcome, TurnRequest, classify_provider_process_failure,
+        factory_environment, issue_qualification_permit, prepare, prepare_with_qualification,
+        run_fixture_turn, run_qualification_turn, run_turn,
     };
 
     #[test]
@@ -1982,6 +2193,7 @@ mod tests {
             exit_code: Some(0),
             timed_out: false,
             cancellation_signal: None,
+            cancellation_cause: None,
             cleanup: CleanupState::Confirmed,
             cleanup_detail: None,
             processes: vec![ObservedProcess {
@@ -2024,6 +2236,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qualification_deadline_covers_configured_turn_and_both_cleanup_graces() {
+        assert_eq!(
+            super::qualification_deadline_seconds(1800, 30).unwrap(),
+            1867
+        );
+        assert_eq!(
+            super::qualification_deadline_seconds(1800, 300).unwrap(),
+            2407
+        );
+        assert_eq!(
+            super::qualification_deadline_seconds(2700, 30).unwrap(),
+            2767
+        );
+        assert!(super::qualification_deadline_seconds(u64::MAX, 30).is_err());
+        assert!(super::qualification_deadline_seconds(1800, 301).is_err());
+    }
+
     fn profile(adapter: AgentAdapter, command: &str) -> Profile {
         Profile {
             adapter,
@@ -2063,6 +2293,7 @@ mod tests {
             controller_generation: 3,
             workspace: root.join("workspace"),
             control_dir: root.join("control"),
+            worker_assignment: None,
             rex_session_id: "session-a".into(),
             rex_block_id: RexBlockId::parse("block-a").unwrap(),
             profile_digest: profile_digest.clone(),
@@ -2172,6 +2403,71 @@ mod tests {
         wrong_group: bool,
         fail_wait_once: bool,
         after_spawn_delay: Duration,
+    }
+
+    #[cfg(unix)]
+    struct DelayedSystemObserver {
+        after_spawn_delay: Duration,
+        root_pid: Option<u32>,
+        anchor_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl ProcessObserver for DelayedSystemObserver {
+        type Identity = ProcessIdentity;
+
+        fn after_spawn(&mut self, pid: u32) -> Result<(), String> {
+            self.root_pid = Some(pid);
+            std::thread::sleep(self.after_spawn_delay);
+            Ok(())
+        }
+
+        fn inspect(&mut self) -> Result<Vec<Self::Identity>, String> {
+            process::inspect_process_table().map_err(|error| error.to_string())
+        }
+
+        fn cancellation_requested(&mut self) -> bool {
+            self.anchor_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn cancellation_cause(&self) -> Option<CancellationCause> {
+            Some(CancellationCause::RexLaunchAnchorClosed {
+                pid: 10,
+                start_identity: "shim-born".into(),
+            })
+        }
+
+        fn pid(identity: &Self::Identity) -> u32 {
+            identity.pid
+        }
+
+        fn group(identity: &Self::Identity) -> u32 {
+            identity.process_group_id
+        }
+
+        fn capture_tree(&self, root_pid: u32, table: &[Self::Identity]) -> Vec<Self::Identity> {
+            process::capture_process_tree(root_pid, table)
+        }
+
+        fn matching(
+            &self,
+            observed: &[Self::Identity],
+            current: &[Self::Identity],
+        ) -> Vec<Self::Identity> {
+            process::matching_processes(observed, current)
+        }
+
+        fn signal_group_if_observed(
+            &self,
+            group: u32,
+            observed: &[Self::Identity],
+            current: &[Self::Identity],
+            signal: ProcessSignal,
+        ) -> Result<bool, String> {
+            process::signal_process_group_if_observed(group, observed, current, signal)
+                .map_err(|error| error.to_string())
+        }
     }
 
     #[cfg(unix)]
@@ -2296,11 +2592,9 @@ mod tests {
     #[test]
     fn overlays_fresh_scoped_markers_and_keeps_the_captured_user_environment() {
         let root = tempdir().unwrap();
-        let env = factory_environment(
-            &request(root.path(), AgentAdapter::Codex, "/bin/sh").environment,
-            &descriptor(root.path(), &profile(AgentAdapter::Codex, "/bin/sh")),
-        )
-        .unwrap();
+        let request = request(root.path(), AgentAdapter::Codex, "/bin/sh");
+        let descriptor = descriptor(root.path(), &profile(AgentAdapter::Codex, "/bin/sh"));
+        let env = factory_environment(&request.environment, &descriptor).unwrap();
         assert_eq!(
             env.get(OsStr::new("REX_PROJECTS_AGENT"))
                 .and_then(|v| v.to_str()),
@@ -2312,6 +2606,11 @@ mod tests {
             Some("worker")
         );
         assert_eq!(
+            env.get(OsStr::new("REX_PROJECTS_WORKSPACE_PATH"))
+                .and_then(|value| value.to_str()),
+            Some(descriptor.workspace.to_str().unwrap())
+        );
+        assert_eq!(
             env.get(OsStr::new("REX_SESSION")).and_then(|v| v.to_str()),
             Some("session-a")
         );
@@ -2319,6 +2618,326 @@ mod tests {
             env.get(OsStr::new("PATH")).and_then(|v| v.to_str()),
             Some("/usr/bin")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_worker_environment_can_queue_the_actual_repository_manifest_cli() {
+        use crate::mailbox::{MailboxCapability, MailboxLimits, unix_time_now};
+
+        let root = tempdir().unwrap();
+        let mut turn = request(root.path(), AgentAdapter::Codex, "/bin/sh");
+        turn.profile.commit_mode = CommitMode::Host;
+        turn.descriptor.provider_capability = fixture_capability(
+            &turn.profile,
+            turn.descriptor.profile_digest.clone(),
+            &turn.descriptor.result_schema,
+        );
+        turn.descriptor.worker_assignment = Some(
+            serde_json::from_value(json!({
+                "schema_version": 1,
+                "accepted_revision": 1,
+                "ticket_revision": 1,
+                "configuration_digest": "a".repeat(64),
+                "plan_digest": "b".repeat(64),
+                "node_id": "documentation-node",
+                "repository_id": "repository-a",
+                "commit_mode": "host",
+                "worktree_path": turn.descriptor.workspace,
+                "branch": "rex-projects/documentation-node",
+                "base_sha": "1".repeat(40),
+                "expected_head": "2".repeat(40),
+                "prepare_operation_id": "prepare-a",
+                "prepare_receipt_digest": "c".repeat(64),
+                "source_evidence_id": "evidence-a",
+                "source_agent_run_id": "coordinator-a",
+                "source_message_id": "plan-a",
+                "source_result_digest": "d".repeat(64),
+                "coordinator_agent_run_id": "coordinator-a",
+                "coordinator_role_session_id": "coordinator-session-a",
+                "coordinator_authority_digest": "e".repeat(64),
+            }))
+            .unwrap(),
+        );
+        let worker_assignment = turn.descriptor.worker_assignment.as_ref().unwrap();
+        assert_eq!(worker_assignment.base_sha, "1".repeat(40));
+        assert_eq!(worker_assignment.expected_head(), "2".repeat(40));
+        for key in [
+            "REX_PROJECTS_COMMIT_MODE",
+            "REX_PROJECTS_WORKTREE_ID",
+            "REX_PROJECTS_WORKTREE_PATH",
+        ] {
+            turn.environment.insert(key.into(), "stale".into());
+        }
+        let mailbox = MailboxCapability::create(
+            turn.descriptor.run_id.as_str(),
+            &turn.descriptor.control_dir,
+            unix_time_now().unwrap() + 60,
+            MailboxLimits::default(),
+        )
+        .unwrap();
+        fs::write(
+            turn.descriptor.workspace.join("documentation.md"),
+            "Verified documentation.\n",
+        )
+        .unwrap();
+        let paths = turn.descriptor.control_dir.join("paths.json");
+        fs::write(
+            &paths,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "worktree_id": "documentation-node",
+                "entries": [{"path":"documentation.md", "operation":"capture"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let prepared = prepare_with_qualification(&turn, true, false).unwrap();
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("rex-projects");
+        let run_manifest = |output_path: &str, message_id: &str| {
+            std::process::Command::new(&binary)
+                .args(["agent", "repository", "manifest", "--paths-file"])
+                .arg(&paths)
+                .args(["--output", output_path, "--message-id", message_id])
+                .args(["--wait-seconds", "0", "--json"])
+                .env_clear()
+                .envs(&prepared.environment)
+                .current_dir(&prepared.working_directory)
+                .output()
+                .unwrap()
+        };
+        let collision = turn.descriptor.workspace.join("collision.json");
+        fs::write(&collision, "ordinary user file\n").unwrap();
+        let collision_result = run_manifest("collision.json", "worker-collision");
+        assert!(!collision_result.status.success());
+        assert_eq!(fs::read(&collision).unwrap(), b"ordinary user file\n");
+        fs::remove_file(&collision).unwrap();
+
+        let symlink_target = turn.descriptor.workspace.join("documentation.md");
+        let symlink_output = turn.descriptor.workspace.join("symlink.json");
+        std::os::unix::fs::symlink(&symlink_target, &symlink_output).unwrap();
+        let symlink_result = run_manifest("symlink.json", "worker-symlink");
+        assert!(!symlink_result.status.success());
+        assert!(
+            fs::symlink_metadata(&symlink_output)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&symlink_output).unwrap();
+
+        let output = run_manifest("manifest.json", "worker-manifest");
+        assert!(
+            output.status.success(),
+            "actual manifest CLI failed: {} {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let manifest: crate::host_commit::ChangeManifest = serde_json::from_slice(
+            &fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&manifest).unwrap()["entries"][0]["path"],
+            "documentation.md"
+        );
+        assert_eq!(manifest.entries.len(), 1);
+        let pending = mailbox.pending(unix_time_now().unwrap()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&pending[0].envelope.method).unwrap(),
+            "artifact.add"
+        );
+        assert_eq!(pending[0].envelope.params["path"], "manifest.json");
+
+        // Exercise the actual public CLI parser and request handoff for a Worker
+        // whose authorized expected HEAD is later than its immutable prepared base.
+        let manifest_reference = turn.descriptor.workspace.join("manifest-reference.json");
+        let manifest_bytes = fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap();
+        let manifest_digest = crate::domain::ids::Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(&manifest_bytes)
+        ))
+        .unwrap();
+        let artifact_reference = crate::engine::orchestration::RoleArtifactReference {
+            artifact_id: crate::domain::ids::ArtifactId::parse("f".repeat(64)).unwrap(),
+            kind: crate::engine::orchestration::RoleArtifactKind::Change,
+            schema_version: 1,
+            path: "artifacts/manifest.json".into(),
+            digest: manifest_digest,
+            bytes: manifest_bytes.len() as u64,
+        };
+        fs::write(
+            &manifest_reference,
+            serde_json::to_vec(&artifact_reference).unwrap(),
+        )
+        .unwrap();
+        let commit_message = turn.descriptor.workspace.join("commit-message.txt");
+        fs::write(&commit_message, "docs: update verified documentation\n").unwrap();
+        let expected_rework_head = worker_assignment.expected_head().to_owned();
+        let commit = std::process::Command::new(&binary)
+            .args(["agent", "repository", "commit", "--expected-head"])
+            .arg(&expected_rework_head)
+            .args(["--manifest-reference-file"])
+            .arg(&manifest_reference)
+            .args(["--message-file"])
+            .arg(&commit_message)
+            .args([
+                "--message-id",
+                "worker-rework-commit",
+                "--wait-seconds",
+                "0",
+                "--json",
+            ])
+            .env_clear()
+            .envs(&prepared.environment)
+            .current_dir(&prepared.working_directory)
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "actual repository commit CLI failed: {} {}",
+            String::from_utf8_lossy(&commit.stderr),
+            String::from_utf8_lossy(&commit.stdout)
+        );
+        let commit_request = mailbox
+            .pending(unix_time_now().unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|request| request.request_id == "worker-rework-commit")
+            .expect("repository commit CLI queues a durable request");
+        assert_eq!(
+            commit_request.envelope.params["expected_head"],
+            expected_rework_head
+        );
+
+        for index in 0..30 {
+            let message_id = format!("queue-fill-{index}");
+            let mut request = serde_json::to_value(&pending[0].envelope).unwrap();
+            request["request_id"] = json!(message_id);
+            request["params"]["message_id"] = json!(message_id);
+            mailbox
+                .queue(
+                    &message_id,
+                    &serde_json::to_vec(&request).unwrap(),
+                    unix_time_now().unwrap(),
+                )
+                .unwrap();
+        }
+        let full = run_manifest("queue-retry.json", "worker-queue-retry");
+        assert!(!full.status.success());
+        assert!(String::from_utf8_lossy(&full.stdout).contains("pending request count"));
+        assert!(
+            !turn.descriptor.workspace.join("queue-retry.json").exists(),
+            "an unqueued, newly generated manifest must not strand a retry"
+        );
+        mailbox
+            .publish_receipt(
+                "queue-fill-0",
+                &serde_json::to_vec(&json!({
+                    "schema_version":1,"request_id":"queue-fill-0","result":{}
+                }))
+                .unwrap(),
+                unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let retry = run_manifest("queue-retry.json", "worker-queue-retry");
+        assert!(
+            retry.status.success(),
+            "queue capacity retry: {} {}",
+            String::from_utf8_lossy(&retry.stdout),
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        assert!(
+            mailbox
+                .pending(unix_time_now().unwrap())
+                .unwrap()
+                .iter()
+                .any(|request| request.request_id == "worker-queue-retry")
+        );
+
+        use sha2::Digest as _;
+        let manifest_bytes = fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap();
+        let premature_retry = run_manifest("manifest.json", "worker-manifest");
+        assert!(!premature_retry.status.success());
+        assert_eq!(
+            fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+            manifest_bytes
+        );
+        fs::write(
+            turn.descriptor.workspace.join("manifest.json"),
+            "changed while receipt was pending\n",
+        )
+        .unwrap();
+        let manifest_digest = crate::domain::ids::Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(&manifest_bytes)
+        ))
+        .unwrap();
+        let receipt = crate::protocol::ResponseEnvelope {
+            schema_version: crate::protocol::SCHEMA_VERSION,
+            request_id: crate::protocol::RequestId::new("worker-manifest").unwrap(),
+            result: Some(crate::agent_api::ArtifactAddReceipt {
+                schema_version: 1,
+                message_id: "worker-manifest".into(),
+                artifact: crate::engine::orchestration::RoleArtifactReference {
+                    artifact_id: crate::domain::ids::ArtifactId::parse("f".repeat(64)).unwrap(),
+                    kind: crate::engine::orchestration::RoleArtifactKind::Change,
+                    schema_version: 1,
+                    path: "artifacts/manifest.json".into(),
+                    digest: manifest_digest,
+                    bytes: manifest_bytes.len() as u64,
+                },
+            }),
+            error: None,
+            extensions: Default::default(),
+        };
+        mailbox
+            .publish_receipt(
+                "worker-manifest",
+                &serde_json::to_vec(&receipt).unwrap(),
+                unix_time_now().unwrap(),
+            )
+            .unwrap();
+        let changed_result = run_manifest("manifest.json", "worker-manifest");
+        assert!(!changed_result.status.success());
+        assert_eq!(
+            fs::read(turn.descriptor.workspace.join("manifest.json")).unwrap(),
+            b"changed while receipt was pending\n"
+        );
+        fs::write(
+            turn.descriptor.workspace.join("manifest.json"),
+            &manifest_bytes,
+        )
+        .unwrap();
+        let retried = run_manifest("manifest.json", "worker-manifest");
+        assert!(
+            retried.status.success(),
+            "actual manifest retry failed: {} {}",
+            String::from_utf8_lossy(&retried.stderr),
+            String::from_utf8_lossy(&retried.stdout)
+        );
+        assert!(!turn.descriptor.workspace.join("manifest.json").exists());
+
+        turn.descriptor.worker_assignment = None;
+        turn.descriptor.role = Role::Coordinator;
+        let coordinator = factory_environment(&turn.environment, &turn.descriptor).unwrap();
+        for key in [
+            "REX_PROJECTS_COMMIT_MODE",
+            "REX_PROJECTS_WORKTREE_ID",
+            "REX_PROJECTS_WORKTREE_PATH",
+        ] {
+            assert!(
+                !coordinator.contains_key(OsStr::new(key)),
+                "{key} leaked into Coordinator"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2333,16 +2952,15 @@ mod tests {
         )
         .unwrap();
         fs::write(&system, "[fixture]\n\tsystem = retained\n").unwrap();
-
         let mut snapshot = BTreeMap::from([
             (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
             (
                 OsString::from("GIT_CONFIG_GLOBAL"),
-                global.as_os_str().to_owned(),
+                global.as_os_str().into(),
             ),
             (
                 OsString::from("GIT_CONFIG_SYSTEM"),
-                system.as_os_str().to_owned(),
+                system.as_os_str().into(),
             ),
             (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
             (
@@ -2404,7 +3022,6 @@ mod tests {
             &descriptor(root.path(), &profile(AgentAdapter::Codex, "/bin/sh")),
         )
         .unwrap();
-
         for key in [
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_SYSTEM",
@@ -2432,7 +3049,6 @@ mod tests {
         ] {
             assert!(!env.contains_key(OsStr::new(key)), "{key}");
         }
-
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
         let git = process::resolve_executable(
@@ -2443,11 +3059,7 @@ mod tests {
         let config = |key: &str| {
             let output = process::run(process::ProcessRequest {
                 executable: git.clone(),
-                args: vec![
-                    OsString::from("config"),
-                    OsString::from("--get"),
-                    OsString::from(key),
-                ],
+                args: vec!["config".into(), "--get".into(), key.into()],
                 stdin: Vec::new(),
                 cwd: Some(workspace.clone()),
                 clear_environment: true,
@@ -2487,25 +3099,38 @@ mod tests {
     #[test]
     fn codex_and_claude_commands_use_verified_automatic_modes_and_contracts() {
         let root = tempdir().unwrap();
-        let codex = prepare_with_qualification(
-            &request(
-                root.path(),
-                AgentAdapter::Codex,
-                executable().to_str().unwrap(),
-            ),
-            true,
-            false,
-        )
-        .unwrap();
-        let codex = codex
+        let codex_request = request(
+            root.path(),
+            AgentAdapter::Codex,
+            executable().to_str().unwrap(),
+        );
+        let expected_control_dir = codex_request.descriptor.control_dir.canonicalize().unwrap();
+        let codex = prepare_with_qualification(&codex_request, true, false).unwrap();
+        let codex_args = codex
             .args
             .iter()
             .map(|v| v.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(codex.contains("--no-daemon"));
-        assert!(codex.contains("--ask-for-approval never"));
-        assert!(codex.contains("Worker must use the mailbox"));
+            .collect::<Vec<_>>();
+        assert!(codex_args.contains(&"--no-daemon".into()));
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "never"])
+        );
+        assert!(codex_args.join(" ").contains("Worker must use the mailbox"));
+        let add_dir = codex_args
+            .iter()
+            .position(|argument| argument == "--add-dir")
+            .unwrap();
+        let exec = codex_args
+            .iter()
+            .position(|argument| argument == "exec")
+            .unwrap();
+        assert_eq!(
+            codex_args[add_dir + 1],
+            expected_control_dir.to_string_lossy()
+        );
+        assert!(add_dir < exec);
         let claude = prepare_with_qualification(
             &request(
                 root.path(),
@@ -2516,15 +3141,27 @@ mod tests {
             false,
         )
         .unwrap();
-        let claude = claude
+        let claude_args = claude
             .args
             .iter()
             .map(|v| v.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(claude.contains("--permission-mode auto"));
-        assert!(claude.contains("--permission-prompts none"));
-        assert!(claude.contains("--append-system-prompt Worker must use the mailbox"));
+            .collect::<Vec<_>>();
+        assert!(
+            claude_args
+                .windows(2)
+                .any(|args| args == ["--permission-mode", "auto"])
+        );
+        assert!(
+            claude_args
+                .windows(2)
+                .any(|args| args == ["--permission-prompts", "none"])
+        );
+        assert!(
+            claude_args
+                .join(" ")
+                .contains("--append-system-prompt Worker must use the mailbox")
+        );
+        assert!(!claude_args.contains(&"--add-dir".into()));
     }
 
     #[test]
@@ -2543,6 +3180,244 @@ mod tests {
             workspace: turn.descriptor.workspace.clone(),
         });
         assert!(prepare_with_qualification(&turn, true, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_producer_checkpoints_late_own_group_child_before_completion() {
+        use crate::run_step_cli::DurableFamilyObserver;
+        use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunStepSpool};
+
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        let release = root.path().join("release");
+        let child_pid_file = root.path().join("child-pid");
+        let response = r#"{"type":"result","session_id":"session-a","is_error":false,"structured_output":{"result":"{\"ok\":true}"}}"#;
+        let script = format!(
+            "/bin/sleep 0.4\nset -m\n/bin/sleep 8 &\necho $! > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 80 ]; do /bin/sleep 0.05; i=$((i+1)); done\nprintf '%s' '{}'\n",
+            child_pid_file.display(),
+            release.display(),
+            response,
+        );
+        let mut turn = request(root.path(), AgentAdapter::ClaudeCode, "/bin/bash");
+        turn.profile.command = vec!["/bin/bash".into(), "-c".into(), script];
+        turn.descriptor.provider_capability = fixture_capability(
+            &turn.profile,
+            turn.descriptor.profile_digest.clone(),
+            &turn.descriptor.result_schema,
+        );
+        let spool = RunStepSpool::open(&turn.descriptor.control_dir).unwrap();
+        let wrapper = process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .unwrap();
+        let binding = RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: turn.descriptor.run_id.clone(),
+            reservation_epoch: turn.descriptor.run_epoch,
+            authority_digest: Digest::parse("f".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("a".repeat(64)).unwrap(),
+            wrapper_pid: wrapper.pid,
+            wrapper_start_identity: wrapper.start_identity,
+            rex_launch_anchor: None,
+        };
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                let mut observer = DurableFamilyObserver::new(&spool, binding, None, None);
+                run_fixture_turn(&turn, &mut observer).unwrap()
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            let (observing, late_child) = loop {
+                let child_pid = fs::read_to_string(&child_pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                if let (Some(pid), Some(record)) =
+                    (child_pid, spool.read_run_family_record().unwrap())
+                    && let Some(child) = record
+                        .process_tree
+                        .iter()
+                        .find(|process| process.pid == pid)
+                        .cloned()
+                {
+                    break (record, child);
+                }
+                if std::time::Instant::now() >= deadline {
+                    fs::write(&release, "continue").unwrap();
+                    let result = producer.join().unwrap();
+                    panic!(
+                        "late child must be durable while provider is alive; receipt={:?}; family={:?}",
+                        result.receipt,
+                        spool.read_run_family_record()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(observing.coverage, RunFamilyCoverage::Observing);
+            assert_ne!(
+                late_child.process_group_id,
+                observing.provider_root.process_group_id
+            );
+            assert_eq!(
+                late_child.quality,
+                process::ProcessIdentityQuality::KernelBirthToken
+            );
+            let current = process::inspect_process_table().unwrap();
+            assert!(
+                current
+                    .iter()
+                    .any(|process| process.pid == observing.provider_root.pid
+                        && process.start_identity == observing.provider_root.start_identity)
+            );
+            fs::write(&release, "continue").unwrap();
+            let result = producer.join().unwrap();
+            assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+            assert!(matches!(result.receipt.outcome, TurnOutcome::Completed));
+            let complete = spool.read_run_family_record().unwrap().unwrap();
+            assert_eq!(complete.coverage, RunFamilyCoverage::Complete);
+            assert!(
+                complete
+                    .process_tree
+                    .iter()
+                    .any(|process| process.pid == late_child.pid
+                        && process.start_identity == late_child.start_identity)
+            );
+            assert!(
+                process::matching_processes(
+                    &complete.process_tree,
+                    &process::inspect_process_table().unwrap()
+                )
+                .is_empty()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_producer_persists_large_executable_image_while_provider_is_live() {
+        use crate::run_step_cli::DurableFamilyObserver;
+        use crate::run_step_spool::{RunFamilyBinding, RunFamilyCoverage, RunStepSpool};
+
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let mut turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        let release = root.path().join("provider-release");
+        turn.profile.command = vec![
+            executable.to_string_lossy().into_owned(),
+            "--exact".into(),
+            "run_step::tests::provider_image_fixture_waits_for_release".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+            "--".into(),
+        ];
+        turn.environment.insert(
+            OsString::from("REX_TEST_PROVIDER_RELEASE"),
+            release.as_os_str().to_owned(),
+        );
+        turn.descriptor.provider_capability = fixture_capability(
+            &turn.profile,
+            turn.descriptor.profile_digest.clone(),
+            &turn.descriptor.result_schema,
+        );
+        let executable_digest = turn
+            .descriptor
+            .provider_capability
+            .executable_digest
+            .clone();
+        let spool = RunStepSpool::open(&turn.descriptor.control_dir).unwrap();
+        let wrapper = process::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .unwrap();
+        let binding = RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: turn.descriptor.run_id.clone(),
+            reservation_epoch: turn.descriptor.run_epoch,
+            authority_digest: Digest::parse("f".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("a".repeat(64)).unwrap(),
+            wrapper_pid: wrapper.pid,
+            wrapper_start_identity: wrapper.start_identity,
+            rex_launch_anchor: None,
+        };
+        spool.publish_run_family_binding_once(&binding).unwrap();
+
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                let mut observer = DurableFamilyObserver::new(&spool, binding, None, None);
+                run_fixture_turn(&turn, &mut observer).unwrap()
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let observing = loop {
+                if let Some(family) = spool.read_run_family_record().unwrap()
+                    && family.coverage == RunFamilyCoverage::Observing
+                {
+                    break family;
+                }
+                if std::time::Instant::now() >= deadline {
+                    fs::write(&release, "continue").unwrap();
+                    let result = producer.join().unwrap();
+                    panic!(
+                        "large executable family was not persisted while the provider was live; receipt={:?}; family={:?}",
+                        result.receipt,
+                        spool.read_run_family_record()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let current = process::inspect_process_table().unwrap();
+            let provider_is_live = current.iter().any(|process| {
+                process.pid == observing.provider_root.pid
+                    && process.start_identity == observing.provider_root.start_identity
+            });
+            let observing_executable_path = observing.provider_executable_path.clone();
+            let observing_executable_digest = observing.provider_executable_digest.clone();
+            fs::write(&release, "continue").unwrap();
+            let result = producer.join().unwrap();
+            assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+            let family = spool.read_run_family_record().unwrap().unwrap();
+            assert!(provider_is_live);
+            assert_eq!(observing_executable_path, executable);
+            assert_eq!(observing_executable_digest, executable_digest);
+            assert_eq!(family.coverage, RunFamilyCoverage::Complete);
+            assert_eq!(family.provider_executable_path, executable);
+            assert_eq!(family.provider_executable_digest, executable_digest);
+            assert_eq!(family.wrapper_process.pid, family.binding.wrapper_pid);
+            assert_eq!(
+                family.wrapper_process.start_identity,
+                family.binding.wrapper_start_identity
+            );
+            assert!(family.process_tree.iter().any(|process| {
+                process.pid == family.provider_root.pid
+                    && process.start_identity == family.provider_root.start_identity
+            }));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture invoked by the durable provider image test"]
+    fn provider_image_fixture_waits_for_release() {
+        let release = std::env::var_os("REX_TEST_PROVIDER_RELEASE")
+            .expect("provider release path is provided by the parent test");
+        let release = PathBuf::from(release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !release.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent test did not release the provider fixture"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!(
+            r#"{{"type":"result","session_id":"session-a","is_error":false,"structured_output":{{"result":"{{\"ok\":true}}"}}}}"#
+        );
     }
 
     #[cfg(unix)]
@@ -2600,7 +3475,6 @@ mod tests {
             AgentAdapter::ClaudeCode,
             executable.to_str().unwrap(),
         );
-        turn.profile.turn_timeout_seconds = 1800;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2613,24 +3487,10 @@ mod tests {
         assert!(prepare(&turn).is_err());
 
         let identity = super::profile_runtime_identity(&turn.profile).unwrap();
-        let cleanup_reserve = turn.shutdown_grace + Duration::from_secs(7);
-        assert!(
-            issue_qualification_permit(
-                &turn,
-                DisposableQualificationContext {
-                    workspace_root: root.path().to_path_buf(),
-                    rex_fixture: crate::adapters::rex::test_qualification_fixture(),
-                    deadline: cleanup_reserve,
-                    expected_permission_mode: identity.effective_permission_mode.into(),
-                    prompts_denied: true,
-                },
-            )
-            .is_err()
-        );
         let context = DisposableQualificationContext {
             workspace_root: root.path().to_path_buf(),
             rex_fixture: crate::adapters::rex::test_qualification_fixture(),
-            deadline: Duration::from_secs(1800),
+            deadline: Duration::from_secs(90),
             expected_permission_mode: identity.effective_permission_mode.into(),
             prompts_denied: true,
         };
@@ -2730,7 +3590,7 @@ mod tests {
         fs::remove_file(&workspace).unwrap();
         fs::remove_dir(&outside).unwrap();
         fs::create_dir(&workspace).unwrap();
-        turn.profile.turn_timeout_seconds = 1800;
+        turn.profile.turn_timeout_seconds = 1;
         turn.shutdown_grace = Duration::from_millis(1);
         let identity = super::profile_runtime_identity(&turn.profile).unwrap();
         let permit = issue_qualification_permit(
@@ -2752,7 +3612,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn qualification_turn_timeout_is_capped_to_deadline_with_cleanup_reserve() {
+    fn qualification_setup_delay_past_deadline_never_returns_a_completed_turn() {
         let _run_lock = TEST_RUN_LOCK.lock().unwrap();
         let root = tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -2760,7 +3620,7 @@ mod tests {
         let executable = root.path().join("long-running fake claude");
         fs::write(
             &executable,
-            "#!/bin/sh\n/bin/sleep 30\nprintf '%s' '{\"type\":\"result\",\"session_id\":\"session-a\",\"is_error\":false,\"structured_output\":{\"result\":\"{\\\"ok\\\":true}\"}}'\n",
+            "#!/bin/sh\nsleep 30\nprintf '%s' '{\"type\":\"result\",\"session_id\":\"session-a\",\"is_error\":false,\"structured_output\":{\"result\":\"{\\\"ok\\\":true}\"}}'\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2771,7 +3631,7 @@ mod tests {
         );
         turn.descriptor.provider_capability.status = ProviderQualificationStatus::Unknown;
         turn.descriptor.rex_block_id = RexBlockId::parse("block-a").unwrap();
-        turn.profile.turn_timeout_seconds = 1800;
+        turn.profile.turn_timeout_seconds = 1;
         turn.shutdown_grace = Duration::from_millis(1);
         let identity = super::profile_runtime_identity(&turn.profile).unwrap();
         let permit = issue_qualification_permit(
@@ -2785,140 +3645,32 @@ mod tests {
             },
         )
         .unwrap();
-        let mut observer = SystemProcessObserver;
+        let mut observer = DelayedSystemObserver {
+            after_spawn_delay: Duration::from_millis(8_200),
+            root_pid: None,
+            anchor_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         let result = run_qualification_turn(&turn, permit, &mut observer).unwrap();
-        assert!(matches!(result.receipt.outcome, TurnOutcome::TimedOut));
-        assert!(result.receipt.timed_out);
-        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+        assert!(!matches!(result.receipt.outcome, TurnOutcome::Completed));
+        assert!(matches!(result.receipt.cleanup, CleanupState::Unknown));
         assert!(result.structured_result.is_none());
         assert!(result.receipt.provider_version.is_none());
         assert!(result.receipt.capability_receipt_digest.is_none());
+        let root_pid = observer.root_pid.unwrap();
         let remaining = process::inspect_process_table().unwrap();
         let observed_pids = result
             .receipt
             .processes
             .iter()
             .map(|identity| identity.pid)
+            .chain(std::iter::once(root_pid))
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(!observed_pids.is_empty());
         assert!(
             observed_pids
                 .iter()
                 .all(|pid| !remaining.iter().any(|identity| identity.pid == *pid)),
             "the live provider and its captured descendants must be stopped before return"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wrapper_exit_still_cleans_observed_descendants_by_kernel_identity() {
-        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
-        let root = tempdir().unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let executable = root.path().join("wrapper-exits-with-child");
-        let child_pid_path = root.path().join("child.pid");
-        fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\n(trap '' INT; while :; do /bin/sleep 1; done) &\nchild=$!\necho \"$child\" > '{}'\nwait\n",
-                child_pid_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut turn = request(
-            root.path(),
-            AgentAdapter::ClaudeCode,
-            executable.to_str().unwrap(),
-        );
-        turn.shutdown_grace = Duration::from_millis(50);
-        struct CancelAfterChildObserved {
-            system: SystemProcessObserver,
-            child_pid_path: PathBuf,
-            cancellation_sent: bool,
-        }
-
-        impl ProcessObserver for CancelAfterChildObserved {
-            type Identity = process::ProcessIdentity;
-
-            fn inspect(&mut self) -> Result<Vec<Self::Identity>, String> {
-                let table = self.system.inspect()?;
-                let child_pid = fs::read_to_string(&self.child_pid_path)
-                    .ok()
-                    .and_then(|value| value.trim().parse::<u32>().ok());
-                if !self.cancellation_sent
-                    && child_pid.is_some_and(|pid| table.iter().any(|identity| identity.pid == pid))
-                {
-                    super::PENDING_SIGNAL
-                        .store(libc::SIGTERM, std::sync::atomic::Ordering::Relaxed);
-                    self.cancellation_sent = true;
-                }
-                Ok(table)
-            }
-
-            fn try_wait(
-                &mut self,
-                child: &mut std::process::Child,
-            ) -> std::io::Result<Option<ExitStatus>> {
-                self.system.try_wait(child)
-            }
-
-            fn pid(identity: &Self::Identity) -> u32 {
-                SystemProcessObserver::pid(identity)
-            }
-
-            fn group(identity: &Self::Identity) -> u32 {
-                SystemProcessObserver::group(identity)
-            }
-
-            fn capture_tree(&self, root_pid: u32, table: &[Self::Identity]) -> Vec<Self::Identity> {
-                self.system.capture_tree(root_pid, table)
-            }
-
-            fn matching(
-                &self,
-                observed: &[Self::Identity],
-                current: &[Self::Identity],
-            ) -> Vec<Self::Identity> {
-                self.system.matching(observed, current)
-            }
-
-            fn signal_group_if_observed(
-                &self,
-                group: u32,
-                observed: &[Self::Identity],
-                current: &[Self::Identity],
-                signal: ProcessSignal,
-            ) -> Result<bool, String> {
-                self.system
-                    .signal_group_if_observed(group, observed, current, signal)
-            }
-        }
-
-        let mut observer = CancelAfterChildObserved {
-            system: SystemProcessObserver,
-            child_pid_path: child_pid_path.clone(),
-            cancellation_sent: false,
-        };
-        let result = run_fixture_turn(&turn, &mut observer).unwrap();
-
-        assert!(matches!(result.receipt.outcome, TurnOutcome::Cancelled));
-        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
-        let child_pid: u32 = fs::read_to_string(child_pid_path)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let remaining = process::inspect_process_table().unwrap();
-        assert!(
-            !remaining.iter().any(|identity| identity.pid == child_pid),
-            "the observed child must be gone after confirmed cleanup"
-        );
-        assert!(result.receipt.processes.iter().any(|identity| {
-            identity.pid == child_pid
-                && identity.identity_quality == "kernel_birth_token"
-                && !identity.start_identity.is_empty()
-        }));
     }
 
     #[cfg(unix)]
@@ -2981,7 +3733,7 @@ mod tests {
         assert!(registration.receipt.launch_pid_hint.is_some());
         assert!(matches!(
             registration.receipt.cleanup,
-            CleanupState::Confirmed
+            CleanupState::Unknown
         ));
         assert!(registration.receipt.processes.iter().any(|process| {
             process.identity_quality == "test_only" && !process.start_identity.is_empty()
@@ -3024,7 +3776,7 @@ mod tests {
             ..TestObserver::default()
         };
         let wait = run_fixture_turn(&make_turn(), &mut wait_failure).unwrap();
-        assert!(matches!(wait.receipt.cleanup, CleanupState::Confirmed));
+        assert!(matches!(wait.receipt.cleanup, CleanupState::Unknown));
         assert!(wait.receipt.cleanup_detail.is_some());
         assert!(!wait.receipt.processes.is_empty());
     }
@@ -3074,5 +3826,155 @@ mod tests {
                 .unwrap()
                 .contains(&ProcessSignal::Kill)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_rex_launch_anchor_cancels_and_confirms_provider_cleanup() {
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let executable = root.path().join("long-running fake claude");
+        fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        turn.shutdown_grace = Duration::from_millis(50);
+        let anchor_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close_anchor = anchor_closed.clone();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            close_anchor.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut observer = DelayedSystemObserver {
+            after_spawn_delay: Duration::ZERO,
+            root_pid: None,
+            anchor_closed,
+        };
+
+        let result = run_fixture_turn(&turn, &mut observer).unwrap();
+        closer.join().unwrap();
+
+        assert!(matches!(result.receipt.outcome, TurnOutcome::Cancelled));
+        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+        assert_eq!(result.receipt.cancellation_signal, None);
+        assert_eq!(
+            result.receipt.cancellation_cause,
+            Some(CancellationCause::RexLaunchAnchorClosed {
+                pid: 10,
+                start_identity: "shim-born".into(),
+            })
+        );
+        let remaining = process::inspect_process_table().unwrap();
+        assert!(result.receipt.processes.iter().all(|observed| {
+            remaining.iter().all(|current| {
+                current.pid != observed.pid || current.start_identity != observed.start_identity
+            })
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_exit_still_cleans_observed_descendants_by_kernel_identity() {
+        let _run_lock = TEST_RUN_LOCK.lock().unwrap();
+        let root = tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let executable = root.path().join("wrapper-exits-with-child");
+        let child_pid_path = root.path().join("child.pid");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n(trap '' INT; while :; do /bin/sleep 1; done) &\nchild=$!\necho \"$child\" > '{}'\nwait\n",
+                child_pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut turn = request(
+            root.path(),
+            AgentAdapter::ClaudeCode,
+            executable.to_str().unwrap(),
+        );
+        turn.shutdown_grace = Duration::from_millis(50);
+        struct CancelAfterChildObserved {
+            system: SystemProcessObserver,
+            child_pid_path: PathBuf,
+            cancellation_sent: bool,
+        }
+        impl ProcessObserver for CancelAfterChildObserved {
+            type Identity = process::ProcessIdentity;
+            fn inspect(&mut self) -> Result<Vec<Self::Identity>, String> {
+                let table = self.system.inspect()?;
+                let child_pid = fs::read_to_string(&self.child_pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if !self.cancellation_sent
+                    && child_pid.is_some_and(|pid| table.iter().any(|identity| identity.pid == pid))
+                {
+                    super::PENDING_SIGNAL
+                        .store(libc::SIGTERM, std::sync::atomic::Ordering::Relaxed);
+                    self.cancellation_sent = true;
+                }
+                Ok(table)
+            }
+            fn try_wait(
+                &mut self,
+                child: &mut std::process::Child,
+            ) -> std::io::Result<Option<ExitStatus>> {
+                self.system.try_wait(child)
+            }
+            fn pid(identity: &Self::Identity) -> u32 {
+                SystemProcessObserver::pid(identity)
+            }
+            fn group(identity: &Self::Identity) -> u32 {
+                SystemProcessObserver::group(identity)
+            }
+            fn capture_tree(&self, root_pid: u32, table: &[Self::Identity]) -> Vec<Self::Identity> {
+                self.system.capture_tree(root_pid, table)
+            }
+            fn matching(
+                &self,
+                observed: &[Self::Identity],
+                current: &[Self::Identity],
+            ) -> Vec<Self::Identity> {
+                self.system.matching(observed, current)
+            }
+            fn signal_group_if_observed(
+                &self,
+                group: u32,
+                observed: &[Self::Identity],
+                current: &[Self::Identity],
+                signal: ProcessSignal,
+            ) -> Result<bool, String> {
+                self.system
+                    .signal_group_if_observed(group, observed, current, signal)
+            }
+        }
+        let mut observer = CancelAfterChildObserved {
+            system: SystemProcessObserver,
+            child_pid_path: child_pid_path.clone(),
+            cancellation_sent: false,
+        };
+        let result = run_fixture_turn(&turn, &mut observer).unwrap();
+        assert!(matches!(result.receipt.outcome, TurnOutcome::Cancelled));
+        assert!(matches!(result.receipt.cleanup, CleanupState::Confirmed));
+        let child_pid: u32 = fs::read_to_string(child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let remaining = process::inspect_process_table().unwrap();
+        assert!(
+            !remaining.iter().any(|identity| identity.pid == child_pid),
+            "the observed child must be gone after confirmed cleanup"
+        );
+        assert!(result.receipt.processes.iter().any(|identity| {
+            identity.pid == child_pid
+                && identity.identity_quality == "kernel_birth_token"
+                && !identity.start_identity.is_empty()
+        }));
     }
 }

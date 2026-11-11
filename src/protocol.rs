@@ -309,7 +309,18 @@ impl Write for BoundedWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{MethodName, RequestEnvelope, RequestId, ResponseEnvelope, parse_unique};
+    use super::{
+        MethodName, RequestEnvelope, RequestId, ResponseEnvelope, parse_unique, serialize_bounded,
+    };
+
+    #[test]
+    fn bounded_serialization_stops_at_the_limit() {
+        let value = serde_json::json!({"payload":"a long value"});
+        assert!(serialize_bounded(&value, 4).is_err());
+        let bytes = serialize_bounded(&value, 128).unwrap();
+        assert!(bytes.len() <= 128);
+        assert_eq!(parse_unique::<serde_json::Value>(&bytes).unwrap(), value);
+    }
 
     #[test]
     fn rejects_duplicate_keys_at_every_json_object_depth() {

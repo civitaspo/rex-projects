@@ -7,6 +7,71 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub(crate) const MAX_PROCESS_EVIDENCE_IDENTITIES: usize = 65_536;
+pub(crate) const MAX_PROCESS_EVIDENCE_TREE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_PROCESS_EVIDENCE_ENVELOPE_BYTES: usize = 34 * 1024 * 1024;
+
+pub(crate) fn serialized_json_size_at_most<T: serde::Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+) -> Result<usize, String> {
+    struct BoundedCounter {
+        bytes: usize,
+        exceeded: bool,
+        limit: usize,
+    }
+
+    impl std::io::Write for BoundedCounter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let Some(bytes) = self.bytes.checked_add(buffer.len()) else {
+                self.exceeded = true;
+                return Err(std::io::Error::other(
+                    "process evidence byte limit exceeded",
+                ));
+            };
+            if bytes > self.limit {
+                self.exceeded = true;
+                return Err(std::io::Error::other(
+                    "process evidence byte limit exceeded",
+                ));
+            }
+            self.bytes = bytes;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = BoundedCounter {
+        bytes: 0,
+        exceeded: false,
+        limit,
+    };
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        if counter.exceeded {
+            return Err("serialized JSON exceeds its byte limit".into());
+        }
+        return Err(error.to_string());
+    }
+    if counter.bytes > limit {
+        return Err("serialized JSON exceeds its byte limit".into());
+    }
+    Ok(counter.bytes)
+}
+
+pub(crate) fn validate_process_evidence_tree<T: serde::Serialize>(
+    tree: &[T],
+) -> Result<(), String> {
+    if tree.len() > MAX_PROCESS_EVIDENCE_IDENTITIES {
+        return Err("process evidence exceeds the 65,536 identity limit".into());
+    }
+    serialized_json_size_at_most(tree, MAX_PROCESS_EVIDENCE_TREE_BYTES)
+        .map(|_| ())
+        .map_err(|_| "process evidence exceeds the 32 MiB serialized tree limit".into())
+}
+
 fn is_process_gone(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
 }
@@ -25,6 +90,23 @@ pub struct ProcessRequest {
     pub stderr_tail_limit: usize,
 }
 
+pub(crate) fn clear_git_repository_environment(environment: &mut BTreeMap<OsString, OsString>) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_PREFIX",
+        "GIT_IMPLICIT_WORK_TREE",
+    ] {
+        environment.remove(std::ffi::OsStr::new(key));
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessOutput {
     pub status: Option<ExitStatus>,
@@ -36,13 +118,17 @@ pub struct ProcessOutput {
     pub cleanup_confirmed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, schemars::JsonSchema, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ProcessIdentityQuality {
     KernelBirthToken,
     SecondPrecision,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub parent_pid: u32,
@@ -91,7 +177,31 @@ impl std::error::Error for ProcessError {
     }
 }
 
-pub fn run(mut request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+pub fn run(request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+    run_inner(request, |_| {}, false, false)
+}
+
+/// Run a child in a new session with no controlling terminal. The child's process group remains
+/// isolated under its PID, so the existing process-group cleanup still owns its descendants.
+pub fn run_in_new_session(request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+    run_inner(request, |_| {}, false, true)
+}
+
+/// Run a child while reporting its kernel identity before waiting for completion.
+/// The callback runs on the calling thread and must return promptly.
+pub fn run_with_started_identity(
+    request: ProcessRequest,
+    on_started: impl FnOnce(ProcessIdentity),
+) -> Result<ProcessOutput, ProcessError> {
+    run_inner(request, on_started, true, false)
+}
+
+fn run_inner(
+    mut request: ProcessRequest,
+    on_started: impl FnOnce(ProcessIdentity),
+    require_started_identity: bool,
+    new_session: bool,
+) -> Result<ProcessOutput, ProcessError> {
     validate(&request)?;
     let mut command = Command::new(&request.executable);
     command
@@ -109,9 +219,56 @@ pub fn run(mut request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        if new_session {
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        } else {
+            command.process_group(0);
+        }
     }
     let mut child = command.spawn().map_err(ProcessError::Start)?;
+    let root_pid = child.id();
+    let mut observed_processes = Vec::new();
+    if require_started_identity {
+        if collect_tree(root_pid, &mut observed_processes).is_err() {
+            let cleaned = cleanup_child_tree(
+                &mut child,
+                root_pid,
+                &mut observed_processes,
+                request.shutdown_grace,
+            );
+            return Err(if cleaned {
+                ProcessError::Inspection("cannot record the started process identity".into())
+            } else {
+                ProcessError::CleanupUnconfirmed
+            });
+        }
+        let Some(root_identity) = observed_processes
+            .iter()
+            .find(|identity| identity.pid == root_pid)
+            .cloned()
+        else {
+            let cleaned = cleanup_child_tree(
+                &mut child,
+                root_pid,
+                &mut observed_processes,
+                request.shutdown_grace,
+            );
+            return Err(if cleaned {
+                ProcessError::Inspection("started process is absent from the process table".into())
+            } else {
+                ProcessError::CleanupUnconfirmed
+            });
+        };
+        on_started(root_identity);
+    }
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let mut stdin = child.stdin.take().expect("stdin was piped");
@@ -135,9 +292,8 @@ pub fn run(mut request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
 
     let deadline = Instant::now() + request.timeout;
     let mut timed_out = false;
-    let root_pid = child.id();
-    let mut observed_processes = Vec::new();
-    let mut observation_failed = collect_tree(root_pid, &mut observed_processes).is_err();
+    let mut observation_failed =
+        !require_started_identity && collect_tree(root_pid, &mut observed_processes).is_err();
     let mut next_process_scan = Instant::now() + Duration::from_millis(20);
     let mut status = loop {
         if Instant::now() >= next_process_scan {
@@ -257,6 +413,88 @@ pub fn inspect_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
             "kernel birth-token inspection is unsupported on this platform".into(),
         ))
     }
+}
+
+/// Read one current kernel identity without enumerating unrelated processes.
+/// A disappeared PID returns `None`; an inspection failure remains an error.
+pub fn process_identity_for_pid(pid: u32) -> Result<Option<ProcessIdentity>, ProcessError> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(ProcessError::Invalid(
+            "process ID must be a positive signed integer".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        inspect_linux_process_identity(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        inspect_macos_process_identity(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(ProcessError::Inspection(
+            "kernel birth-token inspection is unsupported on this platform".into(),
+        ))
+    }
+}
+
+/// Resolve the executable image for a process only while its kernel birth token
+/// still matches the supplied process identity.
+pub fn executable_path_for_identity(
+    identity: &ProcessIdentity,
+) -> Result<Option<PathBuf>, ProcessError> {
+    let matches_identity = |current: Option<ProcessIdentity>| {
+        current.is_some_and(|current| {
+            current.pid == identity.pid
+                && current.start_identity == identity.start_identity
+                && identity.quality == ProcessIdentityQuality::KernelBirthToken
+                && current.quality == ProcessIdentityQuality::KernelBirthToken
+        })
+    };
+    if !matches_identity(process_identity_for_pid(identity.pid)?) {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    let path = std::fs::canonicalize(format!("/proc/{}/exe", identity.pid));
+    #[cfg(target_os = "macos")]
+    let path = macos_executable_path(identity.pid);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let path: Result<PathBuf, std::io::Error> = Err(std::io::Error::other(
+        "executable path inspection is unsupported on this platform",
+    ));
+    let path = match path {
+        Ok(path) => path,
+        Err(error) if is_process_gone(&error) => return Ok(None),
+        Err(error) => return Err(ProcessError::Inspection(error.to_string())),
+    };
+    if !matches_identity(process_identity_for_pid(identity.pid)?) {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_executable_path(pid: u32) -> std::io::Result<PathBuf> {
+    use std::ffi::{CStr, c_int, c_void};
+
+    unsafe extern "C" {
+        fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+
+    let mut buffer = [0_i8; 4096];
+    let length = unsafe {
+        proc_pidpath(
+            pid as c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 || length as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    Ok(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 pub fn capture_process_tree(
@@ -445,33 +683,39 @@ fn inspect_linux_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
         else {
             continue;
         };
-        let stat_path = entry.path().join("stat");
-        let stat = match std::fs::read_to_string(&stat_path) {
-            Ok(stat) => stat,
-            Err(error) if is_process_gone(&error) => continue,
-            Err(error) => return Err(ProcessError::Inspection(error.to_string())),
-        };
-        let Some((command, fields)) = parse_linux_stat(&stat) else {
-            return Err(ProcessError::Inspection(
-                "kernel returned an invalid process stat record".into(),
-            ));
-        };
-        processes.push(ProcessIdentity {
-            pid,
-            parent_pid: parse_field(&fields, 1)?,
-            process_group_id: parse_field(&fields, 2)?,
-            start_identity: format!(
-                "linux-start-ticks:{}",
-                fields.get(19).ok_or_else(|| {
-                    ProcessError::Inspection("process stat omitted start ticks".into())
-                })?
-            ),
-            command,
-            quality: ProcessIdentityQuality::KernelBirthToken,
-        });
+        if let Some(identity) = inspect_linux_process_identity(pid)? {
+            processes.push(identity);
+        }
     }
     processes.sort_by_key(|item| item.pid);
     Ok(processes)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_linux_process_identity(pid: u32) -> Result<Option<ProcessIdentity>, ProcessError> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if is_process_gone(&error) => return Ok(None),
+        Err(error) => return Err(ProcessError::Inspection(error.to_string())),
+    };
+    let Some((command, fields)) = parse_linux_stat(&stat) else {
+        return Err(ProcessError::Inspection(
+            "kernel returned an invalid process stat record".into(),
+        ));
+    };
+    Ok(Some(ProcessIdentity {
+        pid,
+        parent_pid: parse_field(&fields, 1)?,
+        process_group_id: parse_field(&fields, 2)?,
+        start_identity: format!(
+            "linux-start-ticks:{}",
+            fields.get(19).ok_or_else(|| {
+                ProcessError::Inspection("process stat omitted start ticks".into())
+            })?
+        ),
+        command,
+        quality: ProcessIdentityQuality::KernelBirthToken,
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -496,6 +740,49 @@ fn parse_field<T: std::str::FromStr>(fields: &[&str], index: usize) -> Result<T,
 
 #[cfg(target_os = "macos")]
 fn inspect_macos_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
+    use std::ffi::{c_int, c_void};
+
+    unsafe extern "C" {
+        fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int)
+        -> c_int;
+        fn getuid() -> u32;
+    }
+
+    const PROC_UID_ONLY: u32 = 4;
+    let max_pids = 65_536_usize;
+    let mut pids = vec![0_i32; max_pids];
+    let uid = unsafe { getuid() };
+    let bytes = unsafe {
+        proc_listpids(
+            PROC_UID_ONLY,
+            uid,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(pids.as_slice()) as c_int,
+        )
+    };
+    if bytes < 0 {
+        return Err(ProcessError::Inspection(
+            "kernel process enumeration failed".into(),
+        ));
+    }
+    if bytes as usize >= std::mem::size_of_val(pids.as_slice()) {
+        return Err(ProcessError::Inspection(
+            "process table exceeded the bounded identity buffer".into(),
+        ));
+    }
+    let count = (bytes as usize / std::mem::size_of::<i32>()).min(pids.len());
+    let mut processes = Vec::new();
+    for pid in pids.into_iter().take(count).filter(|pid| *pid > 0) {
+        if let Some(identity) = inspect_macos_process_identity(pid as u32)? {
+            processes.push(identity);
+        }
+    }
+    processes.sort_by_key(|item| item.pid);
+    Ok(processes)
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_macos_process_identity(pid: u32) -> Result<Option<ProcessIdentity>, ProcessError> {
     use std::ffi::{CStr, c_char, c_int, c_void};
 
     #[repr(C)]
@@ -525,8 +812,6 @@ fn inspect_macos_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
     }
 
     unsafe extern "C" {
-        fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int)
-        -> c_int;
         fn proc_pidinfo(
             pid: c_int,
             flavor: c_int,
@@ -538,76 +823,58 @@ fn inspect_macos_process_table() -> Result<Vec<ProcessIdentity>, ProcessError> {
     }
 
     const PROC_PIDTBSDINFO: c_int = 3;
-    const PROC_UID_ONLY: u32 = 4;
-    let max_pids = 65_536_usize;
-    let mut pids = vec![0_i32; max_pids];
-    let uid = unsafe { getuid() };
-    let bytes = unsafe {
-        proc_listpids(
-            PROC_UID_ONLY,
-            uid,
-            pids.as_mut_ptr().cast(),
-            std::mem::size_of_val(pids.as_slice()) as c_int,
+    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+    let read = unsafe {
+        proc_pidinfo(
+            pid as c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<ProcBsdInfo>() as c_int,
         )
     };
-    if bytes < 0 {
+    if read == 0 {
+        // The PID may have exited between enumeration and inspection. A
+        // failed non-ESRCH query is not safe to present as an empty table.
+        let error = std::io::Error::last_os_error();
+        if is_process_gone(&error) {
+            return Ok(None);
+        }
+        return Err(ProcessError::Inspection(error.to_string()));
+    }
+    if read as usize != std::mem::size_of::<ProcBsdInfo>() {
         return Err(ProcessError::Inspection(
-            "kernel process enumeration failed".into(),
+            "kernel returned a truncated process identity".into(),
         ));
     }
-    if bytes as usize >= std::mem::size_of_val(pids.as_slice()) {
+    let info = unsafe { info.assume_init() };
+    if info.uid != unsafe { getuid() } {
         return Err(ProcessError::Inspection(
-            "process table exceeded the bounded identity buffer".into(),
+            "process identity belongs to another user".into(),
         ));
     }
-    let count = (bytes as usize / std::mem::size_of::<i32>()).min(pids.len());
-    let mut processes = Vec::new();
-    for pid in pids.into_iter().take(count).filter(|pid| *pid > 0) {
-        let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
-        let read = unsafe {
-            proc_pidinfo(
-                pid,
-                PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                std::mem::size_of::<ProcBsdInfo>() as c_int,
-            )
-        };
-        if read == 0 {
-            // The PID may have exited between enumeration and inspection. A
-            // failed non-ESRCH query is not safe to present as an empty table.
-            let error = std::io::Error::last_os_error();
-            if is_process_gone(&error) {
-                continue;
-            }
-            return Err(ProcessError::Inspection(error.to_string()));
-        }
-        if read as usize != std::mem::size_of::<ProcBsdInfo>() {
-            return Err(ProcessError::Inspection(
-                "kernel returned a truncated process identity".into(),
-            ));
-        }
-        let info = unsafe { info.assume_init() };
-        let command = CStr::from_bytes_until_nul(unsafe {
-            std::slice::from_raw_parts(info.command.as_ptr().cast::<u8>(), info.command.len())
-        })
-        .map_err(|_| ProcessError::Inspection("kernel command identity was not terminated".into()))?
-        .to_string_lossy()
-        .into_owned();
-        processes.push(ProcessIdentity {
-            pid: info.pid,
-            parent_pid: info.parent_pid,
-            process_group_id: info.process_group_id,
-            start_identity: format!(
-                "macos-start:{}:{}",
-                info.start_seconds, info.start_microseconds
-            ),
-            command,
-            quality: ProcessIdentityQuality::KernelBirthToken,
-        });
+    let command = CStr::from_bytes_until_nul(unsafe {
+        std::slice::from_raw_parts(info.command.as_ptr().cast::<u8>(), info.command.len())
+    })
+    .map_err(|_| ProcessError::Inspection("kernel command identity was not terminated".into()))?
+    .to_string_lossy()
+    .into_owned();
+    if info.pid != pid {
+        return Err(ProcessError::Inspection(
+            "kernel returned a different process ID".into(),
+        ));
     }
-    processes.sort_by_key(|item| item.pid);
-    Ok(processes)
+    Ok(Some(ProcessIdentity {
+        pid: info.pid,
+        parent_pid: info.parent_pid,
+        process_group_id: info.process_group_id,
+        start_identity: format!(
+            "macos-start:{}:{}",
+            info.start_seconds, info.start_microseconds
+        ),
+        command,
+        quality: ProcessIdentityQuality::KernelBirthToken,
+    }))
 }
 
 fn validate(request: &ProcessRequest) -> Result<(), ProcessError> {
@@ -873,8 +1140,93 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{ProcessRequest, resolve_executable, run};
+    use super::{ProcessRequest, resolve_executable, run, run_in_new_session};
     use std::path::Path;
+
+    #[test]
+    fn process_evidence_budget_rejects_identity_and_serialized_byte_overflow() {
+        let identities = (1..=super::MAX_PROCESS_EVIDENCE_IDENTITIES + 1)
+            .map(|pid| super::ProcessIdentity {
+                pid: pid as u32,
+                parent_pid: 1,
+                process_group_id: 1,
+                start_identity: format!("birth-{pid}"),
+                command: "worker".into(),
+                quality: super::ProcessIdentityQuality::KernelBirthToken,
+            })
+            .collect::<Vec<_>>();
+        assert!(super::validate_process_evidence_tree(&identities).is_err());
+
+        let oversized = vec![super::ProcessIdentity {
+            pid: 1,
+            parent_pid: 1,
+            process_group_id: 1,
+            start_identity: "birth-1".into(),
+            command: "x".repeat(super::MAX_PROCESS_EVIDENCE_TREE_BYTES),
+            quality: super::ProcessIdentityQuality::KernelBirthToken,
+        }];
+        assert!(super::validate_process_evidence_tree(&oversized).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_kernel_identity_matches_the_process_table_and_rejects_invalid_pids() {
+        let pid = std::process::id();
+        let direct = super::process_identity_for_pid(pid).unwrap().unwrap();
+        let enumerated = super::inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|identity| identity.pid == pid)
+            .unwrap();
+        assert_eq!(direct, enumerated);
+        assert_eq!(
+            direct.quality,
+            super::ProcessIdentityQuality::KernelBirthToken
+        );
+        assert!(super::process_identity_for_pid(0).is_err());
+        assert!(super::process_identity_for_pid(u32::MAX).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_path_requires_live_kernel_birth_identity() {
+        use super::{
+            ProcessIdentity, ProcessIdentityQuality, executable_path_for_identity,
+            inspect_process_table,
+        };
+        use std::process::Command;
+
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let identity = inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == child.id())
+            .unwrap();
+        let executable = executable_path_for_identity(&identity).unwrap().unwrap();
+        assert_eq!(executable, Path::new("/bin/sleep").canonicalize().unwrap());
+
+        let reused_pid = ProcessIdentity {
+            start_identity: "wrong-birth-token".into(),
+            ..identity
+        };
+        assert_eq!(executable_path_for_identity(&reused_pid).unwrap(), None);
+
+        let current = inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == child.id())
+            .unwrap();
+        assert_eq!(current.quality, ProcessIdentityQuality::KernelBirthToken);
+        let imprecise = ProcessIdentity {
+            quality: ProcessIdentityQuality::SecondPrecision,
+            ..current.clone()
+        };
+        assert_eq!(executable_path_for_identity(&imprecise).unwrap(), None);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(super::process_identity_for_pid(child.id()).unwrap(), None);
+        assert_eq!(executable_path_for_identity(&current).unwrap(), None);
+    }
 
     fn request(executable: &str, args: &[&str]) -> ProcessRequest {
         ProcessRequest {
@@ -912,6 +1264,34 @@ mod tests {
             req.environment.insert(key.into(), value.into());
         }
         req
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_session_keeps_a_private_process_group() {
+        let mut req = request(
+            "",
+            &[
+                "--exact",
+                "process::tests::detached_session_fixture",
+                "--ignored",
+                "--nocapture",
+            ],
+        );
+        req.executable = std::env::current_exe().unwrap();
+        req.timeout = Duration::from_secs(5);
+        let output = run_in_new_session(req).unwrap();
+        assert_eq!(output.status.unwrap().code(), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture invoked by the process lifecycle tests"]
+    fn detached_session_fixture() {
+        let pid = std::process::id() as i32;
+        assert_eq!(unsafe { libc::getsid(0) }, pid);
+        assert_eq!(unsafe { libc::getpgrp() }, pid);
+        std::process::exit(0);
     }
 
     #[cfg(unix)]
@@ -995,6 +1375,18 @@ mod tests {
         assert_eq!(output.stderr_tail, b"bcdefghi");
         assert!(output.stderr_truncated);
         assert_eq!(output.status.unwrap().code(), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_true_repeatedly() {
+        for iteration in 0..1000 {
+            let result = run(request("/usr/bin/true", &[]));
+            assert!(
+                result.is_ok(),
+                "fast child run failed at {iteration}: {result:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

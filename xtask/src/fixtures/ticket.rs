@@ -287,13 +287,16 @@ fn list(
         .query_map([scope_key], |row| row.get::<_, String>(0))
         .map_err(|error| error.to_string())?
         .map(|row| serde_json::from_str::<Value>(&row.unwrap()).unwrap())
+        .map(|native| normalize(&native, &params["scope"], namespace, shape))
+        .filter(|ticket| {
+            params["status"].as_str().is_none_or(|status| {
+                ticket.pointer("/status/value").and_then(Value::as_str) == Some(status)
+            })
+        })
         .collect::<Vec<_>>();
     let size = params["page_size"].as_u64().unwrap_or(20) as usize;
     let end = (offset + size).min(all.len());
-    let tickets = all[offset.min(all.len())..end]
-        .iter()
-        .map(|native| normalize(native, &params["scope"], namespace, shape))
-        .collect::<Vec<_>>();
+    let tickets = &all[offset.min(all.len())..end];
     let filters = params
         .as_object()
         .into_iter()

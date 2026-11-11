@@ -251,6 +251,7 @@
         "prepare_worktrees",
         "plan_ready",
         "implementation_ready",
+        "verification_ready",
         "review_ready",
         "merge_assessment",
         "merge_intent",
@@ -319,6 +320,24 @@
       "required": [
         "nodes",
         "requested_investigation_children"
+      ],
+      "type": "object"
+    },
+    "WorkerRecoveryRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "prior_host_commit_operation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prior_worker_agent_run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prior_worker_agent_run_id"
       ],
       "type": "object"
     }
@@ -527,7 +546,10 @@
                   "maxLength": 64,
                   "minLength": 64,
                   "pattern": "^[a-f0-9]{64}$",
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "profile_id": {
                   "maxLength": 255,
@@ -543,13 +565,23 @@
                   "maxLength": 80,
                   "minLength": 1,
                   "pattern": "^[A-Za-z0-9._-]+$"
+                },
+                "worker_recovery": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/WorkerRecoveryRequest"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Requests host-authorized recovery of a terminal Worker on this accepted node.\nThis value is a request only; the controller derives the durable wake authority."
                 }
               },
               "required": [
                 "work_node",
                 "role",
                 "profile_id",
-                "plan_digest",
                 "allowed_repositories",
                 "artifact_inputs"
               ],
@@ -680,7 +712,6 @@
     "kind",
     "assertion",
     "structured_result",
-    "result_digest",
     "artifact_refs"
   ],
   "title": "rex-projects coordinator result message",

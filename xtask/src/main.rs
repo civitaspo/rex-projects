@@ -1,9 +1,13 @@
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use rex_projects::domain::types::Role;
 
+mod acceptance;
 mod fixtures;
 mod release;
+mod verify;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -48,6 +52,21 @@ enum Command {
         #[command(subcommand)]
         fixture: FixtureCommand,
     },
+    /// Check explicitly supplied product and Rex binaries before starting acceptance resources.
+    Verify {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        rex: PathBuf,
+        #[arg(long)]
+        rex_server: String,
+        #[arg(long)]
+        expected_instance: String,
+        #[arg(long)]
+        rex_session: String,
+        #[arg(long)]
+        fixture_root: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -56,6 +75,8 @@ enum FixtureCommand {
     Operations {
         #[arg(long)]
         state_dir: PathBuf,
+        #[arg(long, default_value = "legacy", value_parser = ["legacy", "queued", "running", "awaiting_approval", "succeeded", "failed", "cancelled", "skipped", "missing", "timed_out", "unknown"])]
+        observe_status: String,
     },
     /// Emulate the normalized generic ticket protocol with durable SQLite state.
     Ticket {
@@ -76,6 +97,37 @@ enum FixtureCommand {
         #[arg(long, default_value = "record", value_parser = ["record", "edges"])]
         native_shape: String,
     },
+    /// Run the local GitHub CLI fixture with the remaining arguments passed to `gh api`.
+    #[command(name = "github")]
+    GitHub {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(last = true, required = true)]
+        args: Vec<OsString>,
+    },
+    /// Emit one deterministic, schema-checked Agent message through a provider CLI protocol.
+    Agent {
+        #[arg(long, value_enum)]
+        provider: AgentProvider,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        scenario: String,
+        #[arg(long)]
+        context: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        runtime_binary: Option<PathBuf>,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AgentProvider {
+    Codex,
+    Claude,
 }
 
 fn default_repository_root() -> PathBuf {
@@ -86,7 +138,69 @@ fn default_repository_root() -> PathBuf {
 }
 
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    if argv
+        .first()
+        .and_then(|value| Path::new(value).file_name())
+        .is_some_and(|name| name == "gh")
+    {
+        let root = argv
+            .first()
+            .map(Path::new)
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("REX_PROJECTS_FIXTURE_ROOT").map(PathBuf::from));
+        let result = root
+            .ok_or_else(|| "fixture gh cannot resolve its owned fixture root".to_owned())
+            .and_then(|root| fixtures::github::run_cli(&root, &argv[1..]));
+        if let Err(error) = result {
+            eprintln!("fixture gh: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let cli = Cli::parse();
+    if let Command::Verify {
+        cli,
+        rex,
+        rex_server,
+        expected_instance,
+        rex_session,
+        fixture_root,
+    } = cli.command
+    {
+        match verify::preflight(
+            &cli,
+            &rex,
+            &rex_server,
+            &expected_instance,
+            &rex_session,
+            &fixture_root,
+        ) {
+            Ok(true) => {
+                let result = acceptance::run(acceptance::Request {
+                    cli: &cli,
+                    rex: &rex,
+                    rex_server: &rex_server,
+                    expected_instance: &expected_instance,
+                    rex_session: &rex_session,
+                    fixture_root: &fixture_root,
+                });
+                if let Err(error) = result {
+                    eprintln!("acceptance: {error}");
+                    std::process::exit(1);
+                }
+            }
+            Ok(false) => std::process::exit(1),
+            Err(error) => {
+                eprintln!("preflight: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Err(error) = run(cli) {
         eprintln!("xtask: {error}");
         std::process::exit(1);
     }
@@ -116,7 +230,10 @@ fn run(cli: Cli) -> Result<(), String> {
             write,
         } => release::refresh_pin(&default_repository_root(), &pin_path, &gh, write),
         Command::Fixture { fixture } => match fixture {
-            FixtureCommand::Operations { state_dir } => fixtures::operations::run(&state_dir),
+            FixtureCommand::Operations {
+                state_dir,
+                observe_status,
+            } => fixtures::operations::run(&state_dir, &observe_status),
             FixtureCommand::Ticket {
                 database,
                 namespace,
@@ -135,6 +252,41 @@ fn run(cli: Cli) -> Result<(), String> {
                 delay_method.as_deref().map(|method| (method, delay_ms)),
                 &native_shape,
             ),
+            FixtureCommand::GitHub { root, args } => fixtures::github::run_cli(&root, &args),
+            FixtureCommand::Agent {
+                provider,
+                role,
+                scenario,
+                context,
+                state_dir,
+                runtime_binary,
+                args,
+            } => {
+                let role = match role.as_str() {
+                    "supervisor" => Role::Supervisor,
+                    "coordinator" => Role::Coordinator,
+                    "planner" => Role::Planner,
+                    "worker" => Role::Worker,
+                    "reviewer" => Role::Reviewer,
+                    "merge_decision" => Role::MergeDecision,
+                    "operator" => Role::Operator,
+                    "postmortem" => Role::Postmortem,
+                    _ => return Err("unknown Agent role".to_owned()),
+                };
+                fixtures::agent::run(
+                    match provider {
+                        AgentProvider::Codex => fixtures::agent::Provider::Codex,
+                        AgentProvider::Claude => fixtures::agent::Provider::Claude,
+                    },
+                    role,
+                    &scenario,
+                    &context,
+                    &state_dir,
+                    runtime_binary.as_deref(),
+                    &args,
+                )
+            }
         },
+        Command::Verify { .. } => unreachable!("verify handled before general dispatch"),
     }
 }

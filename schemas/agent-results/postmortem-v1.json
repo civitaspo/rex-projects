@@ -196,6 +196,7 @@
         "prepare_worktrees",
         "plan_ready",
         "implementation_ready",
+        "verification_ready",
         "review_ready",
         "merge_assessment",
         "merge_intent",
@@ -483,7 +484,6 @@
     "kind",
     "assertion",
     "structured_result",
-    "result_digest",
     "artifact_refs"
   ],
   "title": "rex-projects postmortem result message",
