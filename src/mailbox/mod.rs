@@ -404,14 +404,14 @@ impl MailboxCapability {
     /// Inspect whether this pinned mailbox contains only complete, matching request/response
     /// pairs. This is read-only and deliberately does not grant any post-expiry processing
     /// authority; callers must verify the run's terminal receipt before using it.
-    pub(crate) fn inspect_drain(&self) -> MailboxDrainInspection {
+    pub(crate) fn inspect_drain(&self, shared_control_layout: bool) -> MailboxDrainInspection {
         use MailboxDrainInspection::{Drained, Unresolved};
 
         let entry_limit = self
             .limits
             .max_pending_requests
             .saturating_mul(2)
-            .saturating_add(2);
+            .saturating_add(if shared_control_layout { 8 } else { 2 });
         let (names, exceeded) = match self.directory_file_names_bounded(entry_limit) {
             Ok(result) => result,
             Err(_) => {
@@ -441,6 +441,41 @@ impl MailboxCapability {
                     }
                 }
                 continue;
+            }
+            if shared_control_layout {
+                match name {
+                    "result.schema.json"
+                    | "changed-paths.json"
+                    | "change-reference.json"
+                    | "commit-message.txt" => {
+                        match self.read_bounded(name, MAX_REGISTERED_REQUEST_BYTES) {
+                            Ok(bytes) => inventory.push((name.to_owned(), digest(&bytes))),
+                            Err(_) => {
+                                reason.get_or_insert(MailboxDrainReason::Unreadable);
+                                inventory.push((name.to_owned(), "unreadable".to_owned()));
+                            }
+                        }
+                    }
+                    "run-step" | "inbox" => match self.is_real_directory_entry(name) {
+                        Ok(true) => inventory.push((name.to_owned(), "directory".to_owned())),
+                        Ok(false) | Err(_) => {
+                            reason.get_or_insert(MailboxDrainReason::Unreadable);
+                            inventory.push((name.to_owned(), "unreadable".to_owned()));
+                        }
+                    },
+                    _ => {}
+                }
+                if matches!(
+                    name,
+                    "result.schema.json"
+                        | "changed-paths.json"
+                        | "change-reference.json"
+                        | "commit-message.txt"
+                        | "run-step"
+                        | "inbox"
+                ) {
+                    continue;
+                }
             }
             let kind = if let Some(key) = name
                 .strip_prefix(REQUEST_PREFIX)
@@ -527,6 +562,34 @@ impl MailboxCapability {
         MailboxDrainInspection::Unresolved {
             fingerprint: inventory_fingerprint(inventory, false),
             reason,
+        }
+    }
+
+    fn is_real_directory_entry(&self, name: &str) -> Result<bool, std::io::Error> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let name = std::ffi::CString::new(name).expect("internal control entry name");
+            // SAFETY: the retained descriptor is the registered mailbox directory; the name is
+            // an exact internal basename and O_NOFOLLOW rejects a substituted symlink.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory_handle.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: openat returned an owned descriptor.
+            let directory = unsafe { File::from_raw_fd(fd) };
+            directory.metadata().map(|metadata| metadata.is_dir())
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::symlink_metadata(self.directory.join(name))?;
+            Ok(metadata.is_dir() && !metadata.file_type().is_symlink())
         }
     }
 
@@ -1117,7 +1180,7 @@ mod tests {
         let mailbox = capability(root.path());
         mailbox.queue("r-1", &request("r-1", "same"), 1).unwrap();
         assert!(matches!(
-            mailbox.inspect_drain(),
+            mailbox.inspect_drain(false),
             MailboxDrainInspection::Unresolved {
                 reason: MailboxDrainReason::MissingPair,
                 ..
@@ -1132,7 +1195,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            mailbox.inspect_drain(),
+            mailbox.inspect_drain(false),
             MailboxDrainInspection::Drained { .. }
         ));
 
@@ -1146,7 +1209,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            malformed.inspect_drain(),
+            malformed.inspect_drain(false),
             MailboxDrainInspection::Unresolved {
                 reason: MailboxDrainReason::Malformed,
                 ..
@@ -1170,7 +1233,7 @@ mod tests {
                 .join(format!("request-{}.json", super::key("r-1"))),
         )
         .unwrap();
-        let inspection = mailbox.inspect_drain();
+        let inspection = mailbox.inspect_drain(false);
         assert!(
             matches!(
                 inspection,
@@ -1197,9 +1260,38 @@ mod tests {
             fs::write(limited_root.path().join(format!("extra-{index}")), b"x").unwrap();
         }
         assert!(matches!(
-            limited.inspect_drain(),
+            limited.inspect_drain(false),
             MailboxDrainInspection::Unresolved {
                 reason: MailboxDrainReason::LimitExceeded,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_control_layout_does_not_allow_symlinked_host_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mailbox = capability(root.path());
+        symlink(outside.path(), root.path().join("run-step")).unwrap();
+        assert!(matches!(
+            mailbox.inspect_drain(true),
+            MailboxDrainInspection::Unresolved {
+                reason: MailboxDrainReason::Unreadable,
+                ..
+            }
+        ));
+        std::fs::remove_file(root.path().join("run-step")).unwrap();
+        let outside_file = outside.path().join("commit-message.txt");
+        fs::write(&outside_file, b"fixture message").unwrap();
+        symlink(&outside_file, root.path().join("commit-message.txt")).unwrap();
+        assert!(matches!(
+            mailbox.inspect_drain(true),
+            MailboxDrainInspection::Unresolved {
+                reason: MailboxDrainReason::Unreadable,
                 ..
             }
         ));

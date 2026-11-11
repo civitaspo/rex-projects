@@ -260,7 +260,15 @@ impl crate::store::ConfigStore {
         .map_err(AgentMailboxProcessingError::LocalMailbox)?;
         if now_unix.max(0) as u64 >= registration.expires_at_unix {
             if mode == MailboxDispatchMode::TerminalReceiptReplay {
-                return match mailbox.inspect_drain() {
+                let canonical_control_directory = std::fs::canonicalize(&reservation.control_dir)
+                    .map_err(|error| {
+                    AgentMailboxProcessingError::LocalMailbox(format!(
+                        "canonicalize registered control directory: {error}"
+                    ))
+                })?;
+                let shared_control_layout =
+                    canonical_mailbox_directory == canonical_control_directory;
+                return match mailbox.inspect_drain(shared_control_layout) {
                     MailboxDrainInspection::Drained { .. } => Ok(false),
                     MailboxDrainInspection::Unresolved {
                         fingerprint,
