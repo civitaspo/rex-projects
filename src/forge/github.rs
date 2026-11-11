@@ -14,11 +14,11 @@ use crate::domain::ids::Digest;
 use crate::domain::types::MergeMethod;
 use crate::forge::{
     BodyUpdateIntent, BranchProtection, CheckRun, CommentIntent, CommitComparison,
-    CommitObservation, CommitStatus, DirectMergeIntent, EffectAcknowledgement, EffectCertainty,
-    Forge, ForgeError, ForgeObservation, IssueComment, MergeEffectIntent, MergeEffectOperation,
-    Observed, PullRequestFile, PullRequestObservation, PullRequestRef, PullRequestState,
-    Reconciliation, RepositoryIdentity, RepositoryRef, Review, ReviewComment, ReviewThread,
-    canonical_digest, merge_commit_message,
+    CommitObservation, CommitStatus, CommitStatusObservation, DirectMergeIntent,
+    EffectAcknowledgement, EffectCertainty, Forge, ForgeError, ForgeObservation, IssueComment,
+    MergeEffectIntent, MergeEffectOperation, Observed, PullRequestFile, PullRequestObservation,
+    PullRequestRef, PullRequestState, Reconciliation, RepositoryIdentity, RepositoryRef, Review,
+    ReviewComment, ReviewThread, canonical_digest, merge_commit_message,
 };
 use crate::process::{ProcessError, ProcessOutput, ProcessRequest};
 
@@ -431,6 +431,35 @@ impl<R: GitHubCommandRunner> GitHubCliForge<R> {
         }
     }
 
+    fn observe_statuses(
+        &self,
+        pull: &PullRequestRef,
+        head_sha: &str,
+    ) -> Observed<Vec<CommitStatus>> {
+        let result = self
+            .read_records(
+                &pull.repository,
+                &format!("commits/{head_sha}/statuses"),
+                None,
+            )
+            .and_then(|(values, pages)| {
+                // GitHub returns commit statuses in reverse chronological order. Preserve the
+                // paginated API order as the only freshness signal; status IDs are identities.
+                let records = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, value)| parse_status(value, head_sha, ordinal as u64))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((records, pages))
+            });
+        match result {
+            Ok((records, pages)) => {
+                Self::observed(records, pages).expect("typed response serialization is infallible")
+            }
+            Err(error) => Self::unknown(error),
+        }
+    }
+
     fn observe_protection(
         &self,
         repository: &RepositoryRef,
@@ -704,12 +733,7 @@ impl<R: GitHubCommandRunner> Forge for GitHubCliForge<R> {
             None => Self::unknown(ForgeError("pull request head is unknown".into())),
         };
         let statuses = match pr {
-            Some(pr) => self.observe_list(
-                &pull.repository,
-                &format!("commits/{}/statuses", pr.head_sha),
-                None,
-                |value| parse_status(value, &pr.head_sha),
-            ),
+            Some(pr) => self.observe_statuses(pull, &pr.head_sha),
             None => Self::unknown(ForgeError("pull request head is unknown".into())),
         };
         let reviews = self.observe_list(
@@ -1234,7 +1258,11 @@ fn parse_check_run(value: Value) -> Result<CheckRun, ForgeError> {
     })
 }
 
-fn parse_status(value: Value, requested_sha: &str) -> Result<CommitStatus, ForgeError> {
+fn parse_status(
+    value: Value,
+    requested_sha: &str,
+    observed_ordinal: u64,
+) -> Result<CommitStatus, ForgeError> {
     let sha = value
         .get("sha")
         .and_then(Value::as_str)
@@ -1245,6 +1273,16 @@ fn parse_status(value: Value, requested_sha: &str) -> Result<CommitStatus, Forge
             "commit status belongs to a different SHA".into(),
         ));
     }
+    let observation = value
+        .get("id")
+        .and_then(Value::as_u64)
+        .zip(value.get("created_at").and_then(Value::as_str))
+        .filter(|(_, created_at)| timestamp_to_unix(created_at).is_some())
+        .map(|(status_id, created_at)| CommitStatusObservation {
+            status_id,
+            created_at: created_at.to_owned(),
+            observed_ordinal,
+        });
     Ok(CommitStatus {
         context: string(&value, "context")?,
         state: string(&value, "state")?,
@@ -1254,6 +1292,7 @@ fn parse_status(value: Value, requested_sha: &str) -> Result<CommitStatus, Forge
             .and_then(|v| v.get("login"))
             .and_then(Value::as_str)
             .map(str::to_owned),
+        observation,
     })
 }
 
@@ -1557,22 +1596,39 @@ fn timestamp_to_unix(value: &str) -> Option<u64> {
     if value.len() < 20 || !value.ends_with('Z') || value.as_bytes().get(10) != Some(&b'T') {
         return None;
     }
+    let bytes = value.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || [0..4, 5..7, 8..10, 11..13, 14..16, 17..19]
+            .iter()
+            .any(|range| !bytes[range.clone()].iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    if value.len() > 20
+        && (bytes.get(19) != Some(&b'.')
+            || bytes[20..bytes.len() - 1].is_empty()
+            || !bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
     let year = value.get(0..4)?.parse::<i64>().ok()?;
     let month = value.get(5..7)?.parse::<i64>().ok()?;
     let day = value.get(8..10)?.parse::<i64>().ok()?;
     let hour = value.get(11..13)?.parse::<i64>().ok()?;
     let minute = value.get(14..16)?.parse::<i64>().ok()?;
     let second = value.get(17..19)?.parse::<i64>().ok()?;
-    if value.as_bytes().get(4) != Some(&b'-')
-        || value.as_bytes().get(7) != Some(&b'-')
-        || value.as_bytes().get(13) != Some(&b':')
-        || value.as_bytes().get(16) != Some(&b':')
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year == 0 || !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
     // Civil date to days since Unix epoch (Howard Hinnant's Gregorian conversion).
@@ -1724,18 +1780,93 @@ mod tests {
     #[test]
     fn status_without_sha_is_bound_to_requested_head_and_mismatch_is_unknown() {
         let status = parse_status(
-            serde_json::json!({"context":"ci","state":"success"}),
+            serde_json::json!({"id":9,"context":"ci","state":"success","created_at":"2026-01-01T00:00:00Z"}),
             "abc123",
+            3,
         )
         .unwrap();
         assert_eq!(status.sha, "abc123");
+        assert_eq!(
+            status.observation,
+            Some(CommitStatusObservation {
+                status_id: 9,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                observed_ordinal: 3,
+            })
+        );
         assert!(
             parse_status(
                 serde_json::json!({"context":"ci","state":"success","sha":"other"}),
                 "abc123",
+                0,
             )
             .is_err()
         );
+        let legacy = parse_status(
+            serde_json::json!({"context":"ci","state":"success"}),
+            "abc123",
+            0,
+        )
+        .unwrap();
+        assert_eq!(legacy.observation, None);
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("observation").is_none());
+        let old_serialized: CommitStatus = serde_json::from_value(serde_json::json!({
+            "context":"ci", "state":"success", "sha":"abc123", "creator":null
+        }))
+        .unwrap();
+        assert_eq!(old_serialized.observation, None);
+        let malformed_timestamp = parse_status(
+            serde_json::json!({"id":10,"context":"ci","state":"success","created_at":"2026-02-31T00:00:00garbageZ"}),
+            "abc123",
+            0,
+        )
+        .unwrap();
+        assert_eq!(malformed_timestamp.observation, None);
+    }
+
+    #[test]
+    fn status_observation_uses_paginated_api_order_not_status_id_order() {
+        let first_page = (1..=100)
+            .map(|id| {
+                serde_json::json!({
+                    "id": 1000 - id,
+                    "context": "ci",
+                    "state": "success",
+                    "sha": "abc123",
+                    "created_at": format!("2026-01-{:02}T00:00:00Z", id % 28 + 1),
+                })
+            })
+            .collect::<Vec<_>>();
+        let last_record = serde_json::json!({
+            "id": 1,
+            "context": "ci",
+            "state": "failure",
+            "sha": "abc123",
+            "created_at": "2025-12-31T00:00:00Z",
+        });
+        let forge = fixture_forge_responses(vec![
+            serde_json::Value::Array(first_page),
+            serde_json::json!([last_record]),
+        ]);
+        let statuses = match forge.observe_statuses(&test_pull(), "abc123") {
+            Observed::Complete { value, pages, .. } => {
+                assert_eq!(pages, 2);
+                value
+            }
+            Observed::Unknown { reason } => panic!("status observation failed: {reason}"),
+        };
+        assert_eq!(statuses.len(), 101);
+        assert_eq!(
+            statuses[0].observation.as_ref().unwrap().observed_ordinal,
+            0
+        );
+        assert_eq!(statuses[0].observation.as_ref().unwrap().status_id, 999);
+        assert_eq!(
+            statuses[100].observation.as_ref().unwrap().observed_ordinal,
+            100
+        );
+        assert_eq!(statuses[100].observation.as_ref().unwrap().status_id, 1);
     }
 
     #[test]
@@ -1996,7 +2127,12 @@ mod tests {
     fn github_rfc3339_timestamp_is_parsed_without_timezone_guessing() {
         assert_eq!(timestamp_to_unix("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(timestamp_to_unix("1970-01-01T00:00:01.100Z"), Some(1));
+        assert!(timestamp_to_unix("2024-02-29T00:00:00Z").is_some());
         assert_eq!(timestamp_to_unix("1970-01-01T01:00:00+01:00"), None);
+        assert_eq!(timestamp_to_unix("2026-02-31T00:00:00garbageZ"), None);
+        assert_eq!(timestamp_to_unix("2026-02-29T00:00:00Z"), None);
+        assert_eq!(timestamp_to_unix("2026-01-01T00:00:00.Z"), None);
+        assert_eq!(timestamp_to_unix("2026-01-01T00:00:00.1xZ"), None);
     }
 
     #[test]

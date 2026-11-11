@@ -1112,13 +1112,10 @@ fn host_gates(
             .filter(|row| row.context == *required && row.sha == pr.head_sha)
             .collect::<Vec<_>>();
         let latest_checks = latest_check_runs(&check_rows);
-        let status_failed = status_rows.iter().any(|row| row.state != "success");
-        let state = if check_rows.is_empty() && status_rows.is_empty() {
-            EvidenceState::Unknown
-        } else if status_failed {
-            EvidenceState::Fail
+        let check_state = if check_rows.is_empty() {
+            None
         } else {
-            match latest_checks {
+            Some(match latest_checks {
                 None => EvidenceState::Unknown,
                 Some(latest)
                     if latest.iter().any(|row| {
@@ -1132,13 +1129,35 @@ fn host_gates(
                     EvidenceState::Fail
                 }
                 Some(_) => EvidenceState::Pass,
+            })
+        };
+        let (status_state, status_uncertainty) = if status_rows.is_empty() {
+            (None, None)
+        } else {
+            match commit_status_state(&status_rows) {
+                Ok(state) => (Some(state), None),
+                Err(reason) => (Some(EvidenceState::Unknown), Some(reason)),
             }
+        };
+        let state = match (check_state, status_state) {
+            (Some(EvidenceState::Fail), _) | (_, Some(EvidenceState::Fail)) => EvidenceState::Fail,
+            (Some(EvidenceState::Unknown), _) | (_, Some(EvidenceState::Unknown)) => {
+                EvidenceState::Unknown
+            }
+            (Some(EvidenceState::Pass), _) | (_, Some(EvidenceState::Pass)) => EvidenceState::Pass,
+            (None, None) => EvidenceState::Unknown,
         };
         gates.push(GateEvidence {
             key: format!("check:{required}"),
             state,
             required: true,
-            detail: format!("observed required check at head {}", pr.head_sha),
+            detail: status_uncertainty
+                .map(|reason| format!("Commit Status evidence is ambiguous: {reason}"))
+                .or_else(|| {
+                    (check_state == Some(EvidenceState::Unknown))
+                        .then(|| "Check Run workflow evidence is incomplete or ambiguous".into())
+                })
+                .unwrap_or_else(|| format!("observed required check at head {}", pr.head_sha)),
         });
     }
     if repo.merge.required_approvals > 0 {
@@ -1185,6 +1204,65 @@ fn host_gates(
     });
     let _ = protection;
     Ok(gates)
+}
+
+fn commit_status_state(
+    rows: &[&crate::forge::CommitStatus],
+) -> Result<EvidenceState, &'static str> {
+    let Some(freshest) = rows
+        .iter()
+        .map(|row| row.observation.as_ref())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Err("freshness metadata (ID, timestamp, or source order) is missing or invalid");
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    let mut ordinals = std::collections::BTreeSet::new();
+    if freshest
+        .iter()
+        .any(|observation| observation.created_at.is_empty())
+    {
+        return Err("status timestamp is missing");
+    }
+    if freshest
+        .iter()
+        .any(|observation| !ids.insert(observation.status_id))
+    {
+        return Err("status identity is duplicated");
+    }
+    if freshest
+        .iter()
+        .any(|observation| !ordinals.insert(observation.observed_ordinal))
+    {
+        return Err("source order is duplicated");
+    }
+    let Some(newest_ordinal) = freshest
+        .iter()
+        .map(|observation| observation.observed_ordinal)
+        .min()
+    else {
+        return Err("freshest status could not be identified");
+    };
+    let mut newest = rows
+        .iter()
+        .zip(&freshest)
+        .filter(|(_, observation)| observation.observed_ordinal == newest_ordinal);
+    let Some((newest_row, newest_observation)) = newest.next() else {
+        return Err("freshest status could not be identified");
+    };
+    if newest.next().is_some()
+        || freshest.iter().any(|observation| {
+            observation.status_id != newest_observation.status_id
+                && observation.created_at == newest_observation.created_at
+        })
+    {
+        return Err("newest status timestamp ties a different identity");
+    }
+    if newest_row.state == "success" {
+        Ok(EvidenceState::Pass)
+    } else {
+        Ok(EvidenceState::Fail)
+    }
 }
 
 /// Keep the latest run per GitHub Actions workflow for a required check. Check-run IDs are
@@ -1910,6 +1988,264 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn required_commit_status_uses_freshest_status_instead_of_historical_failure() {
+        let mut config: crate::config::Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let repo_id = crate::domain::ids::RepositoryId::parse("example").unwrap();
+        config
+            .repositories
+            .get_mut(&repo_id)
+            .unwrap()
+            .merge
+            .required_checks = vec!["ci".into()];
+        let status = |state: &str, id, created_at: &str, ordinal, context: &str, sha: &str| {
+            crate::forge::CommitStatus {
+                context: context.into(),
+                state: state.into(),
+                sha: sha.into(),
+                creator: Some("bot".into()),
+                observation: Some(crate::forge::CommitStatusObservation {
+                    status_id: id,
+                    created_at: created_at.into(),
+                    observed_ordinal: ordinal,
+                }),
+            }
+        };
+        let check = |id, conclusion: &str, app_id, workflow_id| crate::forge::CheckRun {
+            id,
+            name: "ci".into(),
+            head_sha: "head".into(),
+            status: "completed".into(),
+            conclusion: Some(conclusion.into()),
+            app_id,
+            app_slug: app_id.map(|_| "github-actions".to_owned()),
+            check_suite_id: Some(id),
+            workflow_id,
+        };
+        let gate = |statuses, checks| {
+            let mut observed = host_observation_with_reviews(Vec::new());
+            observed.statuses = complete(statuses);
+            observed.check_runs = complete(checks);
+            host_gates(
+                config.repositories.get(&repo_id).unwrap(),
+                &observed,
+                &test_pull_reference(),
+            )
+            .unwrap()
+            .into_iter()
+            .find(|gate| gate.key == "check:ci")
+            .unwrap()
+        };
+
+        assert_eq!(
+            gate(
+                vec![
+                    status("success", 2, "2026-01-02T00:00:00Z", 1, "ci", "head"),
+                    status("failure", 1, "2026-01-01T00:00:00Z", 2, "ci", "head"),
+                ],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Pass
+        );
+        assert_eq!(
+            gate(
+                vec![
+                    status("failure", 2, "2026-01-02T00:00:00Z", 1, "ci", "head"),
+                    status("success", 1, "2026-01-01T00:00:00Z", 2, "ci", "head"),
+                ],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Fail
+        );
+        assert_eq!(
+            gate(
+                vec![
+                    status("success", 2, "2026-01-02T00:00:00Z", 1, "ci", "head"),
+                    status("failure", 1, "2026-01-02T00:00:00Z", 2, "ci", "head"),
+                ],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Unknown
+        );
+        assert_eq!(
+            gate(
+                vec![
+                    status("success", 3, "2026-01-02T00:00:00Z", 1, "ci", "head"),
+                    status("failure", 1, "2026-01-01T00:00:00Z", 2, "ci", "head"),
+                    status("success", 2, "2026-01-01T00:00:00Z", 3, "ci", "head"),
+                ],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Pass
+        );
+        assert_eq!(
+            gate(
+                vec![
+                    status("success", 2, "2026-01-02T00:00:00Z", 1, "ci", "head"),
+                    status("failure", 2, "2026-01-01T00:00:00Z", 2, "ci", "head"),
+                ],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Unknown
+        );
+        assert_eq!(
+            gate(
+                vec![
+                    status("success", 2, "2026-01-02T00:00:00Z", 1, "ci", "head"),
+                    status("failure", 1, "2026-01-01T00:00:00Z", 1, "ci", "head"),
+                ],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Unknown
+        );
+        assert_eq!(
+            gate(
+                vec![status(
+                    "success",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    1,
+                    "ci",
+                    "old-head"
+                )],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Unknown
+        );
+        assert_eq!(
+            gate(
+                vec![status(
+                    "success",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    1,
+                    "other",
+                    "head"
+                )],
+                Vec::new(),
+            )
+            .state,
+            EvidenceState::Unknown
+        );
+        let mut legacy_status = status("success", 2, "2026-01-02T00:00:00Z", 1, "ci", "head");
+        legacy_status.observation = None;
+        let missing_metadata = gate(vec![legacy_status], Vec::new());
+        assert_eq!(missing_metadata.state, EvidenceState::Unknown);
+        assert!(missing_metadata.detail.contains("freshness metadata"));
+        assert_eq!(
+            gate(
+                vec![status(
+                    "success",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    1,
+                    "ci",
+                    "head"
+                )],
+                vec![check(3, "failure", Some(1), Some(4))],
+            )
+            .state,
+            EvidenceState::Fail
+        );
+        assert_eq!(
+            gate(
+                vec![status(
+                    "failure",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    1,
+                    "ci",
+                    "head"
+                )],
+                vec![check(3, "success", Some(1), Some(4))],
+            )
+            .state,
+            EvidenceState::Fail
+        );
+        assert_eq!(
+            gate(
+                vec![status(
+                    "success",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    1,
+                    "ci",
+                    "head"
+                )],
+                vec![
+                    crate::forge::CheckRun {
+                        id: 3,
+                        name: "ci".into(),
+                        head_sha: "head".into(),
+                        status: "completed".into(),
+                        conclusion: Some("failure".into()),
+                        app_id: None,
+                        app_slug: None,
+                        check_suite_id: None,
+                        workflow_id: None,
+                    },
+                    crate::forge::CheckRun {
+                        id: 4,
+                        name: "ci".into(),
+                        head_sha: "head".into(),
+                        status: "completed".into(),
+                        conclusion: Some("success".into()),
+                        app_id: None,
+                        app_slug: None,
+                        check_suite_id: None,
+                        workflow_id: None,
+                    },
+                ],
+            )
+            .state,
+            EvidenceState::Unknown
+        );
+    }
+
+    #[test]
+    fn commit_status_digest_binds_identity_and_ordinal_but_not_input_order() {
+        let make_status = |id, ordinal| crate::forge::CommitStatus {
+            context: "ci".into(),
+            state: "success".into(),
+            sha: "head".into(),
+            creator: Some("bot".into()),
+            observation: Some(crate::forge::CommitStatusObservation {
+                status_id: id,
+                created_at: format!("2026-01-0{id}T00:00:00Z"),
+                observed_ordinal: ordinal,
+            }),
+        };
+        let mut forward = host_observation_with_reviews(Vec::new());
+        forward.statuses = complete(vec![make_status(1, 1), make_status(2, 0)]);
+        let mut reverse = host_observation_with_reviews(Vec::new());
+        reverse.statuses = complete(vec![make_status(2, 0), make_status(1, 1)]);
+        assert_eq!(
+            forward.semantic_digests().unwrap().checks,
+            reverse.semantic_digests().unwrap().checks
+        );
+
+        let mut changed_ordinal = host_observation_with_reviews(Vec::new());
+        changed_ordinal.statuses = complete(vec![make_status(1, 0), make_status(2, 1)]);
+        assert_ne!(
+            forward.semantic_digests().unwrap().checks,
+            changed_ordinal.semantic_digests().unwrap().checks
+        );
+        let mut changed_identity = host_observation_with_reviews(Vec::new());
+        changed_identity.statuses = complete(vec![make_status(1, 1), make_status(3, 0)]);
+        assert_ne!(
+            forward.semantic_digests().unwrap().checks,
+            changed_identity.semantic_digests().unwrap().checks
+        );
+    }
+
+    #[test]
     fn approval_gate_counts_only_distinct_latest_decisive_reviews_for_exact_head() {
         use crate::forge::Review;
 
@@ -2232,7 +2568,10 @@ pub(crate) mod tests {
             ]}),
             json!({"total_count":1,"workflow_runs":[{"head_sha":head_sha,"check_suite_id":301,"workflow_id":405468936}]}),
             json!({"total_count":1,"workflow_runs":[{"head_sha":head_sha,"check_suite_id":302,"workflow_id":405468936}]}),
-            json!([]),
+            json!([
+                {"id":42,"context":"ci","state":"success","sha":head_sha,"creator":{"login":"actions"},"created_at":"2026-01-02T00:00:00Z"},
+                {"id":41,"context":"ci","state":"failure","sha":head_sha,"creator":{"login":"actions"},"created_at":"2026-01-01T00:00:00Z"}
+            ]),
             json!([
                 {"id":1,"user":{"login":"alice"},"state":"APPROVED","commit_id":head_sha,"submitted_at":"2026-01-01T10:00:00Z"},
                 {"id":2,"user":{"login":"bob"},"state":"APPROVED","commit_id":head_sha,"submitted_at":"2026-01-01T11:00:00Z"}
