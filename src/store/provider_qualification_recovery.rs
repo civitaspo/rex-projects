@@ -65,7 +65,7 @@ pub(crate) fn validate_v17_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 17..=18) {
+    if !matches!(version, 17..=19) {
         return Err(format!(
             "provider qualification recovery schema version mismatch: {version}"
         ));
@@ -117,7 +117,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            crate::store::SCHEMA_VERSION
         );
         validate_v17_schema(&store.connection).unwrap();
         drop(store);
@@ -229,7 +229,11 @@ mod tests {
         let legacy = Connection::open(&database).unwrap();
         legacy
             .execute_batch(
-                "CREATE TEMP TABLE preserved_provider_qualification_jobs AS
+                "DROP TABLE learning_decisions;
+                 DROP TABLE learning_findings;
+                 DROP TABLE learning_batches;
+                 DELETE FROM schema_migrations WHERE version=19;
+                 CREATE TEMP TABLE preserved_provider_qualification_jobs AS
                  SELECT request_id,project_id,role,profile_id,profile_digest,config_revision,
                         config_digest,request_digest,status,controller_generation,rex_session_id,
                         rex_window_id,rex_block_id,result_json,evidence_digest,created_at_unix,

@@ -313,7 +313,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 12..=18) {
+    if !matches!(version, 12..=19) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -425,7 +425,7 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 13..=18) {
+    if !matches!(version, 13..=19) {
         return Err(format!(
             "Agent block lifecycle schema version mismatch: {version}"
         ));
@@ -502,7 +502,7 @@ pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 14..=18) {
+    if !matches!(version, 14..=19) {
         return Err(format!(
             "process evidence schema version mismatch: {version}"
         ));
@@ -1751,6 +1751,10 @@ mod tests {
             .execute_batch(
                 "PRAGMA foreign_keys=OFF;
                  BEGIN IMMEDIATE;
+                 DROP TABLE learning_decisions;
+                 DROP TABLE learning_findings;
+                 DROP TABLE learning_batches;
+                 DELETE FROM schema_migrations WHERE version=19;
                  DROP TRIGGER agent_launch_phase_transitions;
                  CREATE TEMP TABLE saved_agent_launch_reservations AS
                      SELECT agent_run_id,project_id,operation_id,controller_generation,project_epoch,
